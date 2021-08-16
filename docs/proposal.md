@@ -16,7 +16,6 @@
 
 ```rust
 type Payload = [u8]
-type GetResult = [u8]
 type Parameters = [u8]
 
 struct Contract {
@@ -24,14 +23,16 @@ struct Contract {
     parameters : Parameters,
 }
 
-
-
+/// Exported contract functions (WASM)
 pub trait Contract {
     pub fn is_valid_payload(payload : &Payload) -> bool
 
     /// Modifies payload to account for payload_update, returns a map of associated contracts
     /// and the corresponding updates for those.
     pub fn is_valid_update(current : &Payload, update : &Payload) -> bool
+
+    /// 
+    pub fn get(getter : &Option<[u8]>, payload : &Option<Payload>) -> Result<Payload, Error>
 }
 ```
 
@@ -62,3 +63,5 @@ An app is a Contract + WASM code to run in-browser, with access to Store via API
 * https://docs.rs/p2p/0.6.0/p2p/
 
 ## Open questions
+
+### Could a request convert into another request, with the response going directly to the original requestor?
