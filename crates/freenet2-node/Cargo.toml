@@ -1,0 +1,12 @@
+[package]
+name = "freenet2-node"
+version = "0.0.1"
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0.42"
+wasmer = "2.0.0"
+libp2p = "0.39.1"
+crypto = "0.3.0"
+rusqlite = "0.25.3"
+futures = "0.3.15"
