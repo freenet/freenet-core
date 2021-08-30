@@ -90,8 +90,3 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
-#[test]
-fn smoke_test() -> Result<(), ()> {
-    Ok(())
-}
