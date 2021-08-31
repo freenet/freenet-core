@@ -37,21 +37,26 @@ least-recently-used eviction policy.
 
 #### Get
 
-Retrieve a contract's value
+Retrieve a contract's value. The contract webassembly is hashed, and the hash is 
+[converted](https://github.com/sanity/locutus/blob/master/src/main/kotlin/locutus/tools/math/Location.kt#L23) 
+to a location on the ring. The Get request is then "greedy routed" towards that
+location. If/when the data is found it is returned along the same path to
+the requestor, potentially being cached by peers along the way.
+
+##### Caching
+
+Peers will cache the closest data to their location, or the most requested data
+once this can be observed. We will need to determine how to balance these two
+overlapping goals. Peers subscribe to updates for the data they cache.
 
 #### Put
 
-Set or update the value of a contract
+Set or update the value of a contract. The put request is greedy routed to the
+location of the contract on the ring. If a peer receives a put request and
+it is the closest peer to that location that it's aware of it will cache it.
+If a peer receives a put request for data other peers are subscribed to, it
+will broadcast to those peers.
 
-#### Listen
+#### Subscribe
 
 Listen for changes to a contract's value
-
-## Karma
-
-Karma is a scarce unit of value which can be used to establish trust within the network.
-Karma can be acquired through a donation to Freenet development.
-
-Notes:
-* Blind signature may be used to purchase Karma without it being tied to a real-world
-  transaction.
