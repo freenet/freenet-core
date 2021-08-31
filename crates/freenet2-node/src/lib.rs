@@ -1,4 +1,4 @@
 mod config;
 mod node;
 
-pub use node::NodeBuilder;
+pub use node::NodeConfig;

@@ -18,14 +18,15 @@ pub(crate) static CONF: Lazy<Config> =
     Lazy::new(|| Config::load_conf().expect("Failed to load configuration"));
 pub(crate) const PEER_TIMEOUT_SECS: u64 = 10;
 
-static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::build_async_executor);
+// Initialize the executor once.
+static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_async_rt);
 
 pub(crate) struct Config {
     pub bootstrap_ip: IpAddr,
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::ed25519::Keypair>,
-    pub log_level: log::LevelFilter,
+    // pub log_level: log::LevelFilter,
 }
 
 impl Config {
@@ -61,7 +62,7 @@ impl Config {
             bootstrap_port,
             bootstrap_id,
             local_peer_keypair,
-            log_level: log::LevelFilter::Off,
+            // log_level: log::LevelFilter::Off,
         })
     }
 
@@ -92,11 +93,9 @@ impl Config {
 pub(crate) struct GlobalExecutor;
 
 impl GlobalExecutor {
-    pub fn new() -> Self {
-        GlobalExecutor
-    }
-
-    fn build_async_executor() -> Option<Runtime> {
+    /// Returns the runtime handle if it was initialized or none if it was already
+    /// running on the background.
+    pub(crate) fn initialize_async_rt() -> Option<Runtime> {
         if tokio::runtime::Handle::try_current().is_ok() {
             None
         } else {
