@@ -3,7 +3,6 @@ use std::net::IpAddr;
 use libp2p::{
     core::{muxing, transport, upgrade},
     dns::TokioDnsConfig,
-    futures::StreamExt,
     identify, identity,
     multiaddr::Protocol,
     noise, ping,
@@ -46,6 +45,8 @@ struct NetBehaviour {
     identify: identify::Identify,
     ping: ping::Ping,
 }
+
+#[derive(Debug)]
 pub(crate) enum NetEvent {
     Identify(identify::IdentifyEvent),
     Ping(ping::PingEvent),
@@ -205,9 +206,14 @@ impl NodeConfig {
         )
         .with_agent_version(CURRENT_AGENT_VER.to_string());
 
+        let ping = if cfg!(debug_assertions) {
+            ping::Ping::new(ping::PingConfig::new().with_keep_alive(true))
+        } else {
+            ping::Ping::default()
+        };
         NetBehaviour {
             identify: identify::Identify::new(ident_config),
-            ping: ping::Ping::default(),
+            ping,
         }
     }
 }
@@ -300,8 +306,10 @@ mod tests {
         time::Duration,
     };
 
+    use crate::config::tracing::Logger;
+
     use super::*;
-    use libp2p::swarm::SwarmEvent;
+    use libp2p::{futures::StreamExt, swarm::SwarmEvent};
     use rand::Rng;
 
     fn get_free_port() -> Result<u16, ()> {
@@ -323,53 +331,66 @@ mod tests {
         rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
     }
 
+    async fn ping_ev_loop(peer: &mut Node) -> Result<(), ()> {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(1), peer.swarm.select_next_some());
+            match ev.await {
+                Ok(SwarmEvent::Behaviour(NetEvent::Ping(ping))) => {
+                    if ping.result.is_ok() {
+                        return Ok(());
+                    }
+                }
+                Ok(other) => {
+                    log::debug!("{:?}", other)
+                }
+                Err(_) => {
+                    return Err(());
+                }
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping() -> Result<(), ()> {
+        Logger::get_logger();
+
+        let peer1_key = identity::ed25519::Keypair::generate();
+        let peer1_id: PeerId = identity::Keypair::Ed25519(peer1_key.clone())
+            .public()
+            .into();
         let peer1_port = get_free_port().unwrap();
         let peer1_config = InitPeerNode::new()
             .listening_ip(Ipv4Addr::LOCALHOST)
-            .listening_port(peer1_port);
+            .listening_port(peer1_port)
+            .with_identifier(peer1_id);
 
-        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-
-        #[allow(clippy::empty_loop, unreachable_code)]
+        // Start up the initial node.
         GlobalExecutor::spawn(async move {
+            log::info!("initial peer port: {}", peer1_port);
             let mut peer1 = NodeConfig::default()
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
+                .with_key(peer1_key)
                 .build()
                 .unwrap();
-            peer1.listen_on()?;
-            kill_rx.await.map_err(|_| ())
+            peer1.listen_on().unwrap();
+            // kill_rx.await.map_err(|_| ())
+            ping_ev_loop(&mut peer1).await
         });
 
+        // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
             let mut peer2 = NodeConfig::default().build().unwrap();
+            let port = get_free_port().unwrap();
+            log::info!("second peer port: {}", port);
             peer2
                 .swarm
                 .dial_addr(peer1_config.addr.unwrap())
                 .map_err(|_| ())?;
-            let res = loop {
-                let ev =
-                    tokio::time::timeout(Duration::from_secs(1), peer2.swarm.select_next_some());
-                match ev.await {
-                    Ok(SwarmEvent::Behaviour(NetEvent::Ping(ping))) => {
-                        if ping.result.is_ok() {
-                            break Ok(());
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        log::error!("elapsed while trying to ping");
-                        break Err(());
-                    }
-                }
-            };
-            kill_tx.send(()).map_err(|_| ())?;
+            let res = ping_ev_loop(&mut peer2).await;
             res
         });
 
-        let r = dialer.await.map_err(|_| ());
-        r?
+        dialer.await.map_err(|_| ())?
     }
 }
