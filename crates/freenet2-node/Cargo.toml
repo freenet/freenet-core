@@ -3,11 +3,18 @@ name = "freenet2-node"
 version = "0.0.1"
 edition = "2018"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "node-deploy" 
+path = "src/bin/node-deploy.rs"
+doc = false
+
 [dependencies]
 # anyhow = "1.0.42"
 config = "0.11"
 env_logger = "0.9.0"
-futures = "0.3.17"
 libp2p = { version = "0.39", features = [
     "identify",
     "mplex",

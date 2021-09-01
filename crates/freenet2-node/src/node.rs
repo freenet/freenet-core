@@ -179,6 +179,7 @@ impl NodeConfig {
 
         let tcp = TokioTcpConfig::new()
             .nodelay(true)
+            .port_reuse(true)
             // FIXME: there seems to be a problem with the deflate upgrade 
             // that repeteadly allocates more space on the heap until OOM
             // .and_then(|conn, endpoint| {
@@ -331,6 +332,7 @@ mod tests {
         rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
     }
 
+    /// Ping test event loop
     async fn ping_ev_loop(peer: &mut Node) -> Result<(), ()> {
         loop {
             let ev = tokio::time::timeout(Duration::from_secs(1), peer.swarm.select_next_some());
@@ -374,15 +376,14 @@ mod tests {
                 .build()
                 .unwrap();
             peer1.listen_on().unwrap();
-            // kill_rx.await.map_err(|_| ())
             ping_ev_loop(&mut peer1).await
         });
 
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
             let mut peer2 = NodeConfig::default().build().unwrap();
-            let port = get_free_port().unwrap();
-            log::info!("second peer port: {}", port);
+            // wait a bit to make sure the first peer is up and listening
+            tokio::time::sleep(Duration::from_millis(10)).await;
             peer2
                 .swarm
                 .dial_addr(peer1_config.addr.unwrap())
