@@ -1,10 +1,14 @@
-//! Manages
-use std::{convert::TryFrom, net::SocketAddr, time::Duration};
+//! Manages connections.
+
+use std::{net::SocketAddr, time::Duration};
 
 use libp2p::PeerId;
 
+use crate::{message::Message, ring_proto::Location};
+
 type Channel<'a> = (PeerId, &'a [u8]);
 pub(crate) type RemoveConnHandle = Box<dyn FnOnce(PeerId, String) -> ()>;
+pub(crate) type ListenerReaction = Box<dyn FnOnce(PeerId, Box<dyn Message>) -> ()>;
 
 trait Transport {
     fn send(&mut self, peer: PeerId, message: &[u8]);
@@ -15,10 +19,14 @@ trait Transport {
 const _PING_EVERY: Duration = Duration::from_secs(30);
 const _DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 
+pub(crate) struct ListenHandler;
+
 /// Responsible for securely transmitting Messages between Peers.
 pub(crate) trait ConnectionManager {
-    /// Register a handle for the remove connection action.
+    /// Register a handle connection removal action.
     fn on_remove_conn(&mut self, func: RemoveConnHandle);
+
+    fn listen(&mut self, reaction: ListenerReaction) -> ListenHandler;
 }
 
 // pub(crate) struct ConnectionManager {
@@ -42,30 +50,6 @@ pub(crate) trait ConnectionManager {
 //     Outbound {},
 //     Inbound {},
 // }
-
-/// An abstract location on the 1D ring.
-#[derive(PartialEq, PartialOrd)]
-pub(crate) struct Location(f64);
-
-impl Location {
-    pub fn new() -> Self {
-        use rand::prelude::*;
-        let mut rng = rand::thread_rng();
-        Location(rng.gen_range(0.0..=1.0))
-    }
-}
-
-impl TryFrom<f64> for Location {
-    type Error = ();
-
-    fn try_from(value: f64) -> Result<Self, Self::Error> {
-        if !(0.0..=1.0).contains(&value) {
-            Err(())
-        } else {
-            Ok(Location(value))
-        }
-    }
-}
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Peer {
