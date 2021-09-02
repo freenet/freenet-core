@@ -24,7 +24,7 @@ impl ProbeProtocol {
         Self { conn_manager }
     }
 
-    // TODO: this must be really async
+    // TODO: this must be really async since it will perform net I/O
     pub fn probe(&mut self, probe_req: ProbeRequest) -> ProbeResponse {
         todo!()
     }

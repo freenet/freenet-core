@@ -273,6 +273,12 @@ mod test {
             }
         }
 
+        let any_empties = sim_nodes
+            .values()
+            .map(|node| node.ring_protocol.ring.connections_by_location.is_empty())
+            .any(|is_empty| is_empty);
+        assert!(!any_empties);
+
         Ok(())
     }
 }
