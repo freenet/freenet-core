@@ -18,11 +18,11 @@ impl ConnectionManager for TestingConnectionManager {
         todo!()
     }
 
-    fn add_connection(&mut self, peer_key: PeerKey, unsolicited: bool) {
+    fn add_connection(&self, peer_key: PeerKey, unsolicited: bool) {
         todo!()
     }
 
-    fn send(&mut self, to: &PeerKey, callback: SendCallback) {
+    fn send(&self, to: &PeerKey, callback: SendCallback) {
         todo!()
     }
 }

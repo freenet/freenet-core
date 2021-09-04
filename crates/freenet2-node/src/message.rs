@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fmt::Display, sync::atomic::AtomicU64, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -7,15 +7,39 @@ use crate::{
     ring_proto::Location,
 };
 
-// TODO: check if this aapproach is a good one:
-// right now using a trait and passing trait objects in call backs;
-// in the Kotlin version the handler is reified with the type (allowing monomorphization)
-// however as we are also making conn manager a trait object (for simplicity) we cannot
-// use a trait bound along with a generic type...
-// may change to an enum later on if it makes sense or... if we don't need ConnectionManager
-// to be dynamically dispatch we can go back to use generics for Message types
+static MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) trait Message {}
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct MessageId(u64);
+
+impl MessageId {
+    fn new() -> MessageId {
+        // FIXME: in kotling this initialized with a random value, is necessary?
+        Self(MESSAGE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum Message {
+    JoinRequest(JoinRequest),
+    JoinResponse(JoinResponse),
+}
+
+impl Message {
+    pub fn msg_type(&self) -> &str {
+        use Message::*;
+        match self {
+            JoinRequest(_) => "JoinRequest",
+            JoinResponse(_) => "JoinResponse",
+        }
+    }
+}
+
+impl Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.msg_type())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum JoinRequest {
@@ -24,21 +48,21 @@ pub(crate) enum JoinRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum JoinResponse {}
-
-impl Message for JoinResponse {}
+pub(crate) enum JoinResponse {
+    Initial {
+        accepted: Vec<PeerKeyLocation>,
+        reply_to: MessageId,
+        your_location: Location,
+    },
+}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ProbeRequest;
-
-impl Message for ProbeRequest {}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ProbeResponse {
     pub visits: Vec<Visit>,
 }
-
-impl Message for ProbeResponse {}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Visit {

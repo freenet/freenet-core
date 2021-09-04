@@ -5,18 +5,16 @@ use std::{fmt::Display, net::SocketAddr, time::Duration};
 use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{
-    message::{JoinResponse, Message},
-    ring_proto::Location,
-};
+use crate::{message::Message, ring_proto::Location, StdResult};
 
 const _PING_EVERY: Duration = Duration::from_secs(30);
 const _DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 
 pub(crate) type Channel<'a> = (PeerId, &'a [u8]);
 pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
-pub(crate) type ListenerCallback<'t> = Box<dyn FnOnce(&'t PeerKey, Box<dyn Message>)>;
-pub(crate) type SendCallback<'t> = Box<dyn FnOnce(&'t PeerKey, Box<dyn Message>)>;
+pub(crate) type ListenerCallback<'t> = Box<dyn FnOnce(&'t PeerKey, Message) -> Result<()>>;
+pub(crate) type SendCallback = Box<dyn FnOnce(&'static PeerKey, Message) -> Result<()> + 'static>;
+pub(crate) type Result<T> = StdResult<T, ConnError>;
 
 pub(crate) struct ListeningHandler;
 
@@ -33,12 +31,12 @@ pub(crate) trait ConnectionManager {
 
     /// Initiate a connection with a given peer. At this stage NAT traversal
     /// has been succesful and the [`Self::Transport`] has established a connection.
-    fn add_connection(&mut self, peer_key: PeerKey, unsolicited: bool);
+    fn add_connection(&self, peer_key: PeerKey, unsolicited: bool);
 
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer, register a callback action
     /// with the manager for when a response is received.
-    fn send(&mut self, to: &PeerKey, call_back: SendCallback);
+    fn send(&self, to: &PeerKey, call_back: SendCallback);
 }
 
 pub(crate) trait Transport {
@@ -94,15 +92,23 @@ impl From<PublicKey> for PeerKey {
 #[derive(Debug, Serialize, Deserialize)]
 /// The Location of a PeerKey in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
-    peer: PeerKey,
+    pub(crate) peer: PeerKey,
     location: Location,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConnError {
+    #[error("received unexpected response type for a sent request: {0}")]
+    UnexpectedResponseMessage(Message),
+    #[error("location unknown for this node")]
+    LocationUnknown,
 }
 
 mod serialization {
     use super::*;
 
     impl Serialize for PeerKey {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
         where
             S: Serializer,
         {
@@ -111,7 +117,7 @@ mod serialization {
     }
 
     impl<'de> Deserialize<'de> for PeerKey {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
         where
             D: Deserializer<'de>,
         {

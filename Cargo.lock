@@ -659,6 +659,7 @@ dependencies = [
  "libp2p",
  "log",
  "once_cell",
+ "parking_lot",
  "rand 0.8.4",
  "serde 1.0.129",
  "thiserror",
