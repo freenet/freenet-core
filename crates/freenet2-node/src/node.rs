@@ -167,9 +167,9 @@ impl NodeConfig {
     ///
     /// - TCP/IP handling over Tokio streams.
     /// - DNS when dialing peers.
-    /// - Authentication and encryption via [Noise protocol](https://github.com/libp2p/specs/tree/master/noise)
+    /// - Authentication and encryption via [Noise](https://github.com/libp2p/specs/tree/master/noise) protocol.
     /// - Compression using Deflate (disabled right now due to a bug).
-    /// - Multiplexing, preferentially using [Yamux](https://github.com/hashicorp/yamux/blob/master/spec.md).
+    /// - Multiplexing using [Yamux](https://github.com/hashicorp/yamux/blob/master/spec.md).
     fn config_transport(
         &self,
     ) -> std::io::Result<transport::Boxed<(PeerId, muxing::StreamMuxerBox)>> {

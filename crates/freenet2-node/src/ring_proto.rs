@@ -6,32 +6,55 @@ use std::{
     sync::Arc,
 };
 
+// use crossbeam::channel::{unbounded, Receiver, Sender};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     conn_manager::{self, ConnectionManager, PeerKey, PeerKeyLocation, Transport},
-    message::{JoinRequest, JoinResponse, Message},
+    message::{Message, MessageType},
     StdResult,
 };
 
+use self::messages::OpenConnection;
+
 type Result<T> = std::result::Result<T, RingProtoError>;
 
-struct RingProtocol<T> {
-    conn_manager: Box<dyn ConnectionManager<Transport = T>>,
+struct RingProtocol<CM> {
+    conn_manager: CM,
     peer_key: PeerKey,
     /// A location gets assigned once a node joins the network via a gateway,
     /// until then it has no location unless the node is a gateway.
     location: RwLock<Option<Location>>,
-    gateways: HashSet<PeerKey>,
+    gateways: HashSet<PeerKeyLocation>,
     max_hops_to_live: usize,
     rnd_if_htl_above: usize,
     ring: Ring,
+    // notify_state_transition: Receiver<>,
 }
 
-impl<T> RingProtocol<T>
+impl<CM, T> RingProtocol<CM>
 where
     T: Transport + 'static,
+    CM: ConnectionManager<Transport = T> + 'static,
 {
+    fn new(
+        conn_manager: CM,
+        peer_key: PeerKey,
+        max_hops_to_live: usize,
+        rnd_if_htl_above: usize,
+    ) -> Self {
+        RingProtocol {
+            conn_manager,
+            peer_key,
+            location: RwLock::new(None),
+            gateways: HashSet::new(),
+            max_hops_to_live,
+            rnd_if_htl_above,
+            ring: Ring::new(Location::random()),
+        }
+    }
+
     fn listen_for_close_conn() {
         todo!()
     }
@@ -48,13 +71,13 @@ where
         // FIXME: this iteration should be shuffled, must write an extension
         // iterator shuffle items "in place"
         for gateway in self.gateways.iter() {
-            log::info!("Joining ring via {gateway}", gateway = gateway);
+            log::info!("Joining ring via {gateway}", gateway = gateway.location);
             self.conn_manager.add_connection(*gateway, true);
-            let join_req = JoinRequest::Initial { key: self.peer_key };
+            let join_req = messages::JoinRequest::Initial { key: self.peer_key };
             log::debug!(
                 "Sending {req:?} to {gateway}",
                 req = join_req,
-                gateway = gateway
+                gateway = gateway.location
             );
 
             let ring_proto = self.clone();
@@ -62,10 +85,10 @@ where
                 log::debug!(
                     "JoinResponse received from {} of type: {}",
                     sender,
-                    join_res.msg_type()
+                    join_res
                 );
 
-                let accepted = if let Message::JoinResponse(JoinResponse::Initial {
+                let accepted = if let Message::JoinResponse(messages::JoinResponse::Initial {
                     accepted,
                     your_location,
                     ..
@@ -92,15 +115,26 @@ where
 
                 Ok(())
             };
-            self.conn_manager.send(gateway, Box::new(join_response));
+            self.conn_manager.send(&gateway.peer, join_response);
         }
 
         Ok(())
     }
 
-    // TODO: should be async
+    // TODO: should be async since it performs I/O
     fn establish_conn(&self, new_peer: PeerKeyLocation) {
-        todo!()
+        self.conn_manager.add_connection(new_peer, false);
+
+        let state = messages::OpenConnection::Connecting;
+
+        let callback = Box::new(move |s, k| -> conn_manager::Result<()> {
+            //;
+            Ok(())
+        });
+
+        self.conn_manager
+            .listen(Message::from(state).msg_type_id(), callback);
+        // self.conn_manager.send(to, call_back)
     }
 }
 
@@ -197,9 +231,53 @@ impl TryFrom<f64> for Location {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum RingProtoError {
+pub(crate) enum RingProtoError {
     #[error("failed while attempting to join a ring")]
     Join,
+}
+
+pub(crate) mod messages {
+    use crate::message::MessageId;
+
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) enum JoinRequest {
+        Initial { key: PeerKey },
+        Proxy { joiner: PeerKeyLocation },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub(crate) enum JoinResponse {
+        Initial {
+            accepted: Vec<PeerKeyLocation>,
+            reply_to: MessageId,
+            your_location: Location,
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    pub(crate) enum OpenConnection {
+        OCReceived,
+        Connecting,
+        Connected,
+    }
+
+    impl OpenConnection {
+        pub fn is_initiate(&self) -> bool {
+            match self {
+                OpenConnection::Connecting => true,
+                _ => false,
+            }
+        }
+
+        pub(super) fn transition(&mut self, other_state: Self) {
+            match other_state {
+                Self::Connecting => *self = Self::OCReceived,
+                Self::OCReceived | Self::Connected => *self = Self::Connected,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -282,8 +360,8 @@ mod test {
     }
 
     struct SimulatedNode {
-        ring_protocol: RingProtocol<InMemoryTransport>,
-        probe_protocol: ProbeProtocol<InMemoryTransport>,
+        ring_protocol: RingProtocol<TestingConnectionManager>,
+        probe_protocol: ProbeProtocol<TestingConnectionManager>,
     }
 
     fn sim_network_builder(
@@ -295,18 +373,15 @@ mod test {
         let mut nodes = HashMap::new();
 
         let keypair = identity::Keypair::generate_ed25519();
-        let conn_manager = Box::new(TestingConnectionManager);
+        let conn_manager = TestingConnectionManager::new();
 
         // build gateway node
-        let ring_protocol = RingProtocol {
-            conn_manager: conn_manager.clone(),
-            peer_key: keypair.public().into(),
-            location: RwLock::new(Some(Location::random())),
-            gateways: HashSet::new(),
-            max_hops_to_live: ring_max_htl,
+        let ring_protocol = RingProtocol::new(
+            conn_manager.clone(),
+            keypair.public().into(),
+            ring_max_htl,
             rnd_if_htl_above,
-            ring: Ring::new(Location::random()),
-        };
+        );
         let probe_protocol = ProbeProtocol::new(conn_manager);
         nodes.insert(
             "gateway".to_owned(),
@@ -320,16 +395,13 @@ mod test {
         for node_no in 0..network_size {
             let label = format!("node-{}", node_no);
             let keypair = identity::Keypair::generate_ed25519();
-            let conn_manager = Box::new(TestingConnectionManager);
-            let ring_protocol = RingProtocol {
-                conn_manager: conn_manager.clone(),
-                peer_key: keypair.public().into(),
-                location: RwLock::new(None),
-                gateways: HashSet::new(),
-                max_hops_to_live: ring_max_htl,
+            let conn_manager = TestingConnectionManager::new();
+            let ring_protocol = RingProtocol::new(
+                conn_manager.clone(),
+                keypair.public().into(),
+                ring_max_htl,
                 rnd_if_htl_above,
-                ring: Ring::new(Location::random()),
-            };
+            );
             let probe_protocol = ProbeProtocol::new(conn_manager);
 
             nodes.insert(

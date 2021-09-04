@@ -1,44 +1,69 @@
 //! Manages connections.
 
-use std::{fmt::Display, net::SocketAddr, time::Duration};
+use std::{fmt::Display, net::SocketAddr, sync::atomic::AtomicU64, time::Duration};
 
 use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{message::Message, ring_proto::Location, StdResult};
+use crate::{
+    message::{Message, MessageType},
+    ring_proto::Location,
+    StdResult,
+};
 
 const _PING_EVERY: Duration = Duration::from_secs(30);
 const _DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
+static HANDLE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type Channel<'a> = (PeerId, &'a [u8]);
 pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
-pub(crate) type ListenerCallback<'t> = Box<dyn FnOnce(&'t PeerKey, Message) -> Result<()>>;
-pub(crate) type SendCallback = Box<dyn FnOnce(&'static PeerKey, Message) -> Result<()> + 'static>;
 pub(crate) type Result<T> = StdResult<T, ConnError>;
 
-pub(crate) struct ListeningHandler;
+// pub(crate) type ListenerCallback2 = for<'t> Box<dyn FnOnce(&'t PeerKey, Message) -> Result<()>>;
 
-/// Responsible for securely transmitting Messages between Peers.
-pub(crate) trait ConnectionManager {
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub(crate) struct ListeningHandler(u64);
+
+impl ListeningHandler {
+    pub fn new() -> Self {
+        Self(HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Types which impl this trait are responsible for the following responsabilities:
+/// - establishing reliable connections to other peers
+/// - keep connections alive or reconnecting to other peers
+/// - securely transmitting messages between peers
+///
+/// This implementing types manage the lower level connection details of the the network,
+/// usually working at the transport layer over UDP or TCP and performing NAT traversal
+/// to establish connections between peers.
+pub(crate) trait ConnectionManager: Clone + Send + Sync {
+    /// The transport being used to manage networking.
     type Transport: Transport;
 
     /// Register a handler callback for when a connection is removed.
-    fn on_remove_conn(&mut self, func: RemoveConnHandler);
+    fn on_remove_conn(&self, func: RemoveConnHandler);
 
-    fn listen(&mut self, call_back: ListenerCallback) -> ListeningHandler;
+    fn listen<F>(&self, msg_type: MessageType, callback: F) -> ListeningHandler
+    where
+        F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 
     fn transport(&self) -> Self::Transport;
 
     /// Initiate a connection with a given peer. At this stage NAT traversal
-    /// has been succesful and the [`Self::Transport`] has established a connection.
-    fn add_connection(&self, peer_key: PeerKey, unsolicited: bool);
+    /// has been succesful and the [`Transport`] has established a connection.
+    fn add_connection(&self, peer_key: PeerKeyLocation, unsolicited: bool);
 
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer, register a callback action
     /// with the manager for when a response is received.
-    fn send(&self, to: &PeerKey, call_back: SendCallback);
+    fn send<F>(&self, to: &PeerKey, callback: F)
+    where
+        F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 }
 
+/// A protocol used to send and receive data over the network.
 pub(crate) trait Transport {
     fn send(&mut self, peer: PeerKey, message: &[u8]);
     fn is_open(&self) -> bool;
@@ -89,11 +114,11 @@ impl From<PublicKey> for PeerKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 /// The Location of a PeerKey in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
-    pub(crate) peer: PeerKey,
-    location: Location,
+    pub peer: PeerKey,
+    pub location: Location,
 }
 
 #[derive(Debug, thiserror::Error)]

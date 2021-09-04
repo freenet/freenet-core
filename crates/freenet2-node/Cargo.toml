@@ -14,6 +14,7 @@ doc = false
 [dependencies]
 # anyhow = "1.0.42"
 config = "0.11"
+crossbeam = "0.8.1"
 env_logger = "0.9.0"
 libp2p = { version = "0.39", features = [
     "identify",

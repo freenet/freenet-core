@@ -3,15 +3,16 @@ use crate::{
     message::{ProbeRequest, ProbeResponse},
 };
 
-pub(crate) struct ProbeProtocol<T> {
+pub(crate) struct ProbeProtocol<CM> {
     // TODO: maybe both probe and ring proto should not hold a copy of connection manager
     // right now this is a transliteration of Kotlin code where this is easy to do
     // due to GC + cheap ref but may be limiting here and will need to refactor probably
-    conn_manager: Box<dyn ConnectionManager<Transport = T>>,
+    conn_manager: CM,
 }
 
-impl<T> ProbeProtocol<T>
+impl<CM, T> ProbeProtocol<CM>
 where
+    CM: ConnectionManager<Transport = T>,
     T: Transport,
 {
     const MAXIMUM_HOPS_TO_LIVE: usize = 10;
@@ -22,7 +23,7 @@ where
     // in case we end up cloning / ref counting
     // re: init { cm.assertUnique(this::class) }
 
-    pub fn new(conn_manager: Box<dyn ConnectionManager<Transport = T>>) -> Self {
+    pub fn new(conn_manager: CM) -> Self {
         // conn_manager.listen(reaction, message);
         Self { conn_manager }
     }
