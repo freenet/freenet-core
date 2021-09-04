@@ -5,10 +5,16 @@ use std::{
     hash::Hasher,
 };
 
-use crate::conn_manager::{ConnectionManager, PeerKey, PeerKeyLocation};
+use crate::{
+    conn_manager::{self, ConnectionManager, PeerKey, PeerKeyLocation, Transport},
+    message::JoinRequest,
+    StdResult,
+};
 
-struct RingProtocol {
-    conn_manager: Box<dyn ConnectionManager>,
+type Result<T> = std::result::Result<T, RingProtoError>;
+
+struct RingProtocol<T> {
+    conn_manager: Box<dyn ConnectionManager<Transport = T>>,
     peer_key: PeerKey,
     location: Location,
     gateways: HashSet<PeerKey>,
@@ -17,7 +23,10 @@ struct RingProtocol {
     ring: Ring,
 }
 
-impl RingProtocol {
+impl<T> RingProtocol<T>
+where
+    T: Transport,
+{
     fn listen_for_close_conn() {
         todo!()
     }
@@ -26,8 +35,27 @@ impl RingProtocol {
         todo!()
     }
 
-    fn join_ring() {
-        todo!()
+    fn join_ring(&mut self) -> Result<()> {
+        if self.conn_manager.transport().is_open() && self.gateways.is_empty() {
+            return Err(RingProtoError::Join);
+        }
+
+        // FIXME: this iteration should be shuffled, must write an extension
+        // iterator shuffle items "in place"
+        for gateway in self.gateways.iter() {
+            log::info!("Joining ring via {gateway}", gateway = gateway);
+            self.conn_manager.add_connection(*gateway, true);
+            let join_req = JoinRequest::Initial { key: self.peer_key };
+            log::debug!(
+                "Sending {req:?} to {gateway}",
+                req = join_req,
+                gateway = gateway
+            );
+            let join_response = |sender, response| todo!();
+            self.conn_manager.send(gateway, Box::new(join_response));
+        }
+
+        Ok(())
     }
 
     fn establish_conn(&mut self, new_peer: PeerKeyLocation) {
@@ -113,7 +141,7 @@ impl std::hash::Hash for Location {
 impl TryFrom<f64> for Location {
     type Error = ();
 
-    fn try_from(value: f64) -> Result<Self, Self::Error> {
+    fn try_from(value: f64) -> StdResult<Self, Self::Error> {
         if !(0.0..=1.0).contains(&value) {
             Err(())
         } else {
@@ -122,91 +150,28 @@ impl TryFrom<f64> for Location {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+enum RingProtoError {
+    #[error("failed while attempting to join a ring")]
+    Join,
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
 
+    use libp2p::identity;
     use rand::Rng;
 
     use super::*;
     use crate::{
-        conn_manager::{ListenHandler, ListenerReaction, RemoveConnHandle},
-        message::{Message, ProbeRequest},
+        message::ProbeRequest,
         probe_proto::ProbeProtocol,
+        tests::{InMemoryTransport, TestingConnectionManager},
     };
 
-    struct SimulatedNode {
-        ring_protocol: RingProtocol,
-        probe_protocol: ProbeProtocol,
-    }
-
-    #[derive(Clone)]
-    struct ConnManagerMock;
-
-    impl ConnectionManager for ConnManagerMock {
-        fn on_remove_conn(&mut self, _func: RemoveConnHandle) {}
-        fn listen(&mut self, reaction: ListenerReaction) -> ListenHandler {
-            ListenHandler
-        }
-    }
-
-    fn sim_network_builder(
-        network_size: usize,
-        ring_max_htl: usize,
-        rnd_if_htl_above: usize,
-        // _per_node_delay: usize,
-    ) -> HashMap<String, SimulatedNode> {
-        let mut nodes = HashMap::new();
-
-        let conn_manager = Box::new(ConnManagerMock);
-        // gateway node
-        let ring_protocol = RingProtocol {
-            conn_manager: conn_manager.clone(),
-            peer_key: PeerKey,
-            location: Location::random(),
-            gateways: HashSet::new(),
-            max_hops_to_live: ring_max_htl,
-            rnd_if_htl_above,
-            ring: Ring::new(Location::random()),
-        };
-        let probe_protocol = ProbeProtocol::new(conn_manager);
-
-        nodes.insert(
-            "gateway".to_owned(),
-            SimulatedNode {
-                ring_protocol,
-                probe_protocol,
-            },
-        );
-
-        // add other nodes to the simulation
-        for node_no in 0..network_size {
-            let label = format!("node-{}", node_no);
-            let conn_manager = Box::new(ConnManagerMock);
-            let ring_protocol = RingProtocol {
-                conn_manager: conn_manager.clone(),
-                peer_key: PeerKey,
-                location: Location::random(),
-                gateways: HashSet::new(),
-                max_hops_to_live: ring_max_htl,
-                rnd_if_htl_above,
-                ring: Ring::new(Location::random()),
-            };
-            let probe_protocol = ProbeProtocol::new(conn_manager);
-
-            nodes.insert(
-                label,
-                SimulatedNode {
-                    ring_protocol,
-                    probe_protocol,
-                },
-            );
-        }
-        nodes
-    }
-
     #[test]
-    fn node0_to_gateway_conn() {
+    fn node0_to_gateway_conn() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of one node and one gateway test that both are connected.
 
         let ring_protocols = sim_network_builder(1, 1, 0);
@@ -230,28 +195,14 @@ mod test {
                 .len(),
             1
         );
-    }
 
-    /// Builds an histogram of the distribution in the ring of each node relative to each other.
-    fn _ring_distribution<'a>(
-        nodes: impl Iterator<Item = &'a SimulatedNode> + 'a,
-    ) -> impl Iterator<Item = f64> + 'a {
-        // TODO: groupby  certain intervals
-        // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0
-        nodes
-            .map(|node| {
-                let node_ring = &node.ring_protocol.ring;
-                node_ring
-                    .connections_by_location
-                    .keys()
-                    .map(|d| node_ring.location.distance(d))
-                    .collect::<Vec<_>>()
-            })
-            .flatten()
+        Ok(())
     }
 
     #[test]
-    fn all_nodes_should_connect() -> Result<(), ()> {
+    fn all_nodes_should_connect() -> StdResult<(), Box<dyn std::error::Error>> {
+        //! Given a network of 1000 peers all nodes should have connections.
+
         let mut sim_nodes = sim_network_builder(200, 10, 7);
 
         // let _hist: Vec<_> = _ring_distribution(sim_nodes.values()).collect();
@@ -259,7 +210,9 @@ mod test {
         for probe_idx in 0..10 {
             let target = Location::random();
             let idx: usize = rand::thread_rng().gen_range(0..sim_nodes.len());
-            let rnd_node = sim_nodes.get_mut(&format!("node-{}", idx)).ok_or(())?;
+            let rnd_node = sim_nodes
+                .get_mut(&format!("node-{}", idx))
+                .ok_or("node not found")?;
             let probe_response = rnd_node.probe_protocol.probe(ProbeRequest);
             println!("Probe #{}, target: {}", probe_idx, target);
             println!("hop\tlocation\tlatency");
@@ -280,5 +233,85 @@ mod test {
         assert!(!any_empties);
 
         Ok(())
+    }
+
+    struct SimulatedNode {
+        ring_protocol: RingProtocol<InMemoryTransport>,
+        probe_protocol: ProbeProtocol<InMemoryTransport>,
+    }
+
+    fn sim_network_builder(
+        network_size: usize,
+        ring_max_htl: usize,
+        rnd_if_htl_above: usize,
+        // _per_node_delay: usize,
+    ) -> HashMap<String, SimulatedNode> {
+        let mut nodes = HashMap::new();
+
+        let keypair = identity::Keypair::generate_ed25519();
+        let conn_manager = Box::new(TestingConnectionManager);
+        // gateway node
+        let ring_protocol = RingProtocol {
+            conn_manager: conn_manager.clone(),
+            peer_key: keypair.public().into(),
+            location: Location::random(),
+            gateways: HashSet::new(),
+            max_hops_to_live: ring_max_htl,
+            rnd_if_htl_above,
+            ring: Ring::new(Location::random()),
+        };
+        let probe_protocol = ProbeProtocol::new(conn_manager);
+
+        nodes.insert(
+            "gateway".to_owned(),
+            SimulatedNode {
+                ring_protocol,
+                probe_protocol,
+            },
+        );
+
+        // add other nodes to the simulation
+        for node_no in 0..network_size {
+            let label = format!("node-{}", node_no);
+            let keypair = identity::Keypair::generate_ed25519();
+            let conn_manager = Box::new(TestingConnectionManager);
+            let ring_protocol = RingProtocol {
+                conn_manager: conn_manager.clone(),
+                peer_key: keypair.public().into(),
+                location: Location::random(),
+                gateways: HashSet::new(),
+                max_hops_to_live: ring_max_htl,
+                rnd_if_htl_above,
+                ring: Ring::new(Location::random()),
+            };
+            let probe_protocol = ProbeProtocol::new(conn_manager);
+
+            nodes.insert(
+                label,
+                SimulatedNode {
+                    ring_protocol,
+                    probe_protocol,
+                },
+            );
+        }
+        nodes
+    }
+
+    /// Builds an histogram of the distribution in the ring of each node relative to each other.
+    fn _ring_distribution<'a>(
+        nodes: impl Iterator<Item = &'a SimulatedNode> + 'a,
+    ) -> impl Iterator<Item = f64> + 'a {
+        // TODO: groupby  certain intervals
+        // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0
+        nodes
+            .map(|node| {
+                let node_ring = &node.ring_protocol.ring;
+                node_ring
+                    .connections_by_location
+                    .keys()
+                    .map(|d| node_ring.location.distance(d))
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
     }
 }

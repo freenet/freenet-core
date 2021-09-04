@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ring_proto::Location;
+use crate::{
+    conn_manager::{PeerKey, PeerKeyLocation},
+    ring_proto::Location,
+};
 
 // TODO: check if this aapproach is a good one:
 // right now using a trait and passing trait objects in call backs;
@@ -14,6 +17,17 @@ use crate::ring_proto::Location;
 
 pub(crate) trait Message {}
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum JoinRequest {
+    Initial { key: PeerKey },
+    Proxy { joiner: PeerKeyLocation },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum JoinResponse {}
+
+impl Message for JoinResponse {}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ProbeRequest;
 
@@ -23,6 +37,8 @@ impl Message for ProbeRequest {}
 pub(crate) struct ProbeResponse {
     pub visits: Vec<Visit>,
 }
+
+impl Message for ProbeResponse {}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Visit {

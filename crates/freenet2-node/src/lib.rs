@@ -6,6 +6,8 @@ mod probe_proto;
 mod ring_proto;
 
 #[cfg(test)]
-mod test;
+mod tests;
 
 pub use node::NodeConfig;
+
+type StdResult<T, E> = std::result::Result<T, E>;

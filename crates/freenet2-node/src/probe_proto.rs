@@ -1,16 +1,19 @@
 use crate::{
-    conn_manager::ConnectionManager,
+    conn_manager::{ConnectionManager, Transport},
     message::{ProbeRequest, ProbeResponse},
 };
 
-pub(crate) struct ProbeProtocol {
+pub(crate) struct ProbeProtocol<T> {
     // TODO: maybe both probe and ring proto should not hold a copy of connection manager
     // right now this is a transliteration of Kotlin code where this is easy to do
     // due to GC + cheap ref but may be limiting here and will need to refactor probably
-    conn_manager: Box<dyn ConnectionManager>,
+    conn_manager: Box<dyn ConnectionManager<Transport = T>>,
 }
 
-impl ProbeProtocol {
+impl<T> ProbeProtocol<T>
+where
+    T: Transport,
+{
     const MAXIMUM_HOPS_TO_LIVE: usize = 10;
 
     // TODO: think if the uniqueness constraint check is required in the Rust impl
@@ -19,7 +22,7 @@ impl ProbeProtocol {
     // in case we end up cloning / ref counting
     // re: init { cm.assertUnique(this::class) }
 
-    pub fn new(conn_manager: Box<dyn ConnectionManager>) -> Self {
+    pub fn new(conn_manager: Box<dyn ConnectionManager<Transport = T>>) -> Self {
         // conn_manager.listen(reaction, message);
         Self { conn_manager }
     }

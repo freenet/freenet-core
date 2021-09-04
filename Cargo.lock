@@ -661,6 +661,7 @@ dependencies = [
  "once_cell",
  "rand 0.8.4",
  "serde 1.0.129",
+ "thiserror",
  "tokio",
 ]
 
