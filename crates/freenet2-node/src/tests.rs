@@ -10,10 +10,8 @@ use crate::{
         self, Channel, ConnectionManager, ListeningHandler, PeerKey, PeerKeyLocation,
         RemoveConnHandler, Transport,
     },
-    message::{Message, MsgTypeId},
+    message::{Message, MessageId, MsgTypeId},
 };
-
-static HANDLE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(crate) struct TestingConnectionManager {
@@ -24,7 +22,7 @@ type ListenerCallback = Box<dyn FnOnce(PeerKey, Message) -> conn_manager::Result
 
 #[derive(Default)]
 struct ListenerRegistry {
-    global: HashMap<ListeningHandler, ListenerCallback>,
+    global: HashMap<MessageId, ListenerCallback>,
 }
 
 impl TestingConnectionManager {
@@ -40,14 +38,18 @@ impl ConnectionManager for TestingConnectionManager {
 
     fn on_remove_conn(&self, _func: RemoveConnHandler) {}
 
-    fn listen<F>(&self, msg_type: MsgTypeId, callback: F) -> ListeningHandler
+    // FIXME: the fn could take arguments by ref if necessary but due to
+    // https://github.com/rust-lang/rust/issues/70263 it won't compile
+    // can workaround by wrapping up the fn to express lifetime constraints,
+    // consider this, meanwhile passing by value is fine
+    fn listen_to_replies<F>(&self, msg_id: MessageId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
-        let handler_id = ListeningHandler::new();
+        let handler_id = ListeningHandler::new(&msg_id);
         let mut reg = self.listeners.write();
-        let reg = reg.entry(msg_type).or_default();
-        reg.global.insert(handler_id, Box::new(callback));
+        let reg = reg.entry(msg_id.msg_type()).or_default();
+        reg.global.insert(msg_id, Box::new(callback));
         handler_id
     }
 
@@ -59,10 +61,15 @@ impl ConnectionManager for TestingConnectionManager {
         todo!()
     }
 
-    fn send<F>(&self, to: &PeerKey, callback: F)
+    // FIXME: same problem as om tje `listen` fn
+    fn send_with_callback<F>(&self, to: PeerKey, msg_id: MessageId, msg: Message, callback: F)
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
+        todo!()
+    }
+
+    fn send(&self, to: PeerKey, msg_id: MessageId, msg: Message) {
         todo!()
     }
 }

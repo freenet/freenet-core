@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, MsgTypeId},
+    message::{Message, MessageId, MsgTypeId},
     ring_proto::Location,
     StdResult,
 };
@@ -19,14 +19,21 @@ pub(crate) type Channel<'a> = (PeerId, &'a [u8]);
 pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
 pub(crate) type Result<T> = StdResult<T, ConnError>;
 
-// pub(crate) type ListenerCallback2 = for<'t> Box<dyn FnOnce(&'t PeerKey, Message) -> Result<()>>;
-
+/// 3 words size for 64-bit platforms.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct ListeningHandler(u64);
+pub(crate) struct ListeningHandler {
+    handler_id: u64,
+    msg_id: [u8; 16],
+}
 
 impl ListeningHandler {
-    pub fn new() -> Self {
-        Self(HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    pub fn new(id: &MessageId) -> Self {
+        let mut msg_id = [0; 16];
+        msg_id.copy_from_slice(id.unique_identifier());
+        Self {
+            handler_id: HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            msg_id,
+        }
     }
 }
 
@@ -45,7 +52,9 @@ pub(crate) trait ConnectionManager: Clone + Send + Sync {
     /// Register a handler callback for when a connection is removed.
     fn on_remove_conn(&self, func: RemoveConnHandler);
 
-    fn listen<F>(&self, msg_type: MsgTypeId, callback: F) -> ListeningHandler
+    /// Listens to inbound replies for a previously broadcasted message to the network,
+    /// if a reply is detected performs a callback.
+    fn listen_to_replies<F>(&self, msg_id: MessageId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 
@@ -55,12 +64,16 @@ pub(crate) trait ConnectionManager: Clone + Send + Sync {
     /// has been succesful and the [`Transport`] has established a connection.
     fn add_connection(&self, peer_key: PeerKeyLocation, unsolicited: bool);
 
-    /// Send a message to a given peer which has already been identified and  
-    /// which has established a connection with this peer, register a callback action
+    /// Sends a message to a given peer which has already been identified and  
+    /// which has established a connection with this peer, registers a callback action
     /// with the manager for when a response is received.
-    fn send<F>(&self, to: &PeerKey, callback: F)
+    fn send_with_callback<F>(&self, to: PeerKey, msg_id: MessageId, msg: Message, callback: F)
     where
         F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
+
+    /// Send a message to a given peer which has already been identified and  
+    /// which has established a connection with this peer.
+    fn send(&self, to: PeerKey, msg_id: MessageId, msg: Message);
 }
 
 /// A protocol used to send and receive data over the network.
@@ -69,28 +82,6 @@ pub(crate) trait Transport {
     fn is_open(&self) -> bool;
     fn recipient(&self) -> Channel;
 }
-
-// pub(crate) struct ConnectionManager {
-//     key: Keypair,
-//     transport: Box<dyn Transport>,
-//     open_connections: HashMap<Peer, Connection>,
-// }
-
-// impl ConnectionManager {
-//     fn new(transport: Box<dyn Transport>, key: Keypair) -> Self {
-//         Self {
-//             key,
-//             transport,
-//             open_connections: HashMap::new(),
-//         }
-//     }
-// }
-
-// enum Connection {
-//     Symmetric {},
-//     Outbound {},
-//     Inbound {},
-// }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Peer {

@@ -31,3 +31,4 @@ rand = "0.8.4"
 serde = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.10", features = ["rt-multi-thread", "sync", "macros"] }
+uuid = { version = "0.8", features = ["serde", "v4", "v5"] }

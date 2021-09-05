@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     conn_manager::{self, ConnectionManager, PeerKey, PeerKeyLocation, Transport},
-    message::{Message, MsgType, MsgTypeId},
+    message::{Message, MessageId, MsgType},
+    ring_proto::messages::JoinRequest,
     StdResult,
 };
 
@@ -88,11 +89,14 @@ where
                     join_res
                 );
 
-                let accepted = if let Message::JoinResponse(messages::JoinResponse::Initial {
-                    accepted,
-                    your_location,
-                    ..
-                }) = join_res
+                let accepted = if let Message::JoinResponse(
+                    _id,
+                    messages::JoinResponse::Initial {
+                        accepted,
+                        your_location,
+                        ..
+                    },
+                ) = join_res
                 {
                     let loc = &mut *ring_proto.location.write();
                     *loc = Some(your_location);
@@ -115,7 +119,9 @@ where
 
                 Ok(())
             };
-            self.conn_manager.send(&gateway.peer, join_response);
+            let msg: Message = messages::JoinRequest::Initial { key: self.peer_key }.into();
+            self.conn_manager
+                .send_with_callback(gateway.peer, *msg.id(), msg, join_response);
         }
 
         Ok(())
@@ -124,14 +130,26 @@ where
     // TODO: should be async since it performs I/O
     fn establish_conn(&self, new_peer: PeerKeyLocation) {
         self.conn_manager.add_connection(new_peer, false);
-        let state = messages::OpenConnection::Connecting;
-        let callback = Box::new(move |s, k| -> conn_manager::Result<()> {
-            //;
+        let conn_manager = self.conn_manager.clone();
+        let state = Arc::new(RwLock::new(messages::OpenConnection::Connecting));
+        let callback = Box::new(move |peer, msg| -> conn_manager::Result<()> {
+            let oc = match msg {
+                Message::OpenConnection(_id, oc) => oc,
+                msg => return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg)),
+            };
+            let mut current_state = state.write();
+            current_state.transition(oc);
+            if !current_state.is_connected() {
+                let open_conn: Message = (*current_state).into();
+                log::debug!("Acknowledging OC");
+                conn_manager.send(peer, *open_conn.id(), open_conn);
+            }
             Ok(())
         });
-        self.conn_manager
-            .listen(<OpenConnection as MsgType>::msg_type_id(), callback);
-        // self.conn_manager.send(to, call_back)
+        let msg_id = MessageId::new(<OpenConnection as MsgType>::msg_type_id());
+        let handler = self.conn_manager.listen_to_replies(msg_id, callback);
+
+        // TODO: dispatch the initial message to start up connection from this peer.
     }
 }
 
@@ -253,6 +271,7 @@ pub(crate) mod messages {
         },
     }
 
+    /// A stateful connection attempt.
     #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
     pub(crate) enum OpenConnection {
         OCReceived,
@@ -261,15 +280,16 @@ pub(crate) mod messages {
     }
 
     impl OpenConnection {
-        pub fn is_initiate(&self) -> bool {
-            match self {
-                OpenConnection::Connecting => true,
-                _ => false,
-            }
+        pub fn is_initiated(&self) -> bool {
+            matches!(self, OpenConnection::Connecting)
         }
 
-        pub(super) fn transition(&mut self, other_state: Self) {
-            match other_state {
+        pub fn is_connected(&self) -> bool {
+            matches!(self, OpenConnection::Connected)
+        }
+
+        pub(super) fn transition(&mut self, other_host_state: Self) {
+            match other_host_state {
                 Self::Connecting => *self = Self::OCReceived,
                 Self::OCReceived | Self::Connected => *self = Self::Connected,
             }
@@ -286,9 +306,7 @@ mod test {
 
     use super::*;
     use crate::{
-        message::ProbeRequest,
-        probe_proto::ProbeProtocol,
-        tests::{InMemoryTransport, TestingConnectionManager},
+        message::ProbeRequest, probe_proto::ProbeProtocol, tests::TestingConnectionManager,
     };
 
     #[test]
