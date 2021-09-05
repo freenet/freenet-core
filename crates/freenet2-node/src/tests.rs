@@ -10,14 +10,14 @@ use crate::{
         self, Channel, ConnectionManager, ListeningHandler, PeerKey, PeerKeyLocation,
         RemoveConnHandler, Transport,
     },
-    message::{Message, MessageType},
+    message::{Message, MsgTypeId},
 };
 
 static HANDLE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(crate) struct TestingConnectionManager {
-    listeners: Arc<RwLock<HashMap<MessageType, ListenerRegistry>>>,
+    listeners: Arc<RwLock<HashMap<MsgTypeId, ListenerRegistry>>>,
 }
 
 type ListenerCallback = Box<dyn FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync>;
@@ -40,7 +40,7 @@ impl ConnectionManager for TestingConnectionManager {
 
     fn on_remove_conn(&self, _func: RemoveConnHandler) {}
 
-    fn listen<F>(&self, msg_type: MessageType, callback: F) -> ListeningHandler
+    fn listen<F>(&self, msg_type: MsgTypeId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {

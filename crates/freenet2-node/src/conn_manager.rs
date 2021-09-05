@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, MessageType},
+    message::{Message, MsgTypeId},
     ring_proto::Location,
     StdResult,
 };
@@ -45,7 +45,7 @@ pub(crate) trait ConnectionManager: Clone + Send + Sync {
     /// Register a handler callback for when a connection is removed.
     fn on_remove_conn(&self, func: RemoveConnHandler);
 
-    fn listen<F>(&self, msg_type: MessageType, callback: F) -> ListeningHandler
+    fn listen<F>(&self, msg_type: MsgTypeId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 

@@ -20,7 +20,46 @@ impl MessageId {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub(crate) struct MessageType(u8);
+pub(crate) struct MsgTypeId(u8);
+
+pub(crate) trait MsgType: _seal_msg_type::SealedMsgType {
+    fn msg_type_id() -> MsgTypeId;
+}
+
+impl<T> MsgType for T
+where
+    T: _seal_msg_type::SealedMsgType,
+{
+    fn msg_type_id() -> MsgTypeId {
+        <Self as _seal_msg_type::SealedMsgType>::msg_type_id()
+    }
+}
+
+mod _seal_msg_type {
+    use super::*;
+
+    pub(crate) trait SealedMsgType {
+        fn msg_type_id() -> MsgTypeId;
+    }
+
+    impl SealedMsgType for JoinRequest {
+        fn msg_type_id() -> MsgTypeId {
+            MsgTypeId(0)
+        }
+    }
+
+    impl SealedMsgType for JoinResponse {
+        fn msg_type_id() -> MsgTypeId {
+            MsgTypeId(1)
+        }
+    }
+
+    impl SealedMsgType for OpenConnection {
+        fn msg_type_id() -> MsgTypeId {
+            MsgTypeId(2)
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Message {
@@ -31,15 +70,6 @@ pub(crate) enum Message {
 }
 
 impl Message {
-    pub fn msg_type_id(&self) -> MessageType {
-        use Message::*;
-        match self {
-            JoinRequest(_) => MessageType(0),
-            JoinResponse(_) => MessageType(1),
-            OpenConnection(_) => MessageType(2),
-        }
-    }
-
     fn msg_type_repr(&self) -> &'static str {
         use Message::*;
         match self {

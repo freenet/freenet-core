@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     conn_manager::{self, ConnectionManager, PeerKey, PeerKeyLocation, Transport},
-    message::{Message, MessageType},
+    message::{Message, MsgType, MsgTypeId},
     StdResult,
 };
 
@@ -124,16 +124,13 @@ where
     // TODO: should be async since it performs I/O
     fn establish_conn(&self, new_peer: PeerKeyLocation) {
         self.conn_manager.add_connection(new_peer, false);
-
         let state = messages::OpenConnection::Connecting;
-
         let callback = Box::new(move |s, k| -> conn_manager::Result<()> {
             //;
             Ok(())
         });
-
         self.conn_manager
-            .listen(Message::from(state).msg_type_id(), callback);
+            .listen(<OpenConnection as MsgType>::msg_type_id(), callback);
         // self.conn_manager.send(to, call_back)
     }
 }
