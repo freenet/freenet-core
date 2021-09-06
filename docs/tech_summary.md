@@ -34,7 +34,8 @@ In addition to storage and retrieval of values under keys, FreenetV2 supports [o
 so applications can listen for changes to key values and be notified in realtime when they occur.
 
 For flexibility and efficiency, contracts are specified in [web assembly](https://en.wikipedia.org/wiki/WebAssembly), designed by the
-World Wide Web Consortium as a replacement for in-browser JavaScript and rapidly growing in support and adoption.
+World Wide Web Consortium as a replacement for in-browser JavaScript and rapidly growing in support and adoption. This will allow
+new applications to be built on FreenetV2 without needing to constantly upgrade the node software.
 
 FreenetV2 is implemented in the [Rust](https://www.rust-lang.org/) programming language.
 
