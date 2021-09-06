@@ -23,8 +23,12 @@ FreenetV2 is an entirely decentralized key-value store with [observer semantics]
 where keys are cryptographic contracts that specify what values are valid for key. This is a generalization of the
 concept of "Signed Subspace Keys" from FreenetV1.
 
-As with FreenetV1, Decentralization and scalability is achived through a [small world ring](https://en.wikipedia.org/wiki/Small-world_network)-based
-distributed hashtable.
+As with FreenetV1, decentralization and scalability is achived through a [small world ring](https://en.wikipedia.org/wiki/Small-world_network).
+
+This can be contrasted with the blockchain approach where every transaction must be broadcast globally, resulting in high [transaction fees](https://ycharts.com/indicators/ethereum_average_transaction_fee) that prohibit many applications (around US$5.50 per transaction in August 2021).
+
+Unlike many popular cryptocurrencies, FreenetV2 also avoids any costly reliance on [proof of work](https://en.wikipedia.org/wiki/Proof_of_work), 
+which was estimated to consume 148TWh per year in May 2021, or around 22 million metric tons of carbon dioxide emissions per year, higher than many countries.
 
 In addition to storage and retrieval of values under keys, FreenetV2 supports [observer semantics](https://en.wikipedia.org/wiki/Observer_pattern)
 so applications can listen for changes to key values and be notified in realtime when they occur.
@@ -34,14 +38,20 @@ World Wide Web Consortium as a replacement for in-browser JavaScript and rapidly
 
 FreenetV2 is implemented in the [Rust](https://www.rust-lang.org/) programming language.
 
-## Karma
-
 ## Services
 
-Contracts can reach out to, for example, check a HTTP API, and potentially use the result to store a value.
+### Microblogging
 
-Untrustworthy behavior like lying about an API result can cost Karma.
+*Comparable to:* Twitter, Facebook
 
-Pre-committing random number generator
+### Instant Messaging
 
-Pool membership to win karma
+*Comparable to:* Whatsapp, Telegram
+
+### Search
+
+*Comparable to:* Google, Bing, Duck Duck Go
+
+### Store
+
+*Comparable to:* Amazon, Ebay, Etsy
