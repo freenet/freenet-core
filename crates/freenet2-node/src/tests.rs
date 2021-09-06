@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{atomic::AtomicU64, Arc},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 
@@ -10,7 +7,7 @@ use crate::{
         self, Channel, ConnectionManager, ListeningHandler, PeerKey, PeerKeyLocation,
         RemoveConnHandler, Transport,
     },
-    message::{Message, MessageId, MsgTypeId},
+    message::{Message, MsgTypeId, TransactionId},
 };
 
 #[derive(Clone)]
@@ -22,7 +19,7 @@ type ListenerCallback = Box<dyn FnOnce(PeerKey, Message) -> conn_manager::Result
 
 #[derive(Default)]
 struct ListenerRegistry {
-    global: HashMap<MessageId, ListenerCallback>,
+    global: HashMap<TransactionId, ListenerCallback>,
 }
 
 impl TestingConnectionManager {
@@ -42,7 +39,7 @@ impl ConnectionManager for TestingConnectionManager {
     // https://github.com/rust-lang/rust/issues/70263 it won't compile
     // can workaround by wrapping up the fn to express lifetime constraints,
     // consider this, meanwhile passing by value is fine
-    fn listen_to_replies<F>(&self, msg_id: MessageId, callback: F) -> ListeningHandler
+    fn listen_to_replies<F>(&self, msg_id: TransactionId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
@@ -62,14 +59,14 @@ impl ConnectionManager for TestingConnectionManager {
     }
 
     // FIXME: same problem as om tje `listen` fn
-    fn send_with_callback<F>(&self, to: PeerKey, msg_id: MessageId, msg: Message, callback: F)
+    fn send_with_callback<F>(&self, to: PeerKey, msg_id: TransactionId, msg: Message, callback: F)
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
         todo!()
     }
 
-    fn send(&self, to: PeerKey, msg_id: MessageId, msg: Message) {
+    fn send(&self, to: PeerKey, msg_id: TransactionId, msg: Message) {
         todo!()
     }
 }

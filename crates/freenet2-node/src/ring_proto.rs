@@ -4,16 +4,15 @@ use std::{
     fmt::Display,
     hash::Hasher,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
-// use crossbeam::channel::{unbounded, Receiver, Sender};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     conn_manager::{self, ConnectionManager, PeerKey, PeerKeyLocation, Transport},
-    message::{Message, MessageId, MsgType},
-    ring_proto::messages::JoinRequest,
+    message::{Message, MsgType, TransactionId},
     StdResult,
 };
 
@@ -22,7 +21,7 @@ use self::messages::OpenConnection;
 type Result<T> = std::result::Result<T, RingProtoError>;
 
 struct RingProtocol<CM> {
-    conn_manager: CM,
+    conn_manager: Arc<CM>,
     peer_key: PeerKey,
     /// A location gets assigned once a node joins the network via a gateway,
     /// until then it has no location unless the node is a gateway.
@@ -44,16 +43,16 @@ where
         peer_key: PeerKey,
         max_hops_to_live: usize,
         rnd_if_htl_above: usize,
-    ) -> Self {
-        RingProtocol {
-            conn_manager,
+    ) -> Arc<Self> {
+        Arc::new(RingProtocol {
+            conn_manager: Arc::new(conn_manager),
             peer_key,
             location: RwLock::new(None),
             gateways: HashSet::new(),
             max_hops_to_live,
             rnd_if_htl_above,
             ring: Ring::new(Location::random()),
-        }
+        })
     }
 
     fn listen_for_close_conn() {
@@ -64,31 +63,27 @@ where
         todo!()
     }
 
-    fn join_ring(self: Arc<Self>) -> Result<()> {
+    fn join_ring(self: &Arc<Self>) -> Result<()> {
         if self.conn_manager.transport().is_open() && self.gateways.is_empty() {
+            log::info!("No gateways to join through, but this is open so select own location.");
             return Err(RingProtoError::Join);
         }
 
         // FIXME: this iteration should be shuffled, must write an extension
         // iterator shuffle items "in place"
         for gateway in self.gateways.iter() {
-            log::info!("Joining ring via {gateway}", gateway = gateway.location);
+            log::info!("Joining ring via {}", gateway.location);
             self.conn_manager.add_connection(*gateway, true);
             let join_req = messages::JoinRequest::Initial { key: self.peer_key };
             log::debug!(
                 "Sending {req:?} to {gateway}",
                 req = join_req,
-                gateway = gateway.location
+                gateway = gateway.peer
             );
 
             let ring_proto = self.clone();
-            let join_response = move |sender, join_res: Message| -> conn_manager::Result<()> {
-                log::debug!(
-                    "JoinResponse received from {} of type: {}",
-                    sender,
-                    join_res
-                );
-
+            let join_response_cb = move |sender, join_res: Message| -> conn_manager::Result<()> {
+                log::debug!("JoinResponse received from {} of type {}", sender, join_res);
                 let accepted = if let Message::JoinResponse(
                     _id,
                     messages::JoinResponse::Initial {
@@ -121,18 +116,19 @@ where
             };
             let msg: Message = messages::JoinRequest::Initial { key: self.peer_key }.into();
             self.conn_manager
-                .send_with_callback(gateway.peer, *msg.id(), msg, join_response);
+                .send_with_callback(gateway.peer, *msg.id(), msg, join_response_cb);
         }
 
         Ok(())
     }
 
-    // TODO: should be async since it performs I/O
     fn establish_conn(&self, new_peer: PeerKeyLocation) {
         self.conn_manager.add_connection(new_peer, false);
         let conn_manager = self.conn_manager.clone();
         let state = Arc::new(RwLock::new(messages::OpenConnection::Connecting));
+        let state_copy = state.clone();
         let callback = Box::new(move |peer, msg| -> conn_manager::Result<()> {
+            let state = state_copy;
             let oc = match msg {
                 Message::OpenConnection(_id, oc) => oc,
                 msg => return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg)),
@@ -146,10 +142,23 @@ where
             }
             Ok(())
         });
-        let msg_id = MessageId::new(<OpenConnection as MsgType>::msg_type_id());
-        let handler = self.conn_manager.listen_to_replies(msg_id, callback);
+        let msg_id = TransactionId::new(<OpenConnection as MsgType>::msg_type_id());
+        let _handler = self.conn_manager.listen_to_replies(msg_id, callback);
 
-        // TODO: dispatch the initial message to start up connection from this peer.
+        let conn_manager = self.conn_manager.clone();
+        tokio::spawn(async move {
+            let curr_time = Instant::now();
+            let state = *state.read();
+            while !state.is_connected() && curr_time.elapsed() <= Duration::from_secs(30) {
+                log::debug!("Sending {:?} to {:?}", state, new_peer);
+                conn_manager.send(
+                    new_peer.peer,
+                    msg_id,
+                    Message::OpenConnection(msg_id, state),
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await
+            }
+        });
     }
 }
 
@@ -160,6 +169,9 @@ struct Ring {
 }
 
 impl Ring {
+    const MIN_CONNECTIONS: usize = 10;
+    const MAX_CONNECTIONS: usize = 20;
+
     fn new(location: Location) -> Self {
         Ring {
             connections_by_location: BTreeMap::new(),
@@ -168,13 +180,37 @@ impl Ring {
     }
 
     fn should_accept(&self, location: &Location) -> bool {
-        todo!()
+        if location == &self.location || self.connections_by_location.contains_key(location) {
+            false
+        } else if self.connections_by_location.len() < Self::MIN_CONNECTIONS {
+            true
+        } else if self.connections_by_location.len() >= Self::MAX_CONNECTIONS {
+            false
+        } else {
+            self.location.distance(location) < self.median_distance_to(&self.location)
+        }
+    }
+
+    fn median_distance_to(&self, location: &Location) -> Distance {
+        let mut conn_by_dist = self.connections_by_distance(location);
+        conn_by_dist.sort_unstable();
+        let idx = self.connections_by_location.len() / 2;
+        conn_by_dist[idx]
+    }
+
+    fn connections_by_distance(&self, to: &Location) -> Vec<Distance> {
+        self.connections_by_location
+            .keys()
+            .map(|key| key.distance(to))
+            .collect()
     }
 }
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
 pub(crate) struct Location(f64);
+
+type Distance = Location;
 
 impl Location {
     /// Returns a new random location.
@@ -185,12 +221,12 @@ impl Location {
     }
 
     /// Compute the distance between two locations.
-    pub fn distance(&self, other: &Location) -> f64 {
+    pub fn distance(&self, other: &Location) -> Distance {
         let d = (self.0 - other.0).abs();
         if d < 0.5 {
-            d
+            Location(d)
         } else {
-            1.0 - d
+            Location(1.0 - d)
         }
     }
 }
@@ -252,7 +288,7 @@ pub(crate) enum RingProtoError {
 }
 
 pub(crate) mod messages {
-    use crate::message::MessageId;
+    use crate::message::TransactionId;
 
     use super::*;
 
@@ -266,7 +302,7 @@ pub(crate) mod messages {
     pub(crate) enum JoinResponse {
         Initial {
             accepted: Vec<PeerKeyLocation>,
-            reply_to: MessageId,
+            reply_to: TransactionId,
             your_location: Location,
         },
     }
@@ -375,7 +411,7 @@ mod test {
     }
 
     struct SimulatedNode {
-        ring_protocol: RingProtocol<TestingConnectionManager>,
+        ring_protocol: Arc<RingProtocol<TestingConnectionManager>>,
         probe_protocol: ProbeProtocol<TestingConnectionManager>,
     }
 
@@ -433,7 +469,7 @@ mod test {
     /// Builds an histogram of the distribution in the ring of each node relative to each other.
     fn _ring_distribution<'a>(
         nodes: impl Iterator<Item = &'a SimulatedNode> + 'a,
-    ) -> impl Iterator<Item = f64> + 'a {
+    ) -> impl Iterator<Item = Distance> + 'a {
         // TODO: groupby  certain intervals
         // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0
         nodes

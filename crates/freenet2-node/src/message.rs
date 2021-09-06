@@ -5,21 +5,23 @@ use uuid::Uuid;
 
 use crate::ring_proto::{messages::*, Location};
 
-/// A message id is a unique and efficient identifier for any message broadcasted
-/// around the Freenet2 network.
+/// An transaction id is a unique, universal and efficient identifier for any
+/// roundtrip transaction as it is broadcasted around the F2 network.
 ///
 /// The identifier conveys all necessary information to identify and classify the
-/// message:
+/// transaction:
 /// - The unique identifier itself.
-/// - The type of message.
+/// - The type of transaction.
+///
+/// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct MessageId {
+pub(crate) struct TransactionId {
     id: Uuid,
     ty: MsgTypeId,
 }
 
-impl MessageId {
-    pub fn new(ty: MsgTypeId) -> MessageId {
+impl TransactionId {
+    pub fn new(ty: MsgTypeId) -> TransactionId {
         // 3 word size for 64-bits platforms most likely since msg type
         // probably will be aligned to 64 bytes
         Self {
@@ -84,9 +86,9 @@ mod _seal_msg_type {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Message {
     // Ring ops
-    JoinRequest(MessageId, JoinRequest),
-    JoinResponse(MessageId, JoinResponse),
-    OpenConnection(MessageId, OpenConnection),
+    JoinRequest(TransactionId, JoinRequest),
+    JoinResponse(TransactionId, JoinResponse),
+    OpenConnection(TransactionId, OpenConnection),
 }
 
 impl Message {
@@ -99,7 +101,7 @@ impl Message {
         }
     }
 
-    pub fn id(&self) -> &MessageId {
+    pub fn id(&self) -> &TransactionId {
         use Message::*;
         match self {
             JoinRequest(id, _) => id,
@@ -111,14 +113,14 @@ impl Message {
 
 impl From<OpenConnection> for Message {
     fn from(oc: OpenConnection) -> Self {
-        let msg_id = MessageId::new(<OpenConnection as MsgType>::msg_type_id());
+        let msg_id = TransactionId::new(<OpenConnection as MsgType>::msg_type_id());
         Self::OpenConnection(msg_id, oc)
     }
 }
 
 impl From<JoinRequest> for Message {
     fn from(jr: JoinRequest) -> Self {
-        let msg_id = MessageId::new(<JoinRequest as MsgType>::msg_type_id());
+        let msg_id = TransactionId::new(<JoinRequest as MsgType>::msg_type_id());
         Self::JoinRequest(msg_id, jr)
     }
 }

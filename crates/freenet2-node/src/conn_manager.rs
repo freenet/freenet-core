@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, MessageId, MsgTypeId},
+    message::{Message, TransactionId},
     ring_proto::Location,
     StdResult,
 };
@@ -27,7 +27,7 @@ pub(crate) struct ListeningHandler {
 }
 
 impl ListeningHandler {
-    pub fn new(id: &MessageId) -> Self {
+    pub fn new(id: &TransactionId) -> Self {
         let mut msg_id = [0; 16];
         msg_id.copy_from_slice(id.unique_identifier());
         Self {
@@ -45,7 +45,7 @@ impl ListeningHandler {
 /// This implementing types manage the lower level connection details of the the network,
 /// usually working at the transport layer over UDP or TCP and performing NAT traversal
 /// to establish connections between peers.
-pub(crate) trait ConnectionManager: Clone + Send + Sync {
+pub(crate) trait ConnectionManager: Send + Sync {
     /// The transport being used to manage networking.
     type Transport: Transport;
 
@@ -54,7 +54,7 @@ pub(crate) trait ConnectionManager: Clone + Send + Sync {
 
     /// Listens to inbound replies for a previously broadcasted message to the network,
     /// if a reply is detected performs a callback.
-    fn listen_to_replies<F>(&self, msg_id: MessageId, callback: F) -> ListeningHandler
+    fn listen_to_replies<F>(&self, msg_id: TransactionId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 
@@ -67,13 +67,13 @@ pub(crate) trait ConnectionManager: Clone + Send + Sync {
     /// Sends a message to a given peer which has already been identified and  
     /// which has established a connection with this peer, registers a callback action
     /// with the manager for when a response is received.
-    fn send_with_callback<F>(&self, to: PeerKey, msg_id: MessageId, msg: Message, callback: F)
+    fn send_with_callback<F>(&self, to: PeerKey, msg_id: TransactionId, msg: Message, callback: F)
     where
         F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer.
-    fn send(&self, to: PeerKey, msg_id: MessageId, msg: Message);
+    fn send(&self, to: PeerKey, msg_id: TransactionId, msg: Message);
 }
 
 /// A protocol used to send and receive data over the network.
