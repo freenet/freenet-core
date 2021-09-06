@@ -28,4 +28,4 @@ These are enabling services that can be provdied by freenet.org, in return for a
 * web archiving service, will record value of a website at a specified time, and digitally sign it for use in other contracts
 
 * More generally, a system to execuite arbitrary wasm code with access off-freenet, execution can be paid for, result will
-  be public
+  be public. This can be used to create contracts that depend on externally available information.
