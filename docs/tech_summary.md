@@ -23,25 +23,20 @@ FreenetV2 is an entirely decentralized key-value store with [observer semantics]
 where keys are cryptographic contracts that specify what values are valid for key. This is a generalization of the
 concept of "Signed Subspace Keys" from FreenetV1.
 
-As with FreenetV1, Decentralization and scalability is achived through a [small world ring](https://en.wikipedia.org/wiki/Small-world_network)-based
-distributed hashtable.
+As with FreenetV1, Decentralization and scalability is achived through a [small world ring](https://en.wikipedia.org/wiki/Small-world_network).
 
 In addition to storage and retrieval of values under keys, FreenetV2 supports [observer semantics](https://en.wikipedia.org/wiki/Observer_pattern)
 so applications can listen for changes to key values and be notified in realtime when they occur.
 
 For flexibility and efficiency, contracts are specified in [web assembly](https://en.wikipedia.org/wiki/WebAssembly), designed by the
-World Wide Web Consortium as a replacement for in-browser JavaScript and rapidly growing in support and adoption.
+World Wide Web Consortium as a replacement for in-browser JavaScript and rapidly growing in support and adoption. This will allow
+new applications to be built on FreenetV2 without needing to constantly upgrade the node software.
 
 FreenetV2 is implemented in the [Rust](https://www.rust-lang.org/) programming language.
 
-## Karma
+## Batteries Included
 
-## Services
+While FreenetV2 is a platform supporting diverse applications, for wide adoption it's important that it is useful out-of-the-box.
+For this reason FreenetV2 will support a number of core usecases:
 
-Contracts can reach out to, for example, check a HTTP API, and potentially use the result to store a value.
-
-Untrustworthy behavior like lying about an API result can cost Karma.
-
-Pre-committing random number generator
-
-Pool membership to win karma
+* 
