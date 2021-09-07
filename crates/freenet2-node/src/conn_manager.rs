@@ -56,7 +56,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// the provided function.
     fn listen<F>(&self, listen_fn: F)
     where
-        F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
+        F: FnOnce(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 
     /// Listens to inbound replies for a previously broadcasted message to the network,
     /// if a reply is detected performs a callback.
@@ -118,7 +118,7 @@ impl From<PublicKey> for PeerKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 /// The Location of a PeerKey in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
     pub peer: PeerKey,
@@ -131,6 +131,8 @@ pub(crate) enum ConnError {
     UnexpectedResponseMessage(Message),
     #[error("location unknown for this node")]
     LocationUnknown,
+    #[error("expected transaction id was {0} but received {1}")]
+    UnexpectedTx(TransactionId, TransactionId),
 }
 
 mod serialization {

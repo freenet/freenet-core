@@ -39,12 +39,11 @@ impl ConnectionManager for TestingConnectionManager {
 
     fn listen<F>(&self, listen_fn: F)
     where
-        F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
+        F: FnOnce(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
         todo!()
     }
 
-   
     fn listen_to_replies<F>(&self, msg_id: TransactionId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,

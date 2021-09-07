@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -66,82 +66,159 @@ where
     }
 
     fn listen_for_join_req(self: &Arc<Self>) {
-        let self_copy = self.clone();
-        let cls = move |peer, msg| -> conn_manager::Result<()> {
-            let (tx_id, join_req) = if let Message::JoinRequest(id, join_req) = msg {
-                (id, join_req)
-            } else {
-                return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg));
-            };
-            log::debug!("JoinRequest received by {} with HTL {:?}", peer, join_req);
-
-            let peer_key_loc;
-            let req_type;
-
-            enum ReqType {
-                Initial,
-                Proxy,
-            }
-
-            match join_req {
-                messages::JoinRequest::Initial { key } => {
-                    peer_key_loc = PeerKeyLocation {
-                        peer: key,
-                        location: Location::random(),
-                    };
-                    req_type = ReqType::Initial;
-                }
-                messages::JoinRequest::Proxy { joiner } => {
-                    peer_key_loc = joiner;
-                    req_type = ReqType::Proxy;
-                }
-            }
-
-            let your_location = self_copy
-                .location
-                .read()
-                .ok_or(conn_manager::ConnError::LocationUnknown)?;
-            let accepted_by = if self_copy
-                .ring
-                .should_accept(&your_location, &peer_key_loc.location)
-            {
+        let self_c = self.clone();
+        let listening_to =
+            move |sender: PeerKeyLocation, msg: Message| -> conn_manager::Result<()> {
+                let (tx_id, join_req) = if let Message::JoinRequest(id, join_req) = msg {
+                    (id, join_req)
+                } else {
+                    return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg));
+                };
                 log::debug!(
-                    "Accepting connections to {:?}, establising connection",
-                    peer_key_loc
+                    "JoinRequest received by {} with HTL {:?}",
+                    sender.peer,
+                    join_req
                 );
-                self_copy.establish_conn(peer_key_loc);
-                vec![peer_key_loc]
-            } else {
-                log::debug!("Not accepting new connection sender {:?}", peer_key_loc);
-                Vec::new()
-            };
 
-            log::debug!(
-                "Sending JoinResponse to {} accepting {} connections",
-                peer,
-                accepted_by.len()
-            );
-            let join_response = match req_type {
-                ReqType::Initial => Message::from((
-                    tx_id,
-                    JoinResponse::Initial {
-                        accepted_by,
-                        your_location: peer_key_loc.location,
-                        your_peer_id: peer_key_loc.peer,
-                    },
-                )),
-                ReqType::Proxy => {
-                    todo!()
+                let peer_key_loc;
+                let req_type;
+
+                enum ReqType {
+                    Initial,
+                    Proxy,
                 }
+
+                let join_req_hpt = match join_req {
+                    messages::JoinRequest::Initial { key, hops_to_live } => {
+                        peer_key_loc = PeerKeyLocation {
+                            peer: key,
+                            location: Location::random(),
+                        };
+                        req_type = ReqType::Initial;
+                        hops_to_live
+                    }
+                    messages::JoinRequest::Proxy {
+                        joiner,
+                        hops_to_live,
+                    } => {
+                        peer_key_loc = joiner;
+                        req_type = ReqType::Proxy;
+                        hops_to_live
+                    }
+                };
+
+                let your_location = self_c
+                    .location
+                    .read()
+                    .ok_or(conn_manager::ConnError::LocationUnknown)?;
+                let accepted_by = if self_c
+                    .ring
+                    .should_accept(&your_location, &peer_key_loc.location)
+                {
+                    log::debug!(
+                        "Accepting connections to {:?}, establising connection",
+                        peer_key_loc
+                    );
+                    self_c.establish_conn(peer_key_loc);
+                    vec![peer_key_loc]
+                } else {
+                    log::debug!("Not accepting new connection sender {:?}", peer_key_loc);
+                    Vec::new()
+                };
+
+                log::debug!(
+                    "Sending JoinResponse to {} accepting {} connections",
+                    sender.peer,
+                    accepted_by.len()
+                );
+                let join_response = match req_type {
+                    ReqType::Initial => Message::from((
+                        tx_id,
+                        JoinResponse::Initial {
+                            accepted_by: accepted_by.clone(),
+                            your_location: peer_key_loc.location,
+                            your_peer_id: peer_key_loc.peer,
+                        },
+                    )),
+                    ReqType::Proxy => Message::from((
+                        tx_id,
+                        JoinResponse::Proxy {
+                            accepted_by: accepted_by.clone(),
+                        },
+                    )),
+                };
+                self_c.conn_manager.send(sender.peer, tx_id, join_response);
+
+                if join_req_hpt > 0 && !self_c.ring.connections_by_location.is_empty() {
+                    let forward_to = if join_req_hpt >= self_c.rnd_if_htl_above {
+                        log::info!(
+                            "Randomly selecting peer to forward JoinRequest sender {}",
+                            sender.peer
+                        );
+                        self_c.ring.random_peer(|p| *p != &sender)
+                    } else {
+                        log::info!(
+                            "Selecting close peer to forward request sender {}",
+                            sender.peer
+                        );
+                        self_c
+                            .ring
+                            .connections_by_location
+                            .get(&peer_key_loc.location)
+                            .filter(|it| it.peer != sender.peer)
+                            .copied()
+                    }
+                    .map(|p| p.peer);
+
+                    if let Some(forward_to) = forward_to {
+                        let forwarded = Message::from((
+                            tx_id,
+                            JoinRequest::Proxy {
+                                joiner: peer_key_loc,
+                                hops_to_live: join_req_hpt.min(self_c.max_hops_to_live) - 1,
+                            },
+                        ));
+
+                        let forwarded_acceptors =
+                            Arc::new(Mutex::new(accepted_by.into_iter().collect::<HashSet<_>>()));
+
+                        log::info!(
+                            "Forwarding JoinRequest sender {} to {}",
+                            sender.peer,
+                            forward_to
+                        );
+                        let self_c2 = self_c.clone();
+                        let callback = move |jr_sender, join_resp| -> conn_manager::Result<()> {
+                            if let Message::JoinResponse(tx_id, resp) = join_resp {
+                                let new_acceptors = match resp {
+                                    JoinResponse::Initial { accepted_by, .. } => accepted_by,
+                                    JoinResponse::Proxy { accepted_by, .. } => accepted_by,
+                                };
+                                let fa = &mut *forwarded_acceptors.lock();
+                                new_acceptors.iter().for_each(|p| {
+                                    if !fa.contains(p) {
+                                        fa.insert(*p);
+                                    }
+                                });
+                                let msg = Message::from((
+                                    tx_id,
+                                    JoinResponse::Proxy {
+                                        accepted_by: new_acceptors,
+                                    },
+                                ));
+                                self_c2.conn_manager.send(jr_sender, tx_id, msg);
+                            };
+                            Ok(())
+                        };
+                        self_c
+                            .conn_manager
+                            .send_with_callback(forward_to, tx_id, forwarded, callback);
+                    }
+                }
+
+                Ok(())
             };
-
-            self_copy.conn_manager.send(peer, tx_id, join_response);
-
-            // TODO: add forwarding logic
-
-            Ok(())
-        };
-        self.conn_manager.listen(cls);
+        self.conn_manager.listen(listening_to);
     }
 
     fn join_ring(self: &Arc<Self>) -> Result<()> {
@@ -164,7 +241,10 @@ where
             log::info!("Joining ring via {}", gateway.location);
             self.conn_manager.add_connection(*gateway, true);
             let tx_id = TransactionId::new(<JoinRequest as MsgType>::msg_type_id());
-            let join_req = messages::JoinRequest::Initial { key: self.peer_key };
+            let join_req = messages::JoinRequest::Initial {
+                key: self.peer_key,
+                hops_to_live: self.max_hops_to_live,
+            };
             log::debug!(
                 "Sending {req:?} to {gateway}",
                 req = join_req,
@@ -183,6 +263,9 @@ where
                     },
                 ) = join_res
                 {
+                    if _tx_id != tx_id {
+                        return Err(conn_manager::ConnError::UnexpectedTx(tx_id, _tx_id));
+                    }
                     let loc = &mut *ring_proto.location.write();
                     *loc = Some(your_location);
                     accepted_by
@@ -204,8 +287,7 @@ where
 
                 Ok(())
             };
-            let msg: Message =
-                (tx_id, messages::JoinRequest::Initial { key: self.peer_key }).into();
+            let msg: Message = (tx_id, join_req).into();
             self.conn_manager
                 .send_with_callback(gateway.peer, tx_id, msg, join_response_cb);
         }
@@ -293,6 +375,18 @@ impl Ring {
             .map(|key| key.distance(to))
             .collect()
     }
+
+    fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
+    where
+        F: FnMut(&&PeerKeyLocation) -> bool,
+    {
+        // FIXME: should be optimized
+        self.connections_by_location
+            .values()
+            .filter(filter_fn)
+            .next()
+            .copied()
+    }
 }
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
@@ -378,17 +472,16 @@ pub(crate) enum RingProtoError {
 
 pub(crate) mod messages {
     use super::*;
-    use crate::message::TransactionId;
 
     #[derive(Debug, Serialize, Deserialize)]
     pub(crate) enum JoinRequest {
         Initial {
-            // tx_id: TransactionId,
             key: PeerKey,
+            hops_to_live: usize,
         },
         Proxy {
-            // tx_id: TransactionId,
             joiner: PeerKeyLocation,
+            hops_to_live: usize,
         },
     }
 
@@ -398,11 +491,9 @@ pub(crate) mod messages {
             accepted_by: Vec<PeerKeyLocation>,
             your_location: Location,
             your_peer_id: PeerKey,
-            // reply_to: TransactionId,
         },
-        Reply {
+        Proxy {
             accepted_by: Vec<PeerKeyLocation>,
-            // reply_to: TransactionId,
         },
     }
 

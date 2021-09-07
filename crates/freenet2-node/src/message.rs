@@ -41,6 +41,12 @@ impl TransactionId {
     }
 }
 
+impl Display for TransactionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, Copy)]
 pub(crate) struct MsgTypeId(u8);
 
@@ -114,7 +120,7 @@ impl Message {
 impl From<(TransactionId, OpenConnection)> for Message {
     fn from(oc: (TransactionId, OpenConnection)) -> Self {
         let (tx_id, oc) = oc;
-        assert_eq!(tx_id.msg_type(), <OpenConnection as MsgType>::msg_type_id());
+        // assert_eq!(tx_id.msg_type(), <OpenConnection as MsgType>::msg_type_id());
         Self::OpenConnection(tx_id, oc)
     }
 }
@@ -122,7 +128,7 @@ impl From<(TransactionId, OpenConnection)> for Message {
 impl From<(TransactionId, JoinRequest)> for Message {
     fn from(jr: (TransactionId, JoinRequest)) -> Self {
         let (tx_id, jr) = jr;
-        assert_eq!(tx_id.msg_type(), <JoinRequest as MsgType>::msg_type_id());
+        // assert_eq!(tx_id.msg_type(), <JoinRequest as MsgType>::msg_type_id());
         Self::JoinRequest(tx_id, jr)
     }
 }
@@ -130,7 +136,7 @@ impl From<(TransactionId, JoinRequest)> for Message {
 impl From<(TransactionId, JoinResponse)> for Message {
     fn from(jr: (TransactionId, JoinResponse)) -> Self {
         let (tx_id, jr) = jr;
-        assert_eq!(tx_id.msg_type(), <JoinResponse as MsgType>::msg_type_id());
+        // assert_eq!(tx_id.msg_type(), <JoinResponse as MsgType>::msg_type_id());
         Self::JoinResponse(tx_id, jr)
     }
 }
