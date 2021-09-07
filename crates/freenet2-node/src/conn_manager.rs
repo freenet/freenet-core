@@ -52,13 +52,25 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// Register a handler callback for when a connection is removed.
     fn on_remove_conn(&self, func: RemoveConnHandler);
 
-    /// Listens to inbound replies for a previously broadcasted message to the network,
-    /// if a reply is detected performs a callback.
-    fn listen_to_replies<F>(&self, msg_id: TransactionId, callback: F) -> ListeningHandler
+    /// Start listening for incoming connections and process any incoming messages with
+    /// the provided function.
+    fn listen<F>(&self, listen_fn: F)
     where
         F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 
-    fn transport(&self) -> Self::Transport;
+    /// Listens to inbound replies for a previously broadcasted message to the network,
+    /// if a reply is detected performs a callback.
+    // FIXME: the fn could take arguments by ref if necessary but due to
+    // https://github.com/rust-lang/rust/issues/70263 it won't compile
+    // can workaround by wrapping up the fn to express lifetime constraints,
+    // consider this, meanwhile passing by value is fine
+    fn listen_to_replies<F>(&self, tx_id: TransactionId, callback: F) -> ListeningHandler
+    where
+        F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
+
+    fn transport(&self) -> &Self::Transport;
+
+    fn transport_mut(&mut self) -> &mut Self::Transport;
 
     /// Initiate a connection with a given peer. At this stage NAT traversal
     /// has been succesful and the [`Transport`] has established a connection.
@@ -67,13 +79,14 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// Sends a message to a given peer which has already been identified and  
     /// which has established a connection with this peer, registers a callback action
     /// with the manager for when a response is received.
-    fn send_with_callback<F>(&self, to: PeerKey, msg_id: TransactionId, msg: Message, callback: F)
+    // FIXME: same problem as om tje `listen` fn
+    fn send_with_callback<F>(&self, to: PeerKey, tx_id: TransactionId, msg: Message, callback: F)
     where
         F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer.
-    fn send(&self, to: PeerKey, msg_id: TransactionId, msg: Message);
+    fn send(&self, to: PeerKey, tx_id: TransactionId, msg: Message);
 }
 
 /// A protocol used to send and receive data over the network.

@@ -11,7 +11,7 @@ use crate::ring_proto::{messages::*, Location};
 /// The identifier conveys all necessary information to identify and classify the
 /// transaction:
 /// - The unique identifier itself.
-/// - The type of transaction.
+/// - The type of transaction being performed.
 ///
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
@@ -111,17 +111,27 @@ impl Message {
     }
 }
 
-impl From<OpenConnection> for Message {
-    fn from(oc: OpenConnection) -> Self {
-        let msg_id = TransactionId::new(<OpenConnection as MsgType>::msg_type_id());
-        Self::OpenConnection(msg_id, oc)
+impl From<(TransactionId, OpenConnection)> for Message {
+    fn from(oc: (TransactionId, OpenConnection)) -> Self {
+        let (tx_id, oc) = oc;
+        assert_eq!(tx_id.msg_type(), <OpenConnection as MsgType>::msg_type_id());
+        Self::OpenConnection(tx_id, oc)
     }
 }
 
-impl From<JoinRequest> for Message {
-    fn from(jr: JoinRequest) -> Self {
-        let msg_id = TransactionId::new(<JoinRequest as MsgType>::msg_type_id());
-        Self::JoinRequest(msg_id, jr)
+impl From<(TransactionId, JoinRequest)> for Message {
+    fn from(jr: (TransactionId, JoinRequest)) -> Self {
+        let (tx_id, jr) = jr;
+        assert_eq!(tx_id.msg_type(), <JoinRequest as MsgType>::msg_type_id());
+        Self::JoinRequest(tx_id, jr)
+    }
+}
+
+impl From<(TransactionId, JoinResponse)> for Message {
+    fn from(jr: (TransactionId, JoinResponse)) -> Self {
+        let (tx_id, jr) = jr;
+        assert_eq!(tx_id.msg_type(), <JoinResponse as MsgType>::msg_type_id());
+        Self::JoinResponse(tx_id, jr)
     }
 }
 

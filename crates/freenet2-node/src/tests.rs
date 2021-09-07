@@ -13,6 +13,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct TestingConnectionManager {
     listeners: Arc<RwLock<HashMap<MsgTypeId, ListenerRegistry>>>,
+    transport: InMemoryTransport,
 }
 
 type ListenerCallback = Box<dyn FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync>;
@@ -23,9 +24,10 @@ struct ListenerRegistry {
 }
 
 impl TestingConnectionManager {
-    pub fn new() -> Self {
+    pub fn new(is_open: bool) -> Self {
         Self {
             listeners: Arc::new(RwLock::new(HashMap::new())),
+            transport: InMemoryTransport { is_open },
         }
     }
 }
@@ -35,10 +37,14 @@ impl ConnectionManager for TestingConnectionManager {
 
     fn on_remove_conn(&self, _func: RemoveConnHandler) {}
 
-    // FIXME: the fn could take arguments by ref if necessary but due to
-    // https://github.com/rust-lang/rust/issues/70263 it won't compile
-    // can workaround by wrapping up the fn to express lifetime constraints,
-    // consider this, meanwhile passing by value is fine
+    fn listen<F>(&self, listen_fn: F)
+    where
+        F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
+    {
+        todo!()
+    }
+
+   
     fn listen_to_replies<F>(&self, msg_id: TransactionId, callback: F) -> ListeningHandler
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
@@ -50,15 +56,18 @@ impl ConnectionManager for TestingConnectionManager {
         handler_id
     }
 
-    fn transport(&self) -> Self::Transport {
-        todo!()
+    fn transport_mut(&mut self) -> &mut Self::Transport {
+        &mut self.transport
+    }
+
+    fn transport(&self) -> &Self::Transport {
+        &self.transport
     }
 
     fn add_connection(&self, peer_key: PeerKeyLocation, unsolicited: bool) {
         todo!()
     }
 
-    // FIXME: same problem as om tje `listen` fn
     fn send_with_callback<F>(&self, to: PeerKey, msg_id: TransactionId, msg: Message, callback: F)
     where
         F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
@@ -71,7 +80,10 @@ impl ConnectionManager for TestingConnectionManager {
     }
 }
 
-pub(crate) struct InMemoryTransport;
+#[derive(Clone, Debug)]
+pub(crate) struct InMemoryTransport {
+    is_open: bool,
+}
 
 impl Transport for InMemoryTransport {
     fn send(&mut self, peer: PeerKey, message: &[u8]) {
@@ -79,7 +91,7 @@ impl Transport for InMemoryTransport {
     }
 
     fn is_open(&self) -> bool {
-        todo!()
+        self.is_open
     }
 
     fn recipient(&self) -> Channel {
