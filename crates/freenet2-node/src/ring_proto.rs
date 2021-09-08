@@ -218,7 +218,8 @@ where
 
                 Ok(())
             };
-        self.conn_manager.listen(listening_to);
+        self.conn_manager
+            .listen(<JoinRequest as MsgType>::msg_type_id(), listening_to);
     }
 
     fn join_ring(self: &Arc<Self>) -> Result<()> {
@@ -300,21 +301,23 @@ where
         let conn_manager = self.conn_manager.clone();
         let state = Arc::new(RwLock::new(messages::OpenConnection::Connecting));
         let state_copy = state.clone();
-        let callback = Box::new(move |peer, msg| -> conn_manager::Result<()> {
-            let state = state_copy;
-            let (tx_id, oc) = match msg {
-                Message::OpenConnection(tx_id, oc) => (tx_id, oc),
-                msg => return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg)),
-            };
-            let mut current_state = state.write();
-            current_state.transition(oc);
-            if !current_state.is_connected() {
-                let open_conn: Message = (tx_id, *current_state).into();
-                log::debug!("Acknowledging OC");
-                conn_manager.send(peer, *open_conn.id(), open_conn);
-            }
-            Ok(())
-        });
+        let callback = Box::new(
+            move |peer: PeerKeyLocation, msg: Message| -> conn_manager::Result<()> {
+                let state = state_copy;
+                let (tx_id, oc) = match msg {
+                    Message::OpenConnection(tx_id, oc) => (tx_id, oc),
+                    msg => return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg)),
+                };
+                let mut current_state = state.write();
+                current_state.transition(oc);
+                if !current_state.is_connected() {
+                    let open_conn: Message = (tx_id, *current_state).into();
+                    log::debug!("Acknowledging OC");
+                    conn_manager.send(peer.peer, *open_conn.id(), open_conn);
+                }
+                Ok(())
+            },
+        );
         let msg_id = TransactionId::new(<OpenConnection as MsgType>::msg_type_id());
         let _handler = self.conn_manager.listen_to_replies(msg_id, callback);
 

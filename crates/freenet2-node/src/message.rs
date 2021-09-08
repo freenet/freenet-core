@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use crate::ring_proto::{messages::*, Location};
 
+use self::_seal_msg_type::SealedMsgType;
+
 /// An transaction id is a unique, universal and efficient identifier for any
 /// roundtrip transaction as it is broadcasted around the F2 network.
 ///
@@ -49,6 +51,17 @@ impl Display for TransactionId {
 
 #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, Copy)]
 pub(crate) struct MsgTypeId(u8);
+
+impl MsgTypeId {
+    /// Return all possible message type id's
+    pub fn enumeration() -> [MsgTypeId; 3] {
+        [
+            <OpenConnection as MsgType>::msg_type_id(),
+            <JoinRequest as MsgType>::msg_type_id(),
+            <JoinResponse as MsgType>::msg_type_id(),
+        ]
+    }
+}
 
 pub(crate) trait MsgType: _seal_msg_type::SealedMsgType {
     fn msg_type_id() -> MsgTypeId;
@@ -117,29 +130,21 @@ impl Message {
     }
 }
 
-impl From<(TransactionId, OpenConnection)> for Message {
-    fn from(oc: (TransactionId, OpenConnection)) -> Self {
-        let (tx_id, oc) = oc;
-        // assert_eq!(tx_id.msg_type(), <OpenConnection as MsgType>::msg_type_id());
-        Self::OpenConnection(tx_id, oc)
-    }
+macro_rules! impl_msg_conversion {
+    ($ty:tt) => {
+        impl From<(TransactionId, $ty)> for Message {
+            fn from(oc: (TransactionId, $ty)) -> Self {
+                let (tx_id, oc) = oc;
+                // assert_eq!(tx_id.msg_type(), <$ty as MsgType>::msg_type_id());
+                Self::$ty(tx_id, oc)
+            }
+        }
+    };
 }
 
-impl From<(TransactionId, JoinRequest)> for Message {
-    fn from(jr: (TransactionId, JoinRequest)) -> Self {
-        let (tx_id, jr) = jr;
-        // assert_eq!(tx_id.msg_type(), <JoinRequest as MsgType>::msg_type_id());
-        Self::JoinRequest(tx_id, jr)
-    }
-}
-
-impl From<(TransactionId, JoinResponse)> for Message {
-    fn from(jr: (TransactionId, JoinResponse)) -> Self {
-        let (tx_id, jr) = jr;
-        // assert_eq!(tx_id.msg_type(), <JoinResponse as MsgType>::msg_type_id());
-        Self::JoinResponse(tx_id, jr)
-    }
-}
+impl_msg_conversion!(OpenConnection);
+impl_msg_conversion!(JoinRequest);
+impl_msg_conversion!(JoinResponse);
 
 impl Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

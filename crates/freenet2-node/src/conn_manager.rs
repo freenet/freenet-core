@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, TransactionId},
+    message::{Message, MsgTypeId, TransactionId},
     ring_proto::Location,
     StdResult,
 };
@@ -21,19 +21,11 @@ pub(crate) type Result<T> = StdResult<T, ConnError>;
 
 /// 3 words size for 64-bit platforms.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct ListeningHandler {
-    handler_id: u64,
-    msg_id: [u8; 16],
-}
+pub(crate) struct ListenerHandle(u64);
 
-impl ListeningHandler {
-    pub fn new(id: &TransactionId) -> Self {
-        let mut msg_id = [0; 16];
-        msg_id.copy_from_slice(id.unique_identifier());
-        Self {
-            handler_id: HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            msg_id,
-        }
+impl ListenerHandle {
+    pub fn new() -> Self {
+        ListenerHandle(HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -54,19 +46,19 @@ pub(crate) trait ConnectionManager: Send + Sync {
 
     /// Start listening for incoming connections and process any incoming messages with
     /// the provided function.
-    fn listen<F>(&self, listen_fn: F)
+    fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
     where
         F: FnOnce(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 
-    /// Listens to inbound replies for a previously broadcasted message to the network,
+    /// Listens to inbound replies for a previously broadcasted transaction to the network,
     /// if a reply is detected performs a callback.
     // FIXME: the fn could take arguments by ref if necessary but due to
     // https://github.com/rust-lang/rust/issues/70263 it won't compile
     // can workaround by wrapping up the fn to express lifetime constraints,
     // consider this, meanwhile passing by value is fine
-    fn listen_to_replies<F>(&self, tx_id: TransactionId, callback: F) -> ListeningHandler
+    fn listen_to_replies<F>(&self, tx_id: TransactionId, callback: F)
     where
-        F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
+        F: FnOnce(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 
     fn transport(&self) -> &Self::Transport;
 

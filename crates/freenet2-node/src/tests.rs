@@ -1,10 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{array::IntoIter, collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 
 use crate::{
     conn_manager::{
-        self, Channel, ConnectionManager, ListeningHandler, PeerKey, PeerKeyLocation,
+        self, Channel, ConnectionManager, ListenerHandle, PeerKey, PeerKeyLocation,
         RemoveConnHandler, Transport,
     },
     message::{Message, MsgTypeId, TransactionId},
@@ -12,21 +12,38 @@ use crate::{
 
 #[derive(Clone)]
 pub(crate) struct TestingConnectionManager {
-    listeners: Arc<RwLock<HashMap<MsgTypeId, ListenerRegistry>>>,
+    /// stores listeners by message type
+    listeners: Arc<HashMap<MsgTypeId, ListenerRegistry>>,
     transport: InMemoryTransport,
 }
 
-type ListenerCallback = Box<dyn FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync>;
+type ListenerFn =
+    Box<dyn FnOnce(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
 
-#[derive(Default)]
 struct ListenerRegistry {
-    global: HashMap<TransactionId, ListenerCallback>,
+    /// listeners for outbound messages
+    outbound: RwLock<HashMap<TransactionId, ListenerFn>>,
+    /// listeners for inbound messages
+    inbound: RwLock<HashMap<ListenerHandle, ListenerFn>>,
+}
+
+impl Default for ListenerRegistry {
+    fn default() -> Self {
+        Self {
+            outbound: RwLock::new(Default::default()),
+            inbound: RwLock::new(Default::default()),
+        }
+    }
 }
 
 impl TestingConnectionManager {
     pub fn new(is_open: bool) -> Self {
         Self {
-            listeners: Arc::new(RwLock::new(HashMap::new())),
+            listeners: Arc::new(
+                IntoIter::new(MsgTypeId::enumeration())
+                    .map(|id| (id, ListenerRegistry::default()))
+                    .collect(),
+            ),
             transport: InMemoryTransport { is_open },
         }
     }
@@ -37,22 +54,28 @@ impl ConnectionManager for TestingConnectionManager {
 
     fn on_remove_conn(&self, _func: RemoveConnHandler) {}
 
-    fn listen<F>(&self, listen_fn: F)
+    fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
     where
         F: FnOnce(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
-        todo!()
+        let tx_ty_listener = self.listeners.get(&tx_type).unwrap();
+        let handle_id = ListenerHandle::new();
+        tx_ty_listener
+            .inbound
+            .write()
+            .insert(handle_id, Box::new(listen_fn));
+        handle_id
     }
 
-    fn listen_to_replies<F>(&self, msg_id: TransactionId, callback: F) -> ListeningHandler
+    fn listen_to_replies<F>(&self, tx_id: TransactionId, callback: F)
     where
-        F: FnOnce(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
+        F: FnOnce(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
-        let handler_id = ListeningHandler::new(&msg_id);
-        let mut reg = self.listeners.write();
-        let reg = reg.entry(msg_id.msg_type()).or_default();
-        reg.global.insert(msg_id, Box::new(callback));
-        handler_id
+        let tx_ty_listener = self.listeners.get(&tx_id.msg_type()).unwrap();
+        tx_ty_listener
+            .outbound
+            .write()
+            .insert(tx_id, Box::new(callback));
     }
 
     fn transport_mut(&mut self) -> &mut Self::Transport {
@@ -74,7 +97,7 @@ impl ConnectionManager for TestingConnectionManager {
         todo!()
     }
 
-    fn send(&self, to: PeerKey, msg_id: TransactionId, msg: Message) {
+    fn send(&self, to: PeerKey, tx_id: TransactionId, msg: Message) {
         todo!()
     }
 }
