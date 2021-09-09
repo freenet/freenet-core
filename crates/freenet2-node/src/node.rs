@@ -368,7 +368,7 @@ mod tests {
 
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
-            log::info!("initial peer port: {}", peer1_port);
+            log::debug!("Initial peer port: {}", peer1_port);
             let mut peer1 = NodeConfig::default()
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)

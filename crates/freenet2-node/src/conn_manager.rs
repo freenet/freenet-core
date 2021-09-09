@@ -48,7 +48,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// the provided function.
     fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
     where
-        F: FnOnce(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
+        F: Fn(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
 
     /// Listens to inbound replies for a previously broadcasted transaction to the network,
     /// if a reply is detected performs a callback.
@@ -58,11 +58,9 @@ pub(crate) trait ConnectionManager: Send + Sync {
     // consider this, meanwhile passing by value is fine
     fn listen_to_replies<F>(&self, tx_id: TransactionId, callback: F)
     where
-        F: FnOnce(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
+        F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 
     fn transport(&self) -> &Self::Transport;
-
-    fn transport_mut(&mut self) -> &mut Self::Transport;
 
     /// Initiate a connection with a given peer. At this stage NAT traversal
     /// has been succesful and the [`Transport`] has established a connection.
@@ -72,18 +70,24 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// which has established a connection with this peer, registers a callback action
     /// with the manager for when a response is received.
     // FIXME: same problem as om tje `listen` fn
-    fn send_with_callback<F>(&self, to: PeerKey, tx_id: TransactionId, msg: Message, callback: F)
+    fn send_with_callback<F>(
+        &self,
+        to: PeerKey,
+        tx_id: TransactionId,
+        msg: Message,
+        callback: F,
+    ) -> Result<()>
     where
-        F: FnOnce(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
+        F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer.
-    fn send(&self, to: PeerKey, tx_id: TransactionId, msg: Message);
+    fn send(&self, to: PeerKey, tx_id: TransactionId, msg: Message) -> Result<()>;
 }
 
 /// A protocol used to send and receive data over the network.
 pub(crate) trait Transport {
-    fn send(&mut self, peer: PeerKey, message: &[u8]);
+    fn send(&self, peer: PeerKey, location: Option<Location>, message: Vec<u8>);
     fn is_open(&self) -> bool;
     fn recipient(&self) -> Channel;
 }
@@ -125,6 +129,8 @@ pub(crate) enum ConnError {
     LocationUnknown,
     #[error("expected transaction id was {0} but received {1}")]
     UnexpectedTx(TransactionId, TransactionId),
+    #[error("error while de/serializing message")]
+    Serialization(#[from] Box<bincode::ErrorKind>),
 }
 
 mod serialization {
