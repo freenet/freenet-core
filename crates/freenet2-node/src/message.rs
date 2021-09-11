@@ -33,12 +33,6 @@ impl Transaction {
             completed: false,
         }
     }
-
-    /// Returns true if this transaction either finished (successfully or not) or
-    /// timed out, and false if it is still in on-going completion.
-    pub fn is_complete(&self) -> bool {
-        self.completed
-    }
 }
 
 impl Display for Transaction {

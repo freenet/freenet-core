@@ -627,7 +627,7 @@ mod test {
         Ok(())
     }
 
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_nodes_should_connect() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of 1000 peers all nodes should have connections.
         Logger::init_logger();

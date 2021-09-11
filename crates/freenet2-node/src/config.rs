@@ -25,7 +25,7 @@ pub(crate) struct Config {
     pub bootstrap_ip: IpAddr,
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
-    pub local_peer_keypair: Option<identity::ed25519::Keypair>,
+    pub local_peer_keypair: Option<identity::Keypair>,
     pub log_level: log::LevelFilter,
 }
 
@@ -46,7 +46,7 @@ impl Config {
                 });
                 let mut buf = Vec::new();
                 key_file.read_to_end(&mut buf).unwrap();
-                Some(identity::ed25519::Keypair::decode(&mut buf).map_err(|_| ())?)
+                Some(identity::Keypair::from_protobuf_encoding(&buf).map_err(|_| ())?)
             } else {
                 None
             };

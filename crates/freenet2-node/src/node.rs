@@ -23,12 +23,8 @@ enum NodeImpl {
 }
 
 pub struct NodeConfig {
-    /// ED25519 local peer private key.
-    local_ed25519_key: identity::ed25519::Keypair,
-    /// ED25519 local peer private key in generic format.
+    /// local peer private key in
     local_key: identity::Keypair,
-    /// The peer ID of this machine.
-    local_peer_id: PeerId,
 
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
@@ -53,17 +49,13 @@ impl NodeConfig {
     /// If both are provided but also additional peers are added via the [add_provider] method, this node will
     /// be listening but also try to connect to an existing peer.
     pub fn new() -> NodeConfig {
-        let local_ed25519_key = if let Some(key) = &CONF.local_peer_keypair {
+        let local_key = if let Some(key) = &CONF.local_peer_keypair {
             key.clone()
         } else {
-            identity::ed25519::Keypair::generate()
+            identity::Keypair::generate_ed25519()
         };
-        let local_key = identity::Keypair::Ed25519(local_ed25519_key.clone());
-        let local_peer_id = PeerId::from(local_key.public());
         NodeConfig {
-            local_ed25519_key,
             local_key,
-            local_peer_id,
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
@@ -82,10 +74,8 @@ impl NodeConfig {
 
     /// Optional identity key of this node.
     /// If not provided it will be either obtained from the configuration or freshly generated.
-    pub fn with_key(mut self, key: identity::ed25519::Keypair) -> Self {
-        self.local_key = identity::Keypair::Ed25519(key.clone());
-        self.local_ed25519_key = key;
-        self.local_peer_id = PeerId::from(self.local_key.public());
+    pub fn with_key(mut self, key: identity::Keypair) -> Self {
+        self.local_key = key;
         self
     }
 

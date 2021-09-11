@@ -53,8 +53,12 @@ impl NodeLibP2P {
             // We set a global executor which is virtually the Tokio multi-threaded executor
             // to reuse it's thread pool and scheduler in order to drive futures.
             let global_executor = Box::new(GlobalExecutor);
-            let builder = SwarmBuilder::new(transport, behaviour, config.local_peer_id)
-                .executor(global_executor);
+            let builder = SwarmBuilder::new(
+                transport,
+                behaviour,
+                PeerId::from(config.local_key.public()),
+            )
+            .executor(global_executor);
             builder.build()
         };
 
@@ -210,10 +214,8 @@ mod tests {
     async fn ping() -> Result<(), ()> {
         Logger::init_logger();
 
-        let peer1_key = identity::ed25519::Keypair::generate();
-        let peer1_id: PeerId = identity::Keypair::Ed25519(peer1_key.clone())
-            .public()
-            .into();
+        let peer1_key = identity::Keypair::generate_ed25519();
+        let peer1_id: PeerId = peer1_key.public().into();
         let peer1_port = get_free_port().unwrap();
         let peer1_config = InitPeerNode::new()
             .listening_ip(Ipv4Addr::LOCALHOST)
