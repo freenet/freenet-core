@@ -26,16 +26,11 @@ pub(crate) struct Config {
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::ed25519::Keypair>,
-    // pub log_level: log::LevelFilter,
+    pub log_level: log::LevelFilter,
 }
 
 impl Config {
     pub fn load_conf() -> Result<Config, ()> {
-        #[cfg(any(debug_assertions, test))]
-        {
-            self::tracing::Logger::get_logger();
-        }
-
         let mut settings = config::Config::new();
         settings
             .merge(config::Environment::with_prefix("FREENET"))
@@ -62,7 +57,7 @@ impl Config {
             bootstrap_port,
             bootstrap_id,
             local_peer_keypair,
-            // log_level: log::LevelFilter::Off,
+            log_level: settings.get("log_level").unwrap_or(log::LevelFilter::Debug),
         })
     }
 
@@ -164,7 +159,7 @@ pub(super) mod tracing {
             .format_module_path(true)
             .format_timestamp_nanos()
             .target(env_logger::Target::Stdout)
-            .filter(None, log::LevelFilter::Debug)
+            .filter(None, CONF.log_level)
             .try_init();
 
         Logger

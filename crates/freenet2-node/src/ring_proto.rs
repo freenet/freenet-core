@@ -605,10 +605,10 @@ mod test {
     #[tokio::test(flavor = "current_thread")]
     async fn node0_to_gateway_conn() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of one node and one gateway test that both are connected.
-        // Logger::get_logger();
+        Logger::get_logger();
 
         let ring_protocols = sim_network_builder(1, 1, 0);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         assert_eq!(
             ring_protocols["node-0"]
@@ -633,9 +633,10 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn all_nodes_should_connect() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of 1000 peers all nodes should have connections.
+        Logger::get_logger();
 
         let mut sim_nodes = sim_network_builder(200, 10, 7);
 
