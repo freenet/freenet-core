@@ -1,3 +1,5 @@
+#![allow(unused)] // FIXME: remove this attr
+
 use crate::{
     conn_manager::{ConnectionManager, Transport},
     message::{ProbeRequest, ProbeResponse},

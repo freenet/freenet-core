@@ -34,16 +34,6 @@ impl Transaction {
         }
     }
 
-    /// Return the type of the message.
-    pub fn msg_type(&self) -> MsgTypeId {
-        self.ty
-    }
-
-    /// Returns the bytes representing the unique identifier for this message.
-    pub fn unique_identifier(&self) -> &[u8; 16] {
-        self.id.as_bytes()
-    }
-
     /// Returns true if this transaction either finished (successfully or not) or
     /// timed out, and false if it is still in on-going completion.
     pub fn is_complete(&self) -> bool {

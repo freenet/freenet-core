@@ -139,7 +139,6 @@ impl libp2p::core::Executor for GlobalExecutor {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
 pub(super) mod tracing {
     use super::*;
 
@@ -148,19 +147,22 @@ pub(super) mod tracing {
 
     impl Logger {
         /// Get or initialize a logger
-        pub fn get_logger() -> &'static Logger {
-            Lazy::force(&LOGGER)
+        #[allow(unused)]
+        pub fn init_logger() {
+            Lazy::force(&LOGGER);
         }
     }
 
-    #[allow(unused_must_use)]
     static LOGGER: Lazy<Logger> = Lazy::new(|| {
-        env_logger::builder()
+        if let Err(err) = env_logger::builder()
             .format_module_path(true)
             .format_timestamp_nanos()
             .target(env_logger::Target::Stdout)
             .filter(None, CONF.log_level)
-            .try_init();
+            .try_init()
+        {
+            eprintln!("Failed to initialize logger with error: {}", err);
+        };
 
         Logger
     });

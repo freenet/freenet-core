@@ -1,3 +1,4 @@
+//! A in-memory connection manager and transport implementation. Used for testing pourpouses.
 use std::{array::IntoIter, collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 
 use crossbeam::channel::{self, Receiver, Sender};
@@ -5,23 +6,24 @@ use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock};
 
 use crate::{
+    config::tracing::Logger,
     conn_manager::{
-        self, Channel, ConnectionManager, ListenerHandle, PeerKey, PeerKeyLocation,
-        RemoveConnHandler, Transport,
+        self, Channel, ConnectionManager, ListenerHandle, PeerKey, PeerKeyLocation, Transport,
     },
     message::{Message, MsgTypeId, Transaction},
     ring_proto::Location,
 };
 
-type ResponseListenerFn =
-    Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
 type InboundListenerFn = Box<dyn Fn(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync>;
 type InboundListenerRegistry = RwLock<HashMap<ListenerHandle, InboundListenerFn>>;
+
+type ResponseListenerFn =
+    Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
 type OutboundListenerRegistry = Arc<RwLock<HashMap<Transaction, ResponseListenerFn>>>;
 
 #[derive(Clone)]
-pub(crate) struct TestingConnectionManager {
-    /// listeners for inbound messages
+pub struct MemoryConnManager {
+    /// listeners for inbound initial messages
     inbound_listeners: Arc<HashMap<MsgTypeId, InboundListenerRegistry>>,
     /// listeners for outbound messages replies
     outbound_listeners: OutboundListenerRegistry,
@@ -30,8 +32,9 @@ pub(crate) struct TestingConnectionManager {
     pend_listeners: Sender<(Transaction, ResponseListenerFn)>,
 }
 
-impl TestingConnectionManager {
+impl MemoryConnManager {
     pub fn new(is_open: bool, peer: PeerKey, location: Option<Location>) -> Self {
+        Logger::init_logger();
         let (pend_listeners, rcv_pend_listeners) = channel::unbounded();
         let transport = InMemoryTransport::new(is_open, peer, location);
         let inbound_listeners: Arc<HashMap<MsgTypeId, InboundListenerRegistry>> = Arc::new(
@@ -94,12 +97,14 @@ impl TestingConnectionManager {
             pend_listeners,
         }
     }
+
+    pub fn start(&mut self) -> Result<(), impl std::error::Error> {
+        Err(super::ConnError::NegotationFailed)
+    }
 }
 
-impl ConnectionManager for TestingConnectionManager {
+impl ConnectionManager for MemoryConnManager {
     type Transport = InMemoryTransport;
-
-    fn on_remove_conn(&self, _func: RemoveConnHandler) {}
 
     fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
     where
@@ -113,18 +118,18 @@ impl ConnectionManager for TestingConnectionManager {
         handle_id
     }
 
-    fn listen_to_replies<F>(&self, tx_id: Transaction, callback: F)
+    fn listen_to_replies<F>(&self, tx: Transaction, callback: F)
     where
         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
         // optimistically try to acquire a lock
         if let Some(mut lock) = self.outbound_listeners.try_write() {
-            lock.insert(tx_id, Box::new(callback));
+            lock.insert(tx, Box::new(callback));
         } else {
             // it failed, this is being inserted from an other existing closure holding the lock
             // send it to the temporal stack queue for posterior insertion
             self.pend_listeners
-                .send((tx_id, Box::new(callback)))
+                .send((tx, Box::new(callback)))
                 .expect("full or disconnected");
         }
     }
@@ -138,7 +143,7 @@ impl ConnectionManager for TestingConnectionManager {
     fn send_with_callback<F>(
         &self,
         to: PeerKeyLocation,
-        tx_id: Transaction,
+        tx: Transaction,
         msg: Message,
         callback: F,
     ) -> conn_manager::Result<()>
@@ -148,7 +153,7 @@ impl ConnectionManager for TestingConnectionManager {
         // store listening func
         self.outbound_listeners
             .write()
-            .insert(tx_id, Box::new(callback));
+            .insert(tx, Box::new(callback));
 
         // send the msg
         let serialized = bincode::serialize(&msg)?;
@@ -159,12 +164,16 @@ impl ConnectionManager for TestingConnectionManager {
     fn send(
         &self,
         to: PeerKeyLocation,
-        _tx_id: Transaction,
+        _tx: Transaction,
         msg: Message,
     ) -> conn_manager::Result<()> {
         let serialized = bincode::serialize(&msg)?;
         self.transport.send(to.peer, to.location, serialized);
         Ok(())
+    }
+
+    fn remove_listener(&self, tx: Transaction) {
+        self.outbound_listeners.write().remove(&tx);
     }
 }
 
@@ -180,7 +189,7 @@ struct MessageOnTransit {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct InMemoryTransport {
+pub struct InMemoryTransport {
     interface_peer: PeerKey,
     location: Option<Location>,
     is_open: bool,

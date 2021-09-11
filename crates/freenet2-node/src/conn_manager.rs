@@ -11,12 +11,14 @@ use crate::{
     StdResult,
 };
 
+pub mod in_memory;
+
 const _PING_EVERY: Duration = Duration::from_secs(30);
 const _DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 static HANDLE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type Channel<'a> = (PeerId, &'a [u8]);
-pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
+// pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
 pub(crate) type Result<T> = StdResult<T, ConnError>;
 
 /// 3 words size for 64-bit platforms.
@@ -26,6 +28,12 @@ pub(crate) struct ListenerHandle(u64);
 impl ListenerHandle {
     pub fn new() -> Self {
         ListenerHandle(HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+impl Default for ListenerHandle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -42,7 +50,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
     type Transport: Transport;
 
     /// Register a handler callback for when a connection is removed.
-    fn on_remove_conn(&self, func: RemoveConnHandler);
+    // fn on_remove_conn(&self, func: RemoveConnHandler);
 
     /// Start listening for incoming connections and process any incoming messages with
     /// the provided function.
@@ -69,7 +77,6 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// Sends a message to a given peer which has already been identified and  
     /// which has established a connection with this peer, registers a callback action
     /// with the manager for when a response is received.
-    // FIXME: same problem as om tje `listen` fn
     fn send_with_callback<F>(
         &self,
         to: PeerKeyLocation,
@@ -83,6 +90,9 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer.
     fn send(&self, to: PeerKeyLocation, tx_id: Transaction, msg: Message) -> Result<()>;
+
+    /// Remove a listener for a given transaction.
+    fn remove_listener(&self, tx_id: Transaction);
 }
 
 /// A protocol used to send and receive data over the network.
@@ -100,7 +110,7 @@ struct Peer {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct PeerKey(PeerId);
+pub struct PeerKey(PeerId);
 
 impl Display for PeerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

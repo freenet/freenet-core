@@ -1,3 +1,5 @@
+#![allow(unused)] // FIXME: remove this attr
+
 use std::{
     collections::{BTreeMap, HashSet},
     convert::TryFrom,
@@ -65,7 +67,7 @@ where
     fn listen_for_join_req(self: &Arc<Self>) -> ListenerHandle {
         let self_cp = self.clone();
         let process_join_req = move |sender: PeerKey, msg: Message| -> conn_manager::Result<()> {
-            let (tx_id, join_req) = if let Message::JoinRequest(id, join_req) = msg {
+            let (tx, join_req) = if let Message::JoinRequest(id, join_req) = msg {
                 (id, join_req)
             } else {
                 return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg));
@@ -111,7 +113,7 @@ where
                     peer_key_loc,
                     self_cp.peer_key
                 );
-                self_cp.establish_conn(peer_key_loc, tx_id);
+                self_cp.establish_conn(peer_key_loc, tx);
                 vec![PeerKeyLocation {
                     peer: self_cp.peer_key,
                     location: your_location,
@@ -128,7 +130,7 @@ where
             );
             let join_response = match req_type {
                 ReqType::Initial => Message::from((
-                    tx_id,
+                    tx,
                     JoinResponse::Initial {
                         accepted_by: accepted_by.clone(),
                         your_location: peer_key_loc.location,
@@ -136,15 +138,13 @@ where
                     },
                 )),
                 ReqType::Proxy => Message::from((
-                    tx_id,
+                    tx,
                     JoinResponse::Proxy {
                         accepted_by: accepted_by.clone(),
                     },
                 )),
             };
-            self_cp
-                .conn_manager
-                .send(peer_key_loc, tx_id, join_response)?;
+            self_cp.conn_manager.send(peer_key_loc, tx, join_response)?;
 
             if jr_hpt > 0 && !self_cp.ring.connections_by_location.read().is_empty() {
                 let forward_to = if jr_hpt >= self_cp.rnd_if_htl_above {
@@ -166,7 +166,7 @@ where
 
                 if let Some(forward_to) = forward_to {
                     let forwarded = Message::from((
-                        tx_id,
+                        tx,
                         JoinRequest::Proxy {
                             joiner: peer_key_loc,
                             hops_to_live: jr_hpt.min(self_cp.max_hops_to_live) - 1,
@@ -184,7 +184,7 @@ where
                     let self_cp2 = self_cp.clone();
                     let register_acceptors =
                         move |jr_sender: PeerKeyLocation, join_resp| -> conn_manager::Result<()> {
-                            if let Message::JoinResponse(tx_id, resp) = join_resp {
+                            if let Message::JoinResponse(tx, resp) = join_resp {
                                 let new_acceptors = match resp {
                                     JoinResponse::Initial { accepted_by, .. } => accepted_by,
                                     JoinResponse::Proxy { accepted_by, .. } => accepted_by,
@@ -196,18 +196,18 @@ where
                                     }
                                 });
                                 let msg = Message::from((
-                                    tx_id,
+                                    tx,
                                     JoinResponse::Proxy {
                                         accepted_by: new_acceptors,
                                     },
                                 ));
-                                self_cp2.conn_manager.send(jr_sender, tx_id, msg)?;
+                                self_cp2.conn_manager.send(jr_sender, tx, msg)?;
                             };
                             Ok(())
                         };
                     self_cp.conn_manager.send_with_callback(
                         forward_to,
-                        tx_id,
+                        tx,
                         forwarded,
                         register_acceptors,
                     )?;
@@ -238,7 +238,7 @@ where
         for gateway in self.gateways.read().iter() {
             log::info!("Joining ring via {} at {}", gateway.peer, gateway.location);
             self.conn_manager.add_connection(*gateway, true);
-            let tx_id = Transaction::new(<JoinRequest as MsgType>::msg_type_id());
+            let tx = Transaction::new(<JoinRequest as MsgType>::msg_type_id());
             let join_req = messages::JoinRequest::Initial {
                 key: self.peer_key,
                 hops_to_live: self.max_hops_to_live,
@@ -246,70 +246,69 @@ where
             log::debug!("Sending {:?} to {}", join_req, gateway.peer);
 
             let ring_proto = self.clone();
-            let join_response_cb = move |sender: PeerKeyLocation,
-                                         join_res: Message|
-                  -> conn_manager::Result<()> {
-                let (accepted_by, tx_id) = if let Message::JoinResponse(
-                    incoming_tx_id,
-                    messages::JoinResponse::Initial {
-                        accepted_by,
-                        your_location,
-                        ..
-                    },
-                ) = join_res
-                {
-                    log::debug!("JoinResponse received from {}", sender.peer,);
-                    if incoming_tx_id != tx_id {
-                        return Err(conn_manager::ConnError::UnexpectedTx(tx_id, incoming_tx_id));
-                    }
-                    let loc = &mut *ring_proto.location.write();
-                    *loc = Some(your_location);
-                    (accepted_by, incoming_tx_id)
-                } else {
-                    return Err(conn_manager::ConnError::UnexpectedResponseMessage(join_res));
-                };
-
-                let self_location = &*ring_proto.location.read();
-                let self_location =
-                    &self_location.ok_or(conn_manager::ConnError::LocationUnknown)?;
-                for new_peer_key in accepted_by {
-                    if ring_proto
-                        .ring
-                        .should_accept(self_location, &new_peer_key.location)
+            let join_response_cb =
+                move |sender: PeerKeyLocation, join_res: Message| -> conn_manager::Result<()> {
+                    let (accepted_by, tx) = if let Message::JoinResponse(
+                        incoming_tx,
+                        messages::JoinResponse::Initial {
+                            accepted_by,
+                            your_location,
+                            ..
+                        },
+                    ) = join_res
                     {
-                        log::info!("Establishing connection to {}", new_peer_key.peer);
-                        ring_proto.establish_conn(new_peer_key, tx_id);
+                        log::debug!("JoinResponse received from {}", sender.peer,);
+                        if incoming_tx != tx {
+                            return Err(conn_manager::ConnError::UnexpectedTx(tx, incoming_tx));
+                        }
+                        let loc = &mut *ring_proto.location.write();
+                        *loc = Some(your_location);
+                        (accepted_by, incoming_tx)
                     } else {
-                        log::debug!("Not accepting connection to {}", new_peer_key.peer);
-                    }
-                }
+                        return Err(conn_manager::ConnError::UnexpectedResponseMessage(join_res));
+                    };
 
-                Ok(())
-            };
-            log::debug!("Initiating JoinRequest transaction: {}", tx_id);
-            let msg: Message = (tx_id, join_req).into();
+                    let self_location = &*ring_proto.location.read();
+                    let self_location =
+                        &self_location.ok_or(conn_manager::ConnError::LocationUnknown)?;
+                    for new_peer_key in accepted_by {
+                        if ring_proto
+                            .ring
+                            .should_accept(self_location, &new_peer_key.location)
+                        {
+                            log::info!("Establishing connection to {}", new_peer_key.peer);
+                            ring_proto.establish_conn(new_peer_key, tx);
+                        } else {
+                            log::debug!("Not accepting connection to {}", new_peer_key.peer);
+                        }
+                    }
+
+                    Ok(())
+                };
+            log::debug!("Initiating JoinRequest transaction: {}", tx);
+            let msg: Message = (tx, join_req).into();
             self.conn_manager
-                .send_with_callback(*gateway, tx_id, msg, join_response_cb)?;
+                .send_with_callback(*gateway, tx, msg, join_response_cb)?;
         }
 
         Ok(())
     }
 
-    fn establish_conn(self: &Arc<Self>, new_peer: PeerKeyLocation, tx_id: Transaction) {
+    fn establish_conn(self: &Arc<Self>, new_peer: PeerKeyLocation, tx: Transaction) {
         self.conn_manager.add_connection(new_peer, false);
         let self_cp = self.clone();
         let state = Arc::new(RwLock::new(messages::OpenConnection::Connecting));
 
         let state_cp = state.clone();
         let ack_peer = move |peer: PeerKeyLocation, msg: Message| -> conn_manager::Result<()> {
-            let (tx_id, oc) = match msg {
-                Message::OpenConnection(tx_id, oc) => (tx_id, oc),
+            let (tx, oc) = match msg {
+                Message::OpenConnection(tx, oc) => (tx, oc),
                 msg => return Err(conn_manager::ConnError::UnexpectedResponseMessage(msg)),
             };
             let mut current_state = state_cp.write();
             current_state.transition(oc);
             if !current_state.is_connected() {
-                let open_conn: Message = (tx_id, *current_state).into();
+                let open_conn: Message = (tx, *current_state).into();
                 log::debug!("Acknowledging OC");
                 self_cp
                     .conn_manager
@@ -322,8 +321,8 @@ where
                 );
                 self_cp.conn_manager.send(
                     peer,
-                    tx_id,
-                    Message::from((tx_id, messages::OpenConnection::Connected)),
+                    tx,
+                    Message::from((tx, messages::OpenConnection::Connected)),
                 )?;
                 self_cp
                     .ring
@@ -333,7 +332,7 @@ where
             }
             Ok(())
         };
-        self.conn_manager.listen_to_replies(tx_id, ack_peer);
+        self.conn_manager.listen_to_replies(tx, ack_peer);
 
         let conn_manager = self.conn_manager.clone();
         tokio::spawn(async move {
@@ -346,11 +345,7 @@ where
                     new_peer.peer,
                     attempts
                 );
-                conn_manager.send(
-                    new_peer,
-                    tx_id,
-                    Message::OpenConnection(tx_id, *state.read()),
-                )?;
+                conn_manager.send(new_peer, tx, Message::OpenConnection(tx, *state.read()))?;
                 attempts += 1;
                 tokio::time::sleep(Duration::from_millis(200)).await
             }
@@ -358,6 +353,7 @@ where
                 log::error!("Timed out trying to connect to {}", new_peer.peer);
                 Err(conn_manager::ConnError::NegotationFailed)
             } else {
+                conn_manager.remove_listener(tx);
                 log::info!("Success negotiating connection to {}", new_peer.peer);
                 Ok(())
             }
@@ -423,7 +419,7 @@ impl Ring {
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
-pub(crate) struct Location(f64);
+pub struct Location(f64);
 
 type Distance = Location;
 
@@ -573,12 +569,12 @@ mod test {
 
     use super::{messages::OpenConnection, *};
     use crate::{
-        config::tracing::Logger, message::ProbeRequest, probe_proto::ProbeProtocol,
-        tests::TestingConnectionManager,
+        config::tracing::Logger, conn_manager::in_memory::MemoryConnManager, message::ProbeRequest,
+        probe_proto::ProbeProtocol,
     };
 
     #[test]
-    fn test() {
+    fn open_connection_state_transition() {
         let mut oc0 = OpenConnection::Connecting;
         let oc1 = OpenConnection::Connecting;
         oc0.transition(oc1);
@@ -600,12 +596,10 @@ mod test {
         assert!(oc0.is_connected());
     }
 
-    // FIXME: deadlock? on multiple threads; keeps messages over and over even after connection
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node0_to_gateway_conn() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of one node and one gateway test that both are connected.
-        Logger::get_logger();
+        Logger::init_logger();
 
         let ring_protocols = sim_network_builder(1, 1, 0);
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -636,7 +630,7 @@ mod test {
     // #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn all_nodes_should_connect() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of 1000 peers all nodes should have connections.
-        Logger::get_logger();
+        Logger::init_logger();
 
         let mut sim_nodes = sim_network_builder(200, 10, 7);
 
@@ -677,8 +671,8 @@ mod test {
     }
 
     struct SimulatedNode {
-        ring_protocol: Arc<RingProtocol<TestingConnectionManager>>,
-        probe_protocol: ProbeProtocol<TestingConnectionManager>,
+        ring_protocol: Arc<RingProtocol<MemoryConnManager>>,
+        probe_protocol: ProbeProtocol<MemoryConnManager>,
     }
 
     fn sim_network_builder(
@@ -693,7 +687,7 @@ mod test {
         let keypair = identity::Keypair::generate_ed25519();
         let gw_key = keypair.public().into();
         let loc = Location::random();
-        let conn_manager = TestingConnectionManager::new(true, gw_key, Some(loc));
+        let conn_manager = MemoryConnManager::new(true, gw_key, Some(loc));
         let ring_protocol =
             RingProtocol::new(conn_manager.clone(), gw_key, ring_max_htl, rnd_if_htl_above)
                 .with_location(loc);
@@ -712,7 +706,7 @@ mod test {
             let label = format!("node-{}", node_no);
             let keypair = identity::Keypair::generate_ed25519();
             let peer_key = keypair.public().into();
-            let conn_manager = TestingConnectionManager::new(false, peer_key, None);
+            let conn_manager = MemoryConnManager::new(false, peer_key, None);
             let ring_protocol = RingProtocol::new(
                 conn_manager.clone(),
                 peer_key,

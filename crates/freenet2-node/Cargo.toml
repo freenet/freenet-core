@@ -8,7 +8,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "node-deploy" 
-path = "src/bin/node-deploy.rs"
+path = "src/bin/gateway-deploy.rs"
 doc = false
 
 [dependencies]
