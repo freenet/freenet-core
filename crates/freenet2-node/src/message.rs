@@ -5,28 +5,32 @@ use uuid::Uuid;
 
 use crate::ring_proto::{messages::*, Location};
 
-/// An transaction id is a unique, universal and efficient identifier for any
+/// An transaction is a unique, universal and efficient identifier for any
 /// roundtrip transaction as it is broadcasted around the F2 network.
 ///
 /// The identifier conveys all necessary information to identify and classify the
 /// transaction:
 /// - The unique identifier itself.
 /// - The type of transaction being performed.
+/// - If the transaction has been finalized, this allows for the connection manager
+///   to sweep any garbage left by a finished (or timed out) transaction.
 ///
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct TransactionId {
+pub(crate) struct Transaction {
     id: Uuid,
     ty: MsgTypeId,
+    completed: bool,
 }
 
-impl TransactionId {
-    pub fn new(ty: MsgTypeId) -> TransactionId {
+impl Transaction {
+    pub fn new(ty: MsgTypeId) -> Transaction {
         // 3 word size for 64-bits platforms most likely since msg type
         // probably will be aligned to 64 bytes
         Self {
             id: Uuid::new_v4(),
             ty,
+            completed: false,
         }
     }
 
@@ -39,9 +43,15 @@ impl TransactionId {
     pub fn unique_identifier(&self) -> &[u8; 16] {
         self.id.as_bytes()
     }
+
+    /// Returns true if this transaction either finished (successfully or not) or
+    /// timed out, and false if it is still in on-going completion.
+    pub fn is_complete(&self) -> bool {
+        self.completed
+    }
 }
 
-impl Display for TransactionId {
+impl Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)
     }
@@ -83,8 +93,8 @@ mod _seal_msg_type {
 
     macro_rules! impl_msg_conversion {
         ($ty:tt -> $id:tt) => {
-            impl From<(TransactionId, $ty)> for Message {
-                fn from(oc: (TransactionId, $ty)) -> Self {
+            impl From<(Transaction, $ty)> for Message {
+                fn from(oc: (Transaction, $ty)) -> Self {
                     let (tx_id, oc) = oc;
                     // assert_eq!(tx_id.msg_type(), <$ty as MsgType>::msg_type_id());
                     Self::$ty(tx_id, oc)
@@ -107,9 +117,9 @@ mod _seal_msg_type {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum Message {
     // Ring ops
-    JoinRequest(TransactionId, JoinRequest),
-    JoinResponse(TransactionId, JoinResponse),
-    OpenConnection(TransactionId, OpenConnection),
+    JoinRequest(Transaction, JoinRequest),
+    JoinResponse(Transaction, JoinResponse),
+    OpenConnection(Transaction, OpenConnection),
 }
 
 impl Message {
@@ -122,7 +132,7 @@ impl Message {
         }
     }
 
-    pub fn id(&self) -> &TransactionId {
+    pub fn id(&self) -> &Transaction {
         use Message::*;
         match self {
             JoinRequest(id, _) => id,

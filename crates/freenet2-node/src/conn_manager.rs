@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, MsgTypeId, TransactionId},
+    message::{Message, MsgTypeId, Transaction},
     ring_proto::Location,
     StdResult,
 };
@@ -56,7 +56,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
     // https://github.com/rust-lang/rust/issues/70263 it won't compile
     // can workaround by wrapping up the fn to express lifetime constraints,
     // consider this, meanwhile passing by value is fine
-    fn listen_to_replies<F>(&self, tx_id: TransactionId, callback: F)
+    fn listen_to_replies<F>(&self, tx_id: Transaction, callback: F)
     where
         F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 
@@ -73,7 +73,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
     fn send_with_callback<F>(
         &self,
         to: PeerKeyLocation,
-        tx_id: TransactionId,
+        tx_id: Transaction,
         msg: Message,
         callback: F,
     ) -> Result<()>
@@ -82,7 +82,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
 
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer.
-    fn send(&self, to: PeerKeyLocation, tx_id: TransactionId, msg: Message) -> Result<()>;
+    fn send(&self, to: PeerKeyLocation, tx_id: Transaction, msg: Message) -> Result<()>;
 }
 
 /// A protocol used to send and receive data over the network.
@@ -128,9 +128,11 @@ pub(crate) enum ConnError {
     #[error("location unknown for this node")]
     LocationUnknown,
     #[error("expected transaction id was {0} but received {1}")]
-    UnexpectedTx(TransactionId, TransactionId),
+    UnexpectedTx(Transaction, Transaction),
     #[error("error while de/serializing message")]
     Serialization(#[from] Box<bincode::ErrorKind>),
+    #[error("connection negotiation between two peers failed")]
+    NegotationFailed,
 }
 
 mod serialization {

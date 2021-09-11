@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     conn_manager::{self, ConnectionManager, ListenerHandle, PeerKey, PeerKeyLocation, Transport},
-    message::{Message, MsgType, TransactionId},
+    message::{Message, MsgType, Transaction},
     ring_proto::messages::{JoinRequest, JoinResponse},
     StdResult,
 };
@@ -29,7 +29,6 @@ struct RingProtocol<CM> {
     max_hops_to_live: usize,
     rnd_if_htl_above: usize,
     ring: Ring,
-    // notify_state_transition: Receiver<>,
 }
 
 impl<CM, T> RingProtocol<CM>
@@ -239,7 +238,7 @@ where
         for gateway in self.gateways.read().iter() {
             log::info!("Joining ring via {} at {}", gateway.peer, gateway.location);
             self.conn_manager.add_connection(*gateway, true);
-            let tx_id = TransactionId::new(<JoinRequest as MsgType>::msg_type_id());
+            let tx_id = Transaction::new(<JoinRequest as MsgType>::msg_type_id());
             let join_req = messages::JoinRequest::Initial {
                 key: self.peer_key,
                 hops_to_live: self.max_hops_to_live,
@@ -296,7 +295,7 @@ where
         Ok(())
     }
 
-    fn establish_conn(self: &Arc<Self>, new_peer: PeerKeyLocation, tx_id: TransactionId) {
+    fn establish_conn(self: &Arc<Self>, new_peer: PeerKeyLocation, tx_id: Transaction) {
         self.conn_manager.add_connection(new_peer, false);
         let self_cp = self.clone();
         let state = Arc::new(RwLock::new(messages::OpenConnection::Connecting));
@@ -316,11 +315,16 @@ where
                     .conn_manager
                     .send(peer, *open_conn.id(), open_conn)?;
             } else {
-                log::debug!(
+                log::info!(
                     "{} connected to {}, adding to ring",
                     self_cp.peer_key,
                     new_peer.peer
                 );
+                self_cp.conn_manager.send(
+                    peer,
+                    tx_id,
+                    Message::from((tx_id, messages::OpenConnection::Connected)),
+                )?;
                 self_cp
                     .ring
                     .connections_by_location
@@ -337,7 +341,7 @@ where
             let mut attempts = 0;
             while !state.read().is_connected() && curr_time.elapsed() <= Duration::from_secs(30) {
                 log::debug!(
-                    "Sending {} to {}, number of retries: {}",
+                    "Sending {} to {}, number of messages sent: {}",
                     *state.read(),
                     new_peer.peer,
                     attempts
@@ -348,10 +352,15 @@ where
                     Message::OpenConnection(tx_id, *state.read()),
                 )?;
                 attempts += 1;
-                tokio::time::sleep(Duration::from_millis(1000)).await
+                tokio::time::sleep(Duration::from_millis(200)).await
             }
-            log::error!("Timed out trying to connect to {}", new_peer.peer);
-            Ok::<_, conn_manager::ConnError>(())
+            if curr_time.elapsed() > Duration::from_secs(30) {
+                log::error!("Timed out trying to connect to {}", new_peer.peer);
+                Err(conn_manager::ConnError::NegotationFailed)
+            } else {
+                log::info!("Success negotiating connection to {}", new_peer.peer);
+                Ok(())
+            }
         });
     }
 }
@@ -523,7 +532,7 @@ pub(crate) mod messages {
     }
 
     /// A stateful connection attempt.
-    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum OpenConnection {
         OCReceived,
         Connecting,
@@ -540,9 +549,10 @@ pub(crate) mod messages {
         }
 
         pub(super) fn transition(&mut self, other_host_state: Self) {
-            match other_host_state {
-                Self::Connecting => *self = Self::OCReceived,
-                Self::OCReceived | Self::Connected => *self = Self::Connected,
+            match (*self, other_host_state) {
+                (Self::Connected, _) => {}
+                (_, Self::Connecting) => *self = Self::OCReceived,
+                (_, Self::OCReceived | Self::Connected) => *self = Self::Connected,
             }
         }
     }
@@ -561,20 +571,44 @@ mod test {
     use libp2p::identity;
     use rand::Rng;
 
-    use super::*;
+    use super::{messages::OpenConnection, *};
     use crate::{
         config::tracing::Logger, message::ProbeRequest, probe_proto::ProbeProtocol,
         tests::TestingConnectionManager,
     };
 
+    #[test]
+    fn test() {
+        let mut oc0 = OpenConnection::Connecting;
+        let oc1 = OpenConnection::Connecting;
+        oc0.transition(oc1);
+        assert_eq!(oc0, OpenConnection::OCReceived);
+
+        let mut oc0 = OpenConnection::Connecting;
+        let oc1 = OpenConnection::OCReceived;
+        oc0.transition(oc1);
+        assert!(oc0.is_connected());
+
+        let mut oc0 = OpenConnection::Connecting;
+        let oc1 = OpenConnection::Connected;
+        oc0.transition(oc1);
+        assert!(oc0.is_connected());
+
+        let mut oc0 = OpenConnection::Connecting;
+        let oc1 = OpenConnection::OCReceived;
+        oc0.transition(oc1);
+        assert!(oc0.is_connected());
+    }
+
+    // FIXME: deadlock? on multiple threads; keeps messages over and over even after connection
     // #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[tokio::test(flavor = "current_thread")]
     async fn node0_to_gateway_conn() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of one node and one gateway test that both are connected.
-        Logger::get_logger();
+        // Logger::get_logger();
 
         let ring_protocols = sim_network_builder(1, 1, 0);
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         assert_eq!(
             ring_protocols["node-0"]

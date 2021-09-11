@@ -354,7 +354,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping() -> Result<(), ()> {
-        Logger::get_logger();
+        // Logger::get_logger();
 
         let peer1_key = identity::ed25519::Keypair::generate();
         let peer1_id: PeerId = identity::Keypair::Ed25519(peer1_key.clone())

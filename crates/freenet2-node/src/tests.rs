@@ -9,7 +9,7 @@ use crate::{
         self, Channel, ConnectionManager, ListenerHandle, PeerKey, PeerKeyLocation,
         RemoveConnHandler, Transport,
     },
-    message::{Message, MsgTypeId, TransactionId},
+    message::{Message, MsgTypeId, Transaction},
     ring_proto::Location,
 };
 
@@ -17,7 +17,7 @@ type ResponseListenerFn =
     Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
 type InboundListenerFn = Box<dyn Fn(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync>;
 type InboundListenerRegistry = RwLock<HashMap<ListenerHandle, InboundListenerFn>>;
-type OutboundListenerRegistry = Arc<RwLock<HashMap<TransactionId, ResponseListenerFn>>>;
+type OutboundListenerRegistry = Arc<RwLock<HashMap<Transaction, ResponseListenerFn>>>;
 
 #[derive(Clone)]
 pub(crate) struct TestingConnectionManager {
@@ -27,7 +27,7 @@ pub(crate) struct TestingConnectionManager {
     outbound_listeners: OutboundListenerRegistry,
     transport: InMemoryTransport,
     // LIFO stack for pending listeners
-    pend_listeners: Sender<(TransactionId, ResponseListenerFn)>,
+    pend_listeners: Sender<(Transaction, ResponseListenerFn)>,
 }
 
 impl TestingConnectionManager {
@@ -39,7 +39,7 @@ impl TestingConnectionManager {
                 .map(|id| (id, RwLock::new(HashMap::new())))
                 .collect(),
         );
-        let outbound_listeners: Arc<RwLock<HashMap<TransactionId, ResponseListenerFn>>> =
+        let outbound_listeners: Arc<RwLock<HashMap<Transaction, ResponseListenerFn>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
         let tr_cp = transport.clone();
@@ -113,7 +113,7 @@ impl ConnectionManager for TestingConnectionManager {
         handle_id
     }
 
-    fn listen_to_replies<F>(&self, tx_id: TransactionId, callback: F)
+    fn listen_to_replies<F>(&self, tx_id: Transaction, callback: F)
     where
         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
@@ -138,7 +138,7 @@ impl ConnectionManager for TestingConnectionManager {
     fn send_with_callback<F>(
         &self,
         to: PeerKeyLocation,
-        tx_id: TransactionId,
+        tx_id: Transaction,
         msg: Message,
         callback: F,
     ) -> conn_manager::Result<()>
@@ -159,7 +159,7 @@ impl ConnectionManager for TestingConnectionManager {
     fn send(
         &self,
         to: PeerKeyLocation,
-        _tx_id: TransactionId,
+        _tx_id: Transaction,
         msg: Message,
     ) -> conn_manager::Result<()> {
         let serialized = bincode::serialize(&msg)?;
