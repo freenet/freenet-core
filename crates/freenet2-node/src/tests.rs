@@ -1,8 +1,8 @@
-use std::{array::IntoIter, collections::HashMap, io::Cursor, sync::Arc};
+use std::{array::IntoIter, collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 
+use crossbeam::channel::{self, Receiver, Sender};
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::broadcast::{Receiver, Sender};
 
 use crate::{
     conn_manager::{
@@ -13,71 +13,85 @@ use crate::{
     ring_proto::Location,
 };
 
-#[derive(Clone)]
-pub(crate) struct TestingConnectionManager {
-    /// stores listeners by message type
-    listeners: Arc<HashMap<MsgTypeId, ListenerRegistry>>,
-    transport: InMemoryTransport,
-}
-
 type ResponseListenerFn =
     Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
 type InboundListenerFn = Box<dyn Fn(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync>;
+type InboundListenerRegistry = RwLock<HashMap<ListenerHandle, InboundListenerFn>>;
+type OutboundListenerRegistry = Arc<RwLock<HashMap<TransactionId, ResponseListenerFn>>>;
 
-struct ListenerRegistry {
-    /// listeners for outbound messages
-    outbound: RwLock<HashMap<TransactionId, ResponseListenerFn>>,
+#[derive(Clone)]
+pub(crate) struct TestingConnectionManager {
     /// listeners for inbound messages
-    inbound: RwLock<HashMap<ListenerHandle, InboundListenerFn>>,
-}
-
-impl Default for ListenerRegistry {
-    fn default() -> Self {
-        Self {
-            outbound: RwLock::new(Default::default()),
-            inbound: RwLock::new(Default::default()),
-        }
-    }
+    inbound_listeners: Arc<HashMap<MsgTypeId, InboundListenerRegistry>>,
+    /// listeners for outbound messages replies
+    outbound_listeners: OutboundListenerRegistry,
+    transport: InMemoryTransport,
+    // LIFO stack for pending listeners
+    pend_listeners: Sender<(TransactionId, ResponseListenerFn)>,
 }
 
 impl TestingConnectionManager {
     pub fn new(is_open: bool, peer: PeerKey, location: Option<Location>) -> Self {
+        let (pend_listeners, rcv_pend_listeners) = channel::unbounded();
         let transport = InMemoryTransport::new(is_open, peer, location);
-        let listeners = Arc::new(
+        let inbound_listeners: Arc<HashMap<MsgTypeId, InboundListenerRegistry>> = Arc::new(
             IntoIter::new(MsgTypeId::enumeration())
-                .map(|id| (id, ListenerRegistry::default()))
+                .map(|id| (id, RwLock::new(HashMap::new())))
                 .collect(),
         );
+        let outbound_listeners: Arc<RwLock<HashMap<TransactionId, ResponseListenerFn>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let tr_cp = transport.clone();
-        let listeners_cp: Arc<HashMap<_, _>> = Arc::clone(&listeners);
-
-        // evaluate the messages as they arrive
+        let inbound_cp = Arc::clone(&inbound_listeners);
+        let outbound_cp = outbound_listeners.clone();
         tokio::spawn(async move {
+            // evaluate the messages as they arrive
             loop {
-                if let Some(msg) = tr_cp.msg_stack_queue.lock().pop() {
+                let msg = { tr_cp.msg_stack_queue.lock().pop() };
+                if let Some(msg) = msg {
                     let msg_data: Message =
                         bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
-                    let listeners = &listeners_cp[&msg_data.msg_type()];
-                    if let Some(_prev_tx) = listeners.outbound.read().get(msg_data.id()) {
-                        log::debug!("Received response for msg {}", msg_data.id());
+                    if let Some(tx_fn) = outbound_cp.read().get(msg_data.id()) {
+                        log::debug!("Received response for transaction: {}", msg_data.id());
+                        if let Some(location) = msg.origin_loc {
+                            if let Err(err) = tx_fn(
+                                PeerKeyLocation {
+                                    peer: msg.origin,
+                                    location,
+                                },
+                                msg_data,
+                            ) {
+                                log::error!("Error processing response: {}", err);
+                            }
+                        } else {
+                            log::error!("No location for responding peer {}", msg.target);
+                        }
                     } else {
-                        let reg = listeners.inbound.read();
+                        let listeners = &inbound_cp[&msg_data.msg_type()];
+                        log::debug!("Received inbound transaction: {}", msg_data.id());
+                        let reg = &*listeners.read();
                         for func in reg.values() {
                             if let Err(err) = func(msg.origin, msg_data.clone()) {
                                 log::error!("Error while calling inbound msg handler: {}", err);
-                            } else {
-                                log::debug!("Successfully processed a message");
                             }
                         }
                     }
+                    // insert any pending functions generated from within the callback
+                    let mut lock = outbound_cp.write();
+                    for (tx, func) in rcv_pend_listeners.try_iter() {
+                        lock.insert(tx, func);
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
 
         Self {
-            listeners,
+            inbound_listeners,
+            outbound_listeners,
             transport,
+            pend_listeners,
         }
     }
 }
@@ -91,17 +105,11 @@ impl ConnectionManager for TestingConnectionManager {
     where
         F: Fn(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
-        let tx_ty_listener = &self.listeners[&tx_type];
+        let tx_ty_listener = &self.inbound_listeners[&tx_type];
         let handle_id = ListenerHandle::new();
         tx_ty_listener
-            .inbound
             .write()
             .insert(handle_id, Box::new(listen_fn));
-
-        // TODO: set a background thread doing the listening
-        // the handle should have a way to know that something has been received
-        // so the protocol can handle the message
-
         handle_id
     }
 
@@ -109,11 +117,16 @@ impl ConnectionManager for TestingConnectionManager {
     where
         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
-        let tx_ty_listener = self.listeners.get(&tx_id.msg_type()).unwrap();
-        tx_ty_listener
-            .outbound
-            .write()
-            .insert(tx_id, Box::new(callback));
+        // optimistically try to acquire a lock
+        if let Some(mut lock) = self.outbound_listeners.try_write() {
+            lock.insert(tx_id, Box::new(callback));
+        } else {
+            // it failed, this is being inserted from an other existing closure holding the lock
+            // send it to the temporal stack queue for posterior insertion
+            self.pend_listeners
+                .send((tx_id, Box::new(callback)))
+                .expect("full or disconnected");
+        }
     }
 
     fn transport(&self) -> &Self::Transport {
@@ -124,7 +137,7 @@ impl ConnectionManager for TestingConnectionManager {
 
     fn send_with_callback<F>(
         &self,
-        to: PeerKey,
+        to: PeerKeyLocation,
         tx_id: TransactionId,
         msg: Message,
         callback: F,
@@ -133,26 +146,29 @@ impl ConnectionManager for TestingConnectionManager {
         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
         // store listening func
-        let tx_ty_listener = self.listeners.get(&tx_id.msg_type()).unwrap();
-        tx_ty_listener
-            .outbound
+        self.outbound_listeners
             .write()
             .insert(tx_id, Box::new(callback));
 
         // send the msg
         let serialized = bincode::serialize(&msg)?;
-        self.transport.send(to, None, serialized);
+        self.transport.send(to.peer, to.location, serialized);
         Ok(())
     }
 
-    fn send(&self, to: PeerKey, _tx_id: TransactionId, msg: Message) -> conn_manager::Result<()> {
+    fn send(
+        &self,
+        to: PeerKeyLocation,
+        _tx_id: TransactionId,
+        msg: Message,
+    ) -> conn_manager::Result<()> {
         let serialized = bincode::serialize(&msg)?;
-        self.transport.send(to, None, serialized);
+        self.transport.send(to.peer, to.location, serialized);
         Ok(())
     }
 }
 
-static NETWORK_TRAFFIC_SIM: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
+static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
     OnceCell::new();
 
 #[derive(Clone, Debug)]
@@ -177,20 +193,30 @@ pub(crate) struct InMemoryTransport {
 impl InMemoryTransport {
     fn new(is_open: bool, interface_peer: PeerKey, location: Option<Location>) -> Self {
         let msg_stack_queue = Arc::new(Mutex::new(Vec::new()));
-        let (tx, _) = NETWORK_TRAFFIC_SIM.get_or_init(|| tokio::sync::broadcast::channel(100));
+        let (tx, rx) = NETWORK_WIRES.get_or_init(crossbeam::channel::unbounded);
 
         // store messages incoming from the network in the msg stack
         let rcv_msg_c = msg_stack_queue.clone();
-        let mut rx = tx.subscribe();
+        let network = tx.clone();
+        let rx = rx.clone();
         tokio::spawn(async move {
             loop {
-                if let Ok(msg) = rx.recv().await {
-                    if msg.target == interface_peer {
-                        log::debug!("Inbound message received for peer {}", interface_peer);
+                match rx.try_recv() {
+                    Ok(msg) if msg.target == interface_peer => {
+                        log::debug!(
+                            "Inbound message received for peer {} from {}",
+                            interface_peer,
+                            msg.origin
+                        );
                         rcv_msg_c.lock().push(msg);
+                    }
+                    Err(channel::TryRecvError::Disconnected) => break,
+                    Err(channel::TryRecvError::Empty) | Ok(_) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
                     }
                 }
             }
+            log::error!("Stopped receiving messages in {}", interface_peer);
         });
 
         Self {
@@ -198,21 +224,28 @@ impl InMemoryTransport {
             location,
             is_open,
             msg_stack_queue,
-            network: tx.clone(),
+            network,
         }
     }
 }
 
 impl Transport for InMemoryTransport {
-    fn send(&self, peer: PeerKey, location: Option<Location>, message: Vec<u8>) {
-        self.network
-            .send(MessageOnTransit {
-                origin: self.interface_peer,
-                origin_loc: location,
-                target: peer,
-                data: message,
-            })
-            .expect("failed to send msg over the network");
+    fn send(&self, peer: PeerKey, location: Location, message: Vec<u8>) {
+        let send_res = self.network.try_send(MessageOnTransit {
+            origin: self.interface_peer,
+            origin_loc: Some(location),
+            target: peer,
+            data: message,
+        });
+        match send_res {
+            Err(channel::TrySendError::Disconnected(_)) => {
+                log::debug!("Network shutdown")
+            }
+            Err(channel::TrySendError::Full(_)) => {
+                unreachable!("not unbounded capacity!")
+            }
+            Ok(_) => {}
+        }
     }
 
     fn is_open(&self) -> bool {

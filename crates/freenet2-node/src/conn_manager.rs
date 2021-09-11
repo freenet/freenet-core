@@ -72,7 +72,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
     // FIXME: same problem as om tje `listen` fn
     fn send_with_callback<F>(
         &self,
-        to: PeerKey,
+        to: PeerKeyLocation,
         tx_id: TransactionId,
         msg: Message,
         callback: F,
@@ -82,12 +82,12 @@ pub(crate) trait ConnectionManager: Send + Sync {
 
     /// Send a message to a given peer which has already been identified and  
     /// which has established a connection with this peer.
-    fn send(&self, to: PeerKey, tx_id: TransactionId, msg: Message) -> Result<()>;
+    fn send(&self, to: PeerKeyLocation, tx_id: TransactionId, msg: Message) -> Result<()>;
 }
 
 /// A protocol used to send and receive data over the network.
 pub(crate) trait Transport {
-    fn send(&self, peer: PeerKey, location: Option<Location>, message: Vec<u8>);
+    fn send(&self, peer: PeerKey, location: Location, message: Vec<u8>);
     fn is_open(&self) -> bool;
     fn recipient(&self) -> Channel;
 }
