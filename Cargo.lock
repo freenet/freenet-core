@@ -725,6 +725,7 @@ dependencies = [
  "config",
  "crossbeam",
  "env_logger",
+ "futures",
  "libp2p",
  "log",
  "once_cell",

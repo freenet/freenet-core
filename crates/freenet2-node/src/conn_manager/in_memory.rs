@@ -7,14 +7,15 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::{
     config::tracing::Logger,
-    conn_manager::{
-        self, Channel, ConnectionManager, ListenerHandle, PeerKey, PeerKeyLocation, Transport,
-    },
+    conn_manager::{self, ConnectionBridge, ListenerHandle, PeerKey, PeerKeyLocation},
     message::{Message, MsgTypeId, Transaction},
     ring_proto::Location,
 };
 
-type InboundListenerFn = Box<dyn Fn(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync>;
+use super::Transport;
+
+type InboundListenerFn =
+    Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
 type InboundListenerRegistry = RwLock<HashMap<ListenerHandle, InboundListenerFn>>;
 
 type ResponseListenerFn =
@@ -22,7 +23,7 @@ type ResponseListenerFn =
 type OutboundListenerRegistry = Arc<RwLock<HashMap<Transaction, ResponseListenerFn>>>;
 
 #[derive(Clone)]
-pub struct MemoryConnManager {
+pub(crate) struct MemoryConnManager {
     /// listeners for inbound initial messages
     inbound_listeners: Arc<HashMap<MsgTypeId, InboundListenerRegistry>>,
     /// listeners for outbound messages replies
@@ -61,7 +62,7 @@ impl MemoryConnManager {
                             if let Err(err) = tx_fn(
                                 PeerKeyLocation {
                                     peer: msg.origin,
-                                    location,
+                                    location: Some(location),
                                 },
                                 msg_data,
                             ) {
@@ -75,7 +76,13 @@ impl MemoryConnManager {
                         log::debug!("Received inbound transaction: {}", msg_data.id());
                         let reg = &*listeners.read();
                         for func in reg.values() {
-                            if let Err(err) = func(msg.origin, msg_data.clone()) {
+                            if let Err(err) = func(
+                                PeerKeyLocation {
+                                    peer: msg.origin,
+                                    location: None,
+                                },
+                                msg_data.clone(),
+                            ) {
                                 log::error!("Error while calling inbound msg handler: {}", err);
                             }
                         }
@@ -97,18 +104,14 @@ impl MemoryConnManager {
             pend_listeners,
         }
     }
-
-    pub fn start(&mut self) -> Result<(), impl std::error::Error> {
-        Err(super::ConnError::NegotationFailed)
-    }
 }
 
-impl ConnectionManager for MemoryConnManager {
+impl ConnectionBridge for MemoryConnManager {
     type Transport = InMemoryTransport;
 
     fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
     where
-        F: Fn(PeerKey, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
+        F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {
         let tx_ty_listener = &self.inbound_listeners[&tx_type];
         let handle_id = ListenerHandle::new();
@@ -157,7 +160,8 @@ impl ConnectionManager for MemoryConnManager {
 
         // send the msg
         let serialized = bincode::serialize(&msg)?;
-        self.transport.send(to.peer, to.location, serialized);
+        self.transport
+            .send(to.peer, to.location.unwrap(), serialized);
         Ok(())
     }
 
@@ -168,7 +172,8 @@ impl ConnectionManager for MemoryConnManager {
         msg: Message,
     ) -> conn_manager::Result<()> {
         let serialized = bincode::serialize(&msg)?;
-        self.transport.send(to.peer, to.location, serialized);
+        self.transport
+            .send(to.peer, to.location.unwrap(), serialized);
         Ok(())
     }
 
@@ -236,9 +241,7 @@ impl InMemoryTransport {
             network,
         }
     }
-}
 
-impl Transport for InMemoryTransport {
     fn send(&self, peer: PeerKey, location: Location, message: Vec<u8>) {
         let send_res = self.network.try_send(MessageOnTransit {
             origin: self.interface_peer,
@@ -256,12 +259,10 @@ impl Transport for InMemoryTransport {
             Ok(_) => {}
         }
     }
+}
 
+impl Transport for InMemoryTransport {
     fn is_open(&self) -> bool {
         self.is_open
-    }
-
-    fn recipient(&self) -> Channel {
-        todo!()
     }
 }

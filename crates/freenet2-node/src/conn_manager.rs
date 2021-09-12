@@ -1,4 +1,4 @@
-//! Manages connections.
+//! Types and definitions to handle all socket communication for the peer nodes.
 
 use std::{fmt::Display, net::SocketAddr, sync::atomic::AtomicU64, time::Duration};
 
@@ -17,7 +17,6 @@ const _PING_EVERY: Duration = Duration::from_secs(30);
 const _DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 static HANDLE_ID: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) type Channel<'a> = (PeerId, &'a [u8]);
 // pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
 pub(crate) type Result<T> = StdResult<T, ConnError>;
 
@@ -38,14 +37,16 @@ impl Default for ListenerHandle {
 }
 
 /// Types which impl this trait are responsible for the following responsabilities:
-/// - establishing reliable connections to other peers
+/// - establishing reliable connections to other peers,
+///   including any handshake procedures
 /// - keep connections alive or reconnecting to other peers
 /// - securely transmitting messages between peers
+/// - serializing and deserializing messages
 ///
-/// This implementing types manage the lower level connection details of the the network,
+/// The implementing types manage the lower level connection details of the the network,
 /// usually working at the transport layer over UDP or TCP and performing NAT traversal
 /// to establish connections between peers.
-pub(crate) trait ConnectionManager: Send + Sync {
+pub(crate) trait ConnectionBridge: Send + Sync {
     /// The transport being used to manage networking.
     type Transport: Transport;
 
@@ -56,7 +57,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
     /// the provided function.
     fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
     where
-        F: Fn(PeerKey, Message) -> Result<()> + Send + Sync + 'static;
+        F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 
     /// Listens to inbound replies for a previously broadcasted transaction to the network,
     /// if a reply is detected performs a callback.
@@ -97,9 +98,7 @@ pub(crate) trait ConnectionManager: Send + Sync {
 
 /// A protocol used to send and receive data over the network.
 pub(crate) trait Transport {
-    fn send(&self, peer: PeerKey, location: Location, message: Vec<u8>);
     fn is_open(&self) -> bool;
-    fn recipient(&self) -> Channel;
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -128,7 +127,7 @@ impl From<PublicKey> for PeerKey {
 /// The Location of a PeerKey in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
     pub peer: PeerKey,
-    pub location: Location,
+    pub location: Option<Location>,
 }
 
 #[derive(Debug, thiserror::Error)]

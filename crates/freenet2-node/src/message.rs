@@ -46,11 +46,13 @@ pub(crate) struct MsgTypeId(u8);
 
 impl MsgTypeId {
     /// Return all possible message type id's
-    pub fn enumeration() -> [MsgTypeId; 3] {
+    pub fn enumeration() -> [MsgTypeId; 5] {
         [
             <OpenConnection as MsgType>::msg_type_id(),
             <JoinRequest as MsgType>::msg_type_id(),
             <JoinResponse as MsgType>::msg_type_id(),
+            <ProbeResponse as MsgType>::msg_type_id(),
+            <ProbeRequest as MsgType>::msg_type_id(),
         ]
     }
 }
@@ -96,14 +98,20 @@ mod _seal_msg_type {
     impl_msg_conversion!(OpenConnection -> 0);
     impl_msg_conversion!(JoinRequest -> 1);
     impl_msg_conversion!(JoinResponse -> 2);
+    impl_msg_conversion!(ProbeRequest -> 3);
+    impl_msg_conversion!(ProbeResponse -> 4);
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum Message {
-    // Ring ops
+    // Ring
     JoinRequest(Transaction, JoinRequest),
     JoinResponse(Transaction, JoinResponse),
     OpenConnection(Transaction, OpenConnection),
+
+    // Probe
+    ProbeRequest(Transaction, ProbeRequest),
+    ProbeResponse(Transaction, ProbeResponse),
 }
 
 impl Message {
@@ -113,6 +121,8 @@ impl Message {
             JoinRequest(_, _) => "JoinRequest",
             JoinResponse(_, _) => "JoinResponse",
             OpenConnection(_, _) => "OpenConnection",
+            ProbeRequest(_, _) => "ProbeRequest",
+            ProbeResponse(_, _) => "ProbeResponse",
         }
     }
 
@@ -122,14 +132,18 @@ impl Message {
             JoinRequest(id, _) => id,
             JoinResponse(id, _) => id,
             OpenConnection(id, _) => id,
+            ProbeRequest(id, _) => id,
+            ProbeResponse(id, _) => id,
         }
     }
 
     pub fn msg_type(&self) -> MsgTypeId {
         match self {
-            Self::JoinRequest(_id, _) => <JoinRequest as MsgType>::msg_type_id(),
-            Self::JoinResponse(_id, _) => <JoinResponse as MsgType>::msg_type_id(),
-            Self::OpenConnection(_id, _) => <OpenConnection as MsgType>::msg_type_id(),
+            Self::JoinRequest(_, _) => <JoinRequest as MsgType>::msg_type_id(),
+            Self::JoinResponse(_, _) => <JoinResponse as MsgType>::msg_type_id(),
+            Self::OpenConnection(_, _) => <OpenConnection as MsgType>::msg_type_id(),
+            Self::ProbeRequest(_, _) => <ProbeRequest as MsgType>::msg_type_id(),
+            Self::ProbeResponse(_, _) => <ProbeResponse as MsgType>::msg_type_id(),
         }
     }
 }
@@ -140,15 +154,18 @@ impl Display for Message {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct ProbeRequest;
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct ProbeRequest {
+    pub hops_to_live: u8,
+    pub target: Location,
+}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct ProbeResponse {
     pub visits: Vec<Visit>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct Visit {
     pub hop: u8,
     pub latency: Duration,

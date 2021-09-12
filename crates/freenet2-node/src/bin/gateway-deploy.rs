@@ -2,10 +2,8 @@ use freenet2_node::*;
 use libp2p::identity::Keypair;
 
 #[tokio::main]
-async fn main() -> Result<(), impl std::error::Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = Keypair::generate_ed25519();
-    let loc = Location::random();
-    let peer = PeerKey::from(key.public());
-    let mut conn_manager = MemoryConnManager::new(true, peer, Some(loc));
-    conn_manager.start()
+    let mut node = NodeConfig::default().with_key(key).build_libp2p()?;
+    node.listen_on().map_err(|_| "failed to start".into())
 }

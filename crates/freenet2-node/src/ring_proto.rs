@@ -13,7 +13,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    conn_manager::{self, ConnectionManager, ListenerHandle, PeerKey, PeerKeyLocation, Transport},
+    conn_manager::{self, ConnectionBridge, ListenerHandle, PeerKey, PeerKeyLocation, Transport},
     message::{Message, MsgType, Transaction},
     ring_proto::messages::{JoinRequest, JoinResponse},
     StdResult,
@@ -21,22 +21,22 @@ use crate::{
 
 type Result<T> = StdResult<T, RingProtoError>;
 
-struct RingProtocol<CM> {
-    conn_manager: Arc<CM>,
+pub(crate) struct RingProtocol<CM> {
+    pub conn_manager: Arc<CM>,
     peer_key: PeerKey,
     /// A location gets assigned once a node joins the network via a gateway,
     /// until then it has no location unless the node is a gateway.
-    location: RwLock<Option<Location>>,
+    pub location: RwLock<Option<Location>>,
     gateways: RwLock<HashSet<PeerKeyLocation>>,
     max_hops_to_live: usize,
     rnd_if_htl_above: usize,
-    ring: Ring,
+    pub ring: Ring,
 }
 
 impl<CM, T> RingProtocol<CM>
 where
     T: Transport + 'static,
-    CM: ConnectionManager<Transport = T> + 'static,
+    CM: ConnectionBridge<Transport = T> + 'static,
 {
     fn new(
         conn_manager: CM,
@@ -66,7 +66,9 @@ where
 
     fn listen_for_join_req(self: &Arc<Self>) -> ListenerHandle {
         let self_cp = self.clone();
-        let process_join_req = move |sender: PeerKey, msg: Message| -> conn_manager::Result<()> {
+        let process_join_req = move |sender: PeerKeyLocation,
+                                     msg: Message|
+              -> conn_manager::Result<()> {
             let (tx, join_req) = if let Message::JoinRequest(id, join_req) = msg {
                 (id, join_req)
             } else {
@@ -84,7 +86,7 @@ where
                 messages::JoinRequest::Initial { key, hops_to_live } => {
                     peer_key_loc = PeerKeyLocation {
                         peer: key,
-                        location: Location::random(),
+                        location: Some(Location::random()),
                     };
                     req_type = ReqType::Initial;
                     hops_to_live
@@ -98,16 +100,24 @@ where
                     hops_to_live
                 }
             };
-            log::debug!("JoinRequest received by {} with HTL {}", sender, jr_hpt);
+            log::debug!(
+                "JoinRequest received by {} with HTL {}",
+                sender
+                    .location
+                    .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                jr_hpt
+            );
 
             let your_location = self_cp
                 .location
                 .read()
                 .ok_or(conn_manager::ConnError::LocationUnknown)?;
-            let accepted_by = if self_cp
-                .ring
-                .should_accept(&your_location, &peer_key_loc.location)
-            {
+            let accepted_by = if self_cp.ring.should_accept(
+                &your_location,
+                &peer_key_loc
+                    .location
+                    .ok_or(conn_manager::ConnError::LocationUnknown)?,
+            ) {
                 log::debug!(
                     "Accepting connections to {:?}, establising connection @ {}",
                     peer_key_loc,
@@ -116,7 +126,7 @@ where
                 self_cp.establish_conn(peer_key_loc, tx);
                 vec![PeerKeyLocation {
                     peer: self_cp.peer_key,
-                    location: your_location,
+                    location: Some(your_location),
                 }]
             } else {
                 log::debug!("Not accepting new connection sender {:?}", peer_key_loc);
@@ -125,7 +135,7 @@ where
 
             log::debug!(
                 "Sending JoinResponse to {} accepting {} connections",
-                sender,
+                sender.peer,
                 accepted_by.len()
             );
             let join_response = match req_type {
@@ -133,7 +143,9 @@ where
                     tx,
                     JoinResponse::Initial {
                         accepted_by: accepted_by.clone(),
-                        your_location: peer_key_loc.location,
+                        your_location: peer_key_loc
+                            .location
+                            .ok_or(conn_manager::ConnError::LocationUnknown)?,
                         your_peer_id: peer_key_loc.peer,
                     },
                 )),
@@ -145,22 +157,30 @@ where
                 )),
             };
             self_cp.conn_manager.send(peer_key_loc, tx, join_response)?;
+            // NOTE: this is in practica a jump to: join_ring.join_response_cb
 
             if jr_hpt > 0 && !self_cp.ring.connections_by_location.read().is_empty() {
                 let forward_to = if jr_hpt >= self_cp.rnd_if_htl_above {
                     log::debug!(
                         "Randomly selecting peer to forward JoinRequest sender {}",
-                        sender
+                        sender.peer
                     );
-                    self_cp.ring.random_peer(|p| p.peer != sender)
+                    self_cp.ring.random_peer(|p| p.peer != sender.peer)
                 } else {
-                    log::debug!("Selecting close peer to forward request sender {}", sender);
+                    log::debug!(
+                        "Selecting close peer to forward request sender {}",
+                        sender.peer
+                    );
                     self_cp
                         .ring
                         .connections_by_location
                         .read()
-                        .get(&peer_key_loc.location)
-                        .filter(|it| it.peer != sender)
+                        .get(
+                            &peer_key_loc
+                                .location
+                                .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                        )
+                        .filter(|it| it.peer != sender.peer)
                         .copied()
                 };
 
@@ -178,7 +198,7 @@ where
 
                     log::debug!(
                         "Forwarding JoinRequest sender {} to {}",
-                        sender,
+                        sender.peer,
                         forward_to.peer
                     );
                     let self_cp2 = self_cp.clone();
@@ -236,7 +256,13 @@ where
         // FIXME: this iteration should be shuffled, must write an extension iterator shuffle items "in place"
         // the idea here is to limit the amount of gateways being contacted that's why shuffling is required
         for gateway in self.gateways.read().iter() {
-            log::info!("Joining ring via {} at {}", gateway.peer, gateway.location);
+            log::info!(
+                "Joining ring via {} at {}",
+                gateway.peer,
+                gateway
+                    .location
+                    .ok_or(conn_manager::ConnError::LocationUnknown)?
+            );
             self.conn_manager.add_connection(*gateway, true);
             let tx = Transaction::new(<JoinRequest as MsgType>::msg_type_id());
             let join_req = messages::JoinRequest::Initial {
@@ -272,10 +298,12 @@ where
                     let self_location =
                         &self_location.ok_or(conn_manager::ConnError::LocationUnknown)?;
                     for new_peer_key in accepted_by {
-                        if ring_proto
-                            .ring
-                            .should_accept(self_location, &new_peer_key.location)
-                        {
+                        if ring_proto.ring.should_accept(
+                            self_location,
+                            &new_peer_key
+                                .location
+                                .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                        ) {
                             log::info!("Establishing connection to {}", new_peer_key.peer);
                             ring_proto.establish_conn(new_peer_key, tx);
                         } else {
@@ -324,11 +352,12 @@ where
                     tx,
                     Message::from((tx, messages::OpenConnection::Connected)),
                 )?;
-                self_cp
-                    .ring
-                    .connections_by_location
-                    .write()
-                    .insert(new_peer.location, new_peer);
+                self_cp.ring.connections_by_location.write().insert(
+                    new_peer
+                        .location
+                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                    new_peer,
+                );
             }
             Ok(())
         };
@@ -362,8 +391,8 @@ where
 }
 
 #[derive(Debug)]
-struct Ring {
-    connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+pub(crate) struct Ring {
+    pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
 }
 
 impl Ring {
@@ -391,16 +420,16 @@ impl Ring {
 
     fn median_distance_to(&self, location: &Location) -> Distance {
         let mut conn_by_dist = self.connections_by_distance(location);
-        conn_by_dist.sort_unstable();
+        conn_by_dist.sort_by_key(|(k, _)| *k);
         let idx = self.connections_by_location.read().len() / 2;
-        conn_by_dist[idx]
+        conn_by_dist[idx].0
     }
 
-    fn connections_by_distance(&self, to: &Location) -> Vec<Distance> {
+    pub fn connections_by_distance(&self, to: &Location) -> Vec<(Distance, PeerKeyLocation)> {
         self.connections_by_location
             .read()
-            .keys()
-            .map(|key| key.distance(to))
+            .iter()
+            .map(|(key, peer)| (key.distance(to), *peer))
             .collect()
     }
 
@@ -561,7 +590,7 @@ pub(crate) mod messages {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::collections::HashMap;
 
     use libp2p::identity;
@@ -569,8 +598,10 @@ mod test {
 
     use super::{messages::OpenConnection, *};
     use crate::{
-        config::tracing::Logger, conn_manager::in_memory::MemoryConnManager, message::ProbeRequest,
-        probe_proto::ProbeProtocol,
+        config::tracing::Logger,
+        conn_manager::in_memory::MemoryConnManager,
+        message::ProbeRequest,
+        probe_proto::{self, ProbeProtocol},
     };
 
     #[test]
@@ -627,33 +658,38 @@ mod test {
         Ok(())
     }
 
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn all_nodes_should_connect() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of 1000 peers all nodes should have connections.
         Logger::init_logger();
 
-        let mut sim_nodes = sim_network_builder(200, 10, 7);
+        let mut sim_nodes = sim_network_builder(10, 10, 7);
 
         // let _hist: Vec<_> = _ring_distribution(sim_nodes.values()).collect();
 
-        for probe_idx in 0..10 {
+        const NUM_PROBES: usize = 10;
+        let mut probe_responses = Vec::with_capacity(NUM_PROBES);
+        for probe_idx in 0..NUM_PROBES {
             let target = Location::random();
             let idx: usize = rand::thread_rng().gen_range(0..sim_nodes.len());
             let rnd_node = sim_nodes
                 .get_mut(&format!("node-{}", idx))
                 .ok_or("node not found")?;
-            let probe_response = rnd_node.probe_protocol.probe(ProbeRequest);
-            log::trace!("Probe #{}, target: {}", probe_idx, target);
-            log::trace!("hop\tlocation\tlatency");
-            for visit in &probe_response.visits {
-                log::trace!(
-                    "{}\t{}\t{}",
-                    visit.hop,
-                    visit.location,
-                    visit.latency.as_secs()
-                );
-            }
+            let probe_response = ProbeProtocol::probe(
+                rnd_node.ring_protocol.clone(),
+                Transaction::new(<ProbeRequest as MsgType>::msg_type_id()),
+                ProbeRequest {
+                    hops_to_live: 7,
+                    target,
+                },
+            )
+            .await
+            .expect("failed to get probe response");
+            probe_responses.push(probe_response);
         }
+        // probe_proto::utils::plot_probe_responses(probe_responses);
+
+        tokio::time::sleep(Duration::from_secs(300)).await;
 
         let any_empties = sim_nodes
             .values()
@@ -672,7 +708,7 @@ mod test {
 
     struct SimulatedNode {
         ring_protocol: Arc<RingProtocol<MemoryConnManager>>,
-        probe_protocol: ProbeProtocol<MemoryConnManager>,
+        probe_protocol: Option<ProbeProtocol>,
     }
 
     fn sim_network_builder(
@@ -688,11 +724,10 @@ mod test {
         let gw_key = keypair.public().into();
         let loc = Location::random();
         let conn_manager = MemoryConnManager::new(true, gw_key, Some(loc));
-        let ring_protocol =
-            RingProtocol::new(conn_manager.clone(), gw_key, ring_max_htl, rnd_if_htl_above)
-                .with_location(loc);
+        let ring_protocol = RingProtocol::new(conn_manager, gw_key, ring_max_htl, rnd_if_htl_above)
+            .with_location(loc);
+        let probe_protocol = Some(ProbeProtocol::new(ring_protocol.clone(), loc));
         ring_protocol.listen_for_join_req();
-        let probe_protocol = ProbeProtocol::new(conn_manager);
         nodes.insert(
             "gateway".to_owned(),
             SimulatedNode {
@@ -707,24 +742,19 @@ mod test {
             let keypair = identity::Keypair::generate_ed25519();
             let peer_key = keypair.public().into();
             let conn_manager = MemoryConnManager::new(false, peer_key, None);
-            let ring_protocol = RingProtocol::new(
-                conn_manager.clone(),
-                peer_key,
-                ring_max_htl,
-                rnd_if_htl_above,
-            );
+            let ring_protocol =
+                RingProtocol::new(conn_manager, peer_key, ring_max_htl, rnd_if_htl_above);
             ring_protocol.gateways.write().insert(PeerKeyLocation {
                 peer: gw_key,
-                location: loc,
+                location: Some(loc),
             });
             ring_protocol.join_ring().unwrap();
-            let probe_protocol = ProbeProtocol::new(conn_manager);
 
             nodes.insert(
                 label,
                 SimulatedNode {
                     ring_protocol,
-                    probe_protocol,
+                    probe_protocol: None,
                 },
             );
         }
