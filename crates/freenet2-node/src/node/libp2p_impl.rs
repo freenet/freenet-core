@@ -1,20 +1,18 @@
-#![allow(unused)] // FIXME: remove this attr
 use std::net::IpAddr;
 
 use libp2p::{
     core::{muxing, transport, upgrade},
     dns::TokioDnsConfig,
     identify,
-    identity::{self, Keypair},
-    multiaddr::Protocol,
+    identity::Keypair,
     noise, ping,
     swarm::SwarmBuilder,
     tcp::TokioTcpConfig,
-    yamux, Multiaddr, PeerId, Swarm, Transport,
+    yamux, PeerId, Swarm, Transport,
 };
 
 use crate::{
-    config::{self, GlobalExecutor, CONF},
+    config::{self, GlobalExecutor},
     NodeConfig,
 };
 
@@ -214,7 +212,7 @@ mod tests {
     async fn ping() -> Result<(), ()> {
         Logger::init_logger();
 
-        let peer1_key = identity::Keypair::generate_ed25519();
+        let peer1_key = Keypair::generate_ed25519();
         let peer1_id: PeerId = peer1_key.public().into();
         let peer1_port = get_free_port().unwrap();
         let peer1_config = InitPeerNode::new()

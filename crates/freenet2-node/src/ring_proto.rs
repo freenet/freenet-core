@@ -658,13 +658,13 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_nodes_should_connect() -> StdResult<(), Box<dyn std::error::Error>> {
         //! Given a network of 1000 peers all nodes should have connections.
         Logger::init_logger();
 
         let mut sim_nodes = sim_network_builder(10, 10, 7);
-
+        tokio::time::sleep(Duration::from_secs(300)).await;
         // let _hist: Vec<_> = _ring_distribution(sim_nodes.values()).collect();
 
         const NUM_PROBES: usize = 10;
@@ -688,8 +688,6 @@ mod tests {
             probe_responses.push(probe_response);
         }
         // probe_proto::utils::plot_probe_responses(probe_responses);
-
-        tokio::time::sleep(Duration::from_secs(300)).await;
 
         let any_empties = sim_nodes
             .values()

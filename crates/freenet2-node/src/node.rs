@@ -2,10 +2,10 @@ use std::net::IpAddr;
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-use crate::config::CONF;
+use self::{in_memory::InMemory, libp2p_impl::NodeLibP2P};
+use crate::{config::CONF, PeerKey};
 
-use self::libp2p_impl::NodeLibP2P;
-
+mod in_memory;
 mod libp2p_impl;
 
 pub struct Node(NodeImpl);
@@ -14,12 +14,14 @@ impl Node {
     pub fn listen_on(&mut self) -> Result<(), ()> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on(),
+            NodeImpl::InMemory(ref mut node) => node.listen_on(),
         }
     }
 }
 
 enum NodeImpl {
-    LibP2P(NodeLibP2P),
+    LibP2P(Box<NodeLibP2P>),
+    InMemory(Box<InMemory>),
 }
 
 pub struct NodeConfig {
@@ -85,9 +87,15 @@ impl NodeConfig {
         self
     }
 
-    /// Builds the default implementation of a node using libp2p as backend.
+    /// Builds a node using libp2p as backend connection manager.
     pub fn build_libp2p(self) -> std::io::Result<Node> {
-        Ok(Node(NodeImpl::LibP2P(NodeLibP2P::build(self)?)))
+        Ok(Node(NodeImpl::LibP2P(Box::new(NodeLibP2P::build(self)?))))
+    }
+
+    /// Builds a node using in-memory transport. Used for testing pourpouses.
+    pub fn build_in_memory(self) -> Result<Node, &'static str> {
+        let inmem = InMemory::build(self)?;
+        Ok(Node(NodeImpl::InMemory(Box::new(inmem))))
     }
 }
 
