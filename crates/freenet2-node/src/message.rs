@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ring_proto::{messages::*, Location};
+pub(crate) use _seal_msg_type::MsgTypeId;
 
 /// An transaction is a unique, universal and efficient identifier for any
 /// roundtrip transaction as it is broadcasted around the F2 network.
@@ -41,22 +42,6 @@ impl Display for Transaction {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, Copy)]
-pub(crate) struct MsgTypeId(u8);
-
-impl MsgTypeId {
-    /// Return all possible message type id's
-    pub fn enumeration() -> [MsgTypeId; 5] {
-        [
-            <OpenConnection as MsgType>::msg_type_id(),
-            <JoinRequest as MsgType>::msg_type_id(),
-            <JoinResponse as MsgType>::msg_type_id(),
-            <ProbeResponse as MsgType>::msg_type_id(),
-            <ProbeRequest as MsgType>::msg_type_id(),
-        ]
-    }
-}
-
 pub(crate) trait MsgType: _seal_msg_type::SealedMsgType {
     fn msg_type_id() -> MsgTypeId;
 }
@@ -77,29 +62,50 @@ mod _seal_msg_type {
         fn msg_type_id() -> MsgTypeId;
     }
 
-    macro_rules! impl_msg_conversion {
-        ($ty:tt -> $id:tt) => {
+    macro_rules! message_enumeration {
+         { [$($var:tt),+] } => {
+            #[repr(u8)]
+            #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+            pub(crate) enum MsgTypeId {
+                $($var,)+
+            }
+
+            impl MsgTypeId {
+                pub fn enumeration() -> [Self; 5] {
+                    [
+                        $( Self::$var, )+
+                    ]
+                }
+            }
+
+            $(
+                message_enumeration!(@transform $var);
+            )+
+        };
+
+        (@transform $ty:tt) => {
             impl From<(Transaction, $ty)> for Message {
                 fn from(oc: (Transaction, $ty)) -> Self {
                     let (tx_id, oc) = oc;
-                    // assert_eq!(tx_id.msg_type(), <$ty as MsgType>::msg_type_id());
                     Self::$ty(tx_id, oc)
                 }
             }
 
             impl SealedMsgType for $ty {
                 fn msg_type_id() -> MsgTypeId {
-                    MsgTypeId($id)
+                    MsgTypeId::$ty
                 }
             }
         };
     }
 
-    impl_msg_conversion!(OpenConnection -> 0);
-    impl_msg_conversion!(JoinRequest -> 1);
-    impl_msg_conversion!(JoinResponse -> 2);
-    impl_msg_conversion!(ProbeRequest -> 3);
-    impl_msg_conversion!(ProbeResponse -> 4);
+    message_enumeration! { [
+        OpenConnection,
+        JoinRequest,
+        JoinResponse,
+        ProbeRequest,
+        ProbeResponse
+    ] }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
