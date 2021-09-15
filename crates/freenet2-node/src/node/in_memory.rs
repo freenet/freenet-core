@@ -1,12 +1,12 @@
-use crate::{
-    conn_manager::{self, in_memory::MemoryConnManager},
-    NodeConfig, PeerKey,
-};
+use crate::{conn_manager::in_memory::MemoryConnManager, NodeConfig, PeerKey};
+
+use super::op_state::OpStateStorage;
 
 pub(super) struct InMemory {
     peer: PeerKey,
     listening: bool,
     conn_manager: MemoryConnManager,
+    tx_storage: OpStateStorage,
 }
 
 impl InMemory {
@@ -22,6 +22,7 @@ impl InMemory {
             peer,
             listening: true,
             conn_manager,
+            tx_storage: OpStateStorage::new(),
         })
     }
 
@@ -29,6 +30,8 @@ impl InMemory {
         if !self.listening {
             return Err(());
         }
+
+        loop {}
         Ok(())
     }
 }

@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     conn_manager::{self, ConnectionBridge, Transport},
-    message::{Message, MsgType, ProbeRequest, ProbeResponse, Transaction, Visit},
+    message::{Message, TransactionType, ProbeRequest, ProbeResponse, Transaction, Visit},
     ring_proto::{self, Location, RingProtocol},
 };
 
@@ -74,7 +74,7 @@ impl ProbeProtocol {
         };
         ring_proto
             .conn_manager
-            .listen(<ProbeRequest as MsgType>::msg_type_id(), listen_fn);
+            .listen(<ProbeRequest as TransactionType>::msg_type_id(), listen_fn);
         ProbeProtocol {
             _void_constructor: (),
         }

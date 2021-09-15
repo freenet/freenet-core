@@ -2,11 +2,13 @@ use std::net::IpAddr;
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
+use crate::config::CONF;
+
 use self::{in_memory::InMemory, libp2p_impl::NodeLibP2P};
-use crate::{config::CONF, PeerKey};
 
 mod in_memory;
 mod libp2p_impl;
+mod op_state;
 
 pub struct Node(NodeImpl);
 

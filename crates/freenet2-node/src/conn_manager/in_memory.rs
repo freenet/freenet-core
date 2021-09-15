@@ -8,7 +8,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::{
     config::tracing::Logger,
     conn_manager::{self, ConnectionBridge, ListenerHandle, PeerKey, PeerKeyLocation},
-    message::{Message, MsgTypeId, Transaction},
+    message::{Message, Transaction, TransactionTypeId},
     ring_proto::Location,
 };
 
@@ -25,7 +25,7 @@ type OutboundListenerRegistry = Arc<RwLock<HashMap<Transaction, ResponseListener
 #[derive(Clone)]
 pub(crate) struct MemoryConnManager {
     /// listeners for inbound initial messages
-    inbound_listeners: Arc<HashMap<MsgTypeId, InboundListenerRegistry>>,
+    inbound_listeners: Arc<HashMap<TransactionTypeId, InboundListenerRegistry>>,
     /// listeners for outbound messages replies
     outbound_listeners: OutboundListenerRegistry,
     transport: InMemoryTransport,
@@ -38,8 +38,8 @@ impl MemoryConnManager {
         Logger::init_logger();
         let (pend_listeners, rcv_pend_listeners) = channel::unbounded();
         let transport = InMemoryTransport::new(is_open, peer, location);
-        let inbound_listeners: Arc<HashMap<MsgTypeId, InboundListenerRegistry>> = Arc::new(
-            IntoIter::new(MsgTypeId::enumeration())
+        let inbound_listeners: Arc<HashMap<TransactionTypeId, InboundListenerRegistry>> = Arc::new(
+            IntoIter::new(TransactionTypeId::enumeration())
                 .map(|id| (id, RwLock::new(HashMap::new())))
                 .collect(),
         );
@@ -109,7 +109,7 @@ impl MemoryConnManager {
 impl ConnectionBridge for MemoryConnManager {
     type Transport = InMemoryTransport;
 
-    fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
+    fn listen<F>(&self, tx_type: TransactionTypeId, listen_fn: F) -> ListenerHandle
     where
         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
     {

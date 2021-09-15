@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     conn_manager::{self, ConnectionBridge, ListenerHandle, PeerKey, PeerKeyLocation, Transport},
-    message::{Message, MsgType, Transaction},
+    message::{Message, TransactionType, Transaction},
     ring_proto::messages::{JoinRequest, JoinResponse},
     StdResult,
 };
@@ -236,7 +236,7 @@ where
             Ok(())
         };
         self.conn_manager
-            .listen(<JoinRequest as MsgType>::msg_type_id(), process_join_req)
+            .listen(<JoinRequest as TransactionType>::msg_type_id(), process_join_req)
     }
 
     fn join_ring(self: &Arc<Self>) -> Result<()> {
@@ -264,7 +264,7 @@ where
                     .ok_or(conn_manager::ConnError::LocationUnknown)?
             );
             self.conn_manager.add_connection(*gateway, true);
-            let tx = Transaction::new(<JoinRequest as MsgType>::msg_type_id());
+            let tx = Transaction::new(<JoinRequest as TransactionType>::msg_type_id());
             let join_req = messages::JoinRequest::Initial {
                 key: self.peer_key,
                 hops_to_live: self.max_hops_to_live,
@@ -677,7 +677,7 @@ mod tests {
                 .ok_or("node not found")?;
             let probe_response = ProbeProtocol::probe(
                 rnd_node.ring_protocol.clone(),
-                Transaction::new(<ProbeRequest as MsgType>::msg_type_id()),
+                Transaction::new(<ProbeRequest as TransactionType>::msg_type_id()),
                 ProbeRequest {
                     hops_to_live: 7,
                     target,

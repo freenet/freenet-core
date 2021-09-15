@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, MsgTypeId, Transaction},
+    message::{Message, TransactionTypeId, Transaction},
     ring_proto::Location,
     StdResult,
 };
@@ -55,7 +55,7 @@ pub(crate) trait ConnectionBridge: Send + Sync {
 
     /// Start listening for incoming connections and process any incoming messages with
     /// the provided function.
-    fn listen<F>(&self, tx_type: MsgTypeId, listen_fn: F) -> ListenerHandle
+    fn listen<F>(&self, tx_type: TransactionTypeId, listen_fn: F) -> ListenerHandle
     where
         F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
 

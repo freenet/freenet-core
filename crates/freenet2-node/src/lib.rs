@@ -2,6 +2,7 @@ mod config;
 pub mod conn_manager;
 mod message;
 mod node;
+mod operations;
 mod probe_proto;
 mod ring_proto;
 

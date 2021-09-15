@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ring_proto::{messages::*, Location};
-pub(crate) use _seal_msg_type::MsgTypeId;
+pub(crate) use sealed_msg_type::TransactionTypeId;
 
 /// An transaction is a unique, universal and efficient identifier for any
 /// roundtrip transaction as it is broadcasted around the F2 network.
@@ -20,12 +20,12 @@ pub(crate) use _seal_msg_type::MsgTypeId;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) struct Transaction {
     id: Uuid,
-    ty: MsgTypeId,
+    ty: TransactionTypeId,
     completed: bool,
 }
 
 impl Transaction {
-    pub fn new(ty: MsgTypeId) -> Transaction {
+    pub fn new(ty: TransactionTypeId) -> Transaction {
         // 3 word size for 64-bits platforms most likely since msg type
         // probably will be aligned to 64 bytes
         Self {
@@ -33,6 +33,10 @@ impl Transaction {
             ty,
             completed: false,
         }
+    }
+
+    pub fn tx_type(&self) -> TransactionTypeId {
+        self.ty
     }
 }
 
@@ -42,48 +46,46 @@ impl Display for Transaction {
     }
 }
 
-pub(crate) trait MsgType: _seal_msg_type::SealedMsgType {
-    fn msg_type_id() -> MsgTypeId;
+/// Get the transaction type associated to a given message type.
+pub(crate) trait TransactionType: sealed_msg_type::SealedTxType {
+    fn msg_type_id() -> TransactionTypeId;
 }
 
-impl<T> MsgType for T
+impl<T> TransactionType for T
 where
-    T: _seal_msg_type::SealedMsgType,
+    T: sealed_msg_type::SealedTxType,
 {
-    fn msg_type_id() -> MsgTypeId {
-        <Self as _seal_msg_type::SealedMsgType>::msg_type_id()
+    fn msg_type_id() -> TransactionTypeId {
+        <Self as sealed_msg_type::SealedTxType>::tx_type_id()
     }
 }
 
-mod _seal_msg_type {
+mod sealed_msg_type {
     use super::*;
 
-    pub(crate) trait SealedMsgType {
-        fn msg_type_id() -> MsgTypeId;
+    pub(crate) trait SealedTxType {
+        fn tx_type_id() -> TransactionTypeId;
     }
 
-    macro_rules! message_enumeration {
-         { [$($var:tt),+] } => {
-            #[repr(u8)]
-            #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
-            pub(crate) enum MsgTypeId {
-                $($var,)+
-            }
+    #[repr(u8)]
+    #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+    pub(crate) enum TransactionTypeId {
+        OpenConnection,
+        Probe,
+    }
 
-            impl MsgTypeId {
-                pub fn enumeration() -> [Self; 5] {
-                    [
-                        $( Self::$var, )+
-                    ]
-                }
-            }
+    impl TransactionTypeId {
+        pub const fn enumeration() -> [Self; 2] {
+            [Self::OpenConnection, Self::Probe]
+        }
+    }
 
-            $(
-                message_enumeration!(@transform $var);
-            )+
+    macro_rules! transaction_type_enumeration {
+         (decl struct { $($type:tt -> $var:tt),+ }) => {
+            $( transaction_type_enumeration!(@conversion $type -> $var); )+
         };
 
-        (@transform $ty:tt) => {
+        (@conversion $ty:tt -> $var:tt) => {
             impl From<(Transaction, $ty)> for Message {
                 fn from(oc: (Transaction, $ty)) -> Self {
                     let (tx_id, oc) = oc;
@@ -91,21 +93,21 @@ mod _seal_msg_type {
                 }
             }
 
-            impl SealedMsgType for $ty {
-                fn msg_type_id() -> MsgTypeId {
-                    MsgTypeId::$ty
+            impl SealedTxType for $ty {
+                fn tx_type_id() -> TransactionTypeId {
+                    TransactionTypeId::$var
                 }
             }
         };
     }
 
-    message_enumeration! { [
-        OpenConnection,
-        JoinRequest,
-        JoinResponse,
-        ProbeRequest,
-        ProbeResponse
-    ] }
+    transaction_type_enumeration!(decl struct {
+        JoinRequest -> OpenConnection,
+        JoinResponse -> OpenConnection,
+        OpenConnection -> OpenConnection,
+        ProbeRequest -> Probe,
+        ProbeResponse -> Probe
+    });
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -143,13 +145,13 @@ impl Message {
         }
     }
 
-    pub fn msg_type(&self) -> MsgTypeId {
+    pub fn msg_type(&self) -> TransactionTypeId {
         match self {
-            Self::JoinRequest(_, _) => <JoinRequest as MsgType>::msg_type_id(),
-            Self::JoinResponse(_, _) => <JoinResponse as MsgType>::msg_type_id(),
-            Self::OpenConnection(_, _) => <OpenConnection as MsgType>::msg_type_id(),
-            Self::ProbeRequest(_, _) => <ProbeRequest as MsgType>::msg_type_id(),
-            Self::ProbeResponse(_, _) => <ProbeResponse as MsgType>::msg_type_id(),
+            Self::JoinRequest(_, _) => <JoinRequest as TransactionType>::msg_type_id(),
+            Self::JoinResponse(_, _) => <JoinResponse as TransactionType>::msg_type_id(),
+            Self::OpenConnection(_, _) => <OpenConnection as TransactionType>::msg_type_id(),
+            Self::ProbeRequest(_, _) => <ProbeRequest as TransactionType>::msg_type_id(),
+            Self::ProbeResponse(_, _) => <ProbeResponse as TransactionType>::msg_type_id(),
         }
     }
 }
