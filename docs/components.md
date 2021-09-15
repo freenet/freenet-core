@@ -56,4 +56,7 @@ the Wasmer WebAssembly library supports resource metering to facilitate this. Pe
 resources may be throttled or disconnected. Peers will generally try to be helpful provided it doesn't
 damage their reputations with other peers.
 
-## 
+## Default Apps
+
+While FreenetV2 is a platform, the core application will be immediately useful even before others begin 
+building on it. To achieve that we will provide default applications that meet the needs of 

@@ -4,18 +4,20 @@
 
 ## Motivation
 
-In 2021 a handful of companies control almost the entire Internet infrastructure, with the power to arbitrarily censor or exclude any person or organization without recourse.
+In 2021, a handful of companies control almost the entire Internet infrastructure, with the ability and willingness to arbitrarily 
+censor or exclude any person or organization without recourse or accountability.
 
-F2 will enable the creation of entirely decentralized websites, social networking platforms, online stores, search 
-engines, email, instant messaging, and discussion forums, while providing a framework that ensures interoperability between th?F2
+FreenetV2 makes it easy to build entirely decentralized websites, social networking apps, online stores, search 
+engines, email, instant messaging, and discussion forums - the entire range of Internet usecases. 
+Default versions of these applications will be included.
 
-## Design
+## Platform
 
 FreenetV2 is an entirely decentralized key-value store with [observer semantics](https://en.wikipedia.org/wiki/Observer_pattern), 
 where keys are cryptographic contracts that specify what values are valid for key. This is a generalization of the
 concept of "Signed Subspace Keys" from FreenetV1.
 
-As with FreenetV1, decentralization and scalability is achived through a [small world ring](https://en.wikipedia.org/wiki/Small-world_network).
+As with FreenetV1, decentralization and scalability is achived through a [small world network](https://en.wikipedia.org/wiki/Small-world_network).
 
 This can be contrasted with the blockchain approach where every transaction must be broadcast globally, resulting in high [transaction fees](https://ycharts.com/indicators/ethereum_average_transaction_fee) that prohibit many applications (around US$5.50 per transaction in August 2021).
 
@@ -29,25 +31,17 @@ For flexibility and efficiency, contracts are specified in [web assembly](https:
 World Wide Web Consortium as a replacement for in-browser JavaScript and rapidly growing in support and adoption. This will allow
 new applications to be built on FreenetV2 without needing to constantly upgrade the node software.
 
-FreenetV2 is implemented in the [Rust](https://www.rust-lang.org/) programming language.
+FreenetV2 is implemented in the [Rust](https://www.rust-lang.org/) programming language, which was selected for its speed,
+robust security, and efficiency.
 
-## Services
+## Applications
 
-### Microblogging
+FreenetV2 
 
-*Comparable to:* Twitter, Facebook
-
-### Instant Messaging
-
-*Comparable to:* Whatsapp, Telegram
-
-### Search
-
-*Comparable to:* Google, Bing, Duck Duck Go
-
-### Store
-
-*Comparable to:* Amazon, Ebay, Etsy
+* Microblogging (Twitter, Facebook)
+* Instant Messaging (Whatsapp, Telegram)
+* Search (Google, Bing, Duck Duck Go)
+* Online Store (Amazon, Ebay, Etsy)
 
 ## History
 
