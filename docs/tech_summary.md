@@ -2,20 +2,12 @@
 
 *A decentralized application layer for the Internet*
 
-## History
+## Motivation
 
-The original Freenet (FreenetV1) was based on the author's 1999 [paper](http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.32.3665) 
-"A Distributed Decentralised Information Storage and Retrieval System". Freenet was the first distributed, decentralized, encrypted 
-peer-to-peer network, and pioneered concepts like [small world networks](https://en.wikipedia.org/wiki/Small-world_network), 
-and cryptographic contracts (also known as [signed subspace keys](https://freenetproject.org/papers/freenet-ieee.pdf)).
+In 2021 a handful of companies control almost the entire Internet infrastructure, with the power to arbitrarily censor or exclude any person or organization without recourse.
 
-## Goal
-
-FreenetV2 is a reimagining of Freenet for 2021. 
-
-It provides an alternative to the current highly centralized Internet architecture in which a handful of companies control almost the entire 
-Internet infrastructure. It will enable the creation of entirely decentralized websites, social networking platforms, online stores, search 
-engines, instant messaging, and discussion forums, while providing a framework that ensures interoperability between them.
+F2 will enable the creation of entirely decentralized websites, social networking platforms, online stores, search 
+engines, email, instant messaging, and discussion forums, while providing a framework that ensures interoperability between th?F2
 
 ## Design
 
@@ -56,3 +48,10 @@ FreenetV2 is implemented in the [Rust](https://www.rust-lang.org/) programming l
 ### Store
 
 *Comparable to:* Amazon, Ebay, Etsy
+
+## History
+
+The original Freenet (FreenetV1) was based on the author's 1999 [paper](http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.32.3665) 
+"A Distributed Decentralised Information Storage and Retrieval System". Freenet was the first distributed, decentralized, encrypted 
+peer-to-peer network, and pioneered concepts like [small world networks](https://en.wikipedia.org/wiki/Small-world_network), 
+and cryptographic contracts (also known as [signed subspace keys](https://freenetproject.org/papers/freenet-ieee.pdf)).
