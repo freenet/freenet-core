@@ -1,5 +1,5 @@
 [package]
-name = "freenet2-node"
+name = "locutus-node"
 version = "0.0.1"
 edition = "2018"
 
