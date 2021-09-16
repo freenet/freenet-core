@@ -1,5 +1,5 @@
-use freenet2_node::*;
 use libp2p::identity::Keypair;
+use locutus_node::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn start_node() -> Result<(), Box<dyn std::error::Error>> {

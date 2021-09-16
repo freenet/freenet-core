@@ -32,7 +32,7 @@ pub trait Contract {
     pub fn is_valid_update(current : &Payload, update : &Payload) -> bool
 
     /// 
-    pub fn get(getter : &Option<[u8]>, payload : &Option<Payload>) -> Result<Payload, Error>
+    pub fn get(getter : Option<&[u8]>, payload : Option<Payload>) -> Result<Payload, Error>
 }
 ```
 

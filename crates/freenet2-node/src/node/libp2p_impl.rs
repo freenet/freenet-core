@@ -16,7 +16,7 @@ use crate::{
     NodeConfig,
 };
 
-const CURRENT_AGENT_VER: &str = "freenet2/0.1.0";
+const CURRENT_AGENT_VER: &str = "locutus/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "id/1.0.0";
 
 pub struct NodeLibP2P {
@@ -126,7 +126,7 @@ impl NodeLibP2P {
 ///
 /// - [Identify](https://github.com/libp2p/specs/tree/master/identify) libp2p protocol.
 /// - Pinging between peers.
-// TODO: - freenet2 routing and messaging protocol
+// TODO: - locutus routing and messaging protocol
 #[derive(libp2p::NetworkBehaviour)]
 #[behaviour(event_process = false)]
 #[behaviour(out_event = "NetEvent")]
