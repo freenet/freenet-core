@@ -13,6 +13,7 @@ doc = false
 
 [dependencies]
 # anyhow = "1.0.42"
+async-trait = "0.1.51"
 bincode = "1.3"
 config = { version = "0.11", features = [ "toml" ] } 
 crossbeam = "0.8.1"

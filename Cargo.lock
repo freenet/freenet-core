@@ -1708,6 +1708,7 @@ dependencies = [
 name = "locutus-node"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "bincode",
  "config",
  "crossbeam",

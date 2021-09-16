@@ -1,4 +1,9 @@
-use crate::{conn_manager::in_memory::MemoryConnManager, NodeConfig, PeerKey};
+use crate::{
+    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge2},
+    message::Message,
+    operations::join_ring,
+    NodeConfig, PeerKey,
+};
 
 use super::op_state::OpStateStorage;
 
@@ -6,7 +11,7 @@ pub(super) struct InMemory {
     peer: PeerKey,
     listening: bool,
     conn_manager: MemoryConnManager,
-    tx_storage: OpStateStorage,
+    op_storage: OpStateStorage,
 }
 
 impl InMemory {
@@ -22,16 +27,30 @@ impl InMemory {
             peer,
             listening: true,
             conn_manager,
-            tx_storage: OpStateStorage::new(),
+            op_storage: OpStateStorage::new(),
         })
     }
 
-    pub fn listen_on(&mut self) -> Result<(), ()> {
+    pub async fn listen_on(&mut self) -> Result<(), ()> {
         if !self.listening {
             return Err(());
         }
 
-        loop {}
-        Ok(())
+        loop {
+            match self.conn_manager.recv().await {
+                Ok(msg) => match msg {
+                    Message::JoinRing(join_op) => {
+                        join_ring::join_ring(&mut self.op_storage, &mut self.conn_manager, join_op)
+                            .await
+                            .unwrap();
+                    }
+                    // old:
+                    Message::ProbeRequest(_, _) => todo!(),
+                    Message::ProbeResponse(_, _) => todo!(),
+                    Message::Canceled(_) => todo!(),
+                },
+                Err(_) => break Err(()),
+            }
+        }
     }
 }
