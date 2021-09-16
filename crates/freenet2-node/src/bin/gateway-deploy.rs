@@ -1,5 +1,5 @@
-use freenet2_node::*;
 use libp2p::identity::Keypair;
+use locutus_node::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -766,28 +766,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "freenet2-node"
-version = "0.0.1"
-dependencies = [
- "bincode",
- "config",
- "crossbeam",
- "env_logger",
- "futures",
- "libp2p",
- "log",
- "once_cell",
- "parking_lot",
- "rand 0.8.4",
- "rust-fsm",
- "serde 1.0.129",
- "thiserror",
- "tokio",
- "typestate",
- "uuid",
-]
-
-[[package]]
 name = "futures"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1724,6 +1702,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712a4d093c9976e24e7dbca41db895dabcbac38eb5f4045393d17a95bdfb1109"
 dependencies = [
  "scopeguard",
+]
+
+[[package]]
+name = "locutus-node"
+version = "0.0.1"
+dependencies = [
+ "bincode",
+ "config",
+ "crossbeam",
+ "env_logger",
+ "futures",
+ "libp2p",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "rand 0.8.4",
+ "rust-fsm",
+ "serde 1.0.129",
+ "thiserror",
+ "tokio",
+ "typestate",
+ "uuid",
 ]
 
 [[package]]

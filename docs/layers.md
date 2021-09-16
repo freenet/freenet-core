@@ -1,1 +1,1 @@
-Moved to https://github.com/freenet/freenet2/wiki/Architecture
+Moved to https://github.com/freenet/locutus/wiki/Architecture
