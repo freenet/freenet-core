@@ -25,7 +25,7 @@ pub struct NodeLibP2P {
 }
 
 impl NodeLibP2P {
-    pub(super) fn listen_on(&mut self) -> Result<(), ()> {
+    pub(super) async fn listen_on(&mut self) -> Result<(), ()> {
         if let Some(conn) = self.listen_on {
             let listening_addr = super::multiaddr_from_connection(conn);
             self.swarm.listen_on(listening_addr).unwrap();
@@ -160,12 +160,9 @@ mod tests {
         time::Duration,
     };
 
-    use crate::{
-        config::tracing::Logger,
-        node::{InitPeerNode, Node},
-    };
-
     use super::*;
+    use crate::{config::tracing::Logger, node::InitPeerNode};
+
     use libp2p::{futures::StreamExt, swarm::SwarmEvent};
     use rand::Rng;
 
@@ -228,7 +225,7 @@ mod tests {
                 .with_port(peer1_port)
                 .with_key(peer1_key);
             let mut peer1 = NodeLibP2P::build(config).unwrap();
-            peer1.listen_on().unwrap();
+            peer1.listen_on().await.unwrap();
             ping_ev_loop(&mut peer1).await
         });
 

@@ -5,6 +5,7 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use crate::config::CONF;
 
 use self::{in_memory::InMemory, libp2p_impl::NodeLibP2P};
+pub(crate) use op_state::{OpStateError, OpStateStorage};
 
 mod in_memory;
 mod libp2p_impl;
@@ -13,10 +14,10 @@ mod op_state;
 pub struct Node(NodeImpl);
 
 impl Node {
-    pub fn listen_on(&mut self) -> Result<(), ()> {
+    pub async fn listen_on(&mut self) -> Result<(), ()> {
         match self.0 {
-            NodeImpl::LibP2P(ref mut node) => node.listen_on(),
-            NodeImpl::InMemory(ref mut node) => node.listen_on(),
+            NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
+            NodeImpl::InMemory(ref mut node) => node.listen_on().await,
         }
     }
 }

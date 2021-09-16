@@ -1,25 +1,32 @@
-//! Keeps track of the join operation state in this machine.
-use rust_fsm::*;
 use serde::{Deserialize, Serialize};
 
-use crate::message::TransactionTypeId;
+use crate::{
+    conn_manager,
+    message::{Message, TransactionTypeId},
+    node::OpStateError,
+};
+use join_ring::JoinRingOp;
+pub(crate) use sealed_op_types::OpsMap;
 
-pub(crate) use sealed_op_types::{OperationType, OpsMap};
+pub(crate) mod join_ring;
 
-state_machine! {
-    derive(Debug)
-    pub(crate) JoinRingOp(Connecting)
-
-    Connecting =>  {
-        Connecting => OCReceived [OCReceived],
-        OCReceived => Connected [Connected],
-        Connected => Connected [Connected],
-    },
-    OCReceived(Connected) => Connected [Connected],
+pub(crate) struct OperationResult<S> {
+    /// Inhabited if there is a message to return to the other peer.
+    pub return_msg: Option<Message>,
+    /// None if the operation has been completed.
+    pub state: Option<S>,
 }
 
 #[derive(Debug, Default)]
 pub struct ProbeOp;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OpError {
+    #[error(transparent)]
+    ConnError(#[from] conn_manager::ConnError),
+    #[error(transparent)]
+    OpStateManagerError(#[from] OpStateError),
+}
 
 /// Get the transaction type associated to a given operation type.
 pub(crate) trait AssociatedTxType: sealed_op_types::SealedAssocTxType {
@@ -75,36 +82,7 @@ mod sealed_op_types {
     }
 
     op_type_enumeration!(decl struct {
-        join_ring: JoinRingOp -> OpenConnection,
+        join_ring: JoinRingOp -> JoinRing,
         probe_peers: ProbeOp -> Probe
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_fsm::StateMachine;
-
-    #[test]
-    fn join_ring_transitions() {
-        let mut join_op_host_1 = StateMachine::<JoinRingOp>::new();
-        let res = join_op_host_1
-            .consume(&JoinRingOpInput::Connecting)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(res, JoinRingOpOutput::OCReceived));
-
-        let mut join_op_host_2 = StateMachine::<JoinRingOp>::new();
-        let res = join_op_host_2
-            .consume(&JoinRingOpInput::OCReceived)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(res, JoinRingOpOutput::Connected));
-
-        let res = join_op_host_1
-            .consume(&JoinRingOpInput::Connected)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(res, JoinRingOpOutput::Connected));
-    }
 }

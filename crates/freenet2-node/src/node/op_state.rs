@@ -1,9 +1,9 @@
 use crate::{
-    message::Transaction,
-    operations::{AssociatedTxType, JoinRingOp, OpsMap},
+    message::{Transaction, TransactionTypeId},
+    operations::{join_ring, OpsMap},
 };
 
-pub(super) struct OpStateStorage {
+pub(crate) struct OpStateStorage {
     ops: OpsMap,
 }
 
@@ -12,24 +12,31 @@ impl OpStateStorage {
         Self { ops: OpsMap::new() }
     }
 
-    pub fn push_join_ring_op(&mut self, id: Transaction, tx: JoinRingOp) -> Result<(), ()> {
-        let op_type = <JoinRingOp as AssociatedTxType>::tx_type_id();
-        if !matches!(id.tx_type(), OP_TYPE) {
-            return Err(());
+    pub fn push_join_ring_op(
+        &mut self,
+        id: Transaction,
+        tx: join_ring::JoinRingOp,
+    ) -> Result<(), OpStateError> {
+        if !matches!(id.tx_type(), TransactionTypeId::JoinRing) {
+            return Err(OpStateError::IncorrectTxType(
+                TransactionTypeId::JoinRing,
+                id.tx_type(),
+            ));
         }
         self.ops.join_ring.insert(id, tx);
         Ok(())
     }
 
-    pub fn pop_join_ring_op(&mut self, id: &Transaction) -> Option<JoinRingOp> {
+    pub fn pop_join_ring_op(&mut self, id: &Transaction) -> Option<join_ring::JoinRingOp> {
         self.ops.join_ring.remove(id)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn example() {
-        todo!()
-    }
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OpStateError {
+    #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
+    IncorrectTxType(TransactionTypeId, TransactionTypeId),
 }
+
+#[cfg(test)]
+mod tests {}

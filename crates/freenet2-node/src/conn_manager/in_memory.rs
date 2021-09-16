@@ -12,7 +12,7 @@ use crate::{
     ring_proto::Location,
 };
 
-use super::Transport;
+use super::{ConnError, ConnectionBridge2, Transport};
 
 type InboundListenerFn =
     Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
@@ -103,6 +103,17 @@ impl MemoryConnManager {
             transport,
             pend_listeners,
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionBridge2 for MemoryConnManager {
+    async fn recv(&self) -> Result<Message, ConnError> {
+        todo!()
+    }
+
+    async fn send(&self, msg: Message) -> Result<(), ConnError> {
+        todo!()
     }
 }
 

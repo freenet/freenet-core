@@ -70,53 +70,64 @@ mod sealed_msg_type {
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     pub(crate) enum TransactionTypeId {
-        OpenConnection,
+        JoinRing,
         Probe,
     }
 
     impl TransactionTypeId {
         pub const fn enumeration() -> [Self; 2] {
-            [Self::OpenConnection, Self::Probe]
+            [Self::JoinRing, Self::Probe]
         }
     }
 
     macro_rules! transaction_type_enumeration {
-         (decl struct { $($type:tt -> $var:tt),+ }) => {
-            $( transaction_type_enumeration!(@conversion $type -> $var); )+
+         (decl struct { $($type:tt),+ }) => {
+            $( transaction_type_enumeration!(@conversion $type); )+
         };
 
-        (@conversion $ty:tt -> $var:tt) => {
-            impl From<(Transaction, $ty)> for Message {
-                fn from(oc: (Transaction, $ty)) -> Self {
-                    let (tx_id, oc) = oc;
-                    Self::$ty(tx_id, oc)
+        (@conversion $ty:tt) => {
+            impl From<$ty> for Message {
+                fn from(msg: $ty) -> Self {
+                    Self::$ty(msg)
                 }
             }
 
             impl SealedTxType for $ty {
                 fn tx_type_id() -> TransactionTypeId {
-                    TransactionTypeId::$var
+                    TransactionTypeId::$ty
                 }
             }
         };
     }
 
     transaction_type_enumeration!(decl struct {
-        JoinRequest -> OpenConnection,
-        JoinResponse -> OpenConnection,
-        OpenConnection -> OpenConnection,
-        ProbeRequest -> Probe,
-        ProbeResponse -> Probe
+        JoinRing
     });
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) enum Message {
-    // Ring
-    JoinRequest(Transaction, JoinRequest),
-    JoinResponse(Transaction, JoinResponse),
-    OpenConnection(Transaction, OpenConnection),
+pub(crate) enum JoinRing {
+    Req { id: Transaction, msg: JoinRequest },
+    OC { id: Transaction, msg: JoinResponse },
+    Resp { id: Transaction, msg: JoinResponse },
+}
 
+impl JoinRing {
+    pub fn id(&self) -> &Transaction {
+        use JoinRing::*;
+        match self {
+            Req { id, .. } => id,
+            OC { id, .. } => id,
+            Resp { id, .. } => id,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) enum Message {
+    JoinRing(JoinRing),
+    /// Failed a transaction, informing of cancellation.
+    Canceled(Transaction),
     // Probe
     ProbeRequest(Transaction, ProbeRequest),
     ProbeResponse(Transaction, ProbeResponse),
@@ -124,35 +135,21 @@ pub(crate) enum Message {
 
 impl Message {
     fn msg_type_repr(&self) -> &'static str {
-        use Message::*;
-        match self {
-            JoinRequest(_, _) => "JoinRequest",
-            JoinResponse(_, _) => "JoinResponse",
-            OpenConnection(_, _) => "OpenConnection",
-            ProbeRequest(_, _) => "ProbeRequest",
-            ProbeResponse(_, _) => "ProbeResponse",
-        }
+        todo!()
     }
 
     pub fn id(&self) -> &Transaction {
         use Message::*;
         match self {
-            JoinRequest(id, _) => id,
-            JoinResponse(id, _) => id,
-            OpenConnection(id, _) => id,
+            JoinRing(op) => op.id(),
             ProbeRequest(id, _) => id,
             ProbeResponse(id, _) => id,
+            Canceled(_) => todo!(),
         }
     }
 
     pub fn msg_type(&self) -> TransactionTypeId {
-        match self {
-            Self::JoinRequest(_, _) => <JoinRequest as TransactionType>::msg_type_id(),
-            Self::JoinResponse(_, _) => <JoinResponse as TransactionType>::msg_type_id(),
-            Self::OpenConnection(_, _) => <OpenConnection as TransactionType>::msg_type_id(),
-            Self::ProbeRequest(_, _) => <ProbeRequest as TransactionType>::msg_type_id(),
-            Self::ProbeResponse(_, _) => <ProbeResponse as TransactionType>::msg_type_id(),
-        }
+        todo!()
     }
 }
 

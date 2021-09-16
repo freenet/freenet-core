@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, TransactionTypeId, Transaction},
+    message::{Message, Transaction, TransactionTypeId},
     ring_proto::Location,
     StdResult,
 };
@@ -36,6 +36,15 @@ impl Default for ListenerHandle {
     }
 }
 
+#[async_trait::async_trait]
+pub(crate) trait ConnectionBridge2 {
+    async fn recv(&self) -> Result<Message>;
+
+    async fn send(&self, msg: Message) -> Result<()>;
+}
+
+/// Manage message carrying in a thread safe & friendly manner.
+///
 /// Types which impl this trait are responsible for the following responsabilities:
 /// - establishing reliable connections to other peers,
 ///   including any handshake procedures
