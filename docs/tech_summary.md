@@ -43,6 +43,48 @@ FreenetV2
 * Search (Google, Bing, Duck Duck Go)
 * Online Store (Amazon, Ebay, Etsy)
 
+## Past Milestones
+
+### July 2020
+
+* Design and prototyping began
+
+### August 2021
+
+* Rust implementation begins
+
+### September 2021
+
+* Second developer joins the team
+
+## Upcoming Milestones
+
+### September 2021
+
+* Low-level networking and infrastructure
+* Ring topology
+
+### October 2021
+
+* Key-value store
+* Web Assembly contracts
+* Get/put/subscribe protocols
+
+### November 2021
+
+* Key-value store WebSocket API
+* Email app
+* freenet.org email gateway
+
+### December 2021
+
+* Microblogging app
+* IM app
+
+### January 2022
+
+* Online store app
+
 ## History
 
 The original Freenet (FreenetV1) was based on the author's 1999 [paper](http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.32.3665) 
