@@ -8,8 +8,8 @@ In 2021, a handful of companies control almost the entire Internet infrastructur
 censor or exclude any person or organization without recourse or accountability.
 
 FreenetV2 makes it easy to build entirely decentralized websites, social networking apps, online stores, search 
-engines, email, instant messaging, and discussion forums - the entire range of Internet usecases. 
-Default versions of these applications will be included.
+engines, email, instant messaging, and discussion forums - the entire range of Internet usecases, and will be distributed
+with versions of each of these apps, likely starting with email.
 
 ## Platform
 
@@ -36,8 +36,7 @@ robust security, and efficiency.
 
 ## Applications
 
-FreenetV2 
-
+* Email (Gmail, ProtonMail)
 * Microblogging (Twitter, Facebook)
 * Instant Messaging (Whatsapp, Telegram)
 * Search (Google, Bing, Duck Duck Go)
