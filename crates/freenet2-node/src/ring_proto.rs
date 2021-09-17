@@ -1,15 +1,66 @@
-// #![allow(unused)] // FIXME: remove this attr
+//! Ring protocol logic and supporting types.
 
-use std::{convert::TryFrom, fmt::Display, hash::Hasher};
+use std::{collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
 
-use serde::{Deserialize, Serialize};
+use parking_lot::RwLock;
 
-use crate::{
-    conn_manager::{self, PeerKey, PeerKeyLocation},
-    StdResult,
-};
+use crate::conn_manager::{self, PeerKeyLocation};
 
-type Result<T> = StdResult<T, RingProtoError>;
+#[derive(Debug)]
+pub(crate) struct Ring {
+    pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+}
+
+impl Ring {
+    const MIN_CONNECTIONS: usize = 10;
+    const MAX_CONNECTIONS: usize = 20;
+
+    fn new() -> Self {
+        Ring {
+            connections_by_location: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    fn should_accept(&self, my_location: &Location, location: &Location) -> bool {
+        let cbl = &*self.connections_by_location.read();
+        if location == my_location || cbl.contains_key(location) {
+            false
+        } else if cbl.len() < Self::MIN_CONNECTIONS {
+            true
+        } else if cbl.len() >= Self::MAX_CONNECTIONS {
+            false
+        } else {
+            my_location.distance(location) < self.median_distance_to(my_location)
+        }
+    }
+
+    fn median_distance_to(&self, location: &Location) -> Distance {
+        let mut conn_by_dist = self.connections_by_distance(location);
+        conn_by_dist.sort_by_key(|(k, _)| *k);
+        let idx = self.connections_by_location.read().len() / 2;
+        conn_by_dist[idx].0
+    }
+
+    pub fn connections_by_distance(&self, to: &Location) -> Vec<(Distance, PeerKeyLocation)> {
+        self.connections_by_location
+            .read()
+            .iter()
+            .map(|(key, peer)| (key.distance(to), *peer))
+            .collect()
+    }
+
+    fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
+    where
+        F: FnMut(&&PeerKeyLocation) -> bool,
+    {
+        // FIXME: should be optimized and avoid copying
+        self.connections_by_location
+            .read()
+            .values()
+            .find(filter_fn)
+            .copied()
+    }
+}
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
@@ -77,7 +128,7 @@ impl std::hash::Hash for Location {
 impl TryFrom<f64> for Location {
     type Error = ();
 
-    fn try_from(value: f64) -> StdResult<Self, Self::Error> {
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
         if !(0.0..=1.0).contains(&value) {
             Err(())
         } else {
@@ -92,64 +143,4 @@ pub(crate) enum RingProtoError {
     Join,
     #[error(transparent)]
     ConnError(#[from] conn_manager::ConnError),
-}
-
-pub(crate) mod messages {
-    use super::*;
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub(crate) enum JoinRequest {
-        Initial {
-            key: PeerKey,
-            hops_to_live: usize,
-        },
-        Proxy {
-            joiner: PeerKeyLocation,
-            hops_to_live: usize,
-        },
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub(crate) enum JoinResponse {
-        Initial {
-            accepted_by: Vec<PeerKeyLocation>,
-            your_location: Location,
-            your_peer_id: PeerKey,
-        },
-        Proxy {
-            accepted_by: Vec<PeerKeyLocation>,
-        },
-    }
-
-    /// A stateful connection attempt.
-    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum OpenConnection {
-        OCReceived,
-        Connecting,
-        Connected,
-    }
-
-    impl OpenConnection {
-        pub fn is_initiated(&self) -> bool {
-            matches!(self, OpenConnection::Connecting)
-        }
-
-        pub fn is_connected(&self) -> bool {
-            matches!(self, OpenConnection::Connected)
-        }
-
-        pub(super) fn transition(&mut self, other_host_state: Self) {
-            match (*self, other_host_state) {
-                (Self::Connected, _) => {}
-                (_, Self::Connecting) => *self = Self::OCReceived,
-                (_, Self::OCReceived | Self::Connected) => *self = Self::Connected,
-            }
-        }
-    }
-
-    impl Display for OpenConnection {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "OpenConnection::{:?}", self)
-        }
-    }
 }

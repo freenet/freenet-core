@@ -3,7 +3,7 @@ use std::{fmt::Display, time::Duration};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ring_proto::{messages::*, Location};
+use crate::{operations::join_ring::JoinRingMsg, ring_proto::Location};
 pub(crate) use sealed_msg_type::TransactionTypeId;
 
 /// An transaction is a unique, universal and efficient identifier for any
@@ -81,51 +81,31 @@ mod sealed_msg_type {
     }
 
     macro_rules! transaction_type_enumeration {
-         (decl struct { $($type:tt),+ }) => {
-            $( transaction_type_enumeration!(@conversion $type); )+
-        };
-
-        (@conversion $ty:tt) => {
-            impl From<$ty> for Message {
-                fn from(msg: $ty) -> Self {
-                    Self::$ty(msg)
+        (decl struct { $( $var:tt -> $ty:tt),+ }) => {
+            $(
+                impl From<$ty> for Message {
+                    fn from(msg: $ty) -> Self {
+                        Self::$var(msg)
+                    }
                 }
-            }
 
-            impl SealedTxType for $ty {
-                fn tx_type_id() -> TransactionTypeId {
-                    TransactionTypeId::$ty
+                impl SealedTxType for $ty {
+                    fn tx_type_id() -> TransactionTypeId {
+                        TransactionTypeId::$var
+                    }
                 }
-            }
+            )+
         };
     }
 
     transaction_type_enumeration!(decl struct {
-        JoinRing
+        JoinRing -> JoinRingMsg
     });
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) enum JoinRing {
-    Req { id: Transaction, msg: JoinRequest },
-    OC { id: Transaction, msg: JoinResponse },
-    Resp { id: Transaction, msg: JoinResponse },
-}
-
-impl JoinRing {
-    pub fn id(&self) -> &Transaction {
-        use JoinRing::*;
-        match self {
-            Req { id, .. } => id,
-            OC { id, .. } => id,
-            Resp { id, .. } => id,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum Message {
-    JoinRing(JoinRing),
+    JoinRing(JoinRingMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
     // Probe

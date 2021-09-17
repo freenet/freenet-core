@@ -5,14 +5,13 @@ use crossbeam::channel::{self, Receiver, Sender};
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock};
 
+use super::{ConnError, Transport};
 use crate::{
     config::tracing::Logger,
     conn_manager::{self, ConnectionBridge, ListenerHandle, PeerKey, PeerKeyLocation},
     message::{Message, Transaction, TransactionTypeId},
     ring_proto::Location,
 };
-
-use super::{ConnError, ConnectionBridge2, Transport};
 
 type InboundListenerFn =
     Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
@@ -107,7 +106,7 @@ impl MemoryConnManager {
 }
 
 #[async_trait::async_trait]
-impl ConnectionBridge2 for MemoryConnManager {
+impl ConnectionBridge for MemoryConnManager {
     async fn recv(&self) -> Result<Message, ConnError> {
         todo!()
     }
@@ -117,81 +116,81 @@ impl ConnectionBridge2 for MemoryConnManager {
     }
 }
 
-impl ConnectionBridge for MemoryConnManager {
-    type Transport = InMemoryTransport;
+// impl ConnectionBridge for MemoryConnManager {
+//     type Transport = InMemoryTransport;
 
-    fn listen<F>(&self, tx_type: TransactionTypeId, listen_fn: F) -> ListenerHandle
-    where
-        F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
-    {
-        let tx_ty_listener = &self.inbound_listeners[&tx_type];
-        let handle_id = ListenerHandle::new();
-        tx_ty_listener
-            .write()
-            .insert(handle_id, Box::new(listen_fn));
-        handle_id
-    }
+//     fn listen<F>(&self, tx_type: TransactionTypeId, listen_fn: F) -> ListenerHandle
+//     where
+//         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
+//     {
+//         let tx_ty_listener = &self.inbound_listeners[&tx_type];
+//         let handle_id = ListenerHandle::new();
+//         tx_ty_listener
+//             .write()
+//             .insert(handle_id, Box::new(listen_fn));
+//         handle_id
+//     }
 
-    fn listen_to_replies<F>(&self, tx: Transaction, callback: F)
-    where
-        F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
-    {
-        // optimistically try to acquire a lock
-        if let Some(mut lock) = self.outbound_listeners.try_write() {
-            lock.insert(tx, Box::new(callback));
-        } else {
-            // it failed, this is being inserted from an other existing closure holding the lock
-            // send it to the temporal stack queue for posterior insertion
-            self.pend_listeners
-                .send((tx, Box::new(callback)))
-                .expect("full or disconnected");
-        }
-    }
+//     fn listen_to_replies<F>(&self, tx: Transaction, callback: F)
+//     where
+//         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
+//     {
+//         // optimistically try to acquire a lock
+//         if let Some(mut lock) = self.outbound_listeners.try_write() {
+//             lock.insert(tx, Box::new(callback));
+//         } else {
+//             // it failed, this is being inserted from an other existing closure holding the lock
+//             // send it to the temporal stack queue for posterior insertion
+//             self.pend_listeners
+//                 .send((tx, Box::new(callback)))
+//                 .expect("full or disconnected");
+//         }
+//     }
 
-    fn transport(&self) -> &Self::Transport {
-        &self.transport
-    }
+//     fn transport(&self) -> &Self::Transport {
+//         &self.transport
+//     }
 
-    fn add_connection(&self, _peer_key: PeerKeyLocation, _unsolicited: bool) {}
+//     fn add_connection(&self, _peer_key: PeerKeyLocation, _unsolicited: bool) {}
 
-    fn send_with_callback<F>(
-        &self,
-        to: PeerKeyLocation,
-        tx: Transaction,
-        msg: Message,
-        callback: F,
-    ) -> conn_manager::Result<()>
-    where
-        F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
-    {
-        // store listening func
-        self.outbound_listeners
-            .write()
-            .insert(tx, Box::new(callback));
+//     fn send_with_callback<F>(
+//         &self,
+//         to: PeerKeyLocation,
+//         tx: Transaction,
+//         msg: Message,
+//         callback: F,
+//     ) -> conn_manager::Result<()>
+//     where
+//         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
+//     {
+//         // store listening func
+//         self.outbound_listeners
+//             .write()
+//             .insert(tx, Box::new(callback));
 
-        // send the msg
-        let serialized = bincode::serialize(&msg)?;
-        self.transport
-            .send(to.peer, to.location.unwrap(), serialized);
-        Ok(())
-    }
+//         // send the msg
+//         let serialized = bincode::serialize(&msg)?;
+//         self.transport
+//             .send(to.peer, to.location.unwrap(), serialized);
+//         Ok(())
+//     }
 
-    fn send(
-        &self,
-        to: PeerKeyLocation,
-        _tx: Transaction,
-        msg: Message,
-    ) -> conn_manager::Result<()> {
-        let serialized = bincode::serialize(&msg)?;
-        self.transport
-            .send(to.peer, to.location.unwrap(), serialized);
-        Ok(())
-    }
+//     fn send(
+//         &self,
+//         to: PeerKeyLocation,
+//         _tx: Transaction,
+//         msg: Message,
+//     ) -> conn_manager::Result<()> {
+//         let serialized = bincode::serialize(&msg)?;
+//         self.transport
+//             .send(to.peer, to.location.unwrap(), serialized);
+//         Ok(())
+//     }
 
-    fn remove_listener(&self, tx: Transaction) {
-        self.outbound_listeners.write().remove(&tx);
-    }
-}
+//     fn remove_listener(&self, tx: Transaction) {
+//         self.outbound_listeners.write().remove(&tx);
+//     }
+// }
 
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
     OnceCell::new();
