@@ -1,5 +1,5 @@
 use crate::{
-    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge2},
+    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge},
     message::Message,
     operations::join_ring,
     NodeConfig, PeerKey,

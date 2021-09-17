@@ -6,7 +6,7 @@ use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    message::{Message, Transaction, TransactionTypeId},
+    message::{Message, Transaction},
     ring_proto::Location,
     StdResult,
 };
@@ -37,72 +37,10 @@ impl Default for ListenerHandle {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait ConnectionBridge2 {
+pub(crate) trait ConnectionBridge {
     async fn recv(&self) -> Result<Message>;
 
     async fn send(&self, msg: Message) -> Result<()>;
-}
-
-/// Manage message carrying in a thread safe & friendly manner.
-///
-/// Types which impl this trait are responsible for the following responsabilities:
-/// - establishing reliable connections to other peers,
-///   including any handshake procedures
-/// - keep connections alive or reconnecting to other peers
-/// - securely transmitting messages between peers
-/// - serializing and deserializing messages
-///
-/// The implementing types manage the lower level connection details of the the network,
-/// usually working at the transport layer over UDP or TCP and performing NAT traversal
-/// to establish connections between peers.
-pub(crate) trait ConnectionBridge: Send + Sync {
-    /// The transport being used to manage networking.
-    type Transport: Transport;
-
-    /// Register a handler callback for when a connection is removed.
-    // fn on_remove_conn(&self, func: RemoveConnHandler);
-
-    /// Start listening for incoming connections and process any incoming messages with
-    /// the provided function.
-    fn listen<F>(&self, tx_type: TransactionTypeId, listen_fn: F) -> ListenerHandle
-    where
-        F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
-
-    /// Listens to inbound replies for a previously broadcasted transaction to the network,
-    /// if a reply is detected performs a callback.
-    // FIXME: the fn could take arguments by ref if necessary but due to
-    // https://github.com/rust-lang/rust/issues/70263 it won't compile
-    // can workaround by wrapping up the fn to express lifetime constraints,
-    // consider this, meanwhile passing by value is fine
-    fn listen_to_replies<F>(&self, tx_id: Transaction, callback: F)
-    where
-        F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
-
-    fn transport(&self) -> &Self::Transport;
-
-    /// Initiate a connection with a given peer. At this stage NAT traversal
-    /// has been succesful and the [`Transport`] has established a connection.
-    fn add_connection(&self, peer_key: PeerKeyLocation, unsolicited: bool);
-
-    /// Sends a message to a given peer which has already been identified and  
-    /// which has established a connection with this peer, registers a callback action
-    /// with the manager for when a response is received.
-    fn send_with_callback<F>(
-        &self,
-        to: PeerKeyLocation,
-        tx_id: Transaction,
-        msg: Message,
-        callback: F,
-    ) -> Result<()>
-    where
-        F: Fn(PeerKeyLocation, Message) -> Result<()> + Send + Sync + 'static;
-
-    /// Send a message to a given peer which has already been identified and  
-    /// which has established a connection with this peer.
-    fn send(&self, to: PeerKeyLocation, tx_id: Transaction, msg: Message) -> Result<()>;
-
-    /// Remove a listener for a given transaction.
-    fn remove_listener(&self, tx_id: Transaction);
 }
 
 /// A protocol used to send and receive data over the network.

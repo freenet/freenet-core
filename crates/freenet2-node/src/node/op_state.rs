@@ -15,7 +15,7 @@ impl OpStateStorage {
     pub fn push_join_ring_op(
         &mut self,
         id: Transaction,
-        tx: join_ring::JoinRingOp,
+        tx: join_ring::JoinRingOpState,
     ) -> Result<(), OpStateError> {
         if !matches!(id.tx_type(), TransactionTypeId::JoinRing) {
             return Err(OpStateError::IncorrectTxType(
@@ -27,7 +27,7 @@ impl OpStateStorage {
         Ok(())
     }
 
-    pub fn pop_join_ring_op(&mut self, id: &Transaction) -> Option<join_ring::JoinRingOp> {
+    pub fn pop_join_ring_op(&mut self, id: &Transaction) -> Option<join_ring::JoinRingOpState> {
         self.ops.join_ring.remove(id)
     }
 }

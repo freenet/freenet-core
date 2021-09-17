@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     conn_manager,
-    message::{Message, TransactionTypeId},
+    message::{Message, Transaction},
     node::OpStateError,
 };
-use join_ring::JoinRingOp;
-pub(crate) use sealed_op_types::OpsMap;
+
+use self::join_ring::JoinRingOpState;
 
 pub(crate) mod join_ring;
 
@@ -28,61 +28,31 @@ pub(crate) enum OpError {
     OpStateManagerError(#[from] OpStateError),
 }
 
-/// Get the transaction type associated to a given operation type.
-pub(crate) trait AssociatedTxType: sealed_op_types::SealedAssocTxType {
-    fn tx_type_id() -> TransactionTypeId;
-}
+macro_rules! op_type_enumeration {
+    (decl struct { $($field:ident: $var:tt),+ } ) => {
+        #[repr(u8)]
+        #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+        pub(crate) enum OperationType {
+            $($var,)+
+        }
 
-impl<T> AssociatedTxType for T
-where
-    T: sealed_op_types::SealedAssocTxType,
-{
-    fn tx_type_id() -> TransactionTypeId {
-        <Self as sealed_op_types::SealedAssocTxType>::tx_type_id()
-    }
-}
 
-mod sealed_op_types {
-    use super::*;
-    use crate::message::Transaction;
+        #[derive(Debug)]
+        pub(crate) struct OpsMap {
+            $( pub $field: std::collections::HashMap<Transaction, $var>),+,
+        }
 
-    pub(crate) trait SealedAssocTxType {
-        fn tx_type_id() -> TransactionTypeId;
-    }
-
-    macro_rules! op_type_enumeration {
-        (decl struct { $($field:ident: $var:tt -> $tx_ty:tt),+ } ) => {
-            #[repr(u8)]
-            #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
-            pub(crate) enum OperationType {
-                $($var,)+
-            }
-
-            $(
-                impl SealedAssocTxType for $var {
-                    fn tx_type_id() -> TransactionTypeId {
-                        TransactionTypeId::$tx_ty
-                    }
-                }
-            )+
-
-            #[derive(Debug)]
-            pub(crate) struct OpsMap {
-                $( pub $field: std::collections::HashMap<Transaction, $var>),+,
-            }
-
-            impl OpsMap {
-                pub fn new() -> Self {
-                    Self {
-                        $( $field: std::collections::HashMap::new()),+,
-                    }
+        impl OpsMap {
+            pub fn new() -> Self {
+                Self {
+                    $( $field: std::collections::HashMap::new()),+,
                 }
             }
-        };
-    }
-
-    op_type_enumeration!(decl struct {
-        join_ring: JoinRingOp -> JoinRing,
-        probe_peers: ProbeOp -> Probe
-    });
+        }
+    };
 }
+
+op_type_enumeration!(decl struct {
+    join_ring: JoinRingOpState,
+    probe_peers: ProbeOp
+});
