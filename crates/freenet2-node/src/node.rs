@@ -5,7 +5,7 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use crate::config::CONF;
 
 use self::{in_memory::InMemory, libp2p_impl::NodeLibP2P};
-pub(crate) use op_state::{OpStateError, OpStateStorage};
+pub(crate) use op_state::{OpExecutionError, OpStateStorage};
 
 mod in_memory;
 mod libp2p_impl;

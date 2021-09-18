@@ -38,6 +38,8 @@ impl Default for ListenerHandle {
 
 #[async_trait::async_trait]
 pub(crate) trait ConnectionBridge {
+    fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool);
+
     async fn recv(&self) -> Result<Message>;
 
     async fn send(&self, msg: Message) -> Result<()>;
