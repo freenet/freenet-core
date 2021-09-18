@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     conn_manager,
     message::{Message, Transaction},
-    node::OpStateError,
+    node::OpExecutionError,
 };
 
-use self::join_ring::JoinRingOpState;
+use self::join_ring::JoinRingOp;
 
 pub(crate) mod join_ring;
 
@@ -25,7 +25,9 @@ pub(crate) enum OpError {
     #[error(transparent)]
     ConnError(#[from] conn_manager::ConnError),
     #[error(transparent)]
-    OpStateManagerError(#[from] OpStateError),
+    OpStateManagerError(#[from] OpExecutionError),
+    #[error("illegal awaiting state")]
+    IllegalStateTransition,
 }
 
 macro_rules! op_type_enumeration {
@@ -36,8 +38,6 @@ macro_rules! op_type_enumeration {
             $($var,)+
         }
 
-
-        #[derive(Debug)]
         pub(crate) struct OpsMap {
             $( pub $field: std::collections::HashMap<Transaction, $var>),+,
         }
@@ -53,6 +53,6 @@ macro_rules! op_type_enumeration {
 }
 
 op_type_enumeration!(decl struct {
-    join_ring: JoinRingOpState,
+    join_ring: JoinRingOp,
     probe_peers: ProbeOp
 });

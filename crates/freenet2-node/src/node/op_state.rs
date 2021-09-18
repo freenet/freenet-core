@@ -15,10 +15,10 @@ impl OpStateStorage {
     pub fn push_join_ring_op(
         &mut self,
         id: Transaction,
-        tx: join_ring::JoinRingOpState,
-    ) -> Result<(), OpStateError> {
+        tx: join_ring::JoinRingOp,
+    ) -> Result<(), OpExecutionError> {
         if !matches!(id.tx_type(), TransactionTypeId::JoinRing) {
-            return Err(OpStateError::IncorrectTxType(
+            return Err(OpExecutionError::IncorrectTxType(
                 TransactionTypeId::JoinRing,
                 id.tx_type(),
             ));
@@ -27,15 +27,17 @@ impl OpStateStorage {
         Ok(())
     }
 
-    pub fn pop_join_ring_op(&mut self, id: &Transaction) -> Option<join_ring::JoinRingOpState> {
+    pub fn pop_join_ring_op(&mut self, id: &Transaction) -> Option<join_ring::JoinRingOp> {
         self.ops.join_ring.remove(id)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OpStateError {
+pub(crate) enum OpExecutionError {
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionTypeId, TransactionTypeId),
+    #[error("failed while processing transaction")]
+    UpdateFailure,
 }
 
 #[cfg(test)]

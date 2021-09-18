@@ -114,6 +114,10 @@ impl ConnectionBridge for MemoryConnManager {
     async fn send(&self, msg: Message) -> Result<(), ConnError> {
         todo!()
     }
+
+    fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool) {
+        todo!()
+    }
 }
 
 // impl ConnectionBridge for MemoryConnManager {
