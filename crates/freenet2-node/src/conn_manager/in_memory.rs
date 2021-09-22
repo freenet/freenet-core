@@ -10,7 +10,7 @@ use crate::{
     config::tracing::Logger,
     conn_manager::{self, ConnectionBridge, ListenerHandle, PeerKey, PeerKeyLocation},
     message::{Message, Transaction, TransactionTypeId},
-    ring_proto::Location,
+    ring::Location,
 };
 
 type InboundListenerFn =
@@ -111,7 +111,7 @@ impl ConnectionBridge for MemoryConnManager {
         todo!()
     }
 
-    async fn send(&self, msg: Message) -> Result<(), ConnError> {
+    async fn send(&self, target: &PeerKeyLocation, msg: Message) -> Result<(), ConnError> {
         todo!()
     }
 

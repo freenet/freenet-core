@@ -4,7 +4,7 @@ mod message;
 mod node;
 mod operations;
 // mod probe_proto;
-mod ring_proto;
+mod ring;
 
 pub use conn_manager::PeerKey;
 pub use node::NodeConfig;
