@@ -1,15 +1,22 @@
+use std::sync::Arc;
+
 use crate::{
     message::{Transaction, TransactionTypeId},
     operations::{join_ring, OpsMap},
+    ring::Ring,
 };
 
 pub(crate) struct OpStateStorage {
     ops: OpsMap,
+    pub ring: Arc<Ring>,
 }
 
 impl OpStateStorage {
     pub fn new() -> Self {
-        Self { ops: OpsMap::new() }
+        Self {
+            ops: OpsMap::new(),
+            ring: Arc::new(Ring::new()),
+        }
     }
 
     pub fn push_join_ring_op(
@@ -36,8 +43,8 @@ impl OpStateStorage {
 pub(crate) enum OpExecutionError {
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionTypeId, TransactionTypeId),
-    #[error("failed while processing transaction")]
-    UpdateFailure,
+    #[error("failed while processing transaction {0}")]
+    TxUpdateFailure(Transaction),
 }
 
 #[cfg(test)]

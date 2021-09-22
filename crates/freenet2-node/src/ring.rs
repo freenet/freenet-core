@@ -9,19 +9,40 @@ use crate::conn_manager::{self, PeerKeyLocation};
 #[derive(Debug)]
 pub(crate) struct Ring {
     pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+    pub rnd_if_htl_above: usize,
+    pub max_hops_to_live: usize,
 }
 
 impl Ring {
     const MIN_CONNECTIONS: usize = 10;
     const MAX_CONNECTIONS: usize = 20;
 
-    fn new() -> Self {
+    /// Above this number of remaining hops,
+    /// randomize which of node a message which be forwarded to.
+    pub const RAND_WALK_ABOVE_HTL: usize = 7;
+
+    ///
+    pub const MAX_HOPS_TO_LIVE: usize = 10;
+
+    pub fn new() -> Self {
         Ring {
             connections_by_location: RwLock::new(BTreeMap::new()),
+            rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
+            max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
         }
     }
 
-    fn should_accept(&self, my_location: &Location, location: &Location) -> bool {
+    pub fn with_rnd_walk_above(&mut self, rnd_if_htl_above: usize) -> &mut Self {
+        self.rnd_if_htl_above = rnd_if_htl_above;
+        self
+    }
+
+    pub fn with_max_hops(&mut self, max_hops_to_live: usize) -> &mut Self {
+        self.max_hops_to_live = max_hops_to_live;
+        self
+    }
+
+    pub fn should_accept(&self, my_location: &Location, location: &Location) -> bool {
         let cbl = &*self.connections_by_location.read();
         if location == my_location || cbl.contains_key(location) {
             false
@@ -34,7 +55,7 @@ impl Ring {
         }
     }
 
-    fn median_distance_to(&self, location: &Location) -> Distance {
+    pub fn median_distance_to(&self, location: &Location) -> Distance {
         let mut conn_by_dist = self.connections_by_distance(location);
         conn_by_dist.sort_by_key(|(k, _)| *k);
         let idx = self.connections_by_location.read().len() / 2;
@@ -49,7 +70,7 @@ impl Ring {
             .collect()
     }
 
-    fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
+    pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
     where
         F: FnMut(&&PeerKeyLocation) -> bool,
     {
@@ -142,5 +163,5 @@ pub(crate) enum RingProtoError {
     #[error("failed while attempting to join a ring")]
     Join,
     #[error(transparent)]
-    ConnError(#[from] conn_manager::ConnError),
+    ConnError(#[from] Box<conn_manager::ConnError>),
 }

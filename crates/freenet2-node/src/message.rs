@@ -3,7 +3,7 @@ use std::{fmt::Display, time::Duration};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{operations::join_ring::JoinRingMsg, ring_proto::Location};
+use crate::{conn_manager::PeerKeyLocation, operations::join_ring::JoinRingMsg, ring::Location};
 pub(crate) use sealed_msg_type::TransactionTypeId;
 
 /// An transaction is a unique, universal and efficient identifier for any
@@ -125,6 +125,16 @@ impl Message {
             ProbeRequest(id, _) => id,
             ProbeResponse(id, _) => id,
             Canceled(_) => todo!(),
+        }
+    }
+
+    pub fn sender(&self) -> Option<&PeerKeyLocation> {
+        use Message::*;
+        match self {
+            JoinRing(op) => op.sender(),
+            ProbeRequest(id, _) => None,
+            ProbeResponse(id, _) => None,
+            Canceled(_) => None,
         }
     }
 

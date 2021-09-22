@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     message::{Message, Transaction},
-    ring_proto::Location,
+    ring::Location,
     StdResult,
 };
 
@@ -42,7 +42,7 @@ pub(crate) trait ConnectionBridge {
 
     async fn recv(&self) -> Result<Message>;
 
-    async fn send(&self, msg: Message) -> Result<()>;
+    async fn send(&self, target: &PeerKeyLocation, msg: Message) -> Result<()>;
 }
 
 /// A protocol used to send and receive data over the network.
