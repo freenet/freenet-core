@@ -39,7 +39,6 @@ impl StateMachineImpl for InternalJROp {
             (
                 JRState::Initializing,
                 JoinRingMsg::Req {
-                    id,
                     msg:
                         JoinRequest::Initial {
                             req_peer,
@@ -47,18 +46,24 @@ impl StateMachineImpl for InternalJROp {
                             max_hops_to_live,
                             ..
                         },
+                    ..
                 },
             ) => Some(JRState::Connecting(ConnectionInfo {
                 gateway: *target_loc,
                 this_peer: *req_peer,
                 max_hops_to_live: *max_hops_to_live,
             })),
-            // (JRState::Connecting { .. }, JRInput::Connecting { .. }) => Some(JRState::OCReceived),
             (
-                JRState::Connecting { .. },
+                JRState::Connecting { .. } | JRState::Initializing,
+                JoinRingMsg::Resp {
+                    msg: JoinResponse::ReceivedOC { .. },
+                    ..
+                },
+            ) => Some(JRState::OCReceived),
+            (
+                JRState::Connecting { .. } | JRState::OCReceived,
                 JoinRingMsg::Req { .. } | JoinRingMsg::Connected { .. },
             ) => Some(JRState::Connected),
-            (JRState::OCReceived { .. }, JoinRingMsg::Connected) => Some(JRState::Connected),
             (JRState::Connected, _) => None,
             _ => None,
         }
@@ -88,21 +93,14 @@ impl StateMachineImpl for InternalJROp {
                 },
             }),
             (
-                JRState::Connecting { .. },
+                JRState::Initializing | JRState::Connecting(_),
                 JoinRingMsg::Resp {
-                    id,
-                    sender,
-                    msg: JoinResponse::ReceivedOC { by_peer },
-                },
-            ) => Some(JoinRingMsg::Resp {
-                id: *id,
-                msg: JoinResponse::ReceivedOC { by_peer: *by_peer },
-                sender: *sender,
-            }),
-            // (JRState::Connecting { .. }, JRInput::OCReceived | JRInput::Connected) => {
-            //     Some(JROutput::Connected)
-            // }
-            // (JRState::OCReceived, &JoinRingMsg::OC) => Some(JROutput::Connected),
+                    msg: JoinResponse::ReceivedOC { .. },
+                    ..
+                }
+                | JoinRingMsg::Connected,
+            ) => Some(JoinRingMsg::Connected),
+            (JRState::OCReceived, JoinRingMsg::Connected) => Some(JoinRingMsg::Connected),
             _ => None,
         }
     }
@@ -131,20 +129,6 @@ impl JRState {
             Err(OpError::IllegalStateTransition)
         }
     }
-}
-
-enum JRInput {
-    Connecting {
-        gateway: PeerKeyLocation,
-        this_peer: PeerKeyLocation,
-    },
-    OCReceived,
-    Connected,
-}
-
-enum JROutput {
-    OCReceived { by_peer: PeerKeyLocation },
-    Connected,
 }
 
 /// Join ring routine, called upon processing a request to join or performing
@@ -532,7 +516,7 @@ mod messages {
 
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRingMsg {
         Req {
             id: Transaction,
@@ -566,7 +550,7 @@ mod messages {
         }
     }
 
-    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRequest {
         Initial {
             target_loc: PeerKeyLocation,
@@ -580,7 +564,7 @@ mod messages {
         },
     }
 
-    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinResponse {
         Initial {
             accepted_by: Vec<PeerKeyLocation>,
@@ -628,19 +612,34 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        // assert!(matches!(res, JROutput::OCReceived { by_peer: h1 }));
+        let expected = JoinRingMsg::Resp {
+            id,
+            sender: h2,
+            msg: JoinResponse::ReceivedOC { by_peer: h1 },
+        };
+        assert_eq!(res, expected);
+        assert!(matches!(join_op_host_1.state(), JRState::Connecting(_)));
 
-        // let mut join_op_host_2 = StateMachine::<InternalJROp>::new();
-        // let res = join_op_host_2
-        //     .consume(&JRInput::OCReceived)
-        //     .unwrap()
-        //     .unwrap();
-        // assert!(matches!(res, JROutput::Connected));
+        let mut join_op_host_2 = StateMachine::<InternalJROp>::new();
+        let res = join_op_host_2.consume(&res).unwrap().unwrap();
+        let expected = JoinRingMsg::Connected;
+        assert_eq!(res, expected);
+        assert!(matches!(join_op_host_2.state(), JRState::OCReceived));
 
-        // let res = join_op_host_1
-        //     .consume(&JRInput::Connected)
-        //     .unwrap()
-        //     .unwrap();
-        // assert!(matches!(res, JROutput::Connected));
+        let res = join_op_host_1.consume(&res).unwrap().unwrap();
+        let expected = JoinRingMsg::Connected;
+        assert_eq!(res, expected);
+        assert!(matches!(join_op_host_1.state(), JRState::Connected));
+
+        let res = join_op_host_2.consume(&res).unwrap().unwrap();
+        let expected = JoinRingMsg::Connected;
+        assert_eq!(res, expected);
+        assert!(matches!(join_op_host_2.state(), JRState::Connected));
+
+        // transaction finished, should not return anymore
+        assert!(join_op_host_1.consume(&res).is_err());
+        assert!(join_op_host_2.consume(&res).is_err());
+        assert!(matches!(join_op_host_1.state(), JRState::Connected));
+        assert!(matches!(join_op_host_2.state(), JRState::Connected));
     }
 }
