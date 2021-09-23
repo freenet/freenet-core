@@ -1,53 +1,34 @@
 //! A in-memory connection manager and transport implementation. Used for testing pourpouses.
-use std::{array::IntoIter, collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::{io::Cursor, sync::Arc, time::Duration};
 
 use crossbeam::channel::{self, Receiver, Sender};
 use once_cell::sync::OnceCell;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use super::{ConnError, Transport};
 use crate::{
     config::tracing::Logger,
-    conn_manager::{self, ConnectionBridge, ListenerHandle, PeerKey, PeerKeyLocation},
-    message::{Message, Transaction, TransactionTypeId},
+    conn_manager::{ConnectionBridge, PeerKey, PeerKeyLocation},
+    message::Message,
     ring::Location,
 };
-
-type InboundListenerFn =
-    Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
-type InboundListenerRegistry = RwLock<HashMap<ListenerHandle, InboundListenerFn>>;
-
-type ResponseListenerFn =
-    Box<dyn Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync>;
-type OutboundListenerRegistry = Arc<RwLock<HashMap<Transaction, ResponseListenerFn>>>;
+static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
+    OnceCell::new();
 
 #[derive(Clone)]
 pub(crate) struct MemoryConnManager {
-    /// listeners for inbound initial messages
-    inbound_listeners: Arc<HashMap<TransactionTypeId, InboundListenerRegistry>>,
-    /// listeners for outbound messages replies
-    outbound_listeners: OutboundListenerRegistry,
     transport: InMemoryTransport,
-    // LIFO stack for pending listeners
-    pend_listeners: Sender<(Transaction, ResponseListenerFn)>,
+    msg_queue: Arc<Mutex<Vec<Message>>>,
 }
 
 impl MemoryConnManager {
     pub fn new(is_open: bool, peer: PeerKey, location: Option<Location>) -> Self {
         Logger::init_logger();
-        let (pend_listeners, rcv_pend_listeners) = channel::unbounded();
         let transport = InMemoryTransport::new(is_open, peer, location);
-        let inbound_listeners: Arc<HashMap<TransactionTypeId, InboundListenerRegistry>> = Arc::new(
-            IntoIter::new(TransactionTypeId::enumeration())
-                .map(|id| (id, RwLock::new(HashMap::new())))
-                .collect(),
-        );
-        let outbound_listeners: Arc<RwLock<HashMap<Transaction, ResponseListenerFn>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let msg_queue = Arc::new(Mutex::new(Vec::new()));
 
+        let msg_queue_cp = msg_queue.clone();
         let tr_cp = transport.clone();
-        let inbound_cp = Arc::clone(&inbound_listeners);
-        let outbound_cp = outbound_listeners.clone();
         tokio::spawn(async move {
             // evaluate the messages as they arrive
             loop {
@@ -55,52 +36,18 @@ impl MemoryConnManager {
                 if let Some(msg) = msg {
                     let msg_data: Message =
                         bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
-                    if let Some(tx_fn) = outbound_cp.read().get(msg_data.id()) {
-                        log::debug!("Received response for transaction: {}", msg_data.id());
-                        if let Some(location) = msg.origin_loc {
-                            if let Err(err) = tx_fn(
-                                PeerKeyLocation {
-                                    peer: msg.origin,
-                                    location: Some(location),
-                                },
-                                msg_data,
-                            ) {
-                                log::error!("Error processing response: {}", err);
-                            }
-                        } else {
-                            log::error!("No location for responding peer {}", msg.target);
-                        }
-                    } else {
-                        let listeners = &inbound_cp[&msg_data.msg_type()];
-                        log::debug!("Received inbound transaction: {}", msg_data.id());
-                        let reg = &*listeners.read();
-                        for func in reg.values() {
-                            if let Err(err) = func(
-                                PeerKeyLocation {
-                                    peer: msg.origin,
-                                    location: None,
-                                },
-                                msg_data.clone(),
-                            ) {
-                                log::error!("Error while calling inbound msg handler: {}", err);
-                            }
-                        }
-                    }
-                    // insert any pending functions generated from within the callback
-                    let mut lock = outbound_cp.write();
-                    for (tx, func) in rcv_pend_listeners.try_iter() {
-                        lock.insert(tx, func);
+                    if let Some(mut queue) = msg_queue_cp.try_lock() {
+                        queue.push(msg_data);
+                        std::mem::drop(queue);
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_nanos(1000)).await;
             }
         });
 
         Self {
-            inbound_listeners,
-            outbound_listeners,
             transport,
-            pend_listeners,
+            msg_queue,
         }
     }
 }
@@ -108,96 +55,29 @@ impl MemoryConnManager {
 #[async_trait::async_trait]
 impl ConnectionBridge for MemoryConnManager {
     async fn recv(&self) -> Result<Message, ConnError> {
-        todo!()
+        loop {
+            if let Some(mut queue) = self.msg_queue.try_lock() {
+                if let Some(msg) = queue.pop() {
+                    return Ok(msg);
+                }
+                std::mem::drop(queue);
+            }
+            tokio::time::sleep(Duration::from_nanos(1000)).await;
+        }
     }
 
     async fn send(&self, target: &PeerKeyLocation, msg: Message) -> Result<(), ConnError> {
-        todo!()
+        let msg = bincode::serialize(&msg)?;
+        self.transport.send(
+            target.peer,
+            target.location.ok_or(ConnError::LocationUnknown)?,
+            msg,
+        );
+        Ok(())
     }
 
-    fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool) {
-        todo!()
-    }
+    fn add_connection(&mut self, _peer: PeerKeyLocation, _unsolicited: bool) {}
 }
-
-// impl ConnectionBridge for MemoryConnManager {
-//     type Transport = InMemoryTransport;
-
-//     fn listen<F>(&self, tx_type: TransactionTypeId, listen_fn: F) -> ListenerHandle
-//     where
-//         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
-//     {
-//         let tx_ty_listener = &self.inbound_listeners[&tx_type];
-//         let handle_id = ListenerHandle::new();
-//         tx_ty_listener
-//             .write()
-//             .insert(handle_id, Box::new(listen_fn));
-//         handle_id
-//     }
-
-//     fn listen_to_replies<F>(&self, tx: Transaction, callback: F)
-//     where
-//         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
-//     {
-//         // optimistically try to acquire a lock
-//         if let Some(mut lock) = self.outbound_listeners.try_write() {
-//             lock.insert(tx, Box::new(callback));
-//         } else {
-//             // it failed, this is being inserted from an other existing closure holding the lock
-//             // send it to the temporal stack queue for posterior insertion
-//             self.pend_listeners
-//                 .send((tx, Box::new(callback)))
-//                 .expect("full or disconnected");
-//         }
-//     }
-
-//     fn transport(&self) -> &Self::Transport {
-//         &self.transport
-//     }
-
-//     fn add_connection(&self, _peer_key: PeerKeyLocation, _unsolicited: bool) {}
-
-//     fn send_with_callback<F>(
-//         &self,
-//         to: PeerKeyLocation,
-//         tx: Transaction,
-//         msg: Message,
-//         callback: F,
-//     ) -> conn_manager::Result<()>
-//     where
-//         F: Fn(PeerKeyLocation, Message) -> conn_manager::Result<()> + Send + Sync + 'static,
-//     {
-//         // store listening func
-//         self.outbound_listeners
-//             .write()
-//             .insert(tx, Box::new(callback));
-
-//         // send the msg
-//         let serialized = bincode::serialize(&msg)?;
-//         self.transport
-//             .send(to.peer, to.location.unwrap(), serialized);
-//         Ok(())
-//     }
-
-//     fn send(
-//         &self,
-//         to: PeerKeyLocation,
-//         _tx: Transaction,
-//         msg: Message,
-//     ) -> conn_manager::Result<()> {
-//         let serialized = bincode::serialize(&msg)?;
-//         self.transport
-//             .send(to.peer, to.location.unwrap(), serialized);
-//         Ok(())
-//     }
-
-//     fn remove_listener(&self, tx: Transaction) {
-//         self.outbound_listeners.write().remove(&tx);
-//     }
-// }
-
-static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
-    OnceCell::new();
 
 #[derive(Clone, Debug)]
 struct MessageOnTransit {
