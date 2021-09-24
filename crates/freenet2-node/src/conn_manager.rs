@@ -48,6 +48,7 @@ pub(crate) trait ConnectionBridge {
 /// A protocol used to send and receive data over the network.
 pub(crate) trait Transport {
     fn is_open(&self) -> bool;
+    fn location(&self) -> Option<Location>;
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]

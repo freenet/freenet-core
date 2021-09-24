@@ -17,7 +17,7 @@ static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTran
 
 #[derive(Clone)]
 pub(crate) struct MemoryConnManager {
-    transport: InMemoryTransport,
+    pub transport: InMemoryTransport,
     msg_queue: Arc<Mutex<Vec<Message>>>,
 }
 
@@ -158,5 +158,9 @@ impl InMemoryTransport {
 impl Transport for InMemoryTransport {
     fn is_open(&self) -> bool {
         self.is_open
+    }
+
+    fn location(&self) -> Option<Location> {
+        self.location
     }
 }

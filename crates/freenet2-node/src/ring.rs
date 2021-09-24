@@ -87,7 +87,7 @@ impl Ring {
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
 pub struct Location(f64);
 
-type Distance = Location;
+pub(crate) type Distance = Location;
 
 impl Location {
     /// Returns a new random location.
