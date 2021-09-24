@@ -17,8 +17,7 @@ pub(crate) struct JoinRingOp(StateMachine<InternalJROp>);
 
 impl JoinRingOp {
     pub fn new(this_peer: PeerKeyLocation, gateway: PeerKeyLocation) -> Self {
-        let mut machine = StateMachine::new();
-        JoinRingOp(machine)
+        JoinRingOp(StateMachine::new())
     }
 }
 
@@ -136,7 +135,7 @@ impl JRState {
 ///
 /// # Arguments
 /// - join_op: no nodes
-pub(crate) async fn join_ring<CB>(
+pub(crate) async fn join_ring_op<CB>(
     op_storage: &mut OpStateStorage,
     conn_manager: &mut CB,
     join_op: JoinRingMsg,
@@ -402,7 +401,7 @@ where
 pub(crate) async fn initial_join_request<CB>(
     op_storage: &mut OpStateStorage,
     conn_manager: &mut CB,
-    mut join_op: JoinRingOp,
+    join_op: JoinRingOp,
 ) -> Result<(), OpError>
 where
     CB: ConnectionBridge,
@@ -582,10 +581,17 @@ mod messages {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use libp2p::identity::Keypair;
 
     use super::*;
-    use crate::{message::TransactionTypeId, PeerKey};
+    use crate::{
+        config::tracing::Logger,
+        message::TransactionTypeId,
+        node::test_utils::{EventType, SimNetwork},
+        PeerKey,
+    };
 
     #[test]
     fn join_ring_transitions() {
@@ -641,5 +647,69 @@ mod tests {
         assert!(join_op_host_2.consume(&res).is_err());
         assert!(matches!(join_op_host_1.state(), JRState::Connected));
         assert!(matches!(join_op_host_2.state(), JRState::Connected));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node0_to_gateway_conn() -> Result<(), Box<dyn std::error::Error>> {
+        //! Given a network of one node and one gateway test that both are connected.
+        Logger::init_logger();
+        let mut sim_net = SimNetwork::build(1, 1, 0);
+        match tokio::time::timeout(Duration::from_secs(1), sim_net.recv_net_events()).await {
+            Ok(Some(Ok(event))) => match event.event {
+                EventType::JoinSuccess { gateway, new_node } => {
+                    log::info!("Successful join op between {} and {}", gateway, new_node)
+                }
+            },
+            _ => return Err("no event received".into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_nodes_should_connect() -> Result<(), Box<dyn std::error::Error>> {
+        //! Given a network of 1000 peers all nodes should have connections.
+        Logger::init_logger();
+
+        let _sim_nodes = SimNetwork::build(10, 10, 7);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        // let _hist: Vec<_> = _ring_distribution(sim_nodes.values()).collect();
+
+        // FIXME: enable probing
+        // const NUM_PROBES: usize = 10;
+        // let mut probe_responses = Vec::with_capacity(NUM_PROBES);
+        // for probe_idx in 0..NUM_PROBES {
+        //     let target = Location::random();
+        //     let idx: usize = rand::thread_rng().gen_range(0..sim_nodes.len());
+        //     let rnd_node = sim_nodes
+        //         .get_mut(&format!("node-{}", idx))
+        //         .ok_or("node not found")?;
+        //     let probe_response = ProbeProtocol::probe(
+        //         rnd_node.ring_protocol.clone(),
+        //         Transaction::new(<ProbeRequest as TransactionType>::msg_type_id()),
+        //         ProbeRequest {
+        //             hops_to_live: 7,
+        //             target,
+        //         },
+        //     )
+        //     .await
+        //     .expect("failed to get probe response");
+        //     probe_responses.push(probe_response);
+        // }
+        // probe_proto::utils::plot_probe_responses(probe_responses);
+
+        // let any_empties = sim_nodes
+        //     .peers
+        //     .values()
+        //     .map(|node| {
+        //         node.op_storage
+        //             .ring
+        //             .connections_by_location
+        //             .read()
+        //             .is_empty()
+        //     })
+        //     .any(|is_empty| is_empty);
+        // assert!(!any_empties);
+
+        Ok(())
     }
 }

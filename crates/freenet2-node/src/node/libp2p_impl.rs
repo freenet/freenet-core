@@ -155,35 +155,15 @@ impl From<ping::PingEvent> for NetEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{Ipv4Addr, SocketAddr, TcpListener},
-        time::Duration,
-    };
+    use std::{net::Ipv4Addr, time::Duration};
 
     use super::*;
-    use crate::{config::tracing::Logger, node::InitPeerNode};
+    use crate::{
+        config::tracing::Logger,
+        node::{test_utils::get_free_port, InitPeerNode},
+    };
 
     use libp2p::{futures::StreamExt, swarm::SwarmEvent};
-    use rand::Rng;
-
-    fn get_free_port() -> Result<u16, ()> {
-        let mut port;
-        for _ in 0..100 {
-            port = get_dynamic_port();
-            let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            if let Ok(conn) = TcpListener::bind(bind_addr) {
-                std::mem::drop(conn);
-                return Ok(port);
-            }
-        }
-        Err(())
-    }
-
-    fn get_dynamic_port() -> u16 {
-        const FIRST_DYNAMIC_PORT: u16 = 49152;
-        const LAST_DYNAMIC_PORT: u16 = 65535;
-        rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
-    }
 
     /// Ping test event loop
     async fn ping_ev_loop(peer: &mut NodeLibP2P) -> Result<(), ()> {

@@ -7,12 +7,12 @@ use crate::{
 
 use super::op_state::OpStateStorage;
 
-pub(super) struct InMemory {
+pub(crate) struct InMemory {
     peer: PeerKey,
     listening: bool,
-    conn_manager: MemoryConnManager,
-    op_storage: OpStateStorage,
     gateways: Vec<PeerKeyLocation>,
+    pub conn_manager: MemoryConnManager,
+    pub op_storage: OpStateStorage,
 }
 
 impl InMemory {
@@ -70,7 +70,7 @@ impl InMemory {
             match self.conn_manager.recv().await {
                 Ok(msg) => match msg {
                     Message::JoinRing(join_op) => {
-                        join_ring::join_ring(&mut self.op_storage, &mut self.conn_manager, join_op)
+                        join_ring::join_ring_op(&mut self.op_storage, &mut self.conn_manager, join_op)
                             .await
                             .unwrap();
                     }

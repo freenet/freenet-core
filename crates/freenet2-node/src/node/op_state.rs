@@ -39,7 +39,7 @@ impl OpStateStorage {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Clone)]
 pub(crate) enum OpExecutionError {
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionTypeId, TransactionTypeId),

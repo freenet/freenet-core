@@ -53,6 +53,6 @@ macro_rules! op_type_enumeration {
 }
 
 op_type_enumeration!(decl struct {
-    join_ring: JoinRingOp,
-    probe_peers: ProbeOp
+    join_ring: JoinRingOp
+    // probe_peers: ProbeOp
 });
