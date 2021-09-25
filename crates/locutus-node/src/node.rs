@@ -1,3 +1,12 @@
+//! The main node data type which encapsulates all the behaviour for maintaining a connection
+//! and performing operations within the network.
+//!
+//! # Implementations
+//! Node comes with different underlying implementations that can be used upon construction.
+//! Those implementations are:
+//! - libp2p: all the connection is handled by libp2p.
+//! - In memory: a simplifying node used for emulation pourpouses mainly.
+
 use std::net::IpAddr;
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
@@ -192,14 +201,7 @@ pub mod test_utils {
     use rand::Rng;
     use tokio::sync::mpsc;
 
-    use crate::{
-        conn_manager::{ConnectionBridge, Transport},
-        message::Message,
-        node::{InitPeerNode, NodeInMemory},
-        operations::{join_ring::join_ring_op, OpError},
-        ring::Distance,
-        NodeConfig, PeerKey,
-    };
+    use crate::{NodeConfig, conn_manager::{ConnectionBridge, PeerKey, Transport}, message::Message, node::{InitPeerNode, NodeInMemory}, operations::{join_ring::join_ring_op, OpError}, ring::Distance};
 
     pub fn get_free_port() -> Result<u16, ()> {
         let mut port;
@@ -228,7 +230,7 @@ pub mod test_utils {
     }
 
     pub(crate) struct NetEvent {
-        pub(crate) sender: String,
+        pub(crate) _sender: String,
         pub(crate) event: EventType,
     }
 

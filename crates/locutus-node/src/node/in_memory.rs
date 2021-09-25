@@ -1,9 +1,9 @@
 use crate::{
-    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKeyLocation},
+    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::Message,
     operations::{get, join_ring, put},
     user_events::{test_utils::MemoryEventsGen, UserEvent, UserEventsProxy},
-    NodeConfig, PeerKey,
+    NodeConfig,
 };
 
 use super::op_state::OpStateStorage;

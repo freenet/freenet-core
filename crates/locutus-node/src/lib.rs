@@ -7,7 +7,6 @@ mod operations;
 mod ring;
 mod user_events;
 
-pub use conn_manager::PeerKey;
 pub use node::NodeConfig;
 
 type StdResult<T, E> = std::result::Result<T, E>;
