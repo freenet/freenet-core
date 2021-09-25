@@ -36,15 +36,8 @@ pub(crate) trait Transport {
     fn location(&self) -> Option<Location>;
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Peer {
-    addr: SocketAddr,
-    port: u16,
-    label: Option<String>,
-}
-
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct PeerKey(PeerId);
+pub struct PeerKey(pub(crate) PeerId);
 
 impl Display for PeerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

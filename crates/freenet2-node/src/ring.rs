@@ -1,4 +1,14 @@
 //! Ring protocol logic and supporting types.
+//!
+//! # Routing
+//! The routing mechanism consist in a greedy routing algorithm which just targets
+//! the closest location to the target destination iteratively in each hop, until it reaches
+//! the destination.
+//!
+//! Path is limited to local knowledge, at any given point only 3 data points are known:
+//! - previous node
+//! - next node
+//! - final location
 
 use std::{collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
 
@@ -56,18 +66,24 @@ impl Ring {
     }
 
     pub fn median_distance_to(&self, location: &Location) -> Distance {
-        let mut conn_by_dist = self.connections_by_distance(location);
-        conn_by_dist.sort_by_key(|(k, _)| *k);
+        let connections = self.connections_by_location.read();
+        let mut conn_by_dist: Vec<_> = connections
+            .keys()
+            .map(|key| key.distance(location))
+            .collect();
+        conn_by_dist.sort_unstable();
         let idx = self.connections_by_location.read().len() / 2;
-        conn_by_dist[idx].0
+        conn_by_dist[idx]
     }
 
-    pub fn connections_by_distance(&self, to: &Location) -> Vec<(Distance, PeerKeyLocation)> {
-        self.connections_by_location
-            .read()
+    pub fn routing(&self, target: &Location) -> Option<(Location, PeerKeyLocation)> {
+        let connections = self.connections_by_location.read();
+        let mut conn_by_dist: Vec<_> = connections
             .iter()
-            .map(|(key, peer)| (key.distance(to), *peer))
-            .collect()
+            .map(|(loc, peer)| (loc.distance(target), (loc, peer)))
+            .collect();
+        conn_by_dist.sort_by_key(|&(dist, _)| dist);
+        conn_by_dist.first().map(|(_, v)| (*v.0, *v.1))
     }
 
     pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
@@ -164,4 +180,44 @@ pub(crate) enum RingProtoError {
     Join,
     #[error(transparent)]
     ConnError(#[from] Box<conn_manager::ConnError>),
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p::PeerId;
+
+    use crate::PeerKey;
+
+    use super::*;
+
+    #[test]
+    fn location_dist() {
+        let l0 = Location(0.);
+        let l1 = Location(0.25);
+        assert!(l0.distance(&l1) == Location(0.25));
+
+        let l0 = Location(0.75);
+        let l1 = Location(0.50);
+        assert!(l0.distance(&l1) == Location(0.25));
+    }
+
+    #[test]
+    fn find_closest() {
+        let ring = Ring::new();
+        {
+            let conns = &mut *ring.connections_by_location.write();
+            let def_peer = PeerKeyLocation {
+                peer: PeerKey(PeerId::random()),
+                location: None,
+            };
+            conns.insert(Location(0.3), def_peer);
+            conns.insert(Location(0.5), def_peer);
+            conns.insert(Location(0.0), def_peer);
+        }
+
+        assert_eq!(Location(0.0), ring.routing(&Location(0.9)).unwrap().0);
+        assert_eq!(Location(0.0), ring.routing(&Location(0.1)).unwrap().0);
+        assert_eq!(Location(0.5), ring.routing(&Location(0.41)).unwrap().0);
+        assert_eq!(Location(0.3), ring.routing(&Location(0.39)).unwrap().0);
+    }
 }

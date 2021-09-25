@@ -3,7 +3,6 @@ use crate::{conn_manager, message::Message, node::OpExecutionError};
 pub(crate) mod get;
 pub(crate) mod join_ring;
 pub(crate) mod put;
-pub(crate) mod routing;
 pub(crate) mod subscribe;
 
 pub(crate) struct OperationResult<S> {
