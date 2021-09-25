@@ -7,7 +7,7 @@ use crate::{
 
 use super::op_state::OpStateStorage;
 
-pub(crate) struct InMemory {
+pub(crate) struct NodeInMemory {
     peer: PeerKey,
     listening: bool,
     gateways: Vec<PeerKeyLocation>,
@@ -15,7 +15,7 @@ pub(crate) struct InMemory {
     pub op_storage: OpStateStorage,
 }
 
-impl InMemory {
+impl NodeInMemory {
     pub fn build(config: NodeConfig) -> Result<Self, &'static str> {
         if (config.local_ip.is_none() || config.local_port.is_none())
             && config.remote_nodes.is_empty()
@@ -24,7 +24,7 @@ impl InMemory {
         }
         let peer = PeerKey::from(config.local_key.public());
         let conn_manager = MemoryConnManager::new(true, peer, None);
-        Ok(InMemory {
+        Ok(NodeInMemory {
             peer,
             listening: true,
             conn_manager,
@@ -70,14 +70,16 @@ impl InMemory {
             match self.conn_manager.recv().await {
                 Ok(msg) => match msg {
                     Message::JoinRing(join_op) => {
-                        join_ring::join_ring_op(&mut self.op_storage, &mut self.conn_manager, join_op)
-                            .await
-                            .unwrap();
+                        join_ring::join_ring_op(
+                            &mut self.op_storage,
+                            &mut self.conn_manager,
+                            join_op,
+                        )
+                        .await
+                        .unwrap();
                     }
+                    Message::Put(_) => todo!(),
                     Message::Canceled(_) => todo!(),
-                    // old:
-                    Message::ProbeRequest(_, _) => todo!(),
-                    Message::ProbeResponse(_, _) => todo!(),
                 },
                 Err(_) => break Err(()),
             }

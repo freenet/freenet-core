@@ -5,7 +5,7 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use crate::config::CONF;
 
 use self::libp2p_impl::NodeLibP2P;
-pub(crate) use in_memory::InMemory;
+pub(crate) use in_memory::NodeInMemory;
 pub(crate) use op_state::{OpExecutionError, OpStateStorage};
 
 mod in_memory;
@@ -25,7 +25,7 @@ impl Node {
 
 enum NodeImpl {
     LibP2P(Box<NodeLibP2P>),
-    InMemory(Box<InMemory>),
+    InMemory(Box<NodeInMemory>),
 }
 
 pub struct NodeConfig {
@@ -98,7 +98,7 @@ impl NodeConfig {
 
     /// Builds a node using in-memory transport. Used for testing pourpouses.
     pub fn build_in_memory(self) -> Result<Node, &'static str> {
-        let inmem = InMemory::build(self)?;
+        let inmem = NodeInMemory::build(self)?;
         Ok(Node(NodeImpl::InMemory(Box::new(inmem))))
     }
 }
@@ -198,7 +198,7 @@ pub mod test_utils {
     use crate::{
         conn_manager::{ConnectionBridge, Transport},
         message::Message,
-        node::{InMemory, InitPeerNode},
+        node::{InitPeerNode, NodeInMemory},
         operations::{join_ring::join_ring_op, OpError},
         ring::Distance,
         NodeConfig, PeerKey,
@@ -257,7 +257,7 @@ pub mod test_utils {
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(gateway_port)
                 .with_key(gateway_pair);
-            let gateway = InMemory::build(config).unwrap();
+            let gateway = NodeInMemory::build(config).unwrap();
             sim.initialize_gateway(gateway, "gateway".to_owned());
 
             // add other nodes to the simulation
@@ -269,7 +269,7 @@ pub mod test_utils {
                         .listening_port(gateway_port)
                         .with_identifier(gateway_peer_id),
                 );
-                sim.initialize_peer(InMemory::build(config).unwrap(), label);
+                sim.initialize_peer(NodeInMemory::build(config).unwrap(), label);
             }
             sim
         }
@@ -286,12 +286,12 @@ pub mod test_utils {
             }
         }
 
-        fn initialize_gateway(&self, gateway: InMemory, sender_label: String) {
+        fn initialize_gateway(&self, gateway: NodeInMemory, sender_label: String) {
             let info_ch = self.meta_info_tx.clone();
             tokio::spawn(Self::listen(gateway, info_ch, sender_label));
         }
 
-        fn initialize_peer(&self, mut peer: InMemory, sender_label: String) {
+        fn initialize_peer(&self, mut peer: NodeInMemory, sender_label: String) {
             let info_ch = self.meta_info_tx.clone();
             tokio::spawn(async move {
                 if peer.start().await.is_err() {
@@ -303,9 +303,9 @@ pub mod test_utils {
         }
 
         async fn listen(
-            mut gateway: InMemory,
+            mut gateway: NodeInMemory,
             info_ch: mpsc::Sender<Result<NetEvent, OpError>>,
-            sender: String,
+            _sender: String,
         ) -> Result<(), ()> {
             while let Ok(msg) = gateway.conn_manager.recv().await {
                 if let Message::JoinRing(msg) = msg {
@@ -325,7 +325,7 @@ pub mod test_utils {
 
     /// Builds an histogram of the distribution in the ring of each node relative to each other.
     fn _ring_distribution<'a>(
-        nodes: impl Iterator<Item = &'a InMemory> + 'a,
+        nodes: impl Iterator<Item = &'a NodeInMemory> + 'a,
     ) -> impl Iterator<Item = Distance> + 'a {
         // TODO: groupby  certain intervals
         // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0

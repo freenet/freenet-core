@@ -18,5 +18,3 @@ target/
 # IDEs
 .idea/*
 .vscode/*
-
-Cargo.lock
