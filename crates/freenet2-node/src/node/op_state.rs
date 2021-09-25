@@ -2,11 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     message::{Transaction, TransactionTypeId},
-    operations::{
-        join_ring::{self, JoinRingOp},
-        put::{self, PutOp},
-        Operation,
-    },
+    operations::{join_ring::JoinRingOp, put::PutOp, Operation},
     ring::Ring,
 };
 

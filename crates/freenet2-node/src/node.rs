@@ -186,10 +186,7 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 
 #[cfg(test)]
 pub mod test_utils {
-    use std::{
-        collections::HashMap,
-        net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
-    };
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 
     use libp2p::identity;
     use rand::Rng;

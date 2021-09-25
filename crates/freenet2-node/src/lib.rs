@@ -5,6 +5,7 @@ mod node;
 mod operations;
 // mod probe_proto;
 mod ring;
+mod user_events;
 
 pub use conn_manager::PeerKey;
 pub use node::NodeConfig;

@@ -1,21 +1,23 @@
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKeyLocation},
     message::Message,
-    operations::{
-        join_ring::{self, JoinRingOp},
-        put,
-    },
+    operations::{join_ring, put},
+    user_events::{test_utils::MemoryEventsGen, UserEvent, UserEventsProxy},
     NodeConfig, PeerKey,
 };
 
 use super::op_state::OpStateStorage;
 
-pub(crate) struct NodeInMemory {
+pub(crate) struct NodeInMemory<Ev = MemoryEventsGen>
+where
+    Ev: UserEventsProxy,
+{
     peer: PeerKey,
     listening: bool,
     gateways: Vec<PeerKeyLocation>,
     pub conn_manager: MemoryConnManager,
     pub op_storage: OpStateStorage,
+    user_events: Ev,
 }
 
 impl NodeInMemory {
@@ -33,6 +35,7 @@ impl NodeInMemory {
             conn_manager,
             op_storage: OpStateStorage::new(),
             gateways: vec![],
+            user_events: MemoryEventsGen {},
         })
     }
 
@@ -47,7 +50,7 @@ impl NodeInMemory {
         // the idea here is to limit the amount of gateways being contacted that's why shuffling is required
         for gateway in &self.gateways {
             // initiate join action action per each gateway
-            let op = JoinRingOp::new(
+            let op = join_ring::JoinRingOp::new(
                 PeerKeyLocation {
                     peer: self.peer,
                     location: None,
@@ -70,21 +73,34 @@ impl NodeInMemory {
         }
 
         loop {
-            match self.conn_manager.recv().await {
-                Ok(msg) => match msg {
-                    Message::JoinRing(op) => {
-                        join_ring::join_ring_op(&mut self.op_storage, &mut self.conn_manager, op)
-                            .await
-                            .unwrap();
+            tokio::select! {
+                msg = self.conn_manager.recv() => {
+                    match msg {
+                        Ok(msg) => match msg {
+                            Message::JoinRing(op) => {
+                                join_ring::join_ring_op(&mut self.op_storage, &mut self.conn_manager, op)
+                                    .await
+                                    .unwrap();
+                            }
+                            Message::Put(op) => {
+                                put::put_op(&mut self.op_storage, &mut self.conn_manager, op)
+                                    .await
+                                    .unwrap();
+                            }
+                            Message::Canceled(_) => todo!(),
+                        },
+                        Err(_) => break Err(()),
                     }
-                    Message::Put(op) => {
-                        put::put_op(&mut self.op_storage, &mut self.conn_manager, op)
-                            .await
-                            .unwrap();
+                }
+                usr_event = self.user_events.recv() => {
+                    match usr_event {
+                        UserEvent::Put {key, value }=> {
+                            // Initialize a put op.
+                            let op = put::PutOp::new();
+                            put::request_put(&mut self.op_storage, &mut self.conn_manager, op).await.unwrap();
+                        }
                     }
-                    Message::Canceled(_) => todo!(),
-                },
-                Err(_) => break Err(()),
+                }
             }
         }
     }
