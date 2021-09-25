@@ -96,7 +96,7 @@ impl NodeInMemory {
                     match usr_event {
                         UserEvent::Put {key, value }=> {
                             // Initialize a put op.
-                            let op = put::PutOp::new();
+                            let op = put::PutOp::new(key, value);
                             put::request_put(&mut self.op_storage, &mut self.conn_manager, op).await.unwrap();
                         }
                     }

@@ -14,7 +14,7 @@ use crate::{
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 
-pub(crate) struct JoinRingOp(StateMachine<InternalJROp>);
+pub(crate) struct JoinRingOp(StateMachine<JROpSM>);
 
 impl JoinRingOp {
     pub fn new(this_peer: PeerKeyLocation, gateway: PeerKeyLocation) -> Self {
@@ -23,9 +23,9 @@ impl JoinRingOp {
 }
 
 #[derive(Debug)]
-struct InternalJROp;
+struct JROpSM;
 
-impl StateMachineImpl for InternalJROp {
+impl StateMachineImpl for JROpSM {
     type Input = JoinRingMsg;
 
     type State = JRState;
@@ -610,7 +610,7 @@ mod tests {
             location: None,
         };
 
-        let mut join_op_host_1 = StateMachine::<InternalJROp>::new();
+        let mut join_op_host_1 = StateMachine::<JROpSM>::new();
         let res = join_op_host_1
             .consume(&JoinRingMsg::Req {
                 id,
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(res, expected);
         assert!(matches!(join_op_host_1.state(), JRState::Connecting(_)));
 
-        let mut join_op_host_2 = StateMachine::<InternalJROp>::new();
+        let mut join_op_host_2 = StateMachine::<JROpSM>::new();
         let res = join_op_host_2.consume(&res).unwrap().unwrap();
         let expected = JoinRingMsg::Connected;
         assert_eq!(res, expected);
