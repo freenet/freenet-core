@@ -18,12 +18,24 @@ impl PutOp {
 pub(crate) async fn put_op<CB>(
     op_storage: &mut OpStateStorage,
     conn_manager: &mut CB,
-    join_op: PutMsg,
+    put_op: PutMsg,
 ) -> Result<(), OpError>
 where
     CB: ConnectionBridge,
 {
     Ok(())
+}
+
+/// Request to insert/update a value into a contract.
+pub(crate) async fn request_put<CB>(
+    op_storage: &mut OpStateStorage,
+    conn_manager: &mut CB,
+    put_op: PutOp,
+) -> Result<(), OpError>
+where
+    CB: ConnectionBridge,
+{
+    todo!()
 }
 
 mod messages {
@@ -34,7 +46,9 @@ mod messages {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-    pub(crate) enum PutMsg {}
+    pub(crate) enum PutMsg {
+        RouteValue { key: Vec<u8>, value: Vec<u8> },
+    }
 
     impl PutMsg {
         pub fn id(&self) -> &Transaction {

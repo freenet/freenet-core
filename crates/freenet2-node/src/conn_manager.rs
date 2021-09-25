@@ -23,6 +23,8 @@ pub(crate) type Result<T> = StdResult<T, ConnError>;
 pub(crate) trait ConnectionBridge {
     fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool);
 
+    /// # Cancellation Safety
+    /// This async fn must be cancellation safe!
     async fn recv(&self) -> Result<Message>;
 
     async fn send(&self, target: &PeerKeyLocation, msg: Message) -> Result<()>;

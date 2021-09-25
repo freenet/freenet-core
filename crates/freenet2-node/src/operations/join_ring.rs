@@ -134,8 +134,8 @@ impl JRState {
 /// Join ring routine, called upon processing a request to join or performing
 /// a join operation for this node.
 ///
-/// # Arguments
-/// - join_op: no nodes
+/// # Cancellation Safety
+/// This future is not cancellation safe.
 pub(crate) async fn join_ring_op<CB>(
     op_storage: &mut OpStateStorage,
     conn_manager: &mut CB,
