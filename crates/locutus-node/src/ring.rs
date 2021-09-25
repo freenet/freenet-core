@@ -186,9 +186,8 @@ pub(crate) enum RingProtoError {
 mod tests {
     use libp2p::PeerId;
 
-    use crate::PeerKey;
-
     use super::*;
+    use crate::conn_manager::PeerKey;
 
     #[test]
     fn location_dist() {

@@ -1,3 +1,5 @@
+//! Main message type which encapsulated all the messaging between nodes.
+
 use std::{fmt::Display, time::Duration};
 
 use serde::{Deserialize, Serialize};

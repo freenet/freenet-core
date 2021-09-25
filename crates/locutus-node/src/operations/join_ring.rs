@@ -4,12 +4,11 @@ use rust_fsm::*;
 
 use super::{OpError, OperationResult};
 use crate::{
-    conn_manager::{self, ConnectionBridge, PeerKeyLocation},
+    conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction, TransactionType},
     node::{OpExecutionError, OpStateStorage},
     operations::Operation,
     ring::{Location, Ring},
-    PeerKey,
 };
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
@@ -131,8 +130,8 @@ impl JRState {
     }
 }
 
-/// Join ring routine, called upon processing a request to join or performing
-/// a join operation for this node.
+/// Join ring routine, called upon processing a request to join or while performing
+/// a join operation for this node after initial request (see [`initial_join_request`]).
 ///
 /// # Cancellation Safety
 /// This future is not cancellation safe.
@@ -403,6 +402,7 @@ where
     })
 }
 
+/// Join ring routine, called upon performing a join operation for this node.
 pub(crate) async fn initial_join_request<CB>(
     op_storage: &mut OpStateStorage,
     conn_manager: &mut CB,
@@ -516,7 +516,7 @@ where
 
 mod messages {
     use super::*;
-    use crate::{conn_manager::PeerKeyLocation, ring::Location, PeerKey};
+    use crate::{conn_manager::PeerKeyLocation, ring::Location};
 
     use serde::{Deserialize, Serialize};
 
@@ -595,7 +595,6 @@ mod tests {
         config::tracing::Logger,
         message::TransactionTypeId,
         node::test_utils::{EventType, SimNetwork},
-        PeerKey,
     };
 
     #[test]
