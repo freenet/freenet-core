@@ -1,12 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-use crate::{
-    conn_manager,
-    message::{Message, Transaction},
-    node::OpExecutionError,
-};
-
-use self::{join_ring::JoinRingOp, put::PutOp};
+use crate::{conn_manager, message::Message, node::OpExecutionError};
 
 pub(crate) mod get;
 pub(crate) mod join_ring;
@@ -21,6 +13,11 @@ pub(crate) struct OperationResult<S> {
     pub state: Option<S>,
 }
 
+pub(crate) enum Operation {
+    JoinRing(join_ring::JoinRingOp),
+    Put(put::PutOp),
+}
+
 #[derive(Debug, Default)]
 pub struct ProbeOp;
 
@@ -33,31 +30,3 @@ pub(crate) enum OpError {
     #[error("illegal awaiting state")]
     IllegalStateTransition,
 }
-
-macro_rules! op_type_enumeration {
-    (decl struct { $($field:ident: $var:tt),+ } ) => {
-        #[repr(u8)]
-        #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
-        pub(crate) enum OperationType {
-            $($var,)+
-        }
-
-        pub(crate) struct OpsMap {
-            $( pub $field: std::collections::HashMap<Transaction, $var>),+,
-        }
-
-        impl OpsMap {
-            pub fn new() -> Self {
-                Self {
-                    $( $field: std::collections::HashMap::new()),+,
-                }
-            }
-        }
-    };
-}
-
-op_type_enumeration!(decl struct {
-    join_ring: JoinRingOp,
-    put: PutOp
-    // probe_peers: ProbeOp
-});
