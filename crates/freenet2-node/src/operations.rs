@@ -15,6 +15,7 @@ pub(crate) struct OperationResult<S> {
 pub(crate) enum Operation {
     JoinRing(join_ring::JoinRingOp),
     Put(put::PutOp),
+    Get(get::GetOp),
 }
 
 #[derive(Debug, Default)]

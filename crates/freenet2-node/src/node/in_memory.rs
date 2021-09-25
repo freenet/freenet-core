@@ -1,7 +1,7 @@
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKeyLocation},
     message::Message,
-    operations::{join_ring, put},
+    operations::{get, join_ring, put},
     user_events::{test_utils::MemoryEventsGen, UserEvent, UserEventsProxy},
     NodeConfig, PeerKey,
 };
@@ -87,6 +87,11 @@ impl NodeInMemory {
                                     .await
                                     .unwrap();
                             }
+                            Message::Get(op) => {
+                                get::get_op(&mut self.op_storage, &mut self.conn_manager, op)
+                                .await
+                                .unwrap();
+                            }
                             Message::Canceled(_) => todo!(),
                         },
                         Err(_) => break Err(()),
@@ -94,10 +99,15 @@ impl NodeInMemory {
                 }
                 usr_event = self.user_events.recv() => {
                     match usr_event {
-                        UserEvent::Put {key, value }=> {
+                        UserEvent::Put { key, value } => {
                             // Initialize a put op.
                             let op = put::PutOp::new(key, value);
                             put::request_put(&mut self.op_storage, &mut self.conn_manager, op).await.unwrap();
+                        }
+                        UserEvent::Get { key } => {
+                            // Initialize a get op.
+                            let op = get::GetOp::new(key);
+                            get::request_get(&mut self.op_storage, &mut self.conn_manager, op).await.unwrap();
                         }
                     }
                 }

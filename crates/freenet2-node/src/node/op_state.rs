@@ -2,13 +2,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     message::{Transaction, TransactionTypeId},
-    operations::{join_ring::JoinRingOp, put::PutOp, Operation},
+    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, Operation},
     ring::Ring,
 };
 
 pub(crate) struct OpStateStorage {
     join_ring: HashMap<Transaction, JoinRingOp>,
     put: HashMap<Transaction, PutOp>,
+    get: HashMap<Transaction, GetOp>,
     pub ring: Arc<Ring>,
 }
 
@@ -28,6 +29,7 @@ impl OpStateStorage {
         Self {
             join_ring: HashMap::default(),
             put: HashMap::default(),
+            get: HashMap::default(),
             ring: Arc::new(Ring::new()),
         }
     }
@@ -42,6 +44,10 @@ impl OpStateStorage {
                 check_id_op!(id.tx_type(), TransactionTypeId::Put);
                 self.put.insert(id, tx);
             }
+            Operation::Get(tx) => {
+                check_id_op!(id.tx_type(), TransactionTypeId::Put);
+                self.get.insert(id, tx);
+            }
         }
         Ok(())
     }
@@ -50,6 +56,7 @@ impl OpStateStorage {
         match id.tx_type() {
             TransactionTypeId::JoinRing => self.join_ring.remove(id).map(Operation::JoinRing),
             TransactionTypeId::Put => self.put.remove(id).map(Operation::Put),
+            TransactionTypeId::Get => self.get.remove(id).map(Operation::Get),
             TransactionTypeId::Canceled => todo!(),
         }
     }

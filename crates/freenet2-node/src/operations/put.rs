@@ -77,7 +77,7 @@ where
 {
     // the initial request must provide:
     // - a location in the network where the contract resides
-    // - and the values to put
+    // - and the value to put
     todo!()
 }
 
