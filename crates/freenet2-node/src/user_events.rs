@@ -4,12 +4,17 @@ pub(crate) trait UserEventsProxy {
 }
 
 pub(crate) enum UserEvent {
-    /// Update or insert a new value in a contract corresponding with the provided key
+    /// Update or insert a new value in a contract corresponding with the provided key.
     Put {
         /// Hash key of the contract.
         key: Vec<u8>,
         /// Value to upsert in the contract.
         value: Vec<u8>,
+    },
+    /// Fetch the current value from a contrart corresponding to the provided key.
+    Get {
+        /// Hash key of the contract.
+        key: Vec<u8>,
     },
 }
 

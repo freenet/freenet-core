@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     conn_manager::PeerKeyLocation,
-    operations::{join_ring::JoinRingMsg, put::PutMsg},
+    operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
     ring::Location,
 };
 pub(crate) use sealed_msg_type::TransactionTypeId;
@@ -76,6 +76,7 @@ mod sealed_msg_type {
     pub(crate) enum TransactionTypeId {
         JoinRing,
         Put,
+        Get,
         Canceled,
     }
 
@@ -100,6 +101,7 @@ mod sealed_msg_type {
     transaction_type_enumeration!(decl struct {
         JoinRing -> JoinRingMsg,
         Put -> PutMsg,
+        Get -> GetMsg,
         Canceled -> Transaction
     });
 }
@@ -108,6 +110,7 @@ mod sealed_msg_type {
 pub(crate) enum Message {
     JoinRing(JoinRingMsg),
     Put(PutMsg),
+    Get(GetMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
 }
@@ -122,6 +125,7 @@ impl Message {
         match self {
             JoinRing(op) => op.id(),
             Put(op) => op.id(),
+            Get(op) => op.id(),
             Canceled(tx) => tx,
         }
     }
@@ -130,8 +134,9 @@ impl Message {
         use Message::*;
         match self {
             JoinRing(op) => op.sender(),
-            Canceled(_) => None,
             Put(op) => op.sender(),
+            Get(op) => op.sender(),
+            Canceled(_) => None,
         }
     }
 }
