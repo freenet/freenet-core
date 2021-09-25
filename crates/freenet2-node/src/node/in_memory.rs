@@ -1,7 +1,10 @@
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKeyLocation},
     message::Message,
-    operations::join_ring::{self, JoinRingOp},
+    operations::{
+        join_ring::{self, JoinRingOp},
+        put,
+    },
     NodeConfig, PeerKey,
 };
 
@@ -69,16 +72,16 @@ impl NodeInMemory {
         loop {
             match self.conn_manager.recv().await {
                 Ok(msg) => match msg {
-                    Message::JoinRing(join_op) => {
-                        join_ring::join_ring_op(
-                            &mut self.op_storage,
-                            &mut self.conn_manager,
-                            join_op,
-                        )
-                        .await
-                        .unwrap();
+                    Message::JoinRing(op) => {
+                        join_ring::join_ring_op(&mut self.op_storage, &mut self.conn_manager, op)
+                            .await
+                            .unwrap();
                     }
-                    Message::Put(_) => todo!(),
+                    Message::Put(op) => {
+                        put::put_op(&mut self.op_storage, &mut self.conn_manager, op)
+                            .await
+                            .unwrap();
+                    }
                     Message::Canceled(_) => todo!(),
                 },
                 Err(_) => break Err(()),

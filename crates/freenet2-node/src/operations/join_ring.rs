@@ -7,6 +7,7 @@ use crate::{
     conn_manager::{self, ConnectionBridge, PeerKeyLocation},
     message::{Message, Transaction, TransactionType},
     node::{OpExecutionError, OpStateStorage},
+    operations::Operation,
     ring::{Location, Ring},
     PeerKey,
 };
@@ -145,15 +146,19 @@ where
 {
     let sender;
     let tx = *join_op.id();
-    let result = if let Some(state) = op_storage.pop_join_ring_op(join_op.id()) {
-        sender = join_op.sender().cloned();
-        // was an existing operation, the other peer messaged back
-        update_state(conn_manager, state, join_op, &op_storage.ring).await
-    } else {
-        sender = join_op.sender().cloned();
-        // new request to join from this node, initialize the machine
-        let machine = JoinRingOp(StateMachine::new());
-        update_state(conn_manager, machine, join_op, &op_storage.ring).await
+    let result = match op_storage.pop(join_op.id()) {
+        Some(Operation::JoinRing(state)) => {
+            sender = join_op.sender().cloned();
+            // was an existing operation, the other peer messaged back
+            update_state(conn_manager, state, join_op, &op_storage.ring).await
+        }
+        Some(_) => return Err(OpExecutionError::TxUpdateFailure(tx).into()),
+        None => {
+            sender = join_op.sender().cloned();
+            // new request to join from this node, initialize the machine
+            let machine = JoinRingOp(StateMachine::new());
+            update_state(conn_manager, machine, join_op, &op_storage.ring).await
+        }
     };
 
     match result {
@@ -173,7 +178,7 @@ where
             if let Some(target) = msg.sender().cloned() {
                 conn_manager.send(&target, msg).await?;
             }
-            op_storage.push_join_ring_op(id, updated_state)?;
+            op_storage.push(id, Operation::JoinRing(updated_state))?;
         }
         Ok(OperationResult {
             return_msg: Some(msg),
@@ -441,7 +446,7 @@ where
     //     .0
     //     .consume(&JoinRingMsg::Req { , this_peer })
     //     .map_err(|_| OpError::IllegalStateTransition)?;
-    op_storage.push_join_ring_op(tx, join_op)?;
+    op_storage.push(tx, Operation::JoinRing(join_op))?;
     Ok(())
 }
 
