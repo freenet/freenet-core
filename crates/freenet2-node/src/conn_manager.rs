@@ -13,28 +13,11 @@ use crate::{
 
 pub mod in_memory;
 
-const _PING_EVERY: Duration = Duration::from_secs(30);
-const _DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
-static HANDLE_ID: AtomicU64 = AtomicU64::new(0);
+const PING_EVERY: Duration = Duration::from_secs(30);
+const DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 
 // pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
 pub(crate) type Result<T> = StdResult<T, ConnError>;
-
-/// 3 words size for 64-bit platforms.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct ListenerHandle(u64);
-
-impl ListenerHandle {
-    pub fn new() -> Self {
-        ListenerHandle(HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-    }
-}
-
-impl Default for ListenerHandle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[async_trait::async_trait]
 pub(crate) trait ConnectionBridge {

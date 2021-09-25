@@ -3,7 +3,11 @@ use std::{fmt::Display, time::Duration};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{conn_manager::PeerKeyLocation, operations::join_ring::JoinRingMsg, ring::Location};
+use crate::{
+    conn_manager::PeerKeyLocation,
+    operations::{join_ring::JoinRingMsg, put::PutMsg},
+    ring::Location,
+};
 pub(crate) use sealed_msg_type::TransactionTypeId;
 
 /// An transaction is a unique, universal and efficient identifier for any
@@ -48,14 +52,14 @@ impl Display for Transaction {
 
 /// Get the transaction type associated to a given message type.
 pub(crate) trait TransactionType: sealed_msg_type::SealedTxType {
-    fn msg_type_id() -> TransactionTypeId;
+    fn tx_type_id() -> TransactionTypeId;
 }
 
 impl<T> TransactionType for T
 where
     T: sealed_msg_type::SealedTxType,
 {
-    fn msg_type_id() -> TransactionTypeId {
+    fn tx_type_id() -> TransactionTypeId {
         <Self as sealed_msg_type::SealedTxType>::tx_type_id()
     }
 }
@@ -71,13 +75,8 @@ mod sealed_msg_type {
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     pub(crate) enum TransactionTypeId {
         JoinRing,
-        Probe,
-    }
-
-    impl TransactionTypeId {
-        pub const fn enumeration() -> [Self; 2] {
-            [Self::JoinRing, Self::Probe]
-        }
+        Put,
+        Canceled,
     }
 
     macro_rules! transaction_type_enumeration {
@@ -99,18 +98,18 @@ mod sealed_msg_type {
     }
 
     transaction_type_enumeration!(decl struct {
-        JoinRing -> JoinRingMsg
+        JoinRing -> JoinRingMsg,
+        Put -> PutMsg,
+        Canceled -> Transaction
     });
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum Message {
     JoinRing(JoinRingMsg),
+    Put(PutMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
-    // Probe
-    ProbeRequest(Transaction, ProbeRequest),
-    ProbeResponse(Transaction, ProbeResponse),
 }
 
 impl Message {
@@ -122,9 +121,8 @@ impl Message {
         use Message::*;
         match self {
             JoinRing(op) => op.id(),
-            ProbeRequest(id, _) => id,
-            ProbeResponse(id, _) => id,
-            Canceled(_) => todo!(),
+            Put(op) => op.id(),
+            Canceled(tx) => tx,
         }
     }
 
@@ -132,14 +130,9 @@ impl Message {
         use Message::*;
         match self {
             JoinRing(op) => op.sender(),
-            ProbeRequest(id, _) => None,
-            ProbeResponse(id, _) => None,
             Canceled(_) => None,
+            Put(op) => op.sender(),
         }
-    }
-
-    pub fn msg_type(&self) -> TransactionTypeId {
-        todo!()
     }
 }
 

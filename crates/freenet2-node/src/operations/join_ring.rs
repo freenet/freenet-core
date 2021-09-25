@@ -421,7 +421,7 @@ where
     );
 
     conn_manager.add_connection(gateway, true);
-    let tx = Transaction::new(<JoinRingMsg as TransactionType>::msg_type_id());
+    let tx = Transaction::new(<JoinRingMsg as TransactionType>::tx_type_id());
     let join_req = Message::from(messages::JoinRingMsg::Req {
         id: tx,
         msg: messages::JoinRequest::Initial {
@@ -657,12 +657,12 @@ mod tests {
         match tokio::time::timeout(Duration::from_secs(1), sim_net.recv_net_events()).await {
             Ok(Some(Ok(event))) => match event.event {
                 EventType::JoinSuccess { gateway, new_node } => {
-                    log::info!("Successful join op between {} and {}", gateway, new_node)
+                    log::info!("Successful join op between {} and {}", gateway, new_node);
+                    Ok(())
                 }
             },
-            _ => return Err("no event received".into()),
+            _ => Err("no event received".into()),
         }
-        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
