@@ -11,7 +11,7 @@ use std::net::IpAddr;
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-use crate::config::CONF;
+use crate::{config::CONF, ring::Location};
 
 use self::libp2p_impl::NodeLibP2P;
 pub(crate) use in_memory::NodeInMemory;
@@ -37,6 +37,16 @@ enum NodeImpl {
     InMemory(Box<NodeInMemory>),
 }
 
+/// When instancing a node you can either join an existing network or bootstrap a new network with a listener
+/// which will act as the initial provider. This initial peer will be listening at the provided port and assigned IP.
+/// If those are not free the instancing process will return an error.
+///
+/// In order to bootstrap a new network the following arguments are required to be provided to the builder:
+/// - ip: IP associated to the initial node.
+/// - port: listening port of the initial node.
+///
+/// If both are provided but also additional peers are added via the [`Self::add_provider()`] method, this node will
+/// be listening but also try to connect to an existing peer.
 pub struct NodeConfig {
     /// local peer private key in
     local_key: identity::Keypair,
@@ -50,19 +60,12 @@ pub struct NodeConfig {
     /// At least an other running listener node is required for joining the network.
     /// Not necessary if this is an initial node.
     remote_nodes: Vec<InitPeerNode>,
+
+    /// the location of this node, used for gateways.
+    location: Option<Location>,
 }
 
 impl NodeConfig {
-    /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
-    /// which will act as the initial provider. This initial peer will be listening at the provided port and assigned IP.
-    /// If those are not free the instancing process will return an error.
-    ///
-    /// In order to bootstrap a new network the following arguments are required to be provided to the builder:
-    /// - ip: IP associated to the initial node.
-    /// - port: listening port of the initial node.
-    ///
-    /// If both are provided but also additional peers are added via the [add_provider] method, this node will
-    /// be listening but also try to connect to an existing peer.
     pub fn new() -> NodeConfig {
         let local_key = if let Some(key) = &CONF.local_peer_keypair {
             key.clone()
@@ -74,6 +77,7 @@ impl NodeConfig {
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
+            location: None,
         }
     }
 
@@ -91,6 +95,11 @@ impl NodeConfig {
     /// If not provided it will be either obtained from the configuration or freshly generated.
     pub fn with_key(mut self, key: identity::Keypair) -> Self {
         self.local_key = key;
+        self
+    }
+
+    pub fn with_location(mut self, loc: Location) -> Self {
+        self.location = Some(loc);
         self
     }
 
@@ -123,6 +132,7 @@ impl Default for NodeConfig {
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
     identifier: Option<PeerId>,
+    location: Option<Location>,
 }
 
 impl InitPeerNode {
@@ -130,6 +140,7 @@ impl InitPeerNode {
         Self {
             addr: None,
             identifier: None,
+            location: None,
         }
     }
 
@@ -169,6 +180,11 @@ impl InitPeerNode {
         self.identifier = Some(id);
         self
     }
+
+    pub fn with_location(mut self, loc: Location) -> Self {
+        self.location = Some(loc);
+        self
+    }
 }
 
 impl std::default::Default for InitPeerNode {
@@ -180,6 +196,7 @@ impl std::default::Default for InitPeerNode {
         Self {
             addr: Some(multi_addr),
             identifier: Some(identifier),
+            location: None,
         }
     }
 }
@@ -201,7 +218,14 @@ pub mod test_utils {
     use rand::Rng;
     use tokio::sync::mpsc;
 
-    use crate::{NodeConfig, conn_manager::{ConnectionBridge, PeerKey, Transport}, message::Message, node::{InitPeerNode, NodeInMemory}, operations::{join_ring::join_ring_op, OpError}, ring::Distance};
+    use crate::{
+        conn_manager::{ConnectionBridge, PeerKey, Transport},
+        message::Message,
+        node::{InitPeerNode, NodeInMemory},
+        operations::{join_ring::join_ring_op, OpError},
+        ring::{Distance, Location},
+        NodeConfig,
+    };
 
     pub fn get_free_port() -> Result<u16, ()> {
         let mut port;
@@ -252,10 +276,12 @@ pub mod test_utils {
             let gateway_pair = identity::Keypair::generate_ed25519();
             let gateway_peer_id = gateway_pair.public().into_peer_id();
             let gateway_port = get_free_port().unwrap();
+            let gateway_loc = Location::random();
             let config = NodeConfig::new()
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(gateway_port)
-                .with_key(gateway_pair);
+                .with_key(gateway_pair)
+                .with_location(gateway_loc);
             let gateway = NodeInMemory::build(config).unwrap();
             sim.initialize_gateway(gateway, "gateway".to_owned());
 
@@ -266,7 +292,8 @@ pub mod test_utils {
                     InitPeerNode::new()
                         .listening_ip(Ipv6Addr::LOCALHOST)
                         .listening_port(gateway_port)
-                        .with_identifier(gateway_peer_id),
+                        .with_identifier(gateway_peer_id)
+                        .with_location(gateway_loc),
                 );
                 sim.initialize_peer(NodeInMemory::build(config).unwrap(), label);
             }

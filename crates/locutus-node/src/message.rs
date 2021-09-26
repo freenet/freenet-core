@@ -103,8 +103,7 @@ mod sealed_msg_type {
     transaction_type_enumeration!(decl struct {
         JoinRing -> JoinRingMsg,
         Put -> PutMsg,
-        Get -> GetMsg,
-        Canceled -> Transaction
+        Get -> GetMsg
     });
 }
 
