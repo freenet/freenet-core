@@ -31,7 +31,6 @@ impl Ring {
     /// randomize which of node a message which be forwarded to.
     pub const RAND_WALK_ABOVE_HTL: usize = 7;
 
-    ///
     pub const MAX_HOPS_TO_LIVE: usize = 10;
 
     pub fn new() -> Self {

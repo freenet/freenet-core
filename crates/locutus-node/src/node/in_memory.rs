@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::Message,
     operations::{get, join_ring, put},
+    ring::Ring,
     user_events::{test_utils::MemoryEventsGen, UserEvent, UserEventsProxy},
     NodeConfig,
 };
@@ -43,10 +46,18 @@ impl NodeInMemory {
                 })
             })
             .collect();
+        let mut ring = Ring::new();
+        if let Some(max_hops_to_live) = config.max_hops_to_live {
+            ring.with_max_hops(max_hops_to_live);
+        }
+        if let Some(rnd_if_htl_above) = config.rnd_if_htl_above {
+            ring.with_rnd_walk_above(rnd_if_htl_above);
+        }
+        let op_storage = OpStateStorage::new(ring);
         Ok(NodeInMemory {
             peer,
             conn_manager,
-            op_storage: OpStateStorage::new(),
+            op_storage,
             gateways,
             user_events: MemoryEventsGen {},
         })
