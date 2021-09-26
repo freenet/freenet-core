@@ -41,7 +41,7 @@ impl MemoryConnManager {
                         std::mem::drop(queue);
                     }
                 }
-                tokio::time::sleep(Duration::from_nanos(1000)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
 
@@ -62,7 +62,7 @@ impl ConnectionBridge for MemoryConnManager {
                 }
                 std::mem::drop(queue);
             }
-            tokio::time::sleep(Duration::from_nanos(1000)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -120,7 +120,7 @@ impl InMemoryTransport {
                     }
                     Err(channel::TryRecvError::Disconnected) => break,
                     Err(channel::TryRecvError::Empty) | Ok(_) => {
-                        tokio::time::sleep(Duration::from_millis(1)).await
+                        tokio::time::sleep(Duration::from_millis(10)).await
                     }
                 }
             }

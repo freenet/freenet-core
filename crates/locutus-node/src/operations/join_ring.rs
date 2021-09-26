@@ -16,8 +16,24 @@ pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 pub(crate) struct JoinRingOp(StateMachine<JROpSM>);
 
 impl JoinRingOp {
-    pub fn new(this_peer: PeerKeyLocation, gateway: PeerKeyLocation) -> Self {
-        JoinRingOp(StateMachine::new())
+    pub fn initial_request(
+        req_peer: PeerKey,
+        target_loc: PeerKeyLocation,
+        max_hops_to_live: usize,
+    ) -> Self {
+        let mut sm = StateMachine::new();
+        sm.consume(&JoinRingMsg::Req {
+            id: Transaction::new(<JoinRingMsg as TransactionType>::tx_type_id()),
+            msg: JoinRequest::Initial {
+                req_peer,
+                target_loc,
+                max_hops_to_live,
+                // initially is the max hops, will be decreased over each hop
+                hops_to_live: max_hops_to_live,
+            },
+        })
+        .unwrap();
+        JoinRingOp(sm)
     }
 }
 
@@ -418,7 +434,7 @@ where
     } = (&join_op.0).state().clone().try_unwrap_connecting()?;
 
     log::info!(
-        "Joining ring via {} at {}",
+        "Joining ring via {} (@{})",
         gateway.peer,
         gateway
             .location
@@ -442,10 +458,6 @@ where
         gateway.peer
     );
     conn_manager.send(&gateway, join_req).await?;
-    // join_op
-    //     .0
-    //     .consume(&JoinRingMsg::Req { , this_peer })
-    //     .map_err(|_| OpError::IllegalStateTransition)?;
     op_storage.push(tx, Operation::JoinRing(join_op))?;
     Ok(())
 }
@@ -653,12 +665,13 @@ mod tests {
         assert!(matches!(join_op_host_2.state(), JRState::Connected));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node0_to_gateway_conn() -> Result<(), Box<dyn std::error::Error>> {
         //! Given a network of one node and one gateway test that both are connected.
         Logger::init_logger();
         let mut sim_net = SimNetwork::build(1, 1, 0);
-        match tokio::time::timeout(Duration::from_secs(1), sim_net.recv_net_events()).await {
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        match tokio::time::timeout(Duration::from_secs(300), sim_net.recv_net_events()).await {
             Ok(Some(Ok(event))) => match event.event {
                 EventType::JoinSuccess { gateway, new_node } => {
                     log::info!("Successful join op between {} and {}", gateway, new_node);
@@ -675,7 +688,7 @@ mod tests {
         Logger::init_logger();
 
         let _sim_nodes = SimNetwork::build(10, 10, 7);
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        // tokio::time::sleep(Duration::from_secs(300)).await;
         // let _hist: Vec<_> = _ring_distribution(sim_nodes.values()).collect();
 
         // FIXME: enable probing

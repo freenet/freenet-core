@@ -6,14 +6,13 @@ use crate::{
     NodeConfig,
 };
 
-use super::op_state::OpStateStorage;
+use super::{op_state::OpStateStorage, InitPeerNode};
 
 pub(crate) struct NodeInMemory<Ev = MemoryEventsGen>
 where
     Ev: UserEventsProxy,
 {
     peer: PeerKey,
-    listening: bool,
     gateways: Vec<PeerKeyLocation>,
     pub conn_manager: MemoryConnManager,
     pub op_storage: OpStateStorage,
@@ -29,49 +28,51 @@ impl NodeInMemory {
         }
         let peer = PeerKey::from(config.local_key.public());
         let conn_manager = MemoryConnManager::new(true, peer, None);
+        let gateways = config
+            .remote_nodes
+            .into_iter()
+            .filter_map(|node| {
+                let InitPeerNode {
+                    identifier,
+                    location,
+                    ..
+                } = node;
+                location.zip(identifier).map(|(loc, id)| PeerKeyLocation {
+                    peer: PeerKey(id),
+                    location: Some(loc),
+                })
+            })
+            .collect();
         Ok(NodeInMemory {
             peer,
-            listening: true,
             conn_manager,
             op_storage: OpStateStorage::new(),
-            gateways: vec![],
+            gateways,
             user_events: MemoryEventsGen {},
         })
     }
 
     pub async fn start(&mut self) -> Result<(), ()> {
-        if self.listening {
-            // cannot start if already listening; meaning that this node already joined
-            // the ring or is a gateway
-            return Err(());
-        }
-
         // FIXME: this iteration should be shuffled, must write an extension iterator shuffle items "in place"
         // the idea here is to limit the amount of gateways being contacted that's why shuffling is required
         for gateway in &self.gateways {
             // initiate join action action per each gateway
-            let op = join_ring::JoinRingOp::new(
-                PeerKeyLocation {
-                    peer: self.peer,
-                    location: None,
-                },
+            let op = join_ring::JoinRingOp::initial_request(
+                self.peer,
                 *gateway,
+                self.op_storage.ring.max_hops_to_live,
             );
             join_ring::initial_join_request(&mut self.op_storage, &mut self.conn_manager, op)
                 .await
                 .unwrap();
         }
-
-        Err(())
+        Ok(())
     }
 
     /// Starts listening to incoming messages, only allowed to be called directly when this node
     /// already joined the network.
     pub async fn listen_on(&mut self) -> Result<(), ()> {
-        if !self.listening {
-            return Err(());
-        }
-
+        self.start().await?;
         loop {
             tokio::select! {
                 msg = self.conn_manager.recv() => {
