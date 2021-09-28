@@ -10,11 +10,13 @@ pub(crate) enum UserEvent {
         key: Vec<u8>,
         /// Value to upsert in the contract.
         value: Vec<u8>,
+        contract: Vec<u8>,
     },
-    /// Fetch the current value from a contrart corresponding to the provided key.
+    /// Fetch the current value from a contract corresponding to the provided key.
     Get {
         /// Hash key of the contract.
         key: Vec<u8>,
+        contract: bool,
     },
 }
 

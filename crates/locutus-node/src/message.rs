@@ -140,6 +140,14 @@ impl Message {
             Canceled(_) => None,
         }
     }
+
+    pub fn target(&self) -> Option<PeerKeyLocation> {
+        use Message::*;
+        match self {
+            JoinRing(op) => op.target(),
+            _ => todo!(),
+        }
+    }
 }
 
 impl Display for Message {

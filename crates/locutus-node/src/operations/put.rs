@@ -55,7 +55,7 @@ enum PutState {
     Requesting { key: Vec<u8> },
 }
 
-pub(crate) async fn put_op<CB>(
+pub(crate) async fn handle_put_response<CB>(
     op_storage: &mut OpStateStorage,
     conn_manager: &mut CB,
     put_op: PutMsg,

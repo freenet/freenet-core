@@ -145,10 +145,11 @@ impl InMemoryTransport {
         });
         match send_res {
             Err(channel::TrySendError::Disconnected(_)) => {
-                log::debug!("Network shutdown")
+                log::error!("Network shutdown")
             }
             Err(channel::TrySendError::Full(_)) => {
-                unreachable!("not unbounded capacity!")
+                log::error!("not unbounded capacity!");
+                panic!();
             }
             Ok(_) => {}
         }

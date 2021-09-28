@@ -240,7 +240,7 @@ pub mod test_utils {
         conn_manager::{ConnectionBridge, PeerKey, Transport},
         message::Message,
         node::{InitPeerNode, NodeInMemory},
-        operations::{join_ring::join_ring_op, OpError},
+        operations::{join_ring::handle_join_ring, OpError},
         ring::{Distance, Location},
         NodeConfig,
     };
@@ -299,20 +299,25 @@ pub mod test_utils {
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(gateway_port)
                 .with_key(gateway_pair)
-                .with_location(gateway_loc);
+                .with_location(gateway_loc)
+                .max_hops_to_live(ring_max_htl)
+                .rnd_if_htl_above(rnd_if_htl_above);
             let gateway = NodeInMemory::build(config).unwrap();
             sim.initialize_gateway(gateway, "gateway".to_owned());
 
             // add other nodes to the simulation
             for node_no in 0..network_size {
                 let label = format!("node-{}", node_no);
-                let config = NodeConfig::new().add_provider(
-                    InitPeerNode::new()
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(gateway_port)
-                        .with_identifier(gateway_peer_id)
-                        .with_location(gateway_loc),
-                );
+                let config = NodeConfig::new()
+                    .add_provider(
+                        InitPeerNode::new()
+                            .listening_ip(Ipv6Addr::LOCALHOST)
+                            .listening_port(gateway_port)
+                            .with_identifier(gateway_peer_id)
+                            .with_location(gateway_loc),
+                    )
+                    .max_hops_to_live(ring_max_htl)
+                    .rnd_if_htl_above(rnd_if_htl_above);
                 sim.initialize_peer(NodeInMemory::build(config).unwrap(), label);
             }
             sim
@@ -338,7 +343,7 @@ pub mod test_utils {
         fn initialize_peer(&self, mut peer: NodeInMemory, sender_label: String) {
             let info_ch = self.meta_info_tx.clone();
             tokio::spawn(async move {
-                if peer.start().await.is_err() {
+                if peer.join_ring().await.is_err() {
                     let _ = info_ch.send(Err(OpError::IllegalStateTransition)).await;
                     return Err(());
                 }
@@ -354,7 +359,7 @@ pub mod test_utils {
             while let Ok(msg) = gateway.conn_manager.recv().await {
                 if let Message::JoinRing(msg) = msg {
                     if let Err(err) =
-                        join_ring_op(&mut gateway.op_storage, &mut gateway.conn_manager, msg).await
+                        handle_join_ring(&mut gateway.op_storage, &mut gateway.conn_manager, msg).await
                     {
                         let _ = info_ch.send(Err(err)).await;
                         return Err(());
