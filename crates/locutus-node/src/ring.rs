@@ -21,6 +21,7 @@ pub(crate) struct Ring {
     pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
+    pub own_location: Option<Location>,
 }
 
 impl Ring {
@@ -31,7 +32,6 @@ impl Ring {
     /// randomize which of node a message which be forwarded to.
     pub const RAND_WALK_ABOVE_HTL: usize = 7;
 
-    ///
     pub const MAX_HOPS_TO_LIVE: usize = 10;
 
     pub fn new() -> Self {
@@ -39,6 +39,7 @@ impl Ring {
             connections_by_location: RwLock::new(BTreeMap::new()),
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
+            own_location: None,
         }
     }
 

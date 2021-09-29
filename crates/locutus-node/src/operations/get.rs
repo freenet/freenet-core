@@ -52,7 +52,7 @@ enum GetState {
     Requesting { key: Vec<u8> },
 }
 
-pub(crate) async fn get_op<CB>(
+pub(crate) async fn handle_get_response<CB>(
     op_storage: &mut OpStateStorage,
     conn_manager: &mut CB,
     get_op: GetMsg,

@@ -10,7 +10,7 @@ pub(crate) struct OpStateStorage {
     join_ring: HashMap<Transaction, JoinRingOp>,
     put: HashMap<Transaction, PutOp>,
     get: HashMap<Transaction, GetOp>,
-    pub ring: Arc<Ring>,
+    pub ring: Ring,
 }
 
 macro_rules! check_id_op {
@@ -25,12 +25,12 @@ macro_rules! check_id_op {
 }
 
 impl OpStateStorage {
-    pub fn new() -> Self {
+    pub fn new(ring: Ring) -> Self {
         Self {
             join_ring: HashMap::default(),
             put: HashMap::default(),
             get: HashMap::default(),
-            ring: Arc::new(Ring::new()),
+            ring,
         }
     }
 

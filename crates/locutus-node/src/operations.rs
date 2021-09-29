@@ -30,3 +30,9 @@ pub(crate) enum OpError {
     #[error("illegal awaiting state")]
     IllegalStateTransition,
 }
+
+impl From<rust_fsm::TransitionImpossibleError> for OpError {
+    fn from(_: rust_fsm::TransitionImpossibleError) -> Self {
+        OpError::IllegalStateTransition
+    }
+}

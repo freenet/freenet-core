@@ -11,7 +11,10 @@ use std::net::IpAddr;
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-use crate::{config::CONF, ring::Location};
+use crate::{
+    config::CONF,
+    ring::{Location, Ring},
+};
 
 use self::libp2p_impl::NodeLibP2P;
 pub(crate) use in_memory::NodeInMemory;
@@ -63,6 +66,9 @@ pub struct NodeConfig {
 
     /// the location of this node, used for gateways.
     location: Option<Location>,
+
+    max_hops_to_live: Option<usize>,
+    rnd_if_htl_above: Option<usize>,
 }
 
 impl NodeConfig {
@@ -78,7 +84,19 @@ impl NodeConfig {
             local_ip: None,
             local_port: None,
             location: None,
+            max_hops_to_live: None,
+            rnd_if_htl_above: None,
         }
+    }
+
+    pub fn max_hops_to_live(mut self, num_hops: usize) -> Self {
+        self.max_hops_to_live = Some(num_hops);
+        self
+    }
+
+    pub fn rnd_if_htl_above(mut self, num_hops: usize) -> Self {
+        self.rnd_if_htl_above = Some(num_hops);
+        self
     }
 
     pub fn with_port(mut self, port: u16) -> Self {
@@ -222,7 +240,7 @@ pub mod test_utils {
         conn_manager::{ConnectionBridge, PeerKey, Transport},
         message::Message,
         node::{InitPeerNode, NodeInMemory},
-        operations::{join_ring::join_ring_op, OpError},
+        operations::{join_ring::handle_join_ring, OpError},
         ring::{Distance, Location},
         NodeConfig,
     };
@@ -281,20 +299,25 @@ pub mod test_utils {
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(gateway_port)
                 .with_key(gateway_pair)
-                .with_location(gateway_loc);
+                .with_location(gateway_loc)
+                .max_hops_to_live(ring_max_htl)
+                .rnd_if_htl_above(rnd_if_htl_above);
             let gateway = NodeInMemory::build(config).unwrap();
             sim.initialize_gateway(gateway, "gateway".to_owned());
 
             // add other nodes to the simulation
             for node_no in 0..network_size {
                 let label = format!("node-{}", node_no);
-                let config = NodeConfig::new().add_provider(
-                    InitPeerNode::new()
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(gateway_port)
-                        .with_identifier(gateway_peer_id)
-                        .with_location(gateway_loc),
-                );
+                let config = NodeConfig::new()
+                    .add_provider(
+                        InitPeerNode::new()
+                            .listening_ip(Ipv6Addr::LOCALHOST)
+                            .listening_port(gateway_port)
+                            .with_identifier(gateway_peer_id)
+                            .with_location(gateway_loc),
+                    )
+                    .max_hops_to_live(ring_max_htl)
+                    .rnd_if_htl_above(rnd_if_htl_above);
                 sim.initialize_peer(NodeInMemory::build(config).unwrap(), label);
             }
             sim
@@ -320,7 +343,7 @@ pub mod test_utils {
         fn initialize_peer(&self, mut peer: NodeInMemory, sender_label: String) {
             let info_ch = self.meta_info_tx.clone();
             tokio::spawn(async move {
-                if peer.start().await.is_err() {
+                if peer.join_ring().await.is_err() {
                     let _ = info_ch.send(Err(OpError::IllegalStateTransition)).await;
                     return Err(());
                 }
@@ -336,7 +359,7 @@ pub mod test_utils {
             while let Ok(msg) = gateway.conn_manager.recv().await {
                 if let Message::JoinRing(msg) = msg {
                     if let Err(err) =
-                        join_ring_op(&mut gateway.op_storage, &mut gateway.conn_manager, msg).await
+                        handle_join_ring(&mut gateway.op_storage, &mut gateway.conn_manager, msg).await
                     {
                         let _ = info_ch.send(Err(err)).await;
                         return Err(());
