@@ -229,7 +229,7 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 pub mod test_utils {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 
-    use libp2p::identity;
+    use libp2p::{identity, PeerId};
     use rand::Rng;
     use tokio::sync::mpsc;
 
@@ -237,7 +237,10 @@ pub mod test_utils {
         conn_manager::{ConnectionBridge, Transport},
         message::Message,
         node::{InitPeerNode, NodeInMemory},
-        operations::{join_ring::handle_join_ring, OpError},
+        operations::{
+            join_ring::{handle_join_ring, JoinRingMsg},
+            OpError,
+        },
         ring::{Distance, Location},
         NodeConfig,
     };
@@ -274,7 +277,7 @@ pub mod test_utils {
 
     pub(crate) enum EventType {
         /// A peer joined the network through some gateway.
-        JoinSuccess,
+        JoinSuccess { peer: PeerId },
     }
 
     impl SimNetwork {
@@ -354,22 +357,28 @@ pub mod test_utils {
         ) -> Result<(), ()> {
             while let Ok(msg) = gateway.conn_manager.recv().await {
                 if let Message::JoinRing(msg) = msg {
-                    if let Err(err) =
-                        handle_join_ring(&mut gateway.op_storage, &mut gateway.conn_manager, msg)
-                            .await
+                    if let JoinRingMsg::Connected { target, .. } = msg {
+                        let _ = info_ch
+                            .send(Ok(NetEvent {
+                                event: EventType::JoinSuccess {
+                                    peer: target.peer.0,
+                                },
+                            }))
+                            .await;
+                        break;
+                    }
+                    match handle_join_ring(&mut gateway.op_storage, &mut gateway.conn_manager, msg)
+                        .await
                     {
-                        let _ = info_ch.send(Err(err)).await;
-                        return Err(());
+                        Err(err) => {
+                            let _ = info_ch.send(Err(err)).await;
+                        }
+                        Ok(()) => {}
                     }
                 } else {
                     return Err(());
                 }
             }
-            let _ = info_ch
-                .send(Ok(NetEvent {
-                    event: EventType::JoinSuccess,
-                }))
-                .await;
             Ok(())
         }
     }

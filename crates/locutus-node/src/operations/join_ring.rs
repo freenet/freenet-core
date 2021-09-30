@@ -156,13 +156,15 @@ impl StateMachineImpl for JROpSM {
             (
                 JRState::OCReceived,
                 JoinRingMsg::Resp {
-                    msg: JoinResponse::ReceivedOC { by_peer },
+                    msg: JoinResponse::ReceivedOC { .. },
                     id,
-                    ..
+                    target,
+                    sender,
                 },
             ) => Some(JoinRingMsg::Connected {
                 id: *id,
-                target: *by_peer,
+                sender: *target,
+                target: *sender,
             }),
             _ => None,
         }
@@ -479,10 +481,10 @@ where
                 new_state = None;
             }
         }
-        JoinRingMsg::Connected { target, id } => {
+        JoinRingMsg::Connected { target, sender, id } => {
             return_msg = state
                 .0
-                .consume(&JoinRingMsg::Connected { target, id })?
+                .consume(&JoinRingMsg::Connected { target, sender, id })?
                 .map(Message::from);
             if !state.0.state().is_connected() {
                 return Err(OpError::IllegalStateTransition);
@@ -562,6 +564,7 @@ mod messages {
         },
         Connected {
             id: Transaction,
+            sender: PeerKeyLocation,
             target: PeerKeyLocation,
         },
     }
@@ -580,6 +583,7 @@ mod messages {
             use JoinRingMsg::*;
             match self {
                 Resp { sender, .. } => Some(sender),
+                Connected { sender, .. } => Some(sender),
                 _ => None,
             }
         }
@@ -656,13 +660,13 @@ mod tests {
             location: Some(Location::random()),
         };
 
-        let mut join_op_host_1 =
+        let mut join_gw_1 =
             StateMachine::<JROpSM>::from_state(JRState::Connecting(ConnectionInfo {
                 gateway,
                 this_peer: new_peer.peer,
                 max_hops_to_live: 0,
             }));
-        let mut join_op_host_2 = StateMachine::<JROpSM>::new();
+        let mut join_new_peer_2 = StateMachine::<JROpSM>::new();
 
         let req = JoinRingMsg::Req {
             id,
@@ -673,7 +677,7 @@ mod tests {
                 your_peer_id: new_peer.peer,
             },
         };
-        let res = join_op_host_2.consume(&req).unwrap().unwrap();
+        let res = join_new_peer_2.consume(&req).unwrap().unwrap();
         let expected = JoinRingMsg::Resp {
             id,
             msg: JoinResponse::AcceptedBy {
@@ -685,9 +689,9 @@ mod tests {
             sender: gateway,
         };
         assert_eq!(res, expected);
-        assert!(matches!(join_op_host_2.state(), JRState::OCReceived));
+        assert!(matches!(join_new_peer_2.state(), JRState::OCReceived));
 
-        let res = join_op_host_1.consume(&res).unwrap().unwrap();
+        let res = join_gw_1.consume(&res).unwrap().unwrap();
         new_peer.location = Some(new_loc);
         let expected = JoinRingMsg::Resp {
             msg: JoinResponse::ReceivedOC { by_peer: new_peer },
@@ -696,25 +700,26 @@ mod tests {
             target: gateway,
         };
         assert_eq!(res, expected);
-        assert!(matches!(join_op_host_1.state(), JRState::OCReceived));
+        assert!(matches!(join_gw_1.state(), JRState::OCReceived));
 
-        let res = join_op_host_2.consume(&res).unwrap().unwrap();
+        let res = join_new_peer_2.consume(&res).unwrap().unwrap();
         let expected = JoinRingMsg::Connected {
             id,
             target: new_peer,
+            sender: gateway,
         };
         assert_eq!(res, expected);
-        assert!(matches!(join_op_host_2.state(), JRState::Connected));
+        assert!(matches!(join_new_peer_2.state(), JRState::Connected));
 
-        assert!(join_op_host_1.consume(&res).unwrap().is_none());
-        assert!(matches!(join_op_host_1.state(), JRState::Connected));
+        assert!(join_gw_1.consume(&res).unwrap().is_none());
+        assert!(matches!(join_gw_1.state(), JRState::Connected));
 
         // transaction finished, should not return anymore
-        assert!(join_op_host_2.consume(&res).is_err());
-        assert!(join_op_host_1.consume(&res).is_err());
+        assert!(join_new_peer_2.consume(&res).is_err());
+        assert!(join_gw_1.consume(&res).is_err());
         // and the final state should be connected
-        assert!(matches!(join_op_host_1.state(), JRState::Connected));
-        assert!(matches!(join_op_host_2.state(), JRState::Connected));
+        assert!(matches!(join_gw_1.state(), JRState::Connected));
+        assert!(matches!(join_new_peer_2.state(), JRState::Connected));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -724,8 +729,8 @@ mod tests {
         let mut sim_net = SimNetwork::build(1, 1, 0);
         match tokio::time::timeout(Duration::from_secs(10), sim_net.recv_net_events()).await {
             Ok(Some(Ok(event))) => match event.event {
-                EventType::JoinSuccess => {
-                    log::info!("Successful join op between ");
+                EventType::JoinSuccess { peer } => {
+                    log::info!("Successful join op for peer {}", peer);
                     Ok(())
                 }
             },
