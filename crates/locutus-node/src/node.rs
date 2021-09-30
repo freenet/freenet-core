@@ -11,10 +11,7 @@ use std::net::IpAddr;
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-use crate::{
-    config::CONF,
-    ring::{Location, Ring},
-};
+use crate::{config::CONF, ring::Location};
 
 use self::libp2p_impl::NodeLibP2P;
 pub(crate) use in_memory::NodeInMemory;
@@ -237,7 +234,7 @@ pub mod test_utils {
     use tokio::sync::mpsc;
 
     use crate::{
-        conn_manager::{ConnectionBridge, PeerKey, Transport},
+        conn_manager::{ConnectionBridge, Transport},
         message::Message,
         node::{InitPeerNode, NodeInMemory},
         operations::{join_ring::handle_join_ring, OpError},
@@ -272,13 +269,12 @@ pub mod test_utils {
     }
 
     pub(crate) struct NetEvent {
-        pub(crate) _sender: String,
         pub(crate) event: EventType,
     }
 
     pub(crate) enum EventType {
         /// A peer joined the network through some gateway.
-        JoinSuccess { gateway: PeerKey, new_node: PeerKey },
+        JoinSuccess,
     }
 
     impl SimNetwork {
@@ -359,15 +355,21 @@ pub mod test_utils {
             while let Ok(msg) = gateway.conn_manager.recv().await {
                 if let Message::JoinRing(msg) = msg {
                     if let Err(err) =
-                        handle_join_ring(&mut gateway.op_storage, &mut gateway.conn_manager, msg).await
+                        handle_join_ring(&mut gateway.op_storage, &mut gateway.conn_manager, msg)
+                            .await
                     {
                         let _ = info_ch.send(Err(err)).await;
                         return Err(());
                     }
                 } else {
-                    break;
+                    return Err(());
                 }
             }
+            let _ = info_ch
+                .send(Ok(NetEvent {
+                    event: EventType::JoinSuccess,
+                }))
+                .await;
             Ok(())
         }
     }

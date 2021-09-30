@@ -41,7 +41,7 @@ impl MemoryConnManager {
                         std::mem::drop(queue);
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_nanos(1_000)).await;
             }
         });
 
@@ -58,11 +58,13 @@ impl ConnectionBridge for MemoryConnManager {
         loop {
             if let Some(mut queue) = self.msg_queue.try_lock() {
                 if let Some(msg) = queue.pop() {
+                    std::mem::drop(queue);
                     return Ok(msg);
+                } else {
+                    std::mem::drop(queue);
                 }
-                std::mem::drop(queue);
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_nanos(1_000)).await;
         }
     }
 
@@ -105,8 +107,8 @@ impl InMemoryTransport {
 
         // store messages incoming from the network in the msg stack
         let rcv_msg_c = msg_stack_queue.clone();
-        let network = tx.clone();
         let rx = rx.clone();
+        let tx_cp = tx.clone();
         tokio::spawn(async move {
             loop {
                 match rx.try_recv() {
@@ -118,15 +120,21 @@ impl InMemoryTransport {
                         );
                         rcv_msg_c.lock().push(msg);
                     }
+                    Ok(msg) => {
+                        // send back to the network since this msg belongs to other peer
+                        tx_cp.send(msg).expect("failed to send msg back to network");
+                        tokio::time::sleep(Duration::from_nanos(1_000)).await
+                    }
                     Err(channel::TryRecvError::Disconnected) => break,
-                    Err(channel::TryRecvError::Empty) | Ok(_) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await
+                    Err(channel::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_nanos(1_000)).await
                     }
                 }
             }
             log::error!("Stopped receiving messages in {}", interface_peer);
         });
 
+        let network = tx.clone();
         Self {
             interface_peer,
             location,
@@ -137,21 +145,14 @@ impl InMemoryTransport {
     }
 
     fn send(&self, peer: PeerKey, location: Location, message: Vec<u8>) {
-        let send_res = self.network.try_send(MessageOnTransit {
+        let send_res = self.network.send(MessageOnTransit {
             origin: self.interface_peer,
             origin_loc: Some(location),
             target: peer,
             data: message,
         });
-        match send_res {
-            Err(channel::TrySendError::Disconnected(_)) => {
-                log::error!("Network shutdown")
-            }
-            Err(channel::TrySendError::Full(_)) => {
-                log::error!("not unbounded capacity!");
-                panic!();
-            }
-            Ok(_) => {}
+        if let Err(channel::SendError(_)) = send_res {
+            log::error!("Network shutdown")
         }
     }
 }
