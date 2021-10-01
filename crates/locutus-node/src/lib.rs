@@ -4,6 +4,7 @@ mod message;
 mod node;
 mod operations;
 // mod probe_proto;
+mod contract;
 mod ring;
 mod user_events;
 

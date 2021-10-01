@@ -125,6 +125,19 @@ impl Location {
     }
 }
 
+impl From<&[u8]> for Location {
+    fn from(slice: &[u8]) -> Self {
+        let mut value = 0.0;
+        let mut divisor = 256.0;
+        // assert!((1..8).contains(&precision));
+        for byte in slice.iter().take(7) {
+            value += *byte as f64 / divisor;
+            divisor *= 256.0;
+        }
+        Location::try_from(value).expect("value should be between 0 and 1")
+    }
+}
+
 impl Display for Location {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0.to_string().as_str())?;

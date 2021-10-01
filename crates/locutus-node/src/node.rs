@@ -14,9 +14,11 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use crate::{config::CONF, ring::Location};
 
 use self::libp2p_impl::NodeLibP2P;
+#[cfg(test)]
 pub(crate) use in_memory::NodeInMemory;
 pub(crate) use op_state::{OpExecutionError, OpStateStorage};
 
+#[cfg(test)]
 mod in_memory;
 mod libp2p_impl;
 mod op_state;
@@ -27,6 +29,7 @@ impl Node {
     pub async fn listen_on(&mut self) -> Result<(), ()> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
+            #[cfg(test)]
             NodeImpl::InMemory(ref mut node) => node.listen_on().await,
         }
     }
@@ -34,6 +37,7 @@ impl Node {
 
 enum NodeImpl {
     LibP2P(Box<NodeLibP2P>),
+    #[cfg(test)]
     InMemory(Box<NodeInMemory>),
 }
 
@@ -130,6 +134,7 @@ impl NodeConfig {
     }
 
     /// Builds a node using in-memory transport. Used for testing pourpouses.
+    #[cfg(test)]
     pub fn build_in_memory(self) -> Result<Node, &'static str> {
         let inmem = NodeInMemory::build(self)?;
         Ok(Node(NodeImpl::InMemory(Box::new(inmem))))

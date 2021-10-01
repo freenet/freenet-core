@@ -61,7 +61,7 @@ impl NodeInMemory {
             conn_manager,
             op_storage,
             gateways,
-            user_events: MemoryEventsGen {},
+            user_events: MemoryEventsGen::new(),
         })
     }
 
