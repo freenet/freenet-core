@@ -15,6 +15,14 @@ pub(crate) struct Contract {
     key: [u8; 64],
 }
 
+pub(crate) struct ContractKey<'a>(&'a [u8]);
+
+impl<'a> ContractKey<'a> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.0
+    }
+}
+
 impl Contract {
     fn new(data: Vec<u8>) -> Self {
         let mut hasher = Blake2b::new();
@@ -28,7 +36,7 @@ impl Contract {
     }
 
     fn assigned_location(&self) -> Location {
-        Location::from(self.key.as_ref())
+        Location::from(ContractKey(self.key.as_ref()))
     }
 }
 

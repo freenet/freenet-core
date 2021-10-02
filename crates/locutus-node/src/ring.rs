@@ -14,7 +14,10 @@ use std::{collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
 
 use parking_lot::RwLock;
 
-use crate::conn_manager::{self, PeerKeyLocation};
+use crate::{
+    conn_manager::{self, PeerKeyLocation},
+    contract::ContractKey,
+};
 
 #[derive(Debug)]
 pub(crate) struct Ring {
@@ -125,12 +128,18 @@ impl Location {
     }
 }
 
-impl From<&[u8]> for Location {
-    fn from(slice: &[u8]) -> Self {
+/// # Security
+/// A location in the ring could be derived from a known sequence of bytes
+/// so we never allow generation of locations from an unknown source byte array.
+///
+/// Instead we ensure at compile time locations can only be constructed from well formed
+/// keys (which have been hashed with a strong cryptographically sage hash function first).
+impl<'a> From<ContractKey<'a>> for Location {
+    fn from(key: ContractKey<'a>) -> Self {
         let mut value = 0.0;
         let mut divisor = 256.0;
-        // assert!((1..8).contains(&precision));
-        for byte in slice.iter().take(7) {
+        // assert!((1..=7).contains(&precision));
+        for byte in key.bytes().iter().take(7) {
             value += *byte as f64 / divisor;
             divisor *= 256.0;
         }
