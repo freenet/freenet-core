@@ -16,5 +16,4 @@ macro_rules! rnd_bytes {
 }
 
 rnd_bytes!(128 -> random_bytes_128);
-rnd_bytes!(256 -> random_bytes_256);
 rnd_bytes!(1024 -> random_bytes_1024);

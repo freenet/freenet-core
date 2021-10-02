@@ -2,7 +2,7 @@ use crate::contract::Contract;
 
 #[async_trait::async_trait]
 pub(crate) trait UserEventsProxy {
-    async fn recv(&self) -> UserEvent;
+    async fn recv(&mut self) -> UserEvent;
 }
 
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
@@ -37,7 +37,7 @@ pub(crate) mod test_utils {
             Self
         }
 
-        fn gen_new_event(&self) -> UserEvent {
+        fn gen_new_event(&mut self) -> UserEvent {
             let bytes = random_bytes_128();
             let mut unst = Unstructured::new(&bytes);
             UserEvent::arbitrary(&mut unst).expect("failed gen arb data")
@@ -48,7 +48,7 @@ pub(crate) mod test_utils {
     impl UserEventsProxy for MemoryEventsGen {
         /// # Cancellation Safety
         /// This future must be safe to cancel.
-        async fn recv(&self) -> UserEvent {
+        async fn recv(&mut self) -> UserEvent {
             self.gen_new_event()
         }
     }

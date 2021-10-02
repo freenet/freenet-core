@@ -11,6 +11,8 @@ use std::net::IpAddr;
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
+#[cfg(test)]
+use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{config::CONF, ring::Location};
 
 use self::libp2p_impl::NodeLibP2P;
@@ -30,7 +32,7 @@ impl Node {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
             #[cfg(test)]
-            NodeImpl::InMemory(ref mut node) => node.listen_on().await,
+            NodeImpl::InMemory(ref mut node) => node.listen_on(MemoryEventsGen::new()).await,
         }
     }
 }

@@ -206,7 +206,7 @@ impl JRState {
 /// # Cancellation Safety
 /// This future is not cancellation safe.
 pub(crate) async fn handle_join_ring<CB>(
-    op_storage: &mut OpStateStorage,
+    op_storage: &OpStateStorage,
     conn_manager: &mut CB,
     join_op: JoinRingMsg,
 ) -> Result<(), OpError>
@@ -219,14 +219,14 @@ where
         Some(Operation::JoinRing(state)) => {
             sender = join_op.sender().cloned();
             // was an existing operation, the other peer messaged back
-            update_state(conn_manager, state, join_op, &mut op_storage.ring).await
+            update_state(conn_manager, state, join_op, &op_storage.ring).await
         }
         Some(_) => return Err(OpExecutionError::TxUpdateFailure(tx).into()),
         None => {
             sender = join_op.sender().cloned();
             // new request to join from this node, initialize the machine
             let machine = JoinRingOp(StateMachine::new());
-            update_state(conn_manager, machine, join_op, &mut op_storage.ring).await
+            update_state(conn_manager, machine, join_op, &op_storage.ring).await
         }
     };
 
@@ -274,7 +274,7 @@ async fn update_state<CB>(
     conn_manager: &mut CB,
     mut state: JoinRingOp,
     other_host_msg: JoinRingMsg,
-    ring: &mut Ring,
+    ring: &Ring,
 ) -> Result<OperationResult<JoinRingOp>, OpError>
 where
     CB: ConnectionBridge,
@@ -425,7 +425,7 @@ where
                     log::info!("Not accepting connection to {}", new_peer.peer);
                 }
             }
-            ring.own_location = Some(your_location);
+            ring.update_location(your_location);
             new_state = Some(state);
         }
         JoinRingMsg::Resp {
@@ -492,7 +492,7 @@ where
                 log::info!(
                     "Successfully completed connection @ {}, new location = {:?}",
                     target.peer,
-                    ring.own_location
+                    ring.own_location()
                 );
                 new_state = None;
             }
@@ -508,7 +508,7 @@ where
 /// Join ring routine, called upon performing a join operation for this node.
 pub(crate) async fn join_ring_request<CB>(
     tx: Transaction,
-    op_storage: &mut OpStateStorage,
+    op_storage: &OpStateStorage,
     conn_manager: &mut CB,
     join_op: JoinRingOp,
 ) -> Result<(), OpError>

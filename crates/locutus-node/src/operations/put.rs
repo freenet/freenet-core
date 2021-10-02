@@ -56,7 +56,7 @@ enum PutState {
 }
 
 pub(crate) async fn handle_put_response<CB>(
-    op_storage: &mut OpStateStorage,
+    op_storage: &OpStateStorage,
     conn_manager: &mut CB,
     put_op: PutMsg,
 ) -> Result<(), OpError>
@@ -67,14 +67,7 @@ where
 }
 
 /// Request to insert/update a value into a contract.
-pub(crate) async fn request_put<CB>(
-    op_storage: &mut OpStateStorage,
-    conn_manager: &mut CB,
-    put_op: PutOp,
-) -> Result<(), OpError>
-where
-    CB: ConnectionBridge,
-{
+pub(crate) async fn request_put(op_storage: &OpStateStorage, put_op: PutOp) -> Result<(), OpError> {
     // the initial request must provide:
     // - a location in the network where the contract resides
     // - and the value to put

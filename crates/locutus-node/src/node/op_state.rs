@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use dashmap::DashMap;
 
 use crate::{
     message::{Transaction, TransactionTypeId},
@@ -6,10 +6,11 @@ use crate::{
     ring::Ring,
 };
 
+/// Thread safe and friendly data structure to maintain state.
 pub(crate) struct OpStateStorage {
-    join_ring: HashMap<Transaction, JoinRingOp>,
-    put: HashMap<Transaction, PutOp>,
-    get: HashMap<Transaction, GetOp>,
+    join_ring: DashMap<Transaction, JoinRingOp>,
+    put: DashMap<Transaction, PutOp>,
+    get: DashMap<Transaction, GetOp>,
     pub ring: Ring,
 }
 
@@ -27,14 +28,14 @@ macro_rules! check_id_op {
 impl OpStateStorage {
     pub fn new(ring: Ring) -> Self {
         Self {
-            join_ring: HashMap::default(),
-            put: HashMap::default(),
-            get: HashMap::default(),
+            join_ring: DashMap::default(),
+            put: DashMap::default(),
+            get: DashMap::default(),
             ring,
         }
     }
 
-    pub fn push(&mut self, id: Transaction, op: Operation) -> Result<(), OpExecutionError> {
+    pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpExecutionError> {
         match op {
             Operation::JoinRing(tx) => {
                 check_id_op!(id.tx_type(), TransactionTypeId::JoinRing);
@@ -52,11 +53,15 @@ impl OpStateStorage {
         Ok(())
     }
 
-    pub fn pop(&mut self, id: &Transaction) -> Option<Operation> {
+    pub fn pop(&self, id: &Transaction) -> Option<Operation> {
         match id.tx_type() {
-            TransactionTypeId::JoinRing => self.join_ring.remove(id).map(Operation::JoinRing),
-            TransactionTypeId::Put => self.put.remove(id).map(Operation::Put),
-            TransactionTypeId::Get => self.get.remove(id).map(Operation::Get),
+            TransactionTypeId::JoinRing => self
+                .join_ring
+                .remove(id)
+                .map(|(_k, v)| v)
+                .map(Operation::JoinRing),
+            TransactionTypeId::Put => self.put.remove(id).map(|(_k, v)| v).map(Operation::Put),
+            TransactionTypeId::Get => self.get.remove(id).map(|(_k, v)| v).map(Operation::Get),
             TransactionTypeId::Canceled => todo!(),
         }
     }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction, TransactionType},
@@ -13,18 +15,15 @@ use crate::{
 
 use super::{op_state::OpStateStorage, InitPeerNode};
 
-pub(crate) struct NodeInMemory<Ev = MemoryEventsGen>
-where
-    Ev: UserEventsProxy,
-{
+pub(crate) struct NodeInMemory {
     peer: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     pub conn_manager: MemoryConnManager,
-    pub op_storage: OpStateStorage,
-    user_events: Ev,
+    pub op_storage: Arc<OpStateStorage>,
 }
 
 impl NodeInMemory {
+    /// Buils an in-memory node. Does nothing upon construction,
     pub fn build(config: NodeConfig) -> Result<Self, &'static str> {
         if (config.local_ip.is_none() || config.local_port.is_none())
             && config.remote_nodes.is_empty()
@@ -55,13 +54,12 @@ impl NodeInMemory {
         if let Some(rnd_if_htl_above) = config.rnd_if_htl_above {
             ring.with_rnd_walk_above(rnd_if_htl_above);
         }
-        let op_storage = OpStateStorage::new(ring);
+        let op_storage = Arc::new(OpStateStorage::new(ring));
         Ok(NodeInMemory {
             peer,
             conn_manager,
             op_storage,
             gateways,
-            user_events: MemoryEventsGen::new(),
         })
     }
 
@@ -76,56 +74,63 @@ impl NodeInMemory {
                 *gateway,
                 self.op_storage.ring.max_hops_to_live,
             );
-            join_ring::join_ring_request(tx_id, &mut self.op_storage, &mut self.conn_manager, op)
+            join_ring::join_ring_request(tx_id, &self.op_storage, &mut self.conn_manager, op)
                 .await
                 .unwrap();
         }
         Ok(())
     }
 
-    /// Starts listening to incoming messages, only allowed to be called directly when this node
-    /// already joined the network.
-    pub async fn listen_on(&mut self) -> Result<(), ()> {
+    /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
+    pub async fn listen_on<UsrEv>(&mut self, mut user_events: UsrEv) -> Result<(), ()>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
         self.join_ring().await?;
+        let op_storage = self.op_storage.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match user_events.recv().await {
+                    UserEvent::Put {
+                        key,
+                        value,
+                        contract,
+                    } => {
+                        // Initialize a put op.
+                        let op = put::PutOp::new(key, value);
+                        put::request_put(&op_storage, op).await.unwrap();
+                    }
+                    UserEvent::Get { key, contract } => {
+                        // Initialize a get op.
+                        let op = get::GetOp::new(key);
+                        get::request_get(&op_storage, op).await.unwrap();
+                    }
+                }
+            }
+        });
+
         loop {
-            tokio::select! {
-                msg = self.conn_manager.recv() => {
-                    match msg {
-                        Ok(msg) => match msg {
-                            Message::JoinRing(op) => {
-                                join_ring::handle_join_ring(&mut self.op_storage, &mut self.conn_manager, op)
-                                    .await
-                                    .unwrap();
-                            }
-                            Message::Put(op) => {
-                                put::handle_put_response(&mut self.op_storage, &mut self.conn_manager, op)
-                                    .await
-                                    .unwrap();
-                            }
-                            Message::Get(op) => {
-                                get::handle_get_response(&mut self.op_storage, &mut self.conn_manager, op)
-                                .await
-                                .unwrap();
-                            }
-                            Message::Canceled(_) => todo!(),
-                        },
-                        Err(_) => break Err(()),
+            match self.conn_manager.recv().await {
+                Ok(msg) => match msg {
+                    Message::JoinRing(op) => {
+                        join_ring::handle_join_ring(&self.op_storage, &mut self.conn_manager, op)
+                            .await
+                            .unwrap();
                     }
-                }
-                usr_event = self.user_events.recv() => {
-                    match usr_event {
-                        UserEvent::Put { key, value, contract } => {
-                            // Initialize a put op.
-                            let op = put::PutOp::new(key, value);
-                            put::request_put(&mut self.op_storage, &mut self.conn_manager, op).await.unwrap();
-                        }
-                        UserEvent::Get { key, contract } => {
-                            // Initialize a get op.
-                            let op = get::GetOp::new(key);
-                            get::request_get(&mut self.op_storage, &mut self.conn_manager, op).await.unwrap();
-                        }
+                    Message::Put(op) => {
+                        put::handle_put_response(&self.op_storage, &mut self.conn_manager, op)
+                            .await
+                            .unwrap();
                     }
-                }
+                    Message::Get(op) => {
+                        get::handle_get_response(&self.op_storage, &mut self.conn_manager, op)
+                            .await
+                            .unwrap();
+                    }
+                    Message::Canceled(_) => todo!(),
+                },
+                Err(_) => return Err(()),
             }
         }
     }

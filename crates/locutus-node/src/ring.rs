@@ -19,12 +19,14 @@ use crate::{
     contract::ContractKey,
 };
 
+/// Thread safe and friendly data structure to keep track of the local knowledge
+/// of the state of the ring.
 #[derive(Debug)]
 pub(crate) struct Ring {
-    pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
-    pub own_location: Option<Location>,
+    pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+    own_location: Option<Location>,
 }
 
 impl Ring {
@@ -39,9 +41,9 @@ impl Ring {
 
     pub fn new() -> Self {
         Ring {
-            connections_by_location: RwLock::new(BTreeMap::new()),
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
+            connections_by_location: RwLock::new(BTreeMap::new()),
             own_location: None,
         }
     }
@@ -54,6 +56,15 @@ impl Ring {
     pub fn with_max_hops(&mut self, max_hops_to_live: usize) -> &mut Self {
         self.max_hops_to_live = max_hops_to_live;
         self
+    }
+
+    pub fn update_location(&self, loc: Location) {
+        todo!()
+    }
+
+    /// Returns this node location in the ring, if any (must have join the ring already).
+    pub fn own_location(&self) -> Option<Location> {
+        self.own_location.clone()
     }
 
     pub fn should_accept(&self, my_location: &Location, location: &Location) -> bool {
@@ -133,7 +144,7 @@ impl Location {
 /// so we never allow generation of locations from an unknown source byte array.
 ///
 /// Instead we ensure at compile time locations can only be constructed from well formed
-/// keys (which have been hashed with a strong cryptographically sage hash function first).
+/// keys (which have been hashed with a strong, cryptographically safe, hash function first).
 impl<'a> From<ContractKey<'a>> for Location {
     fn from(key: ContractKey<'a>) -> Self {
         let mut value = 0.0;
