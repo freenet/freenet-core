@@ -197,7 +197,7 @@ pub(crate) enum RingProtoError {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use libp2p::PeerId;
 
     use super::*;

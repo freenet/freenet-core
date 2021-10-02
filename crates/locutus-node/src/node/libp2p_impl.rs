@@ -154,7 +154,7 @@ impl From<ping::PingEvent> for NetEvent {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use std::{net::Ipv4Addr, time::Duration};
 
     use super::*;

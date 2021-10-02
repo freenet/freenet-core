@@ -26,25 +26,21 @@ pub(crate) enum UserEvent {
 #[cfg(test)]
 pub(crate) mod test_utils {
     use arbitrary::{Arbitrary, Unstructured};
-    use rand::Rng;
 
     use super::*;
+    use crate::test::random_bytes_128;
 
-    pub(crate) struct MemoryEventsGen {
-        rnd_bytes: [u8; 128],
-    }
+    pub(crate) struct MemoryEventsGen;
 
     impl MemoryEventsGen {
         pub fn new() -> Self {
-            let mut rng = rand::thread_rng();
-            let mut rnd_bytes = [0u8; 128];
-            rng.fill(&mut rnd_bytes);
-            MemoryEventsGen { rnd_bytes }
+            Self
         }
 
         fn gen_new_event(&self) -> UserEvent {
-            let mut unst = Unstructured::new(&self.rnd_bytes);
-            UserEvent::arbitrary(&mut unst).expect("failed generating a random user event")
+            let bytes = random_bytes_128();
+            let mut unst = Unstructured::new(&bytes);
+            UserEvent::arbitrary(&mut unst).expect("failed gen arb data")
         }
     }
 

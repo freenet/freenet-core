@@ -635,7 +635,7 @@ mod messages {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use std::time::Duration;
 
     use libp2p::identity::Keypair;
