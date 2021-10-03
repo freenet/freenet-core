@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tokio::sync::mpsc::{self, Receiver};
+
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction, TransactionType},
@@ -9,7 +11,7 @@ use crate::{
         put,
     },
     ring::Ring,
-    user_events::{test_utils::MemoryEventsGen, UserEvent, UserEventsProxy},
+    user_events::{UserEvent, UserEventsProxy},
     NodeConfig,
 };
 
@@ -18,6 +20,7 @@ use super::{op_state::OpStateStorage, InitPeerNode};
 pub(crate) struct NodeInMemory {
     peer: PeerKey,
     gateways: Vec<PeerKeyLocation>,
+    notification_channel: Receiver<Message>,
     pub conn_manager: MemoryConnManager,
     pub op_storage: Arc<OpStateStorage>,
 }
@@ -54,12 +57,14 @@ impl NodeInMemory {
         if let Some(rnd_if_htl_above) = config.rnd_if_htl_above {
             ring.with_rnd_walk_above(rnd_if_htl_above);
         }
-        let op_storage = Arc::new(OpStateStorage::new(ring));
+        let (notification_tx, notification_channel) = mpsc::channel(100);
+        let op_storage = Arc::new(OpStateStorage::new(ring, notification_tx));
         Ok(NodeInMemory {
             peer,
             conn_manager,
             op_storage,
             gateways,
+            notification_channel,
         })
     }
 
@@ -92,13 +97,9 @@ impl NodeInMemory {
         tokio::spawn(async move {
             loop {
                 match user_events.recv().await {
-                    UserEvent::Put {
-                        key,
-                        value,
-                        contract,
-                    } => {
+                    UserEvent::Put { value, contract } => {
                         // Initialize a put op.
-                        let op = put::PutOp::new(key, value);
+                        let op = put::PutOp::start_op(&contract, value);
                         put::request_put(&op_storage, op).await.unwrap();
                     }
                     UserEvent::Get { key, contract } => {
@@ -111,7 +112,15 @@ impl NodeInMemory {
         });
 
         loop {
-            match self.conn_manager.recv().await {
+            let msg = tokio::select! {
+                msg = self.conn_manager.recv() => { msg }
+                msg = self.notification_channel.recv() => if let Some(msg) = msg {
+                    Ok(msg)
+                } else {
+                    break Err(());
+                }
+            };
+            match msg {
                 Ok(msg) => match msg {
                     Message::JoinRing(op) => {
                         join_ring::handle_join_ring(&self.op_storage, &mut self.conn_manager, op)

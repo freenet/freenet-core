@@ -1,4 +1,4 @@
-use crate::{conn_manager, message::Message, node::OpExecutionError};
+use crate::{conn_manager, message::Message, node::OpExecutionError, ring::RingError};
 
 pub(crate) mod get;
 pub(crate) mod join_ring;
@@ -29,6 +29,10 @@ pub(crate) enum OpError {
     OpStateManagerError(#[from] OpExecutionError),
     #[error("illegal awaiting state")]
     IllegalStateTransition,
+    #[error("failed notifying back to the node message loop, channel closed")]
+    NotificationError(#[from] tokio::sync::mpsc::error::SendError<Message>),
+    #[error(transparent)]
+    RingError(#[from] RingError),
 }
 
 impl From<rust_fsm::TransitionImpossibleError> for OpError {

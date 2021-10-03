@@ -200,6 +200,45 @@ impl JRState {
     }
 }
 
+/// Join ring routine, called upon performing a join operation for this node.
+pub(crate) async fn join_ring_request<CB>(
+    tx: Transaction,
+    op_storage: &OpStateStorage,
+    conn_manager: &mut CB,
+    join_op: JoinRingOp,
+) -> Result<(), OpError>
+where
+    CB: ConnectionBridge,
+{
+    let ConnectionInfo {
+        gateway,
+        this_peer,
+        max_hops_to_live,
+    } = (&join_op.0).state().clone().try_unwrap_connecting()?;
+
+    log::info!(
+        "Joining ring via {} (at {})",
+        gateway.peer,
+        gateway
+            .location
+            .ok_or(conn_manager::ConnError::LocationUnknown)?
+    );
+
+    conn_manager.add_connection(gateway, true);
+    let join_req = Message::from(messages::JoinRingMsg::Req {
+        id: tx,
+        msg: messages::JoinRequest::Initial {
+            target_loc: gateway,
+            req_peer: this_peer,
+            hops_to_live: max_hops_to_live,
+            max_hops_to_live,
+        },
+    });
+    conn_manager.send(&gateway, join_req).await?;
+    op_storage.push(tx, Operation::JoinRing(join_op))?;
+    Ok(())
+}
+
 /// Join ring routine, called upon processing a request to join or while performing
 /// a join operation for this node after initial request (see [`join_ring_request`]).
 ///
@@ -264,12 +303,11 @@ where
         }) => {
             // operation finished_completely
         }
-        _ => unreachable!(),
+        _ => return Err(OpError::IllegalStateTransition),
     }
     Ok(())
 }
 
-#[inline(always)]
 async fn update_state<CB>(
     conn_manager: &mut CB,
     mut state: JoinRingOp,
@@ -497,51 +535,12 @@ where
                 new_state = None;
             }
         }
-        _ => unimplemented!(),
+        _ => return Err(OpError::IllegalStateTransition),
     }
     Ok(OperationResult {
         return_msg,
         state: new_state,
     })
-}
-
-/// Join ring routine, called upon performing a join operation for this node.
-pub(crate) async fn join_ring_request<CB>(
-    tx: Transaction,
-    op_storage: &OpStateStorage,
-    conn_manager: &mut CB,
-    join_op: JoinRingOp,
-) -> Result<(), OpError>
-where
-    CB: ConnectionBridge,
-{
-    let ConnectionInfo {
-        gateway,
-        this_peer,
-        max_hops_to_live,
-    } = (&join_op.0).state().clone().try_unwrap_connecting()?;
-
-    log::info!(
-        "Joining ring via {} (at {})",
-        gateway.peer,
-        gateway
-            .location
-            .ok_or(conn_manager::ConnError::LocationUnknown)?
-    );
-
-    conn_manager.add_connection(gateway, true);
-    let join_req = Message::from(messages::JoinRingMsg::Req {
-        id: tx,
-        msg: messages::JoinRequest::Initial {
-            target_loc: gateway,
-            req_peer: this_peer,
-            hops_to_live: max_hops_to_live,
-            max_hops_to_live,
-        },
-    });
-    conn_manager.send(&gateway, join_req).await?;
-    op_storage.push(tx, Operation::JoinRing(join_op))?;
-    Ok(())
 }
 
 mod messages {

@@ -10,7 +10,7 @@
 //! - next node
 //! - final location
 
-use std::{collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
+use std::{borrow::Borrow, collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
 
 use parking_lot::RwLock;
 
@@ -139,18 +139,17 @@ impl Location {
     }
 }
 
-/// # Security
-/// A location in the ring could be derived from a known sequence of bytes
-/// so we never allow generation of locations from an unknown source byte array.
-///
-/// Instead we ensure at compile time locations can only be constructed from well formed
-/// keys (which have been hashed with a strong, cryptographically safe, hash function first).
-impl<'a> From<ContractKey<'a>> for Location {
-    fn from(key: ContractKey<'a>) -> Self {
+/// Ensure at compile time locations can only be constructed from well formed contract keys
+/// (which have been hashed with a strong, cryptographically safe, hash function first).
+impl<T> From<T> for Location
+where
+    T: Borrow<ContractKey>,
+{
+    fn from(key: T) -> Self {
         let mut value = 0.0;
         let mut divisor = 256.0;
         // assert!((1..=7).contains(&precision));
-        for byte in key.bytes().iter().take(7) {
+        for byte in key.borrow().bytes().iter().take(7) {
             value += *byte as f64 / divisor;
             divisor *= 256.0;
         }
@@ -209,11 +208,13 @@ impl TryFrom<f64> for Location {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub(crate) enum RingProtoError {
+pub(crate) enum RingError {
     #[error("failed while attempting to join a ring")]
     Join,
     #[error(transparent)]
     ConnError(#[from] Box<conn_manager::ConnError>),
+    #[error("no ring connections found")]
+    EmptyRing,
 }
 
 #[cfg(test)]

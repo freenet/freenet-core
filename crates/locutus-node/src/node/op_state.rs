@@ -1,8 +1,14 @@
 use dashmap::DashMap;
+use tokio::sync::mpsc::{error::SendError, Receiver, Sender};
 
 use crate::{
-    message::{Transaction, TransactionTypeId},
-    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, Operation},
+    message::{Message, Transaction, TransactionTypeId},
+    operations::{
+        get::GetOp,
+        join_ring::JoinRingOp,
+        put::{PutMsg, PutOp},
+        Operation,
+    },
     ring::Ring,
 };
 
@@ -11,6 +17,7 @@ pub(crate) struct OpStateStorage {
     join_ring: DashMap<Transaction, JoinRingOp>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
+    notification_channel: Sender<Message>,
     pub ring: Ring,
 }
 
@@ -26,13 +33,20 @@ macro_rules! check_id_op {
 }
 
 impl OpStateStorage {
-    pub fn new(ring: Ring) -> Self {
+    pub fn new(ring: Ring, notification_channel: Sender<Message>) -> Self {
         Self {
             join_ring: DashMap::default(),
             put: DashMap::default(),
             get: DashMap::default(),
             ring,
+            notification_channel,
         }
+    }
+
+    /// A fast path for communicating back changes to on-going operations in the node.
+    /// This will then be processed back on the message receiving loop.
+    pub async fn notify_change(&self, msg: Message) -> Result<(), SendError<Message>> {
+        self.notification_channel.send(msg).await
     }
 
     pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpExecutionError> {

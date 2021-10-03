@@ -1,6 +1,6 @@
 //! Types and definitions to handle all socket communication for the peer nodes.
 
-use std::{fmt::Display, net::SocketAddr, sync::atomic::AtomicU64, time::Duration};
+use std::{fmt::Display, time::Duration};
 
 use libp2p::{core::PublicKey, PeerId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
