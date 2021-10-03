@@ -4,7 +4,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
-    message::{Message, Transaction, TransactionType},
+    message::{Message, Transaction, GetTxType},
     operations::{
         get,
         join_ring::{self, JoinRingMsg},
@@ -72,7 +72,7 @@ impl NodeInMemory {
         // FIXME: this iteration should be shuffled, must write an extension iterator shuffle items "in place"
         // the idea here is to limit the amount of gateways being contacted that's why shuffling is required
         for gateway in &self.gateways {
-            let tx_id = Transaction::new(<JoinRingMsg as TransactionType>::tx_type_id());
+            let tx_id = Transaction::new(<JoinRingMsg as GetTxType>::tx_type_id());
             // initiate join action action per each gateway
             let op = join_ring::JoinRingOp::initial_request(
                 self.peer,

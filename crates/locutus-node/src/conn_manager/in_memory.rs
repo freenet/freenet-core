@@ -19,6 +19,7 @@ static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTran
 pub(crate) struct MemoryConnManager {
     pub transport: InMemoryTransport,
     msg_queue: Arc<Mutex<Vec<Message>>>,
+    peer: PeerKey,
 }
 
 impl MemoryConnManager {
@@ -48,6 +49,7 @@ impl MemoryConnManager {
         Self {
             transport,
             msg_queue,
+            peer,
         }
     }
 }
@@ -79,6 +81,10 @@ impl ConnectionBridge for MemoryConnManager {
     }
 
     fn add_connection(&mut self, _peer: PeerKeyLocation, _unsolicited: bool) {}
+
+    fn peer_key(&self) -> PeerKey {
+        self.peer
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -21,6 +21,9 @@ pub(crate) type Result<T> = StdResult<T, ConnError>;
 
 #[async_trait::async_trait]
 pub(crate) trait ConnectionBridge {
+    /// Returns the peer key for this connection.
+    fn peer_key(&self) -> PeerKey;
+
     fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool);
 
     /// # Cancellation Safety

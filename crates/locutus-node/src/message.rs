@@ -10,7 +10,7 @@ use crate::{
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
     ring::Location,
 };
-pub(crate) use sealed_msg_type::TransactionTypeId;
+pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 
 /// An transaction is a unique, universal and efficient identifier for any
 /// roundtrip transaction as it is broadcasted around the F2 network.
@@ -41,8 +41,8 @@ impl Transaction {
         }
     }
 
-    pub fn tx_type(&self) -> TransactionTypeId {
-        self.ty
+    pub fn tx_type(&self) -> TransactionType {
+        self.ty.desc()
     }
 }
 
@@ -53,11 +53,11 @@ impl Display for Transaction {
 }
 
 /// Get the transaction type associated to a given message type.
-pub(crate) trait TransactionType: sealed_msg_type::SealedTxType {
+pub(crate) trait GetTxType: sealed_msg_type::SealedTxType {
     fn tx_type_id() -> TransactionTypeId;
 }
 
-impl<T> TransactionType for T
+impl<T> GetTxType for T
 where
     T: sealed_msg_type::SealedTxType,
 {
@@ -73,9 +73,18 @@ mod sealed_msg_type {
         fn tx_type_id() -> TransactionTypeId;
     }
 
+    #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+    pub(crate) struct TransactionTypeId(TransactionType);
+
+    impl TransactionTypeId {
+        pub fn desc(&self) -> TransactionType {
+            self.0
+        }
+    }
+
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
-    pub(crate) enum TransactionTypeId {
+    pub(crate) enum TransactionType {
         JoinRing,
         Put,
         Get,
@@ -93,7 +102,7 @@ mod sealed_msg_type {
 
                 impl SealedTxType for $ty {
                     fn tx_type_id() -> TransactionTypeId {
-                        TransactionTypeId::$var
+                        TransactionTypeId(TransactionType::$var)
                     }
                 }
             )+
@@ -141,10 +150,11 @@ impl Message {
         }
     }
 
-    pub fn target(&self) -> Option<PeerKeyLocation> {
+    pub fn target(&self) -> Option<&PeerKeyLocation> {
         use Message::*;
         match self {
             JoinRing(op) => op.target(),
+            Put(op) => op.target(),
             _ => todo!(),
         }
     }

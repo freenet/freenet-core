@@ -1,3 +1,0 @@
-[target.x86_64-unknown-linux-gnu]
-linker = "/usr/bin/ld.lld"
-rustflags = ["-Clink-arg=-fuse-ld=lld"]

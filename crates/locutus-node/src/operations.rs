@@ -1,4 +1,4 @@
-use crate::{conn_manager, message::Message, node::OpExecutionError, ring::RingError};
+use crate::{conn_manager, message::Message, node::OpExecError, ring::RingError};
 
 pub(crate) mod get;
 pub(crate) mod join_ring;
@@ -26,7 +26,7 @@ pub(crate) enum OpError {
     #[error(transparent)]
     ConnError(#[from] conn_manager::ConnError),
     #[error(transparent)]
-    OpStateManagerError(#[from] OpExecutionError),
+    OpStateManagerError(#[from] OpExecError),
     #[error("illegal awaiting state")]
     IllegalStateTransition,
     #[error("failed notifying back to the node message loop, channel closed")]

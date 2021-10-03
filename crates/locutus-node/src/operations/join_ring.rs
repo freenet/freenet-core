@@ -6,7 +6,7 @@ use super::{OpError, OperationResult};
 use crate::{
     conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction},
-    node::{OpExecutionError, OpStateStorage},
+    node::{OpExecError, OpStateStorage},
     operations::Operation,
     ring::{Location, Ring},
 };
@@ -260,7 +260,7 @@ where
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, join_op, &op_storage.ring).await
         }
-        Some(_) => return Err(OpExecutionError::TxUpdateFailure(tx).into()),
+        Some(_) => return Err(OpExecError::TxUpdateFailure(tx).into()),
         None => {
             sender = join_op.sender().cloned();
             // new request to join from this node, initialize the machine
@@ -284,7 +284,7 @@ where
             // updated op
             let id = *msg.id();
             if let Some(target) = msg.target() {
-                conn_manager.send(&target, msg).await?;
+                conn_manager.send(&target.clone(), msg).await?;
             }
             op_storage.push(id, Operation::JoinRing(updated_state))?;
         }
@@ -294,7 +294,7 @@ where
         }) => {
             // finished the operation at this node, informing back
             if let Some(target) = msg.target() {
-                conn_manager.send(&target, msg).await?;
+                conn_manager.send(&target.clone(), msg).await?;
             }
         }
         Ok(OperationResult {
@@ -340,7 +340,7 @@ where
             let accepted_by = if ring.should_accept(
                 &gw_location
                     .location
-                    .ok_or(OpExecutionError::TxUpdateFailure(id))?,
+                    .ok_or(OpExecError::TxUpdateFailure(id))?,
                 &new_location,
             ) {
                 log::debug!("Accepting connections from {}", req_peer,);
@@ -544,6 +544,8 @@ where
 }
 
 mod messages {
+    use std::borrow::Borrow;
+
     use super::*;
     use crate::{conn_manager::PeerKeyLocation, ring::Location};
 
@@ -587,11 +589,11 @@ mod messages {
             }
         }
 
-        pub fn target(&self) -> Option<PeerKeyLocation> {
+        pub fn target(&self) -> Option<&PeerKeyLocation> {
             use JoinRingMsg::*;
             match self {
-                Resp { target, .. } => Some(*target),
-                Connected { target, .. } => Some(*target),
+                Resp { target, .. } => Some(target),
+                Connected { target, .. } => Some(target),
                 _ => None,
             }
         }
@@ -642,13 +644,13 @@ mod test {
     use super::*;
     use crate::{
         config::tracing::Logger,
-        message::TransactionTypeId,
+        message::GetTxType,
         node::test_utils::{EventType, SimNetwork},
     };
 
     #[test]
     fn succesful_join_ring_seq() {
-        let id = Transaction::new(TransactionTypeId::JoinRing);
+        let id = Transaction::new(<JoinRingMsg as GetTxType>::tx_type_id());
         let new_loc = Location::random();
         let mut new_peer = PeerKeyLocation {
             peer: PeerKey::from(Keypair::generate_ed25519().public()),

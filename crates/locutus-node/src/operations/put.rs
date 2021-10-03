@@ -1,10 +1,10 @@
 use rust_fsm::{StateMachine, StateMachineImpl};
 
 use crate::{
-    conn_manager::ConnectionBridge,
+    conn_manager::{ConnectionBridge, PeerKeyLocation},
     contract::{Contract, ContractKey},
-    message::{Message, Transaction},
-    node::{OpExecutionError, OpStateStorage},
+    message::{GetTxType, Message, Transaction},
+    node::{OpExecError, OpStateStorage},
     ring::{Location, Ring, RingError},
 };
 
@@ -23,7 +23,9 @@ impl PutOp {
             hex::encode(contract.key().bytes()),
             Location::from(contract.key())
         );
+        let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
         let state = StateMachine::from_state(PutState::Requesting {
+            id,
             key: contract.key(),
             value,
         });
@@ -44,13 +46,14 @@ impl StateMachineImpl for PutOpSM {
 
     fn transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
         match (state, input) {
-            (PutState::Requesting { key, value }, PutMsg::RouteValue) => {
+            (PutState::Requesting { key, value, id }, PutMsg::RouteValue { .. }) => {
                 Some(PutState::AwaitAnswer {
+                    id: *id,
                     key: *key,
                     value: value.clone(),
                 })
             }
-            (PutState::Initializing, PutMsg::RouteValue) => {
+            (PutState::Initializing, PutMsg::SeekNode { .. }) => {
                 todo!()
             }
             _ => None,
@@ -59,10 +62,13 @@ impl StateMachineImpl for PutOpSM {
 
     fn output(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
         match (state, input) {
-            (PutState::Requesting { key, value }, PutMsg::RouteValue) => Some(PutMsg::RequestPut {
-                key: *key,
-                value: value.clone(),
-            }),
+            (PutState::Requesting { key, value, id }, PutMsg::RouteValue { .. }) => {
+                Some(PutMsg::RequestPut {
+                    id: *id,
+                    key: *key,
+                    value: value.clone(),
+                })
+            }
             _ => None,
         }
     }
@@ -71,10 +77,12 @@ impl StateMachineImpl for PutOpSM {
 enum PutState {
     Initializing,
     Requesting {
+        id: Transaction,
         key: ContractKey,
         value: ContractPutValue,
     },
     AwaitAnswer {
+        id: Transaction,
         key: ContractKey,
         value: ContractPutValue,
     },
@@ -83,6 +91,10 @@ enum PutState {
 impl PutState {
     fn is_requesting(&self) -> bool {
         matches!(self, Self::Requesting { .. })
+    }
+
+    fn id(&self) -> &Transaction {
+        todo!()
     }
 }
 
@@ -95,7 +107,9 @@ pub(crate) async fn request_put(
         return Err(OpError::IllegalStateTransition);
     };
 
-    if let Some(req_put) = put_op.0.consume(&PutMsg::RouteValue)? {
+    if let Some(req_put) = put_op.0.consume(&PutMsg::RouteValue {
+        id: *put_op.0.state().id(),
+    })? {
         op_storage.notify_change(Message::from(req_put)).await?;
     } else {
         return Err(OpError::IllegalStateTransition);
@@ -120,7 +134,7 @@ where
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, put_op, &op_storage.ring).await
         }
-        Some(_) => return Err(OpExecutionError::TxUpdateFailure(tx).into()),
+        Some(_) => return Err(OpExecError::TxUpdateFailure(tx).into()),
         None => {
             sender = put_op.sender().cloned();
             // new request to join from this node, initialize the machine
@@ -155,7 +169,7 @@ where
     let return_msg;
     let new_state;
     match other_host_msg {
-        PutMsg::RequestPut { key, value } => {
+        PutMsg::RequestPut { id, key, value } => {
             // find the closest node to the location of the contract
             let target = if let Some((_, potential_target)) = ring.routing(&key.location()) {
                 potential_target
@@ -165,7 +179,22 @@ where
             // the initial request must provide:
             // - a peer as close as possible to the contract location
             // - and the value to put
-            return_msg = Some((PutMsg::SeekNode { target, key, value }).into());
+            return_msg = Some(
+                (PutMsg::SeekNode {
+                    id,
+                    target,
+                    sender: ring
+                        .own_location()
+                        .map(|location| PeerKeyLocation {
+                            location: Some(location),
+                            peer: conn_manager.peer_key(),
+                        })
+                        .ok_or_else(|| OpError::from(RingError::NoLocationAssigned))?,
+                    key,
+                    value,
+                })
+                .into(),
+            );
             // no changes to state yet, still in AwaitResponse state
             new_state = Some(state);
         }
@@ -187,14 +216,17 @@ mod messages {
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum PutMsg {
         /// Initialize the put operation by routing the value
-        RouteValue,
+        RouteValue { id: Transaction },
         /// Internal node instruction to find a route to the target node.
         RequestPut {
+            id: Transaction,
             key: ContractKey,
             value: ContractPutValue,
         },
         /// Target the node which is closest to the key
         SeekNode {
+            id: Transaction,
+            sender: PeerKeyLocation,
             target: PeerKeyLocation,
             key: ContractKey,
             value: ContractPutValue,
@@ -203,11 +235,25 @@ mod messages {
 
     impl PutMsg {
         pub fn id(&self) -> &Transaction {
-            todo!()
+            match self {
+                Self::SeekNode { id, .. } => id,
+                PutMsg::RouteValue { id } => id,
+                PutMsg::RequestPut { id, .. } => id,
+            }
         }
 
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
-            todo!()
+            match self {
+                Self::SeekNode { sender, .. } => Some(sender),
+                _ => None,
+            }
+        }
+
+        pub fn target(&self) -> Option<&PeerKeyLocation> {
+            match self {
+                Self::SeekNode { target, .. } => Some(target),
+                _ => None,
+            }
         }
     }
 }

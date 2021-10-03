@@ -215,6 +215,8 @@ pub(crate) enum RingError {
     ConnError(#[from] Box<conn_manager::ConnError>),
     #[error("no ring connections found")]
     EmptyRing,
+    #[error("no location assigned to this node")]
+    NoLocationAssigned,
 }
 
 #[cfg(test)]

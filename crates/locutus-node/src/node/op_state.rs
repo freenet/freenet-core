@@ -1,14 +1,9 @@
 use dashmap::DashMap;
-use tokio::sync::mpsc::{error::SendError, Receiver, Sender};
+use tokio::sync::mpsc::{error::SendError, Sender};
 
 use crate::{
-    message::{Message, Transaction, TransactionTypeId},
-    operations::{
-        get::GetOp,
-        join_ring::JoinRingOp,
-        put::{PutMsg, PutOp},
-        Operation,
-    },
+    message::{Message, Transaction, TransactionType},
+    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, Operation},
     ring::Ring,
 };
 
@@ -24,10 +19,7 @@ pub(crate) struct OpStateStorage {
 macro_rules! check_id_op {
     ($get_ty:expr, $var:path) => {
         if !matches!($get_ty, $var) {
-            return Err(OpExecutionError::IncorrectTxType(
-                TransactionTypeId::JoinRing,
-                $get_ty,
-            ));
+            return Err(OpExecError::IncorrectTxType($var, $get_ty));
         }
     };
 }
@@ -49,18 +41,18 @@ impl OpStateStorage {
         self.notification_channel.send(msg).await
     }
 
-    pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpExecutionError> {
+    pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpExecError> {
         match op {
             Operation::JoinRing(tx) => {
-                check_id_op!(id.tx_type(), TransactionTypeId::JoinRing);
+                check_id_op!(id.tx_type(), TransactionType::JoinRing);
                 self.join_ring.insert(id, tx);
             }
             Operation::Put(tx) => {
-                check_id_op!(id.tx_type(), TransactionTypeId::Put);
+                check_id_op!(id.tx_type(), TransactionType::Put);
                 self.put.insert(id, tx);
             }
             Operation::Get(tx) => {
-                check_id_op!(id.tx_type(), TransactionTypeId::Put);
+                check_id_op!(id.tx_type(), TransactionType::Put);
                 self.get.insert(id, tx);
             }
         }
@@ -69,22 +61,22 @@ impl OpStateStorage {
 
     pub fn pop(&self, id: &Transaction) -> Option<Operation> {
         match id.tx_type() {
-            TransactionTypeId::JoinRing => self
+            TransactionType::JoinRing => self
                 .join_ring
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(Operation::JoinRing),
-            TransactionTypeId::Put => self.put.remove(id).map(|(_k, v)| v).map(Operation::Put),
-            TransactionTypeId::Get => self.get.remove(id).map(|(_k, v)| v).map(Operation::Get),
-            TransactionTypeId::Canceled => todo!(),
+            TransactionType::Put => self.put.remove(id).map(|(_k, v)| v).map(Operation::Put),
+            TransactionType::Get => self.get.remove(id).map(|(_k, v)| v).map(Operation::Get),
+            TransactionType::Canceled => todo!(),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error, Clone)]
-pub(crate) enum OpExecutionError {
+pub(crate) enum OpExecError {
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
-    IncorrectTxType(TransactionTypeId, TransactionTypeId),
+    IncorrectTxType(TransactionType, TransactionType),
     #[error("failed while processing transaction {0}")]
     TxUpdateFailure(Transaction),
 }
