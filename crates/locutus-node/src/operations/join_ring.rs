@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use rust_fsm::*;
 
-use super::{OpError, OperationResult};
+use super::{handle_op_result, OpError, OperationResult};
 use crate::{
     conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction},
@@ -268,44 +268,14 @@ where
             update_state(conn_manager, machine, join_op, &op_storage.ring).await
         }
     };
-
-    match result {
-        Err(err) => {
-            log::error!("error while processing join request: {}", err);
-            if let Some(sender) = sender {
-                conn_manager.send(&sender, Message::Canceled(tx)).await?;
-            }
-            return Err(err);
-        }
-        Ok(OperationResult {
-            return_msg: Some(msg),
-            state: Some(updated_state),
-        }) => {
-            // updated op
-            let id = *msg.id();
-            if let Some(target) = msg.target() {
-                conn_manager.send(&target.clone(), msg).await?;
-            }
-            op_storage.push(id, Operation::JoinRing(updated_state))?;
-        }
-        Ok(OperationResult {
-            return_msg: Some(msg),
-            state: None,
-        }) => {
-            // finished the operation at this node, informing back
-            if let Some(target) = msg.target() {
-                conn_manager.send(&target.clone(), msg).await?;
-            }
-        }
-        Ok(OperationResult {
-            return_msg: None,
-            state: None,
-        }) => {
-            // operation finished_completely
-        }
-        _ => return Err(OpError::IllegalStateTransition),
-    }
-    Ok(())
+    
+    handle_op_result(
+        op_storage,
+        conn_manager,
+        result.map_err(|err| (err, tx)),
+        sender,
+    )
+    .await
 }
 
 async fn update_state<CB>(
@@ -313,7 +283,7 @@ async fn update_state<CB>(
     mut state: JoinRingOp,
     other_host_msg: JoinRingMsg,
     ring: &Ring,
-) -> Result<OperationResult<JoinRingOp>, OpError>
+) -> Result<OperationResult, OpError>
 where
     CB: ConnectionBridge,
 {
@@ -539,13 +509,11 @@ where
     }
     Ok(OperationResult {
         return_msg,
-        state: new_state,
+        state: new_state.map(Operation::JoinRing),
     })
 }
 
 mod messages {
-    use std::borrow::Borrow;
-
     use super::*;
     use crate::{conn_manager::PeerKeyLocation, ring::Location};
 

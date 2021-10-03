@@ -10,9 +10,9 @@ use crate::{
 
 pub(crate) use self::messages::PutMsg;
 
-use super::{OpError, Operation, OperationResult};
+use super::{handle_op_result, OpError, Operation, OperationResult};
 
-type ContractPutValue = Vec<u8>;
+pub(crate) type ContractPutValue = Vec<u8>;
 
 pub(crate) struct PutOp(StateMachine<PutOpSM>);
 
@@ -117,7 +117,6 @@ pub(crate) async fn request_put(
     Ok(())
 }
 
-// TODO: deduplicate the handle functions between different ops, are pretty much the same
 pub(crate) async fn handle_put_response<CB>(
     op_storage: &OpStateStorage,
     conn_manager: &mut CB,
@@ -143,18 +142,13 @@ where
         }
     };
 
-    match result {
-        Err(err) => {
-            log::error!("error while processing put request: {}", err);
-            if let Some(sender) = sender {
-                conn_manager.send(&sender, Message::Canceled(tx)).await?;
-            }
-            return Err(err);
-        }
-        _ => todo!(),
-    }
-
-    Ok(())
+    handle_op_result(
+        op_storage,
+        conn_manager,
+        result.map_err(|err| (err, tx)),
+        sender,
+    )
+    .await
 }
 
 async fn update_state<CB>(
@@ -162,7 +156,7 @@ async fn update_state<CB>(
     mut state: PutOp,
     other_host_msg: PutMsg,
     ring: &Ring,
-) -> Result<OperationResult<PutOp>, OpError>
+) -> Result<OperationResult, OpError>
 where
     CB: ConnectionBridge,
 {
@@ -202,7 +196,7 @@ where
     }
     Ok(OperationResult {
         return_msg,
-        state: new_state,
+        state: new_state.map(Operation::Put),
     })
 }
 

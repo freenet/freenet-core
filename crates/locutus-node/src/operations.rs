@@ -1,15 +1,68 @@
-use crate::{conn_manager, message::Message, node::OpExecError, ring::RingError};
+use crate::{
+    conn_manager::{self, ConnectionBridge, PeerKeyLocation},
+    message::{Message, Transaction},
+    node::{OpExecError, OpStateStorage},
+    ring::RingError,
+};
 
 pub(crate) mod get;
 pub(crate) mod join_ring;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 
-pub(crate) struct OperationResult<S> {
+pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
     pub return_msg: Option<Message>,
     /// None if the operation has been completed.
-    pub state: Option<S>,
+    pub state: Option<Operation>,
+}
+
+async fn handle_op_result<CB>(
+    op_storage: &OpStateStorage,
+    conn_manager: &mut CB,
+    result: Result<OperationResult, (OpError, Transaction)>,
+    sender: Option<PeerKeyLocation>,
+) -> Result<(), OpError>
+where
+    CB: ConnectionBridge,
+{
+    match result {
+        Err((err, tx_id)) => {
+            log::error!("error while processing join request: {}", err);
+            if let Some(sender) = sender {
+                conn_manager.send(&sender, Message::Canceled(tx_id)).await?;
+            }
+            return Err(err);
+        }
+        Ok(OperationResult {
+            return_msg: Some(msg),
+            state: Some(updated_state),
+        }) => {
+            // updated op
+            let id = *msg.id();
+            if let Some(target) = msg.target() {
+                conn_manager.send(&target.clone(), msg).await?;
+            }
+            op_storage.push(id, updated_state)?;
+        }
+        Ok(OperationResult {
+            return_msg: Some(msg),
+            state: None,
+        }) => {
+            // finished the operation at this node, informing back
+            if let Some(target) = msg.target() {
+                conn_manager.send(&target.clone(), msg).await?;
+            }
+        }
+        Ok(OperationResult {
+            return_msg: None,
+            state: None,
+        }) => {
+            // operation finished_completely
+        }
+        _ => return Err(OpError::IllegalStateTransition),
+    }
+    Ok(())
 }
 
 pub(crate) enum Operation {

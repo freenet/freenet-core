@@ -1,6 +1,9 @@
 use rust_fsm::{StateMachine, StateMachineImpl};
 
-use crate::{conn_manager::ConnectionBridge, message::Transaction, node::OpStateStorage};
+use crate::{
+    conn_manager::ConnectionBridge, contract::ContractKey, message::Transaction,
+    node::OpStateStorage,
+};
 
 pub(crate) use self::messages::GetMsg;
 
@@ -10,9 +13,8 @@ use super::OpError;
 pub(crate) struct GetOp(StateMachine<GetOpSM>);
 
 impl GetOp {
-    pub fn new(key: Vec<u8>) -> Self {
-        let mut state = StateMachine::new();
-        state.consume(&GetMsg::FetchRouting { key }).unwrap();
+    pub fn start_op(key: ContractKey) -> Self {
+        let state = StateMachine::from_state(GetState::Requesting { key });
         GetOp(state)
     }
 }
@@ -49,7 +51,7 @@ impl StateMachineImpl for GetOpSM {
 
 enum GetState {
     Initializing,
-    Requesting { key: Vec<u8> },
+    Requesting { key: ContractKey },
 }
 
 pub(crate) async fn handle_get_response<CB>(
@@ -72,7 +74,7 @@ pub(crate) async fn request_get(op_storage: &OpStateStorage, get_op: GetOp) -> R
 }
 
 mod messages {
-    use crate::conn_manager::PeerKeyLocation;
+    use crate::{conn_manager::PeerKeyLocation, contract::ContractKey};
 
     use super::*;
 
@@ -80,7 +82,7 @@ mod messages {
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum GetMsg {
-        FetchRouting { key: Vec<u8> },
+        FetchRouting { key: ContractKey },
     }
 
     impl GetMsg {

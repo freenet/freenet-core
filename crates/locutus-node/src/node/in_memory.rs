@@ -104,7 +104,7 @@ impl NodeInMemory {
                     }
                     UserEvent::Get { key, contract } => {
                         // Initialize a get op.
-                        let op = get::GetOp::new(key);
+                        let op = get::GetOp::start_op(key);
                         get::request_get(&op_storage, op).await.unwrap();
                     }
                 }

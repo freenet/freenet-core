@@ -1,4 +1,7 @@
-use crate::contract::Contract;
+use crate::{
+    contract::{Contract, ContractKey},
+    operations::put::ContractPutValue,
+};
 
 #[async_trait::async_trait]
 pub(crate) trait UserEventsProxy {
@@ -10,13 +13,13 @@ pub(crate) enum UserEvent {
     /// Update or insert a new value in a contract corresponding with the provided key.
     Put {
         /// Value to upsert in the contract.
-        value: Vec<u8>,
+        value: ContractPutValue,
         contract: Contract,
     },
     /// Fetch the current value from a contract corresponding to the provided key.
     Get {
-        /// Hash key of the contract.
-        key: Vec<u8>,
+        /// Key of the contract.
+        key: ContractKey,
         /// If this flag is set then fetch also the contract itself.
         contract: bool,
     },

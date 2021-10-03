@@ -38,9 +38,9 @@ impl Contract {
     }
 }
 
-
 /// The key representing a contract.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct ContractKey(
     #[serde(deserialize_with = "contract_key_deser")]
     #[serde(serialize_with = "<[_]>::serialize")]

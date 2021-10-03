@@ -26,7 +26,8 @@ pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
     pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
-    own_location: Option<Location>,
+    // TODO: optimize this for an AtomicU64
+    own_location: RwLock<Option<Location>>,
 }
 
 impl Ring {
@@ -44,7 +45,7 @@ impl Ring {
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
             connections_by_location: RwLock::new(BTreeMap::new()),
-            own_location: None,
+            own_location: RwLock::new(None),
         }
     }
 
@@ -59,12 +60,13 @@ impl Ring {
     }
 
     pub fn update_location(&self, loc: Location) {
-        todo!()
+        let old_loc = &mut *self.own_location.write();
+        *old_loc = Some(loc);
     }
 
     /// Returns this node location in the ring, if any (must have join the ring already).
     pub fn own_location(&self) -> Option<Location> {
-        self.own_location.clone()
+        *self.own_location.read()
     }
 
     pub fn should_accept(&self, my_location: &Location, location: &Location) -> bool {
