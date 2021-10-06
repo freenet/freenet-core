@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use rust_fsm::*;
 
 use super::{handle_op_result, OpError, OperationResult};
 use crate::{
+    config::PEER_TIMEOUT_SECS,
     conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction},
     node::{OpExecError, OpStateStorage},
@@ -13,7 +14,11 @@ use crate::{
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 
-pub(crate) struct JoinRingOp(StateMachine<JROpSM>);
+pub(crate) struct JoinRingOp {
+    sm: StateMachine<JROpSM>,
+    /// time left until time out, when this reaches zero it will be removed from the state
+    ttl: Duration,
+}
 
 impl JoinRingOp {
     pub fn initial_request(
@@ -27,7 +32,10 @@ impl JoinRingOp {
             this_peer,
             max_hops_to_live,
         }));
-        JoinRingOp(sm)
+        JoinRingOp {
+            sm,
+            ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+        }
     }
 }
 
@@ -214,7 +222,7 @@ where
         gateway,
         this_peer,
         max_hops_to_live,
-    } = (&join_op.0).state().clone().try_unwrap_connecting()?;
+    } = (&join_op.sm).state().clone().try_unwrap_connecting()?;
 
     log::info!(
         "Joining ring via {} (at {})",
@@ -264,11 +272,14 @@ where
         None => {
             sender = join_op.sender().cloned();
             // new request to join from this node, initialize the machine
-            let machine = JoinRingOp(StateMachine::new());
+            let machine = JoinRingOp {
+                sm: StateMachine::new(),
+                ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+            };
             update_state(conn_manager, machine, join_op, &op_storage.ring).await
         }
     };
-    
+
     handle_op_result(
         op_storage,
         conn_manager,
@@ -327,7 +338,7 @@ where
                 accepted_by.len()
             );
             return_msg = state
-                .0
+                .sm
                 .consume(&JoinRingMsg::Req {
                     id,
                     msg: JoinRequest::Accepted {
@@ -408,7 +419,7 @@ where
         } => {
             log::debug!("Join response received from {}", sender.peer,);
             return_msg = state
-                .0
+                .sm
                 .consume(&JoinRingMsg::Resp {
                     id,
                     sender,
@@ -474,7 +485,7 @@ where
             target,
         } => {
             return_msg = state
-                .0
+                .sm
                 .consume(&JoinRingMsg::Resp {
                     id,
                     sender,
@@ -482,7 +493,7 @@ where
                     target,
                 })?
                 .map(Message::from);
-            if !state.0.state().is_connected() {
+            if !state.sm.state().is_connected() {
                 return Err(OpError::IllegalStateTransition);
             } else {
                 log::debug!("Successfully completed connection to peer {}", by_peer.peer);
@@ -491,10 +502,10 @@ where
         }
         JoinRingMsg::Connected { target, sender, id } => {
             return_msg = state
-                .0
+                .sm
                 .consume(&JoinRingMsg::Connected { target, sender, id })?
                 .map(Message::from);
-            if !state.0.state().is_connected() {
+            if !state.sm.state().is_connected() {
                 return Err(OpError::IllegalStateTransition);
             } else {
                 log::info!(

@@ -33,7 +33,7 @@ impl StateMachineImpl for GetOpSM {
     fn transition(state: &Self::State, inget: &Self::Input) -> Option<Self::State> {
         match (state, inget) {
             (GetState::Initializing, GetMsg::FetchRouting { key }) => {
-                Some(GetState::Requesting { key: key.clone() })
+                Some(GetState::Requesting { key: *key })
             }
             _ => None,
         }
@@ -42,7 +42,7 @@ impl StateMachineImpl for GetOpSM {
     fn output(state: &Self::State, inget: &Self::Input) -> Option<Self::Output> {
         match (state, inget) {
             (GetState::Initializing, GetMsg::FetchRouting { key }) => {
-                Some(GetMsg::FetchRouting { key: key.clone() })
+                Some(GetMsg::FetchRouting { key: *key })
             }
             _ => None,
         }

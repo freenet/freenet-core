@@ -1,9 +1,15 @@
 //! Main message type which encapsulated all the messaging between nodes.
 
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    time::{Duration, Instant, SystemTime},
+};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use uuid::{
+    v1::{Context, Timestamp},
+    Uuid,
+};
 
 use crate::{
     conn_manager::PeerKeyLocation,
@@ -25,24 +31,37 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) struct Transaction {
+    /// UUID V1, can retrieve timestamp information later to check for possible out of time
+    /// expired transactions which have been clean up already.
     id: Uuid,
     ty: TransactionTypeId,
-    completed: bool,
 }
+
+static UUID_CONTEXT: Context = Context::new(14);
 
 impl Transaction {
     pub fn new(ty: TransactionTypeId) -> Transaction {
-        // 3 word size for 64-bits platforms most likely since msg type
+        // using v1 UUID to keep to keep track of the creation ts so
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("infallible");
+        let now_secs = now.as_secs();
+        let now_nanos = now.as_nanos() - (now_secs as u128 * 1_000_000);
+        let ts = Timestamp::from_unix(&UUID_CONTEXT, now_secs, now_nanos as u32);
+        // this could be problematic on smartphones, will have to check/readdress eventually
+        let mac_addr = mac_address::get_mac_address().unwrap().unwrap();
+        let id = Uuid::new_v1(ts, mac_addr.bytes().as_ref()).unwrap();
+        // 2 word size for 64-bits platforms most likely since msg type
         // probably will be aligned to 64 bytes
-        Self {
-            id: Uuid::new_v4(),
-            ty,
-            completed: false,
-        }
+        Self { id, ty }
     }
 
     pub fn tx_type(&self) -> TransactionType {
         self.ty.desc()
+    }
+
+    pub fn timestamp(&self) -> Timestamp {
+        self.id.to_timestamp().expect("infallible")
     }
 }
 

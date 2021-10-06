@@ -9,7 +9,36 @@ use crate::ring::Location;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Behaviour
+#[async_trait::async_trait]
+pub(crate) trait ContractHandler {
+    type Error;
+
+    /// Returns a copy of the contract bytes if available, none otherwise.
+    async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, Self::Error>;
+
+    /// Store a copy of the contract in the local store.
+    async fn store_contract(&mut self, contract: Contract) -> Result<(), Self::Error>;
+}
+
+#[cfg(test)]
+pub(crate) struct MemoryContractHandler;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ContractHandler for MemoryContractHandler {
+    type Error = ();
+
+    async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, ()> {
+        todo!()
+    }
+
+    async fn store_contract(&mut self, contract: Contract) -> Result<(), ()> {
+        todo!()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Contract {
     data: Vec<u8>,
     #[serde(serialize_with = "<[_]>::serialize")]
@@ -33,13 +62,13 @@ impl Contract {
         ContractKey(self.key)
     }
 
-    fn assigned_location(&self) -> Location {
+    pub fn assigned_location(&self) -> Location {
         Location::from(self.key())
     }
 }
 
 /// The key representing a contract.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct ContractKey(
     #[serde(deserialize_with = "contract_key_deser")]
@@ -77,6 +106,14 @@ where
     let mut key = [0u8; CONTRACT_KEY_SIZE];
     key.copy_from_slice(&data);
     Ok(key)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ContractError<T> {
+    #[error("failed while storing a contract")]
+    StorageError(#[from] T),
+    #[error("failed while sending messages to the handler")]
+    HandlerMessage,
 }
 
 #[cfg(test)]

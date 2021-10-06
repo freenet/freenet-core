@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::mpsc::{self, error::SendError, Receiver, Sender};
 
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
-    message::{Message, Transaction, GetTxType},
+    contract::{ContractError, ContractHandler, MemoryContractHandler},
+    message::{GetTxType, Message, Transaction},
     operations::{
         get,
         join_ring::{self, JoinRingMsg},
@@ -15,7 +16,10 @@ use crate::{
     NodeConfig,
 };
 
-use super::{op_state::OpStateStorage, InitPeerNode};
+use super::{
+    op_state::{ContractHandlerEvent, OpStateStorage},
+    InitPeerNode,
+};
 
 pub(crate) struct NodeInMemory {
     peer: PeerKey,
@@ -58,7 +62,24 @@ impl NodeInMemory {
             ring.with_rnd_walk_above(rnd_if_htl_above);
         }
         let (notification_tx, notification_channel) = mpsc::channel(100);
-        let op_storage = Arc::new(OpStateStorage::new(ring, notification_tx));
+        let (ch_tx, ch_listener) = mpsc::channel(10);
+        let (ch_cb_tx, ch_cb_listener) = mpsc::channel(10);
+
+        let op_storage = Arc::new(OpStateStorage::new(
+            ring,
+            notification_tx,
+            (ch_tx, ch_cb_listener),
+        ));
+
+        let contract_handler = MemoryContractHandler;
+
+        tokio::spawn(contract_handling(
+            op_storage.clone(),
+            contract_handler,
+            ch_listener,
+            ch_cb_tx,
+        ));
+
         Ok(NodeInMemory {
             peer,
             conn_manager,
@@ -92,25 +113,9 @@ impl NodeInMemory {
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
         self.join_ring().await?;
-        let op_storage = self.op_storage.clone();
+        tokio::spawn(user_event_handling(self.op_storage.clone(), user_events));
 
-        tokio::spawn(async move {
-            loop {
-                match user_events.recv().await {
-                    UserEvent::Put { value, contract } => {
-                        // Initialize a put op.
-                        let op = put::PutOp::start_op(&contract, value);
-                        put::request_put(&op_storage, op).await.unwrap();
-                    }
-                    UserEvent::Get { key, contract } => {
-                        // Initialize a get op.
-                        let op = get::GetOp::start_op(key);
-                        get::request_get(&op_storage, op).await.unwrap();
-                    }
-                }
-            }
-        });
-
+        // loop for processings messages
         loop {
             let msg = tokio::select! {
                 msg = self.conn_manager.recv() => { msg }
@@ -140,6 +145,57 @@ impl NodeInMemory {
                     Message::Canceled(_) => todo!(),
                 },
                 Err(_) => return Err(()),
+            }
+        }
+    }
+}
+
+async fn contract_handling<CH, Err>(
+    op_storage: Arc<OpStateStorage>,
+    mut contract_handler: CH,
+    mut ch_listener: Receiver<ContractHandlerEvent>,
+    mut ch_callback_tx: Sender<ContractHandlerEvent>,
+) -> Result<(), ContractError<Err>>
+where
+    CH: ContractHandler<Error = Err>,
+{
+    loop {
+        match ch_listener
+            .recv()
+            .await
+            .ok_or(ContractError::HandlerMessage)?
+        {
+            ContractHandlerEvent::AskFetch(key) => {
+                let contract = contract_handler.fetch_contract(&key).await?;
+                ch_callback_tx
+                    .send(ContractHandlerEvent::AnswerFetch(key, contract))
+                    .await
+                    .map_err(|_| ContractError::HandlerMessage)?;
+            }
+            ContractHandlerEvent::Cache(contract) => {
+                contract_handler.store_contract(contract).await?;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Process user events.
+async fn user_event_handling<UsrEv>(op_storage: Arc<OpStateStorage>, mut user_events: UsrEv)
+where
+    UsrEv: UserEventsProxy + Send + Sync + 'static,
+{
+    loop {
+        match user_events.recv().await {
+            UserEvent::Put { value, contract } => {
+                // Initialize a put op.
+                let op = put::PutOp::start_op(contract, value);
+                put::request_put(&op_storage, op).await.unwrap();
+            }
+            UserEvent::Get { key, contract } => {
+                // Initialize a get op.
+                let op = get::GetOp::start_op(key);
+                get::request_get(&op_storage, op).await.unwrap();
             }
         }
     }

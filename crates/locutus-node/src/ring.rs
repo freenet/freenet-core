@@ -10,8 +10,15 @@
 //! - next node
 //! - final location
 
-use std::{borrow::Borrow, collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
+use std::{
+    borrow::Borrow,
+    collections::{BTreeMap, HashSet},
+    convert::TryFrom,
+    fmt::Display,
+    hash::Hasher,
+};
 
+use dashmap::DashSet;
 use parking_lot::RwLock;
 
 use crate::{
@@ -26,6 +33,8 @@ pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
     pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+    /// contracts in the ring cached by this node
+    cached_contracts: DashSet<ContractKey>,
     // TODO: optimize this for an AtomicU64
     own_location: RwLock<Option<Location>>,
 }
@@ -45,6 +54,7 @@ impl Ring {
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
             connections_by_location: RwLock::new(BTreeMap::new()),
+            cached_contracts: DashSet::new(),
             own_location: RwLock::new(None),
         }
     }
@@ -57,6 +67,15 @@ impl Ring {
     pub fn with_max_hops(&mut self, max_hops_to_live: usize) -> &mut Self {
         self.max_hops_to_live = max_hops_to_live;
         self
+    }
+
+    pub fn within_caching_distance(&self, loc: &Location) -> bool {
+        // FIXME: add logic here
+        true
+    }
+
+    pub fn has_contract(&self, key: &ContractKey) -> bool {
+        self.cached_contracts.contains(key)
     }
 
     pub fn update_location(&self, loc: Location) {

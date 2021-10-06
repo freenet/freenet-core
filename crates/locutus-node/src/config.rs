@@ -155,7 +155,8 @@ pub(super) mod tracing {
 
     static LOGGER: Lazy<Logger> = Lazy::new(|| {
         if let Err(err) = env_logger::builder()
-            .format_module_path(true)
+            .format_indent(Some(4))
+            .format_module_path(false)
             .format_timestamp_nanos()
             .target(env_logger::Target::Stdout)
             .filter(None, CONF.log_level)

@@ -18,7 +18,7 @@ use crate::{config::CONF, ring::Location};
 use self::libp2p_impl::NodeLibP2P;
 #[cfg(test)]
 pub(crate) use in_memory::NodeInMemory;
-pub(crate) use op_state::{OpExecError, OpStateStorage};
+pub(crate) use op_state::{ContractHandlerEvent, OpExecError, OpStateStorage};
 
 #[cfg(test)]
 mod in_memory;
@@ -374,7 +374,7 @@ pub mod test_utils {
                             .await;
                         break;
                     }
-                    match handle_join_ring(&mut gateway.op_storage, &mut gateway.conn_manager, msg)
+                    match handle_join_ring(&gateway.op_storage, &mut gateway.conn_manager, msg)
                         .await
                     {
                         Err(err) => {
