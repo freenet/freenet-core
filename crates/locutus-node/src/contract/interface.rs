@@ -3,6 +3,8 @@
 //!
 //! This abstraction layer shouldn't leak beyong the contract handler.
 
+use super::ContractKey;
+
 pub(super) type ContractKeyResult<T> = Result<T, ContractKeyError>;
 
 pub(super) struct ContractKeyError {

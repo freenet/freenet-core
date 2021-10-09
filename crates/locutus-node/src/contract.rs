@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ring::Location;
 
+mod interface;
 mod store;
 #[cfg(test)]
 mod test;
