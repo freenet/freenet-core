@@ -1,5 +1,3 @@
-//! Main abstraction for representing a contract in binary form.
-
 #[cfg(test)]
 use arbitrary::Arbitrary;
 use blake2::{Blake2b, Digest};
@@ -7,8 +5,17 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ring::Location;
 
+mod store;
+#[cfg(test)]
+mod test;
+
+pub(crate) use store::{ContractHandler, ContractHandlerChannel, ContractHandlerEvent};
+#[cfg(test)]
+pub(crate) use test::MemoryContractHandler;
+
 const CONTRACT_KEY_SIZE: usize = 64;
 
+/// Main abstraction for representing a contract in binary form.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Contract {
     data: Vec<u8>,
@@ -85,24 +92,4 @@ pub(crate) enum ContractError<SErr> {
     StorageError(#[from] SErr),
     #[error("failed while sending messages to the handler")]
     HandlerMessage,
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::test::random_bytes_1024;
-
-    #[test]
-    fn serialization() -> Result<(), Box<dyn std::error::Error>> {
-        let bytes = random_bytes_1024();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-
-        let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
-
-        let serialized = bincode::serialize(&contract)?;
-        let deser: Contract = bincode::deserialize(&serialized)?;
-        assert_eq!(deser.data, contract.data);
-        assert_eq!(deser.key, contract.key);
-        Ok(())
-    }
 }

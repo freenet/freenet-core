@@ -10,6 +10,8 @@ use crate::{
 pub(crate) trait ContractHandler {
     type Error;
 
+    fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
+
     /// Returns a copy of the contract bytes if available, none otherwise.
     async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, Self::Error>;
 
@@ -20,8 +22,6 @@ pub(crate) trait ContractHandler {
     /// It will return an error when the value is not valid (from the contract pov)
     /// or any other condition happened.
     async fn put_value(&mut self, contract: &ContractKey) -> Result<ContractPutValue, Self::Error>;
-
-    fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
 }
 
 pub struct EventId(usize);
@@ -81,46 +81,4 @@ pub(crate) enum ContractHandlerEvent<Err> {
     Cache(Contract),
     /// Result of a caching operation.
     CacheResult(Result<(), Err>),
-}
-
-#[cfg(test)]
-pub(crate) mod test {
-    use super::*;
-
-    #[cfg(test)]
-    pub(crate) struct MemoryContractHandler {
-        channel: ContractHandlerChannel<String>,
-    }
-
-    impl MemoryContractHandler {
-        pub fn new(channel: ContractHandlerChannel<String>) -> Self {
-            MemoryContractHandler { channel }
-        }
-    }
-
-    #[cfg(test)]
-    #[async_trait::async_trait]
-    impl ContractHandler for MemoryContractHandler {
-        type Error = String;
-
-        async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, Self::Error> {
-            todo!()
-        }
-
-        async fn store_contract(&mut self, contract: Contract) -> Result<(), Self::Error> {
-            todo!()
-        }
-
-        #[inline(always)]
-        fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
-            &self.channel
-        }
-
-        async fn put_value(
-            &mut self,
-            contract: &ContractKey,
-        ) -> Result<ContractPutValue, Self::Error> {
-            todo!()
-        }
-    }
 }

@@ -4,9 +4,9 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
-    contract::ContractError,
-    contract_store::{
-        test::MemoryContractHandler, ContractHandler, ContractHandlerChannel, ContractHandlerEvent,
+    contract::{
+        ContractError, ContractHandler, ContractHandlerChannel, ContractHandlerEvent,
+        MemoryContractHandler,
     },
     message::{GetTxType, Message, Transaction},
     operations::{

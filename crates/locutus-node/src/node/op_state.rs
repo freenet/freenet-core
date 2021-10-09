@@ -4,8 +4,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc::{error::SendError, Sender};
 
 use crate::{
-    contract::ContractError,
-    contract_store::{ContractHandlerChannel, ContractHandlerEvent},
+    contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent},
     message::{Message, Transaction, TransactionType},
     operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, Operation},
     ring::Ring,

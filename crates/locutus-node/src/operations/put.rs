@@ -9,8 +9,7 @@ use rust_fsm::{StateMachine, StateMachineImpl};
 use crate::{
     config::PEER_TIMEOUT_SECS,
     conn_manager::{ConnectionBridge, PeerKeyLocation},
-    contract::{Contract, ContractError},
-    contract_store::ContractHandlerEvent,
+    contract::{Contract, ContractError, ContractHandlerEvent},
     message::{GetTxType, Message, Transaction},
     node::{OpExecError, OpStateStorage},
     ring::{Location, RingError},
