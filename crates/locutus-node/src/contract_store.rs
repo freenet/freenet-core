@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use crate::{
     contract::{Contract, ContractError, ContractKey},
     operations::put::ContractPutValue,
@@ -19,38 +21,45 @@ pub(crate) trait ContractHandler {
     /// or any other condition happened.
     async fn put_value(&mut self, contract: &ContractKey) -> Result<ContractPutValue, Self::Error>;
 
-    fn channel(&self) -> &ContractHandlerChannel;
+    fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
 }
 
 pub struct EventId(usize);
 
 /// A bidirectional channel which keeps track of the initiator half
 /// and sends the corresponding response to the listener of the operation.
-#[derive(Clone)]
-pub(crate) struct ContractHandlerChannel {}
+pub(crate) struct ContractHandlerChannel<Err> {
+    _err: PhantomData<Err>,
+}
 
-impl ContractHandlerChannel {
+impl<Err> Clone for ContractHandlerChannel<Err> {
+    fn clone(&self) -> Self {
+        Self { _err: PhantomData }
+    }
+}
+
+impl<Err> ContractHandlerChannel<Err> {
     pub fn new() -> Self {
         // let (notification_tx, notification_channel) = mpsc::channel(100);
         // let (ch_tx, ch_listener) = mpsc::channel(10);
-        Self {}
+        Self { _err: PhantomData }
     }
 
     /// Send an event to the contract handler and receive a response event if succesful.
-    pub async fn send_to_handler<Err>(
+    pub async fn send_to_handler(
         &self,
         ev: ContractHandlerEvent<Err>,
-    ) -> Result<ContractHandlerEvent<Err>, ContractError> {
+    ) -> Result<ContractHandlerEvent<Err>, ContractError<Err>> {
         todo!()
     }
 
-    pub async fn send_to_listeners<Err>(&self, id: EventId, ev: ContractHandlerEvent<Err>) {
+    pub async fn send_to_listeners(&self, id: EventId, ev: ContractHandlerEvent<Err>) {
         todo!()
     }
 
-    pub async fn recv_from_listeners<Err>(
+    pub async fn recv_from_listeners(
         &self,
-    ) -> Result<(EventId, ContractHandlerEvent<Err>), ContractError> {
+    ) -> Result<(EventId, ContractHandlerEvent<Err>), ContractError<Err>> {
         todo!()
     }
 }
@@ -80,11 +89,11 @@ pub(crate) mod test {
 
     #[cfg(test)]
     pub(crate) struct MemoryContractHandler {
-        channel: ContractHandlerChannel,
+        channel: ContractHandlerChannel<String>,
     }
 
     impl MemoryContractHandler {
-        pub fn new(channel: ContractHandlerChannel) -> Self {
+        pub fn new(channel: ContractHandlerChannel<String>) -> Self {
             MemoryContractHandler { channel }
         }
     }
@@ -92,18 +101,18 @@ pub(crate) mod test {
     #[cfg(test)]
     #[async_trait::async_trait]
     impl ContractHandler for MemoryContractHandler {
-        type Error = ();
+        type Error = String;
 
-        async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, ()> {
+        async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, Self::Error> {
             todo!()
         }
 
-        async fn store_contract(&mut self, contract: Contract) -> Result<(), ()> {
+        async fn store_contract(&mut self, contract: Contract) -> Result<(), Self::Error> {
             todo!()
         }
 
         #[inline(always)]
-        fn channel(&self) -> &ContractHandlerChannel {
+        fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
             &self.channel
         }
 

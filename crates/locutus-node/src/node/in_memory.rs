@@ -26,7 +26,7 @@ pub(crate) struct NodeInMemory {
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
     pub conn_manager: MemoryConnManager,
-    pub op_storage: Arc<OpStateStorage>,
+    pub op_storage: Arc<OpStateStorage<String>>,
 }
 
 impl NodeInMemory {
@@ -142,22 +142,13 @@ impl NodeInMemory {
     }
 }
 
-async fn contract_handling<CH, Err>(
-    mut contract_handler: CH,
-    // mut ch_listener: Receiver<ContractHandlerEvent>,
-    // mut ch_callback_tx: Sender<ContractHandlerEvent>,
-) -> Result<(), ContractError<Err>>
+async fn contract_handling<CH, Err>(mut contract_handler: CH) -> Result<(), ContractError<Err>>
 where
     CH: ContractHandler<Error = Err>,
 {
     loop {
-        // FIXME: rm unwrapping here, make handler return proper err type
-        match contract_handler
-            .channel()
-            .recv_from_listeners::<<CH as ContractHandler>::Error>()
-            .await
-            .unwrap()
-        {
+        let res = contract_handler.channel().recv_from_listeners().await?;
+        match res {
             (id, ContractHandlerEvent::FetchQuery(key)) => {
                 let contract = contract_handler.fetch_contract(&key).await;
                 contract_handler
@@ -170,19 +161,13 @@ where
                     Ok(_) => {
                         contract_handler
                             .channel()
-                            .send_to_listeners::<<CH as ContractHandler>::Error>(
-                                id,
-                                ContractHandlerEvent::CacheResult(Ok(())),
-                            )
+                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Ok(())))
                             .await;
                     }
                     Err(err) => {
                         contract_handler
                             .channel()
-                            .send_to_listeners::<<CH as ContractHandler>::Error>(
-                                id,
-                                ContractHandlerEvent::CacheResult(Err(err)),
-                            )
+                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Err(err)))
                             .await;
                     }
                 }
@@ -199,9 +184,12 @@ where
 }
 
 /// Process user events.
-async fn user_event_handling<UsrEv>(op_storage: Arc<OpStateStorage>, mut user_events: UsrEv)
-where
+async fn user_event_handling<UsrEv, CErr>(
+    op_storage: Arc<OpStateStorage<CErr>>,
+    mut user_events: UsrEv,
+) where
     UsrEv: UserEventsProxy + Send + Sync + 'static,
+    CErr: std::fmt::Debug,
 {
     loop {
         match user_events.recv().await {

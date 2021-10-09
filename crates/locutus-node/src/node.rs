@@ -242,6 +242,7 @@ pub mod test_utils {
 
     use crate::{
         conn_manager::{ConnectionBridge, Transport},
+        contract::ContractError,
         message::Message,
         node::{InitPeerNode, NodeInMemory},
         operations::{
@@ -274,8 +275,8 @@ pub mod test_utils {
     pub(crate) struct SimNetwork {
         // gateways: HashMap<String, InMemory>,
         // peers: HashMap<String, InMemory>,
-        meta_info_tx: mpsc::Sender<Result<NetEvent, OpError>>,
-        meta_info_rx: mpsc::Receiver<Result<NetEvent, OpError>>,
+        meta_info_tx: mpsc::Sender<Result<NetEvent, OpError<String>>>,
+        meta_info_rx: mpsc::Receiver<Result<NetEvent, OpError<String>>>,
     }
 
     pub(crate) struct NetEvent {
@@ -329,7 +330,7 @@ pub mod test_utils {
             sim
         }
 
-        pub async fn recv_net_events(&mut self) -> Option<Result<NetEvent, OpError>> {
+        pub async fn recv_net_events(&mut self) -> Option<Result<NetEvent, OpError<String>>> {
             self.meta_info_rx.recv().await
         }
 
@@ -359,7 +360,7 @@ pub mod test_utils {
 
         async fn listen(
             mut gateway: NodeInMemory,
-            info_ch: mpsc::Sender<Result<NetEvent, OpError>>,
+            info_ch: mpsc::Sender<Result<NetEvent, OpError<String>>>,
             _sender: String,
         ) -> Result<(), ()> {
             while let Ok(msg) = gateway.conn_manager.recv().await {

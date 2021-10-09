@@ -195,7 +195,7 @@ struct ConnectionInfo {
 }
 
 impl JRState {
-    fn try_unwrap_connecting(self) -> Result<ConnectionInfo, OpError> {
+    fn try_unwrap_connecting<CErr>(self) -> Result<ConnectionInfo, OpError<CErr>> {
         if let Self::Connecting(conn_info) = self {
             Ok(conn_info)
         } else {
@@ -209,12 +209,12 @@ impl JRState {
 }
 
 /// Join ring routine, called upon performing a join operation for this node.
-pub(crate) async fn join_ring_request<CB>(
+pub(crate) async fn join_ring_request<CB, CErr>(
     tx: Transaction,
-    op_storage: &OpStateStorage,
+    op_storage: &OpStateStorage<CErr>,
     conn_manager: &mut CB,
     join_op: JoinRingOp,
-) -> Result<(), OpError>
+) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
 {
@@ -252,17 +252,17 @@ where
 ///
 /// # Cancellation Safety
 /// This future is not cancellation safe.
-pub(crate) async fn handle_join_ring<CB>(
-    op_storage: &OpStateStorage,
+pub(crate) async fn handle_join_ring<CB, CErr>(
+    op_storage: &OpStateStorage<CErr>,
     conn_manager: &mut CB,
     join_op: JoinRingMsg,
-) -> Result<(), OpError>
+) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
 {
     let sender;
     let tx = *join_op.id();
-    let result = match op_storage.pop(join_op.id()) {
+    let result: Result<_, OpError<CErr>> = match op_storage.pop(join_op.id()) {
         Some(Operation::JoinRing(state)) => {
             sender = join_op.sender().cloned();
             // was an existing operation, the other peer messaged back
@@ -289,12 +289,12 @@ where
     .await
 }
 
-async fn update_state<CB>(
+async fn update_state<CB, CErr>(
     conn_manager: &mut CB,
     mut state: JoinRingOp,
     other_host_msg: JoinRingMsg,
     ring: &Ring,
-) -> Result<OperationResult, OpError>
+) -> Result<OperationResult, OpError<CErr>>
 where
     CB: ConnectionBridge,
 {

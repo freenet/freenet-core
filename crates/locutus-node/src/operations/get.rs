@@ -54,11 +54,11 @@ enum GetState {
     Requesting { key: ContractKey },
 }
 
-pub(crate) async fn handle_get_response<CB>(
-    op_storage: &OpStateStorage,
+pub(crate) async fn handle_get_response<CB, CErr>(
+    op_storage: &OpStateStorage<CErr>,
     conn_manager: &mut CB,
     get_op: GetMsg,
-) -> Result<(), OpError>
+) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
 {
@@ -66,7 +66,10 @@ where
 }
 
 /// Request to get the current value from a contract.
-pub(crate) async fn request_get(op_storage: &OpStateStorage, get_op: GetOp) -> Result<(), OpError> {
+pub(crate) async fn request_get<CErr>(
+    op_storage: &OpStateStorage<CErr>,
+    get_op: GetOp,
+) -> Result<(), OpError<CErr>> {
     // the initial request must provide:
     // - a location in the network where the contract resides
     // - and the value to get

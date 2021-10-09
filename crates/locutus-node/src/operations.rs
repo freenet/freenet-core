@@ -18,12 +18,12 @@ pub(crate) struct OperationResult {
     pub state: Option<Operation>,
 }
 
-async fn handle_op_result<CB>(
-    op_storage: &OpStateStorage,
+async fn handle_op_result<CB, CErr>(
+    op_storage: &OpStateStorage<CErr>,
     conn_manager: &mut CB,
-    result: Result<OperationResult, (OpError, Transaction)>,
+    result: Result<OperationResult, (OpError<CErr>, Transaction)>,
     sender: Option<PeerKeyLocation>,
-) -> Result<(), OpError>
+) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
 {
@@ -76,7 +76,7 @@ pub(crate) enum Operation {
 pub struct ProbeOp;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OpError<S = String> {
+pub(crate) enum OpError<S> {
     #[error(transparent)]
     ConnError(#[from] conn_manager::ConnError),
     #[error(transparent)]

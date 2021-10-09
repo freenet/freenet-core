@@ -139,10 +139,10 @@ impl PutState {
 }
 
 /// Request to insert/update a value into a contract.
-pub(crate) async fn request_put(
-    op_storage: &OpStateStorage,
+pub(crate) async fn request_put<CErr>(
+    op_storage: &OpStateStorage<CErr>,
     mut put_op: PutOp,
-) -> Result<(), OpError> {
+) -> Result<(), OpError<CErr>> {
     if !put_op.sm.state().is_requesting() {
         return Err(OpError::IllegalStateTransition);
     };
@@ -157,13 +157,14 @@ pub(crate) async fn request_put(
     Ok(())
 }
 
-pub(crate) async fn handle_put_response<CB>(
-    op_storage: &OpStateStorage,
+pub(crate) async fn handle_put_response<CB, CErr>(
+    op_storage: &OpStateStorage<CErr>,
     conn_manager: &mut CB,
     put_op: PutMsg,
-) -> Result<(), OpError>
+) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
+    OpError<CErr>: From<ContractError<CErr>>,
 {
     let sender;
     let tx = *put_op.id();
@@ -194,14 +195,15 @@ where
     .await
 }
 
-async fn update_state<CB>(
+async fn update_state<CB, CErr>(
     conn_manager: &mut CB,
-    mut state: PutOp,
+    state: PutOp,
     other_host_msg: PutMsg,
-    op_storage: &OpStateStorage,
-) -> Result<OperationResult, OpError>
+    op_storage: &OpStateStorage<CErr>,
+) -> Result<OperationResult, OpError<CErr>>
 where
     CB: ConnectionBridge,
+    OpError<CErr>: From<ContractError<CErr>>,
 {
     let return_msg;
     let new_state;
@@ -222,6 +224,7 @@ where
             // the initial request must provide:
             // - a peer as close as possible to the contract location
             // - and the value to put
+
             return_msg = Some(
                 (PutMsg::SeekNode {
                     id,
@@ -233,7 +236,9 @@ where
                             location: Some(location),
                             peer: conn_manager.peer_key(),
                         })
-                        .ok_or_else(|| OpError::from(RingError::NoLocationAssigned))?,
+                        .ok_or_else(|| {
+                            <OpError<CErr> as From<RingError>>::from(RingError::NoLocationAssigned)
+                        })?,
                     contract,
                     value,
                 })
@@ -253,7 +258,7 @@ where
             let cached_contract = op_storage.ring.has_contract(&contract.key());
             if cached_contract {
                 match op_storage
-                    .notify_contract_handler::<()>(ContractHandlerEvent::PushQuery {
+                    .notify_contract_handler(ContractHandlerEvent::PushQuery {
                         key: contract.key(),
                         value,
                     })
@@ -274,7 +279,7 @@ where
                 // this node does not have the contract, so instead store the contract and
                 // execute the put op.
                 op_storage
-                    .notify_contract_handler::<()>(ContractHandlerEvent::Cache(contract))
+                    .notify_contract_handler(ContractHandlerEvent::Cache(contract))
                     .await?;
             }
 

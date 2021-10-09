@@ -80,9 +80,9 @@ where
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ContractError<T = String> {
+pub(crate) enum ContractError<SErr> {
     #[error("failed while storing a contract")]
-    StorageError(#[from] T),
+    StorageError(#[from] SErr),
     #[error("failed while sending messages to the handler")]
     HandlerMessage,
 }
