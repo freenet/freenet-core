@@ -9,35 +9,6 @@ use crate::ring::Location;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
-/// Behaviour
-#[async_trait::async_trait]
-pub(crate) trait ContractHandler {
-    type Error;
-
-    /// Returns a copy of the contract bytes if available, none otherwise.
-    async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, Self::Error>;
-
-    /// Store a copy of the contract in the local store.
-    async fn store_contract(&mut self, contract: Contract) -> Result<(), Self::Error>;
-}
-
-#[cfg(test)]
-pub(crate) struct MemoryContractHandler;
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl ContractHandler for MemoryContractHandler {
-    type Error = ();
-
-    async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, ()> {
-        todo!()
-    }
-
-    async fn store_contract(&mut self, contract: Contract) -> Result<(), ()> {
-        todo!()
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Contract {
     data: Vec<u8>,
@@ -109,7 +80,7 @@ where
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ContractError<T> {
+pub(crate) enum ContractError<T = String> {
     #[error("failed while storing a contract")]
     StorageError(#[from] T),
     #[error("failed while sending messages to the handler")]

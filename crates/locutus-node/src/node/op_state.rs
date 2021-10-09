@@ -1,10 +1,11 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use dashmap::DashMap;
-use tokio::sync::mpsc::{error::SendError, Receiver, Sender};
+use tokio::sync::mpsc::{error::SendError, Sender};
 
 use crate::{
-    contract::{Contract, ContractKey},
+    contract::ContractError,
+    contract_store::{ContractHandlerChannel, ContractHandlerEvent},
     message::{Message, Transaction, TransactionType},
     operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, Operation},
     ring::Ring,
@@ -16,16 +17,10 @@ pub(crate) struct OpStateStorage {
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     notification_channel: Sender<Message>,
-    contract_handler: (Sender<ContractHandlerEvent>, Receiver<ContractHandlerEvent>),
+    contract_handler: ContractHandlerChannel,
     pub ring: Ring,
     // FIXME: think of an optiomal strategy to check for timeouts and clean up garbage
     ops_ttl: BTreeMap<Duration, Vec<Transaction>>,
-}
-
-pub(crate) enum ContractHandlerEvent {
-    AskFetch(ContractKey),
-    AnswerFetch(ContractKey, Option<Contract>),
-    Cache(Contract),
 }
 
 macro_rules! check_id_op {
@@ -40,7 +35,7 @@ impl OpStateStorage {
     pub fn new(
         ring: Ring,
         notification_channel: Sender<Message>,
-        contract_handler: (Sender<ContractHandlerEvent>, Receiver<ContractHandlerEvent>),
+        contract_handler: ContractHandlerChannel,
     ) -> Self {
         Self {
             join_ring: DashMap::default(),
@@ -59,8 +54,12 @@ impl OpStateStorage {
         self.notification_channel.send(msg).await
     }
 
-    pub async fn notify_contract_handler(&self, msg: ContractHandlerEvent) {
-        self.contract_handler.0.send(msg).await;
+    /// Send an event to the contract handler and await a response event from it if successful.
+    pub async fn notify_contract_handler<Err>(
+        &self,
+        msg: ContractHandlerEvent<Err>,
+    ) -> Result<ContractHandlerEvent<Err>, ContractError> {
+        self.contract_handler.send_to_handler(msg).await
     }
 
     pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpExecError> {

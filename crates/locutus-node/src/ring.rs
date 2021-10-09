@@ -10,13 +10,7 @@
 //! - next node
 //! - final location
 
-use std::{
-    borrow::Borrow,
-    collections::{BTreeMap, HashSet},
-    convert::TryFrom,
-    fmt::Display,
-    hash::Hasher,
-};
+use std::{borrow::Borrow, collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
 
 use dashmap::DashSet;
 use parking_lot::RwLock;
@@ -59,25 +53,34 @@ impl Ring {
         }
     }
 
+    /// Set the threashold of HPL for which a random walk will be performed.
     pub fn with_rnd_walk_above(&mut self, rnd_if_htl_above: usize) -> &mut Self {
         self.rnd_if_htl_above = rnd_if_htl_above;
         self
     }
 
+    /// Set the maximum HTL for transactions.
     pub fn with_max_hops(&mut self, max_hops_to_live: usize) -> &mut Self {
         self.max_hops_to_live = max_hops_to_live;
         self
     }
 
-    pub fn within_caching_distance(&self, loc: &Location) -> bool {
-        // FIXME: add logic here
+    #[inline]
+    /// Return if a location is within appropiate caching distance.
+    pub fn within_caching_distance(&self, _loc: &Location) -> bool {
+        // This always returns true as of current version since LRU cache will make sure
+        // to remove contracts when capacity is fully utilized.
+        // So all nodes along the path will be caching all the contracts.
+        // This will be changed in the future as the caching logic gets more complicated.
         true
     }
 
+    #[inline]
     pub fn has_contract(&self, key: &ContractKey) -> bool {
         self.cached_contracts.contains(key)
     }
 
+    /// Update this node location.
     pub fn update_location(&self, loc: Location) {
         let old_loc = &mut *self.own_location.write();
         *old_loc = Some(loc);
@@ -88,6 +91,8 @@ impl Ring {
         *self.own_location.read()
     }
 
+    /// Whether a node should accept a new node connection or not based
+    /// on the relative location and other conditions.
     pub fn should_accept(&self, my_location: &Location, location: &Location) -> bool {
         let cbl = &*self.connections_by_location.read();
         if location == my_location || cbl.contains_key(location) {
@@ -112,6 +117,7 @@ impl Ring {
         conn_by_dist[idx]
     }
 
+    /// Find the closest node to a given location.
     pub fn routing(&self, target: &Location) -> Option<(Location, PeerKeyLocation)> {
         let connections = self.connections_by_location.read();
         let mut conn_by_dist: Vec<_> = connections
@@ -122,6 +128,7 @@ impl Ring {
         conn_by_dist.first().map(|(_, v)| (*v.0, *v.1))
     }
 
+    /// Get a random peer from the known ring connections.
     pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
     where
         F: FnMut(&&PeerKeyLocation) -> bool,
@@ -169,7 +176,6 @@ where
     fn from(key: T) -> Self {
         let mut value = 0.0;
         let mut divisor = 256.0;
-        // assert!((1..=7).contains(&precision));
         for byte in key.borrow().bytes().iter().take(7) {
             value += *byte as f64 / divisor;
             divisor *= 256.0;

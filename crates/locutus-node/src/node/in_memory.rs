@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc::{self, error::SendError, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
-    contract::{ContractError, ContractHandler, MemoryContractHandler},
+    contract::ContractError,
+    contract_store::{
+        test::MemoryContractHandler, ContractHandler, ContractHandlerChannel, ContractHandlerEvent,
+    },
     message::{GetTxType, Message, Transaction},
     operations::{
         get,
@@ -16,10 +19,7 @@ use crate::{
     NodeConfig,
 };
 
-use super::{
-    op_state::{ContractHandlerEvent, OpStateStorage},
-    InitPeerNode,
-};
+use super::{op_state::OpStateStorage, InitPeerNode};
 
 pub(crate) struct NodeInMemory {
     peer: PeerKey,
@@ -62,23 +62,15 @@ impl NodeInMemory {
             ring.with_rnd_walk_above(rnd_if_htl_above);
         }
         let (notification_tx, notification_channel) = mpsc::channel(100);
-        let (ch_tx, ch_listener) = mpsc::channel(10);
-        let (ch_cb_tx, ch_cb_listener) = mpsc::channel(10);
-
+        let ch_handler = ContractHandlerChannel::new();
         let op_storage = Arc::new(OpStateStorage::new(
             ring,
             notification_tx,
-            (ch_tx, ch_cb_listener),
+            ch_handler.clone(),
         ));
+        let contract_handler = MemoryContractHandler::new(ch_handler);
 
-        let contract_handler = MemoryContractHandler;
-
-        tokio::spawn(contract_handling(
-            op_storage.clone(),
-            contract_handler,
-            ch_listener,
-            ch_cb_tx,
-        ));
+        tokio::spawn(contract_handling(contract_handler));
 
         Ok(NodeInMemory {
             peer,
@@ -108,7 +100,7 @@ impl NodeInMemory {
     }
 
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
-    pub async fn listen_on<UsrEv>(&mut self, mut user_events: UsrEv) -> Result<(), ()>
+    pub async fn listen_on<UsrEv>(&mut self, user_events: UsrEv) -> Result<(), ()>
     where
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
@@ -151,29 +143,55 @@ impl NodeInMemory {
 }
 
 async fn contract_handling<CH, Err>(
-    op_storage: Arc<OpStateStorage>,
     mut contract_handler: CH,
-    mut ch_listener: Receiver<ContractHandlerEvent>,
-    mut ch_callback_tx: Sender<ContractHandlerEvent>,
+    // mut ch_listener: Receiver<ContractHandlerEvent>,
+    // mut ch_callback_tx: Sender<ContractHandlerEvent>,
 ) -> Result<(), ContractError<Err>>
 where
     CH: ContractHandler<Error = Err>,
 {
     loop {
-        match ch_listener
-            .recv()
+        // FIXME: rm unwrapping here, make handler return proper err type
+        match contract_handler
+            .channel()
+            .recv_from_listeners::<<CH as ContractHandler>::Error>()
             .await
-            .ok_or(ContractError::HandlerMessage)?
+            .unwrap()
         {
-            ContractHandlerEvent::AskFetch(key) => {
-                let contract = contract_handler.fetch_contract(&key).await?;
-                ch_callback_tx
-                    .send(ContractHandlerEvent::AnswerFetch(key, contract))
+            (id, ContractHandlerEvent::FetchQuery(key)) => {
+                let contract = contract_handler.fetch_contract(&key).await;
+                contract_handler
+                    .channel()
+                    .send_to_listeners(id, ContractHandlerEvent::FetchResponse { key, contract })
                     .await
-                    .map_err(|_| ContractError::HandlerMessage)?;
             }
-            ContractHandlerEvent::Cache(contract) => {
-                contract_handler.store_contract(contract).await?;
+            (id, ContractHandlerEvent::Cache(contract)) => {
+                match contract_handler.store_contract(contract).await {
+                    Ok(_) => {
+                        contract_handler
+                            .channel()
+                            .send_to_listeners::<<CH as ContractHandler>::Error>(
+                                id,
+                                ContractHandlerEvent::CacheResult(Ok(())),
+                            )
+                            .await;
+                    }
+                    Err(err) => {
+                        contract_handler
+                            .channel()
+                            .send_to_listeners::<<CH as ContractHandler>::Error>(
+                                id,
+                                ContractHandlerEvent::CacheResult(Err(err)),
+                            )
+                            .await;
+                    }
+                }
+            }
+            (id, ContractHandlerEvent::PushQuery { key, value }) => {
+                match contract_handler.put_value(&key).await {
+                    Ok(value) => {}
+                    Err(err) => {}
+                }
             }
             _ => unreachable!(),
         }

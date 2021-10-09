@@ -9,10 +9,11 @@ use rust_fsm::{StateMachine, StateMachineImpl};
 use crate::{
     config::PEER_TIMEOUT_SECS,
     conn_manager::{ConnectionBridge, PeerKeyLocation},
-    contract::{Contract, ContractKey},
+    contract::{Contract, ContractError},
+    contract_store::ContractHandlerEvent,
     message::{GetTxType, Message, Transaction},
-    node::{ContractHandlerEvent, OpExecError, OpStateStorage},
-    ring::{Location, Ring, RingError},
+    node::{OpExecError, OpStateStorage},
+    ring::{Location, RingError},
 };
 
 pub(crate) use self::messages::PutMsg;
@@ -248,29 +249,53 @@ where
             value,
             contract,
         } => {
+            let contract_loc = contract.assigned_location();
             let cached_contract = op_storage.ring.has_contract(&contract.key());
             if cached_contract {
-                //TODO:
-                // 1. attempt update
-                // 1.1. if ok then return success
-                // 1.2. propagate changes
-                // 2. if failed communicate failure
-            }
-            if op_storage
-                .ring
-                .within_caching_distance(&contract.assigned_location())
-                && !cached_contract
-            {
-                op_storage
-                    .notify_contract_handler(ContractHandlerEvent::Cache(contract))
-                    .await;
+                match op_storage
+                    .notify_contract_handler::<()>(ContractHandlerEvent::PushQuery {
+                        key: contract.key(),
+                        value,
+                    })
+                    .await
+                {
+                    Ok(ContractHandlerEvent::PushResponse) => {
+                        // 1.1. if ok then return success
+                        // 1.2. propagate/broadcast changes
+                    }
+                    Err(ContractError::StorageError(_err)) => {
+                        // 2. if failed communicate failure
+                    }
+                    _ => unreachable!(),
+                }
             }
 
-            // <QUESTION?> what if it happens to be closer nodes known by this host to the contract location?
-            // 1. send towards those nodes (how many times should this be repeated?)
-            // 2. cache anyways and put the value;
-            // <QUESTION?> what happens after some value is put successfully?
-            // this has to be replicated across the network, have to handle this case
+            if !cached_contract && op_storage.ring.within_caching_distance(&contract_loc) {
+                // this node does not have the contract, so instead store the contract and
+                // execute the put op.
+                op_storage
+                    .notify_contract_handler::<()>(ContractHandlerEvent::Cache(contract))
+                    .await?;
+            }
+
+            if let Some((
+                _,
+                PeerKeyLocation {
+                    location: Some(other_loc),
+                    peer,
+                },
+            )) = op_storage.ring.routing(&contract_loc)
+            {
+                if let Some(own_loc) = op_storage.ring.own_location() {
+                    let other_distance = contract_loc.distance(&other_loc);
+                    let self_distance = contract_loc.distance(&own_loc);
+                    if other_distance < self_distance {
+                        // forward the contract towards this node since it is indeed closer
+                        // to the contract location
+                        todo!()
+                    }
+                }
+            }
             todo!()
         }
         _ => return Err(OpError::IllegalStateTransition),

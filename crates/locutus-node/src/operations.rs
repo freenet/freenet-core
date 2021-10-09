@@ -1,5 +1,6 @@
 use crate::{
     conn_manager::{self, ConnectionBridge, PeerKeyLocation},
+    contract::ContractError,
     message::{Message, Transaction},
     node::{OpExecError, OpStateStorage},
     ring::RingError,
@@ -75,7 +76,7 @@ pub(crate) enum Operation {
 pub struct ProbeOp;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OpError {
+pub(crate) enum OpError<S = String> {
     #[error(transparent)]
     ConnError(#[from] conn_manager::ConnError),
     #[error(transparent)]
@@ -86,9 +87,11 @@ pub(crate) enum OpError {
     NotificationError(#[from] tokio::sync::mpsc::error::SendError<Message>),
     #[error(transparent)]
     RingError(#[from] RingError),
+    #[error(transparent)]
+    ContractError(#[from] ContractError<S>),
 }
 
-impl From<rust_fsm::TransitionImpossibleError> for OpError {
+impl<S> From<rust_fsm::TransitionImpossibleError> for OpError<S> {
     fn from(_: rust_fsm::TransitionImpossibleError) -> Self {
         OpError::IllegalStateTransition
     }

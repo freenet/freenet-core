@@ -8,7 +8,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::{
     message::{Message, Transaction},
     ring::Location,
-    StdResult,
 };
 
 pub mod in_memory;
@@ -17,7 +16,7 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 const DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 
 // pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
-pub(crate) type Result<T> = StdResult<T, ConnError>;
+pub(crate) type Result<T> = std::result::Result<T, ConnError>;
 
 #[async_trait::async_trait]
 pub(crate) trait ConnectionBridge {
@@ -76,10 +75,14 @@ pub(crate) enum ConnError {
 }
 
 mod serialization {
-    use super::*;
+    use libp2p::PeerId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::PeerKey;
+
 
     impl Serialize for PeerKey {
-        fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
@@ -88,7 +91,7 @@ mod serialization {
     }
 
     impl<'de> Deserialize<'de> for PeerKey {
-        fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>,
         {
