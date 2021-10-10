@@ -7,20 +7,24 @@
 //! - libp2p: all the connection is handled by libp2p.
 //! - In memory: a simplifying node used for emulation pourpouses mainly.
 
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 #[cfg(test)]
 use crate::user_events::test_utils::MemoryEventsGen;
-use crate::{config::CONF, ring::Location};
+use crate::{
+    config::CONF,
+    contract::{ContractError, ContractHandler, ContractHandlerEvent},
+    operations::{get, put},
+    ring::Location,
+    user_events::{UserEvent, UserEventsProxy},
+};
 
 use self::libp2p_impl::NodeLibP2P;
-#[cfg(test)]
 pub(crate) use in_memory::NodeInMemory;
-pub(crate) use op_state::{OpExecError, OpStateStorage};
+pub(crate) use op_state::{OpExecError, OpManager};
 
-#[cfg(test)]
 mod in_memory;
 mod libp2p_impl;
 mod op_state;
@@ -409,5 +413,68 @@ pub mod test_utils {
                     .collect::<Vec<_>>()
             })
             .flatten()
+    }
+}
+
+/// Process user events.
+async fn user_event_handling<UsrEv, CErr>(op_storage: Arc<OpManager<CErr>>, mut user_events: UsrEv)
+where
+    UsrEv: UserEventsProxy + Send + Sync + 'static,
+    CErr: std::fmt::Debug,
+{
+    loop {
+        match user_events.recv().await {
+            UserEvent::Put { value, contract } => {
+                // Initialize a put op.
+                let op = put::PutOp::start_op(contract, value);
+                put::request_put(&op_storage, op).await.unwrap();
+            }
+            UserEvent::Get { key, contract } => {
+                // Initialize a get op.
+                let op = get::GetOp::start_op(key);
+                get::request_get(&op_storage, op).await.unwrap();
+            }
+        }
+    }
+}
+
+async fn contract_handling<CH, Err>(mut contract_handler: CH) -> Result<(), ContractError<Err>>
+where
+    CH: ContractHandler<Error = Err>,
+{
+    loop {
+        let res = contract_handler.channel().recv_from_listeners().await?;
+        match res {
+            (id, ContractHandlerEvent::FetchQuery(key)) => {
+                let contract = contract_handler.fetch_contract(&key).await;
+                contract_handler
+                    .channel()
+                    .send_to_listeners(id, ContractHandlerEvent::FetchResponse { key, contract })
+                    .await
+            }
+            (id, ContractHandlerEvent::Cache(contract)) => {
+                match contract_handler.store_contract(contract).await {
+                    Ok(_) => {
+                        contract_handler
+                            .channel()
+                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Ok(())))
+                            .await;
+                    }
+                    Err(err) => {
+                        contract_handler
+                            .channel()
+                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Err(err)))
+                            .await;
+                    }
+                }
+            }
+            (id, ContractHandlerEvent::PushQuery { key, value }) => {
+                match contract_handler.put_value(&key).await {
+                    Ok(value) => {}
+                    Err(err) => {}
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 }

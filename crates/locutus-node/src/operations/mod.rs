@@ -2,7 +2,7 @@ use crate::{
     conn_manager::{self, ConnectionBridge, PeerKeyLocation},
     contract::ContractError,
     message::{Message, Transaction},
-    node::{OpExecError, OpStateStorage},
+    node::{OpExecError, OpManager},
     ring::RingError,
 };
 
@@ -19,7 +19,7 @@ pub(crate) struct OperationResult {
 }
 
 async fn handle_op_result<CB, CErr>(
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     result: Result<OperationResult, (OpError<CErr>, Transaction)>,
     sender: Option<PeerKeyLocation>,
@@ -28,6 +28,10 @@ where
     CB: ConnectionBridge,
 {
     match result {
+        Err((OpError::StatePushed, _)) => {
+            // do nothing and continue,the operation will just continue later on
+            return Ok(());
+        }
         Err((err, tx_id)) => {
             log::error!("error while processing join request: {}", err);
             if let Some(sender) = sender {
@@ -89,6 +93,10 @@ pub(crate) enum OpError<S> {
     RingError(#[from] RingError),
     #[error(transparent)]
     ContractError(#[from] ContractError<S>),
+    /// This is used as an early interrumpt of an op update when an op
+    /// was sent throught the fast path back to the storage.
+    #[error("early push of state into the op stack")]
+    StatePushed,
 }
 
 impl<S> From<rust_fsm::TransitionImpossibleError> for OpError<S> {

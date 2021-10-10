@@ -7,12 +7,10 @@ use crate::ring::Location;
 
 mod interface;
 mod store;
-#[cfg(test)]
-mod test;
+mod test_utils;
 
 pub(crate) use store::{ContractHandler, ContractHandlerChannel, ContractHandlerEvent};
-#[cfg(test)]
-pub(crate) use test::MemoryContractHandler;
+pub(crate) use test_utils::MemoryContractHandler;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 

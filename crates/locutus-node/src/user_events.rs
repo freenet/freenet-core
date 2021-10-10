@@ -30,7 +30,7 @@ pub(crate) mod test_utils {
     use arbitrary::{Arbitrary, Unstructured};
 
     use super::*;
-    use crate::test::random_bytes_128;
+    use crate::test_utils::random_bytes_128;
 
     pub(crate) struct MemoryEventsGen;
 

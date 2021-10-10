@@ -1,11 +1,10 @@
-use crate::{operations::put::ContractPutValue, test::random_bytes_1024};
+use crate::operations::put::ContractPutValue;
 
 use super::{
     store::{ContractHandler, ContractHandlerChannel},
     Contract, ContractKey,
 };
 
-#[cfg(test)]
 pub(crate) struct MemoryContractHandler {
     channel: ContractHandlerChannel<String>,
 }
@@ -16,7 +15,6 @@ impl MemoryContractHandler {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
     type Error = String;
@@ -41,7 +39,7 @@ impl ContractHandler for MemoryContractHandler {
 
 #[test]
 fn serialization() -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = random_bytes_1024();
+    let bytes = crate::test_utils::random_bytes_1024();
     let mut gen = arbitrary::Unstructured::new(&bytes);
 
     let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;

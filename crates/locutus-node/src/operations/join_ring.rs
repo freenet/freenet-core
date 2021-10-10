@@ -7,7 +7,7 @@ use crate::{
     config::PEER_TIMEOUT_SECS,
     conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction},
-    node::{OpExecError, OpStateStorage},
+    node::{OpExecError, OpManager},
     operations::Operation,
     ring::{Location, Ring},
 };
@@ -211,7 +211,7 @@ impl JRState {
 /// Join ring routine, called upon performing a join operation for this node.
 pub(crate) async fn join_ring_request<CB, CErr>(
     tx: Transaction,
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     join_op: JoinRingOp,
 ) -> Result<(), OpError<CErr>>
@@ -253,7 +253,7 @@ where
 /// # Cancellation Safety
 /// This future is not cancellation safe.
 pub(crate) async fn handle_join_ring<CB, CErr>(
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     join_op: JoinRingMsg,
 ) -> Result<(), OpError<CErr>>

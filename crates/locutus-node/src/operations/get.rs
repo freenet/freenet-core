@@ -2,7 +2,7 @@ use rust_fsm::{StateMachine, StateMachineImpl};
 
 use crate::{
     conn_manager::ConnectionBridge, contract::ContractKey, message::Transaction,
-    node::OpStateStorage,
+    node::OpManager,
 };
 
 pub(crate) use self::messages::GetMsg;
@@ -55,7 +55,7 @@ enum GetState {
 }
 
 pub(crate) async fn handle_get_response<CB, CErr>(
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     get_op: GetMsg,
 ) -> Result<(), OpError<CErr>>
@@ -67,7 +67,7 @@ where
 
 /// Request to get the current value from a contract.
 pub(crate) async fn request_get<CErr>(
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
     get_op: GetOp,
 ) -> Result<(), OpError<CErr>> {
     // the initial request must provide:

@@ -15,18 +15,18 @@ use crate::{
         put,
     },
     ring::Ring,
-    user_events::{UserEvent, UserEventsProxy},
+    user_events::UserEventsProxy,
     NodeConfig,
 };
 
-use super::{op_state::OpStateStorage, InitPeerNode};
+use super::{op_state::OpManager, InitPeerNode};
 
 pub(crate) struct NodeInMemory {
     peer: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
     pub conn_manager: MemoryConnManager,
-    pub op_storage: Arc<OpStateStorage<String>>,
+    pub op_storage: Arc<OpManager<String>>,
 }
 
 impl NodeInMemory {
@@ -63,14 +63,10 @@ impl NodeInMemory {
         }
         let (notification_tx, notification_channel) = mpsc::channel(100);
         let ch_handler = ContractHandlerChannel::new();
-        let op_storage = Arc::new(OpStateStorage::new(
-            ring,
-            notification_tx,
-            ch_handler.clone(),
-        ));
+        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ch_handler.clone()));
         let contract_handler = MemoryContractHandler::new(ch_handler);
 
-        tokio::spawn(contract_handling(contract_handler));
+        tokio::spawn(super::contract_handling(contract_handler));
 
         Ok(NodeInMemory {
             peer,
@@ -105,7 +101,10 @@ impl NodeInMemory {
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
         self.join_ring().await?;
-        tokio::spawn(user_event_handling(self.op_storage.clone(), user_events));
+        tokio::spawn(super::user_event_handling(
+            self.op_storage.clone(),
+            user_events,
+        ));
 
         // loop for processings messages
         loop {
@@ -137,71 +136,6 @@ impl NodeInMemory {
                     Message::Canceled(_) => todo!(),
                 },
                 Err(_) => return Err(()),
-            }
-        }
-    }
-}
-
-async fn contract_handling<CH, Err>(mut contract_handler: CH) -> Result<(), ContractError<Err>>
-where
-    CH: ContractHandler<Error = Err>,
-{
-    loop {
-        let res = contract_handler.channel().recv_from_listeners().await?;
-        match res {
-            (id, ContractHandlerEvent::FetchQuery(key)) => {
-                let contract = contract_handler.fetch_contract(&key).await;
-                contract_handler
-                    .channel()
-                    .send_to_listeners(id, ContractHandlerEvent::FetchResponse { key, contract })
-                    .await
-            }
-            (id, ContractHandlerEvent::Cache(contract)) => {
-                match contract_handler.store_contract(contract).await {
-                    Ok(_) => {
-                        contract_handler
-                            .channel()
-                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Ok(())))
-                            .await;
-                    }
-                    Err(err) => {
-                        contract_handler
-                            .channel()
-                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Err(err)))
-                            .await;
-                    }
-                }
-            }
-            (id, ContractHandlerEvent::PushQuery { key, value }) => {
-                match contract_handler.put_value(&key).await {
-                    Ok(value) => {}
-                    Err(err) => {}
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-/// Process user events.
-async fn user_event_handling<UsrEv, CErr>(
-    op_storage: Arc<OpStateStorage<CErr>>,
-    mut user_events: UsrEv,
-) where
-    UsrEv: UserEventsProxy + Send + Sync + 'static,
-    CErr: std::fmt::Debug,
-{
-    loop {
-        match user_events.recv().await {
-            UserEvent::Put { value, contract } => {
-                // Initialize a put op.
-                let op = put::PutOp::start_op(contract, value);
-                put::request_put(&op_storage, op).await.unwrap();
-            }
-            UserEvent::Get { key, contract } => {
-                // Initialize a get op.
-                let op = get::GetOp::start_op(key);
-                get::request_get(&op_storage, op).await.unwrap();
             }
         }
     }
