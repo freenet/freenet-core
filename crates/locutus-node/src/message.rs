@@ -2,7 +2,7 @@
 
 use std::{
     fmt::Display,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
@@ -58,10 +58,6 @@ impl Transaction {
 
     pub fn tx_type(&self) -> TransactionType {
         self.ty.desc()
-    }
-
-    pub fn timestamp(&self) -> Timestamp {
-        self.id.to_timestamp().expect("infallible")
     }
 }
 
@@ -156,16 +152,6 @@ impl Message {
             Put(op) => op.id(),
             Get(op) => op.id(),
             Canceled(tx) => tx,
-        }
-    }
-
-    pub fn sender(&self) -> Option<&PeerKeyLocation> {
-        use Message::*;
-        match self {
-            JoinRing(op) => op.sender(),
-            Put(op) => op.sender(),
-            Get(op) => op.sender(),
-            Canceled(_) => None,
         }
     }
 

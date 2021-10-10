@@ -19,7 +19,7 @@ pub(crate) struct OpManager<CErr> {
     notification_channel: Sender<Message>,
     contract_handler: ContractHandlerChannel<CErr>,
     // FIXME: think of an optiomal strategy to check for timeouts and clean up garbage
-    ops_ttl: BTreeMap<Duration, Vec<Transaction>>,
+    _ops_ttl: BTreeMap<Duration, Vec<Transaction>>,
     pub ring: Ring,
 }
 
@@ -44,7 +44,7 @@ impl<CErr> OpManager<CErr> {
             ring,
             notification_channel,
             contract_handler,
-            ops_ttl: BTreeMap::new(),
+            _ops_ttl: BTreeMap::new(),
         }
     }
 

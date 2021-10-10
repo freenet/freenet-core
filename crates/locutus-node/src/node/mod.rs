@@ -11,7 +11,6 @@ use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-#[cfg(test)]
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
     config::CONF,
@@ -35,7 +34,6 @@ impl Node {
     pub async fn listen_on(&mut self) -> Result<(), ()> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
-            #[cfg(test)]
             NodeImpl::InMemory(ref mut node) => node.listen_on(MemoryEventsGen::new()).await,
         }
     }
@@ -43,7 +41,6 @@ impl Node {
 
 enum NodeImpl {
     LibP2P(Box<NodeLibP2P>),
-    #[cfg(test)]
     InMemory(Box<NodeInMemory>),
 }
 
@@ -140,7 +137,6 @@ impl NodeConfig {
     }
 
     /// Builds a node using in-memory transport. Used for testing pourpouses.
-    #[cfg(test)]
     pub fn build_in_memory(self) -> Result<Node, &'static str> {
         let inmem = NodeInMemory::build(self)?;
         Ok(Node(NodeImpl::InMemory(Box::new(inmem))))
@@ -246,7 +242,6 @@ pub mod test_utils {
 
     use crate::{
         conn_manager::{ConnectionBridge, Transport},
-        contract::ContractError,
         message::Message,
         node::{InitPeerNode, NodeInMemory},
         operations::{
@@ -429,7 +424,7 @@ where
                 let op = put::PutOp::start_op(contract, value);
                 put::request_put(&op_storage, op).await.unwrap();
             }
-            UserEvent::Get { key, contract } => {
+            UserEvent::Get { key, .. } => {
                 // Initialize a get op.
                 let op = get::GetOp::start_op(key);
                 get::request_get(&op_storage, op).await.unwrap();

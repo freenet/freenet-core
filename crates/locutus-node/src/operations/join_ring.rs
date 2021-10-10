@@ -17,7 +17,7 @@ pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 pub(crate) struct JoinRingOp {
     sm: StateMachine<JROpSM>,
     /// time left until time out, when this reaches zero it will be removed from the state
-    ttl: Duration,
+    _ttl: Duration,
 }
 
 impl JoinRingOp {
@@ -34,7 +34,7 @@ impl JoinRingOp {
         }));
         JoinRingOp {
             sm,
-            ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+            _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
         }
     }
 }
@@ -274,7 +274,7 @@ where
             // new request to join from this node, initialize the machine
             let machine = JoinRingOp {
                 sm: StateMachine::new(),
-                ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+                _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
             };
             update_state(conn_manager, machine, join_op, &op_storage.ring).await
         }
@@ -397,12 +397,8 @@ where
             }
         }
         JoinRingMsg::Req {
-            id,
-            msg:
-                JoinRequest::Proxy {
-                    joiner,
-                    hops_to_live,
-                },
+            msg: JoinRequest::Proxy { .. },
+            ..
         } => {
             todo!()
         }
@@ -448,10 +444,8 @@ where
             new_state = Some(state);
         }
         JoinRingMsg::Resp {
-            id,
-            sender,
-            msg: JoinResponse::Proxy { accepted_by },
-            target,
+            msg: JoinResponse::Proxy { .. },
+            ..
         } => {
             //         let register_acceptors =
             //             move |jr_sender: PeerKeyLocation, join_resp| -> conn_manager::Result<()> {

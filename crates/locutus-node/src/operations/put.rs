@@ -24,7 +24,7 @@ pub(crate) type ContractPutValue = Vec<u8>;
 pub(crate) struct PutOp {
     sm: StateMachine<PutOpSM>,
     /// time left until time out, when this reaches zero it will be removed from the state
-    ttl: Duration,
+    _ttl: Duration,
 }
 
 impl PutOp {
@@ -42,7 +42,7 @@ impl PutOp {
         });
         PutOp {
             sm,
-            ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+            _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
         }
     }
 }
@@ -197,7 +197,7 @@ where
             // new request to join from this node, initialize the machine
             let machine = PutOp {
                 sm: StateMachine::new(),
-                ttl: Duration::from_millis(PEER_TIMEOUT_SECS),
+                _ttl: Duration::from_millis(PEER_TIMEOUT_SECS),
             };
             update_state(conn_manager, machine, put_op, op_storage).await
         }

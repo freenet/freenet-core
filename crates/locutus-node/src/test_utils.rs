@@ -16,4 +16,5 @@ macro_rules! rnd_bytes {
 }
 
 rnd_bytes!(128 -> random_bytes_128);
+#[cfg(test)]
 rnd_bytes!(1024 -> random_bytes_1024);

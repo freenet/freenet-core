@@ -24,15 +24,18 @@ impl ContractHandler for MemoryContractHandler {
         &self.channel
     }
 
-    async fn fetch_contract(&self, key: &ContractKey) -> Result<Option<Contract>, Self::Error> {
+    async fn fetch_contract(&self, _key: &ContractKey) -> Result<Option<Contract>, Self::Error> {
         todo!()
     }
 
-    async fn store_contract(&mut self, contract: Contract) -> Result<(), Self::Error> {
+    async fn store_contract(&mut self, _contract: Contract) -> Result<(), Self::Error> {
         todo!()
     }
 
-    async fn put_value(&mut self, contract: &ContractKey) -> Result<ContractPutValue, Self::Error> {
+    async fn put_value(
+        &mut self,
+        _contract: &ContractKey,
+    ) -> Result<ContractPutValue, Self::Error> {
         todo!()
     }
 }

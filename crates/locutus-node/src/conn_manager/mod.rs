@@ -1,19 +1,17 @@
 //! Types and definitions to handle all socket communication for the peer nodes.
 
-use std::{fmt::Display, time::Duration};
+use std::fmt::Display;
 
 use libp2p::{core::PublicKey, PeerId};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
-use crate::{
-    message::{Message, Transaction},
-    ring::Location,
-};
+use crate::{message::Message, ring::Location};
 
 pub mod in_memory;
 
-const PING_EVERY: Duration = Duration::from_secs(30);
-const DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
+// TODO: use this constants when we do real net i/o
+// const PING_EVERY: Duration = Duration::from_secs(30);
+// const DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 
 // pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
 pub(crate) type Result<T> = std::result::Result<T, ConnError>;
@@ -62,16 +60,17 @@ pub(crate) struct PeerKeyLocation {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConnError {
-    #[error("received unexpected response type for a sent request: {0}")]
-    UnexpectedResponseMessage(Message),
+    // TODO: clean up comments/variants
+    // #[error("received unexpected response type for a sent request: {0}")]
+    // UnexpectedResponseMessage(Message),
     #[error("location unknown for this node")]
     LocationUnknown,
-    #[error("expected transaction id was {0} but received {1}")]
-    UnexpectedTx(Transaction, Transaction),
+    // #[error("expected transaction id was {0} but received {1}")]
+    // UnexpectedTx(Transaction, Transaction),
     #[error("error while de/serializing message")]
     Serialization(#[from] Box<bincode::ErrorKind>),
-    #[error("connection negotiation between two peers failed")]
-    NegotationFailed,
+    // #[error("connection negotiation between two peers failed")]
+    // NegotationFailed,
 }
 
 mod serialization {
@@ -79,7 +78,6 @@ mod serialization {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     use super::PeerKey;
-
 
     impl Serialize for PeerKey {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

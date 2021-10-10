@@ -1,5 +1,3 @@
-#[cfg(test)]
-use arbitrary::Arbitrary;
 use blake2::{Blake2b, Digest};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -45,8 +43,8 @@ impl Contract {
 }
 
 /// The key representing a contract.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, arbitrary::Arbitrary)]
+// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct ContractKey(
     #[serde(deserialize_with = "contract_key_deser")]
     #[serde(serialize_with = "<[_]>::serialize")]
@@ -65,8 +63,7 @@ impl ContractKey {
     }
 }
 
-#[cfg(test)]
-impl<'a> Arbitrary<'a> for Contract {
+impl<'a> arbitrary::Arbitrary<'a> for Contract {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
         Ok(Contract::new(data))
@@ -89,6 +86,4 @@ where
 pub(crate) enum ContractError<SErr> {
     #[error("failed while storing a contract")]
     StorageError(#[from] SErr),
-    #[error("failed while sending messages to the handler")]
-    HandlerMessage,
 }

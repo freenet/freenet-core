@@ -6,7 +6,6 @@ mod operations;
 // mod probe_proto;
 mod contract;
 mod ring;
-#[cfg(test)]
 pub(crate) mod test_utils;
 mod user_events;
 

@@ -1,8 +1,7 @@
 use rust_fsm::{StateMachine, StateMachineImpl};
 
 use crate::{
-    conn_manager::ConnectionBridge, contract::ContractKey, message::Transaction,
-    node::OpManager,
+    conn_manager::ConnectionBridge, contract::ContractKey, message::Transaction, node::OpManager,
 };
 
 pub(crate) use self::messages::GetMsg;
@@ -55,20 +54,20 @@ enum GetState {
 }
 
 pub(crate) async fn handle_get_response<CB, CErr>(
-    op_storage: &OpManager<CErr>,
-    conn_manager: &mut CB,
-    get_op: GetMsg,
+    _op_storage: &OpManager<CErr>,
+    _conn_manager: &mut CB,
+    _get_op: GetMsg,
 ) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
 {
-    Ok(())
+    todo!()
 }
 
 /// Request to get the current value from a contract.
 pub(crate) async fn request_get<CErr>(
-    op_storage: &OpManager<CErr>,
-    get_op: GetOp,
+    _op_storage: &OpManager<CErr>,
+    _get_op: GetOp,
 ) -> Result<(), OpError<CErr>> {
     // the initial request must provide:
     // - a location in the network where the contract resides
@@ -77,7 +76,7 @@ pub(crate) async fn request_get<CErr>(
 }
 
 mod messages {
-    use crate::{conn_manager::PeerKeyLocation, contract::ContractKey};
+    use crate::contract::ContractKey;
 
     use super::*;
 
@@ -90,10 +89,6 @@ mod messages {
 
     impl GetMsg {
         pub fn id(&self) -> &Transaction {
-            todo!()
-        }
-
-        pub fn sender(&self) -> Option<&PeerKeyLocation> {
             todo!()
         }
     }

@@ -8,7 +8,8 @@ pub(crate) trait UserEventsProxy {
     async fn recv(&mut self) -> UserEvent;
 }
 
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[derive(arbitrary::Arbitrary)]
 pub(crate) enum UserEvent {
     /// Update or insert a new value in a contract corresponding with the provided key.
     Put {
@@ -25,7 +26,6 @@ pub(crate) enum UserEvent {
     },
 }
 
-#[cfg(test)]
 pub(crate) mod test_utils {
     use arbitrary::{Arbitrary, Unstructured};
 

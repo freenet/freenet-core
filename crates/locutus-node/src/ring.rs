@@ -237,8 +237,6 @@ impl TryFrom<f64> for Location {
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
-    #[error("failed while attempting to join a ring")]
-    Join,
     #[error(transparent)]
     ConnError(#[from] Box<conn_manager::ConnError>),
     #[error("no ring connections found")]
