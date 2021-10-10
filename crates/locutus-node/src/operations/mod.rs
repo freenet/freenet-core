@@ -79,6 +79,7 @@ pub(crate) enum Operation {
 #[derive(Debug, Default)]
 pub struct ProbeOp;
 
+#[allow(unused)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpError<S> {
     #[error(transparent)]

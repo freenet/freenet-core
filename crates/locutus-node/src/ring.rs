@@ -117,6 +117,13 @@ impl Ring {
         conn_by_dist[idx]
     }
 
+    /// Return the closest peers to a contract location which are caching it.
+    pub fn closest_caching(&self, contract: &ContractKey, n: usize) -> Vec<PeerKeyLocation> {
+        // Right now we return just the closest known peers to that location.
+        // In the future this may change to the ones closest which are actually already caching it.
+        self.routing(&contract.location(), n)
+    }
+
     /// Find the closest number of peers to a given location. Result is returned sorted by proximity.
     pub fn routing(&self, target: &Location, n: usize) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();

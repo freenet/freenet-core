@@ -37,7 +37,7 @@ impl Contract {
         ContractKey(self.key)
     }
 
-    pub fn assigned_location(&self) -> Location {
+    pub fn location(&self) -> Location {
         Location::from(self.key())
     }
 }
@@ -60,6 +60,13 @@ impl ContractKey {
     #[inline]
     pub fn location(&self) -> Location {
         Location::from(self)
+    }
+}
+
+impl std::fmt::Display for ContractKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = hex::encode(self.0);
+        write!(f, "{}", r)
     }
 }
 

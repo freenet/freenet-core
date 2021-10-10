@@ -67,6 +67,7 @@ impl<Err> ContractHandlerChannel<Err> {
 pub(crate) enum ContractHandlerEvent<Err> {
     /// Fetch a supposedly existing contract in this node.  
     FetchQuery(ContractKey),
+    /// The response to a FetchQuery event
     FetchResponse {
         key: ContractKey,
         contract: Result<Option<Contract>, Err>,
@@ -74,10 +75,12 @@ pub(crate) enum ContractHandlerEvent<Err> {
     /// Try to push/put a new value into the contract.
     PushQuery {
         key: ContractKey,
-        value: Vec<u8>,
+        value: ContractPutValue,
     },
-    /// A push query was successful.
-    PushResponse,
+    /// The response to a push query.
+    PushResponse {
+        new_value: Result<ContractPutValue, Err>,
+    },
     Cache(Contract),
     /// Result of a caching operation.
     CacheResult(Result<(), Err>),
