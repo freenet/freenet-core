@@ -117,15 +117,16 @@ impl Ring {
         conn_by_dist[idx]
     }
 
-    /// Find the closest node to a given location.
-    pub fn routing(&self, target: &Location) -> Option<(Location, PeerKeyLocation)> {
+    /// Find the closest number of peers to a given location. Result is returned sorted by proximity.
+    pub fn routing(&self, target: &Location, n: usize) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let mut conn_by_dist: Vec<_> = connections
             .iter()
             .map(|(loc, peer)| (loc.distance(target), (loc, peer)))
             .collect();
         conn_by_dist.sort_by_key(|&(dist, _)| dist);
-        conn_by_dist.first().map(|(_, v)| (*v.0, *v.1))
+        let iter = conn_by_dist.into_iter().map(|(_, v)| *v.1).take(n);
+        iter.collect()
     }
 
     /// Get a random peer from the known ring connections.
@@ -267,20 +268,52 @@ mod test {
     #[test]
     fn find_closest() {
         let ring = Ring::new();
-        {
-            let conns = &mut *ring.connections_by_location.write();
-            let def_peer = PeerKeyLocation {
+
+        fn build_pk(loc: Location) -> PeerKeyLocation {
+            PeerKeyLocation {
                 peer: PeerKey(PeerId::random()),
-                location: None,
-            };
-            conns.insert(Location(0.3), def_peer);
-            conns.insert(Location(0.5), def_peer);
-            conns.insert(Location(0.0), def_peer);
+                location: Some(loc),
+            }
         }
 
-        assert_eq!(Location(0.0), ring.routing(&Location(0.9)).unwrap().0);
-        assert_eq!(Location(0.0), ring.routing(&Location(0.1)).unwrap().0);
-        assert_eq!(Location(0.5), ring.routing(&Location(0.41)).unwrap().0);
-        assert_eq!(Location(0.3), ring.routing(&Location(0.39)).unwrap().0);
+        {
+            let conns = &mut *ring.connections_by_location.write();
+            conns.insert(Location(0.3), build_pk(Location(0.3)));
+            conns.insert(Location(0.5), build_pk(Location(0.5)));
+            conns.insert(Location(0.0), build_pk(Location(0.0)));
+        }
+
+        assert_eq!(
+            Location(0.0),
+            ring.routing(&Location(0.9), 1)
+                .first()
+                .unwrap()
+                .location
+                .unwrap()
+        );
+        assert_eq!(
+            Location(0.0),
+            ring.routing(&Location(0.1), 1)
+                .first()
+                .unwrap()
+                .location
+                .unwrap()
+        );
+        assert_eq!(
+            Location(0.5),
+            ring.routing(&Location(0.41), 1)
+                .first()
+                .unwrap()
+                .location
+                .unwrap()
+        );
+        assert_eq!(
+            Location(0.3),
+            ring.routing(&Location(0.39), 1)
+                .first()
+                .unwrap()
+                .location
+                .unwrap()
+        );
     }
 }

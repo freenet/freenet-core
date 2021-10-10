@@ -11,7 +11,7 @@ use crate::{
     conn_manager::{ConnectionBridge, PeerKeyLocation},
     contract::{Contract, ContractError, ContractHandlerEvent},
     message::{GetTxType, Message, Transaction},
-    node::{OpExecError, OpStateStorage},
+    node::{OpExecError, OpManager},
     ring::{Location, RingError},
 };
 
@@ -87,8 +87,21 @@ impl StateMachineImpl for PutOpSM {
                     hex::encode(contract.key().bytes()),
                     sender.peer,
                 );
-
-                todo!()
+                Some(PutState::AwaitingBroadcast { id: *id })
+            }
+            (
+                PutState::Initializing,
+                PutMsg::AwaitingBroadcast {
+                    id,
+                    broadcast_to,
+                    broadcasted_to,
+                },
+            ) => {
+                if *broadcasted_to >= broadcast_to.len() {
+                    todo!()
+                } else {
+                    Some(PutState::Initializing)
+                }
             }
             _ => None,
         }
@@ -125,6 +138,9 @@ enum PutState {
         contract: Contract,
         value: ContractPutValue,
     },
+    AwaitingBroadcast {
+        id: Transaction,
+    },
 }
 
 impl PutState {
@@ -139,7 +155,7 @@ impl PutState {
 
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put<CErr>(
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
     mut put_op: PutOp,
 ) -> Result<(), OpError<CErr>> {
     if !put_op.sm.state().is_requesting() {
@@ -149,7 +165,9 @@ pub(crate) async fn request_put<CErr>(
     if let Some(req_put) = put_op.sm.consume(&PutMsg::RouteValue {
         id: *put_op.sm.state().id(),
     })? {
-        op_storage.notify_change(Message::from(req_put)).await?;
+        op_storage
+            .notify_change(Message::from(req_put), Operation::Put(put_op))
+            .await?;
     } else {
         return Err(OpError::IllegalStateTransition);
     }
@@ -157,7 +175,7 @@ pub(crate) async fn request_put<CErr>(
 }
 
 pub(crate) async fn handle_put_response<CB, CErr>(
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     put_op: PutMsg,
 ) -> Result<(), OpError<CErr>>
@@ -196,9 +214,9 @@ where
 
 async fn update_state<CB, CErr>(
     conn_manager: &mut CB,
-    state: PutOp,
+    mut state: PutOp,
     other_host_msg: PutMsg,
-    op_storage: &OpStateStorage<CErr>,
+    op_storage: &OpManager<CErr>,
 ) -> Result<OperationResult, OpError<CErr>>
 where
     CB: ConnectionBridge,
@@ -213,8 +231,11 @@ where
             value,
         } => {
             // find the closest node to the location of the contract
-            let target = if let Some((_, potential_target)) =
-                op_storage.ring.routing(&contract.key().location())
+            let target = if let Some(potential_target) = op_storage
+                .ring
+                .routing(&contract.key().location(), 1)
+                .into_iter()
+                .next()
             {
                 potential_target
             } else {
@@ -275,20 +296,32 @@ where
             }
 
             if !cached_contract && op_storage.ring.within_caching_distance(&contract_loc) {
-                // this node does not have the contract, so instead store the contract and
-                // execute the put op.
+                // this node does not have the contract, so instead store the contract and execute the put op.
                 op_storage
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract))
                     .await?;
+
+                // if the change was successful broadcast the change
+                let broadcast_to = op_storage.ring.routing(&contract_loc, 10);
+                state.sm.consume(&PutMsg::AwaitingBroadcast {
+                    id,
+                    broadcasted_to: 0,
+                    broadcast_to,
+                })?;
+
+                op_storage
+                    .notify_change(
+                        Message::Put(PutMsg::Broadcast { id }),
+                        Operation::Put(state),
+                    )
+                    .await?;
+                return Err(OpError::StatePushed);
             }
 
-            if let Some((
-                _,
-                PeerKeyLocation {
-                    location: Some(other_loc),
-                    peer,
-                },
-            )) = op_storage.ring.routing(&contract_loc)
+            if let Some(PeerKeyLocation {
+                location: Some(other_loc),
+                peer,
+            }) = op_storage.ring.routing(&contract_loc, 1).into_iter().next()
             {
                 if let Some(own_loc) = op_storage.ring.own_location() {
                     let other_distance = contract_loc.distance(&other_loc);
@@ -296,10 +329,18 @@ where
                     if other_distance < self_distance {
                         // forward the contract towards this node since it is indeed closer
                         // to the contract location
+
                         todo!()
                     }
                 }
             }
+            todo!()
+        }
+        PutMsg::AwaitingBroadcast {
+            id,
+            broadcast_to,
+            broadcasted_to,
+        } => {
             todo!()
         }
         _ => return Err(OpError::IllegalStateTransition),
@@ -335,14 +376,24 @@ mod messages {
             value: ContractPutValue,
             contract: Contract,
         },
+        ///
+        AwaitingBroadcast {
+            id: Transaction,
+            broadcasted_to: usize,
+            broadcast_to: Vec<PeerKeyLocation>,
+        },
+        /// Broadcast a change (either a first time insert or an update).
+        Broadcast { id: Transaction },
     }
 
     impl PutMsg {
         pub fn id(&self) -> &Transaction {
             match self {
                 Self::SeekNode { id, .. } => id,
-                PutMsg::RouteValue { id } => id,
-                PutMsg::RequestPut { id, .. } => id,
+                Self::RouteValue { id } => id,
+                Self::RequestPut { id, .. } => id,
+                Self::Broadcast { id } => id,
+                Self::AwaitingBroadcast { id, .. } => id,
             }
         }
 
