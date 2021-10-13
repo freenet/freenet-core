@@ -469,3 +469,19 @@ mod messages {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn successful_put_op_seq() -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
+
+        let mut requester = PutOp::start_op(contract, vec![0, 1, 2, 3], 0).sm;
+        let mut target = StateMachine::<PutOpSM>::new();
+        Ok(())
+    }
+}

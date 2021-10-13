@@ -21,7 +21,11 @@ pub(crate) trait ContractHandler {
     /// Updates (or inserts) a value for the given contract. This operation is fallible:
     /// It will return an error when the value is not valid (from the contract pov)
     /// or any other condition happened.
-    async fn put_value(&mut self, contract: &ContractKey) -> Result<ContractPutValue, Self::Error>;
+    async fn put_value(
+        &mut self,
+        contract: &ContractKey,
+        value: ContractPutValue,
+    ) -> Result<ContractPutValue, Self::Error>;
 }
 
 pub struct EventId(usize);

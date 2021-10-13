@@ -35,6 +35,7 @@ impl ContractHandler for MemoryContractHandler {
     async fn put_value(
         &mut self,
         _contract: &ContractKey,
+        _value: ContractPutValue,
     ) -> Result<ContractPutValue, Self::Error> {
         todo!()
     }
@@ -44,7 +45,6 @@ impl ContractHandler for MemoryContractHandler {
 fn serialization() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = crate::test_utils::random_bytes_1024();
     let mut gen = arbitrary::Unstructured::new(&bytes);
-
     let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
 
     let serialized = bincode::serialize(&contract)?;

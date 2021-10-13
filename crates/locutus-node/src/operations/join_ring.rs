@@ -634,12 +634,7 @@ mod test {
             location: Some(Location::random()),
         };
 
-        let mut join_gw_1 =
-            StateMachine::<JROpSM>::from_state(JRState::Connecting(ConnectionInfo {
-                gateway,
-                this_peer: new_peer.peer,
-                max_hops_to_live: 0,
-            }));
+        let mut join_gw_1 = JoinRingOp::initial_request(new_peer.peer, gateway, 0).sm;
         let mut join_new_peer_2 = StateMachine::<JROpSM>::new();
 
         let req = JoinRingMsg::Req {

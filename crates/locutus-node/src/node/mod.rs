@@ -287,10 +287,16 @@ where
                 }
             }
             (id, ContractHandlerEvent::PushQuery { key, value }) => {
-                match contract_handler.put_value(&key).await {
-                    Ok(value) => {}
-                    Err(err) => {}
-                }
+                let put_result = contract_handler.put_value(&key, value).await;
+                contract_handler
+                    .channel()
+                    .send_to_listeners(
+                        id,
+                        ContractHandlerEvent::PushResponse {
+                            new_value: put_result,
+                        },
+                    )
+                    .await;
             }
             _ => unreachable!(),
         }
