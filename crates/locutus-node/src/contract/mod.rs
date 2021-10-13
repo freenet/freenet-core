@@ -36,11 +36,15 @@ impl Contract {
     pub fn key(&self) -> ContractKey {
         ContractKey(self.key)
     }
+}
 
-    pub fn location(&self) -> Location {
-        Location::from(self.key())
+impl PartialEq for Contract {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
     }
 }
+
+impl Eq for Contract {}
 
 /// The key representing a contract.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, arbitrary::Arbitrary)]
