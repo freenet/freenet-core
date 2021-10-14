@@ -9,6 +9,7 @@ use crate::{
 pub(crate) mod get;
 pub(crate) mod join_ring;
 pub(crate) mod put;
+mod state_machine;
 pub(crate) mod subscribe;
 
 pub(crate) struct OperationResult {
@@ -86,7 +87,7 @@ pub(crate) enum OpError<S> {
     ConnError(#[from] conn_manager::ConnError),
     #[error(transparent)]
     OpStateManagerError(#[from] OpExecError),
-    #[error("illegal awaiting state")]
+    #[error("cannot perform a state transition from the current state with the provided input")]
     IllegalStateTransition,
     #[error("failed notifying back to the node message loop, channel closed")]
     NotificationError(#[from] tokio::sync::mpsc::error::SendError<Message>),

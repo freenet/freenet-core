@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use rust_fsm::{StateMachine, StateMachineImpl};
+// use rust_fsm::{StateMachine, StateMachineImpl};
 
 use crate::{
     config::PEER_TIMEOUT_SECS,
@@ -17,7 +17,11 @@ use crate::{
 
 pub(crate) use self::messages::PutMsg;
 
-use super::{handle_op_result, OpError, Operation, OperationResult};
+use super::{
+    handle_op_result,
+    state_machine::{StateMachine, StateMachineImpl},
+    OpError, Operation, OperationResult,
+};
 
 pub(crate) type ContractPutValue = Vec<u8>;
 
@@ -57,20 +61,14 @@ impl StateMachineImpl for PutOpSM {
 
     type Output = PutMsg;
 
-    const INITIAL_STATE: Self::State = PutState::Initializing;
-
-    fn transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
+    fn transition(state: Self::State, input: Self::Input) -> Option<Self::State> {
         match (state, input) {
             // state changed for the initial requesting node
             (PutState::Requesting { contract, .. }, PutMsg::RouteValue { .. }) => {
-                Some(PutState::AwaitAnswer {
-                    contract: contract.clone(),
-                })
+                Some(PutState::AwaitAnswer { contract: contract })
             }
             (PutState::AwaitAnswer { contract }, PutMsg::RequestPut { .. }) => {
-                Some(PutState::AwaitAnswer {
-                    contract: contract.clone(),
-                })
+                Some(PutState::AwaitAnswer { contract: contract })
             }
             (PutState::AwaitAnswer { contract, .. }, PutMsg::SuccessfulUpdate { .. }) => {
                 log::debug!("Successfully updated value for {}", contract.key());
@@ -85,13 +83,13 @@ impl StateMachineImpl for PutOpSM {
                     ..
                 },
             ) => {
-                if *broadcasted_to >= broadcast_to.len() {
+                if broadcasted_to >= broadcast_to.len() {
                     // broadcast complete
                     Some(PutState::BroadcastComplete)
                 } else {
                     Some(PutState::BroadcastOngoing {
                         left_peers: broadcast_to.clone(),
-                        completed: *broadcasted_to,
+                        completed: broadcasted_to,
                     })
                 }
             }
@@ -184,7 +182,7 @@ pub(crate) async fn request_put<CErr>(
         return Err(OpError::IllegalStateTransition);
     };
 
-    if let Some(req_put) = put_op.sm.consume(&PutMsg::RouteValue {
+    if let Some(req_put) = put_op.sm.consume(PutMsg::RouteValue {
         id: *put_op.sm.state().id(),
         htl: op_storage.ring.max_hops_to_live,
     })? {
@@ -219,7 +217,7 @@ where
             sender = put_op.sender().cloned();
             // new request to join from this node, initialize the machine
             let machine = PutOp {
-                sm: StateMachine::new(),
+                sm: StateMachine::from_state(PutState::Initializing),
                 _ttl: Duration::from_millis(PEER_TIMEOUT_SECS),
             };
             update_state(conn_manager, machine, put_op, op_storage).await
@@ -271,7 +269,7 @@ where
 
             return_msg = state
                 .sm
-                .consume(&PutMsg::RequestPut {
+                .consume(PutMsg::RequestPut {
                     id,
                     contract,
                     value,
@@ -374,7 +372,7 @@ where
 
             return_msg = state
                 .sm
-                .consume(&PutMsg::Broadcasting {
+                .consume(PutMsg::Broadcasting {
                     id,
                     broadcasted_to: 0,
                     broadcast_to,
@@ -390,7 +388,7 @@ where
         PutMsg::SuccessfulUpdate { id, new_value } => {
             return_msg = state
                 .sm
-                .consume(&PutMsg::SuccessfulUpdate { id, new_value })?
+                .consume(PutMsg::SuccessfulUpdate { id, new_value })?
                 .map(Message::from);
             new_state = None;
         }
@@ -496,10 +494,10 @@ mod test {
         let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
 
         let mut requester = PutOp::start_op(contract.clone(), vec![0, 1, 2, 3], 0).sm;
-        let mut target = StateMachine::<PutOpSM>::new();
+        let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
 
         let _req_msg = requester
-            .consume(&PutMsg::RouteValue { id, htl: 0 })?
+            .consume::<OpExecError>(PutMsg::RouteValue { id, htl: 0 })?
             .ok_or("no msg")?;
         let _expected = PutMsg::RequestPut {
             id,
@@ -516,7 +514,7 @@ mod test {
         );
 
         let res_msg = target
-            .consume(&PutMsg::Broadcasting {
+            .consume::<OpExecError>(PutMsg::Broadcasting {
                 id,
                 broadcast_to: vec![],
                 broadcasted_to: 0,
@@ -530,7 +528,7 @@ mod test {
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert_eq!(res_msg, expected);
 
-        let finished = requester.consume(&res_msg)?;
+        let finished = requester.consume::<OpExecError>(res_msg)?;
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert!(finished.is_none());
 
