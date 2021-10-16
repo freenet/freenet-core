@@ -46,7 +46,7 @@ impl NodeInMemory {
                     ..
                 } = node;
                 location.zip(identifier).map(|(loc, id)| PeerKeyLocation {
-                    peer: PeerKey(id),
+                    peer: PeerKey::from(id),
                     location: Some(loc),
                 })
             })

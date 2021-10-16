@@ -37,7 +37,7 @@ pub(crate) trait Transport {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct PeerKey(pub(crate) PeerId);
+pub struct PeerKey(PeerId);
 
 impl PeerKey {
     pub fn random() -> Self {
@@ -54,6 +54,12 @@ impl Display for PeerKey {
 impl From<PublicKey> for PeerKey {
     fn from(val: PublicKey) -> Self {
         PeerKey(PeerId::from(val))
+    }
+}
+
+impl From<PeerId> for PeerKey {
+    fn from(val: PeerId) -> Self {
+        PeerKey(val)
     }
 }
 

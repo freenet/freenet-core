@@ -1,11 +1,11 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 
-use libp2p::{identity, PeerId};
+use libp2p::identity;
 use rand::Rng;
 use tokio::sync::mpsc;
 
 use crate::{
-    conn_manager::{ConnectionBridge, Transport},
+    conn_manager::{ConnectionBridge, PeerKey, Transport},
     contract::ContractHandlerChannel,
     message::Message,
     node::{InitPeerNode, NodeInMemory},
@@ -58,7 +58,7 @@ pub(crate) struct NetEvent {
 
 pub(crate) enum EventType {
     /// A peer joined the network through some gateway.
-    JoinSuccess { peer: PeerId },
+    JoinSuccess { peer: PeerKey },
 }
 
 impl SimNetwork {
@@ -137,9 +137,7 @@ impl SimNetwork {
                 if let JoinRingMsg::Connected { target, .. } = msg {
                     let _ = info_ch
                         .send(Ok(NetEvent {
-                            event: EventType::JoinSuccess {
-                                peer: target.peer.0,
-                            },
+                            event: EventType::JoinSuccess { peer: target.peer },
                         }))
                         .await;
                     break;

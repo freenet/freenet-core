@@ -276,7 +276,7 @@ mod test {
 
         fn build_pk(loc: Location) -> PeerKeyLocation {
             PeerKeyLocation {
-                peer: PeerKey(PeerId::random()),
+                peer: PeerKey::random(),
                 location: Some(loc),
             }
         }

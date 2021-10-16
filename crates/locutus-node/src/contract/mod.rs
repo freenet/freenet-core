@@ -13,6 +13,7 @@ pub(crate) use test_utils::MemoryContractHandler;
 const CONTRACT_KEY_SIZE: usize = 64;
 
 /// Main abstraction for representing a contract in binary form.
+/// Potentially expensive to clone.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Contract {
     data: Vec<u8>,
