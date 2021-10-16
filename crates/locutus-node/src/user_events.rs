@@ -1,6 +1,6 @@
 use crate::{
     contract::{Contract, ContractKey},
-    operations::put::ContractPutValue,
+    operations::put::ContractValue,
 };
 
 #[async_trait::async_trait]
@@ -14,7 +14,7 @@ pub(crate) enum UserEvent {
     /// Update or insert a new value in a contract corresponding with the provided key.
     Put {
         /// Value to upsert in the contract.
-        value: ContractPutValue,
+        value: ContractValue,
         contract: Contract,
     },
     /// Fetch the current value from a contract corresponding to the provided key.

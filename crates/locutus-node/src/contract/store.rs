@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use crate::{
     contract::{Contract, ContractError, ContractKey},
-    operations::put::ContractPutValue,
+    operations::put::ContractValue,
 };
 
 /// Behaviour
@@ -24,8 +24,8 @@ pub(crate) trait ContractHandler {
     async fn put_value(
         &mut self,
         contract: &ContractKey,
-        value: ContractPutValue,
-    ) -> Result<ContractPutValue, Self::Error>;
+        value: ContractValue,
+    ) -> Result<ContractValue, Self::Error>;
 }
 
 pub struct EventId(usize);
@@ -79,11 +79,11 @@ pub(crate) enum ContractHandlerEvent<Err> {
     /// Try to push/put a new value into the contract.
     PushQuery {
         key: ContractKey,
-        value: ContractPutValue,
+        value: ContractValue,
     },
     /// The response to a push query.
     PushResponse {
-        new_value: Result<ContractPutValue, Err>,
+        new_value: Result<ContractValue, Err>,
     },
     Cache(Contract),
     /// Result of a caching operation.

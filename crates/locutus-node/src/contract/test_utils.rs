@@ -1,4 +1,4 @@
-use crate::operations::put::ContractPutValue;
+use crate::operations::put::ContractValue;
 
 use super::{
     store::{ContractHandler, ContractHandlerChannel},
@@ -35,8 +35,8 @@ impl ContractHandler for MemoryContractHandler {
     async fn put_value(
         &mut self,
         _contract: &ContractKey,
-        _value: ContractPutValue,
-    ) -> Result<ContractPutValue, Self::Error> {
+        _value: ContractValue,
+    ) -> Result<ContractValue, Self::Error> {
         todo!()
     }
 }

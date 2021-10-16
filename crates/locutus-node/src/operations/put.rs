@@ -23,7 +23,17 @@ use super::{
     OpError, Operation, OperationResult,
 };
 
-pub(crate) type ContractPutValue = Vec<u8>;
+/// The value for a contract. Potentially very expensive to clone.
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[derive(arbitrary::Arbitrary)]
+pub(crate) struct ContractValue(Vec<u8>);
+
+impl ContractValue {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        ContractValue(bytes)
+    }
+}
 
 pub(crate) struct PutOp {
     sm: StateMachine<PutOpSM>,
@@ -34,7 +44,7 @@ pub(crate) struct PutOp {
 impl PutOp {
     pub fn start_op<CErr>(
         contract: Contract,
-        value: Vec<u8>,
+        value: ContractValue,
         htl: usize,
         op_storage: &OpManager<CErr>,
     ) -> Result<Self, OpError<CErr>> {
@@ -183,7 +193,7 @@ enum PutState {
     Requesting {
         id: Transaction,
         contract: Contract,
-        value: ContractPutValue,
+        value: ContractValue,
         htl: usize,
         target: PeerKeyLocation,
     },
@@ -440,7 +450,7 @@ mod messages {
         RequestPut {
             id: Transaction,
             contract: Contract,
-            value: ContractPutValue,
+            value: ContractValue,
             /// max hops to live
             htl: usize,
             target: PeerKeyLocation,
@@ -448,21 +458,21 @@ mod messages {
         PutProxy {
             id: Transaction,
             contract: Contract,
-            new_value: ContractPutValue,
+            new_value: ContractValue,
             /// current htl, reduced by one at each hop
             htl: usize,
         },
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
             id: Transaction,
-            new_value: ContractPutValue,
+            new_value: ContractValue,
         },
         /// Target the node which is closest to the key
         SeekNode {
             id: Transaction,
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
-            value: ContractPutValue,
+            value: ContractValue,
             contract: Contract,
             /// max hops to live
             htl: usize,
@@ -472,7 +482,7 @@ mod messages {
             id: Transaction,
             broadcasted_to: usize,
             broadcast_to: Vec<PeerKeyLocation>,
-            new_value: ContractPutValue,
+            new_value: ContractValue,
         },
     }
 
@@ -528,9 +538,14 @@ mod test {
             .write()
             .insert(target_loc.location.clone().unwrap(), target_loc);
 
-        let mut requester = PutOp::start_op(contract.clone(), vec![0, 1, 2, 3], 0, &op_storage)
-            .unwrap()
-            .sm;
+        let mut requester = PutOp::start_op(
+            contract.clone(),
+            ContractValue::new(vec![0, 1, 2, 3]),
+            0,
+            &op_storage,
+        )
+        .unwrap()
+        .sm;
         let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
 
         // requester.consume_to_state();
@@ -540,7 +555,7 @@ mod test {
         let _expected = PutMsg::RequestPut {
             id,
             contract: contract.clone(),
-            value: vec![0, 1, 2, 3],
+            value: ContractValue::new(vec![0, 1, 2, 3]),
             htl: 0,
             target: target_loc,
         };
@@ -557,12 +572,12 @@ mod test {
                 id,
                 broadcast_to: vec![],
                 broadcasted_to: 0,
-                new_value: vec![4, 3, 2, 1],
+                new_value: ContractValue::new(vec![4, 3, 2, 1]),
             })?
             .ok_or("no msg")?;
         let expected = PutMsg::SuccessfulUpdate {
             id,
-            new_value: vec![4, 3, 2, 1],
+            new_value: ContractValue::new(vec![4, 3, 2, 1]),
         };
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert_eq!(res_msg, expected);

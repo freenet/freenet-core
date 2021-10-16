@@ -47,7 +47,7 @@ impl StateMachineImpl for JROpSM {
 
     type Output = JoinRingMsg;
 
-    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
+    fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
         match (state, input) {
             (
                 JRState::Initializing,
@@ -100,7 +100,21 @@ impl StateMachineImpl for JROpSM {
         }
     }
 
-    fn output_from_input_as_ref(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
+    fn state_transition_from_input(
+        _state: Self::State,
+        _input: Self::Input,
+    ) -> Option<Self::State> {
+        None
+    }
+
+    fn output_from_input_as_ref(
+        _state: &Self::State,
+        _input: &Self::Input,
+    ) -> Option<Self::Output> {
+        None
+    }
+
+    fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
         match (state, input) {
             (
                 JRState::Initializing,
@@ -115,16 +129,16 @@ impl StateMachineImpl for JROpSM {
                         },
                 },
             ) => Some(JoinRingMsg::Resp {
-                id: *id,
-                sender: *gateway,
+                id,
+                sender: gateway,
                 msg: JoinResponse::AcceptedBy {
                     peers: accepted_by.clone(),
-                    your_location: *your_location,
-                    your_peer_id: *your_peer_id,
+                    your_location,
+                    your_peer_id,
                 },
                 target: PeerKeyLocation {
-                    peer: *your_peer_id,
-                    location: Some(*your_location),
+                    peer: your_peer_id,
+                    location: Some(your_location),
                 },
             }),
             (
@@ -147,14 +161,14 @@ impl StateMachineImpl for JROpSM {
                     prev_sender.peer
                 );
                 let sender = PeerKeyLocation {
-                    peer: *your_peer_id,
-                    location: Some(*your_location),
+                    peer: your_peer_id,
+                    location: Some(your_location),
                 };
                 Some(JoinRingMsg::Resp {
-                    id: *id,
+                    id,
                     msg: JoinResponse::ReceivedOC { by_peer: sender },
                     sender,
-                    target: *prev_sender,
+                    target: prev_sender,
                 })
             }
             (
@@ -166,9 +180,9 @@ impl StateMachineImpl for JROpSM {
                     sender,
                 },
             ) => Some(JoinRingMsg::Connected {
-                id: *id,
-                sender: *target,
-                target: *sender,
+                id,
+                sender: target,
+                target: sender,
             }),
             _ => None,
         }
@@ -335,7 +349,7 @@ where
             );
             return_msg = state
                 .sm
-                .consume_to_state(JoinRingMsg::Req {
+                .consume_to_output(JoinRingMsg::Req {
                     id,
                     msg: JoinRequest::Accepted {
                         gateway: gw_location,
@@ -412,7 +426,7 @@ where
             log::debug!("Join response received from {}", sender.peer,);
             return_msg = state
                 .sm
-                .consume_to_state(JoinRingMsg::Resp {
+                .consume_to_output(JoinRingMsg::Resp {
                     id,
                     sender,
                     msg: JoinResponse::AcceptedBy {
@@ -476,7 +490,7 @@ where
         } => {
             return_msg = state
                 .sm
-                .consume_to_state(JoinRingMsg::Resp {
+                .consume_to_output(JoinRingMsg::Resp {
                     id,
                     sender,
                     msg: JoinResponse::ReceivedOC { by_peer },
@@ -493,7 +507,7 @@ where
         JoinRingMsg::Connected { target, sender, id } => {
             return_msg = state
                 .sm
-                .consume_to_state(JoinRingMsg::Connected { target, sender, id })?
+                .consume_to_output(JoinRingMsg::Connected { target, sender, id })?
                 .map(Message::from);
             if !state.sm.state().is_connected() {
                 return Err(OpError::IllegalStateTransition);
@@ -643,7 +657,7 @@ mod test {
             },
         };
         let res = join_new_peer_2
-            .consume_to_state::<OpExecError>(req)
+            .consume_to_output::<OpExecError>(req)
             .unwrap()
             .unwrap();
         let expected = JoinRingMsg::Resp {
@@ -660,7 +674,7 @@ mod test {
         assert!(matches!(join_new_peer_2.state(), JRState::OCReceived));
 
         let res = join_gw_1
-            .consume_to_state::<OpExecError>(res)
+            .consume_to_output::<OpExecError>(res)
             .unwrap()
             .unwrap();
         new_peer.location = Some(new_loc);
@@ -674,7 +688,7 @@ mod test {
         assert!(matches!(join_gw_1.state(), JRState::OCReceived));
 
         let res = join_new_peer_2
-            .consume_to_state::<OpExecError>(res)
+            .consume_to_output::<OpExecError>(res)
             .unwrap()
             .unwrap();
         let expected = JoinRingMsg::Connected {
@@ -686,16 +700,16 @@ mod test {
         assert!(matches!(join_new_peer_2.state(), JRState::Connected));
 
         assert!(join_gw_1
-            .consume_to_state::<OpExecError>(res.clone())
+            .consume_to_output::<OpExecError>(res.clone())
             .unwrap()
             .is_none());
         assert!(matches!(join_gw_1.state(), JRState::Connected));
 
         // transaction finished, should not return anymore
         assert!(join_new_peer_2
-            .consume_to_state::<OpExecError>(res.clone())
+            .consume_to_output::<OpExecError>(res.clone())
             .is_err());
-        assert!(join_gw_1.consume_to_state::<OpExecError>(res).is_err());
+        assert!(join_gw_1.consume_to_output::<OpExecError>(res).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
