@@ -507,63 +507,69 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::conn_manager::PeerKey;
+    use crate::{conn_manager::PeerKey, node::test_utils::get_test_op_storage};
 
     use super::*;
 
     #[test]
     fn successful_put_op_seq() -> Result<(), Box<dyn std::error::Error>> {
-        // let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
-        // let bytes = crate::test_utils::random_bytes_1024();
-        // let mut gen = arbitrary::Unstructured::new(&bytes);
-        // let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
-        // let target_loc = PeerKeyLocation {
-        //     location: Some(Location::random()),
-        //     peer: PeerKey::random(),
-        // };
+        let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
+        let target_loc = PeerKeyLocation {
+            location: Some(Location::random()),
+            peer: PeerKey::random(),
+        };
+        let op_storage = get_test_op_storage();
+        op_storage
+            .ring
+            .connections_by_location
+            .write()
+            .insert(target_loc.location.clone().unwrap(), target_loc);
 
-        // let mut requester =
-        //     PutOp::start_op(contract.clone(), vec![0, 1, 2, 3], 0, target_loc.clone()).sm;
-        // let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
+        let mut requester = PutOp::start_op(contract.clone(), vec![0, 1, 2, 3], 0, &op_storage)
+            .unwrap()
+            .sm;
+        let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
 
-        // // requester.consume_to_state();
-        // let _req_msg = requester
-        //     .consume_to_state::<OpExecError>(PutMsg::RouteValue { id, htl: 0 })?
-        //     .ok_or("no msg")?;
-        // let _expected = PutMsg::RequestPut {
-        //     id,
-        //     contract: contract.clone(),
-        //     value: vec![0, 1, 2, 3],
-        //     htl: 0,
-        //     target: target_loc,
-        // };
-        // // assert_eq!(req_msg, expected);
-        // assert_eq!(
-        //     requester.state(),
-        //     &PutState::AwaitAnswer {
-        //         contract: contract.clone()
-        //     }
-        // );
+        // requester.consume_to_state();
+        let _req_msg = requester
+            .consume_to_state::<OpExecError>(PutMsg::RouteValue { id, htl: 0 })?
+            .ok_or("no msg")?;
+        let _expected = PutMsg::RequestPut {
+            id,
+            contract: contract.clone(),
+            value: vec![0, 1, 2, 3],
+            htl: 0,
+            target: target_loc,
+        };
+        // assert_eq!(req_msg, expected);
+        assert_eq!(
+            requester.state(),
+            &PutState::AwaitAnswer {
+                contract: contract.clone()
+            }
+        );
 
-        // let res_msg = target
-        //     .consume_to_output::<OpExecError>(PutMsg::Broadcasting {
-        //         id,
-        //         broadcast_to: vec![],
-        //         broadcasted_to: 0,
-        //         new_value: vec![4, 3, 2, 1],
-        //     })?
-        //     .ok_or("no msg")?;
-        // let expected = PutMsg::SuccessfulUpdate {
-        //     id,
-        //     new_value: vec![4, 3, 2, 1],
-        // };
-        // assert_eq!(target.state(), &PutState::BroadcastComplete);
-        // assert_eq!(res_msg, expected);
+        let res_msg = target
+            .consume_to_output::<OpExecError>(PutMsg::Broadcasting {
+                id,
+                broadcast_to: vec![],
+                broadcasted_to: 0,
+                new_value: vec![4, 3, 2, 1],
+            })?
+            .ok_or("no msg")?;
+        let expected = PutMsg::SuccessfulUpdate {
+            id,
+            new_value: vec![4, 3, 2, 1],
+        };
+        assert_eq!(target.state(), &PutState::BroadcastComplete);
+        assert_eq!(res_msg, expected);
 
-        // let finished = requester.consume_to_state::<OpExecError>(res_msg)?;
-        // assert_eq!(target.state(), &PutState::BroadcastComplete);
-        // assert!(finished.is_none());
-
-        todo!()
+        let finished = requester.consume_to_state::<OpExecError>(res_msg)?;
+        assert_eq!(target.state(), &PutState::BroadcastComplete);
+        assert!(finished.is_none());
+        Ok(())
     }
 }

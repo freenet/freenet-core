@@ -6,15 +6,18 @@ use tokio::sync::mpsc;
 
 use crate::{
     conn_manager::{ConnectionBridge, Transport},
+    contract::ContractHandlerChannel,
     message::Message,
     node::{InitPeerNode, NodeInMemory},
     operations::{
         join_ring::{handle_join_ring, JoinRingMsg},
         OpError,
     },
-    ring::{Distance, Location},
+    ring::{Distance, Location, Ring},
     NodeConfig,
 };
+
+use super::OpManager;
 
 pub fn get_free_port() -> Result<u16, ()> {
     let mut port;
@@ -33,6 +36,13 @@ pub fn get_dynamic_port() -> u16 {
     const FIRST_DYNAMIC_PORT: u16 = 49152;
     const LAST_DYNAMIC_PORT: u16 = 65535;
     rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
+}
+
+pub(crate) fn get_test_op_storage() -> OpManager<String> {
+    let ring = Ring::new();
+    let (notification_tx, _notification_channel) = mpsc::channel(100);
+    let ch_handler = ContractHandlerChannel::new();
+    OpManager::new(ring, notification_tx, ch_handler)
 }
 
 pub(crate) struct SimNetwork {
