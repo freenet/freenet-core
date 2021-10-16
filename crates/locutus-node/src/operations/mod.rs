@@ -100,9 +100,3 @@ pub(crate) enum OpError<S> {
     #[error("early push of state into the op stack")]
     StatePushed,
 }
-
-impl<S> From<rust_fsm::TransitionImpossibleError> for OpError<S> {
-    fn from(_: rust_fsm::TransitionImpossibleError) -> Self {
-        OpError::IllegalStateTransition
-    }
-}

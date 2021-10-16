@@ -52,12 +52,12 @@ impl<Err> ContractHandlerChannel<Err> {
     /// Send an event to the contract handler and receive a response event if succesful.
     pub async fn send_to_handler(
         &self,
-        ev: ContractHandlerEvent<Err>,
+        _ev: ContractHandlerEvent<Err>,
     ) -> Result<ContractHandlerEvent<Err>, ContractError<Err>> {
         todo!()
     }
 
-    pub async fn send_to_listeners(&self, id: EventId, ev: ContractHandlerEvent<Err>) {
+    pub async fn send_to_listeners(&self, _id: EventId, _ev: ContractHandlerEvent<Err>) {
         todo!()
     }
 

@@ -1754,7 +1754,6 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "rand 0.8.4",
- "rust-fsm",
  "serde 1.0.130",
  "thiserror",
  "tokio",
@@ -2463,25 +2462,6 @@ dependencies = [
  "untrusted",
  "web-sys",
  "winapi",
-]
-
-[[package]]
-name = "rust-fsm"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b9ee4731a0f53c973772b83c43c57a26e146b6fa024af5aeab972b63d678b65"
-dependencies = [
- "rust-fsm-dsl",
-]
-
-[[package]]
-name = "rust-fsm-dsl"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44237c429621e3606374941c3061fe95686bdaddb9b4f6524e4edc2d21da9c58"
-dependencies = [
- "quote",
- "syn",
 ]
 
 [[package]]

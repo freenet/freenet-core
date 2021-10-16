@@ -1,14 +1,12 @@
 use std::{collections::HashSet, time::Duration};
 
-use rust_fsm::*;
-
-use super::{handle_op_result, OpError, OperationResult};
+use super::{handle_op_result, state_machine::StateMachineImpl, OpError, OperationResult};
 use crate::{
     config::PEER_TIMEOUT_SECS,
     conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction},
     node::{OpExecError, OpManager},
-    operations::Operation,
+    operations::{state_machine::StateMachine, Operation},
     ring::{Location, Ring},
 };
 
@@ -49,9 +47,7 @@ impl StateMachineImpl for JROpSM {
 
     type Output = JoinRingMsg;
 
-    const INITIAL_STATE: Self::State = JRState::Initializing;
-
-    fn transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
+    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
         match (state, input) {
             (
                 JRState::Initializing,
@@ -104,7 +100,7 @@ impl StateMachineImpl for JROpSM {
         }
     }
 
-    fn output(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
+    fn output_from_input_as_ref(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
         match (state, input) {
             (
                 JRState::Initializing,
@@ -273,7 +269,7 @@ where
             sender = join_op.sender().cloned();
             // new request to join from this node, initialize the machine
             let machine = JoinRingOp {
-                sm: StateMachine::new(),
+                sm: StateMachine::from_state(JRState::Initializing),
                 _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
             };
             update_state(conn_manager, machine, join_op, &op_storage.ring).await
@@ -339,7 +335,7 @@ where
             );
             return_msg = state
                 .sm
-                .consume(&JoinRingMsg::Req {
+                .consume_to_state(JoinRingMsg::Req {
                     id,
                     msg: JoinRequest::Accepted {
                         gateway: gw_location,
@@ -416,7 +412,7 @@ where
             log::debug!("Join response received from {}", sender.peer,);
             return_msg = state
                 .sm
-                .consume(&JoinRingMsg::Resp {
+                .consume_to_state(JoinRingMsg::Resp {
                     id,
                     sender,
                     msg: JoinResponse::AcceptedBy {
@@ -480,7 +476,7 @@ where
         } => {
             return_msg = state
                 .sm
-                .consume(&JoinRingMsg::Resp {
+                .consume_to_state(JoinRingMsg::Resp {
                     id,
                     sender,
                     msg: JoinResponse::ReceivedOC { by_peer },
@@ -497,7 +493,7 @@ where
         JoinRingMsg::Connected { target, sender, id } => {
             return_msg = state
                 .sm
-                .consume(&JoinRingMsg::Connected { target, sender, id })?
+                .consume_to_state(JoinRingMsg::Connected { target, sender, id })?
                 .map(Message::from);
             if !state.sm.state().is_connected() {
                 return Err(OpError::IllegalStateTransition);
@@ -635,7 +631,7 @@ mod test {
         };
 
         let mut join_gw_1 = JoinRingOp::initial_request(new_peer.peer, gateway, 0).sm;
-        let mut join_new_peer_2 = StateMachine::<JROpSM>::new();
+        let mut join_new_peer_2 = StateMachine::<JROpSM>::from_state(JRState::Initializing);
 
         let req = JoinRingMsg::Req {
             id,
@@ -646,7 +642,10 @@ mod test {
                 your_peer_id: new_peer.peer,
             },
         };
-        let res = join_new_peer_2.consume(&req).unwrap().unwrap();
+        let res = join_new_peer_2
+            .consume_to_state::<OpExecError>(req)
+            .unwrap()
+            .unwrap();
         let expected = JoinRingMsg::Resp {
             id,
             msg: JoinResponse::AcceptedBy {
@@ -660,7 +659,10 @@ mod test {
         assert_eq!(res, expected);
         assert!(matches!(join_new_peer_2.state(), JRState::OCReceived));
 
-        let res = join_gw_1.consume(&res).unwrap().unwrap();
+        let res = join_gw_1
+            .consume_to_state::<OpExecError>(res)
+            .unwrap()
+            .unwrap();
         new_peer.location = Some(new_loc);
         let expected = JoinRingMsg::Resp {
             msg: JoinResponse::ReceivedOC { by_peer: new_peer },
@@ -671,7 +673,10 @@ mod test {
         assert_eq!(res, expected);
         assert!(matches!(join_gw_1.state(), JRState::OCReceived));
 
-        let res = join_new_peer_2.consume(&res).unwrap().unwrap();
+        let res = join_new_peer_2
+            .consume_to_state::<OpExecError>(res)
+            .unwrap()
+            .unwrap();
         let expected = JoinRingMsg::Connected {
             id,
             target: new_peer,
@@ -680,15 +685,17 @@ mod test {
         assert_eq!(res, expected);
         assert!(matches!(join_new_peer_2.state(), JRState::Connected));
 
-        assert!(join_gw_1.consume(&res).unwrap().is_none());
+        assert!(join_gw_1
+            .consume_to_state::<OpExecError>(res.clone())
+            .unwrap()
+            .is_none());
         assert!(matches!(join_gw_1.state(), JRState::Connected));
 
         // transaction finished, should not return anymore
-        assert!(join_new_peer_2.consume(&res).is_err());
-        assert!(join_gw_1.consume(&res).is_err());
-        // and the final state should be connected
-        assert!(matches!(join_gw_1.state(), JRState::Connected));
-        assert!(matches!(join_new_peer_2.state(), JRState::Connected));
+        assert!(join_new_peer_2
+            .consume_to_state::<OpExecError>(res.clone())
+            .is_err());
+        assert!(join_gw_1.consume_to_state::<OpExecError>(res).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

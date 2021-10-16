@@ -32,23 +32,44 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    pub fn start_op(contract: Contract, value: Vec<u8>, htl: usize) -> Self {
+    pub fn start_op<CErr>(
+        contract: Contract,
+        value: Vec<u8>,
+        htl: usize,
+        op_storage: &OpManager<CErr>,
+    ) -> Result<Self, OpError<CErr>> {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
             contract.key(),
             Location::from(contract.key())
         );
+
+        // the initial request must provide:
+        // - a peer as close as possible to the contract location
+        // - and the value to put
+        let target = if let Some(potential_target) = op_storage
+            .ring
+            .routing(&contract.key().location(), 1)
+            .into_iter()
+            .next()
+        {
+            potential_target
+        } else {
+            return Err(RingError::EmptyRing.into());
+        };
+
         let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
         let sm = StateMachine::from_state(PutState::Requesting {
             id,
             contract,
             value,
             htl,
+            target,
         });
-        PutOp {
+        Ok(PutOp {
             sm,
             _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
-        }
+        })
     }
 }
 
@@ -61,19 +82,28 @@ impl StateMachineImpl for PutOpSM {
 
     type Output = PutMsg;
 
-    fn transition(state: Self::State, input: Self::Input) -> Option<Self::State> {
+    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
         match (state, input) {
             // state changed for the initial requesting node
             (PutState::Requesting { contract, .. }, PutMsg::RouteValue { .. }) => {
-                Some(PutState::AwaitAnswer { contract: contract })
+                Some(PutState::AwaitAnswer { contract })
             }
             (PutState::AwaitAnswer { contract }, PutMsg::RequestPut { .. }) => {
-                Some(PutState::AwaitAnswer { contract: contract })
+                Some(PutState::AwaitAnswer { contract })
             }
             (PutState::AwaitAnswer { contract, .. }, PutMsg::SuccessfulUpdate { .. }) => {
                 log::debug!("Successfully updated value for {}", contract.key());
                 Some(PutState::BroadcastComplete)
             }
+
+            // state changes for proxies
+            (PutState::Initializing, PutMsg::PutProxy { .. }) => None,
+            _ => None,
+        }
+    }
+
+    fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
+        match (state, input) {
             // state changes for the target node
             (
                 PutState::Initializing | PutState::BroadcastOngoing { .. },
@@ -83,23 +113,21 @@ impl StateMachineImpl for PutOpSM {
                     ..
                 },
             ) => {
-                if broadcasted_to >= broadcast_to.len() {
+                if *broadcasted_to >= broadcast_to.len() {
                     // broadcast complete
                     Some(PutState::BroadcastComplete)
                 } else {
                     Some(PutState::BroadcastOngoing {
                         left_peers: broadcast_to.clone(),
-                        completed: broadcasted_to,
+                        completed: broadcasted_to.clone(),
                     })
                 }
             }
-            // state changes for proxies
-            (PutState::Initializing, PutMsg::PutProxy { .. }) => None,
             _ => None,
         }
     }
 
-    fn output(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
+    fn output_from_input_as_ref(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
         match (state, input) {
             (
                 PutState::Requesting {
@@ -107,6 +135,7 @@ impl StateMachineImpl for PutOpSM {
                     value,
                     id,
                     htl,
+                    target,
                 },
                 PutMsg::RouteValue { .. },
             ) => Some(PutMsg::RequestPut {
@@ -114,7 +143,14 @@ impl StateMachineImpl for PutOpSM {
                 contract: contract.clone(),
                 value: value.clone(),
                 htl: *htl,
+                target: *target,
             }),
+            _ => None,
+        }
+    }
+
+    fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
+        match (state, input) {
             (
                 PutState::Requesting { .. },
                 PutMsg::SeekNode {
@@ -126,18 +162,15 @@ impl StateMachineImpl for PutOpSM {
                     htl,
                 },
             ) => Some(PutMsg::SeekNode {
-                id: *id,
-                target: *target,
-                sender: *sender,
-                contract: contract.clone(),
-                value: value.clone(),
-                htl: *htl,
+                id,
+                target,
+                sender,
+                contract,
+                value,
+                htl,
             }),
             (PutState::Initializing, PutMsg::Broadcasting { id, new_value, .. }) => {
-                Some(PutMsg::SuccessfulUpdate {
-                    id: *id,
-                    new_value: new_value.clone(),
-                })
+                Some(PutMsg::SuccessfulUpdate { id, new_value })
             }
             _ => None,
         }
@@ -152,6 +185,7 @@ enum PutState {
         contract: Contract,
         value: ContractPutValue,
         htl: usize,
+        target: PeerKeyLocation,
     },
     AwaitAnswer {
         contract: Contract,
@@ -182,7 +216,7 @@ pub(crate) async fn request_put<CErr>(
         return Err(OpError::IllegalStateTransition);
     };
 
-    if let Some(req_put) = put_op.sm.consume(PutMsg::RouteValue {
+    if let Some(req_put) = put_op.sm.consume_to_state(PutMsg::RouteValue {
         id: *put_op.sm.state().id(),
         htl: op_storage.ring.max_hops_to_live,
     })? {
@@ -251,29 +285,16 @@ where
             contract,
             value,
             htl,
+            target,
         } => {
-            // find the closest node to the location of the contract
-            let target = if let Some(potential_target) = op_storage
-                .ring
-                .routing(&contract.key().location(), 1)
-                .into_iter()
-                .next()
-            {
-                potential_target
-            } else {
-                return Err(RingError::EmptyRing.into());
-            };
-            // the initial request must provide:
-            // - a peer as close as possible to the contract location
-            // - and the value to put
-
             return_msg = state
                 .sm
-                .consume(PutMsg::RequestPut {
+                .consume_to_state(PutMsg::RequestPut {
                     id,
                     contract,
                     value,
                     htl,
+                    target,
                 })?
                 .map(Message::from);
             // no changes to state yet, still in AwaitResponse state
@@ -372,7 +393,7 @@ where
 
             return_msg = state
                 .sm
-                .consume(PutMsg::Broadcasting {
+                .consume_to_output(PutMsg::Broadcasting {
                     id,
                     broadcasted_to: 0,
                     broadcast_to,
@@ -388,7 +409,7 @@ where
         PutMsg::SuccessfulUpdate { id, new_value } => {
             return_msg = state
                 .sm
-                .consume(PutMsg::SuccessfulUpdate { id, new_value })?
+                .consume_to_state(PutMsg::SuccessfulUpdate { id, new_value })?
                 .map(Message::from);
             new_state = None;
         }
@@ -422,6 +443,7 @@ mod messages {
             value: ContractPutValue,
             /// max hops to live
             htl: usize,
+            target: PeerKeyLocation,
         },
         PutProxy {
             id: Transaction,
@@ -476,6 +498,7 @@ mod messages {
         pub fn target(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
+                Self::RequestPut { target, .. } => Some(target),
                 _ => None,
             }
         }
@@ -484,54 +507,63 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use crate::conn_manager::PeerKey;
+
     use super::*;
 
     #[test]
     fn successful_put_op_seq() -> Result<(), Box<dyn std::error::Error>> {
-        let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
-        let bytes = crate::test_utils::random_bytes_1024();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
+        // let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
+        // let bytes = crate::test_utils::random_bytes_1024();
+        // let mut gen = arbitrary::Unstructured::new(&bytes);
+        // let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
+        // let target_loc = PeerKeyLocation {
+        //     location: Some(Location::random()),
+        //     peer: PeerKey::random(),
+        // };
 
-        let mut requester = PutOp::start_op(contract.clone(), vec![0, 1, 2, 3], 0).sm;
-        let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
+        // let mut requester =
+        //     PutOp::start_op(contract.clone(), vec![0, 1, 2, 3], 0, target_loc.clone()).sm;
+        // let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
 
-        let _req_msg = requester
-            .consume::<OpExecError>(PutMsg::RouteValue { id, htl: 0 })?
-            .ok_or("no msg")?;
-        let _expected = PutMsg::RequestPut {
-            id,
-            contract: contract.clone(),
-            value: vec![0, 1, 2, 3],
-            htl: 0,
-        };
-        // assert_eq!(req_msg, expected);
-        assert_eq!(
-            requester.state(),
-            &PutState::AwaitAnswer {
-                contract: contract.clone()
-            }
-        );
+        // // requester.consume_to_state();
+        // let _req_msg = requester
+        //     .consume_to_state::<OpExecError>(PutMsg::RouteValue { id, htl: 0 })?
+        //     .ok_or("no msg")?;
+        // let _expected = PutMsg::RequestPut {
+        //     id,
+        //     contract: contract.clone(),
+        //     value: vec![0, 1, 2, 3],
+        //     htl: 0,
+        //     target: target_loc,
+        // };
+        // // assert_eq!(req_msg, expected);
+        // assert_eq!(
+        //     requester.state(),
+        //     &PutState::AwaitAnswer {
+        //         contract: contract.clone()
+        //     }
+        // );
 
-        let res_msg = target
-            .consume::<OpExecError>(PutMsg::Broadcasting {
-                id,
-                broadcast_to: vec![],
-                broadcasted_to: 0,
-                new_value: vec![4, 3, 2, 1],
-            })?
-            .ok_or("no msg")?;
-        let expected = PutMsg::SuccessfulUpdate {
-            id,
-            new_value: vec![4, 3, 2, 1],
-        };
-        assert_eq!(target.state(), &PutState::BroadcastComplete);
-        assert_eq!(res_msg, expected);
+        // let res_msg = target
+        //     .consume_to_output::<OpExecError>(PutMsg::Broadcasting {
+        //         id,
+        //         broadcast_to: vec![],
+        //         broadcasted_to: 0,
+        //         new_value: vec![4, 3, 2, 1],
+        //     })?
+        //     .ok_or("no msg")?;
+        // let expected = PutMsg::SuccessfulUpdate {
+        //     id,
+        //     new_value: vec![4, 3, 2, 1],
+        // };
+        // assert_eq!(target.state(), &PutState::BroadcastComplete);
+        // assert_eq!(res_msg, expected);
 
-        let finished = requester.consume::<OpExecError>(res_msg)?;
-        assert_eq!(target.state(), &PutState::BroadcastComplete);
-        assert!(finished.is_none());
+        // let finished = requester.consume_to_state::<OpExecError>(res_msg)?;
+        // assert_eq!(target.state(), &PutState::BroadcastComplete);
+        // assert!(finished.is_none());
 
-        Ok(())
+        todo!()
     }
 }

@@ -2,7 +2,7 @@
 
 use std::fmt::Display;
 
-use libp2p::{core::PublicKey, PeerId};
+use libp2p::{core::PublicKey, identity::Keypair, PeerId};
 use serde::{Deserialize, Serialize};
 
 use crate::{message::Message, ring::Location};
@@ -38,6 +38,12 @@ pub(crate) trait Transport {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct PeerKey(pub(crate) PeerId);
+
+impl PeerKey {
+    pub fn random() -> Self {
+        PeerKey::from(Keypair::generate_ed25519().public())
+    }
+}
 
 impl Display for PeerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

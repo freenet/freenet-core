@@ -14,12 +14,24 @@ pub trait StateMachineImpl {
     /// The transition fuction that outputs a new state based on the current
     /// state and the provided input. Outputs `None` when there is no transition
     /// for a given combination of the input and the state.
-    fn transition(state: Self::State, input: Self::Input) -> Option<Self::State>;
+    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State>;
+
+    fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
+        match (state, input) {
+            _ => None,
+        }
+    }
 
     /// The output function that outputs some value from the output alphabet
     /// based on the current state and the given input. Outputs `None` when
     /// there is no output for a given combination of the input and the state.
-    fn output(state: &Self::State, input: &Self::Input) -> Option<Self::Output>;
+    fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
+        match (state, input) {
+            _ => None,
+        }
+    }
+
+    fn output_from_input_as_ref(state: &Self::State, input: &Self::Input) -> Option<Self::Output>;
 }
 
 /// A convenience wrapper around the `StateMachine` trait that encapsulates the
@@ -41,11 +53,28 @@ where
     /// Consumes the provided input, gives an output and performs a state
     /// transition. If a state transition with the current state and the
     /// provided input is not allowed, returns an error.
-    pub fn consume<CErr>(&mut self, input: T::Input) -> Result<Option<T::Output>, OpError<CErr>> {
+    pub fn consume_to_state<CErr>(
+        &mut self,
+        input: T::Input,
+    ) -> Result<Option<T::Output>, OpError<CErr>> {
         let popped_state = self.state.take().expect("infallible");
-        let output = T::output(&popped_state, &input);
-        if let Some(state) = T::transition(popped_state, input) {
-            self.state = Some(state);
+        let output = T::output_from_input_as_ref(&popped_state, &input);
+        if let Some(new_state) = T::state_transition_from_input(popped_state, input) {
+            self.state = Some(new_state);
+            Ok(output)
+        } else {
+            Err(OpError::IllegalStateTransition)
+        }
+    }
+
+    pub fn consume_to_output<CErr>(
+        &mut self,
+        input: T::Input,
+    ) -> Result<Option<T::Output>, OpError<CErr>> {
+        let popped_state = self.state.take().expect("infallible");
+        if let Some(new_state) = T::state_transition(&popped_state, &input) {
+            let output = T::output_from_input(popped_state, input);
+            self.state = Some(new_state);
             Ok(output)
         } else {
             Err(OpError::IllegalStateTransition)

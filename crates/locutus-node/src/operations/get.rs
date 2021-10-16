@@ -1,12 +1,13 @@
-use rust_fsm::{StateMachine, StateMachineImpl};
-
 use crate::{
     conn_manager::ConnectionBridge, contract::ContractKey, message::Transaction, node::OpManager,
 };
 
 pub(crate) use self::messages::GetMsg;
 
-use super::OpError;
+use super::{
+    state_machine::{StateMachine, StateMachineImpl},
+    OpError,
+};
 
 /// This is just a placeholder for now!
 pub(crate) struct GetOp(StateMachine<GetOpSM>);
@@ -27,19 +28,17 @@ impl StateMachineImpl for GetOpSM {
 
     type Output = GetMsg;
 
-    const INITIAL_STATE: Self::State = GetState::Initializing;
-
-    fn transition(state: &Self::State, inget: &Self::Input) -> Option<Self::State> {
-        match (state, inget) {
+    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
+        match (state, input) {
             (GetState::Initializing, GetMsg::FetchRouting { key }) => {
-                Some(GetState::Requesting { key: *key })
+                Some(GetState::Requesting { key })
             }
             _ => None,
         }
     }
 
-    fn output(state: &Self::State, inget: &Self::Input) -> Option<Self::Output> {
-        match (state, inget) {
+    fn output_from_input_as_ref(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
+        match (state, input) {
             (GetState::Initializing, GetMsg::FetchRouting { key }) => {
                 Some(GetMsg::FetchRouting { key: *key })
             }

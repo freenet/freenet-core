@@ -244,8 +244,16 @@ where
         match user_events.recv().await {
             UserEvent::Put { value, contract } => {
                 // Initialize a put op.
-                let op = put::PutOp::start_op(contract, value, op_storage.ring.max_hops_to_live);
-                put::request_put(&op_storage, op).await.unwrap();
+                if let Ok(op) = put::PutOp::start_op(
+                    contract,
+                    value,
+                    op_storage.ring.max_hops_to_live,
+                    &*op_storage,
+                ) {
+                    put::request_put(&op_storage, op).await.unwrap();
+                } else {
+                    todo!()
+                }
             }
             UserEvent::Get { key, .. } => {
                 // Initialize a get op.
