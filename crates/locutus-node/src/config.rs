@@ -7,6 +7,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     str::FromStr,
+    time::Duration,
 };
 
 use libp2p::{identity, PeerId};
@@ -16,7 +17,7 @@ use tokio::runtime::Runtime;
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 pub(crate) static CONF: Lazy<Config> =
     Lazy::new(|| Config::load_conf().expect("Failed to load configuration"));
-pub(crate) const PEER_TIMEOUT_SECS: u64 = 10;
+pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Initialize the executor once.
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_async_rt);

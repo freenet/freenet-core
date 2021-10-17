@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{error::SendError, Sender};
 use crate::{
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent},
     message::{Message, Transaction, TransactionType},
-    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, Operation},
+    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, OpError, Operation},
     ring::Ring,
 };
 
@@ -26,12 +26,15 @@ pub(crate) struct OpManager<CErr> {
 macro_rules! check_id_op {
     ($get_ty:expr, $var:path) => {
         if !matches!($get_ty, $var) {
-            return Err(OpExecError::IncorrectTxType($var, $get_ty));
+            return Err(OpError::IncorrectTxType($var, $get_ty));
         }
     };
 }
 
-impl<CErr> OpManager<CErr> {
+impl<CErr> OpManager<CErr>
+where
+    CErr: std::error::Error,
+{
     pub fn new(
         ring: Ring,
         notification_channel: Sender<Message>,
@@ -72,7 +75,7 @@ impl<CErr> OpManager<CErr> {
         self.contract_handler.send_to_handler(msg).await
     }
 
-    pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpExecError> {
+    pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpError<CErr>> {
         match op {
             Operation::JoinRing(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::JoinRing);
@@ -102,12 +105,4 @@ impl<CErr> OpManager<CErr> {
             TransactionType::Canceled => todo!(),
         }
     }
-}
-
-#[derive(Debug, thiserror::Error, Clone)]
-pub(crate) enum OpExecError {
-    #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
-    IncorrectTxType(TransactionType, TransactionType),
-    #[error("failed while processing transaction {0}")]
-    TxUpdateFailure(Transaction),
 }

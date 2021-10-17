@@ -14,24 +14,30 @@ pub trait StateMachineImpl {
     /// The transition fuction that outputs a new state based on the current
     /// state and the provided input. Outputs `None` when there is no transition
     /// for a given combination of the input and the state.
-    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State>;
+    fn state_transition_from_input(
+        _state: Self::State,
+        _input: Self::Input,
+    ) -> Option<Self::State> {
+        None
+    }
 
-    fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
-        match (state, input) {
-            _ => None,
-        }
+    fn state_transition(_state: &Self::State, _input: &Self::Input) -> Option<Self::State> {
+        None
     }
 
     /// The output function that outputs some value from the output alphabet
     /// based on the current state and the given input. Outputs `None` when
     /// there is no output for a given combination of the input and the state.
-    fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
-        match (state, input) {
-            _ => None,
-        }
+    fn output_from_input(_state: Self::State, _input: Self::Input) -> Option<Self::Output> {
+        None
     }
 
-    fn output_from_input_as_ref(state: &Self::State, input: &Self::Input) -> Option<Self::Output>;
+    fn output_from_input_as_ref(
+        _state: &Self::State,
+        _input: &Self::Input,
+    ) -> Option<Self::Output> {
+        None
+    }
 }
 
 /// A convenience wrapper around the `StateMachine` trait that encapsulates the
@@ -53,7 +59,7 @@ where
     /// Consumes the provided input, gives an output and performs a state
     /// transition. If a state transition with the current state and the
     /// provided input is not allowed, returns an error.
-    pub fn consume_to_state<CErr>(
+    pub fn consume_to_state<CErr: std::error::Error>(
         &mut self,
         input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {
@@ -67,7 +73,7 @@ where
         }
     }
 
-    pub fn consume_to_output<CErr>(
+    pub fn consume_to_output<CErr: std::error::Error>(
         &mut self,
         input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {

@@ -98,7 +98,7 @@ impl NodeLibP2P {
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
             .multiplex(yamux::YamuxConfig::default())
-            .timeout(std::time::Duration::from_secs(config::PEER_TIMEOUT_SECS))
+            .timeout(config::PEER_TIMEOUT)
             .map(|(peer, muxer), _| (peer, muxing::StreamMuxerBox::new(muxer)))
             .boxed())
     }

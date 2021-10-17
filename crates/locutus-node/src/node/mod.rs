@@ -22,7 +22,7 @@ use crate::{
 
 use self::libp2p_impl::NodeLibP2P;
 pub(crate) use in_memory::NodeInMemory;
-pub(crate) use op_state::{OpExecError, OpManager};
+pub(crate) use op_state::OpManager;
 
 mod in_memory;
 mod libp2p_impl;
@@ -238,7 +238,7 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 async fn user_event_handling<UsrEv, CErr>(op_storage: Arc<OpManager<CErr>>, mut user_events: UsrEv)
 where
     UsrEv: UserEventsProxy + Send + Sync + 'static,
-    CErr: std::fmt::Debug,
+    CErr: std::error::Error,
 {
     loop {
         match user_events.recv().await {
@@ -259,15 +259,22 @@ where
 async fn contract_handling<CH, Err>(mut contract_handler: CH) -> Result<(), ContractError<Err>>
 where
     CH: ContractHandler<Error = Err>,
+    Err: std::error::Error,
 {
     loop {
         let res = contract_handler.channel().recv_from_listeners().await?;
         match res {
-            (id, ContractHandlerEvent::FetchQuery(key)) => {
-                let contract = contract_handler.fetch_contract(&key).await;
+            (
+                id,
+                ContractHandlerEvent::FetchQuery {
+                    key,
+                    fetch_contract,
+                },
+            ) => {
+                let response = contract_handler.fetch_contract(&key).await;
                 contract_handler
                     .channel()
-                    .send_to_listeners(id, ContractHandlerEvent::FetchResponse { key, contract })
+                    .send_to_listeners(id, ContractHandlerEvent::FetchResponse { key, response })
                     .await
             }
             (id, ContractHandlerEvent::Cache(contract)) => {
@@ -302,3 +309,14 @@ where
         }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct SimStorageError(String);
+
+impl std::fmt::Display for SimStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SimStorageError {}

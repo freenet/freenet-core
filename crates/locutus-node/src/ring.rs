@@ -65,7 +65,7 @@ impl Ring {
         self
     }
 
-    #[inline]
+    #[inline(always)]
     /// Return if a location is within appropiate caching distance.
     pub fn within_caching_distance(&self, _loc: &Location) -> bool {
         // This always returns true as of current version since LRU cache will make sure
@@ -248,14 +248,10 @@ pub(crate) enum RingError {
     ConnError(#[from] Box<conn_manager::ConnError>),
     #[error("no ring connections found")]
     EmptyRing,
-    #[error("no location assigned to this node")]
-    NoLocationAssigned,
 }
 
 #[cfg(test)]
 mod test {
-    use libp2p::PeerId;
-
     use super::*;
     use crate::conn_manager::PeerKey;
 

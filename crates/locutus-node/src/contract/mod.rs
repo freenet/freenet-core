@@ -7,11 +7,14 @@ mod interface;
 mod store;
 mod test_utils;
 
-pub(crate) use store::{ContractHandler, ContractHandlerChannel, ContractHandlerEvent};
+pub(crate) use store::{
+    ContractHandler, ContractHandlerChannel, ContractHandlerEvent, StoreResponse,
+};
 pub(crate) use test_utils::MemoryContractHandler;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
+// FIXME: naively implementing clone here is going to be a perf issue in the future likely
 /// Main abstraction for representing a contract in binary form.
 /// Potentially expensive to clone.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -94,8 +97,21 @@ where
     Ok(key)
 }
 
+// FIXME: naively implementing clone here will be a future perf problem, must be improved
+/// The value for a contract. Potentially very expensive to clone.
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[derive(arbitrary::Arbitrary)]
+pub(crate) struct ContractValue(Vec<u8>);
+
+impl ContractValue {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        ContractValue(bytes)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ContractError<SErr> {
+pub(crate) enum ContractError<SErr: std::error::Error> {
     #[error("failed while storing a contract")]
     StorageError(#[from] SErr),
 }

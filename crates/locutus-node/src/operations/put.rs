@@ -7,11 +7,11 @@ use std::time::Duration;
 // use rust_fsm::{StateMachine, StateMachineImpl};
 
 use crate::{
-    config::PEER_TIMEOUT_SECS,
+    config::PEER_TIMEOUT,
     conn_manager::{ConnectionBridge, PeerKeyLocation},
-    contract::{Contract, ContractError, ContractHandlerEvent, ContractKey},
+    contract::{Contract, ContractError, ContractHandlerEvent, ContractKey, ContractValue},
     message::{GetTxType, Message, Transaction},
-    node::{OpExecError, OpManager},
+    node::OpManager,
     ring::{Location, RingError},
 };
 
@@ -22,18 +22,6 @@ use super::{
     state_machine::{StateMachine, StateMachineImpl},
     OpError, Operation, OperationResult,
 };
-
-/// The value for a contract. Potentially very expensive to clone.
-#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
-// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-#[derive(arbitrary::Arbitrary)]
-pub(crate) struct ContractValue(Vec<u8>);
-
-impl ContractValue {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        ContractValue(bytes)
-    }
-}
 
 pub(crate) struct PutOp {
     sm: StateMachine<PutOpSM>,
@@ -58,7 +46,7 @@ impl PutOp {
         });
         PutOp {
             sm,
-            _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+            _ttl: PEER_TIMEOUT,
         }
     }
 }
@@ -195,7 +183,10 @@ impl PutState {
 pub(crate) async fn request_put<CErr>(
     op_storage: &OpManager<CErr>,
     mut put_op: PutOp,
-) -> Result<(), OpError<CErr>> {
+) -> Result<(), OpError<CErr>>
+where
+    CErr: std::error::Error,
+{
     let key = if let PutState::Requesting { contract, .. } = put_op.sm.state() {
         contract.key()
     } else {
@@ -234,6 +225,7 @@ pub(crate) async fn handle_put_response<CB, CErr>(
 where
     CB: ConnectionBridge,
     OpError<CErr>: From<ContractError<CErr>>,
+    CErr: std::error::Error,
 {
     let sender;
     let tx = *put_op.id();
@@ -243,13 +235,13 @@ where
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, put_op, op_storage).await
         }
-        Some(_) => return Err(OpExecError::TxUpdateFailure(tx).into()),
+        Some(_) => return Err(OpError::TxUpdateFailure(tx)),
         None => {
             sender = put_op.sender().cloned();
             // new request to join from this node, initialize the machine
             let machine = PutOp {
                 sm: StateMachine::from_state(PutState::Initializing),
-                _ttl: Duration::from_millis(PEER_TIMEOUT_SECS),
+                _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, put_op, op_storage).await
         }
@@ -273,6 +265,7 @@ async fn update_state<CB, CErr>(
 where
     CB: ConnectionBridge,
     OpError<CErr>: From<ContractError<CErr>>,
+    CErr: std::error::Error,
 {
     let return_msg;
     let new_state;
@@ -312,8 +305,8 @@ where
                 op_storage
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
-            } else {
-                // in this case forward to a closest node to the target location and just wait for a response
+            } else if !cached_contract {
+                // in this case forward to a closer node to the target location and just wait for a response
                 // to give back to requesting peer
                 todo!()
             }
@@ -333,7 +326,7 @@ where
                     new_value: Err(_err),
                 }) => {
                     // return Err(OpError::from(ContractError::StorageError(err)));
-                    todo!("not a valid value update, notify back to requestor")
+                    todo!("not a valid value update, notify back to requester")
                 }
                 Err(err) => return Err(err.into()),
                 Ok(_) => return Err(OpError::IllegalStateTransition),
@@ -423,7 +416,7 @@ where
 }
 
 mod messages {
-    use crate::conn_manager::PeerKeyLocation;
+    use crate::{conn_manager::PeerKeyLocation, contract::ContractValue};
 
     use super::*;
 
@@ -511,7 +504,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::conn_manager::PeerKey;
+    use crate::{conn_manager::PeerKey, node::SimStorageError};
 
     use super::*;
 
@@ -532,7 +525,7 @@ mod test {
 
         // requester.consume_to_state();
         let _req_msg = requester
-            .consume_to_output::<OpExecError>(PutMsg::RouteValue {
+            .consume_to_output::<OpError<SimStorageError>>(PutMsg::RouteValue {
                 id,
                 htl: 0,
                 target: target_loc,
@@ -554,7 +547,7 @@ mod test {
         );
 
         let res_msg = target
-            .consume_to_output::<OpExecError>(PutMsg::Broadcasting {
+            .consume_to_output::<OpError<SimStorageError>>(PutMsg::Broadcasting {
                 id,
                 broadcast_to: vec![],
                 broadcasted_to: 0,
@@ -568,7 +561,7 @@ mod test {
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert_eq!(res_msg, expected);
 
-        let finished = requester.consume_to_state::<OpExecError>(res_msg)?;
+        let finished = requester.consume_to_state::<SimStorageError>(res_msg)?;
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert!(finished.is_none());
         Ok(())

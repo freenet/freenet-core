@@ -2,10 +2,10 @@ use std::{collections::HashSet, time::Duration};
 
 use super::{handle_op_result, state_machine::StateMachineImpl, OpError, OperationResult};
 use crate::{
-    config::PEER_TIMEOUT_SECS,
+    config::PEER_TIMEOUT,
     conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
     message::{Message, Transaction},
-    node::{OpExecError, OpManager},
+    node::OpManager,
     operations::{state_machine::StateMachine, Operation},
     ring::{Location, Ring},
 };
@@ -32,7 +32,7 @@ impl JoinRingOp {
         }));
         JoinRingOp {
             sm,
-            _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+            _ttl: PEER_TIMEOUT,
         }
     }
 }
@@ -98,20 +98,6 @@ impl StateMachineImpl for JROpSM {
             }
             _ => None,
         }
-    }
-
-    fn state_transition_from_input(
-        _state: Self::State,
-        _input: Self::Input,
-    ) -> Option<Self::State> {
-        None
-    }
-
-    fn output_from_input_as_ref(
-        _state: &Self::State,
-        _input: &Self::Input,
-    ) -> Option<Self::Output> {
-        None
     }
 
     fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
@@ -205,7 +191,9 @@ struct ConnectionInfo {
 }
 
 impl JRState {
-    fn try_unwrap_connecting<CErr>(self) -> Result<ConnectionInfo, OpError<CErr>> {
+    fn try_unwrap_connecting<CErr: std::error::Error>(
+        self,
+    ) -> Result<ConnectionInfo, OpError<CErr>> {
         if let Self::Connecting(conn_info) = self {
             Ok(conn_info)
         } else {
@@ -227,6 +215,7 @@ pub(crate) async fn join_ring_request<CB, CErr>(
 ) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
+    CErr: std::error::Error,
 {
     let ConnectionInfo {
         gateway,
@@ -269,6 +258,7 @@ pub(crate) async fn handle_join_ring<CB, CErr>(
 ) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
+    CErr: std::error::Error,
 {
     let sender;
     let tx = *join_op.id();
@@ -278,13 +268,13 @@ where
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, join_op, &op_storage.ring).await
         }
-        Some(_) => return Err(OpExecError::TxUpdateFailure(tx).into()),
+        Some(_) => return Err(OpError::TxUpdateFailure(tx).into()),
         None => {
             sender = join_op.sender().cloned();
             // new request to join from this node, initialize the machine
             let machine = JoinRingOp {
                 sm: StateMachine::from_state(JRState::Initializing),
-                _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
+                _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, join_op, &op_storage.ring).await
         }
@@ -307,6 +297,7 @@ async fn update_state<CB, CErr>(
 ) -> Result<OperationResult, OpError<CErr>>
 where
     CB: ConnectionBridge,
+    CErr: std::error::Error,
 {
     let return_msg;
     let new_state;
@@ -329,9 +320,7 @@ where
             );
             let new_location = Location::random();
             let accepted_by = if ring.should_accept(
-                &gw_location
-                    .location
-                    .ok_or(OpExecError::TxUpdateFailure(id))?,
+                &gw_location.location.ok_or(OpError::TxUpdateFailure(id))?,
                 &new_location,
             ) {
                 log::debug!("Accepting connections from {}", req_peer,);
@@ -622,13 +611,14 @@ mod messages {
 mod test {
     use std::time::Duration;
 
-    use libp2p::identity::Keypair;
-
     use super::*;
     use crate::{
         config::tracing::Logger,
         message::GetTxType,
-        node::test_utils::{EventType, SimNetwork},
+        node::{
+            test_utils::{EventType, SimNetwork},
+            SimStorageError,
+        },
     };
 
     #[test]
@@ -636,11 +626,11 @@ mod test {
         let id = Transaction::new(<JoinRingMsg as GetTxType>::tx_type_id());
         let new_loc = Location::random();
         let mut new_peer = PeerKeyLocation {
-            peer: PeerKey::from(Keypair::generate_ed25519().public()),
+            peer: PeerKey::random(),
             location: Some(new_loc),
         };
         let gateway = PeerKeyLocation {
-            peer: PeerKey::from(Keypair::generate_ed25519().public()),
+            peer: PeerKey::random(),
             location: Some(Location::random()),
         };
 
@@ -657,7 +647,7 @@ mod test {
             },
         };
         let res = join_new_peer_2
-            .consume_to_output::<OpExecError>(req)
+            .consume_to_output::<SimStorageError>(req)
             .unwrap()
             .unwrap();
         let expected = JoinRingMsg::Resp {
@@ -674,7 +664,7 @@ mod test {
         assert!(matches!(join_new_peer_2.state(), JRState::OCReceived));
 
         let res = join_gw_1
-            .consume_to_output::<OpExecError>(res)
+            .consume_to_output::<SimStorageError>(res)
             .unwrap()
             .unwrap();
         new_peer.location = Some(new_loc);
@@ -688,7 +678,7 @@ mod test {
         assert!(matches!(join_gw_1.state(), JRState::OCReceived));
 
         let res = join_new_peer_2
-            .consume_to_output::<OpExecError>(res)
+            .consume_to_output::<SimStorageError>(res)
             .unwrap()
             .unwrap();
         let expected = JoinRingMsg::Connected {
@@ -700,16 +690,16 @@ mod test {
         assert!(matches!(join_new_peer_2.state(), JRState::Connected));
 
         assert!(join_gw_1
-            .consume_to_output::<OpExecError>(res.clone())
+            .consume_to_output::<SimStorageError>(res.clone())
             .unwrap()
             .is_none());
         assert!(matches!(join_gw_1.state(), JRState::Connected));
 
         // transaction finished, should not return anymore
         assert!(join_new_peer_2
-            .consume_to_output::<OpExecError>(res.clone())
+            .consume_to_output::<SimStorageError>(res.clone())
             .is_err());
-        assert!(join_gw_1.consume_to_output::<OpExecError>(res).is_err());
+        assert!(join_gw_1.consume_to_output::<SimStorageError>(res).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

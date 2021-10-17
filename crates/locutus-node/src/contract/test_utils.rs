@@ -1,30 +1,30 @@
-use crate::operations::put::ContractValue;
+use crate::node::SimStorageError;
 
 use super::{
-    store::{ContractHandler, ContractHandlerChannel},
-    Contract, ContractKey,
+    store::{ContractHandler, ContractHandlerChannel, StoreResponse},
+    Contract, ContractKey, ContractValue,
 };
 
 pub(crate) struct MemoryContractHandler {
-    channel: ContractHandlerChannel<String>,
+    channel: ContractHandlerChannel<SimStorageError>,
 }
 
 impl MemoryContractHandler {
-    pub fn new(channel: ContractHandlerChannel<String>) -> Self {
+    pub fn new(channel: ContractHandlerChannel<SimStorageError>) -> Self {
         MemoryContractHandler { channel }
     }
 }
 
 #[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
-    type Error = String;
+    type Error = SimStorageError;
 
     #[inline(always)]
     fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
         &self.channel
     }
 
-    async fn fetch_contract(&self, _key: &ContractKey) -> Result<Option<Contract>, Self::Error> {
+    async fn fetch_contract(&self, _key: &ContractKey) -> Result<StoreResponse, Self::Error> {
         todo!()
     }
 

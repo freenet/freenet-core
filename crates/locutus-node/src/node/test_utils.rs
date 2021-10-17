@@ -6,18 +6,17 @@ use tokio::sync::mpsc;
 
 use crate::{
     conn_manager::{ConnectionBridge, PeerKey, Transport},
-    contract::ContractHandlerChannel,
     message::Message,
     node::{InitPeerNode, NodeInMemory},
     operations::{
         join_ring::{handle_join_ring, JoinRingMsg},
         OpError,
     },
-    ring::{Distance, Location, Ring},
+    ring::{Distance, Location},
     NodeConfig,
 };
 
-use super::OpManager;
+use super::SimStorageError;
 
 pub fn get_free_port() -> Result<u16, ()> {
     let mut port;
@@ -38,18 +37,11 @@ pub fn get_dynamic_port() -> u16 {
     rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
 }
 
-pub(crate) fn get_test_op_storage() -> OpManager<String> {
-    let ring = Ring::new();
-    let (notification_tx, _notification_channel) = mpsc::channel(100);
-    let ch_handler = ContractHandlerChannel::new();
-    OpManager::new(ring, notification_tx, ch_handler)
-}
-
 pub(crate) struct SimNetwork {
     // gateways: HashMap<String, InMemory>,
     // peers: HashMap<String, InMemory>,
-    meta_info_tx: mpsc::Sender<Result<NetEvent, OpError<String>>>,
-    meta_info_rx: mpsc::Receiver<Result<NetEvent, OpError<String>>>,
+    meta_info_tx: mpsc::Sender<Result<NetEvent, OpError<SimStorageError>>>,
+    meta_info_rx: mpsc::Receiver<Result<NetEvent, OpError<SimStorageError>>>,
 }
 
 pub(crate) struct NetEvent {
@@ -99,7 +91,7 @@ impl SimNetwork {
         sim
     }
 
-    pub async fn recv_net_events(&mut self) -> Option<Result<NetEvent, OpError<String>>> {
+    pub async fn recv_net_events(&mut self) -> Option<Result<NetEvent, OpError<SimStorageError>>> {
         self.meta_info_rx.recv().await
     }
 
@@ -129,7 +121,7 @@ impl SimNetwork {
 
     async fn listen(
         mut gateway: NodeInMemory,
-        info_ch: mpsc::Sender<Result<NetEvent, OpError<String>>>,
+        info_ch: mpsc::Sender<Result<NetEvent, OpError<SimStorageError>>>,
         _sender: String,
     ) -> Result<(), ()> {
         while let Ok(msg) = gateway.conn_manager.recv().await {

@@ -16,14 +16,14 @@ use crate::{
     NodeConfig,
 };
 
-use super::{op_state::OpManager, InitPeerNode};
+use super::{op_state::OpManager, InitPeerNode, SimStorageError};
 
 pub(crate) struct NodeInMemory {
     peer: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
     pub conn_manager: MemoryConnManager,
-    pub op_storage: Arc<OpManager<String>>,
+    pub op_storage: Arc<OpManager<SimStorageError>>,
 }
 
 impl NodeInMemory {

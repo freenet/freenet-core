@@ -1,7 +1,4 @@
-use crate::{
-    contract::{Contract, ContractKey},
-    operations::put::ContractValue,
-};
+use crate::contract::{Contract, ContractKey, ContractValue};
 
 #[async_trait::async_trait]
 pub(crate) trait UserEventsProxy {

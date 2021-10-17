@@ -1,8 +1,8 @@
 use crate::{
     conn_manager::{self, ConnectionBridge, PeerKeyLocation},
     contract::ContractError,
-    message::{Message, Transaction},
-    node::{OpExecError, OpManager},
+    message::{Message, Transaction, TransactionType},
+    node::OpManager,
     ring::RingError,
 };
 
@@ -27,6 +27,7 @@ async fn handle_op_result<CB, CErr>(
 ) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
+    CErr: std::error::Error,
 {
     match result {
         Err((OpError::StatePushed, _)) => {
@@ -82,11 +83,9 @@ pub struct ProbeOp;
 
 #[allow(unused)]
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OpError<S> {
+pub(crate) enum OpError<S: std::error::Error> {
     #[error(transparent)]
     ConnError(#[from] conn_manager::ConnError),
-    #[error(transparent)]
-    OpStateManagerError(#[from] OpExecError),
     #[error("cannot perform a state transition from the current state with the provided input")]
     IllegalStateTransition,
     #[error("failed notifying back to the node message loop, channel closed")]
@@ -99,4 +98,8 @@ pub(crate) enum OpError<S> {
     /// was sent throught the fast path back to the storage.
     #[error("early push of state into the op stack")]
     StatePushed,
+    #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
+    IncorrectTxType(TransactionType, TransactionType),
+    #[error("failed while processing transaction {0}")]
+    TxUpdateFailure(Transaction),
 }
