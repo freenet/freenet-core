@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::{
     config::PEER_TIMEOUT_SECS,
     conn_manager::{ConnectionBridge, PeerKeyLocation},
-    contract::{Contract, ContractError, ContractHandlerEvent},
+    contract::{Contract, ContractError, ContractHandlerEvent, ContractKey},
     message::{GetTxType, Message, Transaction},
     node::{OpExecError, OpManager},
     ring::{Location, RingError},
@@ -42,31 +42,12 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    pub fn start_op<CErr>(
-        contract: Contract,
-        value: ContractValue,
-        htl: usize,
-        op_storage: &OpManager<CErr>,
-    ) -> Result<Self, OpError<CErr>> {
+    pub fn start_op(contract: Contract, value: ContractValue, htl: usize) -> Self {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
             contract.key(),
             Location::from(contract.key())
         );
-
-        // the initial request must provide:
-        // - a peer as close as possible to the contract location
-        // - and the value to put
-        let target = if let Some(potential_target) = op_storage
-            .ring
-            .routing(&contract.key().location(), 1)
-            .into_iter()
-            .next()
-        {
-            potential_target
-        } else {
-            return Err(RingError::EmptyRing.into());
-        };
 
         let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
         let sm = StateMachine::from_state(PutState::Requesting {
@@ -74,12 +55,11 @@ impl PutOp {
             contract,
             value,
             htl,
-            target,
         });
-        Ok(PutOp {
+        PutOp {
             sm,
             _ttl: Duration::from_secs(PEER_TIMEOUT_SECS),
-        })
+        }
     }
 }
 
@@ -95,14 +75,11 @@ impl StateMachineImpl for PutOpSM {
     fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
         match (state, input) {
             // state changed for the initial requesting node
-            (PutState::Requesting { contract, .. }, PutMsg::RouteValue { .. }) => {
-                Some(PutState::AwaitAnswer { contract })
-            }
             (PutState::AwaitAnswer { contract }, PutMsg::RequestPut { .. }) => {
                 Some(PutState::AwaitAnswer { contract })
             }
             (PutState::AwaitAnswer { contract, .. }, PutMsg::SuccessfulUpdate { .. }) => {
-                log::debug!("Successfully updated value for {}", contract.key());
+                log::debug!("Successfully updated value for {}", contract);
                 Some(PutState::BroadcastComplete)
             }
 
@@ -114,6 +91,12 @@ impl StateMachineImpl for PutOpSM {
 
     fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
         match (state, input) {
+            // state changed for the initial requesting node
+            (PutState::Requesting { contract, .. }, PutMsg::RouteValue { .. }) => {
+                Some(PutState::AwaitAnswer {
+                    contract: contract.key(),
+                })
+            }
             // state changes for the target node
             (
                 PutState::Initializing | PutState::BroadcastOngoing { .. },
@@ -129,7 +112,7 @@ impl StateMachineImpl for PutOpSM {
                 } else {
                     Some(PutState::BroadcastOngoing {
                         left_peers: broadcast_to.clone(),
-                        completed: broadcasted_to.clone(),
+                        completed: *broadcasted_to,
                     })
                 }
             }
@@ -137,7 +120,7 @@ impl StateMachineImpl for PutOpSM {
         }
     }
 
-    fn output_from_input_as_ref(state: &Self::State, input: &Self::Input) -> Option<Self::Output> {
+    fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
         match (state, input) {
             (
                 PutState::Requesting {
@@ -145,22 +128,15 @@ impl StateMachineImpl for PutOpSM {
                     value,
                     id,
                     htl,
-                    target,
                 },
-                PutMsg::RouteValue { .. },
+                PutMsg::RouteValue { target, .. },
             ) => Some(PutMsg::RequestPut {
-                id: *id,
-                contract: contract.clone(),
-                value: value.clone(),
-                htl: *htl,
-                target: *target,
+                id,
+                contract,
+                value,
+                htl,
+                target,
             }),
-            _ => None,
-        }
-    }
-
-    fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
-        match (state, input) {
             (
                 PutState::Requesting { .. },
                 PutMsg::SeekNode {
@@ -195,10 +171,9 @@ enum PutState {
         contract: Contract,
         value: ContractValue,
         htl: usize,
-        target: PeerKeyLocation,
     },
     AwaitAnswer {
-        contract: Contract,
+        contract: ContractKey,
     },
     BroadcastOngoing {
         left_peers: Vec<PeerKeyLocation>,
@@ -208,12 +183,11 @@ enum PutState {
 }
 
 impl PutState {
-    fn is_requesting(&self) -> bool {
-        matches!(self, Self::Requesting { .. })
-    }
-
     fn id(&self) -> &Transaction {
-        todo!()
+        match self {
+            Self::Requesting { id, .. } => id,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -222,13 +196,26 @@ pub(crate) async fn request_put<CErr>(
     op_storage: &OpManager<CErr>,
     mut put_op: PutOp,
 ) -> Result<(), OpError<CErr>> {
-    if !put_op.sm.state().is_requesting() {
+    let key = if let PutState::Requesting { contract, .. } = put_op.sm.state() {
+        contract.key()
+    } else {
         return Err(OpError::IllegalStateTransition);
     };
 
-    if let Some(req_put) = put_op.sm.consume_to_state(PutMsg::RouteValue {
+    // the initial request must provide:
+    // - a peer as close as possible to the contract location
+    // - and the value to put
+    let target = op_storage
+        .ring
+        .closest_caching(&key, 1)
+        .into_iter()
+        .next()
+        .ok_or_else(|| OpError::from(RingError::EmptyRing))?;
+
+    if let Some(req_put) = put_op.sm.consume_to_output(PutMsg::RouteValue {
         id: *put_op.sm.state().id(),
         htl: op_storage.ring.max_hops_to_live,
+        target,
     })? {
         op_storage
             .notify_change(Message::from(req_put), Operation::Put(put_op))
@@ -445,7 +432,11 @@ mod messages {
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum PutMsg {
         /// Initialize the put operation by routing the value
-        RouteValue { id: Transaction, htl: usize },
+        RouteValue {
+            id: Transaction,
+            htl: usize,
+            target: PeerKeyLocation,
+        },
         /// Internal node instruction to find a route to the target node.
         RequestPut {
             id: Transaction,
@@ -455,6 +446,8 @@ mod messages {
             htl: usize,
             target: PeerKeyLocation,
         },
+        /// Internal node instruction to await the result of a put.
+        AwaitPut { id: Transaction },
         PutProxy {
             id: Transaction,
             contract: Contract,
@@ -495,6 +488,7 @@ mod messages {
                 Self::Broadcasting { id, .. } => id,
                 Self::SuccessfulUpdate { id, .. } => id,
                 Self::PutProxy { id, .. } => id,
+                Self::AwaitPut { id } => id,
             }
         }
 
@@ -517,7 +511,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::{conn_manager::PeerKey, node::test_utils::get_test_op_storage};
+    use crate::conn_manager::PeerKey;
 
     use super::*;
 
@@ -531,26 +525,18 @@ mod test {
             location: Some(Location::random()),
             peer: PeerKey::random(),
         };
-        let op_storage = get_test_op_storage();
-        op_storage
-            .ring
-            .connections_by_location
-            .write()
-            .insert(target_loc.location.clone().unwrap(), target_loc);
 
-        let mut requester = PutOp::start_op(
-            contract.clone(),
-            ContractValue::new(vec![0, 1, 2, 3]),
-            0,
-            &op_storage,
-        )
-        .unwrap()
-        .sm;
+        let mut requester =
+            PutOp::start_op(contract.clone(), ContractValue::new(vec![0, 1, 2, 3]), 0).sm;
         let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
 
         // requester.consume_to_state();
         let _req_msg = requester
-            .consume_to_state::<OpExecError>(PutMsg::RouteValue { id, htl: 0 })?
+            .consume_to_output::<OpExecError>(PutMsg::RouteValue {
+                id,
+                htl: 0,
+                target: target_loc,
+            })?
             .ok_or("no msg")?;
         let _expected = PutMsg::RequestPut {
             id,
@@ -563,7 +549,7 @@ mod test {
         assert_eq!(
             requester.state(),
             &PutState::AwaitAnswer {
-                contract: contract.clone()
+                contract: contract.key()
             }
         );
 
