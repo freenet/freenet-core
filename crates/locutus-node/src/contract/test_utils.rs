@@ -1,8 +1,10 @@
 use crate::node::SimStorageError;
 
+#[cfg(test)]
+use super::Contract;
 use super::{
-    store::{ContractHandler, ContractHandlerChannel, StoreResponse},
-    Contract, ContractKey, ContractValue,
+    store::{ContractHandler, ContractHandlerChannel, ContractStore},
+    ContractKey, ContractValue,
 };
 
 pub(crate) struct MemoryContractHandler {
@@ -24,11 +26,16 @@ impl ContractHandler for MemoryContractHandler {
         &self.channel
     }
 
-    async fn fetch_contract(&self, _key: &ContractKey) -> Result<StoreResponse, Self::Error> {
+    #[inline(always)]
+    fn contract_store(&mut self) -> &mut ContractStore {
         todo!()
     }
 
-    async fn store_contract(&mut self, _contract: Contract) -> Result<(), Self::Error> {
+    /// Get current contract value, if present, otherwise get none.
+    async fn get_value(
+        &self,
+        _contract: &ContractKey,
+    ) -> Result<Option<ContractValue>, Self::Error> {
         todo!()
     }
 

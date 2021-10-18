@@ -11,20 +11,48 @@ pub(crate) trait ContractHandler {
 
     fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
 
-    /// Returns a copy of the contract bytes if available, none otherwise.
-    async fn fetch_contract(&self, key: &ContractKey) -> Result<StoreResponse, Self::Error>;
+    fn contract_store(&mut self) -> &mut ContractStore;
 
-    /// Store a copy of the contract in the local store.
-    async fn store_contract(&mut self, contract: Contract) -> Result<(), Self::Error>;
+    /// Get current contract value, if present, otherwise get none.
+    async fn get_value(&self, contract: &ContractKey)
+        -> Result<Option<ContractValue>, Self::Error>;
 
     /// Updates (or inserts) a value for the given contract. This operation is fallible:
-    /// It will return an error when the value is not valid (from the contract pov)
-    /// or any other condition happened.
+    /// It will return an error when the value is not valid (according to the contract specification)
+    /// or any other condition happened (for example the contract not being present currently,
+    /// in which case it has to be stored by calling `contract_store` first).
     async fn put_value(
         &mut self,
         contract: &ContractKey,
         value: ContractValue,
     ) -> Result<ContractValue, Self::Error>;
+}
+
+/// Handle contract blob storage on the file system.
+pub(crate) struct ContractStore {}
+
+impl ContractStore {
+    /// Returns a copy of the contract bytes if available, none otherwise.
+    pub async fn fetch_contract<CErr>(
+        &self,
+        _key: &ContractKey,
+    ) -> Result<Option<Contract>, ContractError<CErr>>
+    where
+        CErr: std::error::Error,
+    {
+        todo!()
+    }
+
+    /// Store a copy of the contract in the local store.
+    pub async fn store_contract<CErr>(
+        &mut self,
+        _contract: Contract,
+    ) -> Result<(), ContractError<CErr>>
+    where
+        CErr: std::error::Error,
+    {
+        todo!()
+    }
 }
 
 pub struct EventId(usize);
@@ -69,11 +97,14 @@ impl<Err: std::error::Error> ContractHandlerChannel<Err> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
-    value: Option<ContractValue>,
-    contract: Option<Contract>,
+    pub value: Option<ContractValue>,
+    pub contract: Option<Contract>,
 }
 
-pub(crate) enum ContractHandlerEvent<Err> {
+pub(crate) enum ContractHandlerEvent<Err>
+where
+    Err: std::error::Error,
+{
     /// Try to push/put a new value into the contract.
     PushQuery {
         key: ContractKey,
@@ -95,5 +126,5 @@ pub(crate) enum ContractHandlerEvent<Err> {
     },
     Cache(Contract),
     /// Result of a caching operation.
-    CacheResult(Result<(), Err>),
+    CacheResult(Result<(), ContractError<Err>>),
 }

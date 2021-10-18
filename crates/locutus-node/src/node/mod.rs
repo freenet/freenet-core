@@ -11,6 +11,7 @@ use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
+use crate::contract::StoreResponse;
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
     config::CONF,
@@ -271,14 +272,31 @@ where
                     fetch_contract,
                 },
             ) => {
-                let response = contract_handler.fetch_contract(&key).await;
+                let contract = if fetch_contract {
+                    contract_handler
+                        .contract_store()
+                        .fetch_contract(&key)
+                        .await?
+                } else {
+                    None
+                };
+
+                let response = contract_handler
+                    .get_value(&key)
+                    .await
+                    .map(|value| StoreResponse { value, contract });
+
                 contract_handler
                     .channel()
                     .send_to_listeners(id, ContractHandlerEvent::FetchResponse { key, response })
                     .await
             }
             (id, ContractHandlerEvent::Cache(contract)) => {
-                match contract_handler.store_contract(contract).await {
+                match contract_handler
+                    .contract_store()
+                    .store_contract(contract)
+                    .await
+                {
                     Ok(_) => {
                         contract_handler
                             .channel()
