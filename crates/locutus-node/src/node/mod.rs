@@ -248,9 +248,9 @@ where
                 let op = put::PutOp::start_op(contract, value, op_storage.ring.max_hops_to_live);
                 put::request_put(&op_storage, op).await.unwrap();
             }
-            UserEvent::Get { key, .. } => {
+            UserEvent::Get { key, contract } => {
                 // Initialize a get op.
-                let op = get::GetOp::start_op(key);
+                let op = get::GetOp::start_op(key, contract);
                 get::request_get(&op_storage, op).await.unwrap();
             }
         }

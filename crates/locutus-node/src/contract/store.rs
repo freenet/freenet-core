@@ -124,7 +124,12 @@ where
         key: ContractKey,
         response: Result<StoreResponse, Err>,
     },
+    /// Store a contract in the local store.
     Cache(Contract),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError<Err>>),
+    /// Get a contract from the store.
+    FetchContract(ContractKey),
+    /// Result of fetching a contract.
+    FetchContractResult(Result<Option<Contract>, ContractError<Err>>),
 }
