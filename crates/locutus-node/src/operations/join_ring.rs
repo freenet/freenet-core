@@ -211,7 +211,7 @@ pub(crate) async fn join_ring_request<CB, CErr>(
     tx: Transaction,
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
-    join_op: JoinRingOp,
+    mut join_op: JoinRingOp,
 ) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
@@ -221,7 +221,7 @@ where
         gateway,
         this_peer,
         max_hops_to_live,
-    } = (&join_op.sm).state().clone().try_unwrap_connecting()?;
+    } = join_op.sm.state().clone().try_unwrap_connecting()?;
 
     log::info!(
         "Joining ring via {} (at {})",

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::ConnectionBridge,
-    contract::{ContractError, ContractHandlerEvent, ContractKey},
+    conn_manager::{ConnectionBridge, PeerKey, PeerKeyLocation},
+    contract::{ContractError, ContractHandlerEvent, ContractKey, StoreResponse},
     message::{GetTxType, Message, Transaction},
     node::OpManager,
     ring::RingError,
@@ -24,9 +24,16 @@ pub(crate) struct GetOp {
 }
 
 impl GetOp {
-    pub fn start_op(key: ContractKey) -> Self {
+    /// Maximum number of retries to get items.
+    const MAX_RETRIES: usize = 10;
+
+    pub fn start_op(key: ContractKey, fetch_contract: bool) -> Self {
         let id = Transaction::new(<GetMsg as GetTxType>::tx_type_id());
-        let sm = StateMachine::from_state(GetState::Request { key, id });
+        let sm = StateMachine::from_state(GetState::Request {
+            key,
+            id,
+            fetch_contract,
+        });
         GetOp {
             sm,
             _ttl: PEER_TIMEOUT,
@@ -45,32 +52,105 @@ impl StateMachineImpl for GetOpSM {
 
     fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
         match (state, input) {
-            (GetState::Request { .. }, GetMsg::FetchRouting { .. }) => {
-                Some(GetState::AwaitingResponse)
+            // states of the requester
+            (GetState::Request { fetch_contract, .. }, GetMsg::FetchRouting { .. }) => {
+                Some(GetState::AwaitingResponse {
+                    skip_list: vec![],
+                    retries: 0,
+                    fetch_contract: *fetch_contract,
+                })
             }
+            (
+                GetState::AwaitingResponse { .. },
+                GetMsg::ReturnGet {
+                    key,
+                    value: StoreResponse { value: Some(_), .. },
+                    ..
+                },
+            ) => {
+                log::info!("Get response received for contract {}", key);
+                Some(GetState::Completed)
+            }
+            // states of the petitioner
             (GetState::Initializing, GetMsg::ReturnGet { .. }) => Some(GetState::Completed),
+            _ => None,
+        }
+    }
+
+    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
+        match (state, input) {
+            (
+                GetState::AwaitingResponse {
+                    mut skip_list,
+                    retries,
+                    fetch_contract,
+                    ..
+                },
+                GetMsg::ReturnGet {
+                    sender,
+                    value:
+                        StoreResponse {
+                            value: None,
+                            contract: None,
+                        },
+                    ..
+                },
+            ) if retries < GetOp::MAX_RETRIES => {
+                // no respose received from this peer, so skip it in the next iteration
+                skip_list.push(sender.peer);
+                Some(GetState::AwaitingResponse {
+                    skip_list,
+                    retries,
+                    fetch_contract,
+                })
+            }
+            (
+                GetState::AwaitingResponse { .. },
+                GetMsg::ReturnGet {
+                    key,
+                    value:
+                        StoreResponse {
+                            value: None,
+                            contract: None,
+                        },
+                    ..
+                },
+            ) => {
+                log::info!("Failed getting a value for contract {}", key);
+                None
+            }
             _ => None,
         }
     }
 
     fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
         match (state, input) {
-            (GetState::Request { key, id }, GetMsg::FetchRouting { target, .. }) => {
-                Some(GetMsg::RequestGet { key, target, id })
-            }
+            (
+                GetState::Request {
+                    key,
+                    id,
+                    fetch_contract,
+                },
+                GetMsg::FetchRouting { target, .. },
+            ) => Some(GetMsg::RequestGet {
+                key,
+                target,
+                id,
+                fetch_contract,
+            }),
             (
                 GetState::Initializing,
                 GetMsg::ReturnGet {
                     id,
                     key,
                     value,
-                    target,
+                    sender,
                 },
             ) => Some(GetMsg::ReturnGet {
                 id,
                 key,
                 value,
-                target,
+                sender,
             }),
             _ => None,
         }
@@ -79,9 +159,52 @@ impl StateMachineImpl for GetOpSM {
 
 enum GetState {
     Initializing,
-    Request { key: ContractKey, id: Transaction },
-    AwaitingResponse,
+    Request {
+        key: ContractKey,
+        id: Transaction,
+        fetch_contract: bool,
+    },
+    AwaitingResponse {
+        skip_list: Vec<PeerKey>,
+        retries: usize,
+        fetch_contract: bool,
+    },
     Completed,
+}
+
+/// Request to get the current value from a contract.
+pub(crate) async fn request_get<CErr>(
+    op_storage: &OpManager<CErr>,
+    mut get_op: GetOp,
+) -> Result<(), OpError<CErr>>
+where
+    CErr: std::error::Error,
+{
+    let (target, id) = if let GetState::Request { key, id, .. } = get_op.sm.state() {
+        // the initial request must provide:
+        // - a location in the network where the contract resides
+        // - and the key of the contract value to get
+        (
+            op_storage
+                .ring
+                .closest_caching(key, 1, &[])
+                .into_iter()
+                .next()
+                .ok_or_else(|| OpError::from(RingError::EmptyRing))?,
+            *id,
+        )
+    } else {
+        return Err(OpError::IllegalStateTransition);
+    };
+    if let Some(req_get) = get_op
+        .sm
+        .consume_to_output(GetMsg::FetchRouting { target, id })?
+    {
+        op_storage
+            .notify_change(Message::from(req_get), Operation::Get(get_op))
+            .await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn handle_get_response<CB, CErr>(
@@ -136,41 +259,132 @@ where
     let return_msg;
     let new_state;
     match other_host_msg {
-        GetMsg::RequestGet { key, id, target } => {
+        GetMsg::RequestGet {
+            key,
+            id,
+            target,
+            fetch_contract,
+        } => {
             new_state = Some(state);
-            return_msg = Some(Message::from(GetMsg::SeekNode { key, id, target }));
+            return_msg = Some(Message::from(GetMsg::SeekNode {
+                key,
+                id,
+                target,
+                fetch_contract,
+            }));
         }
-        GetMsg::SeekNode { key, id, target } => {
+        GetMsg::SeekNode {
+            key,
+            id,
+            fetch_contract,
+            ..
+        } => {
+            let sender = PeerKeyLocation {
+                peer: conn_manager.peer_key(),
+                location: op_storage.ring.own_location(),
+            };
             if !op_storage.ring.has_contract(&key) {
-                // this node does not have the contract, return an error to the requester
+                //FIXME: should try forward to someone else who may have it first
+                // this node does not have the contract, return a void result to the requester
                 log::info!("Contract {} not found while processing info", key);
-                new_state = None;
-                todo!()
+                return Ok(OperationResult {
+                    return_msg: Some(Message::from(GetMsg::ReturnGet {
+                        key,
+                        id,
+                        value: StoreResponse {
+                            value: None,
+                            contract: None,
+                        },
+                        sender,
+                    })),
+                    state: None,
+                });
             }
-            // FIXME: fetch_contract should be communicated by the requester
             if let ContractHandlerEvent::FetchResponse {
                 response: value,
                 key: returned_key,
             } = op_storage
                 .notify_contract_handler(ContractHandlerEvent::FetchQuery {
                     key,
-                    fetch_contract: false,
+                    fetch_contract,
                 })
                 .await?
             {
                 if returned_key != key {
                     return Err(OpError::IllegalStateTransition);
                 }
+
+                match &value {
+                    Ok(StoreResponse {
+                        value: Some(_),
+                        contract: None,
+                    }) => return Err(ContractError::ContractNotFound(key).into()),
+                    _ => {}
+                }
+
                 return_msg = state
                     .sm
                     .consume_to_output(GetMsg::ReturnGet {
                         key,
                         id,
                         value: value.map_err(ContractError::from)?,
-                        target,
+                        sender,
                     })?
                     .map(Message::from);
                 new_state = Some(state);
+            } else {
+                return Err(OpError::IllegalStateTransition);
+            }
+        }
+        GetMsg::ReturnGet {
+            id,
+            key,
+            value:
+                StoreResponse {
+                    value: None,
+                    contract: None,
+                },
+            sender,
+            ..
+        } => {
+            log::info!(
+                "Contract value for {} not available, retrying with other peers.",
+                key
+            );
+            // will error out in case
+            state.sm.consume_to_state(GetMsg::ReturnGet {
+                id,
+                key,
+                sender,
+                value: StoreResponse {
+                    value: None,
+                    contract: None,
+                },
+            })?;
+            if let GetState::AwaitingResponse {
+                skip_list,
+                fetch_contract,
+                retries,
+                ..
+            } = state.sm.state()
+            {
+                if let Some(target) = op_storage
+                    .ring
+                    .closest_caching(&key, 1, skip_list)
+                    .into_iter()
+                    .next()
+                {
+                    return_msg = Some(Message::from(GetMsg::SeekNode {
+                        id,
+                        key,
+                        target,
+                        fetch_contract: *fetch_contract,
+                    }));
+                    *retries += 1;
+                    new_state = Some(state);
+                } else {
+                    return Err(OpError::IllegalStateTransition);
+                }
             } else {
                 return Err(OpError::IllegalStateTransition);
             }
@@ -181,41 +395,6 @@ where
         return_msg,
         state: new_state.map(Operation::Get),
     })
-}
-
-/// Request to get the current value from a contract.
-pub(crate) async fn request_get<CErr>(
-    op_storage: &OpManager<CErr>,
-    mut get_op: GetOp,
-) -> Result<(), OpError<CErr>>
-where
-    CErr: std::error::Error,
-{
-    let (target, id) = if let GetState::Request { key, id } = get_op.sm.state() {
-        // the initial request must provide:
-        // - a location in the network where the contract resides
-        // - and the key of the contract value to get
-        (
-            op_storage
-                .ring
-                .closest_caching(key, 1)
-                .into_iter()
-                .next()
-                .ok_or_else(|| OpError::from(RingError::EmptyRing))?,
-            *id,
-        )
-    } else {
-        return Err(OpError::IllegalStateTransition);
-    };
-    if let Some(req_get) = get_op
-        .sm
-        .consume_to_output(GetMsg::FetchRouting { target, id })?
-    {
-        op_storage
-            .notify_change(Message::from(req_get), Operation::Get(get_op))
-            .await?;
-    }
-    Ok(())
 }
 
 mod messages {
@@ -236,17 +415,22 @@ mod messages {
             id: Transaction,
             target: PeerKeyLocation,
             key: ContractKey,
+            fetch_contract: bool,
         },
         SeekNode {
             id: Transaction,
             key: ContractKey,
             target: PeerKeyLocation,
+            fetch_contract: bool,
         },
         ReturnGet {
             id: Transaction,
             key: ContractKey,
             value: StoreResponse,
-            target: PeerKeyLocation,
+            sender: PeerKeyLocation,
+        },
+        Retry {
+            num_retries: usize,
         },
     }
 
@@ -257,13 +441,13 @@ mod messages {
                 Self::RequestGet { id, .. } => id,
                 Self::SeekNode { id, .. } => id,
                 Self::ReturnGet { id, .. } => id,
+                Self::Retry { .. } => unimplemented!(),
             }
         }
 
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
-                Self::ReturnGet { target, .. } => Some(target),
                 _ => None,
             }
         }

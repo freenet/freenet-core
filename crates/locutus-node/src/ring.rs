@@ -16,7 +16,7 @@ use dashmap::DashSet;
 use parking_lot::RwLock;
 
 use crate::{
-    conn_manager::{self, PeerKeyLocation},
+    conn_manager::{self, PeerKey, PeerKeyLocation},
     contract::ContractKey,
 };
 
@@ -117,18 +117,31 @@ impl Ring {
         conn_by_dist[idx]
     }
 
-    /// Return the closest peers to a contract location which are caching it.
-    pub fn closest_caching(&self, contract: &ContractKey, n: usize) -> Vec<PeerKeyLocation> {
+    /// Return the closest peers to a contract location which are caching it,
+    /// excluding whichever peers in the skip list.
+    #[inline]
+    pub fn closest_caching(
+        &self,
+        contract: &ContractKey,
+        n: usize,
+        skip_list: &[PeerKey],
+    ) -> Vec<PeerKeyLocation> {
         // Right now we return just the closest known peers to that location.
         // In the future this may change to the ones closest which are actually already caching it.
-        self.routing(&contract.location(), n)
+        self.routing(&contract.location(), n, skip_list)
     }
 
     /// Find the closest number of peers to a given location. Result is returned sorted by proximity.
-    pub fn routing(&self, target: &Location, n: usize) -> Vec<PeerKeyLocation> {
+    pub fn routing(
+        &self,
+        target: &Location,
+        n: usize,
+        skip_list: &[PeerKey],
+    ) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let mut conn_by_dist: Vec<_> = connections
             .iter()
+            .filter(|(_, pkloc)| !skip_list.contains(&pkloc.peer))
             .map(|(loc, peer)| (loc.distance(target), (loc, peer)))
             .collect();
         conn_by_dist.sort_by_key(|&(dist, _)| dist);
@@ -286,7 +299,7 @@ mod test {
 
         assert_eq!(
             Location(0.0),
-            ring.routing(&Location(0.9), 1)
+            ring.routing(&Location(0.9), 1, &[])
                 .first()
                 .unwrap()
                 .location
@@ -294,7 +307,7 @@ mod test {
         );
         assert_eq!(
             Location(0.0),
-            ring.routing(&Location(0.1), 1)
+            ring.routing(&Location(0.1), 1, &[])
                 .first()
                 .unwrap()
                 .location
@@ -302,7 +315,7 @@ mod test {
         );
         assert_eq!(
             Location(0.5),
-            ring.routing(&Location(0.41), 1)
+            ring.routing(&Location(0.41), 1, &[])
                 .first()
                 .unwrap()
                 .location
@@ -310,7 +323,7 @@ mod test {
         );
         assert_eq!(
             Location(0.3),
-            ring.routing(&Location(0.39), 1)
+            ring.routing(&Location(0.39), 1, &[])
                 .first()
                 .unwrap()
                 .location

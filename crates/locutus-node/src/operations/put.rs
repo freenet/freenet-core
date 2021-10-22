@@ -198,13 +198,14 @@ where
     // - and the value to put
     let target = op_storage
         .ring
-        .closest_caching(&key, 1)
+        .closest_caching(&key, 1, &[])
         .into_iter()
         .next()
         .ok_or_else(|| OpError::from(RingError::EmptyRing))?;
 
+    let id = *put_op.sm.state().id();
     if let Some(req_put) = put_op.sm.consume_to_output(PutMsg::RouteValue {
-        id: *put_op.sm.state().id(),
+        id,
         htl: op_storage.ring.max_hops_to_live,
         target,
     })? {
@@ -344,7 +345,7 @@ where
                 )
                 .await?;
             // TODO: actual broadcasting to subscribers of this contract
-            let broadcast_to = op_storage.ring.closest_caching(&key, 10);
+            let broadcast_to = op_storage.ring.closest_caching(&key, 10, &[]);
 
             // forward changes in the contract to nodes closer to the contract location, if possible
             let forward_to = broadcast_to.clone();

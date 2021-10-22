@@ -1,6 +1,5 @@
 use sqlx::SqlitePool;
 use crate::contract::handler::SQLiteContractHandler;
-use crate::contract::interface::{ContractInterface, ContractKeyResult};
 use crate::node::SimStorageError;
 
 #[cfg(test)]
@@ -12,23 +11,6 @@ use super::{
 
 pub(crate) struct MemoryContractHandler {
     channel: ContractHandlerChannel<SimStorageError>,
-}
-
-pub(crate) struct TestContract {}
-
-
-impl ContractInterface for TestContract {
-
-    fn validate_value(value: &[u8]) -> bool {todo!()}
-
-    fn update_value(value: Vec<u8>, value_update: &[u8]) -> ContractKeyResult<Vec<u8>> {
-        // si es correcto el update_value
-        todo!()
-    }
-
-    fn related_contracts(value_update: &[u8]) -> Vec<ContractKey> {todo!()}
-
-    fn extract(extractor: Option<&[u8]>, value: &[u8]) -> Vec<u8> {todo!()}
 }
 
 impl MemoryContractHandler {

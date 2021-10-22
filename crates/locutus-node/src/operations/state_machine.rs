@@ -88,7 +88,7 @@ where
     }
 
     /// Returns the current state.
-    pub fn state(&self) -> &T::State {
-        self.state.as_ref().expect("infallible")
+    pub fn state(&mut self) -> &mut T::State {
+        self.state.as_mut().expect("infallible")
     }
 }

@@ -115,4 +115,6 @@ impl ContractValue {
 pub(crate) enum ContractError<SErr: std::error::Error> {
     #[error("failed while storing a contract")]
     StorageError(#[from] SErr),
+    #[error("contract {0} not found in storage")]
+    ContractNotFound(ContractKey),
 }
