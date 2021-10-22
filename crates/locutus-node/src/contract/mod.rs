@@ -5,6 +5,7 @@ use crate::ring::Location;
 
 mod interface;
 mod store;
+mod handler;
 mod test_utils;
 
 pub(crate) use store::{
