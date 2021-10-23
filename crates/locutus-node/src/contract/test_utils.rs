@@ -49,10 +49,10 @@ impl ContractHandler for MemoryContractHandler {
 }
 
 #[test]
-fn serialization() -> Result<(), Box<dyn std::error::Error>> {
+fn serialization() -> Result<(), anyhow::Error> {
     let bytes = crate::test_utils::random_bytes_1024();
     let mut gen = arbitrary::Unstructured::new(&bytes);
-    let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
+    let contract: Contract = gen.arbitrary()?;
 
     let serialized = bincode::serialize(&contract)?;
     let deser: Contract = bincode::deserialize(&serialized)?;

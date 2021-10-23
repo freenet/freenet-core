@@ -453,3 +453,14 @@ mod messages {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn successful_get_op_seq() -> Result<(), anyhow::Error> {
+        //
+        Ok(())
+    }
+}

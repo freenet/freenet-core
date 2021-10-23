@@ -140,7 +140,7 @@ impl NodeConfig {
     }
 
     /// Builds a node using in-memory transport. Used for testing pourpouses.
-    pub fn build_in_memory(self) -> Result<Node, &'static str> {
+    pub fn build_in_memory(self) -> Result<Node, anyhow::Error> {
         let inmem = NodeInMemory::build(self)?;
         Ok(Node(NodeImpl::InMemory(Box::new(inmem))))
     }

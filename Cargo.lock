@@ -1738,6 +1738,7 @@ dependencies = [
 name = "locutus-node"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "arbitrary",
  "async-trait",
  "bincode",

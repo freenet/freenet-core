@@ -28,11 +28,11 @@ pub(crate) struct NodeInMemory {
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub fn build(config: NodeConfig) -> Result<Self, &'static str> {
+    pub fn build(config: NodeConfig) -> Result<Self, anyhow::Error> {
         if (config.local_ip.is_none() || config.local_port.is_none())
             && config.remote_nodes.is_empty()
         {
-            return Err("At least one remote gateway is required to join an existing network for non-gateway nodes.");
+            return Err(anyhow::anyhow!("At least one remote gateway is required to join an existing network for non-gateway nodes."));
         }
         let peer = PeerKey::from(config.local_key.public());
         let conn_manager = MemoryConnManager::new(true, peer, None);
