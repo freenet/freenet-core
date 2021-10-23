@@ -1,10 +1,8 @@
-use libp2p::core::Executor;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 use crate::contract::{ContractHandler, ContractHandlerChannel, ContractKey, ContractValue};
-use crate::contract::interface::{ContractInterface, ContractUpdateError, ContractUpdateResult};
+use crate::contract::interface::{ContractInterface, ContractUpdateResult};
 use crate::contract::store::ContractStore;
-use crate::node::SimStorageError;
 
 pub(crate) struct TestContract {}
 
@@ -48,9 +46,9 @@ impl ContractHandler for SQLiteContractHandler {
     /// Get current contract value, if present, otherwise get none.
     async fn get_value(
         &self,
-        _contract: &ContractKey,
+        contract: &ContractKey,
     ) -> Result<Option<ContractValue>, Self::Error> {
-        let encoded_key = base64::encode(_contract.0);
+        let encoded_key = base64::encode(contract.0);
         match sqlx::query(
         "SELECT key, value FROM contracts WHERE key = ?"
         )
@@ -92,7 +90,7 @@ impl ContractHandler for SQLiteContractHandler {
              RETURNING value"
         )
         .bind(encoded_key)
-        .bind(&value)
+        .bind(value)
         .map(|row: SqliteRow| {
             ContractValue{ 0: row.get("value") }
         })

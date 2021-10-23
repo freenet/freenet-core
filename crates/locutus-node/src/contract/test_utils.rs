@@ -1,6 +1,7 @@
 use sqlx::SqlitePool;
 use crate::contract::handler::SQLiteContractHandler;
 use crate::node::SimStorageError;
+use std::env;
 
 #[cfg(test)]
 use super::Contract;
@@ -73,7 +74,7 @@ async fn get_handler() -> Result<SQLiteContractHandler, sqlx::Error> {
     Ok(SQLiteContractHandler::new(ch_handler, db_pool))
 }
 
-// Create test cintracts table
+// Create test contracts table
 async fn create_test_contracts_table(pool: &SqlitePool) {
     sqlx::query("CREATE TABLE IF NOT EXISTS contracts (
         key             STRING PRIMARY KEY,
@@ -84,13 +85,16 @@ async fn create_test_contracts_table(pool: &SqlitePool) {
 
 #[tokio::test]
 async fn contract_handler() -> Result<(), Box<dyn std::error::Error>> {
+    // Generate a contract
     let contract_value: Vec<u8> = base64::decode_config("dmFsb3IgZGUgcHJ1ZWJhIDE=", base64::STANDARD)?;
     let contract: Contract = Contract::new(contract_value);
 
+    // Get contract parts
     let contract_key= ContractKey{0: contract.key};
     let contract_value= ContractValue::new(contract.data);
     let contract_value_cloned= contract_value.clone();
 
+    // Create a sqlite handler and add/get a new value
     let mut handler : SQLiteContractHandler = get_handler().await?;
     create_test_contracts_table(&handler.pool).await;
     let added_value = handler.put_value(&contract_key, contract_value).await?;
@@ -100,7 +104,7 @@ async fn contract_handler() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(contract_value_cloned.0, got_value.0);
     assert_eq!(added_value.0, got_value.0);
 
-    // Insert new contract_value at the same key
+    // Update the contract value with new one
     let new_contract_value: Vec<u8> = base64::decode_config("dmFsb3IgZGUgcHJ1ZWJhIDI=", base64::STANDARD)?;
     let new_contract_value= ContractValue::new(new_contract_value);
     let new_contract_value_cloned= new_contract_value.clone();

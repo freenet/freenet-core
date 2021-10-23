@@ -12,6 +12,7 @@ pub(crate) use store::{
     ContractHandler, ContractHandlerChannel, ContractHandlerEvent, StoreResponse,
 };
 pub(crate) use test_utils::MemoryContractHandler;
+pub(crate) use handler::SQLiteContractHandler;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 

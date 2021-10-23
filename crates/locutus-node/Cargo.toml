@@ -2,6 +2,7 @@
 name = "locutus-node"
 version = "0.0.1"
 edition = "2018"
+build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -10,6 +11,9 @@ path = "src/lib.rs"
 name = "node-deploy" 
 path = "src/bin/gateway-deploy.rs"
 doc = false
+
+[build-dependencies]
+rusqlite = { version = "0.25.0"}
 
 [dependencies]
 # anyhow = "1.0.42"
