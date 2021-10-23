@@ -76,6 +76,7 @@ pub(crate) enum Operation {
     JoinRing(join_ring::JoinRingOp),
     Put(put::PutOp),
     Get(get::GetOp),
+    Subscribe(subscribe::SubscribeOp),
 }
 
 #[derive(Debug, Default)]

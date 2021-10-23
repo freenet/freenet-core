@@ -17,14 +17,13 @@ use super::{
     OpError, Operation, OperationResult,
 };
 
-/// This is just a placeholder for now!
 pub(crate) struct GetOp {
     sm: StateMachine<GetOpSM>,
     _ttl: Duration,
 }
 
 impl GetOp {
-    /// Maximum number of retries to get items.
+    /// Maximum number of retries to get values.
     const MAX_RETRIES: usize = 10;
 
     pub fn start_op(key: ContractKey, fetch_contract: bool) -> Self {
@@ -245,6 +244,7 @@ where
     )
     .await
 }
+
 async fn update_state<CB, CErr>(
     conn_manager: &mut CB,
     mut state: GetOp,
@@ -460,7 +460,7 @@ mod test {
 
     #[test]
     fn successful_get_op_seq() -> Result<(), anyhow::Error> {
-        //
+        
         Ok(())
     }
 }

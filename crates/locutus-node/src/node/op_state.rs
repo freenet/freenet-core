@@ -6,7 +6,9 @@ use tokio::sync::mpsc::{error::SendError, Sender};
 use crate::{
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent},
     message::{Message, Transaction, TransactionType},
-    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, OpError, Operation},
+    operations::{
+        get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpError, Operation,
+    },
     ring::Ring,
 };
 
@@ -16,6 +18,7 @@ pub(crate) struct OpManager<CErr> {
     join_ring: DashMap<Transaction, JoinRingOp>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
+    subscribe: DashMap<Transaction, SubscribeOp>,
     notification_channel: Sender<Message>,
     contract_handler: ContractHandlerChannel<CErr>,
     // FIXME: think of an optiomal strategy to check for timeouts and clean up garbage
@@ -44,6 +47,7 @@ where
             join_ring: DashMap::default(),
             put: DashMap::default(),
             get: DashMap::default(),
+            subscribe: DashMap::default(),
             ring,
             notification_channel,
             contract_handler,
@@ -89,6 +93,10 @@ where
                 check_id_op!(id.tx_type(), TransactionType::Put);
                 self.get.insert(id, tx);
             }
+            Operation::Subscribe(tx) => {
+                check_id_op!(id.tx_type(), TransactionType::Subscribe);
+                self.subscribe.insert(id, tx);
+            }
         }
         Ok(())
     }
@@ -102,6 +110,11 @@ where
                 .map(Operation::JoinRing),
             TransactionType::Put => self.put.remove(id).map(|(_k, v)| v).map(Operation::Put),
             TransactionType::Get => self.get.remove(id).map(|(_k, v)| v).map(Operation::Get),
+            TransactionType::Subscribe => self
+                .subscribe
+                .remove(id)
+                .map(|(_k, v)| v)
+                .map(Operation::Subscribe),
             TransactionType::Canceled => todo!(),
         }
     }

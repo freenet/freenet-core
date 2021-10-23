@@ -9,7 +9,7 @@ use crate::{
     operations::{
         get,
         join_ring::{self, JoinRingMsg},
-        put,
+        put, subscribe,
     },
     ring::Ring,
     user_events::UserEventsProxy,
@@ -129,6 +129,15 @@ impl NodeInMemory {
                         get::handle_get_response(&self.op_storage, &mut self.conn_manager, op)
                             .await
                             .unwrap();
+                    }
+                    Message::Subscribe(op) => {
+                        subscribe::handle_subscribe_response(
+                            &self.op_storage,
+                            &mut self.conn_manager,
+                            op,
+                        )
+                        .await
+                        .unwrap();
                     }
                     Message::Canceled(_) => todo!(),
                 },

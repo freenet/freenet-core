@@ -13,7 +13,7 @@ use uuid::{
 
 use crate::{
     conn_manager::PeerKeyLocation,
-    operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
+    operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::Location,
 };
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
@@ -104,6 +104,7 @@ mod sealed_msg_type {
         Put,
         Get,
         Canceled,
+        Subscribe,
     }
 
     macro_rules! transaction_type_enumeration {
@@ -127,7 +128,8 @@ mod sealed_msg_type {
     transaction_type_enumeration!(decl struct {
         JoinRing -> JoinRingMsg,
         Put -> PutMsg,
-        Get -> GetMsg
+        Get -> GetMsg,
+        Subscribe -> SubscribeMsg
     });
 }
 
@@ -136,6 +138,7 @@ pub(crate) enum Message {
     JoinRing(JoinRingMsg),
     Put(PutMsg),
     Get(GetMsg),
+    Subscribe(SubscribeMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
 }
@@ -151,6 +154,7 @@ impl Message {
             JoinRing(op) => op.id(),
             Put(op) => op.id(),
             Get(op) => op.id(),
+            Subscribe(op) => op.id(),
             Canceled(tx) => tx,
         }
     }
