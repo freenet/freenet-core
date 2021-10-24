@@ -12,6 +12,7 @@ use std::{net::IpAddr, sync::Arc};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 use crate::contract::StoreResponse;
+use crate::operations::subscribe;
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
     config::CONF,
@@ -252,6 +253,11 @@ where
                 // Initialize a get op.
                 let op = get::GetOp::start_op(key, contract);
                 get::request_get(&op_storage, op).await.unwrap();
+            }
+            UserEvent::Subscribe { key } => {
+                // Initialize a subscribe op.
+                let op = subscribe::SubscribeOp::start_op(key);
+                subscribe::request_subscribe(&op_storage, op).await.unwrap();
             }
         }
     }

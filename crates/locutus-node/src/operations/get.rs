@@ -9,13 +9,13 @@ use crate::{
     ring::RingError,
 };
 
-pub(crate) use self::messages::GetMsg;
-
 use super::{
     handle_op_result,
     state_machine::{StateMachine, StateMachineImpl},
     OpError, Operation, OperationResult,
 };
+
+pub(crate) use self::messages::GetMsg;
 
 pub(crate) struct GetOp {
     sm: StateMachine<GetOpSM>,
@@ -28,7 +28,7 @@ impl GetOp {
 
     pub fn start_op(key: ContractKey, fetch_contract: bool) -> Self {
         let id = Transaction::new(<GetMsg as GetTxType>::tx_type_id());
-        let sm = StateMachine::from_state(GetState::Request {
+        let sm = StateMachine::from_state(GetState::PrepareRequest {
             key,
             id,
             fetch_contract,
@@ -52,7 +52,7 @@ impl StateMachineImpl for GetOpSM {
     fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
         match (state, input) {
             // states of the requester
-            (GetState::Request { fetch_contract, .. }, GetMsg::FetchRouting { .. }) => {
+            (GetState::PrepareRequest { fetch_contract, .. }, GetMsg::FetchRouting { .. }) => {
                 Some(GetState::AwaitingResponse {
                     skip_list: vec![],
                     retries: 0,
@@ -71,7 +71,7 @@ impl StateMachineImpl for GetOpSM {
                 Some(GetState::Completed)
             }
             // states of the petitioner
-            (GetState::Initializing, GetMsg::ReturnGet { .. }) => Some(GetState::Completed),
+            (GetState::ReceiveRequest, GetMsg::ReturnGet { .. }) => Some(GetState::Completed),
             _ => None,
         }
     }
@@ -125,7 +125,7 @@ impl StateMachineImpl for GetOpSM {
     fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
         match (state, input) {
             (
-                GetState::Request {
+                GetState::PrepareRequest {
                     key,
                     id,
                     fetch_contract,
@@ -138,7 +138,7 @@ impl StateMachineImpl for GetOpSM {
                 fetch_contract,
             }),
             (
-                GetState::Initializing,
+                GetState::ReceiveRequest,
                 GetMsg::ReturnGet {
                     id,
                     key,
@@ -157,17 +157,21 @@ impl StateMachineImpl for GetOpSM {
 }
 
 enum GetState {
-    Initializing,
-    Request {
+    /// A new petition for a get op.
+    ReceiveRequest,
+    /// Preparing request for get op.
+    PrepareRequest {
         key: ContractKey,
         id: Transaction,
         fetch_contract: bool,
     },
+    /// Awaiting response from petition.
     AwaitingResponse {
         skip_list: Vec<PeerKey>,
         retries: usize,
         fetch_contract: bool,
     },
+    /// Transaction complete.
     Completed,
 }
 
@@ -179,7 +183,7 @@ pub(crate) async fn request_get<CErr>(
 where
     CErr: std::error::Error,
 {
-    let (target, id) = if let GetState::Request { key, id, .. } = get_op.sm.state() {
+    let (target, id) = if let GetState::PrepareRequest { key, id, .. } = get_op.sm.state() {
         // the initial request must provide:
         // - a location in the network where the contract resides
         // - and the key of the contract value to get
@@ -206,7 +210,7 @@ where
     Ok(())
 }
 
-pub(crate) async fn handle_get_response<CB, CErr>(
+pub(crate) async fn handle_get_request<CB, CErr>(
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     get_op: GetMsg,
@@ -227,9 +231,9 @@ where
         Some(_) => return Err(OpError::TxUpdateFailure(tx)),
         None => {
             sender = get_op.sender().cloned();
-            // new request to join from this node, initialize the machine
+            // new request to get a value for a contract, initialize the machine
             let machine = GetOp {
-                sm: StateMachine::from_state(GetState::Initializing),
+                sm: StateMachine::from_state(GetState::ReceiveRequest),
                 _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, get_op, op_storage).await
@@ -460,7 +464,6 @@ mod test {
 
     #[test]
     fn successful_get_op_seq() -> Result<(), anyhow::Error> {
-        
         Ok(())
     }
 }

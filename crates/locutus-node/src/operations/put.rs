@@ -1,10 +1,9 @@
 //! A contract is PUT within a location distance, this entails that all nodes within
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
+// FIXME: should allow to do partial value updates
 
 use std::time::Duration;
-
-// use rust_fsm::{StateMachine, StateMachineImpl};
 
 use crate::{
     config::PEER_TIMEOUT,
@@ -38,7 +37,7 @@ impl PutOp {
         );
 
         let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
-        let sm = StateMachine::from_state(PutState::Requesting {
+        let sm = StateMachine::from_state(PutState::PrepareRequest {
             id,
             contract,
             value,
@@ -63,16 +62,16 @@ impl StateMachineImpl for PutOpSM {
     fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
         match (state, input) {
             // state changed for the initial requesting node
-            (PutState::AwaitAnswer { contract }, PutMsg::RequestPut { .. }) => {
-                Some(PutState::AwaitAnswer { contract })
+            (PutState::AwaitingResponse { contract }, PutMsg::RequestPut { .. }) => {
+                Some(PutState::AwaitingResponse { contract })
             }
-            (PutState::AwaitAnswer { contract, .. }, PutMsg::SuccessfulUpdate { .. }) => {
+            (PutState::AwaitingResponse { contract, .. }, PutMsg::SuccessfulUpdate { .. }) => {
                 log::debug!("Successfully updated value for {}", contract);
                 Some(PutState::BroadcastComplete)
             }
 
             // state changes for proxies
-            (PutState::Initializing, PutMsg::PutProxy { .. }) => None,
+            (PutState::ReceivedRequest, PutMsg::PutProxy { .. }) => None,
             _ => None,
         }
     }
@@ -80,14 +79,14 @@ impl StateMachineImpl for PutOpSM {
     fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
         match (state, input) {
             // state changed for the initial requesting node
-            (PutState::Requesting { contract, .. }, PutMsg::RouteValue { .. }) => {
-                Some(PutState::AwaitAnswer {
+            (PutState::PrepareRequest { contract, .. }, PutMsg::RouteValue { .. }) => {
+                Some(PutState::AwaitingResponse {
                     contract: contract.key(),
                 })
             }
             // state changes for the target node
             (
-                PutState::Initializing | PutState::BroadcastOngoing { .. },
+                PutState::ReceivedRequest | PutState::BroadcastOngoing { .. },
                 PutMsg::Broadcasting {
                     broadcast_to,
                     broadcasted_to,
@@ -111,7 +110,7 @@ impl StateMachineImpl for PutOpSM {
     fn output_from_input(state: Self::State, input: Self::Input) -> Option<Self::Output> {
         match (state, input) {
             (
-                PutState::Requesting {
+                PutState::PrepareRequest {
                     contract,
                     value,
                     id,
@@ -126,7 +125,7 @@ impl StateMachineImpl for PutOpSM {
                 target,
             }),
             (
-                PutState::Requesting { .. },
+                PutState::PrepareRequest { .. },
                 PutMsg::SeekNode {
                     id,
                     target,
@@ -143,7 +142,7 @@ impl StateMachineImpl for PutOpSM {
                 value,
                 htl,
             }),
-            (PutState::Initializing, PutMsg::Broadcasting { id, new_value, .. }) => {
+            (PutState::ReceivedRequest, PutMsg::Broadcasting { id, new_value, .. }) => {
                 Some(PutMsg::SuccessfulUpdate { id, new_value })
             }
             _ => None,
@@ -153,14 +152,14 @@ impl StateMachineImpl for PutOpSM {
 
 #[derive(PartialEq, Eq, Debug)]
 enum PutState {
-    Initializing,
-    Requesting {
+    ReceivedRequest,
+    PrepareRequest {
         id: Transaction,
         contract: Contract,
         value: ContractValue,
         htl: usize,
     },
-    AwaitAnswer {
+    AwaitingResponse {
         contract: ContractKey,
     },
     BroadcastOngoing {
@@ -173,7 +172,7 @@ enum PutState {
 impl PutState {
     fn id(&self) -> &Transaction {
         match self {
-            Self::Requesting { id, .. } => id,
+            Self::PrepareRequest { id, .. } => id,
             _ => unreachable!(),
         }
     }
@@ -187,7 +186,7 @@ pub(crate) async fn request_put<CErr>(
 where
     CErr: std::error::Error,
 {
-    let key = if let PutState::Requesting { contract, .. } = put_op.sm.state() {
+    let key = if let PutState::PrepareRequest { contract, .. } = put_op.sm.state() {
         contract.key()
     } else {
         return Err(OpError::IllegalStateTransition);
@@ -218,7 +217,7 @@ where
     Ok(())
 }
 
-pub(crate) async fn handle_put_response<CB, CErr>(
+pub(crate) async fn handle_put_request<CB, CErr>(
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     put_op: PutMsg,
@@ -239,9 +238,9 @@ where
         Some(_) => return Err(OpError::TxUpdateFailure(tx)),
         None => {
             sender = put_op.sender().cloned();
-            // new request to join from this node, initialize the machine
+            // new request to put a new value for a contract, initialize the machine
             let machine = PutOp {
-                sm: StateMachine::from_state(PutState::Initializing),
+                sm: StateMachine::from_state(PutState::ReceivedRequest),
                 _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, put_op, op_storage).await
@@ -344,11 +343,9 @@ where
                     .into(),
                 )
                 .await?;
-            // TODO: actual broadcasting to subscribers of this contract
-            let broadcast_to = op_storage.ring.closest_caching(&key, 10, &[]);
 
             // forward changes in the contract to nodes closer to the contract location, if possible
-            let forward_to = broadcast_to.clone();
+            let forward_to = op_storage.ring.closest_caching(&key, 10, &[]).clone();
             let own_loc = op_storage.ring.own_location().expect("infallible");
             let contract_loc = key.location();
             for peer in &forward_to {
@@ -376,6 +373,8 @@ where
                 }
             }
 
+            // TODO: actual broadcasting to subscribers of this contract
+            let broadcast_to = forward_to.clone();
             log::debug!(
                 "Successfully updated a value for contract {} @ {:?}",
                 contract.key(),
@@ -522,7 +521,7 @@ mod test {
 
         let mut requester =
             PutOp::start_op(contract.clone(), ContractValue::new(vec![0, 1, 2, 3]), 0).sm;
-        let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
+        let mut target = StateMachine::<PutOpSM>::from_state(PutState::ReceivedRequest);
 
         // requester.consume_to_state();
         let _req_msg =
@@ -541,7 +540,7 @@ mod test {
         // assert_eq!(req_msg, expected);
         assert_eq!(
             requester.state(),
-            &PutState::AwaitAnswer {
+            &PutState::AwaitingResponse {
                 contract: contract.key()
             }
         );
