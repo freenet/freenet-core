@@ -1,5 +1,5 @@
 # Locutus 
 
-Experimental P2P distributed layer for application building over the internet.
+[![Build Status](https://github.com/freenet/locutus/actions/workflows/build.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/build.yml)
 
-[![build](https://github.com/freenet/locutus/actions/workflows/rust.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/rust.yml)
+Experimental P2P distributed layer for application building over the internet.
