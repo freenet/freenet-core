@@ -1,4 +1,4 @@
-name: Rust
+name: build
 
 on:
   push:
@@ -31,8 +31,8 @@ jobs:
         with:
           toolchain: stable
           profile: minimal
-          override: 'true'
-          default: 'true'
+          override: "true"
+          default: "true"
 
       - name: Build
         run: cargo build --locked
@@ -65,8 +65,8 @@ jobs:
           toolchain: stable
           profile: minimal
           components: clippy
-          override: 'true'
-          default: 'true'
+          override: "true"
+          default: "true"
 
       - name: Use clippy to lint code
         run: cargo clippy -- -D warnings
@@ -84,9 +84,8 @@ jobs:
           toolchain: stable
           profile: minimal
           components: rustfmt
-          override: 'true'
-          default: 'true'
+          override: "true"
+          default: "true"
 
       - name: Check code formatting
         run: cargo fmt -- --check
-        
