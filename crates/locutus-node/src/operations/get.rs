@@ -269,6 +269,11 @@ where
             target,
             fetch_contract,
         } => {
+            // fast tracked from the request_get func
+            debug_assert!(matches!(
+                state.sm.state(),
+                GetState::AwaitingResponse { .. }
+            ));
             new_state = Some(state);
             return_msg = Some(Message::from(GetMsg::SeekNode {
                 key,
@@ -433,9 +438,6 @@ mod messages {
             value: StoreResponse,
             sender: PeerKeyLocation,
         },
-        Retry {
-            num_retries: usize,
-        },
     }
 
     impl GetMsg {
@@ -445,7 +447,6 @@ mod messages {
                 Self::RequestGet { id, .. } => id,
                 Self::SeekNode { id, .. } => id,
                 Self::ReturnGet { id, .. } => id,
-                Self::Retry { .. } => unimplemented!(),
             }
         }
 
