@@ -703,7 +703,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn node0_to_gateway_conn() -> Result<(), Box<dyn std::error::Error>> {
+    async fn node0_to_gateway_conn() -> Result<(), anyhow::Error> {
         //! Given a network of one node and one gateway test that both are connected.
         Logger::init_logger();
         let mut sim_net = SimNetwork::build(1, 1, 0);
@@ -714,12 +714,12 @@ mod test {
                     Ok(())
                 }
             },
-            _ => Err("no event received".into()),
+            _ => Err(anyhow::anyhow!("no event received")),
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn all_nodes_should_connect() -> Result<(), Box<dyn std::error::Error>> {
+    async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         //! Given a network of 1000 peers all nodes should have connections.
         Logger::init_logger();
 

@@ -510,11 +510,11 @@ mod test {
     use super::*;
 
     #[test]
-    fn successful_put_op_seq() -> Result<(), Box<dyn std::error::Error>> {
+    fn successful_put_op_seq() -> Result<(), anyhow::Error> {
         let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary().map_err(|_| "failed gen arb data")?;
+        let contract: Contract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
             location: Some(Location::random()),
             peer: PeerKey::random(),
@@ -525,13 +525,12 @@ mod test {
         let mut target = StateMachine::<PutOpSM>::from_state(PutState::Initializing);
 
         // requester.consume_to_state();
-        let _req_msg = requester
-            .consume_to_output::<OpError<SimStorageError>>(PutMsg::RouteValue {
+        let _req_msg =
+            requester.consume_to_output::<OpError<SimStorageError>>(PutMsg::RouteValue {
                 id,
                 htl: 0,
                 target: target_loc,
-            })?
-            .ok_or("no msg")?;
+            })?;
         let _expected = PutMsg::RequestPut {
             id,
             contract: contract.clone(),
@@ -554,7 +553,7 @@ mod test {
                 broadcasted_to: 0,
                 new_value: ContractValue::new(vec![4, 3, 2, 1]),
             })?
-            .ok_or("no msg")?;
+            .ok_or(anyhow::anyhow!("no output"))?;
         let expected = PutMsg::SuccessfulUpdate {
             id,
             new_value: ContractValue::new(vec![4, 3, 2, 1]),
