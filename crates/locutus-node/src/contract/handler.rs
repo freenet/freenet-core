@@ -43,7 +43,6 @@ impl ContractHandler for SQLiteContractHandler {
         todo!()
     }
 
-    /// Get current contract value, if present, otherwise get none.
     async fn get_value(
         &self,
         contract: &ContractKey,
