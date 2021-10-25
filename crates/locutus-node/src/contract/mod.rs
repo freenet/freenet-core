@@ -8,7 +8,6 @@ mod interface;
 mod store;
 mod test_utils;
 
-pub(crate) use handler::SQLiteContractHandler;
 pub(crate) use store::{
     ContractHandler, ContractHandlerChannel, ContractHandlerEvent, StoreResponse,
 };

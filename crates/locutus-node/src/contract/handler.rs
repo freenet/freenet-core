@@ -1,4 +1,3 @@
-use crate::contract::handler::DatabaseError::ContractNotFound;
 use crate::contract::interface::{ContractInterface, ContractUpdateResult};
 use crate::contract::store::ContractStore;
 use crate::contract::{ContractHandler, ContractHandlerChannel, ContractKey, ContractValue};
