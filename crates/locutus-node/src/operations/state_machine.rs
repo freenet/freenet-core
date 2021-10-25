@@ -1,4 +1,4 @@
-//! Inspired by rust-fsm. Brought in tree for modifying and tailoring it to
+//! Inspired by `rust-fsm`, bought in tree for modifying and tailoring it to
 //! this application needs.
 
 use super::OpError;
@@ -59,11 +59,13 @@ where
     /// Consumes the provided input, gives an output and performs a state
     /// transition. If a state transition with the current state and the
     /// provided input is not allowed, returns an error.
+    ///
+    /// The consumed input is moved to the state, while the output production takes it by reference.
     pub fn consume_to_state<CErr: std::error::Error>(
         &mut self,
         input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {
-        let popped_state = self.state.take().expect("infallible");
+        let popped_state = self.state.take().ok_or(OpError::IllegalStateTransition)?;
         let output = T::output_from_input_as_ref(&popped_state, &input);
         if let Some(new_state) = T::state_transition_from_input(popped_state, input) {
             self.state = Some(new_state);
@@ -73,11 +75,13 @@ where
         }
     }
 
+    /// Semantically similar to [`Self::consume_to_state()`] with the exception that
+    /// the consumed input is moved to the output, while the state change takes it by reference.
     pub fn consume_to_output<CErr: std::error::Error>(
         &mut self,
         input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {
-        let popped_state = self.state.take().expect("infallible");
+        let popped_state = self.state.take().ok_or(OpError::IllegalStateTransition)?;
         if let Some(new_state) = T::state_transition(&popped_state, &input) {
             let output = T::output_from_input(popped_state, input);
             self.state = Some(new_state);

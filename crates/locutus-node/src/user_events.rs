@@ -21,6 +21,9 @@ pub(crate) enum UserEvent {
         /// If this flag is set then fetch also the contract itself.
         contract: bool,
     },
+    /// Subscribe to teh changes in a given contract. Implicitly starts a get operation
+    /// if the contract is not present yet.
+    Subscribe { key: ContractKey },
 }
 
 pub(crate) mod test_utils {

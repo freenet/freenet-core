@@ -118,7 +118,7 @@ impl StateMachineImpl for JROpSM {
                 id,
                 sender: gateway,
                 msg: JoinResponse::AcceptedBy {
-                    peers: accepted_by.clone(),
+                    peers: accepted_by,
                     your_location,
                     your_peer_id,
                 },

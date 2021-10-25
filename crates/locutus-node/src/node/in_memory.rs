@@ -121,12 +121,12 @@ impl NodeInMemory {
                             .unwrap();
                     }
                     Message::Put(op) => {
-                        put::handle_put_response(&self.op_storage, &mut self.conn_manager, op)
+                        put::handle_put_request(&self.op_storage, &mut self.conn_manager, op)
                             .await
                             .unwrap();
                     }
                     Message::Get(op) => {
-                        get::handle_get_response(&self.op_storage, &mut self.conn_manager, op)
+                        get::handle_get_request(&self.op_storage, &mut self.conn_manager, op)
                             .await
                             .unwrap();
                     }

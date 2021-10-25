@@ -12,6 +12,7 @@ use std::{net::IpAddr, sync::Arc};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 use crate::contract::StoreResponse;
+use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
     config::CONF,
@@ -239,21 +240,50 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 async fn user_event_handling<UsrEv, CErr>(op_storage: Arc<OpManager<CErr>>, mut user_events: UsrEv)
 where
     UsrEv: UserEventsProxy + Send + Sync + 'static,
-    CErr: std::error::Error,
+    CErr: std::error::Error + Send + Sync + 'static,
 {
     loop {
-        match user_events.recv().await {
-            UserEvent::Put { value, contract } => {
-                // Initialize a put op.
-                let op = put::PutOp::start_op(contract, value, op_storage.ring.max_hops_to_live);
-                put::request_put(&op_storage, op).await.unwrap();
+        let ev = user_events.recv().await;
+        let op_storage_cp = op_storage.clone();
+        tokio::spawn(async move {
+            match ev {
+                UserEvent::Put { value, contract } => {
+                    // Initialize a put op.
+                    let op =
+                        put::PutOp::start_op(contract, value, op_storage_cp.ring.max_hops_to_live);
+                    if let Err(err) = put::request_put(&op_storage_cp, op).await {
+                        log::error!("{}", err);
+                    }
+                }
+                UserEvent::Get { key, contract } => {
+                    // Initialize a get op.
+                    let op = get::GetOp::start_op(key, contract);
+                    if let Err(err) = get::request_get(&op_storage_cp, op).await {
+                        log::error!("{}", err);
+                    }
+                }
+                UserEvent::Subscribe { key } => {
+                    // Initialize a subscribe op.
+                    loop {
+                        let op = subscribe::SubscribeOp::start_op(key);
+                        match subscribe::request_subscribe(&op_storage_cp, op).await {
+                            Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
+                                log::info!("Trying to subscribe to a contract not present: {}, requesting it first", key);
+                                let get_op = get::GetOp::start_op(key, true);
+                                if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
+                                    log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
+                                }
+                            }
+                            Err(err) => {
+                                log::error!("{}", err);
+                                break;
+                            }
+                            Ok(()) => break,
+                        }
+                    }
+                }
             }
-            UserEvent::Get { key, contract } => {
-                // Initialize a get op.
-                let op = get::GetOp::start_op(key, contract);
-                get::request_get(&op_storage, op).await.unwrap();
-            }
-        }
+        });
     }
 }
 
