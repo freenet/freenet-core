@@ -1,6 +1,6 @@
-use sqlx::SqlitePool;
 use crate::contract::handler::SQLiteContractHandler;
 use crate::node::SimStorageError;
+use sqlx::SqlitePool;
 
 #[cfg(test)]
 use super::Contract;
@@ -22,6 +22,7 @@ impl MemoryContractHandler {
 #[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
     type Error = SimStorageError;
+    type ContractStore = ContractStore;
 
     #[inline(always)]
     fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
@@ -73,45 +74,55 @@ async fn get_handler() -> Result<SQLiteContractHandler, sqlx::Error> {
 
 // Create test contracts table
 async fn create_test_contracts_table(pool: &SqlitePool) {
-    sqlx::query("CREATE TABLE IF NOT EXISTS contracts (
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS contracts (
         key             STRING PRIMARY KEY,
         value           BLOB
-        )"
-    ).execute(pool).await.unwrap();
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
-async fn contract_handler() -> Result<(), Box<dyn std::error::Error>> {
+async fn contract_handler() -> Result<(), anyhow::Error> {
+    // Create a sqlite handler and initialize the database
+    let mut handler: SQLiteContractHandler = get_handler().await?;
+    create_test_contracts_table(&handler.pool).await;
+
     // Generate a contract
-    let contract_value: Vec<u8> = base64::decode_config("dmFsb3IgZGUgcHJ1ZWJhIDE=", base64::STANDARD)?;
+    let contract_value: Vec<u8> = b"Test contract value".to_vec();
     let contract: Contract = Contract::new(contract_value);
 
     // Get contract parts
-    let contract_key= ContractKey{0: contract.key};
-    let contract_value= ContractValue::new(contract.data);
-    let contract_value_cloned= contract_value.clone();
+    let contract_key = ContractKey(contract.key);
+    let contract_value = ContractValue::new(contract.data);
+    let contract_value_cloned = contract_value.clone();
 
-    // Create a sqlite handler and add/get a new value
-    let mut handler : SQLiteContractHandler = get_handler().await?;
-    create_test_contracts_table(&handler.pool).await;
-    let added_value = handler.put_value(&contract_key, contract_value).await?;
-    let got_value = handler.get_value(&contract_key).await?.unwrap();
+    let put_result_value = handler.put_value(&contract_key, contract_value).await?;
+    let get_result_value = handler
+        .get_value(&contract_key)
+        .await?
+        .ok_or(anyhow::anyhow!("No value found"))?;
 
-    assert_eq!(contract_value_cloned.0, added_value.0);
-    assert_eq!(contract_value_cloned.0, got_value.0);
-    assert_eq!(added_value.0, got_value.0);
+    assert_eq!(contract_value_cloned.0, put_result_value.0);
+    assert_eq!(contract_value_cloned.0, get_result_value.0);
+    assert_eq!(put_result_value.0, get_result_value.0);
 
     // Update the contract value with new one
-    let new_contract_value: Vec<u8> = base64::decode_config("dmFsb3IgZGUgcHJ1ZWJhIDI=", base64::STANDARD)?;
-    let new_contract_value= ContractValue::new(new_contract_value);
-    let new_contract_value_cloned= new_contract_value.clone();
-    let new_added_value = handler.put_value(&contract_key, new_contract_value).await?;
-    let new_got_value = handler.get_value(&contract_key).await?.unwrap();
+    let new_contract_value: Vec<u8> = b"New test contract value".to_vec();
+    let new_contract_value = ContractValue::new(new_contract_value);
+    let new_contract_value_cloned = new_contract_value.clone();
+    let new_put_result_value = handler.put_value(&contract_key, new_contract_value).await?;
+    let new_get_result_value = handler
+        .get_value(&contract_key)
+        .await?
+        .ok_or(anyhow::anyhow!("No value found"))?;
 
-    assert_eq!(new_contract_value_cloned.0, new_added_value.0);
-    assert_eq!(new_contract_value_cloned.0, new_got_value.0);
-    assert_eq!(new_added_value.0, new_got_value.0);
-
+    assert_eq!(new_contract_value_cloned.0, new_put_result_value.0);
+    assert_eq!(new_contract_value_cloned.0, new_get_result_value.0);
+    assert_eq!(new_put_result_value.0, new_get_result_value.0);
 
     Ok(())
 }

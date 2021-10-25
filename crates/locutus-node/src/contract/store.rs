@@ -8,6 +8,7 @@ use super::{Contract, ContractError, ContractKey, ContractValue};
 #[async_trait::async_trait]
 pub(crate) trait ContractHandler {
     type Error;
+    type ContractStore;
 
     fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
 

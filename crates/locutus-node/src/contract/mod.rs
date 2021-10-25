@@ -3,16 +3,16 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ring::Location;
 
+mod handler;
 mod interface;
 mod store;
-mod handler;
 mod test_utils;
 
+pub(crate) use handler::SQLiteContractHandler;
 pub(crate) use store::{
     ContractHandler, ContractHandlerChannel, ContractHandlerEvent, StoreResponse,
 };
 pub(crate) use test_utils::MemoryContractHandler;
-pub(crate) use handler::SQLiteContractHandler;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
