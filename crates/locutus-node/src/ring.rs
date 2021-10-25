@@ -12,12 +12,12 @@
 
 use std::{borrow::Borrow, collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
 
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 
 use crate::{
     conn_manager::{self, PeerKey, PeerKeyLocation},
-    contract::ContractKey,
+    contract::{ContractKey, ContractValue},
 };
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
@@ -31,6 +31,12 @@ pub(crate) struct Ring {
     cached_contracts: DashSet<ContractKey>,
     // TODO: optimize this for an AtomicU64
     own_location: RwLock<Option<Location>>,
+    /// The container for subscriber is a vec instead of something like a hashset
+    /// that would allow for blind inserts of duplicate peers subscribing because
+    /// of data locality, since we are likely to end up iterating over the whole sequence
+    /// of subscribers more often than inserting, and anyways is a relatively short sequence
+    /// then is more optimal to just use a vector for it's compact memory layout.
+    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
 
 impl Ring {
@@ -50,6 +56,7 @@ impl Ring {
             connections_by_location: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location: RwLock::new(None),
+            subscribers: DashMap::new(),
         }
     }
 
@@ -160,6 +167,13 @@ impl Ring {
             .values()
             .find(filter_fn)
             .copied()
+    }
+
+    pub fn add_subscriber(&self, contract: ContractKey, subscriber: PeerKeyLocation) {
+        let mut subs = self.subscribers.entry(contract).or_default();
+        if let Err(next_idx) = subs.value_mut().binary_search(&subscriber) {
+            subs.value_mut().insert(next_idx, subscriber);
+        }
     }
 }
 

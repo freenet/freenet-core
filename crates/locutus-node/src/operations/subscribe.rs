@@ -88,6 +88,11 @@ where
     CErr: std::error::Error,
 {
     let (target, id) = if let SubscribeState::PrepareRequest { id, key } = sub_op.sm.state() {
+        if !op_storage.ring.has_contract(key) {
+            return Err(OpError::ContractError(ContractError::ContractNotFound(
+                *key,
+            )));
+        }
         (
             op_storage
                 .ring
@@ -101,7 +106,6 @@ where
         return Err(OpError::IllegalStateTransition);
     };
 
-    // FIXME assert that this node already got the contract, if it doesn't it should do that first
     if let Some(req_sub) = sub_op
         .sm
         .consume_to_output(SubscribeMsg::FetchRouting { target, id })?
@@ -172,15 +176,54 @@ where
                 state.sm.state(),
                 SubscribeState::AwaitingResponse { .. }
             ));
+            let sender = PeerKeyLocation {
+                peer: conn_manager.peer_key(),
+                location: op_storage.ring.own_location(),
+            };
             new_state = Some(state);
-            return_msg = Some(Message::from(SubscribeMsg::SeekNode { id, key, target }));
+            return_msg = Some(Message::from(SubscribeMsg::SeekNode {
+                id,
+                key,
+                target,
+                subscriber: sender,
+            }));
         }
-        SubscribeMsg::SeekNode { key, id, target } => {
+        SubscribeMsg::SeekNode {
+            key,
+            id,
+            target,
+            subscriber,
+        } => {
+            let sender = PeerKeyLocation {
+                peer: conn_manager.peer_key(),
+                location: op_storage.ring.own_location(),
+            };
+
+            if !op_storage.ring.has_contract(&key) {
+                //FIXME: should try forward to someone else who may have it first
+                // this node does not have the contract, return a void result to the requester
+                log::info!("Contract {} not found while processing info", key);
+                return Ok(OperationResult {
+                    return_msg: Some(Message::from(SubscribeMsg::ReturnSub {
+                        key,
+                        id,
+                        subscribed: false,
+                        sender,
+                    })),
+                    state: None,
+                });
+            }
+
+            op_storage.ring.add_subscriber(key.clone(), subscriber);
+
             todo!()
         }
         _ => return Err(OpError::IllegalStateTransition),
     }
-    todo!()
+    Ok(OperationResult {
+        return_msg,
+        state: new_state.map(Operation::Subscribe),
+    })
 }
 
 mod messages {
@@ -201,6 +244,13 @@ mod messages {
             id: Transaction,
             key: ContractKey,
             target: PeerKeyLocation,
+            subscriber: PeerKeyLocation,
+        },
+        ReturnSub {
+            id: Transaction,
+            key: ContractKey,
+            sender: PeerKeyLocation,
+            subscribed: bool,
         },
     }
 
@@ -210,6 +260,7 @@ mod messages {
                 Self::SeekNode { id, .. } => id,
                 Self::FetchRouting { id, .. } => id,
                 Self::RequestSub { id, .. } => id,
+                Self::ReturnSub { id, .. } => id,
             }
         }
 

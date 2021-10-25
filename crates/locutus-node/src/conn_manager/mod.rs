@@ -36,7 +36,7 @@ pub(crate) trait Transport {
     fn location(&self) -> Option<Location>;
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct PeerKey(PeerId);
 
 impl PeerKey {
@@ -63,10 +63,11 @@ impl From<PeerId> for PeerKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
-/// The Location of a PeerKey in the ring. This location allows routing towards the peer.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// The Location of a peer in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
     pub peer: PeerKey,
+    /// An unspecified location means that the peer hasn't been asigned a location, yet.
     pub location: Option<Location>,
 }
 

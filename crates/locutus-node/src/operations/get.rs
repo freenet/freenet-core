@@ -292,6 +292,7 @@ where
                 peer: conn_manager.peer_key(),
                 location: op_storage.ring.own_location(),
             };
+            
             if !op_storage.ring.has_contract(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
@@ -309,6 +310,7 @@ where
                     state: None,
                 });
             }
+
             if let ContractHandlerEvent::FetchResponse {
                 response: value,
                 key: returned_key,
