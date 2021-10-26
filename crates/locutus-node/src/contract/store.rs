@@ -8,7 +8,6 @@ use super::{Contract, ContractError, ContractKey, ContractValue};
 #[async_trait::async_trait]
 pub(crate) trait ContractHandler {
     type Error;
-    type ContractStore;
 
     fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
 
@@ -33,6 +32,9 @@ pub(crate) trait ContractHandler {
 pub(crate) struct ContractStore {}
 
 impl ContractStore {
+    pub fn new() -> Self {
+        Self {}
+    }
     /// Returns a copy of the contract bytes if available, none otherwise.
     pub async fn fetch_contract<CErr>(
         &self,

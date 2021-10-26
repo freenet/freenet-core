@@ -33,19 +33,27 @@ impl ContractInterface for TestContract {
 
 pub(crate) struct SQLiteContractHandler {
     channel: ContractHandlerChannel<DatabaseError>,
+    store: ContractStore,
     pub pool: SqlitePool,
 }
 
 impl SQLiteContractHandler {
-    pub fn new(channel: ContractHandlerChannel<DatabaseError>, pool: SqlitePool) -> Self {
-        SQLiteContractHandler { channel, pool }
+    pub fn new(
+        channel: ContractHandlerChannel<DatabaseError>,
+        store: ContractStore,
+        pool: SqlitePool,
+    ) -> Self {
+        SQLiteContractHandler {
+            channel,
+            store,
+            pool,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl ContractHandler for SQLiteContractHandler {
     type Error = DatabaseError;
-    type ContractStore = ContractStore;
 
     #[inline(always)]
     fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
@@ -54,7 +62,7 @@ impl ContractHandler for SQLiteContractHandler {
 
     #[inline(always)]
     fn contract_store(&mut self) -> &mut ContractStore {
-        todo!()
+        &mut self.store
     }
 
     async fn get_value(
@@ -91,10 +99,7 @@ impl ContractHandler for SQLiteContractHandler {
 
         let value: Vec<u8> = match TestContract::update_value(old_value.0, &value.0) {
             Ok(contract_value) => contract_value,
-            Err(err) => {
-                // err.value
-                todo!()
-            }
+            Err(err) => err.value,
         };
 
         let encoded_key = base64::encode(contract.0);

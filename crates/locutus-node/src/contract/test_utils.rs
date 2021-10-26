@@ -22,7 +22,6 @@ impl MemoryContractHandler {
 #[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
     type Error = SimStorageError;
-    type ContractStore = ContractStore;
 
     #[inline(always)]
     fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
@@ -68,8 +67,9 @@ fn serialization() -> Result<(), anyhow::Error> {
 async fn get_handler() -> Result<SQLiteContractHandler, sqlx::Error> {
     let ch_handler = ContractHandlerChannel::new();
     let db_pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    let store: ContractStore = ContractStore::new();
     create_test_contracts_table(&db_pool).await;
-    Ok(SQLiteContractHandler::new(ch_handler, db_pool))
+    Ok(SQLiteContractHandler::new(ch_handler, store, db_pool))
 }
 
 // Create test contracts table
