@@ -42,3 +42,5 @@ thiserror = "1.0"
 tokio = { version = "1.12", features = ["rt-multi-thread", "sync", "macros"] }
 typestate = "0.8.0"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
+sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
+base64 = { version = "0.13.0" }

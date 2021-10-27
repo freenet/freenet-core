@@ -10,7 +10,7 @@ pub(super) type ContractUpdateResult<T> = Result<T, ContractUpdateError>;
 
 pub(super) struct ContractUpdateError {
     /// original PUT value
-    value: Vec<u8>,
+    pub value: Vec<u8>,
     kind: ErrorKind,
 }
 

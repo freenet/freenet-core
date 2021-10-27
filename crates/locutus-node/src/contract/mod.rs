@@ -3,6 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ring::Location;
 
+mod handler;
 mod interface;
 mod store;
 mod test_utils;
