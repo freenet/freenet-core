@@ -74,7 +74,7 @@ impl ContractKey {
 
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let r = hex::encode(self.0);
+        let r = base64::encode(self.0);
         write!(f, "{}", r)
     }
 }
