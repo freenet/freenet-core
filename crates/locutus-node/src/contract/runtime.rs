@@ -42,10 +42,8 @@ impl ContractRuntime {
     }
 }
 
-pub(crate) struct ContractUpdateError {
-    /// original PUT value
-    pub value: Vec<u8>,
-    pub kind: ErrorKind,
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum ContractUpdateError {
+    #[error("invalid put value")]
+    InvalidValue(Vec<u8>),
 }
-
-pub(crate) enum ErrorKind {}

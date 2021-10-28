@@ -3,7 +3,7 @@ use crate::contract::{ContractHandler, ContractHandlerChannel, ContractKey, Cont
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
-use super::runtime::ContractRuntime;
+use super::runtime::{ContractRuntime, ContractUpdateError};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DatabaseError {
@@ -11,6 +11,8 @@ pub(crate) enum DatabaseError {
     ContractNotFound,
     #[error(transparent)]
     SqliteError(#[from] sqlx::Error),
+    #[error(transparent)]
+    RuntimeError(#[from] ContractUpdateError),
 }
 
 pub(crate) struct SQLiteContractHandler {
@@ -79,11 +81,7 @@ impl ContractHandler for SQLiteContractHandler {
             Err(_) => value.clone(),
         };
 
-        let value: Vec<u8> = match ContractRuntime::update_value(old_value.0, &value.0) {
-            Ok(contract_value) => contract_value,
-            Err(err) => err.value,
-        };
-
+        let value: Vec<u8> = ContractRuntime::update_value(old_value.0, &value.0)?;
         let encoded_key = base64::encode(contract.0);
         match sqlx::query(
             "INSERT OR REPLACE INTO contracts (key, value) VALUES (?1, ?2)\
