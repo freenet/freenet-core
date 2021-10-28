@@ -100,6 +100,7 @@ impl ContractHandler for SQLiteContractHandler {
         }
     }
 }
+
 #[cfg(test)]
 mod test {
     use crate::contract::Contract;
@@ -119,9 +120,9 @@ mod test {
     async fn create_test_contracts_table(pool: &SqlitePool) {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS contracts (
-        key             STRING PRIMARY KEY,
-        value           BLOB
-        )",
+                    key             STRING PRIMARY KEY,
+                    value           BLOB
+                )",
         )
         .execute(pool)
         .await

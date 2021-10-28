@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::node::SimStorageError;
 
 #[cfg(test)]
@@ -9,11 +11,17 @@ use super::{
 
 pub(crate) struct MemoryContractHandler {
     channel: ContractHandlerChannel<SimStorageError>,
+    mem_db: HashMap<ContractKey, ContractValue>,
+    contract_store: ContractStore,
 }
 
 impl MemoryContractHandler {
     pub fn new(channel: ContractHandlerChannel<SimStorageError>) -> Self {
-        MemoryContractHandler { channel }
+        MemoryContractHandler {
+            channel,
+            mem_db: HashMap::new(),
+            contract_store: ContractStore::new(),
+        }
     }
 }
 
@@ -28,23 +36,25 @@ impl ContractHandler for MemoryContractHandler {
 
     #[inline(always)]
     fn contract_store(&mut self) -> &mut ContractStore {
-        todo!()
+        &mut self.contract_store
     }
 
     /// Get current contract value, if present, otherwise get none.
     async fn get_value(
         &self,
-        _contract: &ContractKey,
+        contract: &ContractKey,
     ) -> Result<Option<ContractValue>, Self::Error> {
-        todo!()
+        Ok(self.mem_db.get(contract).cloned())
     }
 
     async fn put_value(
         &mut self,
-        _contract: &ContractKey,
-        _value: ContractValue,
+        contract: &ContractKey,
+        value: ContractValue,
     ) -> Result<ContractValue, Self::Error> {
-        todo!()
+        let new_val = value.clone();
+        self.mem_db.insert(*contract, value);
+        Ok(new_val)
     }
 }
 
