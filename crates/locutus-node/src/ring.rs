@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 
 use crate::{
     conn_manager::{self, PeerKey, PeerKeyLocation},
-    contract::{ContractKey, ContractValue},
+    contract::ContractKey,
 };
 
 /// Thread safe and friendly data structure to keep track of the local knowledge

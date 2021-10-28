@@ -32,6 +32,9 @@ pub(crate) trait ContractHandler {
 pub(crate) struct ContractStore {}
 
 impl ContractStore {
+    pub fn new() -> Self {
+        Self {}
+    }
     /// Returns a copy of the contract bytes if available, none otherwise.
     pub async fn fetch_contract<CErr>(
         &self,
