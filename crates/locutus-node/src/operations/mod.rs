@@ -103,4 +103,6 @@ pub(crate) enum OpError<S: std::error::Error> {
     IncorrectTxType(TransactionType, TransactionType),
     #[error("failed while processing transaction {0}")]
     TxUpdateFailure(Transaction),
+    #[error("max number of retries for tx {0} of op type {1} reached")]
+    RetriesNumber(Transaction, String),
 }

@@ -25,6 +25,8 @@ pub(crate) struct SubscribeOp {
 }
 
 impl SubscribeOp {
+    const MAX_RETRIES: usize = 10;
+
     pub fn start_op(key: ContractKey) -> Self {
         let id = Transaction::new(<SubscribeMsg as GetTxType>::tx_type_id());
         let sm = StateMachine::from_state(SubscribeState::PrepareRequest { id, key });
@@ -52,6 +54,42 @@ impl StateMachineImpl for SubscribeOpSM {
                     retries: 0,
                 })
             }
+            (SubscribeState::ReceivedRequest, SubscribeMsg::SeekNode { .. }) => {
+                Some(SubscribeState::Completed)
+            }
+            (
+                SubscribeState::AwaitingResponse { .. },
+                SubscribeMsg::ReturnSub {
+                    subscribed: true, ..
+                },
+            ) => Some(SubscribeState::Completed),
+            _ => None,
+        }
+    }
+
+    fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
+        match (state, input) {
+            (
+                SubscribeState::AwaitingResponse {
+                    mut skip_list,
+                    retries,
+                },
+                SubscribeMsg::ReturnSub {
+                    sender,
+                    subscribed: false,
+                    ..
+                },
+            ) => {
+                if retries < SubscribeOp::MAX_RETRIES {
+                    skip_list.push(sender.peer);
+                    Some(SubscribeState::AwaitingResponse {
+                        skip_list,
+                        retries: retries + 1,
+                    })
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -62,6 +100,27 @@ impl StateMachineImpl for SubscribeOpSM {
                 SubscribeState::PrepareRequest { id, key, .. },
                 SubscribeMsg::FetchRouting { target, .. },
             ) => Some(SubscribeMsg::RequestSub { id, key, target }),
+            (
+                SubscribeState::ReceivedRequest,
+                SubscribeMsg::SeekNode {
+                    id,
+                    key,
+                    target,
+                    subscriber,
+                },
+            ) => {
+                log::info!(
+                    "Peer {} successfully subscribed to contract {}",
+                    subscriber.peer,
+                    key
+                );
+                Some(SubscribeMsg::ReturnSub {
+                    sender: target,
+                    id,
+                    key,
+                    subscribed: true,
+                })
+            }
             _ => None,
         }
     }
@@ -69,7 +128,10 @@ impl StateMachineImpl for SubscribeOpSM {
 
 enum SubscribeState {
     /// Prepare the request to subscribe.
-    PrepareRequest { id: Transaction, key: ContractKey },
+    PrepareRequest {
+        id: Transaction,
+        key: ContractKey,
+    },
     /// Received a request to subscribe to this network.
     ReceivedRequest,
     /// Awaitinh response from petition.
@@ -77,6 +139,7 @@ enum SubscribeState {
         skip_list: Vec<PeerKey>,
         retries: usize,
     },
+    Completed,
 }
 
 /// Request to subscribe to value changes from a contract.
@@ -191,19 +254,16 @@ where
         SubscribeMsg::SeekNode {
             key,
             id,
-            target,
             subscriber,
+            target,
         } => {
             let sender = PeerKeyLocation {
                 peer: conn_manager.peer_key(),
                 location: op_storage.ring.own_location(),
             };
 
-            if !op_storage.ring.has_contract(&key) {
-                //FIXME: should try forward to someone else who may have it first
-                // this node does not have the contract, return a void result to the requester
-                log::info!("Contract {} not found while processing info", key);
-                return Ok(OperationResult {
+            let return_err = || -> OperationResult {
+                OperationResult {
                     return_msg: Some(Message::from(SubscribeMsg::ReturnSub {
                         key,
                         id,
@@ -211,12 +271,101 @@ where
                         sender,
                     })),
                     state: None,
-                });
+                }
+            };
+
+            if !op_storage.ring.has_contract(&key) {
+                //FIXME: should try forward to someone else who may have it first
+                // this node does not have the contract, return a void result to the requester
+                log::info!("Contract {} not found while processing info", key);
+                return Ok(return_err());
             }
 
-            op_storage.ring.add_subscriber(key.clone(), subscriber);
+            if let Err(_) = op_storage.ring.add_subscriber(key.clone(), subscriber) {
+                // max number of subscribers for this contract reached
+                return Ok(return_err());
+            }
 
-            todo!()
+            return_msg = state
+                .sm
+                .consume_to_output(SubscribeMsg::SeekNode {
+                    id,
+                    key,
+                    target,
+                    subscriber,
+                })?
+                .map(Message::from);
+            new_state = None;
+        }
+        SubscribeMsg::ReturnSub {
+            subscribed: false,
+            key,
+            sender,
+            id,
+        } => {
+            log::info!(
+                "Contract `{}` not found at potential subscription provider {}",
+                key,
+                sender.peer
+            );
+            // will error out in case it has reached max number of retries
+            state
+                .sm
+                .consume_to_state(SubscribeMsg::ReturnSub {
+                    subscribed: false,
+                    key,
+                    sender,
+                    id,
+                })
+                .map_err(|_: OpError<CErr>| OpError::RetriesNumber(id, "sub".to_owned()))?;
+            if let SubscribeState::AwaitingResponse { skip_list, retries } = state.sm.state() {
+                if let Some(target) = op_storage
+                    .ring
+                    .closest_caching(&key, 1, skip_list)
+                    .into_iter()
+                    .next()
+                {
+                    let subscriber = PeerKeyLocation {
+                        peer: conn_manager.peer_key(),
+                        location: op_storage.ring.own_location(),
+                    };
+                    return_msg = Some(Message::from(SubscribeMsg::SeekNode {
+                        id,
+                        key,
+                        subscriber,
+                        target,
+                    }));
+                    new_state = Some(state);
+                } else {
+                    // TODO: better return err here
+                    return Err(OpError::IllegalStateTransition);
+                }
+            } else {
+                return Err(OpError::IllegalStateTransition);
+            }
+        }
+        SubscribeMsg::ReturnSub {
+            subscribed: true,
+            key,
+            sender,
+            id,
+        } => {
+            log::info!(
+                "Subscribed to `{}` not found at potential subscription provider {}",
+                key,
+                sender.peer
+            );
+            op_storage.ring.add_subscription(key);
+            return_msg = state
+                .sm
+                .consume_to_output(SubscribeMsg::ReturnSub {
+                    subscribed: true,
+                    key,
+                    sender,
+                    id,
+                })?
+                .map(Message::from);
+            new_state = None;
         }
         _ => return Err(OpError::IllegalStateTransition),
     }

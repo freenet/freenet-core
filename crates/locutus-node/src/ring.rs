@@ -46,7 +46,7 @@ pub(crate) struct Ring {
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    subscriptions: Vec<PeerKeyLocation>,
+    subscriptions: RwLock<Vec<ContractKey>>,
 }
 
 impl Ring {
@@ -69,7 +69,7 @@ impl Ring {
             cached_contracts: DashSet::new(),
             own_location: RwLock::new(None),
             subscribers: DashMap::new(),
-            subscriptions: Vec::new(),
+            subscriptions: RwLock::new(Vec::new()),
         }
     }
 
@@ -201,6 +201,12 @@ impl Ring {
             }
         }
         Ok(())
+    }
+
+    /// Add a new subscription for this peer.
+    pub fn add_subscription(&self, contract: ContractKey) {
+        self.subscriptions.write().push(contract);
+        todo!()
     }
 }
 

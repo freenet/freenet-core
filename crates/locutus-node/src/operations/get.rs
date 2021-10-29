@@ -92,34 +92,25 @@ impl StateMachineImpl for GetOpSM {
                             value: None,
                             contract: None,
                         },
-                    ..
-                },
-            ) if retries < GetOp::MAX_RETRIES => {
-                // no respose received from this peer, so skip it in the next iteration
-                skip_list.push(sender.peer);
-                Some(GetState::AwaitingResponse {
-                    skip_list,
-                    retries,
-                    fetch_contract,
-                })
-            }
-            (
-                GetState::AwaitingResponse { .. },
-                GetMsg::ReturnGet {
                     key,
-                    value:
-                        StoreResponse {
-                            value: None,
-                            contract: None,
-                        },
                     ..
                 },
             ) => {
-                log::error!(
-                    "Failed getting a value for contract {}, reached max retries",
-                    key
-                );
-                None
+                if retries < GetOp::MAX_RETRIES {
+                    // no respose received from this peer, so skip it in the next iteration
+                    skip_list.push(sender.peer);
+                    Some(GetState::AwaitingResponse {
+                        skip_list,
+                        retries: retries + 1,
+                        fetch_contract,
+                    })
+                } else {
+                    log::error!(
+                        "Failed getting a value for contract {}, reached max retries",
+                        key
+                    );
+                    None
+                }
             }
             _ => None,
         }
@@ -366,16 +357,19 @@ where
                 sender.peer,
                 key
             );
-            // will error out in case
-            state.sm.consume_to_state(GetMsg::ReturnGet {
-                id,
-                key,
-                sender,
-                value: StoreResponse {
-                    value: None,
-                    contract: None,
-                },
-            })?;
+            // will error out in case it has reached max number of retries
+            state
+                .sm
+                .consume_to_state(GetMsg::ReturnGet {
+                    id,
+                    key,
+                    sender,
+                    value: StoreResponse {
+                        value: None,
+                        contract: None,
+                    },
+                })
+                .map_err(|_: OpError<CErr>| OpError::RetriesNumber(id, "get".to_owned()))?;
             if let GetState::AwaitingResponse {
                 skip_list,
                 fetch_contract,
@@ -395,9 +389,9 @@ where
                         target,
                         fetch_contract: *fetch_contract,
                     }));
-                    *retries += 1;
                     new_state = Some(state);
                 } else {
+                    // TODO: better return err here
                     return Err(OpError::IllegalStateTransition);
                 }
             } else {
