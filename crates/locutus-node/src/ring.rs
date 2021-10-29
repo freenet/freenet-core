@@ -14,11 +14,20 @@ use std::{borrow::Borrow, collections::BTreeMap, convert::TryFrom, fmt::Display,
 
 use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    conn_manager::{self, PeerKey, PeerKeyLocation},
+    conn_manager::{self, PeerKey},
     contract::ContractKey,
 };
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// The Location of a peer in the ring. This location allows routing towards the peer.
+pub(crate) struct PeerKeyLocation {
+    pub peer: PeerKey,
+    /// An unspecified location means that the peer hasn't been asigned a location, yet.
+    pub location: Option<Location>,
+}
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.

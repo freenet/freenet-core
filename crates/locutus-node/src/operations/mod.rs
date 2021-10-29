@@ -1,9 +1,9 @@
 use crate::{
-    conn_manager::{self, ConnectionBridge, PeerKeyLocation},
+    conn_manager::{self, ConnectionBridge},
     contract::ContractError,
     message::{Message, Transaction, TransactionType},
     node::OpManager,
-    ring::RingError,
+    ring::{PeerKeyLocation, RingError},
 };
 
 pub(crate) mod get;

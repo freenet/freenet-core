@@ -3,11 +3,11 @@ use std::{collections::HashSet, time::Duration};
 use super::{handle_op_result, state_machine::StateMachineImpl, OpError, OperationResult};
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{self, ConnectionBridge, PeerKey, PeerKeyLocation},
+    conn_manager::{self, ConnectionBridge, PeerKey},
     message::{Message, Transaction},
     node::OpManager,
     operations::{state_machine::StateMachine, Operation},
-    ring::{Location, Ring},
+    ring::{Location, PeerKeyLocation, Ring},
 };
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
@@ -519,7 +519,7 @@ where
 
 mod messages {
     use super::*;
-    use crate::{conn_manager::PeerKeyLocation, ring::Location};
+    use crate::ring::{Location, PeerKeyLocation};
 
     use serde::{Deserialize, Serialize};
 

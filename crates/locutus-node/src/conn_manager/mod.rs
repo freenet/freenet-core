@@ -3,9 +3,11 @@
 use std::fmt::Display;
 
 use libp2p::{core::PublicKey, identity::Keypair, PeerId};
-use serde::{Deserialize, Serialize};
 
-use crate::{message::Message, ring::Location};
+use crate::{
+    message::Message,
+    ring::{Location, PeerKeyLocation},
+};
 
 pub mod in_memory;
 
@@ -61,14 +63,6 @@ impl From<PeerId> for PeerKey {
     fn from(val: PeerId) -> Self {
         PeerKey(val)
     }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-/// The Location of a peer in the ring. This location allows routing towards the peer.
-pub(crate) struct PeerKeyLocation {
-    pub peer: PeerKey,
-    /// An unspecified location means that the peer hasn't been asigned a location, yet.
-    pub location: Option<Location>,
 }
 
 #[derive(Debug, thiserror::Error)]

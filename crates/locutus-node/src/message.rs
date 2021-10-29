@@ -12,9 +12,8 @@ use uuid::{
 };
 
 use crate::{
-    conn_manager::PeerKeyLocation,
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg},
-    ring::Location,
+    ring::{Location, PeerKeyLocation},
 };
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 

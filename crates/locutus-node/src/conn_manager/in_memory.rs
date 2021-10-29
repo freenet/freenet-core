@@ -8,9 +8,9 @@ use parking_lot::Mutex;
 use super::{ConnError, Transport};
 use crate::{
     config::tracing::Logger,
-    conn_manager::{ConnectionBridge, PeerKey, PeerKeyLocation},
+    conn_manager::{ConnectionBridge, PeerKey},
     message::Message,
-    ring::Location,
+    ring::{Location, PeerKeyLocation},
 };
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
     OnceCell::new();

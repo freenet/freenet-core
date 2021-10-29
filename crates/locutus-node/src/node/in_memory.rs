@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
-    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey, PeerKeyLocation},
+    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
     contract::{ContractHandlerChannel, MemoryContractHandler},
     message::{GetTxType, Message, Transaction},
     operations::{
@@ -11,7 +11,7 @@ use crate::{
         join_ring::{self, JoinRingMsg},
         put, subscribe,
     },
-    ring::Ring,
+    ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     NodeConfig,
 };

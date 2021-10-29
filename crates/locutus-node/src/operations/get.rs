@@ -2,11 +2,11 @@ use std::time::Duration;
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey, PeerKeyLocation},
+    conn_manager::{ConnectionBridge, PeerKey},
     contract::{ContractError, ContractHandlerEvent, ContractKey, StoreResponse},
     message::{GetTxType, Message, Transaction},
     node::OpManager,
-    ring::RingError,
+    ring::{PeerKeyLocation, RingError},
 };
 
 use super::{
@@ -409,7 +409,7 @@ where
 }
 
 mod messages {
-    use crate::{conn_manager::PeerKeyLocation, contract::StoreResponse};
+    use crate::contract::StoreResponse;
 
     use super::*;
 

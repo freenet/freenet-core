@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey, PeerKeyLocation},
+    conn_manager::{ConnectionBridge, PeerKey},
     contract::{ContractError, ContractKey},
     message::{GetTxType, Message, Transaction},
     node::OpManager,
-    ring::RingError,
+    ring::{PeerKeyLocation, RingError},
 };
 
 use super::{
