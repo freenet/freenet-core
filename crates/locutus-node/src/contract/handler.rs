@@ -53,7 +53,7 @@ impl ContractHandler for SQLiteContractHandler {
         &self,
         contract: &ContractKey,
     ) -> Result<Option<ContractValue>, Self::Error> {
-        let encoded_key = base64::encode(contract.0);
+        let encoded_key = hex::encode(contract.0);
         match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
             .bind(encoded_key)
             .map(|row: SqliteRow| {
@@ -82,7 +82,7 @@ impl ContractHandler for SQLiteContractHandler {
         };
 
         let value: Vec<u8> = ContractRuntime::update_value(old_value.0, &value.0)?;
-        let encoded_key = base64::encode(contract.0);
+        let encoded_key = hex::encode(contract.0);
         match sqlx::query(
             "INSERT OR REPLACE INTO contracts (key, value) VALUES (?1, ?2)\
              RETURNING value",
