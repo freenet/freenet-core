@@ -67,7 +67,7 @@ impl StateMachineImpl for GetOpSM {
                     ..
                 },
             ) => {
-                log::info!("Get response received for contract {}", key);
+                log::debug!("Get response received for contract {}", key);
                 Some(GetState::Completed)
             }
             // states of the petitioner
@@ -115,7 +115,10 @@ impl StateMachineImpl for GetOpSM {
                     ..
                 },
             ) => {
-                log::info!("Failed getting a value for contract {}", key);
+                log::error!(
+                    "Failed getting a value for contract {}, reached max retries",
+                    key
+                );
                 None
             }
             _ => None,
@@ -296,7 +299,7 @@ where
             if !op_storage.ring.has_contract(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
-                log::info!("Contract {} not found while processing info", key);
+                log::info!("Contract {} not found while processing a get request", key);
                 return Ok(OperationResult {
                     return_msg: Some(Message::from(GetMsg::ReturnGet {
                         key,
@@ -359,7 +362,8 @@ where
             ..
         } => {
             log::info!(
-                "Contract value for {} not available, retrying with other peers.",
+                "Contract value for {} not available from peer {}, retrying with other peers.",
+                sender.peer,
                 key
             );
             // will error out in case

@@ -5,7 +5,8 @@ use crate::node::SimStorageError;
 #[cfg(test)]
 use super::Contract;
 use super::{
-    store::{ContractHandler, ContractHandlerChannel, ContractStore},
+    handler::{ContractHandler, ContractHandlerChannel},
+    store::ContractStore,
     ContractKey, ContractValue,
 };
 

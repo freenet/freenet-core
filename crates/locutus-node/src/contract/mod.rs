@@ -8,7 +8,7 @@ mod runtime;
 mod store;
 mod test_utils;
 
-pub(crate) use store::{
+pub(crate) use handler::{
     ContractHandler, ContractHandlerChannel, ContractHandlerEvent, StoreResponse,
 };
 pub(crate) use test_utils::MemoryContractHandler;
