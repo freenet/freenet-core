@@ -139,7 +139,7 @@ impl NodeInMemory {
                         .await
                         .unwrap();
                     }
-                    Message::Canceled(_) => todo!(),
+                    Message::Canceled(_tx) => todo!(),
                 },
                 Err(_) => return Err(()),
             }

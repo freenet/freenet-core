@@ -12,7 +12,7 @@
 
 use std::{borrow::Borrow, collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -215,7 +215,7 @@ impl Ring {
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
-    ) -> Option<dashmap::mapref::one::Ref<ContractKey, Vec<PeerKeyLocation>>> {
+    ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
         self.subscribers.get(contract)
     }
 }

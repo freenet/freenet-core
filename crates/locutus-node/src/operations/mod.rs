@@ -31,7 +31,7 @@ where
 {
     match result {
         Err((OpError::StatePushed, _)) => {
-            // do nothing and continue,the operation will just continue later on
+            // do nothing and continue, the operation will just continue later on
             return Ok(());
         }
         Err((err, tx_id)) => {

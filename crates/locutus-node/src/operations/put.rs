@@ -70,7 +70,9 @@ impl StateMachineImpl for PutOpSM {
                 Some(PutState::BroadcastComplete)
             }
             // state changes for proxies
-            (PutState::ReceivedRequest, PutMsg::PutForward { .. }) => None,
+            (PutState::ReceivedRequest, PutMsg::PutForward { .. }) => {
+                Some(PutState::BroadcastComplete)
+            }
             // state changes for the target node
             (
                 PutState::ReceivedRequest | PutState::BroadcastOngoing { .. },
@@ -180,6 +182,7 @@ enum PutState {
         completed: usize,
     },
     BroadcastComplete,
+    Done,
 }
 
 impl PutState {
@@ -324,27 +327,8 @@ where
                 todo!()
             }
 
-            let new_value;
             // after the contract has been cached, push the update query
-            match op_storage
-                .notify_contract_handler(ContractHandlerEvent::PushQuery { key, value })
-                .await
-            {
-                Ok(ContractHandlerEvent::PushResponse {
-                    new_value: Ok(new_val),
-                }) => {
-                    new_value = new_val;
-                }
-                Ok(ContractHandlerEvent::PushResponse {
-                    new_value: Err(_err),
-                }) => {
-                    // return Err(OpError::from(ContractError::StorageError(err)));
-                    todo!("not a valid value update, notify back to requester")
-                }
-                Err(err) => return Err(err.into()),
-                Ok(_) => return Err(OpError::IllegalStateTransition),
-            }
-
+            let new_value = put_contract(op_storage, key, value).await?;
             // if the change was successful, communicate this back to the requestor and broadcast the change
             conn_manager
                 .send(
@@ -357,30 +341,17 @@ where
                 )
                 .await?;
 
-            // forward changes in the contract to nodes closer to the contract location, if possible
-            let forward_to = op_storage.ring.closest_caching(&key, 10, &[]).clone();
-            let own_loc = op_storage.ring.own_location().location.expect("infallible");
-            let contract_loc = key.location();
-            for peer in forward_to {
-                let other_loc = peer.location.as_ref().expect("infallible");
-                let other_distance = contract_loc.distance(other_loc);
-                let self_distance = contract_loc.distance(&own_loc);
-                if other_distance < self_distance {
-                    // forward the contract towards this node since it is indeed closer
-                    // to the contract location
-                    conn_manager
-                        .send(
-                            peer,
-                            (PutMsg::PutForward {
-                                id,
-                                contract: contract.clone(),
-                                new_value: new_value.clone(),
-                                htl: htl - 1,
-                            })
-                            .into(),
-                        )
-                        .await?;
-                }
+            if let Some(new_htl) = htl.checked_sub(1) {
+                // forward changes in the contract to nodes closer to the contract location, if possible
+                forward_changes(
+                    op_storage,
+                    conn_manager,
+                    &contract,
+                    new_value.clone(),
+                    id,
+                    new_htl,
+                )
+                .await;
             }
 
             let broadcast_to = op_storage
@@ -490,8 +461,29 @@ where
             new_value,
             htl,
         } => {
-            // should here directly insert the update or run the value throught the value?
-            todo!()
+            let key = contract.key();
+            let cached_contract = op_storage.ring.has_contract(&key);
+            let within_caching_dist = op_storage.ring.within_caching_distance(&key.location());
+            if !cached_contract && within_caching_dist {
+                // this node does not have the contract, so instead store the contract and execute the put op.
+                op_storage
+                    .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
+                    .await?;
+            } else if !within_caching_dist {
+                // not a contract this node cares about; do nothing
+                return Ok(OperationResult {
+                    return_msg: None,
+                    state: None,
+                });
+            }
+            // after the contract has been cached, push the update query
+            let new_value = put_contract(op_storage, key, new_value).await?;
+            // if sucessful, forward to the next closest peers (if any)
+            if let Some(new_htl) = htl.checked_sub(1) {
+                forward_changes(op_storage, conn_manager, &contract, new_value, id, new_htl).await;
+            }
+            return_msg = None;
+            new_state = None;
         }
         _ => return Err(OpError::IllegalStateTransition),
     }
@@ -499,6 +491,75 @@ where
         return_msg,
         state: new_state.map(Operation::Put),
     })
+}
+
+async fn put_contract<CErr>(
+    op_storage: &OpManager<CErr>,
+    key: ContractKey,
+    value: ContractValue,
+) -> Result<ContractValue, OpError<CErr>>
+where
+    CErr: std::error::Error,
+{
+    // after the contract has been cached, push the update query
+    match op_storage
+        .notify_contract_handler(ContractHandlerEvent::PushQuery { key, value })
+        .await
+    {
+        Ok(ContractHandlerEvent::PushResponse {
+            new_value: Ok(new_val),
+        }) => Ok(new_val),
+        Ok(ContractHandlerEvent::PushResponse {
+            new_value: Err(_err),
+        }) => {
+            // return Err(OpError::from(ContractError::StorageError(err)));
+            todo!("not a valid value update, notify back to requester")
+        }
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(OpError::IllegalStateTransition),
+    }
+}
+
+// TODO: keep track of who is supposed to have the contract, and only send if necessary
+// since sending the contract over and over, will be expensive; this can be done via subscriptions
+/// Communicate changes in the contract to other peers nearby the contract location.
+/// This operation is "fire and forget" and the node does not keep track if is successful or not.
+async fn forward_changes<CErr, CB>(
+    op_storage: &OpManager<CErr>,
+    conn_manager: &CB,
+    contract: &Contract,
+    new_value: ContractValue,
+    id: Transaction,
+    htl: usize,
+) where
+    CErr: std::error::Error,
+    CB: ConnectionBridge,
+{
+    let key = contract.key();
+    let contract_loc = key.location();
+    let forward_to = op_storage.ring.closest_caching(&key, 10, &[]).clone();
+    let own_loc = op_storage.ring.own_location().location.expect("infallible");
+    for peer in forward_to {
+        let other_loc = peer.location.as_ref().expect("infallible");
+        let other_distance = contract_loc.distance(other_loc);
+        let self_distance = contract_loc.distance(&own_loc);
+        if other_distance < self_distance {
+            // forward the contract towards this node since it is indeed closer to the contract location
+            // and forget about it, no need to keep track of this op or wait for response
+            let _ = conn_manager
+                .send(
+                    peer,
+                    (PutMsg::PutForward {
+                        id,
+                        contract: contract.clone(),
+                        new_value: new_value.clone(),
+                        htl,
+                    })
+                    .into(),
+                )
+                .await;
+        }
+    }
 }
 
 mod messages {
