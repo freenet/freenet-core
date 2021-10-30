@@ -70,7 +70,7 @@ impl ConnectionBridge for MemoryConnManager {
         }
     }
 
-    async fn send(&self, target: &PeerKeyLocation, msg: Message) -> Result<(), ConnError> {
+    async fn send(&self, target: PeerKeyLocation, msg: Message) -> Result<(), ConnError> {
         let msg = bincode::serialize(&msg)?;
         self.transport.send(
             target.peer,
@@ -81,6 +81,8 @@ impl ConnectionBridge for MemoryConnManager {
     }
 
     fn add_connection(&mut self, _peer: PeerKeyLocation, _unsolicited: bool) {}
+
+    fn drop_connection(&mut self, _peer: PeerKey) {}
 
     fn peer_key(&self) -> PeerKey {
         self.peer

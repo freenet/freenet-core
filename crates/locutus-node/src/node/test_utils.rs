@@ -152,7 +152,7 @@ impl SimNetwork {
 fn _ring_distribution<'a>(
     nodes: impl Iterator<Item = &'a NodeInMemory> + 'a,
 ) -> impl Iterator<Item = Distance> + 'a {
-    // TODO: groupby  certain intervals
+    // TODO: groupby certain intervals
     // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0
     nodes
         .map(|node| {

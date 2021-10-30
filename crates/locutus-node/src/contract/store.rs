@@ -1,8 +1,4 @@
-use std::marker::PhantomData;
-
-use serde::{Deserialize, Serialize};
-
-use super::{Contract, ContractError, ContractKey, ContractValue};
+use super::{Contract, ContractError, ContractKey};
 
 /// Handle contract blob storage on the file system.
 pub(crate) struct ContractStore {}

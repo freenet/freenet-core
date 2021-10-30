@@ -39,7 +39,7 @@ pub(crate) struct Ring {
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
     // TODO: optimize this for an AtomicU64
-    own_location: RwLock<Option<Location>>,
+    own_location: RwLock<PeerKeyLocation>,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
@@ -53,7 +53,7 @@ impl Ring {
     const MIN_CONNECTIONS: usize = 10;
     const MAX_CONNECTIONS: usize = 20;
     /// Max number of subscribers for a contract.
-    const MAX_SUBSCRIBERS: usize = 10;
+    pub const MAX_SUBSCRIBERS: usize = 10;
 
     /// Above this number of remaining hops,
     /// randomize which of node a message which be forwarded to.
@@ -61,13 +61,16 @@ impl Ring {
 
     pub const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new() -> Self {
+    pub fn new(peer: PeerKey) -> Self {
         Ring {
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
             connections_by_location: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
-            own_location: RwLock::new(None),
+            own_location: RwLock::new(PeerKeyLocation {
+                peer,
+                location: None,
+            }),
             subscribers: DashMap::new(),
             subscriptions: RwLock::new(Vec::new()),
         }
@@ -101,13 +104,14 @@ impl Ring {
     }
 
     /// Update this node location.
-    pub fn update_location(&self, loc: Location) {
+    pub fn update_location(&self, loc: PeerKeyLocation) {
+        assert!(loc.location.is_some());
         let old_loc = &mut *self.own_location.write();
-        *old_loc = Some(loc);
+        *old_loc = loc;
     }
 
     /// Returns this node location in the ring, if any (must have join the ring already).
-    pub fn own_location(&self) -> Option<Location> {
+    pub fn own_location(&self) -> PeerKeyLocation {
         *self.own_location.read()
     }
 
@@ -206,7 +210,13 @@ impl Ring {
     /// Add a new subscription for this peer.
     pub fn add_subscription(&self, contract: ContractKey) {
         self.subscriptions.write().push(contract);
-        todo!()
+    }
+
+    pub fn subscribers_of(
+        &self,
+        contract: &ContractKey,
+    ) -> Option<dashmap::mapref::one::Ref<ContractKey, Vec<PeerKeyLocation>>> {
+        self.subscribers.get(contract)
     }
 }
 
@@ -308,6 +318,8 @@ pub(crate) enum RingError {
     ConnError(#[from] Box<conn_manager::ConnError>),
     #[error("no ring connections found")]
     EmptyRing,
+    #[error("ran out of, or haven't found any, caching peers for contract {0}")]
+    NoCachingPeers(ContractKey),
 }
 
 #[cfg(test)]
@@ -328,7 +340,7 @@ mod test {
 
     #[test]
     fn find_closest() {
-        let ring = Ring::new();
+        let ring = Ring::new(PeerKey::random());
 
         fn build_pk(loc: Location) -> PeerKeyLocation {
             PeerKeyLocation {

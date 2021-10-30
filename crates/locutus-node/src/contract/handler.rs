@@ -38,6 +38,9 @@ pub(crate) struct ContractHandlerChannel<Err> {
     _err: PhantomData<Err>,
 }
 
+// TODO: pretty much can copy this verbatim?
+// https://docs.rs/tarpc/0.27.2/src/tarpc/transport/channel.rs.html#39-42
+
 impl<Err> Clone for ContractHandlerChannel<Err> {
     fn clone(&self) -> Self {
         Self { _err: PhantomData }

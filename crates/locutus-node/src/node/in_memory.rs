@@ -51,7 +51,7 @@ impl NodeInMemory {
                 })
             })
             .collect();
-        let mut ring = Ring::new();
+        let mut ring = Ring::new(peer);
         if let Some(max_hops_to_live) = config.max_hops_to_live {
             ring.with_max_hops(max_hops_to_live);
         }

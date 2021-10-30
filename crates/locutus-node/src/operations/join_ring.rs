@@ -241,7 +241,7 @@ where
             max_hops_to_live,
         },
     });
-    conn_manager.send(&gateway, join_req).await?;
+    conn_manager.send(gateway, join_req).await?;
     op_storage.push(tx, Operation::JoinRing(join_op))?;
     Ok(())
 }
@@ -387,7 +387,7 @@ where
                         req_peer,
                         forward_to.peer
                     );
-                    conn_manager.send(&forward_to, forwarded).await?;
+                    conn_manager.send(forward_to, forwarded).await?;
                     let _forwarded_acceptors = accepted_by.into_iter().collect::<HashSet<_>>();
                     // this will would jump to JoinRingMsg::Resp::JoinResponse::Proxy after peer return
                     // TODO: add a new state that transits from Connecting -> WaitingProxyResponse
@@ -439,7 +439,10 @@ where
                     log::info!("Not accepting connection to {}", new_peer.peer);
                 }
             }
-            ring.update_location(your_location);
+            ring.update_location(PeerKeyLocation {
+                peer: your_peer_id,
+                location: Some(your_location),
+            });
             new_state = Some(state);
         }
         JoinRingMsg::Resp {

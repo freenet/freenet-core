@@ -244,7 +244,7 @@ where
 }
 
 async fn update_state<CB, CErr>(
-    conn_manager: &mut CB,
+    _conn_manager: &mut CB,
     mut state: GetOp,
     other_host_msg: GetMsg,
     op_storage: &OpManager<CErr>,
@@ -282,11 +282,7 @@ where
             fetch_contract,
             ..
         } => {
-            let sender = PeerKeyLocation {
-                peer: conn_manager.peer_key(),
-                location: op_storage.ring.own_location(),
-            };
-
+            let sender = op_storage.ring.own_location();
             if !op_storage.ring.has_contract(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
@@ -373,7 +369,6 @@ where
             if let GetState::AwaitingResponse {
                 skip_list,
                 fetch_contract,
-                retries,
                 ..
             } = state.sm.state()
             {
@@ -391,8 +386,7 @@ where
                     }));
                     new_state = Some(state);
                 } else {
-                    // TODO: better return err here
-                    return Err(OpError::IllegalStateTransition);
+                    return Err(RingError::NoCachingPeers(key).into());
                 }
             } else {
                 return Err(OpError::IllegalStateTransition);

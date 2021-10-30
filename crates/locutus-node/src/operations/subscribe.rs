@@ -220,7 +220,7 @@ where
 }
 
 async fn update_state<CB, CErr>(
-    conn_manager: &mut CB,
+    _conn_manager: &mut CB,
     mut state: SubscribeOp,
     other_host_msg: SubscribeMsg,
     op_storage: &OpManager<CErr>,
@@ -239,10 +239,7 @@ where
                 state.sm.state(),
                 SubscribeState::AwaitingResponse { .. }
             ));
-            let sender = PeerKeyLocation {
-                peer: conn_manager.peer_key(),
-                location: op_storage.ring.own_location(),
-            };
+            let sender = op_storage.ring.own_location();
             new_state = Some(state);
             return_msg = Some(Message::from(SubscribeMsg::SeekNode {
                 id,
@@ -257,11 +254,7 @@ where
             subscriber,
             target,
         } => {
-            let sender = PeerKeyLocation {
-                peer: conn_manager.peer_key(),
-                location: op_storage.ring.own_location(),
-            };
-
+            let sender = op_storage.ring.own_location();
             let return_err = || -> OperationResult {
                 OperationResult {
                     return_msg: Some(Message::from(SubscribeMsg::ReturnSub {
@@ -318,17 +311,14 @@ where
                     id,
                 })
                 .map_err(|_: OpError<CErr>| OpError::RetriesNumber(id, "sub".to_owned()))?;
-            if let SubscribeState::AwaitingResponse { skip_list, retries } = state.sm.state() {
+            if let SubscribeState::AwaitingResponse { skip_list, .. } = state.sm.state() {
                 if let Some(target) = op_storage
                     .ring
                     .closest_caching(&key, 1, skip_list)
                     .into_iter()
                     .next()
                 {
-                    let subscriber = PeerKeyLocation {
-                        peer: conn_manager.peer_key(),
-                        location: op_storage.ring.own_location(),
-                    };
+                    let subscriber = op_storage.ring.own_location();
                     return_msg = Some(Message::from(SubscribeMsg::SeekNode {
                         id,
                         key,
@@ -337,8 +327,7 @@ where
                     }));
                     new_state = Some(state);
                 } else {
-                    // TODO: better return err here
-                    return Err(OpError::IllegalStateTransition);
+                    return Err(RingError::NoCachingPeers(key).into());
                 }
             } else {
                 return Err(OpError::IllegalStateTransition);

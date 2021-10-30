@@ -37,7 +37,7 @@ where
         Err((err, tx_id)) => {
             log::error!("error while processing join request: {}", err);
             if let Some(sender) = sender {
-                conn_manager.send(&sender, Message::Canceled(tx_id)).await?;
+                conn_manager.send(sender, Message::Canceled(tx_id)).await?;
             }
             return Err(err);
         }
@@ -48,7 +48,7 @@ where
             // updated op
             let id = *msg.id();
             if let Some(target) = msg.target() {
-                conn_manager.send(&target.clone(), msg).await?;
+                conn_manager.send(target.clone(), msg).await?;
             }
             op_storage.push(id, updated_state)?;
         }
@@ -58,7 +58,7 @@ where
         }) => {
             // finished the operation at this node, informing back
             if let Some(target) = msg.target() {
-                conn_manager.send(&target.clone(), msg).await?;
+                conn_manager.send(target.clone(), msg).await?;
             }
         }
         Ok(OperationResult {

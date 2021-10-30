@@ -25,11 +25,13 @@ pub(crate) trait ConnectionBridge {
 
     fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool);
 
+    fn drop_connection(&mut self, peer: PeerKey);
+
     /// # Cancellation Safety
     /// This async fn must be cancellation safe!
     async fn recv(&self) -> Result<Message>;
 
-    async fn send(&self, target: &PeerKeyLocation, msg: Message) -> Result<()>;
+    async fn send(&self, target: PeerKeyLocation, msg: Message) -> Result<()>;
 }
 
 /// A protocol used to send and receive data over the network.
