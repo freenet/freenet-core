@@ -10,19 +10,27 @@ use super::{
     ContractKey, ContractValue,
 };
 
-pub(crate) struct MemoryContractHandler {
+pub(crate) type MemKVStore = HashMap<ContractKey, ContractValue>;
+
+pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
     channel: ContractHandlerChannel<SimStorageError>,
-    mem_db: HashMap<ContractKey, ContractValue>,
+    kv_store: KVStore,
     contract_store: ContractStore,
 }
 
-impl MemoryContractHandler {
-    pub fn new(channel: ContractHandlerChannel<SimStorageError>) -> Self {
+impl<KVStore> MemoryContractHandler<KVStore> {
+    pub fn new(channel: ContractHandlerChannel<SimStorageError>, kv_store: KVStore) -> Self {
         MemoryContractHandler {
             channel,
-            mem_db: HashMap::new(),
+            kv_store,
             contract_store: ContractStore::new(),
         }
+    }
+}
+
+impl From<ContractHandlerChannel<<Self as ContractHandler>::Error>> for MemoryContractHandler {
+    fn from(_: ContractHandlerChannel<<Self as ContractHandler>::Error>) -> Self {
+        todo!()
     }
 }
 
@@ -45,7 +53,7 @@ impl ContractHandler for MemoryContractHandler {
         &self,
         contract: &ContractKey,
     ) -> Result<Option<ContractValue>, Self::Error> {
-        Ok(self.mem_db.get(contract).cloned())
+        Ok(self.kv_store.get(contract).cloned())
     }
 
     async fn put_value(
@@ -54,7 +62,7 @@ impl ContractHandler for MemoryContractHandler {
         value: ContractValue,
     ) -> Result<ContractValue, Self::Error> {
         let new_val = value.clone();
-        self.mem_db.insert(*contract, value);
+        self.kv_store.insert(*contract, value);
         Ok(new_val)
     }
 }

@@ -8,7 +8,7 @@ use crate::contract::{Contract, ContractError, ContractKey, ContractValue};
 
 /// Behaviour
 #[async_trait::async_trait]
-pub(crate) trait ContractHandler {
+pub(crate) trait ContractHandler: From<ContractHandlerChannel<Self::Error>> {
     type Error;
 
     fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
@@ -113,9 +113,25 @@ where
 }
 
 mod sqlite {
+    use once_cell::sync::Lazy;
     use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 
     use super::*;
+
+    // Is fine to clone this as it wraps by an Arc.
+    static POOL: Lazy<SqlitePool> = Lazy::new(|| {
+        tokio::task::block_in_place(|| {
+            let conn_str = if cfg!(debug_assertions) {
+                "sqlite::memory:"
+            } else {
+                // FIXME: initialize this with the actual connection string
+                todo!()
+            };
+            tokio::runtime::Handle::current()
+                .block_on(async move { SqlitePool::connect(conn_str).await })
+        })
+        .unwrap()
+    });
 
     #[derive(Debug, thiserror::Error)]
     pub(crate) enum DatabaseError {
@@ -130,7 +146,7 @@ mod sqlite {
     pub(crate) struct SQLiteContractHandler {
         channel: ContractHandlerChannel<DatabaseError>,
         store: ContractStore,
-        pub pool: SqlitePool,
+        pool: SqlitePool,
     }
 
     impl SQLiteContractHandler {
@@ -144,6 +160,14 @@ mod sqlite {
                 store,
                 pool,
             }
+        }
+    }
+
+    impl From<ContractHandlerChannel<<Self as ContractHandler>::Error>> for SQLiteContractHandler {
+        fn from(channel: ContractHandlerChannel<<Self as ContractHandler>::Error>) -> Self {
+            let store = ContractStore::new();
+            let pool = (&*POOL).clone();
+            SQLiteContractHandler::new(channel, store, pool)
         }
     }
 

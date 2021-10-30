@@ -11,7 +11,7 @@ use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-use crate::contract::StoreResponse;
+use crate::contract::{MemoryContractHandler, StoreResponse};
 use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
@@ -43,9 +43,9 @@ impl Node {
     }
 }
 
-enum NodeImpl {
+enum NodeImpl<StorageErr = SimStorageError> {
     LibP2P(Box<NodeLibP2P>),
-    InMemory(Box<NodeInMemory>),
+    InMemory(Box<NodeInMemory<StorageErr>>),
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -142,8 +142,8 @@ impl NodeConfig {
 
     /// Builds a node using in-memory transport. Used for testing pourpouses.
     pub fn build_in_memory(self) -> Result<Node, anyhow::Error> {
-        let inmem = NodeInMemory::build(self)?;
-        Ok(Node(NodeImpl::InMemory(Box::new(inmem))))
+        let in_mem = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(self)?;
+        Ok(Node(NodeImpl::InMemory(Box::new(in_mem))))
     }
 }
 
@@ -289,8 +289,8 @@ where
 
 async fn contract_handling<CH, Err>(mut contract_handler: CH) -> Result<(), ContractError<Err>>
 where
-    CH: ContractHandler<Error = Err>,
-    Err: std::error::Error,
+    CH: ContractHandler<Error = Err> + Send + 'static,
+    Err: std::error::Error + Send + 'static,
 {
     loop {
         let res = contract_handler.channel().recv_from_listeners().await?;

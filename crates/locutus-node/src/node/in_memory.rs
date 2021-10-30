@@ -4,7 +4,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
-    contract::{ContractHandlerChannel, MemoryContractHandler},
+    contract::{ContractHandler, ContractHandlerChannel},
     message::{GetTxType, Message, Transaction},
     operations::{
         get,
@@ -16,19 +16,28 @@ use crate::{
     NodeConfig,
 };
 
-use super::{op_state::OpManager, InitPeerNode, SimStorageError};
+use super::{op_state::OpManager, InitPeerNode};
 
-pub(crate) struct NodeInMemory {
+pub(crate) struct NodeInMemory<CErr> {
     peer: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
     pub conn_manager: MemoryConnManager,
-    pub op_storage: Arc<OpManager<SimStorageError>>,
+    pub op_storage: Arc<OpManager<CErr>>,
 }
 
-impl NodeInMemory {
+impl<CErr> NodeInMemory<CErr>
+where
+    CErr: std::error::Error + Send + Sync + 'static,
+{
     /// Buils an in-memory node. Does nothing upon construction,
-    pub fn build(config: NodeConfig) -> Result<Self, anyhow::Error> {
+    pub fn build<CH>(
+        config: NodeConfig,
+    ) -> Result<NodeInMemory<<CH as ContractHandler>::Error>, anyhow::Error>
+    where
+        CH: ContractHandler + Send + Sync + 'static,
+        <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
+    {
         if (config.local_ip.is_none() || config.local_port.is_none())
             && config.remote_nodes.is_empty()
         {
@@ -61,7 +70,7 @@ impl NodeInMemory {
         let (notification_tx, notification_channel) = mpsc::channel(100);
         let ch_handler = ContractHandlerChannel::new();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ch_handler.clone()));
-        let contract_handler = MemoryContractHandler::new(ch_handler);
+        let contract_handler = CH::from(ch_handler);
 
         tokio::spawn(super::contract_handling(contract_handler));
 
