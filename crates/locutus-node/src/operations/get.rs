@@ -365,7 +365,7 @@ where
                         contract: None,
                     },
                 })
-                .map_err(|_: OpError<CErr>| OpError::RetriesNumber(id, "get".to_owned()))?;
+                .map_err(|_: OpError<CErr>| OpError::MaxRetriesExceeded(id, "get".to_owned()))?;
             if let GetState::AwaitingResponse {
                 skip_list,
                 fetch_contract,

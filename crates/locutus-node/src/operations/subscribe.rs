@@ -310,7 +310,7 @@ where
                     sender,
                     id,
                 })
-                .map_err(|_: OpError<CErr>| OpError::RetriesNumber(id, "sub".to_owned()))?;
+                .map_err(|_: OpError<CErr>| OpError::MaxRetriesExceeded(id, "sub".to_owned()))?;
             if let SubscribeState::AwaitingResponse { skip_list, .. } = state.sm.state() {
                 if let Some(target) = op_storage
                     .ring

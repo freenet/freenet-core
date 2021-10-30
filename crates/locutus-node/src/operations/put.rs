@@ -67,30 +67,7 @@ impl StateMachineImpl for PutOpSM {
             }
             (PutState::AwaitingResponse { contract, .. }, PutMsg::SuccessfulUpdate { .. }) => {
                 log::debug!("Successfully updated value for {}", contract);
-                Some(PutState::BroadcastComplete)
-            }
-            // state changes for proxies
-            (PutState::ReceivedRequest, PutMsg::PutForward { .. }) => {
-                Some(PutState::BroadcastComplete)
-            }
-            // state changes for the target node
-            (
-                PutState::ReceivedRequest | PutState::BroadcastOngoing { .. },
-                PutMsg::Broadcasting {
-                    broadcast_to,
-                    broadcasted_to,
-                    ..
-                },
-            ) => {
-                if broadcast_to.is_empty() {
-                    // broadcast complete
-                    Some(PutState::BroadcastComplete)
-                } else {
-                    Some(PutState::BroadcastOngoing {
-                        left_peers: broadcast_to,
-                        completed: broadcasted_to,
-                    })
-                }
+                Some(PutState::Done)
             }
             _ => None,
         }
@@ -103,6 +80,18 @@ impl StateMachineImpl for PutOpSM {
                 Some(PutState::AwaitingResponse {
                     contract: contract.key(),
                 })
+            }
+            // state changes for the target node
+            (
+                PutState::ReceivedRequest | PutState::BroadcastOngoing { .. },
+                PutMsg::Broadcasting { broadcast_to, .. },
+            ) => {
+                if broadcast_to.is_empty() {
+                    // broadcast complete
+                    Some(PutState::BroadcastComplete)
+                } else {
+                    Some(PutState::BroadcastOngoing)
+                }
             }
             _ => None,
         }
@@ -146,7 +135,7 @@ impl StateMachineImpl for PutOpSM {
             }),
             // output from initial target
             (
-                PutState::ReceivedRequest,
+                PutState::ReceivedRequest | PutState::BroadcastOngoing { .. },
                 PutMsg::Broadcasting {
                     id,
                     new_value,
@@ -154,10 +143,10 @@ impl StateMachineImpl for PutOpSM {
                     ..
                 },
             ) => {
-                if !broadcast_to.is_empty() {
-                    None
-                } else {
+                if broadcast_to.is_empty() {
                     Some(PutMsg::SuccessfulUpdate { id, new_value })
+                } else {
+                    None
                 }
             }
             _ => None,
@@ -177,12 +166,9 @@ enum PutState {
     AwaitingResponse {
         contract: ContractKey,
     },
-    BroadcastOngoing {
-        left_peers: Vec<PeerKeyLocation>,
-        completed: usize,
-    },
-    BroadcastComplete,
     Done,
+    BroadcastOngoing,
+    BroadcastComplete,
 }
 
 impl PutState {
@@ -367,12 +353,16 @@ where
                 target.location
             );
 
+            // add one because since is originating from this node and we don't want to
+            // reduce prematurely on the broadcasting instruction
+            let initial_htl = op_storage.ring.max_hops_to_live + 1;
             if let Some(msg) = state.sm.consume_to_state(PutMsg::Broadcasting {
                 id,
-                broadcasted_to: 0,
                 broadcast_to,
+                broadcasted_to: 0,
                 key,
                 new_value,
+                htl: initial_htl,
             })? {
                 op_storage
                     .notify_change(msg.into(), Operation::Put(state))
@@ -388,16 +378,23 @@ where
             mut broadcasted_to,
             key,
             new_value,
+            htl,
         } => {
-            // here just keep updating the number of broadcasts done and whether broadcasting should be cancelled
-            let mut broadcasting = Vec::with_capacity(broadcast_to.len());
+            let htl = if let Some(new_htl) = htl.checked_sub(1) {
+                new_htl
+            } else {
+                return Err(OpError::BroadcastCompleted);
+            };
             let sender = op_storage.ring.own_location();
             let msg = PutMsg::BroadcastTo {
                 id,
                 key,
                 new_value: new_value.clone(),
                 sender,
+                htl,
             };
+
+            let mut broadcasting = Vec::with_capacity(broadcast_to.len());
             for peer in &broadcast_to {
                 let f = conn_manager.send(*peer, msg.clone().into());
                 broadcasting.push(f);
@@ -414,6 +411,7 @@ where
                     }
                 })
                 .rev();
+
             let mut incorrect_results = 0;
             for (peer_num, err) in error_futures {
                 // remove the failed peers in reverse order
@@ -427,12 +425,14 @@ where
 
                 incorrect_results += 1;
             }
+
             broadcasted_to += broadcast_to.len() - incorrect_results;
             log::debug!(
                 "successfully broadcasted put into contract {} to {} peers",
                 key,
                 broadcasted_to
             );
+
             return_msg = state
                 .sm
                 .consume_to_state(PutMsg::Broadcasting {
@@ -441,6 +441,7 @@ where
                     broadcast_to,
                     key,
                     new_value,
+                    htl,
                 })?
                 .map(Message::from);
             new_state = None;
@@ -618,13 +619,15 @@ mod messages {
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
             new_value: ContractValue,
+            htl: usize,
         },
-        ///
+        /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
             id: Transaction,
             sender: PeerKeyLocation,
             key: ContractKey,
             new_value: ContractValue,
+            htl: usize,
         },
     }
 
@@ -704,12 +707,13 @@ mod test {
         );
 
         let res_msg = target
-            .consume_to_state::<OpError<SimStorageError>>(PutMsg::Broadcasting {
+            .consume_to_output::<OpError<SimStorageError>>(PutMsg::Broadcasting {
                 id,
                 broadcast_to: vec![],
                 broadcasted_to: 0,
                 key: contract.key(),
                 new_value: ContractValue::new(vec![4, 3, 2, 1]),
+                htl: 0,
             })?
             .ok_or(anyhow::anyhow!("no output"))?;
         let expected = PutMsg::SuccessfulUpdate {

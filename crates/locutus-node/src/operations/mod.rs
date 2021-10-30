@@ -29,9 +29,13 @@ where
     CB: ConnectionBridge,
     CErr: std::error::Error,
 {
+    // TODO: register changes in the future op commit log
     match result {
         Err((OpError::StatePushed, _)) => {
             // do nothing and continue, the operation will just continue later on
+            return Ok(());
+        }
+        Err((OpError::BroadcastCompleted, tx)) => {
             return Ok(());
         }
         Err((err, tx_id)) => {
@@ -87,22 +91,31 @@ pub struct ProbeOp;
 pub(crate) enum OpError<S: std::error::Error> {
     #[error(transparent)]
     ConnError(#[from] conn_manager::ConnError),
-    #[error("cannot perform a state transition from the current state with the provided input")]
-    IllegalStateTransition,
-    #[error("failed notifying back to the node message loop, channel closed")]
-    NotificationError(#[from] tokio::sync::mpsc::error::SendError<Message>),
     #[error(transparent)]
     RingError(#[from] RingError),
     #[error(transparent)]
     ContractError(#[from] ContractError<S>),
-    /// This is used as an early interrumpt of an op update when an op
-    /// was sent throught the fast path back to the storage.
-    #[error("early push of state into the op stack")]
-    StatePushed,
+
+    #[error("cannot perform a state transition from the current state with the provided input")]
+    IllegalStateTransition,
+    #[error("failed notifying back to the node message loop, channel closed")]
+    NotificationError(#[from] tokio::sync::mpsc::error::SendError<Message>),
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("failed while processing transaction {0}")]
     TxUpdateFailure(Transaction),
     #[error("max number of retries for tx {0} of op type {1} reached")]
-    RetriesNumber(Transaction, String),
+    MaxRetriesExceeded(Transaction, String),
+
+    // user for control flow
+    /// This is used as an early interrumpt of an op update when an op
+    /// was sent throught the fast path back to the storage.
+    #[error("early push of state into the op stack")]
+    StatePushed,
+
+    /// For operations that involved broadcasting updates (like put)
+    /// this signals that the broadcast has reached the max htl and no more
+    /// broadcasting is required
+    #[error("broadcast completed for tx")]
+    BroadcastCompleted,
 }
