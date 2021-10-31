@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     conn_manager::{ConnectionBridge, PeerKey, Transport},
+    contract::MemoryContractHandler,
     message::Message,
     node::{InitPeerNode, NodeInMemory},
     operations::{
@@ -70,7 +71,8 @@ impl SimNetwork {
             .with_location(gateway_loc)
             .max_hops_to_live(ring_max_htl)
             .rnd_if_htl_above(rnd_if_htl_above);
-        let gateway = NodeInMemory::build(config).unwrap();
+        let gateway =
+            NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(config).unwrap();
         sim.initialize_gateway(gateway, "gateway".to_owned());
 
         // add other nodes to the simulation
@@ -86,7 +88,10 @@ impl SimNetwork {
                 )
                 .max_hops_to_live(ring_max_htl)
                 .rnd_if_htl_above(rnd_if_htl_above);
-            sim.initialize_peer(NodeInMemory::build(config).unwrap(), label);
+            sim.initialize_peer(
+                NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(config).unwrap(),
+                label,
+            );
         }
         sim
     }
@@ -103,12 +108,12 @@ impl SimNetwork {
         }
     }
 
-    fn initialize_gateway(&self, gateway: NodeInMemory, sender_label: String) {
+    fn initialize_gateway(&self, gateway: NodeInMemory<SimStorageError>, sender_label: String) {
         let info_ch = self.meta_info_tx.clone();
         tokio::spawn(Self::listen(gateway, info_ch, sender_label));
     }
 
-    fn initialize_peer(&self, mut peer: NodeInMemory, sender_label: String) {
+    fn initialize_peer(&self, mut peer: NodeInMemory<SimStorageError>, sender_label: String) {
         let info_ch = self.meta_info_tx.clone();
         tokio::spawn(async move {
             if peer.join_ring().await.is_err() {
@@ -120,7 +125,7 @@ impl SimNetwork {
     }
 
     async fn listen(
-        mut gateway: NodeInMemory,
+        mut gateway: NodeInMemory<SimStorageError>,
         info_ch: mpsc::Sender<Result<NetEvent, OpError<SimStorageError>>>,
         _sender: String,
     ) -> Result<(), ()> {
@@ -150,7 +155,7 @@ impl SimNetwork {
 
 /// Builds an histogram of the distribution in the ring of each node relative to each other.
 fn _ring_distribution<'a>(
-    nodes: impl Iterator<Item = &'a NodeInMemory> + 'a,
+    nodes: impl Iterator<Item = &'a NodeInMemory<SimStorageError>> + 'a,
 ) -> impl Iterator<Item = Distance> + 'a {
     // TODO: groupby certain intervals
     // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0

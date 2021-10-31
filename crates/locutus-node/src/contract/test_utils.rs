@@ -29,8 +29,12 @@ impl<KVStore> MemoryContractHandler<KVStore> {
 }
 
 impl From<ContractHandlerChannel<<Self as ContractHandler>::Error>> for MemoryContractHandler {
-    fn from(_: ContractHandlerChannel<<Self as ContractHandler>::Error>) -> Self {
-        todo!()
+    fn from(channel: ContractHandlerChannel<<Self as ContractHandler>::Error>) -> Self {
+        MemoryContractHandler {
+            channel,
+            kv_store: MemKVStore::new(),
+            contract_store: ContractStore::new(),
+        }
     }
 }
 

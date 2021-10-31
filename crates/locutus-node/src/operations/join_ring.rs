@@ -766,6 +766,6 @@ mod test {
         //     .any(|is_empty| is_empty);
         // assert!(!any_empties);
 
-        Ok(())
+        anyhow::bail!("test not impl")
     }
 }

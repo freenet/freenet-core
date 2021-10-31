@@ -459,6 +459,6 @@ mod test {
 
     #[test]
     fn successful_get_op_seq() -> Result<(), anyhow::Error> {
-        Ok(())
+        anyhow::bail!("test not impl")
     }
 }

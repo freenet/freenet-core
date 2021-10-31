@@ -409,3 +409,11 @@ mod messages {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
+        anyhow::bail!("test not impl")
+    }
+}

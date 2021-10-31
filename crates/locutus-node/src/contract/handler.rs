@@ -146,7 +146,7 @@ mod sqlite {
     pub(crate) struct SQLiteContractHandler {
         channel: ContractHandlerChannel<DatabaseError>,
         store: ContractStore,
-        pool: SqlitePool,
+        pub(super) pool: SqlitePool,
     }
 
     impl SQLiteContractHandler {
