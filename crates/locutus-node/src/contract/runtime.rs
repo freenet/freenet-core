@@ -22,8 +22,8 @@ impl ContractRuntime {
     /// - If the same `value_update` is applied twice to a value, then the second will be ignored.
     /// - Application of `value_update` is "order invariant", no matter what the order in which the values are
     ///   applied, the resulting value must be exactly the same.
-    pub fn update_value(value: Vec<u8>, value_update: &[u8]) -> ContractUpdateResult<Vec<u8>> {
-        Ok(value_update.to_vec())
+    pub fn update_value(value: &[u8], value_update: &[u8]) -> ContractUpdateResult<Vec<u8>> {
+        todo!()
     }
 
     /// Obtain any other related contracts for this value update. Typically used to ensure

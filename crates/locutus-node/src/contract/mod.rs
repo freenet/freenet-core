@@ -1,3 +1,5 @@
+use std::{ops::Deref, sync::Arc};
+
 use blake2::{Blake2b, Digest};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -16,12 +18,10 @@ pub(crate) use test_utils::MemoryContractHandler;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
-// FIXME: naively implementing clone here is going to be a perf issue in the future likely
 /// Main abstraction for representing a contract in binary form.
-/// Potentially expensive to clone.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Contract {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     #[serde(serialize_with = "<[_]>::serialize")]
     #[serde(deserialize_with = "contract_key_deser")]
     key: [u8; CONTRACT_KEY_SIZE],
@@ -36,7 +36,10 @@ impl Contract {
         let mut key = [0; CONTRACT_KEY_SIZE];
         key.copy_from_slice(&key_arr);
 
-        Self { data, key }
+        Self {
+            data: Arc::new(data),
+            key,
+        }
     }
 
     pub fn key(&self) -> ContractKey {
@@ -48,8 +51,7 @@ impl TryInto<Vec<u8>> for Contract {
     type Error = anyhow::Error;
 
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
-        // this will change once we wrap data into an Arc
-        Ok(self.data)
+        Arc::try_unwrap(self.data).map_err(|_| anyhow::anyhow!("non-unique contract ref"))
     }
 }
 
@@ -108,16 +110,23 @@ where
     Ok(key)
 }
 
-// FIXME: naively implementing clone here will be a future perf problem, must be improved
-/// The value for a contract. Potentially very expensive to clone.
+/// The value for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[derive(arbitrary::Arbitrary)]
-pub(crate) struct ContractValue(Vec<u8>);
+pub(crate) struct ContractValue(Arc<Vec<u8>>);
 
 impl ContractValue {
     pub fn new(bytes: Vec<u8>) -> Self {
-        ContractValue(bytes)
+        ContractValue(Arc::new(bytes))
+    }
+}
+
+impl Deref for ContractValue {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
     }
 }
 

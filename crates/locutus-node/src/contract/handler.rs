@@ -325,11 +325,7 @@ mod sqlite {
             let encoded_key = hex::encode(contract.0);
             match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
                 .bind(encoded_key)
-                .map(|row: SqliteRow| {
-                    Some(ContractValue {
-                        0: row.get("value"),
-                    })
-                })
+                .map(|row: SqliteRow| Some(ContractValue::new(row.get("value"))))
                 .fetch_one(&self.pool)
                 .await
             {
@@ -350,7 +346,7 @@ mod sqlite {
                 Err(_) => value.clone(),
             };
 
-            let value: Vec<u8> = ContractRuntime::update_value(old_value.0, &value.0)?;
+            let value: Vec<u8> = ContractRuntime::update_value(&*old_value, &value.0)?;
             let encoded_key = hex::encode(contract.0);
             match sqlx::query(
                 "INSERT OR REPLACE INTO contracts (key, value) VALUES (?1, ?2)\
@@ -358,9 +354,7 @@ mod sqlite {
             )
             .bind(encoded_key)
             .bind(value)
-            .map(|row: SqliteRow| ContractValue {
-                0: row.get("value"),
-            })
+            .map(|row: SqliteRow| ContractValue::new(row.get("value")))
             .fetch_one(&self.pool)
             .await
             {
@@ -406,11 +400,11 @@ mod sqlite {
 
             // Generate a contract
             let contract_value: Vec<u8> = b"Test contract value".to_vec();
-            let contract: Contract = Contract::new(contract_value);
+            let contract: Contract = Contract::new(contract_value.clone());
 
             // Get contract parts
             let contract_key = ContractKey(contract.key);
-            let contract_value = ContractValue::new(contract.data);
+            let contract_value = ContractValue::new(contract_value);
             let contract_value_cloned = contract_value.clone();
 
             let put_result_value = handler.put_value(&contract_key, contract_value).await?;

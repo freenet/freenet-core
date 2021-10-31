@@ -27,7 +27,7 @@ where
     subscribe: DashMap<Transaction, SubscribeOp>,
     notification_channel: Sender<Message>,
     contract_handler: Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>,
-    // FIXME: think of an optiomal strategy to check for timeouts and clean up garbage
+    // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
     _ops_ttl: BTreeMap<Duration, Vec<Transaction>>,
     pub ring: Ring,
 }

@@ -1,5 +1,3 @@
-#![allow(unused)] // FIXME: remove this attr
-
 use std::{
     ops::Deref,
     sync::Arc,
