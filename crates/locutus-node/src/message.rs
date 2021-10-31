@@ -143,10 +143,6 @@ pub(crate) enum Message {
 }
 
 impl Message {
-    fn msg_type_repr(&self) -> &'static str {
-        todo!()
-    }
-
     pub fn id(&self) -> &Transaction {
         use Message::*;
         match self {
@@ -170,7 +166,16 @@ impl Message {
 
 impl Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.msg_type_repr())
+        use Message::*;
+        write!(f, "Message {{")?;
+        match self {
+            JoinRing(msg) => msg.fmt(f)?,
+            Put(msg) => msg.fmt(f)?,
+            Get(msg) => msg.fmt(f)?,
+            Subscribe(msg) => msg.fmt(f)?,
+            Canceled(msg) => msg.fmt(f)?,
+        };
+        write!(f, "}}")
     }
 }
 

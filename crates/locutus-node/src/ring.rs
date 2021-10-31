@@ -199,7 +199,6 @@ impl Ring {
     where
         F: FnMut(&&PeerKeyLocation) -> bool,
     {
-        // FIXME: should be optimized and avoid copying
         self.connections_by_location
             .read()
             .values()

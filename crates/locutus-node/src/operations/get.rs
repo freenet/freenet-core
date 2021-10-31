@@ -401,6 +401,8 @@ where
 }
 
 mod messages {
+    use std::fmt::Display;
+
     use crate::contract::StoreResponse;
 
     use super::*;
@@ -448,6 +450,18 @@ mod messages {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 _ => None,
+            }
+        }
+    }
+
+    impl Display for GetMsg {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let id = self.id();
+            match self {
+                Self::FetchRouting { .. } => write!(f, "FetchRouting(id: {})", id),
+                Self::RequestGet { .. } => write!(f, "RequestGet(id: {})", id),
+                Self::SeekNode { .. } => write!(f, "SeekNode(id: {})", id),
+                Self::ReturnGet { .. } => write!(f, "ReturnGet(id: {})", id),
             }
         }
     }

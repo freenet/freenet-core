@@ -564,6 +564,8 @@ async fn forward_changes<CErr, CB>(
 }
 
 mod messages {
+    use std::fmt::Display;
+
     use crate::contract::ContractValue;
 
     use super::*;
@@ -658,6 +660,22 @@ mod messages {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestPut { target, .. } => Some(target),
                 _ => None,
+            }
+        }
+    }
+
+    impl Display for PutMsg {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let id = self.id();
+            match self {
+                Self::SeekNode { .. } => write!(f, "SeekNode(id: {})", id),
+                Self::RouteValue { .. } => write!(f, "RouteValue(id: {})", id),
+                Self::RequestPut { .. } => write!(f, "RequestPut(id: {})", id),
+                Self::Broadcasting { .. } => write!(f, "Broadcasting(id: {})", id),
+                Self::SuccessfulUpdate { .. } => write!(f, "SusscessfulUpdate(id: {})", id),
+                Self::PutForward { .. } => write!(f, "PutForward(id: {})", id),
+                Self::AwaitPut { .. } => write!(f, "AwaitPut(id: {})", id),
+                Self::BroadcastTo { .. } => write!(f, "BroadcastTo(id: {})", id),
             }
         }
     }

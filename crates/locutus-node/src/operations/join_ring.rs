@@ -234,7 +234,7 @@ where
     conn_manager.add_connection(gateway, true);
     let join_req = Message::from(messages::JoinRingMsg::Req {
         id: tx,
-        msg: messages::JoinRequest::Initial {
+        msg: messages::JoinRequest::StartReq {
             target_loc: gateway,
             req_peer: this_peer,
             hops_to_live: max_hops_to_live,
@@ -305,7 +305,7 @@ where
         JoinRingMsg::Req {
             id,
             msg:
-                JoinRequest::Initial {
+                JoinRequest::StartReq {
                     target_loc: gw_location,
                     req_peer,
                     hops_to_live,
@@ -521,6 +521,8 @@ where
 }
 
 mod messages {
+    use std::fmt::Display;
+
     use super::*;
     use crate::ring::{Location, PeerKeyLocation};
 
@@ -574,9 +576,42 @@ mod messages {
         }
     }
 
+    impl Display for JoinRingMsg {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let id = self.id();
+            match self {
+                Self::Req {
+                    msg: JoinRequest::StartReq { .. },
+                    ..
+                } => write!(f, "StartRequest(id: {})", id),
+                Self::Req {
+                    msg: JoinRequest::Accepted { .. },
+                    ..
+                } => write!(f, "RequestAccepted(id: {})", id),
+                Self::Req {
+                    msg: JoinRequest::Proxy { .. },
+                    ..
+                } => write!(f, "ProxyRequest(id: {})", id),
+                Self::Resp {
+                    msg: JoinResponse::AcceptedBy { .. },
+                    ..
+                } => write!(f, "RouteValue(id: {})", id),
+                Self::Resp {
+                    msg: JoinResponse::ReceivedOC { .. },
+                    ..
+                } => write!(f, "RouteValue(id: {})", id),
+                Self::Resp {
+                    msg: JoinResponse::Proxy { .. },
+                    ..
+                } => write!(f, "RouteValue(id: {})", id),
+                Self::Connected { .. } => write!(f, "Connected(id: {})", id),
+            }
+        }
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRequest {
-        Initial {
+        StartReq {
             target_loc: PeerKeyLocation,
             req_peer: PeerKey,
             hops_to_live: usize,

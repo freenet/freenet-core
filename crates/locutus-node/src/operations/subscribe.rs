@@ -365,6 +365,8 @@ where
 }
 
 mod messages {
+    use std::fmt::Display;
+
     use super::*;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -405,6 +407,18 @@ mod messages {
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
                 _ => None,
+            }
+        }
+    }
+
+    impl Display for SubscribeMsg {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let id = self.id();
+            match self {
+                Self::SeekNode { .. } => write!(f, "SeekNode(id: {})", id),
+                Self::FetchRouting { .. } => write!(f, "FetchRouting(id: {})", id),
+                Self::RequestSub { .. } => write!(f, "RequestSub(id: {})", id),
+                Self::ReturnSub { .. } => write!(f, "ReturnSub(id: {})", id),
             }
         }
     }

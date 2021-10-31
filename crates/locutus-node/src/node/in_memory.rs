@@ -151,7 +151,7 @@ where
                         .await
                         .unwrap();
                     }
-                    Message::Canceled(_tx) => todo!(),
+                    Message::Canceled(_tx) => unreachable!(),
                 },
                 Err(_) => return Err(()),
             }

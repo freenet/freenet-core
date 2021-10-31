@@ -125,7 +125,7 @@ where
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(Operation::Subscribe),
-            TransactionType::Canceled => todo!(),
+            TransactionType::Canceled => unreachable!(),
         }
     }
 }
