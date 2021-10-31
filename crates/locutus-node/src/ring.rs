@@ -10,7 +10,14 @@
 //! - next node
 //! - final location
 
-use std::{borrow::Borrow, collections::BTreeMap, convert::TryFrom, fmt::Display, hash::Hasher};
+use std::{
+    borrow::Borrow,
+    collections::BTreeMap,
+    convert::TryFrom,
+    fmt::Display,
+    hash::Hasher,
+    sync::atomic::{AtomicU64, Ordering::SeqCst},
+};
 
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
 use parking_lot::RwLock;
@@ -39,7 +46,8 @@ pub(crate) struct Ring {
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
     // TODO: optimize this for an AtomicU64
-    own_location: RwLock<PeerKeyLocation>,
+    own_location: AtomicU64,
+    assigned_key: PeerKey,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
@@ -62,15 +70,15 @@ impl Ring {
     pub const MAX_HOPS_TO_LIVE: usize = 10;
 
     pub fn new(peer: PeerKey) -> Self {
+        // for location here consider -1 == None
+        let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
         Ring {
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
             connections_by_location: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
-            own_location: RwLock::new(PeerKeyLocation {
-                peer,
-                location: None,
-            }),
+            own_location,
+            assigned_key: peer,
             subscribers: DashMap::new(),
             subscriptions: RwLock::new(Vec::new()),
         }
@@ -105,14 +113,27 @@ impl Ring {
 
     /// Update this node location.
     pub fn update_location(&self, loc: PeerKeyLocation) {
-        assert!(loc.location.is_some());
-        let old_loc = &mut *self.own_location.write();
-        *old_loc = loc;
+        if let Some(loc) = loc.location {
+            self.own_location
+                .store(u64::from_le_bytes(loc.0.to_le_bytes()), SeqCst)
+        } else {
+            self.own_location
+                .store(u64::from_le_bytes((-1f64).to_le_bytes()), SeqCst)
+        }
     }
 
     /// Returns this node location in the ring, if any (must have join the ring already).
     pub fn own_location(&self) -> PeerKeyLocation {
-        *self.own_location.read()
+        let location = f64::from_le_bytes(self.own_location.load(SeqCst).to_le_bytes());
+        let location = if location == -1f64 {
+            None
+        } else {
+            Some(Location(location))
+        };
+        PeerKeyLocation {
+            peer: self.assigned_key,
+            location,
+        }
     }
 
     /// Whether a node should accept a new node connection or not based

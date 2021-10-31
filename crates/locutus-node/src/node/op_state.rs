@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, time::Duration};
 use dashmap::DashMap;
 use tokio::sync::{
     mpsc::{error::SendError, Sender},
-    RwLock,
+    Mutex,
 };
 
 use crate::{
@@ -26,7 +26,7 @@ where
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
     notification_channel: Sender<Message>,
-    contract_handler: RwLock<ContractHandlerChannel<CErr, CHSenderHalve>>,
+    contract_handler: Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>,
     // FIXME: think of an optiomal strategy to check for timeouts and clean up garbage
     _ops_ttl: BTreeMap<Duration, Vec<Transaction>>,
     pub ring: Ring,
@@ -56,7 +56,7 @@ where
             subscribe: DashMap::default(),
             ring,
             notification_channel,
-            contract_handler: RwLock::new(contract_handler),
+            contract_handler: Mutex::new(contract_handler),
             _ops_ttl: BTreeMap::new(),
         }
     }
@@ -83,7 +83,7 @@ where
         msg: ContractHandlerEvent<CErr>,
     ) -> Result<ContractHandlerEvent<CErr>, ContractError<CErr>> {
         self.contract_handler
-            .write()
+            .lock()
             .await
             .send_to_handler(msg)
             .await

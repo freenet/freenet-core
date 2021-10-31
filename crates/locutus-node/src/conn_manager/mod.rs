@@ -69,17 +69,10 @@ impl From<PeerId> for PeerKey {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConnError {
-    // TODO: clean up comments/variants
-    // #[error("received unexpected response type for a sent request: {0}")]
-    // UnexpectedResponseMessage(Message),
     #[error("location unknown for this node")]
     LocationUnknown,
-    // #[error("expected transaction id was {0} but received {1}")]
-    // UnexpectedTx(Transaction, Transaction),
     #[error("error while de/serializing message")]
     Serialization(#[from] Box<bincode::ErrorKind>),
-    // #[error("connection negotiation between two peers failed")]
-    // NegotationFailed,
 }
 
 mod serialization {
