@@ -9,7 +9,8 @@ mod store;
 mod test_utils;
 
 pub(crate) use handler::{
-    ContractHandler, ContractHandlerChannel, ContractHandlerEvent, StoreResponse,
+    contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
+    ContractHandlerEvent, StoreResponse,
 };
 pub(crate) use test_utils::MemoryContractHandler;
 
@@ -40,6 +41,15 @@ impl Contract {
 
     pub fn key(&self) -> ContractKey {
         ContractKey(self.key)
+    }
+}
+
+impl TryInto<Vec<u8>> for Contract {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+        // this will change once we wrap data into an Arc
+        Ok(self.data)
     }
 }
 
@@ -117,4 +127,8 @@ pub(crate) enum ContractError<SErr: std::error::Error> {
     StorageError(#[from] SErr),
     #[error("contract {0} not found in storage")]
     ContractNotFound(ContractKey),
+    #[error("handler channel dropped")]
+    ChannelDropped(Box<ContractHandlerEvent<SErr>>),
+    #[error("no response received from handler")]
+    NoHandlerEvResponse,
 }

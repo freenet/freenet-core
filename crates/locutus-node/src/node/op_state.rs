@@ -1,10 +1,13 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use dashmap::DashMap;
-use tokio::sync::mpsc::{error::SendError, Sender};
+use tokio::sync::{
+    mpsc::{error::SendError, Sender},
+    RwLock,
+};
 
 use crate::{
-    contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent},
+    contract::{CHSenderHalve, ContractError, ContractHandlerChannel, ContractHandlerEvent},
     message::{Message, Transaction, TransactionType},
     operations::{
         get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpError, Operation,
@@ -14,13 +17,16 @@ use crate::{
 
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
-pub(crate) struct OpManager<CErr> {
+pub(crate) struct OpManager<CErr>
+where
+    CErr: std::error::Error,
+{
     join_ring: DashMap<Transaction, JoinRingOp>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
     notification_channel: Sender<Message>,
-    contract_handler: ContractHandlerChannel<CErr>,
+    contract_handler: RwLock<ContractHandlerChannel<CErr, CHSenderHalve>>,
     // FIXME: think of an optiomal strategy to check for timeouts and clean up garbage
     _ops_ttl: BTreeMap<Duration, Vec<Transaction>>,
     pub ring: Ring,
@@ -41,7 +47,7 @@ where
     pub fn new(
         ring: Ring,
         notification_channel: Sender<Message>,
-        contract_handler: ContractHandlerChannel<CErr>,
+        contract_handler: ContractHandlerChannel<CErr, CHSenderHalve>,
     ) -> Self {
         Self {
             join_ring: DashMap::default(),
@@ -50,7 +56,7 @@ where
             subscribe: DashMap::default(),
             ring,
             notification_channel,
-            contract_handler,
+            contract_handler: RwLock::new(contract_handler),
             _ops_ttl: BTreeMap::new(),
         }
     }
@@ -76,7 +82,11 @@ where
         &self,
         msg: ContractHandlerEvent<CErr>,
     ) -> Result<ContractHandlerEvent<CErr>, ContractError<CErr>> {
-        self.contract_handler.send_to_handler(msg).await
+        self.contract_handler
+            .write()
+            .await
+            .send_to_handler(msg)
+            .await
     }
 
     pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpError<CErr>> {

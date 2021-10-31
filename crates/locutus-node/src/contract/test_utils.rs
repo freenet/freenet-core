@@ -5,7 +5,7 @@ use crate::node::SimStorageError;
 #[cfg(test)]
 use super::Contract;
 use super::{
-    handler::{ContractHandler, ContractHandlerChannel},
+    handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
     store::ContractStore,
     ContractKey, ContractValue,
 };
@@ -13,13 +13,16 @@ use super::{
 pub(crate) type MemKVStore = HashMap<ContractKey, ContractValue>;
 
 pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
-    channel: ContractHandlerChannel<SimStorageError>,
+    channel: ContractHandlerChannel<SimStorageError, CHListenerHalve>,
     kv_store: KVStore,
     contract_store: ContractStore,
 }
 
 impl<KVStore> MemoryContractHandler<KVStore> {
-    pub fn new(channel: ContractHandlerChannel<SimStorageError>, kv_store: KVStore) -> Self {
+    pub fn new(
+        channel: ContractHandlerChannel<SimStorageError, CHListenerHalve>,
+        kv_store: KVStore,
+    ) -> Self {
         MemoryContractHandler {
             channel,
             kv_store,
@@ -28,8 +31,12 @@ impl<KVStore> MemoryContractHandler<KVStore> {
     }
 }
 
-impl From<ContractHandlerChannel<<Self as ContractHandler>::Error>> for MemoryContractHandler {
-    fn from(channel: ContractHandlerChannel<<Self as ContractHandler>::Error>) -> Self {
+impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>>
+    for MemoryContractHandler
+{
+    fn from(
+        channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
+    ) -> Self {
         MemoryContractHandler {
             channel,
             kv_store: MemKVStore::new(),
@@ -43,8 +50,8 @@ impl ContractHandler for MemoryContractHandler {
     type Error = SimStorageError;
 
     #[inline(always)]
-    fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
-        &self.channel
+    fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
+        &mut self.channel
     }
 
     #[inline(always)]

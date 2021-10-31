@@ -43,7 +43,10 @@ impl Node {
     }
 }
 
-enum NodeImpl<StorageErr = SimStorageError> {
+enum NodeImpl<StorageErr = SimStorageError>
+where
+    StorageErr: std::error::Error,
+{
     LibP2P(Box<NodeLibP2P>),
     InMemory(Box<NodeInMemory<StorageErr>>),
 }
@@ -293,7 +296,7 @@ where
     Err: std::error::Error + Send + 'static,
 {
     loop {
-        let res = contract_handler.channel().recv_from_listeners().await?;
+        let res = contract_handler.channel().recv_from_listener().await?;
         match res {
             (
                 id,
@@ -318,8 +321,8 @@ where
 
                 contract_handler
                     .channel()
-                    .send_to_listeners(id, ContractHandlerEvent::FetchResponse { key, response })
-                    .await
+                    .send_to_listener(id, ContractHandlerEvent::FetchResponse { key, response })
+                    .await?;
             }
             (id, ContractHandlerEvent::Cache(contract)) => {
                 match contract_handler
@@ -330,14 +333,14 @@ where
                     Ok(_) => {
                         contract_handler
                             .channel()
-                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Ok(())))
-                            .await;
+                            .send_to_listener(id, ContractHandlerEvent::CacheResult(Ok(())))
+                            .await?;
                     }
                     Err(err) => {
                         contract_handler
                             .channel()
-                            .send_to_listeners(id, ContractHandlerEvent::CacheResult(Err(err)))
-                            .await;
+                            .send_to_listener(id, ContractHandlerEvent::CacheResult(Err(err)))
+                            .await?;
                     }
                 }
             }
@@ -345,13 +348,13 @@ where
                 let put_result = contract_handler.put_value(&key, value).await;
                 contract_handler
                     .channel()
-                    .send_to_listeners(
+                    .send_to_listener(
                         id,
                         ContractHandlerEvent::PushResponse {
                             new_value: put_result,
                         },
                     )
-                    .await;
+                    .await?;
             }
             _ => unreachable!(),
         }

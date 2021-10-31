@@ -1,17 +1,22 @@
+use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use super::runtime::{ContractRuntime, ContractUpdateError};
 use crate::contract::store::ContractStore;
 use crate::contract::{Contract, ContractError, ContractKey, ContractValue};
 
-/// Behaviour
 #[async_trait::async_trait]
-pub(crate) trait ContractHandler: From<ContractHandlerChannel<Self::Error>> {
-    type Error;
+pub(crate) trait ContractHandler:
+    From<ContractHandlerChannel<Self::Error, CHListenerHalve>>
+{
+    type Error: std::error::Error;
 
-    fn channel(&self) -> &ContractHandlerChannel<Self::Error>;
+    fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve>;
 
     fn contract_store(&mut self) -> &mut ContractStore;
 
@@ -30,46 +35,118 @@ pub(crate) trait ContractHandler: From<ContractHandlerChannel<Self::Error>> {
     ) -> Result<ContractValue, Self::Error>;
 }
 
-pub struct EventId(usize);
+pub struct EventId(u64);
 
 /// A bidirectional channel which keeps track of the initiator half
 /// and sends the corresponding response to the listener of the operation.
-pub(crate) struct ContractHandlerChannel<Err> {
-    _err: PhantomData<Err>,
+pub(crate) struct ContractHandlerChannel<SErr, End>
+where
+    SErr: std::error::Error,
+{
+    rx: mpsc::UnboundedReceiver<InternalCHEvent<SErr>>,
+    tx: mpsc::UnboundedSender<InternalCHEvent<SErr>>,
+    //TODO: change queue to btree once pop_first is stabilized
+    queue: VecDeque<(u64, ContractHandlerEvent<SErr>)>,
+    _halve: PhantomData<End>,
 }
 
-// TODO: pretty much can copy this verbatim?
-// https://docs.rs/tarpc/0.27.2/src/tarpc/transport/channel.rs.html#39-42
+pub(crate) struct CHListenerHalve;
+pub(crate) struct CHSenderHalve;
 
-impl<Err> Clone for ContractHandlerChannel<Err> {
-    fn clone(&self) -> Self {
-        Self { _err: PhantomData }
-    }
+mod sealed {
+    use super::{CHListenerHalve, CHSenderHalve};
+    pub(crate) trait ChannelHalve {}
+    impl ChannelHalve for CHListenerHalve {}
+    impl ChannelHalve for CHSenderHalve {}
 }
 
-impl<Err: std::error::Error> ContractHandlerChannel<Err> {
-    pub fn new() -> Self {
-        // let (notification_tx, notification_channel) = mpsc::channel(100);
-        // let (ch_tx, ch_listener) = mpsc::channel(10);
-        Self { _err: PhantomData }
-    }
+pub(crate) fn contract_handler_channel<SErr>() -> (
+    ContractHandlerChannel<SErr, CHSenderHalve>,
+    ContractHandlerChannel<SErr, CHListenerHalve>,
+)
+where
+    SErr: std::error::Error,
+{
+    let (notification_tx, notification_channel) = mpsc::unbounded_channel();
+    let (ch_tx, ch_listener) = mpsc::unbounded_channel();
+    (
+        ContractHandlerChannel {
+            rx: notification_channel,
+            tx: ch_tx,
+            queue: VecDeque::new(),
+            _halve: PhantomData,
+        },
+        ContractHandlerChannel {
+            rx: ch_listener,
+            tx: notification_tx,
+            queue: VecDeque::new(),
+            _halve: PhantomData,
+        },
+    )
+}
 
+static EV_ID: AtomicU64 = AtomicU64::new(0);
+
+// TODO: the timeout should be derived from whatever is the worst
+// case we are willing to accept for waiting out for an event;
+// have to double check all events to see if any depend on external
+// responses and go from there, also this may very well depend on the
+// kind of event and can be optimized on a case basis
+const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
+
+impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHSenderHalve> {
     /// Send an event to the contract handler and receive a response event if succesful.
     pub async fn send_to_handler(
+        &mut self,
+        ev: ContractHandlerEvent<SErr>,
+    ) -> Result<ContractHandlerEvent<SErr>, ContractError<SErr>> {
+        let id = EV_ID.fetch_add(1, SeqCst);
+        self.tx
+            .send(InternalCHEvent { ev, id })
+            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
+        if let Ok(pos) = self.queue.binary_search_by_key(&id, |(k, _v)| *k) {
+            Ok(self.queue.remove(pos).unwrap().1)
+        } else {
+            let started_op = Instant::now();
+            loop {
+                if started_op.elapsed() > CH_EV_RESPONSE_TIME_OUT {
+                    break Err(ContractError::NoHandlerEvResponse);
+                }
+                while let Some(msg) = self.rx.recv().await {
+                    if msg.id == id {
+                        return Ok(msg.ev);
+                    } else {
+                        let _ = self.queue.push_front((id, msg.ev)); // should never be duplicates
+                    }
+                }
+                tokio::time::sleep(Duration::from_nanos(100)).await;
+            }
+        }
+    }
+}
+
+impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHListenerHalve> {
+    pub async fn send_to_listener(
         &self,
-        _ev: ContractHandlerEvent<Err>,
-    ) -> Result<ContractHandlerEvent<Err>, ContractError<Err>> {
-        todo!()
+        id: EventId,
+        ev: ContractHandlerEvent<SErr>,
+    ) -> Result<(), ContractError<SErr>> {
+        Ok(self
+            .tx
+            .send(InternalCHEvent { ev, id: id.0 })
+            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?)
     }
 
-    pub async fn send_to_listeners(&self, _id: EventId, _ev: ContractHandlerEvent<Err>) {
-        todo!()
-    }
-
-    pub async fn recv_from_listeners(
-        &self,
-    ) -> Result<(EventId, ContractHandlerEvent<Err>), ContractError<Err>> {
-        todo!()
+    pub async fn recv_from_listener(
+        &mut self,
+    ) -> Result<(EventId, ContractHandlerEvent<SErr>), ContractError<SErr>> {
+        if let Some((id, ev)) = self.queue.pop_front() {
+            return Ok((EventId(id), ev));
+        }
+        while let Some(msg) = self.rx.recv().await {
+            return Ok((EventId(msg.id), msg.ev));
+        }
+        Err(ContractError::NoHandlerEvResponse)
     }
 }
 
@@ -79,6 +156,15 @@ pub(crate) struct StoreResponse {
     pub contract: Option<Contract>,
 }
 
+struct InternalCHEvent<Err>
+where
+    Err: std::error::Error,
+{
+    ev: ContractHandlerEvent<Err>,
+    id: u64,
+}
+
+#[derive(Debug)]
 pub(crate) enum ContractHandlerEvent<Err>
 where
     Err: std::error::Error,
@@ -110,6 +196,49 @@ where
     FetchContract(ContractKey),
     /// Result of fetching a contract.
     FetchContractResult(Result<Option<Contract>, ContractError<Err>>),
+}
+
+#[cfg(test)]
+mod test {
+    use crate::node::SimStorageError;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_test() -> Result<(), anyhow::Error> {
+        let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStorageError>();
+
+        let h = tokio::spawn(async move {
+            send_halve
+                .send_to_handler(ContractHandlerEvent::Cache(Contract::new(vec![0, 1, 2, 3])))
+                .await
+        });
+
+        let (id, ev) =
+            tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_listener())
+                .await??;
+
+        if let ContractHandlerEvent::Cache(contract) = ev {
+            let data: Vec<u8> = contract.try_into()?;
+            assert_eq!(data, vec![0, 1, 2, 3]);
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                rcv_halve.send_to_listener(id, ContractHandlerEvent::Cache(Contract::new(data))),
+            )
+            .await??;
+        } else {
+            anyhow::bail!("invalid event");
+        }
+
+        if let ContractHandlerEvent::Cache(contract) = h.await?? {
+            let data: Vec<u8> = contract.try_into()?;
+            assert_eq!(data, vec![0, 1, 2, 3]);
+        } else {
+            anyhow::bail!("invalid event!");
+        }
+
+        Ok(())
+    }
 }
 
 mod sqlite {
@@ -144,14 +273,14 @@ mod sqlite {
     }
 
     pub(crate) struct SQLiteContractHandler {
-        channel: ContractHandlerChannel<DatabaseError>,
+        channel: ContractHandlerChannel<DatabaseError, CHListenerHalve>,
         store: ContractStore,
         pub(super) pool: SqlitePool,
     }
 
     impl SQLiteContractHandler {
         pub fn new(
-            channel: ContractHandlerChannel<DatabaseError>,
+            channel: ContractHandlerChannel<DatabaseError, CHListenerHalve>,
             store: ContractStore,
             pool: SqlitePool,
         ) -> Self {
@@ -163,8 +292,12 @@ mod sqlite {
         }
     }
 
-    impl From<ContractHandlerChannel<<Self as ContractHandler>::Error>> for SQLiteContractHandler {
-        fn from(channel: ContractHandlerChannel<<Self as ContractHandler>::Error>) -> Self {
+    impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>>
+        for SQLiteContractHandler
+    {
+        fn from(
+            channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
+        ) -> Self {
             let store = ContractStore::new();
             let pool = (&*POOL).clone();
             SQLiteContractHandler::new(channel, store, pool)
@@ -176,8 +309,8 @@ mod sqlite {
         type Error = DatabaseError;
 
         #[inline(always)]
-        fn channel(&self) -> &ContractHandlerChannel<Self::Error> {
-            &self.channel
+        fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
+            &mut self.channel
         }
 
         #[inline(always)]
@@ -236,77 +369,75 @@ mod sqlite {
             }
         }
     }
-}
 
-#[cfg(test)]
-mod test {
-    use sqlx::SqlitePool;
+    #[cfg(test)]
+    mod test {
+        use super::sqlite::SQLiteContractHandler;
+        use super::*;
+        use crate::contract::Contract;
 
-    use super::sqlite::SQLiteContractHandler;
-    use super::*;
-    use crate::contract::Contract;
+        // Prepare and get handler for an in-memory sqlite db
+        async fn get_handler() -> Result<SQLiteContractHandler, sqlx::Error> {
+            let (_, ch_handler) = contract_handler_channel();
+            let db_pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+            let store: ContractStore = ContractStore::new();
+            create_test_contracts_table(&db_pool).await;
+            Ok(SQLiteContractHandler::new(ch_handler, store, db_pool))
+        }
 
-    // Prepare and get handler for an in-memory sqlite db
-    async fn get_handler() -> Result<SQLiteContractHandler, sqlx::Error> {
-        let ch_handler = ContractHandlerChannel::new();
-        let db_pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let store: ContractStore = ContractStore::new();
-        create_test_contracts_table(&db_pool).await;
-        Ok(SQLiteContractHandler::new(ch_handler, store, db_pool))
-    }
+        // Create test contracts table
+        async fn create_test_contracts_table(pool: &SqlitePool) {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS contracts (
+                        key             STRING PRIMARY KEY,
+                        value           BLOB
+                    )",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+        }
 
-    // Create test contracts table
-    async fn create_test_contracts_table(pool: &SqlitePool) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS contracts (
-                    key             STRING PRIMARY KEY,
-                    value           BLOB
-                )",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-    }
+        #[tokio::test]
+        async fn contract_handler() -> Result<(), anyhow::Error> {
+            // Create a sqlite handler and initialize the database
+            let mut handler: SQLiteContractHandler = get_handler().await?;
+            create_test_contracts_table(&handler.pool).await;
 
-    #[tokio::test]
-    async fn contract_handler() -> Result<(), anyhow::Error> {
-        // Create a sqlite handler and initialize the database
-        let mut handler: SQLiteContractHandler = get_handler().await?;
-        create_test_contracts_table(&handler.pool).await;
+            // Generate a contract
+            let contract_value: Vec<u8> = b"Test contract value".to_vec();
+            let contract: Contract = Contract::new(contract_value);
 
-        // Generate a contract
-        let contract_value: Vec<u8> = b"Test contract value".to_vec();
-        let contract: Contract = Contract::new(contract_value);
+            // Get contract parts
+            let contract_key = ContractKey(contract.key);
+            let contract_value = ContractValue::new(contract.data);
+            let contract_value_cloned = contract_value.clone();
 
-        // Get contract parts
-        let contract_key = ContractKey(contract.key);
-        let contract_value = ContractValue::new(contract.data);
-        let contract_value_cloned = contract_value.clone();
+            let put_result_value = handler.put_value(&contract_key, contract_value).await?;
+            let get_result_value = handler
+                .get_value(&contract_key)
+                .await?
+                .ok_or(anyhow::anyhow!("No value found"))?;
 
-        let put_result_value = handler.put_value(&contract_key, contract_value).await?;
-        let get_result_value = handler
-            .get_value(&contract_key)
-            .await?
-            .ok_or(anyhow::anyhow!("No value found"))?;
+            assert_eq!(contract_value_cloned.0, put_result_value.0);
+            assert_eq!(contract_value_cloned.0, get_result_value.0);
+            assert_eq!(put_result_value.0, get_result_value.0);
 
-        assert_eq!(contract_value_cloned.0, put_result_value.0);
-        assert_eq!(contract_value_cloned.0, get_result_value.0);
-        assert_eq!(put_result_value.0, get_result_value.0);
+            // Update the contract value with new one
+            let new_contract_value: Vec<u8> = b"New test contract value".to_vec();
+            let new_contract_value = ContractValue::new(new_contract_value);
+            let new_contract_value_cloned = new_contract_value.clone();
+            let new_put_result_value = handler.put_value(&contract_key, new_contract_value).await?;
+            let new_get_result_value = handler
+                .get_value(&contract_key)
+                .await?
+                .ok_or(anyhow::anyhow!("No value found"))?;
 
-        // Update the contract value with new one
-        let new_contract_value: Vec<u8> = b"New test contract value".to_vec();
-        let new_contract_value = ContractValue::new(new_contract_value);
-        let new_contract_value_cloned = new_contract_value.clone();
-        let new_put_result_value = handler.put_value(&contract_key, new_contract_value).await?;
-        let new_get_result_value = handler
-            .get_value(&contract_key)
-            .await?
-            .ok_or(anyhow::anyhow!("No value found"))?;
+            assert_eq!(new_contract_value_cloned.0, new_put_result_value.0);
+            assert_eq!(new_contract_value_cloned.0, new_get_result_value.0);
+            assert_eq!(new_put_result_value.0, new_get_result_value.0);
 
-        assert_eq!(new_contract_value_cloned.0, new_put_result_value.0);
-        assert_eq!(new_contract_value_cloned.0, new_get_result_value.0);
-        assert_eq!(new_put_result_value.0, new_get_result_value.0);
-
-        Ok(())
+            Ok(())
+        }
     }
 }

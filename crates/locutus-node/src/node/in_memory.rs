@@ -4,7 +4,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
-    contract::{ContractHandler, ContractHandlerChannel},
+    contract::{self, ContractHandler},
     message::{GetTxType, Message, Transaction},
     operations::{
         get,
@@ -18,7 +18,10 @@ use crate::{
 
 use super::{op_state::OpManager, InitPeerNode};
 
-pub(crate) struct NodeInMemory<CErr> {
+pub(crate) struct NodeInMemory<CErr>
+where
+    CErr: std::error::Error,
+{
     peer: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
@@ -68,9 +71,9 @@ where
             ring.with_rnd_walk_above(rnd_if_htl_above);
         }
         let (notification_tx, notification_channel) = mpsc::channel(100);
-        let ch_handler = ContractHandlerChannel::new();
-        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ch_handler.clone()));
-        let contract_handler = CH::from(ch_handler);
+        let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
+        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
+        let contract_handler = CH::from(ch_channel);
 
         tokio::spawn(super::contract_handling(contract_handler));
 
