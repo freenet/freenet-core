@@ -20,6 +20,10 @@ Our "chainless" smart contract approach will result in learnings for IPFS-native
 
 Lastly, our deployment of a libp2p application to the major mobile platforms will inform other IPFS on mobile efforts, particularly the low-bandwidth, low-power, and variable connectivity challenges of mobile.
 
+### Status
+
+Freenet2 is currently in development with an initial release planned for Q1 2022.
+
 ### Naming
 
 "Locutus" is the development codename for this project which is also known as "Freenet2".
