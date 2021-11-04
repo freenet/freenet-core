@@ -1,6 +1,4 @@
-### Locutus
-
-*Note:* "Locutus" is the development codename for this project which is also known as "Freenet2".
+### Purpose
 
 A distributed, decentralized, key-value store in which keys are cryptographic contracts which determine what values are valid under that key.
 
@@ -21,3 +19,7 @@ We're building Freenet2 on the Rust implementation of libp2p meaning our develop
 Our "chainless" smart contract approach will result in learnings for IPFS-native applications and FileCoin's smart contract initiative.
 
 Lastly, our deployment of a libp2p application to the major mobile platforms will inform other IPFS on mobile efforts, particularly the low-bandwidth, low-power, and variable connectivity challenges of mobile.
+
+### Naming
+
+"Locutus" is the development codename for this project which is also known as "Freenet2".
