@@ -2,7 +2,7 @@
 
 *Note:* "Locutus" is the development codename for this project which is also known as "Freenet2".
 
-[![Build Status](https://github.com/freenet/locutus/actions/workflows/build.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/build.yml)
+[//]: # ([![Build Status](https://github.com/freenet/locutus/actions/workflows/build.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/build.yml))
 
 A distributed, decentralized, key-value store in which keys are cryptographic contracts which determine what values are valid under that key.
 
