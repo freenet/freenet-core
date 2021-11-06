@@ -18,6 +18,79 @@ pub(crate) use test_utils::MemoryContractHandler;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
+pub(crate) async fn contract_handling<CH, Err>(
+    mut contract_handler: CH,
+) -> Result<(), ContractError<Err>>
+where
+    CH: ContractHandler<Error = Err> + Send + 'static,
+    Err: std::error::Error + Send + 'static,
+{
+    loop {
+        let res = contract_handler.channel().recv_from_listener().await?;
+        match res {
+            (
+                id,
+                ContractHandlerEvent::FetchQuery {
+                    key,
+                    fetch_contract,
+                },
+            ) => {
+                let contract = if fetch_contract {
+                    contract_handler
+                        .contract_store()
+                        .fetch_contract(&key)
+                        .await?
+                } else {
+                    None
+                };
+
+                let response = contract_handler
+                    .get_value(&key)
+                    .await
+                    .map(|value| StoreResponse { value, contract });
+
+                contract_handler
+                    .channel()
+                    .send_to_listener(id, ContractHandlerEvent::FetchResponse { key, response })
+                    .await?;
+            }
+            (id, ContractHandlerEvent::Cache(contract)) => {
+                match contract_handler
+                    .contract_store()
+                    .store_contract(contract)
+                    .await
+                {
+                    Ok(_) => {
+                        contract_handler
+                            .channel()
+                            .send_to_listener(id, ContractHandlerEvent::CacheResult(Ok(())))
+                            .await?;
+                    }
+                    Err(err) => {
+                        contract_handler
+                            .channel()
+                            .send_to_listener(id, ContractHandlerEvent::CacheResult(Err(err)))
+                            .await?;
+                    }
+                }
+            }
+            (id, ContractHandlerEvent::PushQuery { key, value }) => {
+                let put_result = contract_handler.put_value(&key, value).await;
+                contract_handler
+                    .channel()
+                    .send_to_listener(
+                        id,
+                        ContractHandlerEvent::PushResponse {
+                            new_value: put_result,
+                        },
+                    )
+                    .await?;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// Main abstraction for representing a contract in binary form.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Contract {

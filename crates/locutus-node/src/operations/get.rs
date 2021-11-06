@@ -448,18 +448,70 @@ where
             }
         }
         GetMsg::ReturnGet {
-            id,
             key,
             value:
                 StoreResponse {
-                    value: Some(contract_val),
+                    value: Some(value),
                     contract,
                 },
-            ..
+            id,
+            sender,
         } => {
-            // received a response with a contract value
+            let require_contract = matches!(
+                state.sm.state(),
+                GetState::AwaitingResponse {
+                    fetch_contract: true,
+                    ..
+                }
+            );
 
-            todo!()
+            // received a response with a contract value
+            if require_contract {
+                if let Some(contract) = &contract {
+                    // store contract first
+                    op_storage
+                        .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
+                        .await?;
+                } else {
+                    // no contract, consider this like an error ignoring the incoming update value
+                    op_storage
+                        .notify_change(
+                            Message::from(GetMsg::ReturnGet {
+                                id,
+                                key,
+                                value: StoreResponse {
+                                    value: None,
+                                    contract: None,
+                                },
+                                sender,
+                            }),
+                            Operation::Get(state),
+                        )
+                        .await?;
+                    return Err(OpError::StatePushed);
+                }
+            }
+
+            op_storage
+                .notify_contract_handler(ContractHandlerEvent::PushQuery {
+                    key,
+                    value: value.clone(),
+                })
+                .await?;
+
+            return_msg = state
+                .sm
+                .consume_to_output(GetMsg::ReturnGet {
+                    key,
+                    value: StoreResponse {
+                        value: Some(value),
+                        contract,
+                    },
+                    id,
+                    sender,
+                })?
+                .map(Message::from);
+            new_state = None;
         }
         _ => return Err(OpError::IllegalStateTransition),
     }
