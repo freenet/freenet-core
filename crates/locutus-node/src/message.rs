@@ -67,11 +67,11 @@ impl Display for Transaction {
 }
 
 /// Get the transaction type associated to a given message type.
-pub(crate) trait GetTxType: sealed_msg_type::SealedTxType {
+pub(crate) trait TxType: sealed_msg_type::SealedTxType {
     fn tx_type_id() -> TransactionTypeId;
 }
 
-impl<T> GetTxType for T
+impl<T> TxType for T
 where
     T: sealed_msg_type::SealedTxType,
 {

@@ -106,8 +106,9 @@ impl Ring {
         true
     }
 
+    /// Whether this node already has this contract cached or not.
     #[inline]
-    pub fn has_contract(&self, key: &ContractKey) -> bool {
+    pub fn contract_exists(&self, key: &ContractKey) -> bool {
         self.cached_contracts.contains(key)
     }
 

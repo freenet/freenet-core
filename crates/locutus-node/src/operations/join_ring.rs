@@ -652,7 +652,7 @@ mod test {
     use super::*;
     use crate::{
         config::tracing::Logger,
-        message::GetTxType,
+        message::TxType,
         node::{
             test_utils::{EventType, SimNetwork},
             SimStorageError,
@@ -661,7 +661,7 @@ mod test {
 
     #[test]
     fn succesful_join_ring_seq() {
-        let id = Transaction::new(<JoinRingMsg as GetTxType>::tx_type_id());
+        let id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id());
         let new_loc = Location::random();
         let mut new_peer = PeerKeyLocation {
             peer: PeerKey::random(),
