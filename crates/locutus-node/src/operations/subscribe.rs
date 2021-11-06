@@ -6,7 +6,7 @@ use crate::{
     config::PEER_TIMEOUT,
     conn_manager::{ConnectionBridge, PeerKey},
     contract::{ContractError, ContractKey},
-    message::{GetTxType, Message, Transaction},
+    message::{Message, Transaction, TxType},
     node::OpManager,
     ring::{PeerKeyLocation, RingError},
 };
@@ -28,7 +28,7 @@ impl SubscribeOp {
     const MAX_RETRIES: usize = 10;
 
     pub fn start_op(key: ContractKey) -> Self {
-        let id = Transaction::new(<SubscribeMsg as GetTxType>::tx_type_id());
+        let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id());
         let sm = StateMachine::from_state(SubscribeState::PrepareRequest { id, key });
         SubscribeOp {
             sm,
@@ -151,7 +151,7 @@ where
     CErr: std::error::Error,
 {
     let (target, id) = if let SubscribeState::PrepareRequest { id, key } = sub_op.sm.state() {
-        if !op_storage.ring.has_contract(key) {
+        if !op_storage.ring.contract_exists(key) {
             return Err(OpError::ContractError(ContractError::ContractNotFound(
                 *key,
             )));
@@ -267,7 +267,7 @@ where
                 }
             };
 
-            if !op_storage.ring.has_contract(&key) {
+            if !op_storage.ring.contract_exists(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
                 log::info!("Contract {} not found while processing info", key);

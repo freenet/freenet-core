@@ -9,7 +9,7 @@ use crate::{
     config::PEER_TIMEOUT,
     conn_manager::ConnectionBridge,
     contract::{Contract, ContractError, ContractHandlerEvent, ContractKey, ContractValue},
-    message::{GetTxType, Message, Transaction},
+    message::{Message, Transaction, TxType},
     node::OpManager,
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -36,7 +36,7 @@ impl PutOp {
             Location::from(contract.key())
         );
 
-        let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
+        let id = Transaction::new(<PutMsg as TxType>::tx_type_id());
         let sm = StateMachine::from_state(PutState::PrepareRequest {
             id,
             contract,
@@ -301,7 +301,7 @@ where
             target,
         } => {
             let key = contract.key();
-            let cached_contract = op_storage.ring.has_contract(&key);
+            let cached_contract = op_storage.ring.contract_exists(&key);
             if !cached_contract && op_storage.ring.within_caching_distance(&key.location()) {
                 // this node does not have the contract, so instead store the contract and execute the put op.
                 op_storage
@@ -463,7 +463,7 @@ where
             htl,
         } => {
             let key = contract.key();
-            let cached_contract = op_storage.ring.has_contract(&key);
+            let cached_contract = op_storage.ring.contract_exists(&key);
             let within_caching_dist = op_storage.ring.within_caching_distance(&key.location());
             if !cached_contract && within_caching_dist {
                 // this node does not have the contract, so instead store the contract and execute the put op.
@@ -687,9 +687,11 @@ mod test {
 
     use super::*;
 
+    type Err = OpError<SimStorageError>;
+
     #[test]
     fn successful_put_op_seq() -> Result<(), anyhow::Error> {
-        let id = Transaction::new(<PutMsg as GetTxType>::tx_type_id());
+        let id = Transaction::new(<PutMsg as TxType>::tx_type_id());
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
@@ -702,21 +704,21 @@ mod test {
             PutOp::start_op(contract.clone(), ContractValue::new(vec![0, 1, 2, 3]), 0).sm;
         let mut target = StateMachine::<PutOpSM>::from_state(PutState::ReceivedRequest);
 
-        // requester.consume_to_state();
-        let _req_msg =
-            requester.consume_to_output::<OpError<SimStorageError>>(PutMsg::RouteValue {
+        let req_msg = requester
+            .consume_to_output::<Err>(PutMsg::RouteValue {
                 id,
                 htl: 0,
                 target: target_loc,
-            })?;
-        let _expected = PutMsg::RequestPut {
+            })?
+            .ok_or(anyhow::anyhow!("no msg"))?;
+        let expected = PutMsg::RequestPut {
             id,
             contract: contract.clone(),
             value: ContractValue::new(vec![0, 1, 2, 3]),
             htl: 0,
             target: target_loc,
         };
-        // assert_eq!(req_msg, expected);
+        assert_eq!(req_msg, expected);
         assert_eq!(
             requester.state(),
             &PutState::AwaitingResponse {
@@ -725,7 +727,7 @@ mod test {
         );
 
         let res_msg = target
-            .consume_to_output::<OpError<SimStorageError>>(PutMsg::Broadcasting {
+            .consume_to_output::<Err>(PutMsg::Broadcasting {
                 id,
                 broadcast_to: vec![],
                 broadcasted_to: 0,
