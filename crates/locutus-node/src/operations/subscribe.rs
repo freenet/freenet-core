@@ -20,7 +20,7 @@ use super::{
 pub(crate) use self::messages::SubscribeMsg;
 
 pub(crate) struct SubscribeOp {
-    sm: StateMachine<SubscribeOpSM>,
+    sm: StateMachine<SubscribeOpSm>,
     _ttl: Duration,
 }
 
@@ -37,9 +37,9 @@ impl SubscribeOp {
     }
 }
 
-struct SubscribeOpSM;
+struct SubscribeOpSm;
 
-impl StateMachineImpl for SubscribeOpSM {
+impl StateMachineImpl for SubscribeOpSm {
     type Input = SubscribeMsg;
 
     type State = SubscribeState;

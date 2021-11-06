@@ -11,12 +11,12 @@ use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-use crate::contract::{MemoryContractHandler, StoreResponse};
+use crate::contract::MemoryContractHandler;
 use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
     config::CONF,
-    contract::{ContractError, ContractHandler, ContractHandlerEvent},
+    contract::ContractError,
     operations::{get, put},
     ring::Location,
     user_events::{UserEvent, UserEventsProxy},

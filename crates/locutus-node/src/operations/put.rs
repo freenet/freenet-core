@@ -23,7 +23,7 @@ use super::{
 };
 
 pub(crate) struct PutOp {
-    sm: StateMachine<PutOpSM>,
+    sm: StateMachine<PutOpSm>,
     /// time left until time out, when this reaches zero it will be removed from the state
     _ttl: Duration,
 }
@@ -50,9 +50,9 @@ impl PutOp {
     }
 }
 
-struct PutOpSM;
+struct PutOpSm;
 
-impl StateMachineImpl for PutOpSM {
+impl StateMachineImpl for PutOpSm {
     type Input = PutMsg;
 
     type State = PutState;
@@ -353,16 +353,12 @@ where
                 target.location
             );
 
-            // add one because since is originating from this node and we don't want to
-            // reduce prematurely on the broadcasting instruction
-            let initial_htl = op_storage.ring.max_hops_to_live + 1;
             if let Some(msg) = state.sm.consume_to_state(PutMsg::Broadcasting {
                 id,
                 broadcast_to,
                 broadcasted_to: 0,
                 key,
                 new_value,
-                htl: initial_htl,
             })? {
                 op_storage
                     .notify_change(msg.into(), Operation::Put(state))
@@ -378,20 +374,13 @@ where
             mut broadcasted_to,
             key,
             new_value,
-            htl,
         } => {
-            let htl = if let Some(new_htl) = htl.checked_sub(1) {
-                new_htl
-            } else {
-                return Err(OpError::BroadcastCompleted);
-            };
             let sender = op_storage.ring.own_location();
             let msg = PutMsg::BroadcastTo {
                 id,
                 key,
                 new_value: new_value.clone(),
                 sender,
-                htl,
             };
 
             let mut broadcasting = Vec::with_capacity(broadcast_to.len());
@@ -422,7 +411,6 @@ where
                     err
                 );
                 conn_manager.drop_connection(peer.peer);
-
                 incorrect_results += 1;
             }
 
@@ -441,7 +429,6 @@ where
                     broadcast_to,
                     key,
                     new_value,
-                    htl,
                 })?
                 .map(Message::from);
             new_state = None;
@@ -621,7 +608,6 @@ mod messages {
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
             new_value: ContractValue,
-            htl: usize,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
@@ -629,7 +615,6 @@ mod messages {
             sender: PeerKeyLocation,
             key: ContractKey,
             new_value: ContractValue,
-            htl: usize,
         },
     }
 
@@ -702,7 +687,7 @@ mod test {
 
         let mut requester =
             PutOp::start_op(contract.clone(), ContractValue::new(vec![0, 1, 2, 3]), 0).sm;
-        let mut target = StateMachine::<PutOpSM>::from_state(PutState::ReceivedRequest);
+        let mut target = StateMachine::<PutOpSm>::from_state(PutState::ReceivedRequest);
 
         let req_msg = requester
             .consume_to_output::<Err>(PutMsg::RouteValue {
@@ -733,7 +718,6 @@ mod test {
                 broadcasted_to: 0,
                 key: contract.key(),
                 new_value: ContractValue::new(vec![4, 3, 2, 1]),
-                htl: 0,
             })?
             .ok_or(anyhow::anyhow!("no output"))?;
         let expected = PutMsg::SuccessfulUpdate {
