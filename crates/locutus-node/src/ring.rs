@@ -17,6 +17,7 @@ use std::{
     fmt::Display,
     hash::Hasher,
     sync::atomic::{AtomicU64, Ordering::SeqCst},
+    time::Instant,
 };
 
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
@@ -55,6 +56,16 @@ pub(crate) struct Ring {
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
     subscriptions: RwLock<Vec<ContractKey>>,
+    /// A peer which has been blacklisted to perform actions regarding a given contract.
+    contract_blacklist: DashMap<ContractKey, Vec<Blacklisted>>,
+}
+
+/// A data type that represents the fact that a peer has been blacklisted
+/// for some action. Has to be coupled with that action
+#[derive(Debug)]
+struct Blacklisted {
+    since: Instant,
+    peer: PeerKey,
 }
 
 impl Ring {
@@ -81,6 +92,7 @@ impl Ring {
             assigned_key: peer,
             subscribers: DashMap::new(),
             subscriptions: RwLock::new(Vec::new()),
+            contract_blacklist: DashMap::new(),
         }
     }
 
