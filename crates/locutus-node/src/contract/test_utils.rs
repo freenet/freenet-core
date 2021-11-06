@@ -16,8 +16,8 @@ impl ContractRuntime for MockRuntime {
         true
     }
 
-    fn update_value(&self, value: &[u8], _value_update: &[u8]) -> ContractUpdateResult<Vec<u8>> {
-        Ok(value.to_vec())
+    fn update_value(&self, _value: &[u8], value_update: &[u8]) -> ContractUpdateResult<Vec<u8>> {
+        Ok(value_update.to_vec())
     }
 
     fn related_contracts(&self, _value_update: &[u8]) -> Vec<crate::contract::ContractKey> {

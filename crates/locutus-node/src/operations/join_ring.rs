@@ -13,7 +13,7 @@ use crate::{
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 
 pub(crate) struct JoinRingOp {
-    sm: StateMachine<JROpSM>,
+    sm: StateMachine<JROpSm>,
     /// time left until time out, when this reaches zero it will be removed from the state
     _ttl: Duration,
 }
@@ -38,9 +38,9 @@ impl JoinRingOp {
 }
 
 #[derive(Debug)]
-struct JROpSM;
+struct JROpSm;
 
-impl StateMachineImpl for JROpSM {
+impl StateMachineImpl for JROpSm {
     type Input = JoinRingMsg;
 
     type State = JRState;
@@ -673,7 +673,7 @@ mod test {
         };
 
         let mut join_gw_1 = JoinRingOp::initial_request(new_peer.peer, gateway, 0).sm;
-        let mut join_new_peer_2 = StateMachine::<JROpSM>::from_state(JRState::Initializing);
+        let mut join_new_peer_2 = StateMachine::<JROpSm>::from_state(JRState::Initializing);
 
         let req = JoinRingMsg::Req {
             id,
