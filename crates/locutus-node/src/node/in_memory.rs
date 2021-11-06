@@ -75,7 +75,7 @@ where
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
         let contract_handler = CH::from(ch_channel);
 
-        tokio::spawn(super::contract_handling(contract_handler));
+        tokio::spawn(contract::contract_handling(contract_handler));
 
         Ok(NodeInMemory {
             peer,

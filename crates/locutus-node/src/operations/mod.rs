@@ -83,9 +83,6 @@ pub(crate) enum Operation {
     Subscribe(subscribe::SubscribeOp),
 }
 
-#[derive(Debug, Default)]
-pub struct ProbeOp;
-
 #[allow(unused)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpError<S: std::error::Error> {
