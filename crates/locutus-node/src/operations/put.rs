@@ -538,7 +538,7 @@ async fn forward_changes<CErr, CB>(
 {
     let key = contract.key();
     let contract_loc = key.location();
-    let forward_to = op_storage.ring.closest_caching(&key, 10, &[]).clone();
+    let forward_to = op_storage.ring.closest_caching(&key, 1, &[]).clone();
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     for peer in forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");

@@ -45,7 +45,8 @@ where
 {
     rx: mpsc::UnboundedReceiver<InternalCHEvent<SErr>>,
     tx: mpsc::UnboundedSender<InternalCHEvent<SErr>>,
-    //TODO: change queue to btree once pop_first is stabilized
+    //TODO:  change queue to btree once pop_first is stabilized
+    // (https://github.com/rust-lang/rust/issues/62924)
     queue: VecDeque<(u64, ContractHandlerEvent<SErr>)>,
     _halve: PhantomData<End>,
 }
@@ -245,6 +246,8 @@ mod sqlite {
     use once_cell::sync::Lazy;
     use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 
+    use crate::contract::test_utils::MockRuntime;
+
     use super::*;
 
     // Is fine to clone this as it wraps by an Arc.
@@ -272,40 +275,46 @@ mod sqlite {
         RuntimeError(#[from] ContractUpdateError),
     }
 
-    pub(crate) struct SQLiteContractHandler {
+    pub(crate) struct SQLiteContractHandler<R> {
         channel: ContractHandlerChannel<DatabaseError, CHListenerHalve>,
         store: ContractStore,
+        runtime: R,
         pub(super) pool: SqlitePool,
     }
 
-    impl SQLiteContractHandler {
+    impl<R> SQLiteContractHandler<R>
+    where
+        R: ContractRuntime,
+    {
         pub fn new(
             channel: ContractHandlerChannel<DatabaseError, CHListenerHalve>,
             store: ContractStore,
-            pool: SqlitePool,
+            runtime: R,
         ) -> Self {
+            let pool = POOL.clone();
             SQLiteContractHandler {
                 channel,
                 store,
                 pool,
+                runtime,
             }
         }
     }
 
     impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>>
-        for SQLiteContractHandler
+        for SQLiteContractHandler<MockRuntime>
     {
         fn from(
             channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
         ) -> Self {
             let store = ContractStore::new();
-            let pool = (&*POOL).clone();
-            SQLiteContractHandler::new(channel, store, pool)
+            let runtime = MockRuntime {};
+            SQLiteContractHandler::new(channel, store, runtime)
         }
     }
 
     #[async_trait::async_trait]
-    impl ContractHandler for SQLiteContractHandler {
+    impl ContractHandler for SQLiteContractHandler<MockRuntime> {
         type Error = DatabaseError;
 
         #[inline(always)]
@@ -346,7 +355,7 @@ mod sqlite {
                 Err(_) => value.clone(),
             };
 
-            let value: Vec<u8> = ContractRuntime::update_value(&*old_value, &value.0)?;
+            let value: Vec<u8> = self.runtime.update_value(&*old_value, &value.0)?;
             let encoded_key = hex::encode(contract.0);
             match sqlx::query(
                 "INSERT OR REPLACE INTO contracts (key, value) VALUES (?1, ?2)\
@@ -371,12 +380,16 @@ mod sqlite {
         use crate::contract::Contract;
 
         // Prepare and get handler for an in-memory sqlite db
-        async fn get_handler() -> Result<SQLiteContractHandler, sqlx::Error> {
+        async fn get_handler() -> Result<SQLiteContractHandler<MockRuntime>, sqlx::Error> {
             let (_, ch_handler) = contract_handler_channel();
             let db_pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
             let store: ContractStore = ContractStore::new();
             create_test_contracts_table(&db_pool).await;
-            Ok(SQLiteContractHandler::new(ch_handler, store, db_pool))
+            Ok(SQLiteContractHandler::new(
+                ch_handler,
+                store,
+                MockRuntime {},
+            ))
         }
 
         // Create test contracts table
@@ -395,7 +408,7 @@ mod sqlite {
         #[tokio::test]
         async fn contract_handler() -> Result<(), anyhow::Error> {
             // Create a sqlite handler and initialize the database
-            let mut handler: SQLiteContractHandler = get_handler().await?;
+            let mut handler = get_handler().await?;
             create_test_contracts_table(&handler.pool).await;
 
             // Generate a contract

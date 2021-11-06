@@ -2,13 +2,32 @@ use std::collections::HashMap;
 
 use crate::node::SimStorageError;
 
-#[cfg(test)]
-use super::Contract;
 use super::{
     handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
+    runtime::{ContractRuntime, ContractUpdateResult},
     store::ContractStore,
     ContractKey, ContractValue,
 };
+
+pub(super) struct MockRuntime {}
+
+impl ContractRuntime for MockRuntime {
+    fn validate_value(&self, _value: &[u8]) -> bool {
+        true
+    }
+
+    fn update_value(&self, value: &[u8], _value_update: &[u8]) -> ContractUpdateResult<Vec<u8>> {
+        Ok(value.to_vec())
+    }
+
+    fn related_contracts(&self, _value_update: &[u8]) -> Vec<crate::contract::ContractKey> {
+        todo!()
+    }
+
+    fn extract(&self, _extractor: Option<&[u8]>, _value: &[u8]) -> Vec<u8> {
+        todo!()
+    }
+}
 
 pub(crate) type MemKVStore = HashMap<ContractKey, ContractValue>;
 
@@ -16,6 +35,7 @@ pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
     channel: ContractHandlerChannel<SimStorageError, CHListenerHalve>,
     kv_store: KVStore,
     contract_store: ContractStore,
+    _runtime: MockRuntime,
 }
 
 impl<KVStore> MemoryContractHandler<KVStore> {
@@ -27,6 +47,7 @@ impl<KVStore> MemoryContractHandler<KVStore> {
             channel,
             kv_store,
             contract_store: ContractStore::new(),
+            _runtime: MockRuntime {},
         }
     }
 }
@@ -37,11 +58,8 @@ impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHal
     fn from(
         channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
     ) -> Self {
-        MemoryContractHandler {
-            channel,
-            kv_store: MemKVStore::new(),
-            contract_store: ContractStore::new(),
-        }
+        let store = MemKVStore::new();
+        MemoryContractHandler::new(channel, store)
     }
 }
 
@@ -78,15 +96,20 @@ impl ContractHandler for MemoryContractHandler {
     }
 }
 
-#[test]
-fn serialization() -> Result<(), anyhow::Error> {
-    let bytes = crate::test_utils::random_bytes_1024();
-    let mut gen = arbitrary::Unstructured::new(&bytes);
-    let contract: Contract = gen.arbitrary()?;
+#[cfg(test)]
+mod test {
+    use crate::contract::Contract;
 
-    let serialized = bincode::serialize(&contract)?;
-    let deser: Contract = bincode::deserialize(&serialized)?;
-    assert_eq!(deser.data, contract.data);
-    assert_eq!(deser.key, contract.key);
-    Ok(())
+    #[test]
+    fn serialization() -> Result<(), anyhow::Error> {
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary()?;
+
+        let serialized = bincode::serialize(&contract)?;
+        let deser: Contract = bincode::deserialize(&serialized)?;
+        assert_eq!(deser.data, contract.data);
+        assert_eq!(deser.key, contract.key);
+        Ok(())
+    }
 }
