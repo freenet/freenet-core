@@ -18,7 +18,7 @@ use super::{
 pub(crate) use self::messages::GetMsg;
 
 pub(crate) struct GetOp {
-    sm: StateMachine<GetOpSM>,
+    sm: StateMachine<GetOpSm>,
     _ttl: Duration,
 }
 
@@ -40,9 +40,9 @@ impl GetOp {
     }
 }
 
-struct GetOpSM;
+struct GetOpSm;
 
-impl StateMachineImpl for GetOpSM {
+impl StateMachineImpl for GetOpSm {
     type Input = GetMsg;
 
     type State = GetState;
@@ -612,7 +612,7 @@ mod test {
         };
 
         let mut requester = GetOp::start_op(contract.key(), true).sm;
-        let mut target = StateMachine::<GetOpSM>::from_state(GetState::ReceivedRequest);
+        let mut target = StateMachine::<GetOpSm>::from_state(GetState::ReceivedRequest);
 
         let req_msg = requester
             .consume_to_output::<Err>(GetMsg::FetchRouting {
