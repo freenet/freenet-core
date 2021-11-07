@@ -144,7 +144,7 @@ impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHListenerHalve> {
         if let Some((id, ev)) = self.queue.pop_front() {
             return Ok((EventId(id), ev));
         }
-        while let Some(msg) = self.rx.recv().await {
+        if let Some(msg) = self.rx.recv().await {
             return Ok((EventId(msg.id), msg.ev));
         }
         Err(ContractError::NoHandlerEvResponse)
@@ -419,7 +419,7 @@ mod sqlite {
             let get_result_value = handler
                 .get_value(&contract.key())
                 .await?
-                .ok_or(anyhow::anyhow!("No value found"))?;
+                .ok_or_else(|| anyhow::anyhow!("No value found"))?;
 
             assert_eq!(contract_value, put_result_value);
             assert_eq!(contract_value, get_result_value);
@@ -432,7 +432,7 @@ mod sqlite {
             let new_get_result_value = handler
                 .get_value(&contract.key())
                 .await?
-                .ok_or(anyhow::anyhow!("No value found"))?;
+                .ok_or_else(|| anyhow::anyhow!("No value found"))?;
 
             assert_eq!(new_contract_value, new_put_result_value);
             assert_eq!(new_contract_value, new_get_result_value);

@@ -343,7 +343,7 @@ where
             let broadcast_to = op_storage
                 .ring
                 .subscribers_of(&key)
-                .ok_or(ContractError::ContractNotFound(key).into())?
+                .ok_or(ContractError::ContractNotFound(key))?
                 .iter()
                 .cloned()
                 .collect();
@@ -525,7 +525,7 @@ async fn forward_changes<CErr, CB>(
 {
     let key = contract.key();
     let contract_loc = key.location();
-    let forward_to = op_storage.ring.closest_caching(&key, 1, &[]).clone();
+    let forward_to = op_storage.ring.closest_caching(&key, 1, &[]);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     for peer in forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
@@ -695,7 +695,7 @@ mod test {
                 htl: 0,
                 target: target_loc,
             })?
-            .ok_or(anyhow::anyhow!("no msg"))?;
+            .ok_or_else(|| anyhow::anyhow!("no msg"))?;
         let expected = PutMsg::RequestPut {
             id,
             contract: contract.clone(),
@@ -719,7 +719,7 @@ mod test {
                 key: contract.key(),
                 new_value: ContractValue::new(vec![4, 3, 2, 1]),
             })?
-            .ok_or(anyhow::anyhow!("no output"))?;
+            .ok_or_else(|| anyhow::anyhow!("no output"))?;
         let expected = PutMsg::SuccessfulUpdate {
             id,
             new_value: ContractValue::new(vec![4, 3, 2, 1]),

@@ -619,7 +619,7 @@ mod test {
                 id,
                 target: target_loc,
             })?
-            .ok_or(anyhow::anyhow!("no msg"))?;
+            .ok_or_else(|| anyhow::anyhow!("no msg"))?;
         assert!(matches!(req_msg, GetMsg::RequestGet { .. }));
         assert!(matches!(
             requester.state(),
@@ -635,9 +635,9 @@ mod test {
                     contract: Some(contract),
                     value: Some(ContractValue::new(b"abc".to_vec())),
                 },
-                sender: target_loc.clone(),
+                sender: target_loc,
             })?
-            .ok_or(anyhow::anyhow!("no msg"))?;
+            .ok_or_else(|| anyhow::anyhow!("no msg"))?;
         assert!(matches!(target.state(), GetState::Completed));
         assert!(matches!(res_msg, GetMsg::ReturnGet { .. }));
 
