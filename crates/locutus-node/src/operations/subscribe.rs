@@ -46,7 +46,7 @@ impl StateMachineImpl for SubscribeOpSm {
 
     type Output = SubscribeMsg;
 
-    fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
+    fn state_transition(state: &mut Self::State, input: &mut Self::Input) -> Option<Self::State> {
         match (state, input) {
             (SubscribeState::PrepareRequest { .. }, SubscribeMsg::FetchRouting { .. }) => {
                 Some(SubscribeState::AwaitingResponse {
@@ -166,7 +166,7 @@ where
             *id,
         )
     } else {
-        return Err(OpError::IllegalStateTransition);
+        return Err(OpError::InvalidStateTransition);
     };
 
     if let Some(req_sub) = sub_op
@@ -270,7 +270,7 @@ where
             if !op_storage.ring.contract_exists(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
-                log::info!("Contract {} not found while processing info", key);
+                log::warn!("Contract {} not found while processing info", key);
                 return Ok(return_err());
             }
 
@@ -296,7 +296,7 @@ where
             sender,
             id,
         } => {
-            log::info!(
+            log::warn!(
                 "Contract `{}` not found at potential subscription provider {}",
                 key,
                 sender.peer
@@ -330,7 +330,7 @@ where
                     return Err(RingError::NoCachingPeers(key).into());
                 }
             } else {
-                return Err(OpError::IllegalStateTransition);
+                return Err(OpError::InvalidStateTransition);
             }
         }
         SubscribeMsg::ReturnSub {
@@ -339,7 +339,7 @@ where
             sender,
             id,
         } => {
-            log::info!(
+            log::warn!(
                 "Subscribed to `{}` not found at potential subscription provider {}",
                 key,
                 sender.peer
@@ -356,7 +356,7 @@ where
                 .map(Message::from);
             new_state = None;
         }
-        _ => return Err(OpError::IllegalStateTransition),
+        _ => return Err(OpError::InvalidStateTransition),
     }
     Ok(OperationResult {
         return_msg,

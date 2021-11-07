@@ -271,7 +271,7 @@ where
                         let op = subscribe::SubscribeOp::start_op(key);
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
                             Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
-                                log::info!("Trying to subscribe to a contract not present: {}, requesting it first", key);
+                                log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
                                 let get_op = get::GetOp::start_op(key, true);
                                 if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
                                     log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);

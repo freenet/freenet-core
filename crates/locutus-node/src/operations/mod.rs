@@ -39,7 +39,7 @@ where
             return Ok(());
         }
         Err((err, tx_id)) => {
-            log::error!("error while processing join request: {}", err);
+            log::error!("error while processing request: {}", err);
             if let Some(sender) = sender {
                 conn_manager.send(sender, Message::Canceled(tx_id)).await?;
             }
@@ -71,7 +71,7 @@ where
         }) => {
             // operation finished_completely
         }
-        _ => return Err(OpError::IllegalStateTransition),
+        _ => return Err(OpError::InvalidStateTransition),
     }
     Ok(())
 }
@@ -94,7 +94,7 @@ pub(crate) enum OpError<S: std::error::Error> {
     ContractError(#[from] ContractError<S>),
 
     #[error("cannot perform a state transition from the current state with the provided input")]
-    IllegalStateTransition,
+    InvalidStateTransition,
     #[error("failed notifying back to the node message loop, channel closed")]
     NotificationError(#[from] tokio::sync::mpsc::error::SendError<Message>),
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]

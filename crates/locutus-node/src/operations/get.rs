@@ -49,7 +49,7 @@ impl StateMachineImpl for GetOpSm {
 
     type Output = GetMsg;
 
-    fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
+    fn state_transition(state: &mut Self::State, input: &mut Self::Input) -> Option<Self::State> {
         match (state, input) {
             // states of the requester
             (GetState::PrepareRequest { fetch_contract, .. }, GetMsg::FetchRouting { .. }) => {
@@ -236,7 +236,7 @@ where
             *id,
         )
     } else {
-        return Err(OpError::IllegalStateTransition);
+        return Err(OpError::InvalidStateTransition);
     };
     if let Some(req_get) = get_op
         .sm
@@ -331,7 +331,7 @@ where
             if !op_storage.ring.contract_exists(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
-                log::info!("Contract {} not found while processing a get request", key);
+                log::warn!("Contract {} not found while processing a get request", key);
                 return Ok(OperationResult {
                     return_msg: Some(Message::from(GetMsg::ReturnGet {
                         key,
@@ -363,7 +363,7 @@ where
                         returned_key,
                         key
                     );
-                    return Err(OpError::IllegalStateTransition);
+                    return Err(OpError::InvalidStateTransition);
                 }
 
                 match &value {
@@ -389,7 +389,7 @@ where
                     .map(Message::from);
                 new_state = Some(state);
             } else {
-                return Err(OpError::IllegalStateTransition);
+                return Err(OpError::InvalidStateTransition);
             }
         }
         GetMsg::ReturnGet {
@@ -403,7 +403,7 @@ where
             sender,
             ..
         } => {
-            log::info!(
+            log::warn!(
                 "Contract value for {} not available from peer {}, retrying with other peers.",
                 sender.peer,
                 key
@@ -444,7 +444,7 @@ where
                     return Err(RingError::NoCachingPeers(key).into());
                 }
             } else {
-                return Err(OpError::IllegalStateTransition);
+                return Err(OpError::InvalidStateTransition);
             }
         }
         GetMsg::ReturnGet {
@@ -513,7 +513,7 @@ where
                 .map(Message::from);
             new_state = None;
         }
-        _ => return Err(OpError::IllegalStateTransition),
+        _ => return Err(OpError::InvalidStateTransition),
     }
     Ok(OperationResult {
         return_msg,
