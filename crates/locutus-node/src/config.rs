@@ -34,7 +34,7 @@ impl Config {
     pub fn load_conf() -> Result<Config, ()> {
         let mut settings = config::Config::new();
         settings
-            .merge(config::Environment::with_prefix("FREENET"))
+            .merge(config::Environment::with_prefix("LOCUTUS"))
             .unwrap();
 
         let local_peer_keypair =
