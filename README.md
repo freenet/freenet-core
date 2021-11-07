@@ -1,3 +1,7 @@
+# Locutus 
+
+[![Build Status](https://github.com/freenet/locutus/actions/workflows/build.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/build.yml)
+
 ### Purpose
 
 A distributed, decentralized, key-value store in which keys are cryptographic contracts that determine what values are valid under that key.
