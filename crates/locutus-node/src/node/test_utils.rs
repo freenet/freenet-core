@@ -117,7 +117,7 @@ impl SimNetwork {
         let info_ch = self.meta_info_tx.clone();
         tokio::spawn(async move {
             if peer.join_ring().await.is_err() {
-                let _ = info_ch.send(Err(OpError::IllegalStateTransition)).await;
+                let _ = info_ch.send(Err(OpError::InvalidStateTransition)).await;
                 return Err(());
             }
             Self::listen(peer, info_ch, sender_label).await

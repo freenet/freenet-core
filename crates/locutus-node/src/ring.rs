@@ -46,7 +46,6 @@ pub(crate) struct Ring {
     pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
-    // TODO: optimize this for an AtomicU64
     own_location: AtomicU64,
     assigned_key: PeerKey,
     /// The container for subscriber is a vec instead of something like a hashset
