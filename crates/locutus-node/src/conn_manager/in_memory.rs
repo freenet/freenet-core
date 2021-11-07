@@ -59,11 +59,10 @@ impl ConnectionBridge for MemoryConnManager {
     async fn recv(&self) -> Result<Message, ConnError> {
         loop {
             if let Some(mut queue) = self.msg_queue.try_lock() {
-                if let Some(msg) = queue.pop() {
-                    std::mem::drop(queue);
+                let msg = queue.pop();
+                std::mem::drop(queue);
+                if let Some(msg) = msg {
                     return Ok(msg);
-                } else {
-                    std::mem::drop(queue);
                 }
             }
             tokio::time::sleep(Duration::from_nanos(1_000)).await;

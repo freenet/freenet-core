@@ -336,7 +336,7 @@ where
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, join_op, &op_storage.ring).await
         }
-        Some(_) => return Err(OpError::TxUpdateFailure(tx).into()),
+        Some(_) => return Err(OpError::TxUpdateFailure(tx)),
         None => {
             sender = join_op.sender().cloned();
             // new request to join from this node, initialize the machine
@@ -599,6 +599,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_conn<F, CM, Err>(
     id: Transaction,
     mut state: JoinRingOp,
@@ -620,7 +621,7 @@ where
                 "Randomly selecting peer to forward JoinRequest, sender: {}",
                 req_peer.peer
             );
-            ring.random_peer(|p| &p.peer != &req_peer.peer)
+            ring.random_peer(|p| p.peer != req_peer.peer)
         } else {
             log::debug!(
                 "Selecting close peer to forward request, sender: {}",

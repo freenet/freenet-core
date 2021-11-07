@@ -274,7 +274,7 @@ where
                 return Ok(return_err());
             }
 
-            if let Err(_) = op_storage.ring.add_subscriber(key.clone(), subscriber) {
+            if op_storage.ring.add_subscriber(key, subscriber).is_err() {
                 // max number of subscribers for this contract reached
                 return Ok(return_err());
             }
@@ -405,9 +405,7 @@ mod messages {
         }
 
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
-            match self {
-                _ => None,
-            }
+            None
         }
     }
 
