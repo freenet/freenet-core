@@ -21,7 +21,7 @@ pub trait StateMachineImpl {
         None
     }
 
-    fn state_transition(_state: &Self::State, _input: &Self::Input) -> Option<Self::State> {
+    fn state_transition(_state: &mut Self::State, _input: &mut Self::Input) -> Option<Self::State> {
         None
     }
 
@@ -65,13 +65,13 @@ where
         &mut self,
         input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {
-        let popped_state = self.state.take().ok_or(OpError::IllegalStateTransition)?;
+        let popped_state = self.state.take().ok_or(OpError::InvalidStateTransition)?;
         let output = T::output_from_input_as_ref(&popped_state, &input);
         if let Some(new_state) = T::state_transition_from_input(popped_state, input) {
             self.state = Some(new_state);
             Ok(output)
         } else {
-            Err(OpError::IllegalStateTransition)
+            Err(OpError::InvalidStateTransition)
         }
     }
 
@@ -79,15 +79,15 @@ where
     /// the consumed input is moved to the output, while the state change takes it by reference.
     pub fn consume_to_output<CErr: std::error::Error>(
         &mut self,
-        input: T::Input,
+        mut input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {
-        let popped_state = self.state.take().ok_or(OpError::IllegalStateTransition)?;
-        if let Some(new_state) = T::state_transition(&popped_state, &input) {
+        let mut popped_state = self.state.take().ok_or(OpError::InvalidStateTransition)?;
+        if let Some(new_state) = T::state_transition(&mut popped_state, &mut input) {
             let output = T::output_from_input(popped_state, input);
             self.state = Some(new_state);
             Ok(output)
         } else {
-            Err(OpError::IllegalStateTransition)
+            Err(OpError::InvalidStateTransition)
         }
     }
 

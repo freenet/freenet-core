@@ -73,7 +73,7 @@ impl StateMachineImpl for PutOpSm {
         }
     }
 
-    fn state_transition(state: &Self::State, input: &Self::Input) -> Option<Self::State> {
+    fn state_transition(state: &mut Self::State, input: &mut Self::Input) -> Option<Self::State> {
         match (state, input) {
             // state changed for the initial requesting node
             (PutState::PrepareRequest { contract, .. }, PutMsg::RouteValue { .. }) => {
@@ -191,7 +191,7 @@ where
     let key = if let PutState::PrepareRequest { contract, .. } = put_op.sm.state() {
         contract.key()
     } else {
-        return Err(OpError::IllegalStateTransition);
+        return Err(OpError::InvalidStateTransition);
     };
 
     // the initial request must provide:
@@ -214,7 +214,7 @@ where
             .notify_change(Message::from(req_put), Operation::Put(put_op))
             .await?;
     } else {
-        return Err(OpError::IllegalStateTransition);
+        return Err(OpError::InvalidStateTransition);
     }
     Ok(())
 }
@@ -405,7 +405,7 @@ where
             for (peer_num, err) in error_futures {
                 // remove the failed peers in reverse order
                 let peer = broadcast_to.remove(peer_num);
-                log::info!(
+                log::warn!(
                     "failed broadcasting put change to {} with error {}; dropping connection",
                     peer.peer,
                     err
@@ -433,7 +433,7 @@ where
                 .map(Message::from);
             new_state = None;
             if &PutState::BroadcastComplete != state.sm.state() {
-                return Err(OpError::IllegalStateTransition);
+                return Err(OpError::InvalidStateTransition);
             }
         }
         PutMsg::SuccessfulUpdate { id, new_value } => {
@@ -473,7 +473,7 @@ where
             return_msg = None;
             new_state = None;
         }
-        _ => return Err(OpError::IllegalStateTransition),
+        _ => return Err(OpError::InvalidStateTransition),
     }
     Ok(OperationResult {
         return_msg,
@@ -504,7 +504,7 @@ where
             todo!("not a valid value update, notify back to requester")
         }
         Err(err) => Err(err.into()),
-        Ok(_) => Err(OpError::IllegalStateTransition),
+        Ok(_) => Err(OpError::InvalidStateTransition),
     }
 }
 
