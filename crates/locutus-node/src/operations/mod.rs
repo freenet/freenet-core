@@ -1,3 +1,5 @@
+use tokio::sync::mpsc::error::SendError;
+
 use crate::{
     conn_manager::{self, ConnectionBridge},
     contract::ContractError,
@@ -52,7 +54,7 @@ where
             // updated op
             let id = *msg.id();
             if let Some(target) = msg.target() {
-                conn_manager.send(target.clone(), msg).await?;
+                conn_manager.send(*target, msg).await?;
             }
             op_storage.push(id, updated_state)?;
         }
@@ -62,7 +64,7 @@ where
         }) => {
             // finished the operation at this node, informing back
             if let Some(target) = msg.target() {
-                conn_manager.send(target.clone(), msg).await?;
+                conn_manager.send(*target, msg).await?;
             }
         }
         Ok(OperationResult {
@@ -96,7 +98,7 @@ pub(crate) enum OpError<S: std::error::Error> {
     #[error("cannot perform a state transition from the current state with the provided input")]
     InvalidStateTransition,
     #[error("failed notifying back to the node message loop, channel closed")]
-    NotificationError(#[from] tokio::sync::mpsc::error::SendError<Message>),
+    NotificationError(#[from] Box<SendError<Message>>),
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("failed while processing transaction {0}")]
@@ -115,4 +117,13 @@ pub(crate) enum OpError<S: std::error::Error> {
     /// broadcasting is required
     #[error("broadcast completed for tx")]
     BroadcastCompleted,
+}
+
+impl<S> From<SendError<Message>> for OpError<S>
+where
+    S: std::error::Error,
+{
+    fn from(err: SendError<Message>) -> OpError<S> {
+        OpError::NotificationError(Box::new(err))
+    }
 }
