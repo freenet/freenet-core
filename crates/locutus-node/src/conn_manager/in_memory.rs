@@ -12,6 +12,7 @@ use crate::{
     message::Message,
     ring::{Location, PeerKeyLocation},
 };
+
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
     OnceCell::new();
 

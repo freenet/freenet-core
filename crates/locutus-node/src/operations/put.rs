@@ -60,6 +60,7 @@ impl StateMachineImpl for PutOpSm {
     type Output = PutMsg;
 
     fn state_transition_from_input(state: Self::State, input: Self::Input) -> Option<Self::State> {
+        // FIXME: receive broadcast msg when awaiting state
         match (state, input) {
             // state changed for the initial requesting node
             (PutState::AwaitingResponse { contract }, PutMsg::RequestPut { .. }) => {
@@ -310,7 +311,8 @@ where
             } else if !cached_contract {
                 // in this case forward to a closer node to the target location and just wait for a response
                 // to give back to requesting peer
-                todo!()
+                // FIXME
+                log::warn!("Contract {} not found while processing info", key);
             }
 
             // after the contract has been cached, push the update query
