@@ -16,7 +16,7 @@ use crate::{
     NodeConfig,
 };
 
-use super::{op_state::OpManager, InitPeerNode};
+use super::{op_state::OpManager, EventListener, InitPeerNode};
 
 pub(crate) struct NodeInMemory<CErr>
 where
@@ -27,6 +27,7 @@ where
     notification_channel: Receiver<Message>,
     pub conn_manager: MemoryConnManager,
     pub op_storage: Arc<OpManager<CErr>>,
+    event_listener: Option<Box<dyn EventListener + Send + 'static>>,
 }
 
 impl<CErr> NodeInMemory<CErr>
@@ -36,6 +37,7 @@ where
     /// Buils an in-memory node. Does nothing upon construction,
     pub fn build<CH>(
         config: NodeConfig,
+        event_listener: Option<Box<dyn EventListener + Send + 'static>>,
     ) -> Result<NodeInMemory<<CH as ContractHandler>::Error>, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
@@ -83,6 +85,7 @@ where
             op_storage,
             gateways,
             notification_channel,
+            event_listener,
         })
     }
 
@@ -126,33 +129,42 @@ where
                 }
             };
             match msg {
-                Ok(msg) => match msg {
-                    Message::JoinRing(op) => {
-                        join_ring::handle_join_ring(&self.op_storage, &mut self.conn_manager, op)
+                Ok(msg) => {
+                    if let Some(listener) = &mut self.event_listener {
+                        listener.event_received(&msg);
+                    }
+                    match msg {
+                        Message::JoinRing(op) => {
+                            join_ring::handle_join_ring(
+                                &self.op_storage,
+                                &mut self.conn_manager,
+                                op,
+                            )
                             .await
                             .unwrap();
-                    }
-                    Message::Put(op) => {
-                        put::handle_put_request(&self.op_storage, &mut self.conn_manager, op)
+                        }
+                        Message::Put(op) => {
+                            put::handle_put_request(&self.op_storage, &mut self.conn_manager, op)
+                                .await
+                                .unwrap();
+                        }
+                        Message::Get(op) => {
+                            get::handle_get_request(&self.op_storage, &mut self.conn_manager, op)
+                                .await
+                                .unwrap();
+                        }
+                        Message::Subscribe(op) => {
+                            subscribe::handle_subscribe_response(
+                                &self.op_storage,
+                                &mut self.conn_manager,
+                                op,
+                            )
                             .await
                             .unwrap();
+                        }
+                        Message::Canceled(_tx) => unreachable!(),
                     }
-                    Message::Get(op) => {
-                        get::handle_get_request(&self.op_storage, &mut self.conn_manager, op)
-                            .await
-                            .unwrap();
-                    }
-                    Message::Subscribe(op) => {
-                        subscribe::handle_subscribe_response(
-                            &self.op_storage,
-                            &mut self.conn_manager,
-                            op,
-                        )
-                        .await
-                        .unwrap();
-                    }
-                    Message::Canceled(_tx) => unreachable!(),
-                },
+                }
                 Err(_) => return Err(()),
             }
         }

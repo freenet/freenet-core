@@ -1,11 +1,15 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    sync::Arc,
+};
 
+use dashmap::DashMap;
 use libp2p::identity;
 use rand::Rng;
 use tokio::sync::mpsc;
 
 use crate::{
-    conn_manager::{ConnectionBridge, PeerKey, Transport},
+    conn_manager::{ConnectionBridge, PeerKey},
     contract::MemoryContractHandler,
     message::Message,
     node::{InitPeerNode, NodeInMemory},
@@ -38,9 +42,8 @@ pub fn get_dynamic_port() -> u16 {
     rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
 }
 
+/// A simulated in-memory network topology.
 pub(crate) struct SimNetwork {
-    // gateways: HashMap<String, InMemory>,
-    // peers: HashMap<String, InMemory>,
     meta_info_tx: mpsc::Sender<Result<NetEvent, OpError<SimStorageError>>>,
     meta_info_rx: mpsc::Receiver<Result<NetEvent, OpError<SimStorageError>>>,
 }
@@ -58,8 +61,11 @@ impl SimNetwork {
     pub fn build(network_size: usize, ring_max_htl: usize, rnd_if_htl_above: usize) -> SimNetwork {
         let sim = SimNetwork::new();
 
+        let mut event_listener = TestEventListener::new();
+
         // build gateway node
         // let probe_protocol = Some(ProbeProtocol::new(ring_protocol.clone(), loc));
+        const GW_LABEL: &str = "gateway";
         let gateway_pair = identity::Keypair::generate_ed25519();
         let gateway_peer_id = gateway_pair.public().into_peer_id();
         let gateway_port = get_free_port().unwrap();
@@ -71,25 +77,37 @@ impl SimNetwork {
             .with_location(gateway_loc)
             .max_hops_to_live(ring_max_htl)
             .rnd_if_htl_above(rnd_if_htl_above);
-        let gateway =
-            NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(config).unwrap();
-        sim.initialize_gateway(gateway, "gateway".to_owned());
+        event_listener.add_node(GW_LABEL.to_string(), PeerKey::from(gateway_peer_id));
+        let gateway = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
+            config,
+            Some(Box::new(event_listener.clone())),
+        )
+        .unwrap();
+        sim.initialize_gateway(gateway, GW_LABEL.to_owned());
 
         // add other nodes to the simulation
         for node_no in 0..network_size {
             let label = format!("node-{}", node_no);
+            let id = identity::Keypair::generate_ed25519()
+                .public()
+                .into_peer_id();
+            event_listener.add_node(label.clone(), PeerKey::from(id));
+
             let config = NodeConfig::new()
                 .add_provider(
                     InitPeerNode::new()
                         .listening_ip(Ipv6Addr::LOCALHOST)
                         .listening_port(gateway_port)
-                        .with_identifier(gateway_peer_id)
-                        .with_location(gateway_loc),
+                        .with_identifier(id),
                 )
                 .max_hops_to_live(ring_max_htl)
                 .rnd_if_htl_above(rnd_if_htl_above);
             sim.initialize_peer(
-                NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(config).unwrap(),
+                NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
+                    config,
+                    Some(Box::new(event_listener.clone())),
+                )
+                .unwrap(),
                 label,
             );
         }
@@ -125,11 +143,11 @@ impl SimNetwork {
     }
 
     async fn listen(
-        mut gateway: NodeInMemory<SimStorageError>,
+        mut peer: NodeInMemory<SimStorageError>,
         info_ch: mpsc::Sender<Result<NetEvent, OpError<SimStorageError>>>,
         _sender: String,
     ) -> Result<(), ()> {
-        while let Ok(msg) = gateway.conn_manager.recv().await {
+        while let Ok(msg) = peer.conn_manager.recv().await {
             if let Message::JoinRing(msg) = msg {
                 if let JoinRingMsg::Connected { target, .. } = msg {
                     let _ = info_ch
@@ -139,7 +157,7 @@ impl SimNetwork {
                         .await;
                     break;
                 }
-                match handle_join_ring(&gateway.op_storage, &mut gateway.conn_manager, msg).await {
+                match handle_join_ring(&peer.op_storage, &mut peer.conn_manager, msg).await {
                     Err(err) => {
                         let _ = info_ch.send(Err(err)).await;
                     }
@@ -153,8 +171,31 @@ impl SimNetwork {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct TestEventListener {
+    nodes: Arc<DashMap<String, PeerKey>>,
+}
+
+impl TestEventListener {
+    pub fn new() -> Self {
+        TestEventListener {
+            nodes: Arc::new(DashMap::new()),
+        }
+    }
+
+    fn add_node(&mut self, label: String, peer: PeerKey) {
+        self.nodes.insert(label, peer);
+    }
+}
+
+impl super::EventListener for TestEventListener {
+    fn event_received(&mut self, _ev: &Message) {
+        todo!()
+    }
+}
+
 /// Builds an histogram of the distribution in the ring of each node relative to each other.
-fn _ring_distribution<'a>(
+pub(crate) fn ring_distribution<'a>(
     nodes: impl Iterator<Item = &'a NodeInMemory<SimStorageError>> + 'a,
 ) -> impl Iterator<Item = Distance> + 'a {
     // TODO: groupby certain intervals
@@ -162,7 +203,7 @@ fn _ring_distribution<'a>(
     nodes
         .map(|node| {
             let node_ring = &node.op_storage.ring;
-            let self_loc = node.conn_manager.transport.location().unwrap();
+            let self_loc = node_ring.own_location().location.unwrap();
             node_ring
                 .connections_by_location
                 .read()

@@ -812,7 +812,7 @@ mod test {
         config::tracing::Logger,
         message::TxType,
         node::{
-            test_utils::{EventType, SimNetwork},
+            test_utils::{ring_distribution, EventType, SimNetwork},
             SimStorageError,
         },
     };
@@ -919,11 +919,10 @@ mod test {
         //! Given a network of 1000 peers all nodes should have connections.
         Logger::init_logger();
 
-        let _sim_nodes = SimNetwork::build(10, 10, 7);
-        // tokio::time::sleep(Duration::from_secs(300)).await;
-        // let _hist: Vec<_> = _ring_distribution(sim_nodes.values()).collect();
+        let sim_nodes = SimNetwork::build(10, 10, 7);
+        // let _hist: Vec<_> = ring_distribution(sim_nodes.values()).collect();
+        tokio::time::sleep(Duration::from_secs(300)).await;
 
-        // FIXME: enable probing
         // const NUM_PROBES: usize = 10;
         // let mut probe_responses = Vec::with_capacity(NUM_PROBES);
         // for probe_idx in 0..NUM_PROBES {
