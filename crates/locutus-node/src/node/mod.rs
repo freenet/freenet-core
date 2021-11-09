@@ -13,6 +13,7 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 use crate::conn_manager::PeerKey;
 use crate::contract::MemoryContractHandler;
+use crate::message::Message;
 use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
@@ -56,6 +57,29 @@ where
 {
     LibP2P(Box<NodeLibP2P>),
     InMemory(Box<NodeInMemory<StorageErr>>),
+}
+
+/// A type that reacts to incoming messages from the network.
+/// It injects itself at the message event loop.
+///
+/// This type then can emit it's own information to adjacent systems
+/// or is a no-op.
+pub(crate) trait EventListener {
+    fn event_received(&mut self, ev: &Message);
+}
+
+struct EventRegister {}
+
+impl EventRegister {
+    fn new() -> Self {
+        EventRegister {}
+    }
+}
+
+impl EventListener for EventRegister {
+    fn event_received(&mut self, ev: &Message) {
+        todo!()
+    }
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
