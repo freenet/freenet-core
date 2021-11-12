@@ -10,6 +10,7 @@ use crate::{
     node::OpManager,
     ring::{PeerKeyLocation, RingError},
 };
+use crate::operations::subscribe::SubscribeState::AwaitingResponse;
 
 use super::{
     handle_op_result,
@@ -220,7 +221,7 @@ where
 }
 
 async fn update_state<CB, CErr>(
-    _conn_manager: &mut CB,
+    conn_manager: &mut CB,
     mut state: SubscribeOp,
     other_host_msg: SubscribeMsg,
     op_storage: &OpManager<CErr>,
@@ -424,8 +425,43 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use crate::{conn_manager::PeerKey, node::SimStorageError};
+    use crate::contract::Contract;
+    use crate::ring::Location;
+    use super::*;
+
     #[test]
     fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
-        anyhow::bail!("test not impl")
+        let id = Transaction::new(<SubscribeMsg as GetTxType>::tx_type_id());
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary()?;
+        let target_loc = PeerKeyLocation {
+            location: Some(Location::random()),
+            peer: PeerKey::random(),
+        };
+        let key = contract.clone().key();
+
+        let mut requester = SubscribeOp::start_op(key).sm;
+        let mut target =
+            StateMachine::<SubscribeOpSM>::from_state(SubscribeState::ReceivedRequest);
+
+        // requester.consume_to_state();
+        let _req_msg =
+            requester.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::FetchRouting {
+                id: id,
+                target: target_loc
+            })?;
+
+        // assert_eq!(req_msg, expected);
+        assert_eq!(
+            requester.state(),
+            &SubscribeState::AwaitingResponse {
+                skip_list: vec![],
+                retries: 0
+            }
+        );
+
+        Ok(())
     }
 }
