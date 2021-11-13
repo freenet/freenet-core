@@ -47,6 +47,10 @@ impl PeerKey {
     pub fn random() -> Self {
         PeerKey::from(Keypair::generate_ed25519().public())
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_bytes()
+    }
 }
 
 impl Display for PeerKey {

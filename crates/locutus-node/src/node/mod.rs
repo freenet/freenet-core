@@ -12,7 +12,7 @@ use std::{net::IpAddr, sync::Arc};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 use crate::contract::MemoryContractHandler;
-use crate::message::Message;
+use crate::node::event_listener::EventListener;
 use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
@@ -27,6 +27,7 @@ use self::libp2p_impl::NodeLibP2P;
 pub(crate) use in_memory::NodeInMemory;
 pub(crate) use op_state::OpManager;
 
+mod event_listener;
 mod in_memory;
 mod libp2p_impl;
 mod op_state;
@@ -50,29 +51,6 @@ where
 {
     LibP2P(Box<NodeLibP2P>),
     InMemory(Box<NodeInMemory<StorageErr>>),
-}
-
-/// A type that reacts to incoming messages from the network.
-/// It injects itself at the message event loop.
-///
-/// This type then can emit it's own information to adjacent systems
-/// or is a no-op.
-pub(crate) trait EventListener {
-    fn event_received(&mut self, ev: &Message);
-}
-
-struct EventRegister {}
-
-impl EventRegister {
-    fn new() -> Self {
-        EventRegister {}
-    }
-}
-
-impl EventListener for EventRegister {
-    fn event_received(&mut self, ev: &Message) {
-        todo!()
-    }
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -172,11 +150,12 @@ impl NodeConfig {
         let listener;
         #[cfg(test)]
         {
-            use self::test_utils::TestEventListener;
+            use self::event_listener::TestEventListener;
             listener = Box::new(TestEventListener::new()) as Box<dyn EventListener + Send + 'static>
         }
         #[cfg(not(test))]
         {
+            use self::event_listener::EventRegister;
             listener = Box::new(EventRegister::new()) as Box<dyn EventListener + Send + 'static>
         }
         let in_mem =
@@ -287,15 +266,19 @@ where
             match ev {
                 UserEvent::Put { value, contract } => {
                     // Initialize a put op.
-                    let op =
-                        put::PutOp::start_op(contract, value, op_storage_cp.ring.max_hops_to_live);
+                    let op = put::PutOp::start_op(
+                        contract,
+                        value,
+                        op_storage_cp.ring.max_hops_to_live,
+                        &op_storage_cp.ring.key,
+                    );
                     if let Err(err) = put::request_put(&op_storage_cp, op).await {
                         log::error!("{}", err);
                     }
                 }
                 UserEvent::Get { key, contract } => {
                     // Initialize a get op.
-                    let op = get::GetOp::start_op(key, contract);
+                    let op = get::GetOp::start_op(key, contract, &op_storage_cp.ring.key);
                     if let Err(err) = get::request_get(&op_storage_cp, op).await {
                         log::error!("{}", err);
                     }
@@ -303,11 +286,12 @@ where
                 UserEvent::Subscribe { key } => {
                     // Initialize a subscribe op.
                     loop {
-                        let op = subscribe::SubscribeOp::start_op(key);
+                        let op = subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.key);
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
                             Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
                                 log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
-                                let get_op = get::GetOp::start_op(key, true);
+                                let get_op =
+                                    get::GetOp::start_op(key, true, &op_storage_cp.ring.key);
                                 if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
                                     log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
                                 }

@@ -6,17 +6,18 @@ use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
     contract::{self, ContractHandler},
     message::{Message, Transaction, TxType},
+    node::event_listener::{EventLog, LogOpStatus},
     operations::{
         get,
         join_ring::{self, JoinRingMsg},
-        put, subscribe,
+        put, subscribe, OpError,
     },
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     NodeConfig,
 };
 
-use super::{op_state::OpManager, EventListener, InitPeerNode};
+use super::{event_listener::ListenerLogId, op_state::OpManager, EventListener, InitPeerNode};
 
 pub(crate) struct NodeInMemory<CErr>
 where
@@ -93,7 +94,7 @@ where
         // FIXME: this iteration should be shuffled, must write an extension iterator shuffle items "in place"
         // the idea here is to limit the amount of gateways being contacted that's why shuffling is required
         for gateway in &self.gateways {
-            let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id());
+            let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &self.peer);
             // initiate join action action per each gateway
             let op = join_ring::JoinRingOp::initial_request(
                 self.peer,
@@ -130,43 +131,70 @@ where
             };
             match msg {
                 Ok(msg) => {
-                    if let Some(listener) = &mut self.event_listener {
-                        listener.event_received(&msg);
-                    }
+                    let log = if let Some(listener) = &mut self.event_listener {
+                        Some(listener.event_received(EventLog::new(&msg, &self.peer)))
+                    } else {
+                        None
+                    };
                     match msg {
                         Message::JoinRing(op) => {
-                            join_ring::handle_join_ring(
+                            let op_result = join_ring::handle_join_ring(
                                 &self.op_storage,
                                 &mut self.conn_manager,
                                 op,
                             )
-                            .await
-                            .unwrap();
+                            .await;
+                            self.finish_log(log, op_result);
                         }
                         Message::Put(op) => {
-                            put::handle_put_request(&self.op_storage, &mut self.conn_manager, op)
-                                .await
-                                .unwrap();
-                        }
-                        Message::Get(op) => {
-                            get::handle_get_request(&self.op_storage, &mut self.conn_manager, op)
-                                .await
-                                .unwrap();
-                        }
-                        Message::Subscribe(op) => {
-                            subscribe::handle_subscribe_response(
+                            let op_result = put::handle_put_request(
                                 &self.op_storage,
                                 &mut self.conn_manager,
                                 op,
                             )
-                            .await
-                            .unwrap();
+                            .await;
+                            self.finish_log(log, op_result);
                         }
-                        Message::Canceled(_tx) => unreachable!(),
+                        Message::Get(op) => {
+                            let op_result = get::handle_get_request(
+                                &self.op_storage,
+                                &mut self.conn_manager,
+                                op,
+                            )
+                            .await;
+                            self.finish_log(log, op_result);
+                        }
+                        Message::Subscribe(op) => {
+                            let op_result = subscribe::handle_subscribe_response(
+                                &self.op_storage,
+                                &mut self.conn_manager,
+                                op,
+                            )
+                            .await;
+                            self.finish_log(log, op_result);
+                        }
+                        Message::Canceled(_tx) => todo!(),
                     }
                 }
                 Err(_) => return Err(()),
             }
+        }
+    }
+
+    fn finish_log(&mut self, log: Option<ListenerLogId>, op_result: Result<(), OpError<CErr>>) {
+        match (log, op_result) {
+            (Some(id), Ok(_)) => {
+                if let Some(ref mut logger) = self.event_listener {
+                    logger.finish(id, LogOpStatus::Ok);
+                }
+            }
+            (Some(id), Err(err)) => {
+                if let Some(ref mut logger) = self.event_listener {
+                    logger.finish(id, LogOpStatus::Failure(format!("{}", err)));
+                }
+            }
+            (_, Err(err)) => log::debug!("Finished tx w/ error: {}", err),
+            (_, _) => {}
         }
     }
 }

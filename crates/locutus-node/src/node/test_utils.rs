@@ -1,9 +1,5 @@
-use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
-    sync::Arc,
-};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 
-use dashmap::DashMap;
 use libp2p::identity;
 use rand::Rng;
 use tokio::sync::mpsc;
@@ -12,7 +8,7 @@ use crate::{
     conn_manager::{ConnectionBridge, PeerKey},
     contract::MemoryContractHandler,
     message::Message,
-    node::{InitPeerNode, NodeInMemory},
+    node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     operations::{
         join_ring::{handle_join_ring, JoinRingMsg},
         OpError,
@@ -86,7 +82,7 @@ impl SimNetwork {
         sim.initialize_gateway(gateway, GW_LABEL.to_owned());
 
         // add other nodes to the simulation
-        for node_no in 0..network_size {
+        for node_no in 0..(network_size - 1) {
             let label = format!("node-{}", node_no);
             let id = identity::Keypair::generate_ed25519()
                 .public()
@@ -168,29 +164,6 @@ impl SimNetwork {
             }
         }
         Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct TestEventListener {
-    nodes: Arc<DashMap<String, PeerKey>>,
-}
-
-impl TestEventListener {
-    pub fn new() -> Self {
-        TestEventListener {
-            nodes: Arc::new(DashMap::new()),
-        }
-    }
-
-    fn add_node(&mut self, label: String, peer: PeerKey) {
-        self.nodes.insert(label, peer);
-    }
-}
-
-impl super::EventListener for TestEventListener {
-    fn event_received(&mut self, _ev: &Message) {
-        todo!()
     }
 }
 

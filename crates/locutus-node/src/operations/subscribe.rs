@@ -27,8 +27,8 @@ pub(crate) struct SubscribeOp {
 impl SubscribeOp {
     const MAX_RETRIES: usize = 10;
 
-    pub fn start_op(key: ContractKey) -> Self {
-        let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id());
+    pub fn start_op(key: ContractKey, peer: &PeerKey) -> Self {
+        let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), peer);
         let sm = StateMachine::from_state(SubscribeState::PrepareRequest { id, key });
         SubscribeOp {
             sm,
