@@ -105,10 +105,10 @@ impl StateMachineImpl for PutOpSm {
                 PutState::PrepareRequest {
                     contract,
                     value,
-                    id,
                     htl,
+                    ..
                 },
-                PutMsg::RouteValue { target, .. },
+                PutMsg::RouteValue { id, target, .. },
             ) => Some(PutMsg::RequestPut {
                 id,
                 contract,

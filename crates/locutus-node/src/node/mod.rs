@@ -11,6 +11,7 @@ use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
+use crate::conn_manager::PeerKey;
 use crate::contract::MemoryContractHandler;
 use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
@@ -40,7 +41,11 @@ impl Node {
     pub async fn listen_on(&mut self) -> Result<(), ()> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
-            NodeImpl::InMemory(ref mut node) => node.listen_on(MemoryEventsGen::new()).await,
+            NodeImpl::InMemory(ref mut node) => {
+                let (_usr_ev_controller, rcv_copy) = tokio::sync::watch::channel(PeerKey::random());
+                let user_events = MemoryEventsGen::new(rcv_copy, node.peer_key);
+                node.listen_on(user_events).await
+            }
         }
     }
 }
