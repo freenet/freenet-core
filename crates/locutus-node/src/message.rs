@@ -46,10 +46,16 @@ impl Transaction {
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("infallible");
         let now_secs = now.as_secs();
-        let now_nanos = now.as_nanos() - (now_secs as u128 * 1_000_000);
+        let now_nanos = now.as_nanos();
+        let now_nanos = now_nanos - (now_secs as u128 * 1_000_000_000);
         let ts = Timestamp::from_unix(&UUID_CONTEXT, now_secs, now_nanos as u32);
 
-        let id = Uuid::new_v1(ts, &initial_peer.to_bytes()).unwrap();
+        // event in the net this UUID should be unique since peer keys are unique
+        // however some id collision may be theoretically possible if two transactions
+        // are created at the same exact time and the first 6 bytes of the key coincide;
+        // in practice the chance of this happening is astronomically low
+
+        let id = Uuid::new_v1(ts, &initial_peer.to_bytes()[0..6]).unwrap();
         // 2 word size for 64-bits platforms most likely since msg type
         // probably will be aligned to 64 bytes
         Self { id, ty }

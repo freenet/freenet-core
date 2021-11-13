@@ -901,6 +901,8 @@ mod test {
         //! Given a network of one node and one gateway test that both are connected.
         Logger::init_logger();
         let mut sim_net = SimNetwork::build(1, 1, 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(sim_net.connected("node-0"));
     }
 
@@ -910,7 +912,7 @@ mod test {
         Logger::init_logger();
 
         let sim_nodes = SimNetwork::build(10, 10, 7);
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         // let _hist: Vec<_> = ring_distribution(sim_nodes.values()).collect();
 
         // const NUM_PROBES: usize = 10;

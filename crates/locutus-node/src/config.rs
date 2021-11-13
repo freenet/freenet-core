@@ -58,7 +58,7 @@ impl Config {
             bootstrap_port,
             bootstrap_id,
             local_peer_keypair,
-            log_level: settings.get("log_level").unwrap_or(log::LevelFilter::Debug),
+            log_level: settings.get("log_level").unwrap_or(log::LevelFilter::Info),
         })
     }
 
