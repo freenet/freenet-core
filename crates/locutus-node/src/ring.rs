@@ -43,7 +43,7 @@ pub(crate) struct PeerKeyLocation {
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
-    pub key: PeerKey,
+    pub peer_key: PeerKey,
     pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
@@ -88,7 +88,7 @@ impl Ring {
             connections_by_location: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location,
-            key,
+            peer_key: key,
             subscribers: DashMap::new(),
             subscriptions: RwLock::new(Vec::new()),
             contract_blacklist: DashMap::new(),
@@ -143,7 +143,7 @@ impl Ring {
             Some(Location(location))
         };
         PeerKeyLocation {
-            peer: self.key,
+            peer: self.peer_key,
             location,
         }
     }

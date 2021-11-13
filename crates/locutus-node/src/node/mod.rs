@@ -12,7 +12,6 @@ use std::{net::IpAddr, sync::Arc};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 use crate::contract::MemoryContractHandler;
-use crate::node::event_listener::EventListener;
 use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
@@ -24,6 +23,7 @@ use crate::{
 };
 
 use self::libp2p_impl::NodeLibP2P;
+pub(crate) use event_listener::{EventListener, EventLog};
 pub(crate) use in_memory::NodeInMemory;
 pub(crate) use op_state::OpManager;
 
@@ -151,12 +151,12 @@ impl NodeConfig {
         #[cfg(test)]
         {
             use self::event_listener::TestEventListener;
-            listener = Box::new(TestEventListener::new()) as Box<dyn EventListener + Send + 'static>
+            listener = Box::new(TestEventListener::new())
         }
         #[cfg(not(test))]
         {
             use self::event_listener::EventRegister;
-            listener = Box::new(EventRegister::new()) as Box<dyn EventListener + Send + 'static>
+            listener = Box::new(EventRegister::new())
         }
         let in_mem =
             NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(self, Some(listener))?;
@@ -270,7 +270,7 @@ where
                         contract,
                         value,
                         op_storage_cp.ring.max_hops_to_live,
-                        &op_storage_cp.ring.key,
+                        &op_storage_cp.ring.peer_key,
                     );
                     if let Err(err) = put::request_put(&op_storage_cp, op).await {
                         log::error!("{}", err);
@@ -278,7 +278,7 @@ where
                 }
                 UserEvent::Get { key, contract } => {
                     // Initialize a get op.
-                    let op = get::GetOp::start_op(key, contract, &op_storage_cp.ring.key);
+                    let op = get::GetOp::start_op(key, contract, &op_storage_cp.ring.peer_key);
                     if let Err(err) = get::request_get(&op_storage_cp, op).await {
                         log::error!("{}", err);
                     }
@@ -286,12 +286,13 @@ where
                 UserEvent::Subscribe { key } => {
                     // Initialize a subscribe op.
                     loop {
-                        let op = subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.key);
+                        let op =
+                            subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.peer_key);
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
                             Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
                                 log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
                                 let get_op =
-                                    get::GetOp::start_op(key, true, &op_storage_cp.ring.key);
+                                    get::GetOp::start_op(key, true, &op_storage_cp.ring.peer_key);
                                 if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
                                     log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
                                 }

@@ -6,7 +6,7 @@ use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
     contract::{self, ContractHandler},
     message::{Message, Transaction, TxType},
-    node::event_listener::{EventLog, LogOpStatus},
+    node::event_listener::EventLog,
     operations::{
         get,
         join_ring::{self, JoinRingMsg},
@@ -17,18 +17,18 @@ use crate::{
     NodeConfig,
 };
 
-use super::{event_listener::ListenerLogId, op_state::OpManager, EventListener, InitPeerNode};
+use super::{op_state::OpManager, EventListener, InitPeerNode};
 
 pub(crate) struct NodeInMemory<CErr>
 where
     CErr: std::error::Error,
 {
-    peer: PeerKey,
+    pub peer_key: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
     pub conn_manager: MemoryConnManager,
     pub op_storage: Arc<OpManager<CErr>>,
-    event_listener: Option<Box<dyn EventListener + Send + 'static>>,
+    event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
 }
 
 impl<CErr> NodeInMemory<CErr>
@@ -38,7 +38,7 @@ where
     /// Buils an in-memory node. Does nothing upon construction,
     pub fn build<CH>(
         config: NodeConfig,
-        event_listener: Option<Box<dyn EventListener + Send + 'static>>,
+        event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     ) -> Result<NodeInMemory<<CH as ContractHandler>::Error>, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
@@ -50,7 +50,12 @@ where
             return Err(anyhow::anyhow!("At least one remote gateway is required to join an existing network for non-gateway nodes."));
         }
         let peer = PeerKey::from(config.local_key.public());
-        let conn_manager = MemoryConnManager::new(true, peer, None);
+
+        let ev_listener_cp = event_listener
+            .as_ref()
+            .map(|listener| listener.trait_clone());
+
+        let conn_manager = MemoryConnManager::new(true, peer, None, ev_listener_cp);
         let gateways = config
             .remote_nodes
             .into_iter()
@@ -81,7 +86,7 @@ where
         tokio::spawn(contract::contract_handling(contract_handler));
 
         Ok(NodeInMemory {
-            peer,
+            peer_key: peer,
             conn_manager,
             op_storage,
             gateways,
@@ -94,10 +99,10 @@ where
         // FIXME: this iteration should be shuffled, must write an extension iterator shuffle items "in place"
         // the idea here is to limit the amount of gateways being contacted that's why shuffling is required
         for gateway in &self.gateways {
-            let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &self.peer);
+            let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &self.peer_key);
             // initiate join action action per each gateway
             let op = join_ring::JoinRingOp::initial_request(
-                self.peer,
+                self.peer_key,
                 *gateway,
                 self.op_storage.ring.max_hops_to_live,
             );
@@ -129,72 +134,63 @@ where
                     break Err(());
                 }
             };
-            match msg {
-                Ok(msg) => {
-                    let log = if let Some(listener) = &mut self.event_listener {
-                        Some(listener.event_received(EventLog::new(&msg, &self.peer)))
-                    } else {
-                        None
-                    };
-                    match msg {
-                        Message::JoinRing(op) => {
-                            let op_result = join_ring::handle_join_ring(
-                                &self.op_storage,
-                                &mut self.conn_manager,
-                                op,
-                            )
-                            .await;
-                            self.finish_log(log, op_result);
+
+            let op_storage = self.op_storage.clone();
+            let mut conn_manager = self.conn_manager.clone();
+            let mut event_listener = self
+                .event_listener
+                .as_ref()
+                .map(|listener| listener.trait_clone());
+
+            tokio::spawn(async move {
+                match msg {
+                    Ok(msg) => {
+                        if let Some(listener) = &mut event_listener {
+                            listener.event_received(EventLog::new(&msg, &op_storage.ring.peer_key));
                         }
-                        Message::Put(op) => {
-                            let op_result = put::handle_put_request(
-                                &self.op_storage,
-                                &mut self.conn_manager,
-                                op,
-                            )
-                            .await;
-                            self.finish_log(log, op_result);
+                        match msg {
+                            Message::JoinRing(op) => {
+                                let op_result =
+                                    join_ring::handle_join_ring(&op_storage, &mut conn_manager, op)
+                                        .await;
+                                Self::report_result(op_result);
+                            }
+                            Message::Put(op) => {
+                                let op_result =
+                                    put::handle_put_request(&op_storage, &mut conn_manager, op)
+                                        .await;
+                                Self::report_result(op_result);
+                            }
+                            Message::Get(op) => {
+                                let op_result =
+                                    get::handle_get_request(&op_storage, &mut conn_manager, op)
+                                        .await;
+                                Self::report_result(op_result);
+                            }
+                            Message::Subscribe(op) => {
+                                let op_result = subscribe::handle_subscribe_response(
+                                    &op_storage,
+                                    &mut conn_manager,
+                                    op,
+                                )
+                                .await;
+                                Self::report_result(op_result);
+                            }
+                            Message::Canceled(_tx) => todo!(),
                         }
-                        Message::Get(op) => {
-                            let op_result = get::handle_get_request(
-                                &self.op_storage,
-                                &mut self.conn_manager,
-                                op,
-                            )
-                            .await;
-                            self.finish_log(log, op_result);
-                        }
-                        Message::Subscribe(op) => {
-                            let op_result = subscribe::handle_subscribe_response(
-                                &self.op_storage,
-                                &mut self.conn_manager,
-                                op,
-                            )
-                            .await;
-                            self.finish_log(log, op_result);
-                        }
-                        Message::Canceled(_tx) => todo!(),
+                    }
+                    Err(err) => {
+                        Self::report_result(Err(err.into()));
                     }
                 }
-                Err(_) => return Err(()),
-            }
+            });
         }
     }
 
-    fn finish_log(&mut self, log: Option<ListenerLogId>, op_result: Result<(), OpError<CErr>>) {
-        match (log, op_result) {
-            (Some(id), Ok(_)) => {
-                if let Some(ref mut logger) = self.event_listener {
-                    logger.finish(id, LogOpStatus::Ok);
-                }
-            }
-            (Some(id), Err(err)) => {
-                if let Some(ref mut logger) = self.event_listener {
-                    logger.finish(id, LogOpStatus::Failure(format!("{}", err)));
-                }
-            }
-            (_, Err(err)) => log::debug!("Finished tx w/ error: {}", err),
-            (_, _) => {}
+    #[inline(always)]
+    fn report_result(op_result: Result<(), OpError<CErr>>) {
+        if let Err(err) = op_result {
+            log::debug!("Finished tx w/ error: {}", err)
         }
     }
 }
