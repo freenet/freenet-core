@@ -195,20 +195,10 @@ where
         }
     }
 
-    fn finish_log(&mut self, log: Option<ListenerLogId>, op_result: Result<(), OpError<CErr>>) {
-        match (log, op_result) {
-            (Some(id), Ok(_)) => {
-                if let Some(ref mut logger) = self.event_listener {
-                    logger.finish(id, LogOpStatus::Ok);
-                }
-            }
-            (Some(id), Err(err)) => {
-                if let Some(ref mut logger) = self.event_listener {
-                    logger.finish(id, LogOpStatus::Failure(format!("{}", err)));
-                }
-            }
-            (_, Err(err)) => log::debug!("Finished tx w/ error: {}", err),
-            (_, _) => {}
+    #[inline(always)]
+    fn report_result(op_result: Result<(), OpError<CErr>>) {
+        if let Err(err) = op_result {
+            log::debug!("Finished tx w/ error: {}", err)
         }
     }
 }

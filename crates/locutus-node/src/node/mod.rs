@@ -13,7 +13,6 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 use crate::conn_manager::PeerKey;
 use crate::contract::MemoryContractHandler;
-use crate::node::event_listener::EventListener;
 use crate::operations::{subscribe, OpError};
 use crate::user_events::test_utils::MemoryEventsGen;
 use crate::{
