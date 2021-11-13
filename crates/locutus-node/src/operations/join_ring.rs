@@ -819,10 +819,11 @@ mod test {
 
     #[test]
     fn succesful_join_ring_seq() {
-        let id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id());
+        let peer = PeerKey::random();
+        let id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer);
         let new_loc = Location::random();
         let mut new_peer = PeerKeyLocation {
-            peer: PeerKey::random(),
+            peer,
             location: Some(new_loc),
         };
         let gateway = PeerKeyLocation {

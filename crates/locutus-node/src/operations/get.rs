@@ -26,8 +26,8 @@ impl GetOp {
     /// Maximum number of retries to get values.
     const MAX_RETRIES: usize = 10;
 
-    pub fn start_op(key: ContractKey, fetch_contract: bool) -> Self {
-        let id = Transaction::new(<GetMsg as TxType>::tx_type_id());
+    pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> Self {
+        let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), id);
         let sm = StateMachine::from_state(GetState::PrepareRequest {
             key,
             id,
@@ -602,7 +602,8 @@ mod test {
 
     #[test]
     fn successful_get_op_seq() -> Result<(), anyhow::Error> {
-        let id = Transaction::new(<GetMsg as TxType>::tx_type_id());
+        let requester = PeerKey::random();
+        let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), &requester);
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
@@ -611,7 +612,7 @@ mod test {
             peer: PeerKey::random(),
         };
 
-        let mut requester = GetOp::start_op(contract.key(), true).sm;
+        let mut requester = GetOp::start_op(contract.key(), true, &requester).sm;
         let mut target = StateMachine::<GetOpSm>::from_state(GetState::ReceivedRequest);
 
         let req_msg = requester

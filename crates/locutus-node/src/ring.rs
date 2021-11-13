@@ -43,11 +43,11 @@ pub(crate) struct PeerKeyLocation {
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
+    pub key: PeerKey,
     pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
     own_location: AtomicU64,
-    assigned_key: PeerKey,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
@@ -79,7 +79,7 @@ impl Ring {
 
     pub const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new(peer: PeerKey) -> Self {
+    pub fn new(key: PeerKey) -> Self {
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
         Ring {
@@ -88,7 +88,7 @@ impl Ring {
             connections_by_location: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location,
-            assigned_key: peer,
+            key,
             subscribers: DashMap::new(),
             subscriptions: RwLock::new(Vec::new()),
             contract_blacklist: DashMap::new(),
@@ -143,7 +143,7 @@ impl Ring {
             Some(Location(location))
         };
         PeerKeyLocation {
-            peer: self.assigned_key,
+            peer: self.key,
             location,
         }
     }
