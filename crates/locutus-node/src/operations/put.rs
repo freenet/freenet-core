@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::ConnectionBridge,
+    conn_manager::{ConnectionBridge, PeerKey},
     contract::{Contract, ContractError, ContractHandlerEvent, ContractKey, ContractValue},
     message::{Message, Transaction, TxType},
     node::OpManager,
@@ -29,14 +29,14 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    pub fn start_op(contract: Contract, value: ContractValue, htl: usize) -> Self {
+    pub fn start_op(contract: Contract, value: ContractValue, htl: usize, peer: &PeerKey) -> Self {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
             contract.key(),
             Location::from(contract.key())
         );
 
-        let id = Transaction::new(<PutMsg as TxType>::tx_type_id());
+        let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), peer);
         let sm = StateMachine::from_state(PutState::PrepareRequest {
             id,
             contract,
@@ -678,7 +678,8 @@ mod test {
 
     #[test]
     fn successful_put_op_seq() -> Result<(), anyhow::Error> {
-        let id = Transaction::new(<PutMsg as TxType>::tx_type_id());
+        let peer = PeerKey::random();
+        let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), &peer);
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
@@ -687,8 +688,13 @@ mod test {
             peer: PeerKey::random(),
         };
 
-        let mut requester =
-            PutOp::start_op(contract.clone(), ContractValue::new(vec![0, 1, 2, 3]), 0).sm;
+        let mut requester = PutOp::start_op(
+            contract.clone(),
+            ContractValue::new(vec![0, 1, 2, 3]),
+            0,
+            &peer,
+        )
+        .sm;
         let mut target = StateMachine::<PutOpSm>::from_state(PutState::ReceivedRequest);
 
         let req_msg = requester
