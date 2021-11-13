@@ -5,6 +5,7 @@ use std::{
 
 use libp2p::identity;
 use rand::Rng;
+use tokio::sync::watch::{channel, Receiver, Sender};
 
 use crate::{
     conn_manager::PeerKey,
@@ -40,13 +41,18 @@ pub fn get_dynamic_port() -> u16 {
 pub(crate) struct SimNetwork {
     event_listener: TestEventListener,
     labels: HashMap<String, PeerKey>,
+    usr_ev_controller: Sender<PeerKey>,
+    _rcv_copy: Receiver<PeerKey>,
 }
 
 impl SimNetwork {
     fn new() -> Self {
+        let (usr_ev_controller, _rcv_copy) = channel(PeerKey::random());
         Self {
             event_listener: TestEventListener::new(),
             labels: HashMap::new(),
+            usr_ev_controller,
+            _rcv_copy,
         }
     }
 
@@ -107,7 +113,7 @@ impl SimNetwork {
     }
 
     fn initialize_peer(&mut self, mut peer: NodeInMemory<SimStorageError>, label: String) {
-        let user_events = MemoryEventsGen::new();
+        let user_events = MemoryEventsGen::new(self._rcv_copy.clone(), peer.peer_key);
         self.labels.insert(label, peer.peer_key);
         tokio::spawn(async move { peer.listen_on(user_events).await });
     }
