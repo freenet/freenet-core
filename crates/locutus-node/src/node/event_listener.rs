@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering::SeqCst;
-use std::{borrow::Cow, sync::atomic::AtomicUsize, time::Instant};
+use std::{sync::atomic::AtomicUsize, time::Instant};
 
+use crate::operations::join_ring::JoinRingMsg;
 use crate::{
     conn_manager::PeerKey,
     message::{Message, Transaction},
@@ -21,29 +22,26 @@ pub(crate) struct ListenerLogId(usize);
 /// or is a no-op.
 pub(crate) trait EventListener {
     fn event_received(&mut self, ev: EventLog) -> ListenerLogId;
-    fn finish(&mut self, id: ListenerLogId, status: LogOpStatus);
+    fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static>;
 }
 
 pub(crate) struct EventLog<'a> {
     tx: &'a Transaction,
     peer_id: &'a PeerKey,
-    event_str: Cow<'a, str>,
+    kind: EventKind,
 }
 
 impl<'a> EventLog<'a> {
-    pub fn new(msg: &Message, peer_id: &PeerKey) -> Self {
-        todo!()
-    }
-}
-
-pub(crate) enum LogOpStatus {
-    Ok,
-    Failure(String),
-}
-
-impl Default for LogOpStatus {
-    fn default() -> Self {
-        Self::Ok
+    pub fn new(msg: &'a Message, peer_id: &'a PeerKey) -> Self {
+        let kind = match msg {
+            Message::JoinRing(JoinRingMsg::Connected { .. }) => EventKind::Connected,
+            _ => EventKind::Unknown,
+        };
+        EventLog {
+            tx: msg.id(),
+            peer_id,
+            kind,
+        }
     }
 }
 
@@ -51,10 +49,10 @@ struct MessageLog {
     log_id: ListenerLogId,
     peer_id: PeerKey,
     ts: Instant,
-    kind: String,
-    status: LogOpStatus,
+    kind: EventKind,
 }
 
+#[derive(Clone)]
 pub(super) struct EventRegister {}
 
 impl EventRegister {
@@ -70,23 +68,26 @@ impl EventListener for EventRegister {
         log_id
     }
 
-    fn finish(&mut self, id: ListenerLogId, status: LogOpStatus) {
-        todo!()
+    fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static> {
+        Box::new(self.clone())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EventKind {
+    Connected,
+    Unknown,
 }
 
 #[inline]
 fn create_log(log: EventLog) -> (MessageLog, ListenerLogId) {
     let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
-    let EventLog {
-        peer_id, event_str, ..
-    } = log;
+    let EventLog { peer_id, kind, .. } = log;
     let msg_log = MessageLog {
         log_id,
         ts: Instant::now(),
         peer_id: *peer_id,
-        kind: event_str.into_owned(),
-        status: LogOpStatus::default(),
+        kind,
     };
     (msg_log, log_id)
 }
@@ -119,6 +120,12 @@ mod test_utils {
         pub fn add_node(&mut self, label: String, peer: PeerKey) {
             self.node_labels.insert(label, peer);
         }
+
+        pub fn registered_connection(&self, peer: PeerKey) -> bool {
+            let logs = self.logs.read();
+            logs.iter()
+                .any(|log| log.peer_id == peer && log.kind == EventKind::Connected)
+        }
     }
 
     impl super::EventListener for TestEventListener {
@@ -132,10 +139,8 @@ mod test_utils {
             log_id
         }
 
-        fn finish(&mut self, id: ListenerLogId, status: LogOpStatus) {
-            let guard = &mut *self.logs.write();
-            let log = &mut guard[id.0];
-            log.status = status;
+        fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static> {
+            Box::new(self.clone())
         }
     }
 }
