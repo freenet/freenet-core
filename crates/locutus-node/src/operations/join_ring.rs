@@ -811,10 +811,7 @@ mod test {
     use crate::{
         config::tracing::Logger,
         message::TxType,
-        node::{
-            test_utils::{ring_distribution, EventType, SimNetwork},
-            SimStorageError,
-        },
+        node::{test_utils::SimNetwork, SimStorageError},
     };
 
     #[test]
@@ -900,19 +897,11 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn node0_to_gateway_conn() -> Result<(), anyhow::Error> {
+    async fn node0_to_gateway_conn() {
         //! Given a network of one node and one gateway test that both are connected.
         Logger::init_logger();
         let mut sim_net = SimNetwork::build(1, 1, 0);
-        match tokio::time::timeout(Duration::from_secs(10), sim_net.recv_net_events()).await {
-            Ok(Some(Ok(event))) => match event.event {
-                EventType::JoinSuccess { peer } => {
-                    log::info!("Successful join op for peer {}", peer);
-                    Ok(())
-                }
-            },
-            _ => Err(anyhow::anyhow!("no event received")),
-        }
+        assert!(sim_net.connected("node-0"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -921,8 +910,8 @@ mod test {
         Logger::init_logger();
 
         let sim_nodes = SimNetwork::build(10, 10, 7);
-        // let _hist: Vec<_> = ring_distribution(sim_nodes.values()).collect();
         tokio::time::sleep(Duration::from_secs(300)).await;
+        // let _hist: Vec<_> = ring_distribution(sim_nodes.values()).collect();
 
         // const NUM_PROBES: usize = 10;
         // let mut probe_responses = Vec::with_capacity(NUM_PROBES);

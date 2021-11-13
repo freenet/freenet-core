@@ -1,19 +1,17 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+};
 
 use libp2p::identity;
 use rand::Rng;
-use tokio::sync::mpsc;
 
 use crate::{
-    conn_manager::{ConnectionBridge, PeerKey},
+    conn_manager::PeerKey,
     contract::MemoryContractHandler,
-    message::Message,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    operations::{
-        join_ring::{handle_join_ring, JoinRingMsg},
-        OpError,
-    },
     ring::{Distance, Location},
+    user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
 
@@ -40,24 +38,20 @@ pub fn get_dynamic_port() -> u16 {
 
 /// A simulated in-memory network topology.
 pub(crate) struct SimNetwork {
-    meta_info_tx: mpsc::Sender<Result<NetEvent, OpError<SimStorageError>>>,
-    meta_info_rx: mpsc::Receiver<Result<NetEvent, OpError<SimStorageError>>>,
-}
-
-pub(crate) struct NetEvent {
-    pub(crate) event: EventType,
-}
-
-pub(crate) enum EventType {
-    /// A peer joined the network through some gateway.
-    JoinSuccess { peer: PeerKey },
+    event_listener: TestEventListener,
+    labels: HashMap<String, PeerKey>,
 }
 
 impl SimNetwork {
-    pub fn build(network_size: usize, ring_max_htl: usize, rnd_if_htl_above: usize) -> SimNetwork {
-        let sim = SimNetwork::new();
+    fn new() -> Self {
+        Self {
+            event_listener: TestEventListener::new(),
+            labels: HashMap::new(),
+        }
+    }
 
-        let mut event_listener = TestEventListener::new();
+    pub fn build(network_size: usize, ring_max_htl: usize, rnd_if_htl_above: usize) -> SimNetwork {
+        let mut sim = SimNetwork::new();
 
         // build gateway node
         // let probe_protocol = Some(ProbeProtocol::new(ring_protocol.clone(), loc));
@@ -73,13 +67,14 @@ impl SimNetwork {
             .with_location(gateway_loc)
             .max_hops_to_live(ring_max_htl)
             .rnd_if_htl_above(rnd_if_htl_above);
-        event_listener.add_node(GW_LABEL.to_string(), PeerKey::from(gateway_peer_id));
+        sim.event_listener
+            .add_node(GW_LABEL.to_string(), PeerKey::from(gateway_peer_id));
         let gateway = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
             config,
-            Some(Box::new(event_listener.clone())),
+            Some(Box::new(sim.event_listener.clone())),
         )
         .unwrap();
-        sim.initialize_gateway(gateway, GW_LABEL.to_owned());
+        sim.initialize_peer(gateway, GW_LABEL.to_string());
 
         // add other nodes to the simulation
         for node_no in 0..(network_size - 1) {
@@ -87,7 +82,8 @@ impl SimNetwork {
             let id = identity::Keypair::generate_ed25519()
                 .public()
                 .into_peer_id();
-            event_listener.add_node(label.clone(), PeerKey::from(id));
+            sim.event_listener
+                .add_node(label.clone(), PeerKey::from(id));
 
             let config = NodeConfig::new()
                 .add_provider(
@@ -101,7 +97,7 @@ impl SimNetwork {
             sim.initialize_peer(
                 NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
                     config,
-                    Some(Box::new(event_listener.clone())),
+                    Some(Box::new(sim.event_listener.clone())),
                 )
                 .unwrap(),
                 label,
@@ -110,61 +106,22 @@ impl SimNetwork {
         sim
     }
 
-    pub async fn recv_net_events(&mut self) -> Option<Result<NetEvent, OpError<SimStorageError>>> {
-        self.meta_info_rx.recv().await
+    fn initialize_peer(&mut self, mut peer: NodeInMemory<SimStorageError>, label: String) {
+        let user_events = MemoryEventsGen::new();
+        self.labels.insert(label, peer.peer_key);
+        tokio::spawn(async move { peer.listen_on(user_events).await });
     }
 
-    fn new() -> Self {
-        let (meta_info_tx, meta_info_rx) = mpsc::channel(100);
-        Self {
-            meta_info_rx,
-            meta_info_tx,
+    pub fn connected(&mut self, peer: &str) -> bool {
+        if let Some(key) = self.labels.get(peer) {
+            self.event_listener.registered_connection(*key)
+        } else {
+            false
         }
     }
 
-    fn initialize_gateway(&self, gateway: NodeInMemory<SimStorageError>, sender_label: String) {
-        let info_ch = self.meta_info_tx.clone();
-        tokio::spawn(Self::listen(gateway, info_ch, sender_label));
-    }
-
-    fn initialize_peer(&self, mut peer: NodeInMemory<SimStorageError>, sender_label: String) {
-        let info_ch = self.meta_info_tx.clone();
-        tokio::spawn(async move {
-            if peer.join_ring().await.is_err() {
-                let _ = info_ch.send(Err(OpError::InvalidStateTransition)).await;
-                return Err(());
-            }
-            Self::listen(peer, info_ch, sender_label).await
-        });
-    }
-
-    async fn listen(
-        mut peer: NodeInMemory<SimStorageError>,
-        info_ch: mpsc::Sender<Result<NetEvent, OpError<SimStorageError>>>,
-        _sender: String,
-    ) -> Result<(), ()> {
-        while let Ok(msg) = peer.conn_manager.recv().await {
-            if let Message::JoinRing(msg) = msg {
-                if let JoinRingMsg::Connected { target, .. } = msg {
-                    let _ = info_ch
-                        .send(Ok(NetEvent {
-                            event: EventType::JoinSuccess { peer: target.peer },
-                        }))
-                        .await;
-                    break;
-                }
-                match handle_join_ring(&peer.op_storage, &mut peer.conn_manager, msg).await {
-                    Err(err) => {
-                        let _ = info_ch.send(Err(err)).await;
-                    }
-                    Ok(()) => {}
-                }
-            } else {
-                return Err(());
-            }
-        }
-        Ok(())
-    }
+    /// Query the network for connectivity stats.
+    pub async fn ring_distribution(&self) {}
 }
 
 /// Builds an histogram of the distribution in the ring of each node relative to each other.
