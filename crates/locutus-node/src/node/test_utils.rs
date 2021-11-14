@@ -3,7 +3,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
 };
 
-use libp2p::identity;
+use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
@@ -11,7 +11,7 @@ use crate::{
     conn_manager::PeerKey,
     contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    ring::{Distance, Location},
+    ring::Location,
     user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
@@ -43,73 +43,131 @@ pub(crate) struct SimNetwork {
     labels: HashMap<String, PeerKey>,
     usr_ev_controller: Sender<PeerKey>,
     receiver_ch: Receiver<PeerKey>,
+    gateways: Vec<(NodeInMemory<SimStorageError>, GatewayConfig)>,
+    nodes: Vec<(NodeInMemory<SimStorageError>, String)>,
+    ring_max_htl: usize,
+    rnd_if_htl_above: usize,
+}
+
+#[derive(Clone)]
+struct GatewayConfig {
+    label: String,
+    port: u16,
+    id: PeerId,
+    location: Location,
 }
 
 impl SimNetwork {
-    fn new() -> Self {
+    pub fn new(
+        gateways: usize,
+        nodes: usize,
+        ring_max_htl: usize,
+        rnd_if_htl_above: usize,
+    ) -> Self {
+        assert!(gateways > 0 && nodes > 0);
         let (usr_ev_controller, _rcv_copy) = channel(PeerKey::random());
-        Self {
+        let mut net = Self {
             event_listener: TestEventListener::new(),
             labels: HashMap::new(),
             usr_ev_controller,
             receiver_ch: _rcv_copy,
+            gateways: Vec::new(),
+            nodes: Vec::new(),
+            ring_max_htl,
+            rnd_if_htl_above,
+        };
+        net.build_gateways(gateways);
+        net.build_nodes(nodes);
+        net
+    }
+
+    fn build_gateways(&mut self, num: usize) {
+        for node_no in 0..num {
+            let label = format!("gateway-{}", node_no);
+            let pair = identity::Keypair::generate_ed25519();
+            let id = pair.public().into_peer_id();
+            let port = get_free_port().unwrap();
+            let location = Location::random();
+
+            let mut config = NodeConfig::new();
+            config
+                .with_ip(Ipv6Addr::LOCALHOST)
+                .with_port(port)
+                .with_key(pair)
+                .with_location(location)
+                .max_hops_to_live(self.ring_max_htl)
+                .rnd_if_htl_above(self.rnd_if_htl_above);
+
+            self.event_listener
+                .add_node(label.clone(), PeerKey::from(id));
+
+            let gateway = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
+                config,
+                Some(Box::new(self.event_listener.clone())),
+            )
+            .unwrap();
+            self.gateways.push((
+                gateway,
+                GatewayConfig {
+                    label,
+                    port,
+                    location,
+                    id,
+                },
+            ));
         }
     }
 
-    pub fn build(network_size: usize, ring_max_htl: usize, rnd_if_htl_above: usize) -> SimNetwork {
-        assert!(network_size >= 2);
-        let mut sim = SimNetwork::new();
+    fn build_nodes(&mut self, num: usize) {
+        let gateways: Vec<_> = self
+            .gateways
+            .iter()
+            .map(|(_node, config)| config)
+            .cloned()
+            .collect();
 
-        // build gateway node
-        // let probe_protocol = Some(ProbeProtocol::new(ring_protocol.clone(), loc));
-        const GW_LABEL: &str = "gateway";
-        let gateway_pair = identity::Keypair::generate_ed25519();
-        let gateway_peer_id = gateway_pair.public().into_peer_id();
-        let gateway_port = get_free_port().unwrap();
-        let gateway_loc = Location::random();
-        let config = NodeConfig::new()
-            .with_ip(Ipv6Addr::LOCALHOST)
-            .with_port(gateway_port)
-            .with_key(gateway_pair)
-            .with_location(gateway_loc)
-            .max_hops_to_live(ring_max_htl)
-            .rnd_if_htl_above(rnd_if_htl_above);
-        sim.event_listener
-            .add_node(GW_LABEL.to_string(), PeerKey::from(gateway_peer_id));
-        let gateway = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
-            config,
-            Some(Box::new(sim.event_listener.clone())),
-        )
-        .unwrap();
-        sim.initialize_peer(gateway, GW_LABEL.to_string());
-
-        // add other nodes to the simulation
-        for node_no in 0..(network_size - 1) {
+        for node_no in 0..num {
             let label = format!("node-{}", node_no);
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().into_peer_id();
-            sim.event_listener
+
+            let mut config = NodeConfig::new();
+            for GatewayConfig {
+                port, id, location, ..
+            } in &gateways
+            {
+                config.add_gateway(
+                    InitPeerNode::new(*id, *location)
+                        .listening_ip(Ipv6Addr::LOCALHOST)
+                        .listening_port(*port),
+                );
+            }
+            config
+                .max_hops_to_live(self.ring_max_htl)
+                .rnd_if_htl_above(self.rnd_if_htl_above)
+                .with_key(pair);
+
+            self.event_listener
                 .add_node(label.clone(), PeerKey::from(id));
 
-            let config = NodeConfig::new()
-                .add_gateway(
-                    InitPeerNode::new(gateway_peer_id, gateway_loc)
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(gateway_port),
-                )
-                .max_hops_to_live(ring_max_htl)
-                .rnd_if_htl_above(rnd_if_htl_above)
-                .with_key(pair);
-            sim.initialize_peer(
-                NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
-                    config,
-                    Some(Box::new(sim.event_listener.clone())),
-                )
-                .unwrap(),
-                label,
-            );
+            let node = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
+                config,
+                Some(Box::new(self.event_listener.clone())),
+            )
+            .unwrap();
+            self.nodes.push((node, label));
         }
-        sim
+    }
+
+    pub fn build(&mut self) {
+        for (node, label) in self
+            .nodes
+            .drain(..)
+            .chain(self.gateways.drain(..).map(|(n, c)| (n, c.label)))
+            .collect::<Vec<_>>()
+        {
+            self.initialize_peer(node, label);
+        }
     }
 
     fn initialize_peer(&mut self, mut peer: NodeInMemory<SimStorageError>, label: String) {
@@ -118,7 +176,7 @@ impl SimNetwork {
         tokio::spawn(async move { peer.listen_on(user_events).await });
     }
 
-    pub fn connected(&mut self, peer: &str) -> bool {
+    pub fn connected(&self, peer: &str) -> bool {
         if let Some(key) = self.labels.get(peer) {
             self.event_listener.registered_connection(*key)
         } else {
@@ -130,22 +188,22 @@ impl SimNetwork {
     pub async fn ring_distribution(&self) {}
 }
 
-/// Builds an histogram of the distribution in the ring of each node relative to each other.
-pub(crate) fn ring_distribution<'a>(
-    nodes: impl Iterator<Item = &'a NodeInMemory<SimStorageError>> + 'a,
-) -> impl Iterator<Item = Distance> + 'a {
-    // TODO: groupby certain intervals
-    // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0
-    nodes
-        .map(|node| {
-            let node_ring = &node.op_storage.ring;
-            let self_loc = node_ring.own_location().location.unwrap();
-            node_ring
-                .connections_by_location
-                .read()
-                .keys()
-                .map(|d| self_loc.distance(d))
-                .collect::<Vec<_>>()
-        })
-        .flatten()
-}
+// /// Builds an histogram of the distribution in the ring of each node relative to each other.
+// pub(crate) fn ring_distribution<'a>(
+//     nodes: impl Iterator<Item = &'a NodeInMemory<SimStorageError>> + 'a,
+// ) -> impl Iterator<Item = Distance> + 'a {
+//     // TODO: groupby certain intervals
+//     // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0
+//     nodes
+//         .map(|node| {
+//             let node_ring = &node.op_storage.ring;
+//             let self_loc = node_ring.own_location().location.unwrap();
+//             node_ring
+//                 .connections_by_location
+//                 .read()
+//                 .keys()
+//                 .map(|d| self_loc.distance(d))
+//                 .collect::<Vec<_>>()
+//         })
+//         .flatten()
+// }
