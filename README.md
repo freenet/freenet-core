@@ -20,6 +20,24 @@ Our "chainless" smart contract approach will result in learnings for IPFS-native
 
 Lastly, our deployment of a libp2p application to the major mobile platforms will inform other IPFS on mobile efforts, particularly the low-bandwidth, low-power, and variable connectivity challenges of mobile.
 
+### Relationship to "Fred"
+
+"Fred" is the name of the software commonly known as Freenet, which was created by Ian Clarke and other volunteers in 2000 and continually maintained since then.
+
+Locutus will be a general purpose, cryptographically secure, decentralized, distributed computation and communication platform. Anyone can write and run software on it, and that software can interact in ways that would be difficult otherwise.
+
+Locutus is not intended to replace Fred, which is very mature and has an active group of volunteer developers who maintain it.
+
+Key differences between Locutus and Fred:
+
+* Locutus is designed to support realtime communication, fast enough for IM (less than 1 second). Fred has been improving in this regard but is still limited to several minutes. This is fine for many applications, but rules out IM, social networking, among others.
+
+* Fred is largely a research platform, and this has limited its adoption. Locutus is being designed from the ground up to be no more difficult to use than a web browser.
+
+* Fred has a strong focus on anonymity. Anonymity is not a core design goal for Locutus itself, but systems that provide greater privacy can be built on top of it.
+
+* Fred is implemented in Java, Locutus is implemented in Rust, Java has been a signficant impediment to getting Fred on the desktop
+
 ### Status
 
 Locutus is currently in development with an initial release planned for Q1 2022.
