@@ -30,7 +30,7 @@ use crate::{
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-/// The Location of a peer in the ring. This location allows routing towards the peer.
+/// The location of a peer in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
     pub peer: PeerKey,
     /// An unspecified location means that the peer hasn't been asigned a location, yet.
@@ -43,8 +43,9 @@ pub(crate) struct PeerKeyLocation {
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
+    max_connections: usize,
     pub peer_key: PeerKey,
-    pub connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+    connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
     own_location: AtomicU64,
@@ -69,15 +70,19 @@ struct Blacklisted {
 
 impl Ring {
     const MIN_CONNECTIONS: usize = 10;
+
     const MAX_CONNECTIONS: usize = 20;
+
     /// Max number of subscribers for a contract.
-    pub const MAX_SUBSCRIBERS: usize = 10;
+    const MAX_SUBSCRIBERS: usize = 10;
 
     /// Above this number of remaining hops,
     /// randomize which of node a message which be forwarded to.
-    pub const RAND_WALK_ABOVE_HTL: usize = 7;
+    const RAND_WALK_ABOVE_HTL: usize = 7;
 
-    pub const MAX_HOPS_TO_LIVE: usize = 10;
+    /// Max hops to be performed for certain operations (e.g. propagating
+    /// connection of a peer in the network).
+    const MAX_HOPS_TO_LIVE: usize = 10;
 
     pub fn new(key: PeerKey) -> Self {
         // for location here consider -1 == None
@@ -85,6 +90,7 @@ impl Ring {
         Ring {
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
+            max_connections: Self::MAX_CONNECTIONS,
             connections_by_location: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location,
@@ -104,6 +110,11 @@ impl Ring {
     /// Set the maximum HTL for transactions.
     pub fn with_max_hops(&mut self, max_hops_to_live: usize) -> &mut Self {
         self.max_hops_to_live = max_hops_to_live;
+        self
+    }
+
+    pub fn with_max_connections(&mut self, connections: usize) -> &mut Self {
+        self.max_connections = connections;
         self
     }
 
@@ -156,7 +167,7 @@ impl Ring {
             false
         } else if cbl.len() < Self::MIN_CONNECTIONS {
             true
-        } else if cbl.len() >= Self::MAX_CONNECTIONS {
+        } else if cbl.len() >= self.max_connections {
             false
         } else {
             my_location.distance(location) < self.median_distance_to(my_location)
@@ -249,6 +260,10 @@ impl Ring {
         contract: &ContractKey,
     ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
         self.subscribers.get(contract)
+    }
+
+    pub fn num_connections(&self) -> usize {
+        self.connections_by_location.read().len()
     }
 }
 

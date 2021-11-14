@@ -17,7 +17,7 @@ use crate::{
     NodeConfig,
 };
 
-use super::{op_state::OpManager, EventListener, InitPeerNode};
+use super::{op_state::OpManager, EventListener};
 
 pub(crate) struct NodeInMemory<CErr>
 where
@@ -75,6 +75,10 @@ where
         if let Some(rnd_if_htl_above) = config.rnd_if_htl_above {
             ring.with_rnd_walk_above(rnd_if_htl_above);
         }
+        if let Some(max_conn) = config.max_number_conn {
+            ring.with_max_connections(max_conn);
+        }
+
         let (notification_tx, notification_channel) = mpsc::channel(100);
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
