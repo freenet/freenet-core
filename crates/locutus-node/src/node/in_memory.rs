@@ -44,33 +44,30 @@ where
         CH: ContractHandler + Send + Sync + 'static,
         <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
     {
-        if (config.local_ip.is_none() || config.local_port.is_none())
-            && config.remote_nodes.is_empty()
-        {
-            return Err(anyhow::anyhow!("At least one remote gateway is required to join an existing network for non-gateway nodes."));
-        }
         let peer = PeerKey::from(config.local_key.public());
-
         let ev_listener_cp = event_listener
             .as_ref()
             .map(|listener| listener.trait_clone());
-
         let conn_manager = MemoryConnManager::new(true, peer, None, ev_listener_cp);
-        let gateways = config
+
+        let gateways: Vec<_> = config
             .remote_nodes
             .into_iter()
             .filter_map(|node| {
-                let InitPeerNode {
-                    identifier,
-                    location,
-                    ..
-                } = node;
-                location.zip(identifier).map(|(loc, id)| PeerKeyLocation {
-                    peer: PeerKey::from(id),
-                    location: Some(loc),
-                })
+                if node.addr.is_some() {
+                    Some(PeerKeyLocation {
+                        peer: PeerKey::from(node.identifier),
+                        location: Some(node.location),
+                    })
+                } else {
+                    None
+                }
             })
             .collect();
+        if (config.local_ip.is_none() || config.local_port.is_none()) && gateways.is_empty() {
+            return Err(anyhow::anyhow!("At least one remote gateway is required to join an existing network for non-gateway nodes."));
+        }
+
         let mut ring = Ring::new(peer);
         if let Some(max_hops_to_live) = config.max_hops_to_live {
             ring.with_max_hops(max_hops_to_live);

@@ -139,8 +139,8 @@ impl NodeConfig {
         self
     }
 
-    /// Connection info for an already existing peer. Required in case this is not a bootstrapping node.
-    pub fn add_provider(mut self, peer: InitPeerNode) -> Self {
+    /// Connection info for an already existing peer. Required in case this is not a gateway node.
+    pub fn add_gateway(mut self, peer: InitPeerNode) -> Self {
         self.remote_nodes.push(peer);
         self
     }
@@ -175,20 +175,20 @@ impl Default for NodeConfig {
     }
 }
 
-/// Initial listening peer node to bootstrap the network.
+/// Gateway node to bootstrap the network.
 #[derive(Clone)]
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
-    identifier: Option<PeerId>,
-    location: Option<Location>,
+    identifier: PeerId,
+    location: Location,
 }
 
 impl InitPeerNode {
-    pub fn new() -> Self {
+    pub fn new(identifier: PeerId, location: Location) -> Self {
         Self {
             addr: None,
-            identifier: None,
-            location: None,
+            identifier,
+            location,
         }
     }
 
@@ -223,16 +223,6 @@ impl InitPeerNode {
         }
         self
     }
-
-    pub fn with_identifier(mut self, id: PeerId) -> Self {
-        self.identifier = Some(id);
-        self
-    }
-
-    pub fn with_location(mut self, loc: Location) -> Self {
-        self.location = Some(loc);
-        self
-    }
 }
 
 impl std::default::Default for InitPeerNode {
@@ -243,8 +233,8 @@ impl std::default::Default for InitPeerNode {
         let multi_addr = multiaddr_from_connection((conf.bootstrap_ip, conf.bootstrap_port));
         Self {
             addr: Some(multi_addr),
-            identifier: Some(identifier),
-            location: None,
+            identifier,
+            location: Location::random(),
         }
     }
 }

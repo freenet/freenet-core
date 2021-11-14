@@ -900,8 +900,7 @@ mod test {
     async fn node0_to_gateway_conn() {
         //! Given a network of one node and one gateway test that both are connected.
         Logger::init_logger();
-        let mut sim_net = SimNetwork::build(1, 1, 0);
-
+        let mut sim_net = SimNetwork::build(2, 1, 0);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(sim_net.connected("node-0"));
     }

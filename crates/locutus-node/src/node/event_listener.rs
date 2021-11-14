@@ -13,7 +13,7 @@ pub(super) use test_utils::TestEventListener;
 static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ListenerLogId(usize);
+struct ListenerLogId(usize);
 
 /// A type that reacts to incoming messages from the network.
 /// It injects itself at the message event loop.
@@ -21,7 +21,7 @@ pub(crate) struct ListenerLogId(usize);
 /// This type then can emit it's own information to adjacent systems
 /// or is a no-op.
 pub(crate) trait EventListener {
-    fn event_received(&mut self, ev: EventLog) -> ListenerLogId;
+    fn event_received(&mut self, ev: EventLog);
     fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static>;
 }
 
@@ -46,7 +46,6 @@ impl<'a> EventLog<'a> {
 }
 
 struct MessageLog {
-    log_id: ListenerLogId,
     peer_id: PeerKey,
     ts: Instant,
     kind: EventKind,
@@ -62,10 +61,9 @@ impl EventRegister {
 }
 
 impl EventListener for EventRegister {
-    fn event_received(&mut self, log: EventLog) -> ListenerLogId {
-        let (_msg_log, log_id) = create_log(log);
-        // TODO
-        log_id
+    fn event_received(&mut self, log: EventLog) {
+        let (_msg_log, _log_id) = create_log(log);
+        // TODO: save log
     }
 
     fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static> {
@@ -84,7 +82,6 @@ fn create_log(log: EventLog) -> (MessageLog, ListenerLogId) {
     let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
     let EventLog { peer_id, kind, .. } = log;
     let msg_log = MessageLog {
-        log_id,
         ts: Instant::now(),
         peer_id: *peer_id,
         kind,
@@ -129,14 +126,13 @@ mod test_utils {
     }
 
     impl super::EventListener for TestEventListener {
-        fn event_received(&mut self, log: EventLog) -> ListenerLogId {
+        fn event_received(&mut self, log: EventLog) {
             let tx = log.tx;
             let mut logs = self.logs.write();
             let (msg_log, log_id) = create_log(log);
             logs.push(msg_log);
             std::mem::drop(logs);
             self.tx_log.entry(*tx).or_default().push(log_id);
-            log_id
         }
 
         fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static> {
