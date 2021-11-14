@@ -586,7 +586,7 @@ where
                 log::info!(
                     "Successfully completed connection @ {}, new location = {:?}",
                     target.peer,
-                    ring.own_location()
+                    ring.own_location().location
                 );
                 new_state = None;
             }
@@ -615,7 +615,7 @@ where
     Err: std::error::Error,
     F: FnOnce() -> JoinRingMsg,
 {
-    if left_htl > 0 && !ring.connections_by_location.read().is_empty() {
+    if left_htl > 0 && ring.num_connections() > 0 {
         let forward_to = if left_htl >= ring.rnd_if_htl_above {
             log::debug!(
                 "Randomly selecting peer to forward JoinRequest, sender: {}",
@@ -809,7 +809,6 @@ mod test {
 
     use super::*;
     use crate::{
-        config::tracing::Logger,
         message::TxType,
         node::{test_utils::SimNetwork, SimStorageError},
     };
@@ -896,24 +895,35 @@ mod test {
         assert!(join_gw_1.consume_to_output::<SimStorageError>(res).is_err());
     }
 
+    /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node0_to_gateway_conn() {
-        //! Given a network of one node and one gateway test that both are connected.
-        Logger::init_logger();
-        let mut sim_net = SimNetwork::build(2, 1, 0);
+        let mut sim_net = SimNetwork::new(1, 1, 1, 0, 2);
+        sim_net.build();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(sim_net.connected("node-0"));
     }
 
+    /// Given a network of 1000 peers all nodes should have connections.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
-        //! Given a network of 1000 peers all nodes should have connections.
-        Logger::init_logger();
+        const NUM_NODES: usize = 100usize;
+        const NUM_GW: usize = 2usize;
 
-        let sim_nodes = SimNetwork::build(10, 10, 7);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 10, 7, 100);
+        sim_nodes.build();
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let all_connected = (0..NUM_NODES).all(|node| {
+            let label = format!("node-{}", node);
+            let connected = sim_nodes.connected(&label);
+            if !connected {
+                log::warn!("{} not connected", label);
+            }
+            connected
+        });
+        assert!(all_connected);
+
         // let _hist: Vec<_> = ring_distribution(sim_nodes.values()).collect();
-
         // const NUM_PROBES: usize = 10;
         // let mut probe_responses = Vec::with_capacity(NUM_PROBES);
         // for probe_idx in 0..NUM_PROBES {
@@ -948,7 +958,6 @@ mod test {
         //     })
         //     .any(|is_empty| is_empty);
         // assert!(!any_empties);
-
-        anyhow::bail!("test not impl")
+        Ok(())
     }
 }

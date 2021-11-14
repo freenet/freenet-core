@@ -71,22 +71,19 @@ where
 pub struct NodeConfig {
     /// local peer private key in
     local_key: identity::Keypair,
-
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
     local_ip: Option<IpAddr>,
     /// socket port to bind to the listener
     local_port: Option<u16>,
-
     /// At least an other running listener node is required for joining the network.
     /// Not necessary if this is an initial node.
     remote_nodes: Vec<InitPeerNode>,
-
     /// the location of this node, used for gateways.
     location: Option<Location>,
-
     max_hops_to_live: Option<usize>,
     rnd_if_htl_above: Option<usize>,
+    max_number_conn: Option<usize>,
 }
 
 impl NodeConfig {
@@ -104,43 +101,49 @@ impl NodeConfig {
             location: None,
             max_hops_to_live: None,
             rnd_if_htl_above: None,
+            max_number_conn: None,
         }
     }
 
-    pub fn max_hops_to_live(mut self, num_hops: usize) -> Self {
+    pub fn max_hops_to_live(&mut self, num_hops: usize) -> &mut Self {
         self.max_hops_to_live = Some(num_hops);
         self
     }
 
-    pub fn rnd_if_htl_above(mut self, num_hops: usize) -> Self {
+    pub fn rnd_if_htl_above(&mut self, num_hops: usize) -> &mut Self {
         self.rnd_if_htl_above = Some(num_hops);
         self
     }
 
-    pub fn with_port(mut self, port: u16) -> Self {
+    pub fn max_number_of_connections(&mut self, num: usize) -> &mut Self {
+        self.max_number_conn = Some(num);
+        self
+    }
+
+    pub fn with_port(&mut self, port: u16) -> &mut Self {
         self.local_port = Some(port);
         self
     }
 
-    pub fn with_ip<T: Into<IpAddr>>(mut self, ip: T) -> Self {
+    pub fn with_ip<T: Into<IpAddr>>(&mut self, ip: T) -> &mut Self {
         self.local_ip = Some(ip.into());
         self
     }
 
     /// Optional identity key of this node.
     /// If not provided it will be either obtained from the configuration or freshly generated.
-    pub fn with_key(mut self, key: identity::Keypair) -> Self {
+    pub fn with_key(&mut self, key: identity::Keypair) -> &mut Self {
         self.local_key = key;
         self
     }
 
-    pub fn with_location(mut self, loc: Location) -> Self {
+    pub fn with_location(&mut self, loc: Location) -> &mut Self {
         self.location = Some(loc);
         self
     }
 
     /// Connection info for an already existing peer. Required in case this is not a gateway node.
-    pub fn add_gateway(mut self, peer: InitPeerNode) -> Self {
+    pub fn add_gateway(&mut self, peer: InitPeerNode) -> &mut Self {
         self.remote_nodes.push(peer);
         self
     }
