@@ -28,7 +28,7 @@ pub(crate) enum UserEvent {
 }
 
 pub(crate) mod test_utils {
-    use std::time::Duration;
+    use std::{thread, time::Duration};
 
     use arbitrary::{Arbitrary, Unstructured};
     use rand::{prelude::Rng, thread_rng};
@@ -125,14 +125,18 @@ pub(crate) mod test_utils {
     #[async_trait::async_trait]
     impl UserEventsProxy for MemoryEventsGen {
         async fn recv(&mut self) -> UserEvent {
-            while self.signal.changed().await.is_ok() {
-                if *self.signal.borrow() == self.id {
-                    return self.gen_new_event();
+            loop {
+                if self.signal.changed().await.is_ok() {
+                    if *self.signal.borrow() == self.id {
+                        return self.gen_new_event();
+                    }
                 } else {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    log::warn!("sender half of user event gen dropped");
+                    // probably the process finished, wait for a bit and then kill the thread
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    panic!("finished orphan background thread");
                 }
             }
-            panic!()
         }
     }
 }

@@ -42,7 +42,7 @@ pub(crate) struct SimNetwork {
     event_listener: TestEventListener,
     labels: HashMap<String, PeerKey>,
     usr_ev_controller: Sender<PeerKey>,
-    _rcv_copy: Receiver<PeerKey>,
+    receiver_ch: Receiver<PeerKey>,
 }
 
 impl SimNetwork {
@@ -52,11 +52,12 @@ impl SimNetwork {
             event_listener: TestEventListener::new(),
             labels: HashMap::new(),
             usr_ev_controller,
-            _rcv_copy,
+            receiver_ch: _rcv_copy,
         }
     }
 
     pub fn build(network_size: usize, ring_max_htl: usize, rnd_if_htl_above: usize) -> SimNetwork {
+        assert!(network_size >= 2);
         let mut sim = SimNetwork::new();
 
         // build gateway node
@@ -85,21 +86,20 @@ impl SimNetwork {
         // add other nodes to the simulation
         for node_no in 0..(network_size - 1) {
             let label = format!("node-{}", node_no);
-            let id = identity::Keypair::generate_ed25519()
-                .public()
-                .into_peer_id();
+            let pair = identity::Keypair::generate_ed25519();
+            let id = pair.public().into_peer_id();
             sim.event_listener
                 .add_node(label.clone(), PeerKey::from(id));
 
             let config = NodeConfig::new()
-                .add_provider(
-                    InitPeerNode::new()
+                .add_gateway(
+                    InitPeerNode::new(gateway_peer_id, gateway_loc)
                         .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(gateway_port)
-                        .with_identifier(id),
+                        .listening_port(gateway_port),
                 )
                 .max_hops_to_live(ring_max_htl)
-                .rnd_if_htl_above(rnd_if_htl_above);
+                .rnd_if_htl_above(rnd_if_htl_above)
+                .with_key(pair);
             sim.initialize_peer(
                 NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
                     config,
@@ -113,7 +113,7 @@ impl SimNetwork {
     }
 
     fn initialize_peer(&mut self, mut peer: NodeInMemory<SimStorageError>, label: String) {
-        let user_events = MemoryEventsGen::new(self._rcv_copy.clone(), peer.peer_key);
+        let user_events = MemoryEventsGen::new(self.receiver_ch.clone(), peer.peer_key);
         self.labels.insert(label, peer.peer_key);
         tokio::spawn(async move { peer.listen_on(user_events).await });
     }
