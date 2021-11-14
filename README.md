@@ -33,6 +33,10 @@ Key differences between Locutus and Fred:
 
 * Fred is implemented in Java, Locutus is implemented in Rust, Java has been a signficant impediment to getting Fred on the desktop
 
+### Name
+
+Locutus is the development name for this software, it may change on launch.
+
 ### Status
 
 Locutus is currently in development with an initial release planned for Q1 2022.
