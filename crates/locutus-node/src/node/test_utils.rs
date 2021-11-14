@@ -47,6 +47,7 @@ pub(crate) struct SimNetwork {
     nodes: Vec<(NodeInMemory<SimStorageError>, String)>,
     ring_max_htl: usize,
     rnd_if_htl_above: usize,
+    max_connections: usize,
 }
 
 #[derive(Clone)]
@@ -63,6 +64,7 @@ impl SimNetwork {
         nodes: usize,
         ring_max_htl: usize,
         rnd_if_htl_above: usize,
+        max_connections: usize,
     ) -> Self {
         assert!(gateways > 0 && nodes > 0);
         let (usr_ev_controller, _rcv_copy) = channel(PeerKey::random());
@@ -75,6 +77,7 @@ impl SimNetwork {
             nodes: Vec::new(),
             ring_max_htl,
             rnd_if_htl_above,
+            max_connections,
         };
         net.build_gateways(gateways);
         net.build_nodes(nodes);
@@ -96,6 +99,7 @@ impl SimNetwork {
                 .with_key(pair)
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
+                .max_number_of_connections(self.max_connections)
                 .rnd_if_htl_above(self.rnd_if_htl_above);
 
             self.event_listener
@@ -145,6 +149,7 @@ impl SimNetwork {
             config
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
+                .max_number_of_connections(self.max_connections)
                 .with_key(pair);
 
             self.event_listener

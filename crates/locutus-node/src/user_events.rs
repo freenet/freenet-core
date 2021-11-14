@@ -131,7 +131,7 @@ pub(crate) mod test_utils {
                         return self.gen_new_event();
                     }
                 } else {
-                    log::warn!("sender half of user event gen dropped");
+                    log::debug!("sender half of user event gen dropped");
                     // probably the process finished, wait for a bit and then kill the thread
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     panic!("finished orphan background thread");
