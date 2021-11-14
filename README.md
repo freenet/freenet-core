@@ -27,6 +27,8 @@ Locutus won't replace Fred; they're trying to solve different (but related) prob
 
 * Fred is primarily a research platform, and this has limited its adoption. While it continues to improve, ease of use has always been an issue for Fred. Locutus is being designed from the ground up to be no more difficult to use than a web browser.
 
+* Fred has [signed subspace keys](https://freenetproject.org/pages/documentation.html), Locutus will have a greatly generalized version of this called cryptographic contracts which are specified in webassembly. These contracts are the software for the distributed, decentralized computer.
+
 * Fred has a strong focus on anonymity. Anonymity is not a core design goal for Locutus itself, but systems that provide greater privacy can be built on top of it.
 
 * Fred is implemented in Java, Locutus is implemented in Rust. Rust apps can be far more lightweight than their Java equivalents because they don't need the JVM. 
