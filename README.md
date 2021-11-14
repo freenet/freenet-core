@@ -14,11 +14,6 @@ The Internet has grown increasingly centralized over the past 25 years, such tha
 
 Locutus' purpose is to make it easy to build decentralized services and also to provide reference implementations of the most popular services such as email and instant messaging.
 
-We're building Locutus on the Rust implementation of libp2p meaning our developers will contribute improvements to this project, including code, testing, and more general feedback. benefitting systems built on libp2p, including FileCoin.
-
-Our "chainless" smart contract approach will result in learnings for IPFS-native applications and FileCoin's smart contract initiative.
-
-Lastly, our deployment of a libp2p application to the major mobile platforms will inform other IPFS on mobile efforts, particularly the low-bandwidth, low-power, and variable connectivity challenges of mobile.
 
 ### Relationship to "Fred"
 
