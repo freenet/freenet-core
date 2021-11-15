@@ -20,3 +20,4 @@ target/
 .vscode/*
 
 config.toml
+.rustc*
