@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::{sync::atomic::AtomicUsize, time::Instant};
 
 use crate::operations::join_ring::JoinRingMsg;
+use crate::ring::{Location, PeerKeyLocation};
 use crate::{
     conn_manager::PeerKey,
     message::{Message, Transaction},
@@ -34,7 +35,12 @@ pub(crate) struct EventLog<'a> {
 impl<'a> EventLog<'a> {
     pub fn new(msg: &'a Message, peer_id: &'a PeerKey) -> Self {
         let kind = match msg {
-            Message::JoinRing(JoinRingMsg::Connected { .. }) => EventKind::Connected,
+            Message::JoinRing(JoinRingMsg::Response { sender, target, .. }) => {
+                EventKind::Connected {
+                    loc: sender.location.unwrap(),
+                    to: *target,
+                }
+            }
             _ => EventKind::Unknown,
         };
         EventLog {
@@ -73,7 +79,7 @@ impl EventListener for EventRegister {
 
 #[derive(Debug, PartialEq, Eq)]
 enum EventKind {
-    Connected,
+    Connected { loc: Location, to: PeerKeyLocation },
     Unknown,
 }
 
@@ -91,10 +97,12 @@ fn create_log(log: EventLog) -> (MessageLog, ListenerLogId) {
 
 #[cfg(test)]
 mod test_utils {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use dashmap::DashMap;
     use parking_lot::RwLock;
+
+    use crate::ring::Distance;
 
     use super::*;
 
@@ -121,7 +129,30 @@ mod test_utils {
         pub fn registered_connection(&self, peer: PeerKey) -> bool {
             let logs = self.logs.read();
             logs.iter()
-                .any(|log| log.peer_id == peer && log.kind == EventKind::Connected)
+                .any(|log| log.peer_id == peer && matches!(log.kind, EventKind::Connected { .. }))
+        }
+
+        pub fn connections(&self, key: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
+            let logs = self.logs.read();
+            logs.iter()
+                .filter_map(|l| {
+                    if let EventKind::Connected {
+                        loc,
+                        to:
+                            PeerKeyLocation {
+                                location: Some(other_loc),
+                                peer,
+                            },
+                    } = l.kind
+                    {
+                        if peer == key {
+                            return Some((peer, loc.distance(&other_loc)));
+                        }
+                    }
+                    None
+                })
+                .collect::<HashMap<_, _>>()
+                .into_iter()
         }
     }
 

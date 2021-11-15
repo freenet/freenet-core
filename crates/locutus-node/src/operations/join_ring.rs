@@ -907,7 +907,7 @@ mod test {
     /// Given a network of 1000 peers all nodes should have connections.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 100usize;
+        const NUM_NODES: usize = 98usize;
         const NUM_GW: usize = 2usize;
 
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 10, 7, 100);
@@ -923,41 +923,8 @@ mod test {
         });
         assert!(all_connected);
 
-        // let _hist: Vec<_> = ring_distribution(sim_nodes.values()).collect();
-        // const NUM_PROBES: usize = 10;
-        // let mut probe_responses = Vec::with_capacity(NUM_PROBES);
-        // for probe_idx in 0..NUM_PROBES {
-        //     let target = Location::random();
-        //     let idx: usize = rand::thread_rng().gen_range(0..sim_nodes.len());
-        //     let rnd_node = sim_nodes
-        //         .get_mut(&format!("node-{}", idx))
-        //         .ok_or("node not found")?;
-        //     let probe_response = ProbeProtocol::probe(
-        //         rnd_node.ring_protocol.clone(),
-        //         Transaction::new(<ProbeRequest as TransactionType>::msg_type_id()),
-        //         ProbeRequest {
-        //             hops_to_live: 7,
-        //             target,
-        //         },
-        //     )
-        //     .await
-        //     .expect("failed to get probe response");
-        //     probe_responses.push(probe_response);
-        // }
-        // probe_proto::utils::plot_probe_responses(probe_responses);
-
-        // let any_empties = sim_nodes
-        //     .peers
-        //     .values()
-        //     .map(|node| {
-        //         node.op_storage
-        //             .ring
-        //             .connections_by_location
-        //             .read()
-        //             .is_empty()
-        //     })
-        //     .any(|is_empty| is_empty);
-        // assert!(!any_empties);
+        let hist: Vec<_> = sim_nodes.ring_distribution().collect();
+        log::info!("{:?}", hist);
         Ok(())
     }
 }

@@ -3,6 +3,7 @@ name = "locutus-node"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.56.0"
+resolver = "2"
 
 [lib]
 path = "src/lib.rs"
@@ -42,3 +43,9 @@ tokio = { version = "1.12", features = ["rt-multi-thread", "sync", "macros"] }
 typestate = "0.8.0"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
 sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
+
+[dev-dependencies]
+itertools = "0.10"
+
+[profile.dev.overrides."*"]
+opt-level = 3

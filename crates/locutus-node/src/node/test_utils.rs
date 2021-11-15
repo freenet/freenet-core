@@ -1,8 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
 };
 
+use itertools::Itertools;
 use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
@@ -11,7 +12,7 @@ use crate::{
     conn_manager::PeerKey,
     contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    ring::Location,
+    ring::{Distance, Location},
     user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
@@ -73,8 +74,8 @@ impl SimNetwork {
             labels: HashMap::new(),
             usr_ev_controller,
             receiver_ch: _rcv_copy,
-            gateways: Vec::new(),
-            nodes: Vec::new(),
+            gateways: Vec::with_capacity(gateways),
+            nodes: Vec::with_capacity(gateways),
             ring_max_htl,
             rnd_if_htl_above,
             max_connections,
@@ -189,26 +190,24 @@ impl SimNetwork {
         }
     }
 
-    /// Query the network for connectivity stats.
-    pub async fn ring_distribution(&self) {}
+    /// Builds an histogram of the distribution in the ring of each node relative to each other.
+    pub fn ring_distribution(&self) -> impl Iterator<Item = (f64, usize)> {
+        let mut all_dists = Vec::with_capacity(self.labels.len());
+        for (.., key) in &self.labels {
+            all_dists.push(self.event_listener.connections(*key).into_iter());
+        }
+        let mut distances = HashMap::new();
+        for (bucket, group) in &all_dists
+            .into_iter()
+            .flatten()
+            .group_by(|(_, d)| ((d.0 * 10.0).floor() / 100.0) as u32)
+        {
+            let count = group.count();
+            distances
+                .entry(bucket)
+                .and_modify(|c| *c += count)
+                .or_insert(count);
+        }
+        distances.into_iter().map(|(k, v)| (k as f64 * 10.0, v))
+    }
 }
-
-// /// Builds an histogram of the distribution in the ring of each node relative to each other.
-// pub(crate) fn ring_distribution<'a>(
-//     nodes: impl Iterator<Item = &'a NodeInMemory<SimStorageError>> + 'a,
-// ) -> impl Iterator<Item = Distance> + 'a {
-//     // TODO: groupby certain intervals
-//     // e.g. grouping func: (it * 200.0).roundToInt().toDouble() / 200.0
-//     nodes
-//         .map(|node| {
-//             let node_ring = &node.op_storage.ring;
-//             let self_loc = node_ring.own_location().location.unwrap();
-//             node_ring
-//                 .connections_by_location
-//                 .read()
-//                 .keys()
-//                 .map(|d| self_loc.distance(d))
-//                 .collect::<Vec<_>>()
-//         })
-//         .flatten()
-// }
