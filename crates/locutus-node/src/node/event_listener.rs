@@ -102,7 +102,7 @@ mod test_utils {
     use dashmap::DashMap;
     use parking_lot::RwLock;
 
-    use crate::ring::Distance;
+    use crate::{message::TxType, ring::Distance};
 
     use super::*;
 
@@ -145,7 +145,7 @@ mod test_utils {
                             },
                     } = l.kind
                     {
-                        if peer == key {
+                        if l.peer_id == key {
                             return Some((peer, loc.distance(&other_loc)));
                         }
                     }
@@ -169,5 +169,37 @@ mod test_utils {
         fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static> {
             Box::new(self.clone())
         }
+    }
+
+    #[test]
+    fn test_get_connections() -> Result<(), anyhow::Error> {
+        let peer_id = PeerKey::random();
+        let loc = Location::try_from(0.5)?;
+        let tx = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_id);
+        let locations = [
+            (PeerKey::random(), Location::try_from(0.5)?),
+            (PeerKey::random(), Location::try_from(0.75)?),
+            (PeerKey::random(), Location::try_from(0.25)?),
+        ];
+
+        let mut listener = TestEventListener::new();
+        locations.iter().for_each(|(other, location)| {
+            listener.event_received(EventLog {
+                tx: &tx,
+                peer_id: &peer_id,
+                kind: EventKind::Connected {
+                    loc,
+                    to: PeerKeyLocation {
+                        peer: *other,
+                        location: Some(*location),
+                    },
+                },
+            });
+        });
+
+        let distances: Vec<_> = listener.connections(peer_id).collect();
+        assert!(distances.len() == 3);
+        assert!((distances.iter().map(|(_, l)| l.0).sum::<f64>() - 0.5f64).abs() < f64::EPSILON);
+        Ok(())
     }
 }

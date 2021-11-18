@@ -924,7 +924,7 @@ mod test {
         assert!(all_connected);
 
         let hist: Vec<_> = sim_nodes.ring_distribution().collect();
-        log::info!("{:?}", hist);
+        log::info!("Ring distribution: {:?}", hist);
         Ok(())
     }
 }

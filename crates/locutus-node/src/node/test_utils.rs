@@ -196,18 +196,41 @@ impl SimNetwork {
         for (.., key) in &self.labels {
             all_dists.push(self.event_listener.connections(*key).into_iter());
         }
-        let mut distances = HashMap::new();
-        for (bucket, group) in &all_dists
-            .into_iter()
-            .flatten()
-            .group_by(|(_, d)| ((d.0 * 10.0).floor() / 100.0) as u32)
-        {
-            let count = group.count();
-            distances
-                .entry(bucket)
-                .and_modify(|c| *c += count)
-                .or_insert(count);
-        }
-        distances.into_iter().map(|(k, v)| (k as f64 * 10.0, v))
+        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l))
     }
+}
+
+fn group_locations_in_buckets(
+    locs: impl IntoIterator<Item = Location>,
+) -> impl Iterator<Item = (f64, usize)> {
+    let mut distances = HashMap::new();
+    for (bucket, group) in &locs.into_iter().group_by(|l| (l.0 * 10.0).floor() as u32) {
+        let count = group.count();
+        distances
+            .entry(bucket)
+            .and_modify(|c| *c += count)
+            .or_insert(count);
+    }
+    distances
+        .into_iter()
+        .map(|(k, v)| ((k as f64 / 10.0) as f64, v))
+}
+
+#[test]
+fn group_locations_test() -> Result<(), anyhow::Error> {
+    let locations = vec![
+        Location::try_from(0.5356)?,
+        Location::try_from(0.5597)?,
+        Location::try_from(0.5435)?,
+        Location::try_from(0.5468)?,
+        Location::try_from(0.7412)?,
+        Location::try_from(0.7309)?,
+        Location::try_from(0.6745)?,
+    ];
+
+    let mut grouped: Vec<_> = group_locations_in_buckets(locations).collect();
+    grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    assert_eq!(grouped, vec![(0.5, 4), (0.6, 1), (0.7, 2)]);
+
+    Ok(())
 }
