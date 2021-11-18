@@ -20,6 +20,7 @@ use std::{
     time::Instant,
 };
 
+use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -348,11 +349,11 @@ impl std::hash::Hash for Location {
 }
 
 impl TryFrom<f64> for Location {
-    type Error = ();
+    type Error = anyhow::Error;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         if !(0.0..=1.0).contains(&value) {
-            Err(())
+            bail!("expected a value between 0.0 and 1.0, received {}", value)
         } else {
             Ok(Location(value))
         }
