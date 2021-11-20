@@ -12,7 +12,7 @@ use crate::{
     conn_manager::PeerKey,
     contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    ring::Location,
+    ring::{Distance, Location},
     user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
