@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
 };
 
@@ -12,7 +12,7 @@ use crate::{
     conn_manager::PeerKey,
     contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    ring::{Distance, Location},
+    ring::Location,
     user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
