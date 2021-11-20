@@ -126,12 +126,13 @@ mod test_utils {
             self.node_labels.insert(label, peer);
         }
 
-        pub fn registered_connection(&self, peer: PeerKey) -> bool {
+        pub fn is_connected(&self, peer: PeerKey) -> bool {
             let logs = self.logs.read();
             logs.iter()
                 .any(|log| log.peer_id == peer && matches!(log.kind, EventKind::Connected { .. }))
         }
 
+        /// Unique connections for a given peer and their relative distance to other peers.
         pub fn connections(&self, key: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
             let logs = self.logs.read();
             logs.iter()
