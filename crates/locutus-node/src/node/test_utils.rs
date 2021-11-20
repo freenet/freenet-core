@@ -12,7 +12,7 @@ use crate::{
     conn_manager::PeerKey,
     contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    ring::Location,
+    ring::{Distance, Location},
     user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
@@ -184,19 +184,34 @@ impl SimNetwork {
 
     pub fn connected(&self, peer: &str) -> bool {
         if let Some(key) = self.labels.get(peer) {
-            self.event_listener.registered_connection(*key)
+            self.event_listener.is_connected(*key)
         } else {
             false
         }
     }
 
     /// Builds an histogram of the distribution in the ring of each node relative to each other.
-    pub fn ring_distribution(&self) -> impl Iterator<Item = (f64, usize)> {
+    pub fn ring_distribution(&self, scale: i32) -> impl Iterator<Item = (f64, usize)> {
         let mut all_dists = Vec::with_capacity(self.labels.len());
         for (.., key) in &self.labels {
             all_dists.push(self.event_listener.connections(*key).into_iter());
         }
-        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l), 1)
+        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l), scale)
+    }
+
+    /// Returns the connectivity in the network per peer (that is all the connections
+    /// this peers has registered).
+    pub fn node_connectivity(&self) -> HashMap<String, HashMap<PeerKey, Distance>> {
+        let mut peers_connections = HashMap::with_capacity(self.labels.len());
+        for (label, key) in &self.labels {
+            peers_connections.insert(
+                label.clone(),
+                self.event_listener
+                    .connections(*key)
+                    .collect::<HashMap<_, _>>(),
+            );
+        }
+        peers_connections
     }
 }
 

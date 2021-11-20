@@ -904,7 +904,7 @@ mod test {
         assert!(sim_net.connected("node-0"));
     }
 
-    /// Given a network of 1000 peers all nodes should have connections.
+    /// Given a network of 100 peers all nodes should have connections.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 98usize;
@@ -923,8 +923,31 @@ mod test {
         });
         assert!(all_connected);
 
-        let hist: Vec<_> = sim_nodes.ring_distribution().collect();
-        log::info!("Ring distribution: {:?}", hist);
+        // let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
+        // log::info!("Ring distribution: {:?}", hist);
+
+        let node_connectivity = sim_nodes.node_connectivity();
+        let mut connections_per_peer: Vec<_> = node_connectivity
+            .iter()
+            .map(|(k, v)| (k, v.len()))
+            .filter_map(|(k, v)| {
+                if !k.starts_with("gateway") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // ensure at least some normal nodes have more than one connection
+        connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
+        assert!(connections_per_peer.iter().last().unwrap() > &1);
+
+        // ensure the average number of connections per peer is above N
+        let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / NUM_NODES;
+        log::info!("Average connections: {}", avg_connections);
+        assert!(avg_connections > 1);
+
         Ok(())
     }
 }
