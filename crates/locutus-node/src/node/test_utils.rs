@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
 };
 
@@ -12,7 +12,7 @@ use crate::{
     conn_manager::PeerKey,
     contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    ring::{Distance, Location},
+    ring::Location,
     user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
@@ -196,15 +196,19 @@ impl SimNetwork {
         for (.., key) in &self.labels {
             all_dists.push(self.event_listener.connections(*key).into_iter());
         }
-        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l))
+        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l), 1)
     }
 }
 
 fn group_locations_in_buckets(
     locs: impl IntoIterator<Item = Location>,
+    scale: i32,
 ) -> impl Iterator<Item = (f64, usize)> {
     let mut distances = HashMap::new();
-    for (bucket, group) in &locs.into_iter().group_by(|l| (l.0 * 10.0).floor() as u32) {
+    for (bucket, group) in &locs
+        .into_iter()
+        .group_by(|l| (l.0 * (10.0f64).powi(scale)).floor() as u32)
+    {
         let count = group.count();
         distances
             .entry(bucket)
@@ -213,24 +217,39 @@ fn group_locations_in_buckets(
     }
     distances
         .into_iter()
-        .map(|(k, v)| ((k as f64 / 10.0) as f64, v))
+        .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)) as f64, v))
 }
 
 #[test]
 fn group_locations_test() -> Result<(), anyhow::Error> {
     let locations = vec![
         Location::try_from(0.5356)?,
-        Location::try_from(0.5597)?,
         Location::try_from(0.5435)?,
         Location::try_from(0.5468)?,
-        Location::try_from(0.7412)?,
-        Location::try_from(0.7309)?,
+        Location::try_from(0.5597)?,
         Location::try_from(0.6745)?,
+        Location::try_from(0.7309)?,
+        Location::try_from(0.7412)?,
     ];
 
-    let mut grouped: Vec<_> = group_locations_in_buckets(locations).collect();
+    let mut grouped: Vec<_> =
+        group_locations_in_buckets(locations.clone().into_iter(), 1).collect();
     grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     assert_eq!(grouped, vec![(0.5, 4), (0.6, 1), (0.7, 2)]);
+
+    let mut grouped: Vec<_> = group_locations_in_buckets(locations, 1).collect();
+    grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    assert_eq!(
+        grouped,
+        vec![
+            (0.53, 1),
+            (0.54, 2),
+            (0.55, 1),
+            (0.67, 1),
+            (0.73, 1),
+            (0.74, 1)
+        ]
+    );
 
     Ok(())
 }
