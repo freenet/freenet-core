@@ -388,12 +388,10 @@ where
                 this_node_loc.peer
             );
             let new_location = Location::random();
-            let accepted_by = if ring.should_accept(
-                &this_node_loc.location.ok_or(OpError::TxUpdateFailure(id))?,
-                &new_location,
-            ) {
+            let accepted_by = if ring.should_accept(&new_location) {
                 log::debug!("Accepting connections from {}", req_peer,);
                 conn_manager.add_connection(this_node_loc, false);
+                ring.add_connection(new_location, req_peer);
                 HashSet::from_iter([this_node_loc])
             } else {
                 log::debug!("Not accepting new connection for sender {}", req_peer);
@@ -447,20 +445,16 @@ where
                 },
         } => {
             let own_loc = ring.own_location();
-            let accepted_by = if ring.should_accept(
-                own_loc
-                    .location
-                    .as_ref()
-                    .ok_or(OpError::TxUpdateFailure(id))?,
-                &joiner.location.ok_or(OpError::TxUpdateFailure(id))?,
-            ) {
-                log::debug!("Accepting connections from {}", joiner.peer);
-                conn_manager.add_connection(joiner, false);
-                HashSet::from_iter([own_loc])
-            } else {
-                log::debug!("Not accepting new connection for sender {}", joiner.peer);
-                HashSet::new()
-            };
+            let accepted_by =
+                if ring.should_accept(&joiner.location.ok_or(OpError::TxUpdateFailure(id))?) {
+                    log::debug!("Accepting connections from {}", joiner.peer);
+                    conn_manager.add_connection(joiner, false);
+                    ring.add_connection(joiner.location.unwrap(), joiner.peer);
+                    HashSet::from_iter([own_loc])
+                } else {
+                    log::debug!("Not accepting new connection for sender {}", joiner.peer);
+                    HashSet::new()
+                };
 
             let accepted_by_this = || -> JoinRingMsg {
                 JoinRingMsg::Response {
@@ -510,17 +504,17 @@ where
                     target,
                 })?
                 .map(Message::from);
-            for new_peer in accepted_by {
+            for other_peer in accepted_by {
                 if ring.should_accept(
-                    &your_location,
-                    &new_peer
+                    &other_peer
                         .location
                         .ok_or(conn_manager::ConnError::LocationUnknown)?,
                 ) {
-                    log::info!("Established connection to {}", new_peer.peer);
-                    conn_manager.add_connection(new_peer, false);
+                    log::info!("Established connection to {}", other_peer.peer);
+                    conn_manager.add_connection(other_peer, false);
+                    ring.add_connection(other_peer.location.unwrap(), other_peer.peer);
                 } else {
-                    log::warn!("Not accepting connection to {}", new_peer.peer);
+                    log::warn!("Not accepting connection to {}", other_peer.peer);
                 }
             }
             ring.update_location(PeerKeyLocation {
