@@ -162,7 +162,8 @@ impl Ring {
 
     /// Whether a node should accept a new node connection or not based
     /// on the relative location and other conditions.
-    pub fn should_accept(&self, my_location: &Location, location: &Location) -> bool {
+    pub fn should_accept(&self, location: &Location) -> bool {
+        let my_location = &self.own_location().location.unwrap();
         let cbl = &*self.connections_by_location.read();
         if location == my_location || cbl.contains_key(location) {
             false
@@ -173,6 +174,17 @@ impl Ring {
         } else {
             my_location.distance(location) < self.median_distance_to(my_location)
         }
+    }
+
+    pub fn add_connection(&self, loc: Location, peer: PeerKey) {
+        let mut cbl = self.connections_by_location.write();
+        cbl.insert(
+            loc,
+            PeerKeyLocation {
+                peer,
+                location: Some(loc),
+            },
+        );
     }
 
     pub fn median_distance_to(&self, location: &Location) -> Distance {
