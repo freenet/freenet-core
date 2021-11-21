@@ -904,11 +904,11 @@ mod test {
         assert!(sim_net.connected("node-0"));
     }
 
-    /// Given a network of 100 peers all nodes should have connections.
+    /// Given a network of 1000 peers all nodes should have connections.
     #[tokio::test(flavor = "multi_thread")]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 998usize;
-        const NUM_GW: usize = 2usize;
+        const NUM_NODES: usize = 990usize;
+        const NUM_GW: usize = 10usize;
 
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 10, 7, 10);
         sim_nodes.build();
