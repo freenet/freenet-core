@@ -24,7 +24,7 @@ impl JoinRingOp {
         gateway: PeerKeyLocation,
         max_hops_to_live: usize,
     ) -> Self {
-        log::info!("Connecting to gw {} from {}", gateway.peer, this_peer);
+        log::debug!("Connecting to gw {} from {}", gateway.peer, this_peer);
         let sm = StateMachine::from_state(JRState::Connecting(ConnectionInfo {
             gateway,
             this_peer,
@@ -805,7 +805,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::{
@@ -905,23 +905,34 @@ mod test {
     }
 
     /// Given a network of 100 peers all nodes should have connections.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 98usize;
+        const NUM_NODES: usize = 998usize;
         const NUM_GW: usize = 2usize;
 
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 10, 7, 100);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 10, 7, 10);
         sim_nodes.build();
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
-        let all_connected = (0..NUM_NODES).all(|node| {
-            let label = format!("node-{}", node);
-            let connected = sim_nodes.connected(&label);
-            if !connected {
-                log::warn!("{} not connected", label);
+
+        let mut connected = HashSet::new();
+        let elapsed = Instant::now();
+        while elapsed.elapsed() < Duration::from_secs(30) && connected.len() < NUM_NODES {
+            for node in 0..NUM_NODES {
+                if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
+                    connected.insert(node);
+                }
             }
-            connected
-        });
-        assert!(all_connected);
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let expected = HashSet::from_iter(0..NUM_NODES);
+        let diff: Vec<_> = expected.difference(&connected).collect();
+        if !diff.is_empty() {
+            log::error!("Nodes without connection: {:?}", diff);
+        }
+        assert!(diff.is_empty());
+        log::info!(
+            "Required time for connecting all peers: {} secs",
+            elapsed.elapsed().as_secs()
+        );
 
         // let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
         // log::info!("Ring distribution: {:?}", hist);

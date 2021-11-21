@@ -14,6 +14,7 @@ use crate::{
     },
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
+    utils::ExtendedIter,
     NodeConfig,
 };
 
@@ -97,9 +98,7 @@ where
     }
 
     pub async fn join_ring(&mut self) -> Result<(), ()> {
-        // FIXME: this iteration should be shuffled, must write an extension iterator shuffle items "in place"
-        // the idea here is to limit the amount of gateways being contacted that's why shuffling is required
-        for gateway in &self.gateways {
+        for gateway in self.gateways.iter().shuffle().take(1) {
             let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &self.peer_key);
             // initiate join action action per each gateway
             let op = join_ring::JoinRingOp::initial_request(

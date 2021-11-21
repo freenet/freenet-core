@@ -28,7 +28,7 @@ pub(crate) enum UserEvent {
 }
 
 pub(crate) mod test_utils {
-    use std::{thread, time::Duration};
+    use std::time::Duration;
 
     use arbitrary::{Arbitrary, Unstructured};
     use rand::{prelude::Rng, thread_rng};
