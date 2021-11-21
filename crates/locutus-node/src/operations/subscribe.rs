@@ -278,7 +278,7 @@ where
                         id,
                         subscribed: false,
                         sender,
-                        target: subscriber
+                        target: subscriber,
                     })),
                     state: None,
                 }
@@ -474,11 +474,16 @@ mod messages {
         }
 
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
-            None
+            match self {
+                Self::ReturnSub { sender, .. } => Some(sender),
+                _ => None,
+            }
         }
 
         pub fn target(&self) -> Option<&PeerKeyLocation> {
             match self {
+                Self::SeekNode { target, .. } => Some(target),
+                Self::ReturnSub { target, .. } => Some(target),
                 _ => None,
             }
         }
@@ -500,11 +505,11 @@ mod messages {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::config::tracing::Logger;
     use crate::contract::Contract;
+    use crate::node::test_utils::SimNetwork;
     use crate::ring::Location;
     use crate::{conn_manager::PeerKey, node::SimStorageError};
-    use crate::config::tracing::Logger;
-    use crate::node::test_utils::SimNetwork;
 
     #[test]
     fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
@@ -596,12 +601,8 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
-        Logger::init_logger();
+        let mut sim_nodes = SimNetwork::new(1, 3, 10, 7, 100);
 
-        // let sim_nodes = SimNetwork::build(3, 10, 7);
-        // let rnd_node = sim_nodes
-        //     .get_mut(&format!("node-{}", 0))
-        //     .ok_or("node not found")?;
         Ok(())
     }
 }

@@ -42,6 +42,7 @@ pub(crate) mod test_utils {
         id: PeerKey,
         non_owned_contracts: Vec<ContractKey>,
         owned_contracts: Vec<Contract>,
+        events_to_gen: Vec<UserEvent>,
     }
 
     impl MemoryEventsGen {
@@ -51,6 +52,7 @@ pub(crate) mod test_utils {
                 id,
                 non_owned_contracts: Vec::new(),
                 owned_contracts: Vec::new(),
+                events_to_gen: Vec::new(),
             }
         }
 
@@ -62,6 +64,15 @@ pub(crate) mod test_utils {
         /// Contracts that the user updates.
         pub fn has_contract(&mut self, contracts: impl IntoIterator<Item = Contract>) {
             self.owned_contracts.extend(contracts.into_iter())
+        }
+
+        /// Events that the user generate.
+        pub fn generate_events(&mut self, events: impl IntoIterator<Item = UserEvent>) {
+            self.events_to_gen.extend(events.into_iter())
+        }
+
+        fn gen_events(&mut self) -> UserEvent {
+            self.events_to_gen.get(0);
         }
 
         fn gen_new_event(&mut self) -> UserEvent {
