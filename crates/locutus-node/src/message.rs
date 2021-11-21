@@ -165,6 +165,7 @@ impl Message {
         match self {
             JoinRing(op) => op.target(),
             Put(op) => op.target(),
+            Subscribe(op) => op.target(),
             _ => todo!(),
         }
     }

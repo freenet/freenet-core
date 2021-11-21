@@ -59,26 +59,8 @@ impl StateMachineImpl for SubscribeOpSm {
                     retries: 0,
                 })
             }
-            (SubscribeState::ReceivedRequest, SubscribeMsg::SeekNode { found: true, .. }) => {
+            (SubscribeState::ReceivedRequest, SubscribeMsg::SeekNode { .. }) => {
                 Some(SubscribeState::Completed)
-            }
-            (
-                SubscribeState::ReceivedRequest,
-                SubscribeMsg::SeekNode {
-                    target,
-                    retries,
-                    found: false,
-                    ..
-                },
-            ) => {
-                if retries < &SubscribeOp::MAX_RETRIES {
-                    Some(SubscribeState::AwaitingResponse {
-                        skip_list: vec![],
-                        retries: 0,
-                    })
-                } else {
-                    None
-                }
             }
             (
                 SubscribeState::AwaitingResponse { .. },
@@ -130,6 +112,8 @@ impl StateMachineImpl for SubscribeOpSm {
                     key,
                     target,
                     subscriber,
+                    skip_list,
+                    htl,
                     found: true,
                 },
             ) => {
@@ -140,6 +124,7 @@ impl StateMachineImpl for SubscribeOpSm {
                 );
                 Some(SubscribeMsg::ReturnSub {
                     sender: target,
+                    target: subscriber,
                     id,
                     key,
                     subscribed: true,
@@ -271,7 +256,8 @@ where
                 key,
                 target,
                 subscriber: sender,
-                retries: 0,
+                skip_list: vec![sender.peer],
+                htl: 0,
                 found: false,
             }));
         }
@@ -280,7 +266,8 @@ where
             id,
             subscriber,
             target,
-            retries,
+            skip_list,
+            htl,
             found,
         } => {
             let sender = op_storage.ring.own_location();
@@ -291,19 +278,25 @@ where
                         id,
                         subscribed: false,
                         sender,
+                        target: subscriber
                     })),
                     state: None,
                 }
             };
 
-            if !op_storage.ring.has_contract(&key) {
+            if !op_storage.ring.contract_exists(&key) {
                 log::info!("Contract {} not found while processing info", key);
                 log::info!("Trying to found the contract from another node");
 
-                let initial_htl = op_storage.ring.max_hops_to_live + 1;
-                let new_requester = target;
-                let new_target = op_storage.ring.closest_caching(&key, initial_htl, &[])[0];
-                let new_retries = retries + 1;
+                let new_target = op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
+                let new_htl = htl + 1;
+
+                if new_htl > SubscribeOp::MAX_RETRIES {
+                    return Ok(return_err());
+                }
+
+                let mut new_skip_list = skip_list.clone();
+                new_skip_list.push(target.peer);
 
                 // Retry seek node when the contract to subscribe has not been found in this node
                 conn_manager
@@ -312,9 +305,10 @@ where
                         (SubscribeMsg::SeekNode {
                             id,
                             key,
-                            subscriber: new_requester,
+                            subscriber,
                             target: new_target,
-                            retries: new_retries,
+                            skip_list: new_skip_list.clone(),
+                            htl: new_htl,
                             found: false,
                         })
                         .into(),
@@ -326,9 +320,10 @@ where
                     .consume_to_state(SubscribeMsg::SeekNode {
                         id,
                         key,
-                        subscriber: new_requester,
-                        target: new_target,
-                        retries: new_retries,
+                        subscriber,
+                        target,
+                        skip_list,
+                        htl,
                         found: false,
                     })?
                     .map(Message::from);
@@ -346,7 +341,8 @@ where
                         key,
                         target,
                         subscriber,
-                        retries,
+                        skip_list,
+                        htl,
                         found: true,
                     })?
                     .map(Message::from);
@@ -356,6 +352,7 @@ where
             subscribed: false,
             key,
             sender,
+            target,
             id,
         } => {
             log::warn!(
@@ -370,6 +367,7 @@ where
                     subscribed: false,
                     key,
                     sender,
+                    target,
                     id,
                 })
                 .map_err(|_: OpError<CErr>| OpError::MaxRetriesExceeded(id, "sub".to_owned()))?;
@@ -386,7 +384,8 @@ where
                         key,
                         subscriber,
                         target,
-                        retries: 0,
+                        skip_list: vec![target.peer],
+                        htl: 0,
                         found: false,
                     }));
                     new_state = Some(state);
@@ -401,6 +400,7 @@ where
             subscribed: true,
             key,
             sender,
+            target,
             id,
         } => {
             log::warn!(
@@ -415,6 +415,7 @@ where
                     subscribed: true,
                     key,
                     sender,
+                    target,
                     id,
                 })?
                 .map(Message::from);
@@ -449,13 +450,15 @@ mod messages {
             key: ContractKey,
             target: PeerKeyLocation,
             subscriber: PeerKeyLocation,
-            retries: usize,
+            skip_list: Vec<PeerKey>,
+            htl: usize,
             found: bool,
         },
         ReturnSub {
             id: Transaction,
             key: ContractKey,
             sender: PeerKeyLocation,
+            target: PeerKeyLocation,
             subscribed: bool,
         },
     }
@@ -472,6 +475,12 @@ mod messages {
 
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             None
+        }
+
+        pub fn target(&self) -> Option<&PeerKeyLocation> {
+            match self {
+                _ => None,
+            }
         }
     }
 
@@ -494,38 +503,42 @@ mod test {
     use crate::contract::Contract;
     use crate::ring::Location;
     use crate::{conn_manager::PeerKey, node::SimStorageError};
+    use crate::config::tracing::Logger;
+    use crate::node::test_utils::SimNetwork;
 
     #[test]
     fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
-        let id = Transaction::new(<SubscribeMsg as GetTxType>::tx_type_id());
+        let peer = PeerKey::random();
+        let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), &peer);
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
-        let requester_loc = PeerKeyLocation {
-            location: Some(Location::random()),
-            peer: PeerKey::random(),
-        };
-        let target_loc = PeerKeyLocation {
-            location: Some(Location::random()),
-            peer: PeerKey::random(),
-        };
-        let next_target_loc = PeerKeyLocation {
-            location: Some(Location::random()),
-            peer: PeerKey::random(),
-        };
 
         let key = contract.clone().key();
 
-        let mut requester = SubscribeOp::start_op(key).sm;
-        let mut target = StateMachine::<SubscribeOpSM>::from_state(SubscribeState::ReceivedRequest);
+        let subscriber_loc = PeerKeyLocation {
+            location: Some(Location::random()),
+            peer: PeerKey::random(),
+        };
+        let first_target_loc = PeerKeyLocation {
+            location: Some(Location::random()),
+            peer: PeerKey::random(),
+        };
+        let second_target_loc = PeerKeyLocation {
+            location: Some(Location::random()),
+            peer: PeerKey::random(),
+        };
 
-        requester.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::FetchRouting {
-            id: id,
-            target: target_loc,
+        let mut subscriber = SubscribeOp::start_op(key, &peer).sm;
+        let mut target = StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest);
+
+        subscriber.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::FetchRouting {
+            id,
+            target: first_target_loc,
         })?;
 
         assert_eq!(
-            requester.state(),
+            subscriber.state(),
             &SubscribeState::AwaitingResponse {
                 skip_list: vec![],
                 retries: 0
@@ -534,11 +547,12 @@ mod test {
 
         let res_msg = target
             .consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::SeekNode {
-                id: id,
-                key: key,
-                target: target_loc,
-                subscriber: requester_loc,
-                retries: 0,
+                id,
+                key,
+                target: first_target_loc,
+                subscriber: subscriber_loc,
+                skip_list: vec![subscriber_loc.peer],
+                htl: 0,
                 found: true,
             })?
             .ok_or(anyhow::anyhow!("no output"))?;
@@ -546,52 +560,48 @@ mod test {
         let expected_msg = SubscribeMsg::ReturnSub {
             id,
             key,
-            sender: target_loc,
+            sender: first_target_loc,
+            target: subscriber_loc,
             subscribed: true,
         };
 
         assert_eq!(target.state(), &SubscribeState::Completed);
         assert_eq!(res_msg, expected_msg);
 
-        requester.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::ReturnSub {
+        subscriber.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::ReturnSub {
             id,
             key,
-            sender: target_loc,
+            sender: first_target_loc,
+            target: subscriber_loc,
             subscribed: true,
         })?;
 
-        assert_eq!(requester.state(), &SubscribeState::Completed);
+        assert_eq!(subscriber.state(), &SubscribeState::Completed);
 
-        target = StateMachine::<SubscribeOpSM>::from_state(SubscribeState::ReceivedRequest);
+        target = StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest);
         target.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::SeekNode {
             id,
             key,
-            target: next_target_loc,
-            subscriber: requester_loc,
-            retries: 0,
+            target: second_target_loc,
+            subscriber: subscriber_loc,
+            skip_list: vec![subscriber_loc.peer, first_target_loc.peer],
+            htl: 0,
             found: false,
         })?;
 
-        assert_eq!(
-            target.state(),
-            &SubscribeState::AwaitingResponse {
-                skip_list: vec![],
-                retries: 0
-            }
-        );
+        assert_eq!(target.state(), &SubscribeState::Completed);
 
-        target = StateMachine::<SubscribeOpSM>::from_state(SubscribeState::ReceivedRequest);
-        let transaction_result =
-            target.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::SeekNode {
-                id,
-                key,
-                target: next_target_loc,
-                subscriber: requester_loc,
-                retries: 10,
-                found: false,
-            });
-        assert_eq!(transaction_result.is_err(), true);
+        Ok(())
+    }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
+        Logger::init_logger();
+
+        // let sim_nodes = SimNetwork::build(3, 10, 7);
+        // let rnd_node = sim_nodes
+        //     .get_mut(&format!("node-{}", 0))
+        //     .ok_or("node not found")?;
         Ok(())
     }
 }
