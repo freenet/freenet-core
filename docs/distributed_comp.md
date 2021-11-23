@@ -1,13 +1,4 @@
 
-# Karma
-
-When coin is minted it can specify one or more "vaults". These are centralized
-archives of coin transactions that can be designated by the coin as authorative.
-Transactions must be reported to the archive.
-
-More sophisticated approaches with multiple vaults and rules for when they
-disagree are also possible.
-
 # Computation authenticity
 
 When nodes perform computations we can't assume they'll do them faithfully.
