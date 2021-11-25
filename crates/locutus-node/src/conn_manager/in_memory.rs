@@ -1,9 +1,14 @@
 //! A in-memory connection manager and transport implementation. Used for testing pourpouses.
-use std::{io::Cursor, sync::Arc, time::Duration};
+use std::{
+    io::Cursor,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crossbeam::channel::{self, Receiver, Sender};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
+use rand::{thread_rng, Rng};
 
 use super::{ConnError, Transport};
 use crate::{
@@ -46,6 +51,8 @@ impl MemoryConnManager {
                         bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
                     if let Some(mut queue) = msg_queue_cp.try_lock() {
                         queue.push(msg_data);
+                        Self::shuffle(&mut *queue);
+                        log::debug!("Queue length: {}", queue.len());
                         std::mem::drop(queue);
                     }
                 }
@@ -58,6 +65,14 @@ impl MemoryConnManager {
             msg_queue,
             peer,
             event_logger,
+        }
+    }
+
+    fn shuffle<T>(iter: &mut Vec<T>) {
+        let mut rng = thread_rng();
+        for i in (1..(iter.len() - 1)).rev() {
+            let idx = rng.gen_range(0..(i + 1));
+            iter.swap(idx, i);
         }
     }
 }
@@ -76,7 +91,11 @@ impl Clone for MemoryConnManager {
 #[async_trait::async_trait]
 impl ConnectionBridge for MemoryConnManager {
     async fn recv(&self) -> Result<Message, ConnError> {
+        let elapsed = Instant::now();
         loop {
+            while elapsed.elapsed() < Duration::from_millis(100) {
+                // keep buffering messages in the queue if possible
+            }
             if let Some(mut queue) = self.msg_queue.try_lock() {
                 let msg = queue.pop();
                 std::mem::drop(queue);

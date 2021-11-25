@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    time::Duration,
 };
 
 use itertools::Itertools;
@@ -165,7 +166,7 @@ impl SimNetwork {
         }
     }
 
-    pub fn build(&mut self) {
+    pub async fn build(&mut self) {
         for (node, label) in self
             .nodes
             .drain(..)
@@ -252,7 +253,7 @@ fn group_locations_test() -> Result<(), anyhow::Error> {
     grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     assert_eq!(grouped, vec![(0.5, 4), (0.6, 1), (0.7, 2)]);
 
-    let mut grouped: Vec<_> = group_locations_in_buckets(locations, 1).collect();
+    let mut grouped: Vec<_> = group_locations_in_buckets(locations, 2).collect();
     grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     assert_eq!(
         grouped,
