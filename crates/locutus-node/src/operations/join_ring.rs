@@ -390,8 +390,6 @@ where
             let new_location = Location::random();
             let accepted_by = if ring.should_accept(&new_location) {
                 log::debug!("Accepting connections from {}", req_peer,);
-                conn_manager.add_connection(this_node_loc, false);
-                ring.add_connection(new_location, req_peer);
                 HashSet::from_iter([this_node_loc])
             } else {
                 log::debug!("Not accepting new connection for sender {}", req_peer);
@@ -448,8 +446,6 @@ where
             let accepted_by =
                 if ring.should_accept(&joiner.location.ok_or(OpError::TxUpdateFailure(id))?) {
                     log::debug!("Accepting connections from {}", joiner.peer);
-                    conn_manager.add_connection(joiner, false);
-                    ring.add_connection(joiner.location.unwrap(), joiner.peer);
                     HashSet::from_iter([own_loc])
                 } else {
                     log::debug!("Not accepting new connection for sender {}", joiner.peer);
@@ -504,6 +500,11 @@ where
                     target,
                 })?
                 .map(Message::from);
+            let pkloc = PeerKeyLocation {
+                location: Some(your_location),
+                peer: your_peer_id,
+            };
+            ring.update_location(Some(your_location));
             for other_peer in accepted_by {
                 if ring.should_accept(
                     &other_peer
@@ -512,17 +513,36 @@ where
                 ) {
                     log::info!("Established connection to {}", other_peer.peer);
                     conn_manager.add_connection(other_peer, false);
-                    ring.add_connection(other_peer.location.unwrap(), other_peer.peer);
+                    ring.add_connection(
+                        other_peer
+                            .location
+                            .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                        other_peer.peer,
+                    );
+                    if other_peer.peer != sender.peer {
+                        // notify all the additional peers which accepted a request;
+                        // the gateway will be notified in the last message
+                        let _ = conn_manager
+                            .send(
+                                other_peer,
+                                JoinRingMsg::Response {
+                                    id,
+                                    target: other_peer,
+                                    sender: pkloc,
+                                    msg: JoinResponse::ReceivedOC { by_peer: pkloc },
+                                }
+                                .into(),
+                            )
+                            .await;
+                    }
                 } else {
                     log::warn!("Not accepting connection to {}", other_peer.peer);
                 }
             }
-            ring.update_location(PeerKeyLocation {
-                peer: your_peer_id,
-                location: Some(your_location),
-            });
+            ring.update_location(Some(your_location));
             new_state = Some(state);
         }
+        // JoinRing
         JoinRingMsg::Response {
             id,
             sender,
@@ -581,6 +601,13 @@ where
                     "Successfully completed connection @ {}, new location = {:?}",
                     target.peer,
                     ring.own_location().location
+                );
+                conn_manager.add_connection(sender, false);
+                ring.add_connection(
+                    sender
+                        .location
+                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                    sender.peer,
                 );
                 new_state = None;
             }
@@ -756,6 +783,7 @@ mod messages {
                     ..
                 } => write!(f, "RouteValue(id: {})", id),
                 Self::Connected { .. } => write!(f, "Connected(id: {})", id),
+                _ => todo!(),
             }
         }
     }
@@ -779,6 +807,7 @@ mod messages {
             joiner: PeerKeyLocation,
             hops_to_live: usize,
         },
+        ReceivedOC,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -893,7 +922,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node0_to_gateway_conn() {
         let mut sim_net = SimNetwork::new(1, 1, 1, 0, 2);
-        sim_net.build();
+        sim_net.build().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(sim_net.connected("node-0"));
     }
@@ -905,7 +934,7 @@ mod test {
         const NUM_GW: usize = 2usize;
 
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 10, 7, 10);
-        sim_nodes.build();
+        sim_nodes.build().await;
 
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
@@ -916,7 +945,7 @@ mod test {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
         let expected = HashSet::from_iter(0..NUM_NODES);
         let diff: Vec<_> = expected.difference(&connected).collect();
         if !diff.is_empty() {
@@ -928,8 +957,8 @@ mod test {
             elapsed.elapsed().as_secs()
         );
 
-        // let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
-        // log::info!("Ring distribution: {:?}", hist);
+        let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
+        log::info!("Ring distribution: {:?}", hist);
 
         let node_connectivity = sim_nodes.node_connectivity();
         let mut connections_per_peer: Vec<_> = node_connectivity

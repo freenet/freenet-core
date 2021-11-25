@@ -136,8 +136,8 @@ impl Ring {
     }
 
     /// Update this node location.
-    pub fn update_location(&self, loc: PeerKeyLocation) {
-        if let Some(loc) = loc.location {
+    pub fn update_location(&self, loc: Option<Location>) {
+        if let Some(loc) = loc {
             self.own_location
                 .store(u64::from_le_bytes(loc.0.to_le_bytes()), SeqCst)
         } else {
@@ -162,8 +162,14 @@ impl Ring {
 
     /// Whether a node should accept a new node connection or not based
     /// on the relative location and other conditions.
+    ///
+    /// # Panic
+    /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: &Location) -> bool {
-        let my_location = &self.own_location().location.unwrap();
+        let my_location = &self
+            .own_location()
+            .location
+            .expect("this node has no location assigned!");
         let cbl = &*self.connections_by_location.read();
         if location == my_location || cbl.contains_key(location) {
             false

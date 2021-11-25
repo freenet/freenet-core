@@ -2,21 +2,11 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Receiver};
 
-use crate::{
-    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
-    contract::{self, ContractHandler},
-    message::{Message, Transaction, TxType},
-    node::event_listener::EventLog,
-    operations::{
+use crate::{NodeConfig, conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey}, contract::{self, ContractHandler}, message::{Message, Transaction, TxType}, node::event_listener::EventLog, operations::{
         get,
         join_ring::{self, JoinRingMsg},
         put, subscribe, OpError,
-    },
-    ring::{PeerKeyLocation, Ring},
-    user_events::UserEventsProxy,
-    utils::ExtendedIter,
-    NodeConfig,
-};
+    }, ring::{Location, PeerKeyLocation, Ring}, user_events::UserEventsProxy, utils::ExtendedIter};
 
 use super::{op_state::OpManager, EventListener};
 
@@ -68,8 +58,12 @@ where
         if (config.local_ip.is_none() || config.local_port.is_none()) && gateways.is_empty() {
             return Err(anyhow::anyhow!("At least one remote gateway is required to join an existing network for non-gateway nodes."));
         }
-
+        
         let mut ring = Ring::new(peer);
+        if gateways.is_empty() {
+            // assign a random location to this gateway
+            ring.update_location(Some(Location::random()));
+        }
         if let Some(max_hops_to_live) = config.max_hops_to_live {
             ring.with_max_hops(max_hops_to_live);
         }
