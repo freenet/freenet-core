@@ -6,7 +6,6 @@ providing resources to the network.
 Karma is measured in coins. Coins can be earned by making a donation to Freenet.
 A coin has a fixed value and one owner at a time.
 
-
 # Vaults
 
 When coin is minted it can specify one or more "vaults". These are centralized
@@ -23,10 +22,12 @@ is known only to the wallet owner.
 
 The value of a wallet is a list of transactions which can be appended to.
 
+# Transaction types
+
 ## Donation
 
 A record that the wallet owner made a donation to Freenet, the record must be
-signed by Freenet and contains:
+signed by Freenet and contain the following fields:
 
 * The amount of the donation
 * The date of the donation
