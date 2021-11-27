@@ -8,7 +8,7 @@ use std::{
 use crossbeam::channel::{self, Receiver, Sender};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
-use rand::{thread_rng, Rng};
+use rand::{prelude::StdRng, thread_rng, Rng, SeedableRng};
 
 use super::{ConnError, Transport};
 use crate::{
@@ -160,6 +160,10 @@ impl InMemoryTransport {
         let rx = rx.clone();
         let tx_cp = tx.clone();
         tokio::spawn(async move {
+            const MAX_DELAYED_MSG: usize = 100;
+            let mut rng = StdRng::from_entropy();
+            let mut delayed = Vec::with_capacity(MAX_DELAYED_MSG);
+            let last_drain = Instant::now();
             loop {
                 match rx.try_recv() {
                     Ok(msg) if msg.target == interface_peer => {
@@ -168,7 +172,12 @@ impl InMemoryTransport {
                             interface_peer,
                             msg.origin
                         );
-                        rcv_msg_c.lock().push(msg);
+                        if rng.gen_bool(0.5) {
+                            delayed.push(msg);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        } else {
+                            rcv_msg_c.lock().push(msg);
+                        }
                     }
                     Ok(msg) => {
                         // send back to the network since this msg belongs to other peer
@@ -177,7 +186,15 @@ impl InMemoryTransport {
                     }
                     Err(channel::TryRecvError::Disconnected) => break,
                     Err(channel::TryRecvError::Empty) => {
-                        tokio::time::sleep(Duration::from_nanos(1_000)).await
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                }
+                if (last_drain.elapsed() > Duration::from_millis(rng.gen_range(1_000..5_000)) && !delayed.is_empty())
+                    || delayed.len() == MAX_DELAYED_MSG
+                {
+                    let mut queue = rcv_msg_c.lock();
+                    for m in delayed.drain(..) {
+                        queue.push(m);
                     }
                 }
             }

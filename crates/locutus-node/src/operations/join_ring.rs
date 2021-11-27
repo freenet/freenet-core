@@ -932,8 +932,7 @@ mod test {
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 98usize;
         const NUM_GW: usize = 2usize;
-
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 4, 4, 4, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 5, 4, 10, 2);
         sim_nodes.build().await;
 
         let mut connected = HashSet::new();
