@@ -921,9 +921,9 @@ mod test {
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node0_to_gateway_conn() {
-        let mut sim_net = SimNetwork::new(1, 1, 1, 0, 2);
+        let mut sim_net = SimNetwork::new(1, 1, 1, 1, 2, 2);
         sim_net.build().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         assert!(sim_net.connected("node-0"));
     }
 
@@ -933,12 +933,12 @@ mod test {
         const NUM_NODES: usize = 98usize;
         const NUM_GW: usize = 2usize;
 
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 10, 7, 10);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 4, 4, 4, 2);
         sim_nodes.build().await;
 
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
-        while elapsed.elapsed() < Duration::from_secs(30) && connected.len() < NUM_NODES {
+        while elapsed.elapsed() < Duration::from_secs(120) && connected.len() < NUM_NODES {
             for node in 0..NUM_NODES {
                 if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
                     connected.insert(node);

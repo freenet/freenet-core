@@ -73,6 +73,9 @@ where
         if let Some(max_conn) = config.max_number_conn {
             ring.with_max_connections(max_conn);
         }
+        if let Some(min_conn) = config.min_number_conn {
+            ring.with_min_connections(min_conn);
+        }
 
         let (notification_tx, notification_channel) = mpsc::channel(100);
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();

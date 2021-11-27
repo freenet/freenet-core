@@ -16,7 +16,7 @@ use std::{
     convert::TryFrom,
     fmt::Display,
     hash::Hasher,
-    sync::atomic::{AtomicU64, Ordering::SeqCst},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
     time::Instant,
 };
 
@@ -45,6 +45,7 @@ pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
     max_connections: usize,
+    min_connections: usize,
     pub peer_key: PeerKey,
     connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     /// contracts in the ring cached by this node
@@ -59,6 +60,9 @@ pub(crate) struct Ring {
     subscriptions: RwLock<Vec<ContractKey>>,
     /// A peer which has been blacklisted to perform actions regarding a given contract.
     contract_blacklist: DashMap<ContractKey, Vec<Blacklisted>>,
+    /// Interim connections ongoing haandshake or succesfully open connections
+    /// Is important to keep track of this so no more connections are accepted prematurely.
+    incoming_connections: AtomicUsize,
 }
 
 /// A data type that represents the fact that a peer has been blacklisted
@@ -92,6 +96,7 @@ impl Ring {
             rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
             max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
             max_connections: Self::MAX_CONNECTIONS,
+            min_connections: Self::MIN_CONNECTIONS,
             connections_by_location: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location,
@@ -99,6 +104,7 @@ impl Ring {
             subscribers: DashMap::new(),
             subscriptions: RwLock::new(Vec::new()),
             contract_blacklist: DashMap::new(),
+            incoming_connections: AtomicUsize::new(0),
         }
     }
 
@@ -116,6 +122,11 @@ impl Ring {
 
     pub fn with_max_connections(&mut self, connections: usize) -> &mut Self {
         self.max_connections = connections;
+        self
+    }
+
+    pub fn with_min_connections(&mut self, connections: usize) -> &mut Self {
+        self.min_connections = connections;
         self
     }
 
@@ -166,6 +177,8 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: &Location) -> bool {
+        // FIXME: when a join ring op expires or a peer connectio is closed this should be reduced
+        let open_conn = self.incoming_connections.fetch_add(1, SeqCst);
         let my_location = &self
             .own_location()
             .location
@@ -173,12 +186,15 @@ impl Ring {
         let cbl = &*self.connections_by_location.read();
         if location == my_location || cbl.contains_key(location) {
             false
-        } else if cbl.len() < Self::MIN_CONNECTIONS {
+        } else if open_conn < self.min_connections {
             true
-        } else if cbl.len() >= self.max_connections {
+        } else if open_conn >= self.max_connections {
             false
         } else {
-            my_location.distance(location) < self.median_distance_to(my_location)
+            my_location.distance(location)
+                < self
+                    .median_distance_to(my_location)
+                    .unwrap_or_else(|| Distance::try_from(0.5).unwrap())
         }
     }
 
@@ -193,15 +209,18 @@ impl Ring {
         );
     }
 
-    pub fn median_distance_to(&self, location: &Location) -> Distance {
+    pub fn median_distance_to(&self, location: &Location) -> Option<Distance> {
         let connections = self.connections_by_location.read();
+        if connections.is_empty() {
+            return None;
+        }
         let mut conn_by_dist: Vec<_> = connections
             .keys()
             .map(|key| key.distance(location))
             .collect();
         conn_by_dist.sort_unstable();
         let idx = self.connections_by_location.read().len() / 2;
-        conn_by_dist[idx]
+        Some(conn_by_dist[idx])
     }
 
     /// Return the closest peers to a contract location which are caching it,
