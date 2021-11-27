@@ -1,5 +1,6 @@
 //! A in-memory connection manager and transport implementation. Used for testing pourpouses.
 use std::{
+    collections::HashMap,
     io::Cursor,
     sync::Arc,
     time::{Duration, Instant},
@@ -51,12 +52,10 @@ impl MemoryConnManager {
                         bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
                     if let Some(mut queue) = msg_queue_cp.try_lock() {
                         queue.push(msg_data);
-                        Self::shuffle(&mut *queue);
-                        log::debug!("Queue length: {}", queue.len());
                         std::mem::drop(queue);
                     }
                 }
-                tokio::time::sleep(Duration::from_nanos(1_000)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
 
@@ -65,14 +64,6 @@ impl MemoryConnManager {
             msg_queue,
             peer,
             event_logger,
-        }
-    }
-
-    fn shuffle<T>(iter: &mut Vec<T>) {
-        let mut rng = thread_rng();
-        for i in (1..(iter.len() - 1)).rev() {
-            let idx = rng.gen_range(0..(i + 1));
-            iter.swap(idx, i);
         }
     }
 }
@@ -91,11 +82,7 @@ impl Clone for MemoryConnManager {
 #[async_trait::async_trait]
 impl ConnectionBridge for MemoryConnManager {
     async fn recv(&self) -> Result<Message, ConnError> {
-        let elapsed = Instant::now();
         loop {
-            while elapsed.elapsed() < Duration::from_millis(100) {
-                // keep buffering messages in the queue if possible
-            }
             if let Some(mut queue) = self.msg_queue.try_lock() {
                 let msg = queue.pop();
                 std::mem::drop(queue);
@@ -103,22 +90,18 @@ impl ConnectionBridge for MemoryConnManager {
                     return Ok(msg);
                 }
             }
-            tokio::time::sleep(Duration::from_nanos(1_000)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
-    async fn send(&self, target: PeerKeyLocation, msg: Message) -> Result<(), ConnError> {
+    async fn send(&self, target: PeerKey, msg: Message) -> Result<(), ConnError> {
         if let Some(listener) = self.event_logger.as_ref() {
             listener
                 .trait_clone()
                 .event_received(EventLog::new(&msg, &self.peer));
         }
         let msg = bincode::serialize(&msg)?;
-        self.transport.send(
-            target.peer,
-            target.location.ok_or(ConnError::LocationUnknown)?,
-            msg,
-        );
+        self.transport.send(target, msg);
         Ok(())
     }
 
@@ -134,7 +117,6 @@ impl ConnectionBridge for MemoryConnManager {
 #[derive(Clone, Debug)]
 struct MessageOnTransit {
     origin: PeerKey,
-    origin_loc: Option<Location>,
     target: PeerKey,
     data: Vec<u8>,
 }
@@ -160,20 +142,23 @@ impl InMemoryTransport {
         let rx = rx.clone();
         let tx_cp = tx.clone();
         tokio::spawn(async move {
-            const MAX_DELAYED_MSG: usize = 100;
+            const MAX_DELAYED_MSG: usize = 10;
             let mut rng = StdRng::from_entropy();
-            let mut delayed = Vec::with_capacity(MAX_DELAYED_MSG);
+            // delayed messages per target
+            let mut delayed: HashMap<_, Vec<_>> = HashMap::with_capacity(MAX_DELAYED_MSG);
             let last_drain = Instant::now();
             loop {
                 match rx.try_recv() {
                     Ok(msg) if msg.target == interface_peer => {
-                        log::debug!(
+                        log::trace!(
                             "Inbound message received for peer {} from {}",
                             interface_peer,
                             msg.origin
                         );
-                        if rng.gen_bool(0.5) {
-                            delayed.push(msg);
+                        if (rng.gen_bool(0.5) && delayed.len() < MAX_DELAYED_MSG)
+                            || delayed.contains_key(&msg.target)
+                        {
+                            delayed.entry(msg.target).or_default().push(msg);
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         } else {
                             rcv_msg_c.lock().push(msg);
@@ -189,13 +174,15 @@ impl InMemoryTransport {
                         tokio::time::sleep(Duration::from_millis(10)).await
                     }
                 }
-                if (last_drain.elapsed() > Duration::from_millis(rng.gen_range(1_000..5_000)) && !delayed.is_empty())
+                if (last_drain.elapsed() > Duration::from_millis(rng.gen_range(1_000..5_000))
+                    && !delayed.is_empty())
                     || delayed.len() == MAX_DELAYED_MSG
                 {
                     let mut queue = rcv_msg_c.lock();
-                    for m in delayed.drain(..) {
-                        queue.push(m);
+                    for (_, msgs) in delayed.drain() {
+                        queue.extend(msgs);
                     }
+                    Self::shuffle(&mut *queue);
                 }
             }
             log::error!("Stopped receiving messages in {}", interface_peer);
@@ -211,15 +198,22 @@ impl InMemoryTransport {
         }
     }
 
-    fn send(&self, peer: PeerKey, location: Location, message: Vec<u8>) {
+    fn send(&self, peer: PeerKey, message: Vec<u8>) {
         let send_res = self.network.send(MessageOnTransit {
             origin: self.interface_peer,
-            origin_loc: Some(location),
             target: peer,
             data: message,
         });
         if let Err(channel::SendError(_)) = send_res {
             log::error!("Network shutdown")
+        }
+    }
+
+    fn shuffle<T>(iter: &mut Vec<T>) {
+        let mut rng = thread_rng();
+        for i in (1..(iter.len() - 1)).rev() {
+            let idx = rng.gen_range(0..=i);
+            iter.swap(idx, i);
         }
     }
 }

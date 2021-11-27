@@ -38,6 +38,15 @@ pub(crate) struct PeerKeyLocation {
     pub location: Option<Location>,
 }
 
+impl From<PeerKey> for PeerKeyLocation {
+    fn from(peer: PeerKey) -> Self {
+        PeerKeyLocation {
+            peer,
+            location: None,
+        }
+    }
+}
+
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
 #[derive(Debug)]
@@ -209,6 +218,8 @@ impl Ring {
         );
     }
 
+    /// Returns the median distance to other peers for the node. None if there are
+    /// no other active connections.
     pub fn median_distance_to(&self, location: &Location) -> Option<Distance> {
         let connections = self.connections_by_location.read();
         if connections.is_empty() {

@@ -38,7 +38,7 @@ pub(crate) mod test_utils;
 pub struct Node(NodeImpl);
 
 impl Node {
-    pub async fn listen_on(&mut self) -> Result<(), ()> {
+    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
             NodeImpl::InMemory(ref mut node) => {
@@ -103,7 +103,7 @@ impl NodeConfig {
             max_hops_to_live: None,
             rnd_if_htl_above: None,
             max_number_conn: None,
-            min_number_conn: None
+            min_number_conn: None,
         }
     }
 

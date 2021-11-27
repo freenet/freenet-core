@@ -31,7 +31,7 @@ pub(crate) trait ConnectionBridge {
     /// This async fn must be cancellation safe!
     async fn recv(&self) -> Result<Message>;
 
-    async fn send(&self, target: PeerKeyLocation, msg: Message) -> Result<()>;
+    async fn send(&self, target: PeerKey, msg: Message) -> Result<()>;
 }
 
 /// A protocol used to send and receive data over the network.
