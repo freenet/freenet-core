@@ -71,11 +71,11 @@ pub(crate) mod test_utils {
             self.events_to_gen.extend(events.into_iter())
         }
 
-        fn gen_events(&mut self) -> UserEvent {
+        fn generate_deterministic_event(&mut self) -> UserEvent {
             self.events_to_gen.get(0);
         }
 
-        fn gen_new_event(&mut self) -> UserEvent {
+        fn generate_rand_event(&mut self) -> UserEvent {
             let mut rng = thread_rng();
             loop {
                 match rng.gen_range(0u8..3) {
@@ -139,7 +139,7 @@ pub(crate) mod test_utils {
             loop {
                 if self.signal.changed().await.is_ok() {
                     if *self.signal.borrow() == self.id {
-                        return self.gen_new_event();
+                        return self.generate_rand_event();
                     }
                 } else {
                     log::debug!("sender half of user event gen dropped");
