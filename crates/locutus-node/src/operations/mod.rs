@@ -1,11 +1,11 @@
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
-    conn_manager::{self, ConnectionBridge},
+    conn_manager::{self, ConnectionBridge, PeerKey},
     contract::ContractError,
     message::{Message, Transaction, TransactionType},
     node::OpManager,
-    ring::{PeerKeyLocation, RingError},
+    ring::RingError,
 };
 
 pub(crate) mod get;
@@ -25,7 +25,7 @@ async fn handle_op_result<CB, CErr>(
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
     result: Result<OperationResult, (OpError<CErr>, Transaction)>,
-    sender: Option<PeerKeyLocation>,
+    sender: Option<PeerKey>,
 ) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
@@ -41,7 +41,7 @@ where
             return Ok(());
         }
         Err((err, tx_id)) => {
-            log::error!("error while processing request: {}", err);
+            log::error!("Error while processing request {}: {}", tx_id, err);
             if let Some(sender) = sender {
                 conn_manager.send(sender, Message::Canceled(tx_id)).await?;
             }
@@ -54,7 +54,7 @@ where
             // updated op
             let id = *msg.id();
             if let Some(target) = msg.target() {
-                conn_manager.send(*target, msg).await?;
+                conn_manager.send(target.peer, msg).await?;
             }
             op_storage.push(id, updated_state)?;
         }
@@ -64,7 +64,7 @@ where
         }) => {
             // finished the operation at this node, informing back
             if let Some(target) = msg.target() {
-                conn_manager.send(*target, msg).await?;
+                conn_manager.send(target.peer, msg).await?;
             }
         }
         Ok(OperationResult {
@@ -115,7 +115,7 @@ pub(crate) enum OpError<S: std::error::Error> {
     /// For operations that involved broadcasting updates (like put)
     /// this signals that the broadcast has reached the max htl and no more
     /// broadcasting is required
-    #[error("broadcast completed for tx")]
+    #[error("broadcast completed for transaction")]
     BroadcastCompleted,
 }
 

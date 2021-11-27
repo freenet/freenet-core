@@ -52,13 +52,19 @@ impl Config {
                 None
             };
 
+        let log_level = settings
+            .get_str("log_level")
+            .map(|lvl| lvl.parse().ok())
+            .ok()
+            .flatten()
+            .unwrap_or(log::LevelFilter::Info);
         let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
         Ok(Config {
             bootstrap_ip,
             bootstrap_port,
             bootstrap_id,
             local_peer_keypair,
-            log_level: settings.get("log_level").unwrap_or(log::LevelFilter::Info),
+            log_level,
         })
     }
 

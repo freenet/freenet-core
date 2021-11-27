@@ -27,7 +27,7 @@ pub(crate) trait EventListener {
 }
 
 pub(crate) struct EventLog<'a> {
-    tx: &'a Transaction,
+    _tx: &'a Transaction,
     peer_id: &'a PeerKey,
     kind: EventKind,
 }
@@ -44,7 +44,7 @@ impl<'a> EventLog<'a> {
             _ => EventKind::Unknown,
         };
         EventLog {
-            tx: msg.id(),
+            _tx: msg.id(),
             peer_id,
             kind,
         }
@@ -159,7 +159,7 @@ mod test_utils {
 
     impl super::EventListener for TestEventListener {
         fn event_received(&mut self, log: EventLog) {
-            let tx = log.tx;
+            let tx = log._tx;
             let mut logs = self.logs.write();
             let (msg_log, log_id) = create_log(log);
             logs.push(msg_log);
@@ -186,7 +186,7 @@ mod test_utils {
         let mut listener = TestEventListener::new();
         locations.iter().for_each(|(other, location)| {
             listener.event_received(EventLog {
-                tx: &tx,
+                _tx: &tx,
                 peer_id: &peer_id,
                 kind: EventKind::Connected {
                     loc,

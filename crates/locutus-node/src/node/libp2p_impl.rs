@@ -25,13 +25,13 @@ pub struct NodeLibP2P {
 }
 
 impl NodeLibP2P {
-    pub(super) async fn listen_on(&mut self) -> Result<(), ()> {
+    pub(super) async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         if let Some(conn) = self.listen_on {
             let listening_addr = super::multiaddr_from_connection(conn);
             self.swarm.listen_on(listening_addr).unwrap();
             Ok(())
         } else {
-            Err(())
+            anyhow::bail!("failed listening to connections")
         }
     }
 

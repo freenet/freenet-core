@@ -283,7 +283,7 @@ where
         op_storage,
         conn_manager,
         result.map_err(|err| (err, tx)),
-        sender,
+        sender.map(|p| p.peer),
     )
     .await
 }

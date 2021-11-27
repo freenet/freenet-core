@@ -1,6 +1,59 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    time::Duration,
+};
 
-use rand::{SeedableRng, prelude::{Rng, StdRng}};
+use rand::{
+    prelude::{Rng, StdRng},
+    SeedableRng,
+};
+
+pub struct ExponentialBackoff {
+    attempt: usize,
+    max_attempts: usize,
+    base: Duration,
+    ceiling: Duration,
+}
+
+impl ExponentialBackoff {
+    pub fn new(base: Duration, ceiling: Duration, max_attempts: usize) -> Self {
+        ExponentialBackoff {
+            attempt: 0,
+            max_attempts,
+            base,
+            ceiling,
+        }
+    }
+
+    /// Record that we made an attempt and sleep for the appropriate amount
+    /// of time. If the max number of attempts was reached returns none.
+    pub async fn sleep_async(&mut self) -> Option<()> {
+        if self.attempt == self.max_attempts {
+            None
+        } else {
+            tokio::time::sleep(self.next_attempt()).await;
+            Some(())
+        }
+    }
+
+    pub fn retries(&self) -> usize {
+        self.attempt
+    }
+
+    fn delay(&self) -> Duration {
+        let mut delay = self.base.saturating_mul(1 << self.attempt);
+        if delay > self.ceiling {
+            delay = self.ceiling;
+        }
+        delay
+    }
+
+    fn next_attempt(&mut self) -> Duration {
+        let delay = self.delay();
+        self.attempt += 1;
+        delay
+    }
+}
 
 // This is extremely inefficient for large sizes but is not what
 // we are really using this for so this ok for now.
