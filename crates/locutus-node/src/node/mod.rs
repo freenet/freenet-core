@@ -84,6 +84,7 @@ pub struct NodeConfig {
     max_hops_to_live: Option<usize>,
     rnd_if_htl_above: Option<usize>,
     max_number_conn: Option<usize>,
+    min_number_conn: Option<usize>,
 }
 
 impl NodeConfig {
@@ -102,6 +103,7 @@ impl NodeConfig {
             max_hops_to_live: None,
             rnd_if_htl_above: None,
             max_number_conn: None,
+            min_number_conn: None
         }
     }
 
@@ -117,6 +119,11 @@ impl NodeConfig {
 
     pub fn max_number_of_connections(&mut self, num: usize) -> &mut Self {
         self.max_number_conn = Some(num);
+        self
+    }
+
+    pub fn min_number_of_connections(&mut self, num: usize) -> &mut Self {
+        self.min_number_conn = Some(num);
         self
     }
 

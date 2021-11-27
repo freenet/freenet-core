@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
-    time::Duration,
 };
 
 use itertools::Itertools;
@@ -50,6 +49,7 @@ pub(crate) struct SimNetwork {
     ring_max_htl: usize,
     rnd_if_htl_above: usize,
     max_connections: usize,
+    min_connections: usize,
 }
 
 #[derive(Clone)]
@@ -67,6 +67,7 @@ impl SimNetwork {
         ring_max_htl: usize,
         rnd_if_htl_above: usize,
         max_connections: usize,
+        min_connections: usize,
     ) -> Self {
         assert!(gateways > 0 && nodes > 0);
         let (usr_ev_controller, _rcv_copy) = channel(PeerKey::random());
@@ -80,6 +81,7 @@ impl SimNetwork {
             ring_max_htl,
             rnd_if_htl_above,
             max_connections,
+            min_connections
         };
         net.build_gateways(gateways);
         net.build_nodes(nodes);
@@ -102,6 +104,7 @@ impl SimNetwork {
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
                 .max_number_of_connections(self.max_connections)
+                .min_number_of_connections(self.min_connections)
                 .rnd_if_htl_above(self.rnd_if_htl_above);
 
             self.event_listener
