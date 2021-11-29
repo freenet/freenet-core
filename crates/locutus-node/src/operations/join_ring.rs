@@ -59,6 +59,7 @@ impl StateMachineImpl for JROpSm {
 
     fn state_transition(state: &mut Self::State, input: &mut Self::Input) -> Option<Self::State> {
         match (state, input) {
+            // initial gateway states
             (
                 JRState::Initializing,
                 JoinRingMsg::Request {
@@ -73,12 +74,23 @@ impl StateMachineImpl for JROpSm {
                 },
             ) if !accepted_by.is_empty() => {
                 log::debug!(
-                    "OC received at gw {} from requesting peer {}",
+                    "OC received at gateway {} from requesting peer {}",
                     gateway.peer,
                     your_peer_id
                 );
                 Some(JRState::OCReceived)
             }
+            (
+                JRState::OCReceived,
+                JoinRingMsg::Response {
+                    msg: JoinResponse::ReceivedOC { .. },
+                    ..
+                },
+            ) => {
+                log::debug!("Acknowledge connected at gateway");
+                Some(JRState::Connected)
+            }
+            // requester states
             (
                 JRState::Connecting(ConnectionInfo { gateway, .. }),
                 JoinRingMsg::Response {
@@ -92,26 +104,32 @@ impl StateMachineImpl for JROpSm {
                 },
             ) if !peers.is_empty() => {
                 log::debug!(
-                    "OC received at requesting peer {} from gw {}",
+                    "OC received at requesting peer {} from gateway {}",
                     your_peer_id,
                     gateway.peer
                 );
                 Some(JRState::OCReceived)
             }
+            (JRState::OCReceived, JoinRingMsg::Connected { .. }) => {
+                log::debug!("Acknowledge connected at peer");
+                Some(JRState::Connected)
+            }
+            // proxies state
             (
-                JRState::OCReceived,
+                JRState::Initializing,
                 JoinRingMsg::Response {
-                    msg: JoinResponse::ReceivedOC { .. },
+                    msg: JoinResponse::Proxy { accepted_by },
+                    sender,
                     ..
                 },
             ) => {
-                log::debug!("Ack connected at gateway");
-                Some(JRState::Connected)
+                if accepted_by.contains(sender) {
+                    Some(JRState::Connected)
+                } else {
+                    None
+                }
             }
-            (JRState::OCReceived, JoinRingMsg::Connected { .. }) => {
-                log::debug!("Ack connected at peer");
-                Some(JRState::Connected)
-            }
+            // interism status (proxy + gw)
             (
                 JRState::AwaitingProxyResponse {
                     accepted_by: previously_accepted,
@@ -171,7 +189,7 @@ impl StateMachineImpl for JROpSm {
                 },
             ) if !peers.is_empty() => {
                 log::debug!(
-                    "Ack OC at init peer {} from gw {}",
+                    "Acknowledge OC at init peer {} from gw {}",
                     your_peer_id,
                     prev_sender.peer
                 );
@@ -234,6 +252,28 @@ impl StateMachineImpl for JROpSm {
                 };
                 Some(resp)
             }
+            // proxies state
+            (
+                JRState::Initializing,
+                JoinRingMsg::Response {
+                    msg: JoinResponse::Proxy { accepted_by },
+                    sender,
+                    id,
+                    target,
+                },
+            ) => {
+                log::debug!(
+                    "Returning from a proxy to the previous requester. Sender: {}; target: {}",
+                    sender.peer,
+                    target.peer
+                );
+                Some(JoinRingMsg::Response {
+                    msg: JoinResponse::Proxy { accepted_by },
+                    sender,
+                    id,
+                    target,
+                })
+            }
             (
                 JRState::OCReceived,
                 JoinRingMsg::Response {
@@ -275,9 +315,10 @@ struct ConnectionInfo {
 }
 
 impl JRState {
-    fn try_unwrap_connecting<CErr: std::error::Error>(
-        self,
-    ) -> Result<ConnectionInfo, OpError<CErr>> {
+    fn try_unwrap_connecting<CErr>(self) -> Result<ConnectionInfo, OpError<CErr>>
+    where
+        CErr: std::error::Error,
+    {
         if let Self::Connecting(conn_info) = self {
             Ok(conn_info)
         } else {
@@ -287,6 +328,21 @@ impl JRState {
 
     fn is_connected(&self) -> bool {
         matches!(self, JRState::Connected { .. })
+    }
+
+    fn add_new_proxy<CErr>(
+        &mut self,
+        proxies: impl IntoIterator<Item = PeerKeyLocation>,
+    ) -> Result<(), OpError<CErr>>
+    where
+        CErr: std::error::Error,
+    {
+        if let Self::AwaitingProxyResponse { accepted_by, .. } = self {
+            accepted_by.extend(proxies.into_iter());
+            Ok(())
+        } else {
+            Err(OpError::InvalidStateTransition)
+        }
     }
 }
 
@@ -412,43 +468,43 @@ where
                 log::debug!("Rejecting connection from peer {}", req_peer);
                 HashSet::new()
             };
-            let num_accepted = accepted_by.len();
-
-            log::debug!(
-                "Sending join response to {} accepting {} connections",
-                req_peer,
-                num_accepted
-            );
 
             let new_peer_loc = PeerKeyLocation {
                 location: Some(new_location),
                 peer: req_peer,
             };
-
-            let accepted_by_this = JoinRingMsg::Request {
+            if let Some(mut updated_state) = forward_conn(
                 id,
-                msg: JoinRequest::Accepted {
-                    gateway: this_node_loc,
-                    accepted_by,
-                    your_location: new_location,
-                    your_peer_id: req_peer,
-                },
-            };
-
-            let (state, msg) = forward_conn(
-                id,
-                state,
                 ring,
                 conn_manager,
                 new_peer_loc,
                 new_peer_loc,
                 hops_to_live,
-                num_accepted,
-                accepted_by_this,
+                accepted_by.len(),
             )
-            .await?;
-            new_state = Some(state);
-            return_msg = msg;
+            .await?
+            {
+                updated_state.add_new_proxy(accepted_by)?;
+                // awaiting responses from proxies
+                *state.sm.state() = updated_state;
+                new_state = Some(state);
+                return_msg = None;
+            } else {
+                return_msg = state
+                    .sm
+                    .consume_to_output(JoinRingMsg::Request {
+                        id,
+                        msg: JoinRequest::Accepted {
+                            gateway: this_node_loc,
+                            accepted_by,
+                            your_location: new_location,
+                            your_peer_id: req_peer,
+                        },
+                    })
+                    .map_err(|_: OpError<CErr>| OpError::TxUpdateFailure(id))?
+                    .map(Message::from);
+                new_state = Some(state);
+            }
         }
         JoinRingMsg::Request {
             id,
@@ -462,35 +518,49 @@ where
             let own_loc = ring.own_location();
             let accepted_by =
                 if ring.should_accept(&joiner.location.ok_or(OpError::TxUpdateFailure(id))?) {
-                    log::debug!("Accepting connections from {}", joiner.peer);
+                    log::debug!("Accepting proxy connections from {}", joiner.peer);
                     HashSet::from_iter([own_loc])
                 } else {
-                    log::debug!("Not accepting new connection for sender {}", joiner.peer);
+                    log::debug!(
+                        "Not accepting new proxy connection for sender {}",
+                        joiner.peer
+                    );
                     HashSet::new()
                 };
 
-            let num_accepted = accepted_by.len();
-            let accepted_by_this = JoinRingMsg::Response {
+            if let Some(mut updated_state) = forward_conn(
                 id,
-                sender,
-                target: sender,
-                msg: JoinResponse::Proxy { accepted_by },
-            };
-
-            let (state, msg) = forward_conn(
-                id,
-                state,
                 ring,
                 conn_manager,
                 sender,
                 joiner,
                 hops_to_live,
-                num_accepted,
-                accepted_by_this,
+                accepted_by.len(),
             )
-            .await?;
-            new_state = Some(state);
-            return_msg = msg;
+            .await?
+            {
+                updated_state.add_new_proxy(accepted_by)?;
+                // awaiting responses from proxies
+                *state.sm.state() = updated_state;
+                new_state = Some(state);
+                return_msg = None;
+            } else {
+                return_msg = state
+                    .sm
+                    .consume_to_output(JoinRingMsg::Response {
+                        id,
+                        sender: own_loc,
+                        target: sender,
+                        msg: JoinResponse::Proxy { accepted_by },
+                    })
+                    .map_err(|_: OpError<CErr>| OpError::TxUpdateFailure(id))?
+                    .map(Message::from);
+                if state.sm.state().is_connected() {
+                    new_state = None;
+                } else {
+                    new_state = Some(state);
+                }
+            }
         }
         JoinRingMsg::Response {
             id,
@@ -559,7 +629,6 @@ where
             ring.update_location(Some(your_location));
             new_state = Some(state);
         }
-        // JoinRing
         JoinRingMsg::Response {
             id,
             sender,
@@ -568,15 +637,14 @@ where
         } => {
             return_msg = state
                 .sm
-                .consume_to_state(JoinRingMsg::Response {
+                .consume_to_output(JoinRingMsg::Response {
                     id,
                     sender,
                     target,
                     msg: JoinResponse::Proxy { accepted_by },
                 })?
                 .map(Message::from);
-            let completed_conn = state.sm.state().is_connected();
-            if completed_conn {
+            if state.sm.state().is_connected() {
                 new_state = None;
             } else {
                 // keep waiting for more responses
@@ -602,6 +670,13 @@ where
             if !state.sm.state().is_connected() {
                 return Err(OpError::InvalidStateTransition);
             } else {
+                conn_manager.add_connection(sender, false);
+                ring.add_connection(
+                    sender
+                        .location
+                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                    sender.peer,
+                );
                 log::debug!("Openned connection with peer {}", by_peer.peer);
                 new_state = None;
             }
@@ -640,87 +715,68 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn forward_conn<CM, Err>(
     id: Transaction,
-    mut state: JoinRingOp,
     ring: &Ring,
     conn_manager: &mut CM,
     req_peer: PeerKeyLocation,
     new_peer_loc: PeerKeyLocation,
     left_htl: usize,
     num_accepted: usize,
-    accepted_once: JoinRingMsg,
-) -> Result<(JoinRingOp, Option<Message>), OpError<Err>>
+) -> Result<Option<JRState>, OpError<Err>>
 where
     CM: ConnectionBridge,
     Err: std::error::Error,
 {
-    if left_htl > 0 && (ring.num_connections() > 0 || num_accepted == 0) {
-        let forward_to = if left_htl >= ring.rnd_if_htl_above {
-            log::debug!(
-                "Randomly selecting peer to forward JoinRequest, sender: {}",
-                req_peer.peer
-            );
-            ring.random_peer(|p| p.peer != req_peer.peer)
-        } else {
-            log::debug!(
-                "Selecting close peer to forward request, sender: {}",
-                req_peer.peer
-            );
-            ring.routing(&new_peer_loc.location.unwrap(), 1, &[]).pop()
-        };
-        let forwarded = if let Some(forward_to) = forward_to {
-            let forwarded = Message::from(JoinRingMsg::Request {
-                id,
-                msg: JoinRequest::Proxy {
-                    joiner: new_peer_loc,
-                    hops_to_live: left_htl.min(ring.max_hops_to_live) - 1,
-                    sender: ring.own_location(),
-                },
-            });
-            log::debug!(
-                "Forwarding JoinRequest from sender {} to {}",
-                req_peer.peer,
-                forward_to.peer
-            );
-            conn_manager.send(forward_to.peer, forwarded).await?;
-            true
-        } else {
-            false
-        };
+    if left_htl == 0 || (ring.num_connections() == 0 && num_accepted == 0) {
+        return Ok(None);
+    }
 
-        if forwarded {
-            // awaiting for responses from forward nodes
-            let accepted_by = HashSet::from_iter([ring.own_location()]);
-            let curr_state = state.sm.state();
-            *curr_state = JRState::AwaitingProxyResponse {
-                target: req_peer,
-                accepted_by,
-                new_location: new_peer_loc.location.unwrap(),
-                identifier: new_peer_loc.peer,
-            };
-            Ok((state, None))
-        } else {
-            if num_accepted != 0 {
-                log::warn!(
-                    "Tx {}: unable to forward, will only be connected to one peer",
-                    id
-                );
-            } else {
-                log::warn!("Tx {}: unable to forward or accept any connections", id);
-            }
-            let return_msg = state
-                .sm
-                .consume_to_output(accepted_once)
-                .map_err(|_: OpError<Err>| OpError::TxUpdateFailure(id))?
-                .map(Message::from);
-            Ok((state, return_msg))
-        }
+    let forward_to = if left_htl >= ring.rnd_if_htl_above {
+        log::debug!(
+            "Randomly selecting peer to forward JoinRequest, sender: {}",
+            req_peer.peer
+        );
+        ring.random_peer(|p| p.peer != req_peer.peer)
     } else {
-        let return_msg = state
-            .sm
-            .consume_to_output(accepted_once)
-            .map_err(|_: OpError<Err>| OpError::TxUpdateFailure(id))?
-            .map(Message::from);
-        Ok((state, return_msg))
+        log::debug!(
+            "Selecting close peer to forward request, sender: {}",
+            req_peer.peer
+        );
+        ring.routing(&new_peer_loc.location.unwrap(), 1, &[]).pop()
+    };
+
+    if let Some(forward_to) = forward_to {
+        let forwarded = Message::from(JoinRingMsg::Request {
+            id,
+            msg: JoinRequest::Proxy {
+                joiner: new_peer_loc,
+                hops_to_live: left_htl.min(ring.max_hops_to_live) - 1,
+                sender: ring.own_location(),
+            },
+        });
+        log::debug!(
+            "Forwarding JoinRequest from sender {} to {}",
+            req_peer.peer,
+            forward_to.peer
+        );
+        conn_manager.send(forward_to.peer, forwarded).await?;
+        // awaiting for responses from forward nodes
+        let new_state = JRState::AwaitingProxyResponse {
+            target: req_peer,
+            accepted_by: HashSet::new(),
+            new_location: new_peer_loc.location.unwrap(),
+            identifier: new_peer_loc.peer,
+        };
+        Ok(Some(new_state))
+    } else {
+        if num_accepted != 0 {
+            log::warn!(
+                "Tx {}: unable to forward, will only be connected to one peer",
+                id
+            );
+        } else {
+            log::warn!("Tx {}: unable to forward or accept any connections", id);
+        }
+        Ok(None)
     }
 }
 
@@ -967,7 +1023,7 @@ mod test {
 
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
-        while elapsed.elapsed() < Duration::from_secs(15) && connected.len() < NUM_NODES {
+        while elapsed.elapsed() < Duration::from_secs(300) && connected.len() < NUM_NODES {
             for node in 0..NUM_NODES {
                 if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
                     connected.insert(node);

@@ -367,7 +367,7 @@ impl Display for Location {
 
 impl PartialEq for Location {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        (self.0 - other.0).abs() < f64::EPSILON
     }
 }
 
