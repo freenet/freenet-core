@@ -238,7 +238,7 @@ where
     #[inline(always)]
     fn report_result(op_result: Result<(), OpError<CErr>>) {
         if let Err(err) = op_result {
-            log::debug!("Finished tx w/ error: {}", err)
+            log::error!("Finished tx w/ error: {}", err)
         }
     }
 }

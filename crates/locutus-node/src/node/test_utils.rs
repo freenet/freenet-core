@@ -81,7 +81,7 @@ impl SimNetwork {
             ring_max_htl,
             rnd_if_htl_above,
             max_connections,
-            min_connections
+            min_connections,
         };
         net.build_gateways(gateways);
         net.build_nodes(nodes);
