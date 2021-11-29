@@ -7,6 +7,7 @@ pub(crate) trait UserEventsProxy {
     async fn recv(&mut self) -> UserEvent;
 }
 
+#[derive(Clone)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) enum UserEvent {
     /// Update or insert a new value in a contract corresponding with the provided key.
@@ -72,7 +73,7 @@ pub(crate) mod test_utils {
         }
 
         fn generate_deterministic_event(&mut self) -> UserEvent {
-            self.events_to_gen.get(0);
+            self.events_to_gen.remove(0)
         }
 
         fn generate_rand_event(&mut self) -> UserEvent {
@@ -139,7 +140,7 @@ pub(crate) mod test_utils {
             loop {
                 if self.signal.changed().await.is_ok() {
                     if *self.signal.borrow() == self.id {
-                        return self.generate_rand_event();
+                        return self.generate_deterministic_event();
                     }
                 } else {
                     log::debug!("sender half of user event gen dropped");

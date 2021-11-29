@@ -11,7 +11,8 @@ jobs:
     name: Test
 
     runs-on: ubuntu-latest
-    env: RUST_LOG=error
+    env:
+      RUST_LOG: error
 
     steps:
       - uses: actions/checkout@v2

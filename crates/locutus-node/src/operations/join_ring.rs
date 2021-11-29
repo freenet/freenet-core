@@ -1064,23 +1064,11 @@ mod test {
         assert!(join_gw_1.consume_to_output::<SimStorageError>(res).is_err());
     }
 
-    /// Given a network of one node and one gateway test that both are connected.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn one_node_connects_to_gw() {
-        let mut sim_net = SimNetwork::new(1, 1, 1, 1, 2, 2);
-        sim_net.build().await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        assert!(sim_net.connected("node-0"));
-    }
-
-    /// Given a network of 100 peers all nodes should have connections.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 998usize;
-        const NUM_GW: usize = 2usize;
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 5, 4, 10, 2);
-        sim_nodes.build().await;
-
+    async fn check_connectivity(
+        sim_nodes: SimNetwork,
+        num_nodes: usize,
+        wait_time: Duration,
+    ) -> Result<(), anyhow::Error> {
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
         while elapsed.elapsed() < wait_time && connected.len() < num_nodes {
@@ -1142,7 +1130,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
-        sim_nodes.build().await;
+        sim_nodes.build();
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(sim_nodes.connected("node-0"));
     }
@@ -1153,7 +1141,7 @@ mod test {
         const NUM_NODES: usize = 4usize;
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
-        sim_nodes.build().await;
+        sim_nodes.build();
         check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(3)).await
     }
 
@@ -1163,7 +1151,7 @@ mod test {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 2usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 5, 2);
-        sim_nodes.build().await;
-        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(300)).await
+        sim_nodes.build();
+        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(20)).await
     }
 }

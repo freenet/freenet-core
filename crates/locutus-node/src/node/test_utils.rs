@@ -8,7 +8,7 @@ use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
-use crate::contract::Contract;
+use crate::contract::{Contract, ContractKey};
 use crate::user_events::UserEvent;
 use crate::{
     conn_manager::PeerKey,
@@ -55,10 +55,10 @@ pub(crate) struct SimNetwork {
 }
 
 #[derive(Clone)]
-struct NodeSpecs {
-    owned_contracts: Vec<Contract>,
-    non_owned_contracts: u16,
-    events_to_generate: Vec<UserEvent>,
+pub(crate) struct NodeSpecification {
+    pub owned_contracts: Vec<Contract>,
+    pub non_owned_contracts: Vec<ContractKey>,
+    pub events_to_generate: Vec<UserEvent>,
 }
 
 #[derive(Clone)]
@@ -198,45 +198,34 @@ impl SimNetwork {
         }
     }
 
-    pub async fn build(&mut self) {
+    pub fn build(&mut self) {
+        self.build_with_specs(HashMap::new())
+    }
+
+    pub fn build_with_specs(&mut self, mut specs: HashMap<String, NodeSpecification>) {
         for (node, label) in self
             .nodes
             .drain(..)
             .chain(self.gateways.drain(..).map(|(n, c)| (n, c.label)))
             .collect::<Vec<_>>()
         {
-            self.initialize_peer(node, label);
+            let node_spec = specs.remove(&label);
+            self.initialize_peer(node, label, node_spec);
         }
     }
 
-    pub fn build_with_specs(&mut self, net_specs: HashMap<String, NodeSpecs>) {
-        for (node, label) in self
-            .nodes
-            .drain(..)
-            .chain(self.gateways.drain(..).map(|(n, c)| (n, c.label)))
-            .collect::<Vec<_>>()
-        {
-            let node_specs = net_specs.get(&label)?;
-            self.initialize_peer_with_specs(node, label, node_specs);
-        }
-    }
-
-    fn initialize_peer(&mut self, mut peer: NodeInMemory<SimStorageError>, label: String) {
-        let user_events = MemoryEventsGen::new(self.receiver_ch.clone(), peer.peer_key);
-        self.labels.insert(label, peer.peer_key);
-        tokio::spawn(async move { peer.listen_on(user_events).await });
-    }
-
-    fn initialize_peer_with_specs(
+    fn initialize_peer(
         &mut self,
         mut peer: NodeInMemory<SimStorageError>,
         label: String,
-        specs: &NodeSpecs,
+        node_specs: Option<NodeSpecification>,
     ) {
         let mut user_events = MemoryEventsGen::new(self.receiver_ch.clone(), peer.peer_key);
-        user_events.has_contract(&specs.owned_contracts);
-        user_events.request_contracts(&specs.non_owned_contracts);
-        user_events.generate_events(&specs.events_to_generate);
+        if let Some(specs) = node_specs {
+            user_events.has_contract(specs.owned_contracts);
+            user_events.request_contracts(specs.non_owned_contracts);
+            user_events.generate_events(specs.events_to_generate);
+        }
         self.labels.insert(label, peer.peer_key);
         tokio::spawn(async move { peer.listen_on(user_events).await });
     }

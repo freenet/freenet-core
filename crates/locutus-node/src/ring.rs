@@ -186,7 +186,7 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: &Location) -> bool {
-        // FIXME: when a join ring op expires or a peer connectio is closed this should be reduced
+        // FIXME: when a join ring op expires or a peer connection is closed this should be reduced
         let open_conn = self.incoming_connections.fetch_add(1, SeqCst);
         let my_location = &self
             .own_location()

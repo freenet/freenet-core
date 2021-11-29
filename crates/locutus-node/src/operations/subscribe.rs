@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::operations::subscribe::SubscribeState::AwaitingResponse;
 use crate::{
     config::PEER_TIMEOUT,
     conn_manager::{ConnectionBridge, PeerKey},
@@ -301,7 +300,7 @@ where
                 // Retry seek node when the contract to subscribe has not been found in this node
                 conn_manager
                     .send(
-                        new_target,
+                        new_target.peer,
                         (SubscribeMsg::SeekNode {
                             id,
                             key,
@@ -329,7 +328,7 @@ where
                     .map(Message::from);
                 new_state = Some(state);
             } else {
-                if let Err(_) = op_storage.ring.add_subscriber(key.clone(), subscriber) {
+                if op_storage.ring.add_subscriber(key, subscriber).is_err() {
                     // max number of subscribers for this contract reached
                     return Ok(return_err());
                 }
@@ -505,11 +504,12 @@ mod messages {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::config::tracing::Logger;
     use crate::contract::Contract;
-    use crate::node::test_utils::SimNetwork;
+    use crate::node::test_utils::{NodeSpecification, SimNetwork};
     use crate::ring::Location;
+    use crate::user_events::UserEvent;
     use crate::{conn_manager::PeerKey, node::SimStorageError};
+    use std::collections::HashMap;
 
     #[test]
     fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
@@ -519,7 +519,7 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
 
-        let key = contract.clone().key();
+        let key = contract.key();
 
         let subscriber_loc = PeerKeyLocation {
             location: Some(Location::random()),
@@ -535,7 +535,8 @@ mod test {
         };
 
         let mut subscriber = SubscribeOp::start_op(key, &peer).sm;
-        let mut target = StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest);
+        let mut target =
+            StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest, id);
 
         subscriber.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::FetchRouting {
             id,
@@ -560,7 +561,7 @@ mod test {
                 htl: 0,
                 found: true,
             })?
-            .ok_or(anyhow::anyhow!("no output"))?;
+            .ok_or_else(|| anyhow::anyhow!("no output"))?;
 
         let expected_msg = SubscribeMsg::ReturnSub {
             id,
@@ -583,7 +584,7 @@ mod test {
 
         assert_eq!(subscriber.state(), &SubscribeState::Completed);
 
-        target = StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest);
+        target = StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest, id);
         target.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::SeekNode {
             id,
             key,
@@ -601,8 +602,30 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
-        let mut sim_nodes = SimNetwork::new(1, 3, 10, 7, 100);
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary()?;
+        let contract_key: ContractKey = contract.key();
+        let event = UserEvent::Subscribe { key: contract_key };
 
+        let first_node = NodeSpecification {
+            owned_contracts: Vec::new(),
+            non_owned_contracts: vec![contract_key],
+            events_to_generate: vec![event],
+        };
+
+        let second_node = NodeSpecification {
+            owned_contracts: vec![contract],
+            non_owned_contracts: Vec::new(),
+            events_to_generate: Vec::new(),
+        };
+
+        let subscribe_specs = HashMap::from_iter([
+            ("node-0".to_string(), first_node),
+            ("node-1".to_string(), second_node),
+        ]);
+        let mut sim_nodes = SimNetwork::new(1, 2, 10, 7, 100, 20);
+        sim_nodes.build_with_specs(subscribe_specs);
         Ok(())
     }
 }
