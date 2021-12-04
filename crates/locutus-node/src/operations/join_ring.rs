@@ -28,13 +28,17 @@ impl JoinRingOp {
         this_peer: PeerKey,
         gateway: PeerKeyLocation,
         max_hops_to_live: usize,
+        id: Transaction,
     ) -> Self {
         log::debug!("Connecting to gw {} from {}", gateway.peer, this_peer);
-        let sm = StateMachine::from_state(JRState::Connecting(ConnectionInfo {
-            gateway,
-            this_peer,
-            max_hops_to_live,
-        }));
+        let sm = StateMachine::from_state(
+            JRState::Connecting(ConnectionInfo {
+                gateway,
+                this_peer,
+                max_hops_to_live,
+            }),
+            id,
+        );
         JoinRingOp {
             sm,
             backoff: Some(ExponentialBackoff::new(
@@ -322,7 +326,7 @@ impl JRState {
         if let Self::Connecting(conn_info) = self {
             Ok(conn_info)
         } else {
-            Err(OpError::InvalidStateTransition)
+            Err(OpError::UnexpectedOpState)
         }
     }
 
@@ -341,7 +345,7 @@ impl JRState {
             accepted_by.extend(proxies.into_iter());
             Ok(())
         } else {
-            Err(OpError::InvalidStateTransition)
+            Err(OpError::UnexpectedOpState)
         }
     }
 }
@@ -413,7 +417,7 @@ where
             sender = join_op.sender().cloned();
             // new request to join this node, initialize the machine
             let machine = JoinRingOp {
-                sm: StateMachine::from_state(JRState::Initializing),
+                sm: StateMachine::from_state(JRState::Initializing, tx),
                 backoff: None,
                 _ttl: PEER_TIMEOUT,
             };
@@ -668,7 +672,7 @@ where
                 })?
                 .map(Message::from);
             if !state.sm.state().is_connected() {
-                return Err(OpError::InvalidStateTransition);
+                return Err(OpError::InvalidStateTransition(id));
             } else {
                 conn_manager.add_connection(sender, false);
                 ring.add_connection(
@@ -687,7 +691,7 @@ where
                 .consume_to_output(JoinRingMsg::Connected { target, sender, id })?
                 .map(Message::from);
             if !state.sm.state().is_connected() {
-                return Err(OpError::InvalidStateTransition);
+                return Err(OpError::InvalidStateTransition(id));
             } else {
                 log::info!(
                     "Successfully completed connection @ {}, new location = {:?}",
@@ -704,7 +708,7 @@ where
                 new_state = None;
             }
         }
-        _ => return Err(OpError::InvalidStateTransition),
+        _ => return Err(OpError::UnexpectedOpState),
     }
     Ok(OperationResult {
         return_msg,
@@ -936,8 +940,8 @@ mod test {
             location: Some(Location::random()),
         };
 
-        let mut join_gw_1 = JoinRingOp::initial_request(new_peer.peer, gateway, 0).sm;
-        let mut join_new_peer_2 = StateMachine::<JROpSm>::from_state(JRState::Initializing);
+        let mut join_gw_1 = JoinRingOp::initial_request(new_peer.peer, gateway, 0, id).sm;
+        let mut join_new_peer_2 = StateMachine::<JROpSm>::from_state(JRState::Initializing, id);
 
         let req = JoinRingMsg::Request {
             id,
@@ -1006,7 +1010,7 @@ mod test {
 
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn node0_to_gateway_conn() {
+    async fn one_node_connects_to_gw() {
         let mut sim_net = SimNetwork::new(1, 1, 1, 1, 2, 2);
         sim_net.build().await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -1015,15 +1019,15 @@ mod test {
 
     /// Given a network of N peers all nodes should have connections.
     #[tokio::test(flavor = "multi_thread")]
-    async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 5usize;
+    async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 3usize;
         const NUM_GW: usize = 1usize;
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 5, 4, 2, 1);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 2, 4, 2, 1);
         sim_nodes.build().await;
 
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
-        while elapsed.elapsed() < Duration::from_secs(300) && connected.len() < NUM_NODES {
+        while elapsed.elapsed() < Duration::from_secs(20) && connected.len() < NUM_NODES {
             for node in 0..NUM_NODES {
                 if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
                     connected.insert(node);

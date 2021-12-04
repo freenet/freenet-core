@@ -29,7 +29,7 @@ impl SubscribeOp {
 
     pub fn start_op(key: ContractKey, peer: &PeerKey) -> Self {
         let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), peer);
-        let sm = StateMachine::from_state(SubscribeState::PrepareRequest { id, key });
+        let sm = StateMachine::from_state(SubscribeState::PrepareRequest { id, key }, id);
         SubscribeOp {
             sm,
             _ttl: PEER_TIMEOUT,
@@ -166,7 +166,7 @@ where
             *id,
         )
     } else {
-        return Err(OpError::InvalidStateTransition);
+        return Err(OpError::UnexpectedOpState);
     };
 
     if let Some(req_sub) = sub_op
@@ -203,7 +203,7 @@ where
             sender = subscribe_op.sender().cloned();
             // new request to subcribe to a contract, initialize the machine
             let machine = SubscribeOp {
-                sm: StateMachine::from_state(SubscribeState::ReceivedRequest),
+                sm: StateMachine::from_state(SubscribeState::ReceivedRequest, tx),
                 _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, subscribe_op, op_storage).await
@@ -330,7 +330,7 @@ where
                     return Err(RingError::NoCachingPeers(key).into());
                 }
             } else {
-                return Err(OpError::InvalidStateTransition);
+                return Err(OpError::InvalidStateTransition(id));
             }
         }
         SubscribeMsg::ReturnSub {
@@ -356,7 +356,7 @@ where
                 .map(Message::from);
             new_state = None;
         }
-        _ => return Err(OpError::InvalidStateTransition),
+        _ => return Err(OpError::UnexpectedOpState),
     }
     Ok(OperationResult {
         return_msg,

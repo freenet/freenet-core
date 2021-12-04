@@ -28,11 +28,14 @@ impl GetOp {
 
     pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> Self {
         let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), id);
-        let sm = StateMachine::from_state(GetState::PrepareRequest {
-            key,
+        let sm = StateMachine::from_state(
+            GetState::PrepareRequest {
+                key,
+                id,
+                fetch_contract,
+            },
             id,
-            fetch_contract,
-        });
+        );
         GetOp {
             sm,
             _ttl: PEER_TIMEOUT,
@@ -236,7 +239,7 @@ where
             *id,
         )
     } else {
-        return Err(OpError::InvalidStateTransition);
+        return Err(OpError::UnexpectedOpState);
     };
     if let Some(req_get) = get_op
         .sm
@@ -272,7 +275,7 @@ where
             sender = get_op.sender().cloned();
             // new request to get a value for a contract, initialize the machine
             let machine = GetOp {
-                sm: StateMachine::from_state(GetState::ReceivedRequest),
+                sm: StateMachine::from_state(GetState::ReceivedRequest, *get_op.id()),
                 _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, get_op, op_storage).await
@@ -363,7 +366,7 @@ where
                         returned_key,
                         key
                     );
-                    return Err(OpError::InvalidStateTransition);
+                    return Err(OpError::InvalidStateTransition(id));
                 }
 
                 match &value {
@@ -389,7 +392,7 @@ where
                     .map(Message::from);
                 new_state = Some(state);
             } else {
-                return Err(OpError::InvalidStateTransition);
+                return Err(OpError::InvalidStateTransition(id));
             }
         }
         GetMsg::ReturnGet {
@@ -444,7 +447,7 @@ where
                     return Err(RingError::NoCachingPeers(key).into());
                 }
             } else {
-                return Err(OpError::InvalidStateTransition);
+                return Err(OpError::UnexpectedOpState);
             }
         }
         GetMsg::ReturnGet {
@@ -513,7 +516,7 @@ where
                 .map(Message::from);
             new_state = None;
         }
-        _ => return Err(OpError::InvalidStateTransition),
+        _ => return Err(OpError::UnexpectedOpState),
     }
     Ok(OperationResult {
         return_msg,
@@ -613,7 +616,7 @@ mod test {
         };
 
         let mut requester = GetOp::start_op(contract.key(), true, &requester).sm;
-        let mut target = StateMachine::<GetOpSm>::from_state(GetState::ReceivedRequest);
+        let mut target = StateMachine::<GetOpSm>::from_state(GetState::ReceivedRequest, id);
 
         let req_msg = requester
             .consume_to_output::<Err>(GetMsg::FetchRouting {
