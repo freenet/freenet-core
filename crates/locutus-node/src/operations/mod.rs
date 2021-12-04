@@ -8,6 +8,8 @@ use crate::{
     ring::RingError,
 };
 
+use self::join_ring::JoinOpError;
+
 pub(crate) mod get;
 pub(crate) mod join_ring;
 pub(crate) mod put;
@@ -85,7 +87,6 @@ pub(crate) enum Operation {
     Subscribe(subscribe::SubscribeOp),
 }
 
-#[allow(unused)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpError<S: std::error::Error> {
     #[error(transparent)]
@@ -94,6 +95,8 @@ pub(crate) enum OpError<S: std::error::Error> {
     RingError(#[from] RingError),
     #[error(transparent)]
     ContractError(#[from] ContractError<S>),
+    #[error(transparent)]
+    JoinOp(#[from] JoinOpError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
@@ -103,8 +106,8 @@ pub(crate) enum OpError<S: std::error::Error> {
     NotificationError(#[from] Box<SendError<Message>>),
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
-    #[error("failed while processing transaction {0}")]
-    TxUpdateFailure(Transaction),
+    #[error("op not present: {0}")]
+    OpNotPresent(Transaction),
     #[error("max number of retries for tx {0} of op type {1} reached")]
     MaxRetriesExceeded(Transaction, String),
 

@@ -241,7 +241,7 @@ where
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, put_op, op_storage).await
         }
-        Some(_) => return Err(OpError::TxUpdateFailure(tx)),
+        Some(_) => return Err(OpError::OpNotPresent(tx)),
         None => {
             sender = put_op.sender().cloned();
             // new request to put a new value for a contract, initialize the machine

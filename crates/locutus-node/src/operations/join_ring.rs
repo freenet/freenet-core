@@ -3,7 +3,7 @@ use std::{collections::HashSet, time::Duration};
 use super::{handle_op_result, state_machine::StateMachineImpl, OpError, OperationResult};
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{self, ConnectionBridge, PeerKey},
+    conn_manager::{self, ConnError, ConnectionBridge, PeerKey},
     message::{Message, Transaction},
     node::OpManager,
     operations::{state_machine::StateMachine, Operation},
@@ -350,6 +350,12 @@ impl JRState {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JoinOpError {
+    #[error("no capacity left")]
+    NoCapacityLeft,
+}
+
 /// Join ring routine, called upon performing a join operation for this node.
 pub(crate) async fn join_ring_request<CB, CErr>(
     tx: Transaction,
@@ -412,7 +418,7 @@ where
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, join_op, &op_storage.ring).await
         }
-        Some(_) => return Err(OpError::TxUpdateFailure(tx)),
+        Some(_) => return Err(OpError::OpNotPresent(tx)),
         None => {
             sender = join_op.sender().cloned();
             // new request to join this node, initialize the machine
@@ -505,7 +511,7 @@ where
                             your_peer_id: req_peer,
                         },
                     })
-                    .map_err(|_: OpError<CErr>| OpError::TxUpdateFailure(id))?
+                    .map_err(|_: OpError<CErr>| OpError::from(JoinOpError::NoCapacityLeft))?
                     .map(Message::from);
                 new_state = Some(state);
             }
@@ -519,18 +525,22 @@ where
                     hops_to_live,
                 },
         } => {
+            // Initial request to a proxy to add a new peer
             let own_loc = ring.own_location();
-            let accepted_by =
-                if ring.should_accept(&joiner.location.ok_or(OpError::TxUpdateFailure(id))?) {
-                    log::debug!("Accepting proxy connections from {}", joiner.peer);
-                    HashSet::from_iter([own_loc])
-                } else {
-                    log::debug!(
-                        "Not accepting new proxy connection for sender {}",
-                        joiner.peer
-                    );
-                    HashSet::new()
-                };
+            let accepted_by = if ring.should_accept(
+                &joiner
+                    .location
+                    .ok_or_else(|| OpError::from(ConnError::LocationUnknown))?,
+            ) {
+                log::debug!("Accepting proxy connections from {}", joiner.peer);
+                HashSet::from_iter([own_loc])
+            } else {
+                log::debug!(
+                    "Not accepting new proxy connection for sender {}",
+                    joiner.peer
+                );
+                HashSet::new()
+            };
 
             if let Some(mut updated_state) = forward_conn(
                 id,
@@ -557,7 +567,7 @@ where
                         target: sender,
                         msg: JoinResponse::Proxy { accepted_by },
                     })
-                    .map_err(|_: OpError<CErr>| OpError::TxUpdateFailure(id))?
+                    .map_err(|_: OpError<CErr>| OpError::from(JoinOpError::NoCapacityLeft))?
                     .map(Message::from);
                 if state.sm.state().is_connected() {
                     new_state = None;
@@ -716,7 +726,7 @@ where
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+// FIXME: don't forward to previously rejecting nodes (keep track of skip list)
 async fn forward_conn<CM, Err>(
     id: Transaction,
     ring: &Ring,

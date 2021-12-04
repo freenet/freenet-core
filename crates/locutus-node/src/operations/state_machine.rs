@@ -73,8 +73,7 @@ where
     ) -> Result<Option<T::Output>, OpError<CErr>> {
         let popped_state = self
             .state
-            .take()
-            .ok_or_else(|| OpError::InvalidStateTransition(self.id))?;
+            .take().ok_or(OpError::InvalidStateTransition(self.id))?;
         let output = T::output_from_input_as_ref(&popped_state, &input);
         if let Some(new_state) = T::state_transition_from_input(popped_state, input) {
             self.state = Some(new_state);
@@ -92,8 +91,7 @@ where
     ) -> Result<Option<T::Output>, OpError<CErr>> {
         let mut popped_state = self
             .state
-            .take()
-            .ok_or_else(|| OpError::InvalidStateTransition(self.id))?;
+            .take().ok_or(OpError::InvalidStateTransition(self.id))?;
         if let Some(new_state) = T::state_transition(&mut popped_state, &mut input) {
             let output = T::output_from_input(popped_state, input);
             self.state = Some(new_state);
