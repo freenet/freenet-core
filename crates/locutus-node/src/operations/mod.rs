@@ -39,11 +39,7 @@ where
             // do nothing and continue, the operation will just continue later on
             return Ok(());
         }
-        Err((OpError::BroadcastCompleted, _tx)) => {
-            return Ok(());
-        }
         Err((err, tx_id)) => {
-            log::error!("Error while processing request {}: {}", tx_id, err);
             if let Some(sender) = sender {
                 conn_manager.send(sender, Message::Canceled(tx_id)).await?;
             }
@@ -134,11 +130,6 @@ pub(crate) enum OpError<S: std::error::Error> {
     /// was sent throught the fast path back to the storage.
     #[error("early push of state into the op stack")]
     StatePushed,
-
-    /// For operations that involved broadcasting updates this signals that the broadcast
-    /// has reached the max htl and no more broadcasting is required
-    #[error("broadcast completed for transaction")]
-    BroadcastCompleted,
 }
 
 impl<S> From<SendError<Message>> for OpError<S>

@@ -152,6 +152,8 @@ impl StateMachineImpl for JROpSm {
             (
                 JRState::AwaitingProxyResponse {
                     accepted_by: previously_accepted,
+                    new_peer_id,
+                    target,
                     ..
                 },
                 JoinRingMsg::Response {
@@ -160,7 +162,16 @@ impl StateMachineImpl for JROpSm {
                 },
             ) if !accepted_by.is_empty() => {
                 previously_accepted.extend(accepted_by.drain());
-                Some(JRState::Connected)
+                if new_peer_id == &target.peer {
+                    Some(JRState::OCReceived)
+                } else {
+                    // for proxies just consider the connection open directly
+                    // what would happen in case that the connection is not confirmed end-to-end
+                    // is that we would end up with a dead connection;
+                    // this then must be dealed with by the normal mechanisms that keep
+                    // connections alive and prune any dead connections
+                    Some(JRState::Connected)
+                }
             }
             _ => None,
         }
@@ -449,6 +460,7 @@ where
     .await
 }
 
+// TODO: un
 async fn update_state<CB, CErr>(
     conn_manager: &mut CB,
     mut state: JoinRingOp,
@@ -665,12 +677,7 @@ where
             target,
             msg: JoinResponse::Proxy { accepted_by },
         } => {
-            log::debug!(
-                "Received proxy join @ {}, current state: {:?}; \n accepted_by: {:?}",
-                target.peer,
-                state.sm.state(),
-                accepted_by
-            );
+            log::debug!("Received proxy join @ {}", target.peer,);
             return_msg = state
                 .sm
                 .consume_to_output(JoinRingMsg::Response {
@@ -768,13 +775,13 @@ where
 
     let forward_to = if left_htl >= ring.rnd_if_htl_above {
         log::debug!(
-            "Randomly selecting peer to forward JoinRequest, sender: {}",
+            "Randomly selecting peer to forward JoinRequest (requester: {})",
             req_peer.peer
         );
         ring.random_peer(|p| p.peer != req_peer.peer)
     } else {
         log::debug!(
-            "Selecting close peer to forward request, sender: {}",
+            "Selecting close peer to forward request (requester: {})",
             req_peer.peer
         );
         match ring
@@ -1124,7 +1131,7 @@ mod test {
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
         sim_nodes.build().await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(sim_nodes.connected("node-0"));
     }
 
@@ -1135,6 +1142,6 @@ mod test {
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 2, 4, 2, 1);
         sim_nodes.build().await;
-        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(500)).await
+        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(10)).await
     }
 }
