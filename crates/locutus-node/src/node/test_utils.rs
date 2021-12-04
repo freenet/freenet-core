@@ -41,7 +41,7 @@ pub fn get_dynamic_port() -> u16 {
 /// A simulated in-memory network topology.
 pub(crate) struct SimNetwork {
     event_listener: TestEventListener,
-    labels: HashMap<String, PeerKey>,
+    pub labels: HashMap<String, PeerKey>,
     usr_ev_controller: Sender<PeerKey>,
     receiver_ch: Receiver<PeerKey>,
     gateways: Vec<(NodeInMemory<SimStorageError>, GatewayConfig)>,

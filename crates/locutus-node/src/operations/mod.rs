@@ -39,7 +39,7 @@ where
             // do nothing and continue, the operation will just continue later on
             return Ok(());
         }
-        Err((OpError::BroadcastCompleted, tx)) => {
+        Err((OpError::BroadcastCompleted, _tx)) => {
             return Ok(());
         }
         Err((err, tx_id)) => {
@@ -61,6 +61,13 @@ where
             op_storage.push(id, updated_state)?;
         }
         Ok(OperationResult {
+            return_msg: None,
+            state: Some(updated_state),
+        }) => {
+            // interim state
+            op_storage.push(updated_state.id(), updated_state)?;
+        }
+        Ok(OperationResult {
             return_msg: Some(msg),
             state: None,
         }) => {
@@ -75,7 +82,6 @@ where
         }) => {
             // operation finished_completely
         }
-        _ => return Err(OpError::UnexpectedOpState),
     }
     Ok(())
 }
@@ -85,6 +91,18 @@ pub(crate) enum Operation {
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
+}
+
+impl Operation {
+    fn id(&self) -> Transaction {
+        use Operation::*;
+        match self {
+            JoinRing(op) => op.id(),
+            Put(op) => op.id(),
+            Get(op) => op.id(),
+            Subscribe(op) => op.id(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,9 +135,8 @@ pub(crate) enum OpError<S: std::error::Error> {
     #[error("early push of state into the op stack")]
     StatePushed,
 
-    /// For operations that involved broadcasting updates (like put)
-    /// this signals that the broadcast has reached the max htl and no more
-    /// broadcasting is required
+    /// For operations that involved broadcasting updates this signals that the broadcast
+    /// has reached the max htl and no more broadcasting is required
     #[error("broadcast completed for transaction")]
     BroadcastCompleted,
 }

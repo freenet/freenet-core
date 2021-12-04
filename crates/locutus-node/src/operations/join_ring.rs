@@ -49,6 +49,10 @@ impl JoinRingOp {
             _ttl: PEER_TIMEOUT,
         }
     }
+
+    pub fn id(&self) -> Transaction {
+        self.sm.id
+    }
 }
 
 #[derive(Debug)]
@@ -124,12 +128,23 @@ impl StateMachineImpl for JROpSm {
                 JoinRingMsg::Response {
                     msg: JoinResponse::Proxy { accepted_by },
                     sender,
+                    target,
+                    id,
                     ..
                 },
             ) => {
+                // the sender of the response is the target of the request and
+                // is only a completed tx if it accepted the connection
                 if accepted_by.contains(sender) {
+                    log::debug!(
+                        "Return to {}, connected at proxy {} (tx: {})",
+                        target.peer,
+                        sender.peer,
+                        id
+                    );
                     Some(JRState::Connected)
                 } else {
+                    log::debug!("Failed to connect at proxy {}", sender.peer);
                     None
                 }
             }
@@ -213,7 +228,7 @@ impl StateMachineImpl for JROpSm {
                     target,
                     accepted_by,
                     new_location,
-                    identifier,
+                    new_peer_id,
                 },
                 JoinRingMsg::Response {
                     id,
@@ -223,7 +238,7 @@ impl StateMachineImpl for JROpSm {
                 },
             ) => {
                 // returning message from a proxy action to the previous requester
-                let resp = if identifier == target.peer {
+                let resp = if new_peer_id == target.peer {
                     log::debug!(
                         "Sending response to join request with all the peers that accepted \
                     connection from gateway {} to peer {}",
@@ -237,7 +252,7 @@ impl StateMachineImpl for JROpSm {
                         msg: JoinResponse::AcceptedBy {
                             peers: accepted_by,
                             your_location: new_location,
-                            your_peer_id: identifier,
+                            your_peer_id: new_peer_id,
                         },
                     }
                 } else {
@@ -265,19 +280,12 @@ impl StateMachineImpl for JROpSm {
                     id,
                     target,
                 },
-            ) => {
-                log::debug!(
-                    "Returning from a proxy to the previous requester. Sender: {}; target: {}",
-                    sender.peer,
-                    target.peer
-                );
-                Some(JoinRingMsg::Response {
-                    msg: JoinResponse::Proxy { accepted_by },
-                    sender,
-                    id,
-                    target,
-                })
-            }
+            ) => Some(JoinRingMsg::Response {
+                msg: JoinResponse::Proxy { accepted_by },
+                sender,
+                id,
+                target,
+            }),
             (
                 JRState::OCReceived,
                 JoinRingMsg::Response {
@@ -305,7 +313,7 @@ enum JRState {
         target: PeerKeyLocation,
         accepted_by: HashSet<PeerKeyLocation>,
         new_location: Location,
-        identifier: PeerKey,
+        new_peer_id: PeerKey,
     },
     OCReceived,
     Connected,
@@ -374,18 +382,19 @@ where
     } = join_op.sm.state().clone().try_unwrap_connecting()?;
 
     log::info!(
-        "Joining ring via {} (at {})",
+        "Joining ring via {} (at {}) (tx: {})",
         gateway.peer,
         gateway
             .location
-            .ok_or(conn_manager::ConnError::LocationUnknown)?
+            .ok_or(conn_manager::ConnError::LocationUnknown)?,
+        tx
     );
 
     conn_manager.add_connection(gateway, true);
     let join_req = Message::from(messages::JoinRingMsg::Request {
         id: tx,
         msg: messages::JoinRequest::StartReq {
-            target_loc: gateway,
+            target: gateway,
             req_peer: this_peer,
             hops_to_live: max_hops_to_live,
             max_hops_to_live,
@@ -457,7 +466,7 @@ where
             id,
             msg:
                 JoinRequest::StartReq {
-                    target_loc: this_node_loc,
+                    target: this_node_loc,
                     req_peer,
                     hops_to_live,
                     ..
@@ -472,7 +481,7 @@ where
             );
             let new_location = Location::random();
             let accepted_by = if ring.should_accept(&new_location) {
-                log::debug!("Accepting connections from {}", req_peer,);
+                log::debug!("Accepting connection from {}", req_peer,);
                 HashSet::from_iter([this_node_loc])
             } else {
                 log::debug!("Rejecting connection from peer {}", req_peer);
@@ -494,6 +503,7 @@ where
             )
             .await?
             {
+                log::debug!("Awaiting @ {} (tx: {})", this_node_loc.peer, id);
                 updated_state.add_new_proxy(accepted_by)?;
                 // awaiting responses from proxies
                 *state.sm.state() = updated_state;
@@ -525,14 +535,20 @@ where
                     hops_to_live,
                 },
         } => {
-            // Initial request to a proxy to add a new peer
             let own_loc = ring.own_location();
+            log::debug!(
+                "Proxy join request received from {} to join new peer {} with HTL {} @ {}",
+                sender.peer,
+                joiner.peer,
+                hops_to_live,
+                own_loc.peer
+            );
             let accepted_by = if ring.should_accept(
                 &joiner
                     .location
                     .ok_or_else(|| OpError::from(ConnError::LocationUnknown))?,
             ) {
-                log::debug!("Accepting proxy connections from {}", joiner.peer);
+                log::debug!("Accepting proxy connection from {}", joiner.peer);
                 HashSet::from_iter([own_loc])
             } else {
                 log::debug!(
@@ -649,6 +665,12 @@ where
             target,
             msg: JoinResponse::Proxy { accepted_by },
         } => {
+            log::debug!(
+                "Received proxy join @ {}, current state: {:?}; \n accepted_by: {:?}",
+                target.peer,
+                state.sm.state(),
+                accepted_by
+            );
             return_msg = state
                 .sm
                 .consume_to_output(JoinRingMsg::Response {
@@ -755,7 +777,25 @@ where
             "Selecting close peer to forward request, sender: {}",
             req_peer.peer
         );
-        ring.routing(&new_peer_loc.location.unwrap(), 1, &[]).pop()
+        match ring
+            .routing(
+                &new_peer_loc.location.unwrap(),
+                Some(&req_peer.peer),
+                1,
+                &[],
+            )
+            .pop()
+        {
+            Some(pkl) => {
+                if pkl.peer == new_peer_loc.peer {
+                    // concurrently this peer was connected already
+                    None
+                } else {
+                    Some(pkl)
+                }
+            }
+            None => None,
+        }
     };
 
     if let Some(forward_to) = forward_to {
@@ -778,17 +818,17 @@ where
             target: req_peer,
             accepted_by: HashSet::new(),
             new_location: new_peer_loc.location.unwrap(),
-            identifier: new_peer_loc.peer,
+            new_peer_id: new_peer_loc.peer,
         };
         Ok(Some(new_state))
     } else {
         if num_accepted != 0 {
             log::warn!(
-                "Tx {}: unable to forward, will only be connected to one peer",
+                "Unable to forward, will only be connected to one peer (tx: {})",
                 id
             );
         } else {
-            log::warn!("Tx {}: unable to forward or accept any connections", id);
+            log::warn!("Unable to forward or accept any connections (tx: {})", id);
         }
         Ok(None)
     }
@@ -891,7 +931,7 @@ mod messages {
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRequest {
         StartReq {
-            target_loc: PeerKeyLocation,
+            target: PeerKeyLocation,
             req_peer: PeerKey,
             hops_to_live: usize,
             max_hops_to_live: usize,
@@ -1018,39 +1058,34 @@ mod test {
         assert!(join_gw_1.consume_to_output::<SimStorageError>(res).is_err());
     }
 
-    /// Given a network of one node and one gateway test that both are connected.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn one_node_connects_to_gw() {
-        let mut sim_net = SimNetwork::new(1, 1, 1, 1, 2, 2);
-        sim_net.build().await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        assert!(sim_net.connected("node-0"));
-    }
-
-    /// Given a network of N peers all nodes should have connections.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 3usize;
-        const NUM_GW: usize = 1usize;
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 2, 4, 2, 1);
-        sim_nodes.build().await;
-
+    async fn check_connectivity(
+        sim_nodes: SimNetwork,
+        num_nodes: usize,
+        wait_time: Duration,
+    ) -> Result<(), anyhow::Error> {
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
-        while elapsed.elapsed() < Duration::from_secs(20) && connected.len() < NUM_NODES {
-            for node in 0..NUM_NODES {
+        while elapsed.elapsed() < wait_time && connected.len() < num_nodes {
+            for node in 0..num_nodes {
                 if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
                     connected.insert(node);
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(1_000)).await;
-        let expected = HashSet::from_iter(0..NUM_NODES);
-        let diff: Vec<_> = expected.difference(&connected).collect();
-        if !diff.is_empty() {
-            log::error!("Nodes without connection: {:?}", diff);
+        let expected = HashSet::from_iter(0..num_nodes);
+        let missing: Vec<_> = expected
+            .difference(&connected)
+            .map(|n| {
+                let label = format!("node-{}", n);
+                let key = sim_nodes.labels[&label];
+                (label, key)
+            })
+            .collect();
+        if !missing.is_empty() {
+            log::error!("Nodes without connection: {:?}", missing);
         }
-        assert!(diff.is_empty());
+        assert!(missing.is_empty());
         log::info!(
             "Required time for connecting all peers: {} secs",
             elapsed.elapsed().as_secs()
@@ -1077,10 +1112,29 @@ mod test {
         assert!(connections_per_peer.iter().last().unwrap() > &1);
 
         // ensure the average number of connections per peer is above N
-        let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / NUM_NODES;
+        let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
         log::info!("Average connections: {}", avg_connections);
         assert!(avg_connections > 1);
 
         Ok(())
+    }
+
+    /// Given a network of one node and one gateway test that both are connected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_node_connects_to_gw() {
+        let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
+        sim_nodes.build().await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(sim_nodes.connected("node-0"));
+    }
+
+    /// Given a network of N peers all nodes should have connections.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 3usize;
+        const NUM_GW: usize = 1usize;
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 2, 4, 2, 1);
+        sim_nodes.build().await;
+        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(500)).await
     }
 }
