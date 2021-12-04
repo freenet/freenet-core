@@ -137,13 +137,13 @@ struct NetBehaviour {
 
 #[derive(Debug)]
 pub(crate) enum NetEvent {
-    Identify(identify::IdentifyEvent),
+    Identify(Box<identify::IdentifyEvent>),
     Ping(ping::PingEvent),
 }
 
 impl From<identify::IdentifyEvent> for NetEvent {
     fn from(event: identify::IdentifyEvent) -> NetEvent {
-        Self::Identify(event)
+        Self::Identify(Box::new(event))
     }
 }
 
