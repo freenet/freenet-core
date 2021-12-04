@@ -73,7 +73,7 @@ where
         }) => {
             // operation finished_completely
         }
-        _ => return Err(OpError::InvalidStateTransition),
+        _ => return Err(OpError::UnexpectedOpState),
     }
     Ok(())
 }
@@ -95,8 +95,10 @@ pub(crate) enum OpError<S: std::error::Error> {
     #[error(transparent)]
     ContractError(#[from] ContractError<S>),
 
-    #[error("cannot perform a state transition from the current state with the provided input")]
-    InvalidStateTransition,
+    #[error("unexpected operation state")]
+    UnexpectedOpState,
+    #[error("cannot perform a state transition from the current state with the provided input (tx: {0})")]
+    InvalidStateTransition(Transaction),
     #[error("failed notifying back to the node message loop, channel closed")]
     NotificationError(#[from] Box<SendError<Message>>),
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]

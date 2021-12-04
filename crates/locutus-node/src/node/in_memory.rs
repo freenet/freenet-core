@@ -115,6 +115,7 @@ where
                 self.peer_key,
                 *gateway,
                 self.op_storage.ring.max_hops_to_live,
+                tx_id,
             );
             if let Some(mut backoff) = backoff {
                 // backoff to retry later in case it failed

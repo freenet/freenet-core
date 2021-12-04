@@ -37,12 +37,15 @@ impl PutOp {
         );
 
         let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), peer);
-        let sm = StateMachine::from_state(PutState::PrepareRequest {
+        let sm = StateMachine::from_state(
+            PutState::PrepareRequest {
+                id,
+                contract,
+                value,
+                htl,
+            },
             id,
-            contract,
-            value,
-            htl,
-        });
+        );
         PutOp {
             sm,
             _ttl: PEER_TIMEOUT,
@@ -192,7 +195,7 @@ where
     let key = if let PutState::PrepareRequest { contract, .. } = put_op.sm.state() {
         contract.key()
     } else {
-        return Err(OpError::InvalidStateTransition);
+        return Err(OpError::UnexpectedOpState);
     };
 
     // the initial request must provide:
@@ -215,7 +218,7 @@ where
             .notify_change(Message::from(req_put), Operation::Put(put_op))
             .await?;
     } else {
-        return Err(OpError::InvalidStateTransition);
+        return Err(OpError::UnexpectedOpState);
     }
     Ok(())
 }
@@ -243,7 +246,7 @@ where
             sender = put_op.sender().cloned();
             // new request to put a new value for a contract, initialize the machine
             let machine = PutOp {
-                sm: StateMachine::from_state(PutState::ReceivedRequest),
+                sm: StateMachine::from_state(PutState::ReceivedRequest, tx),
                 _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, put_op, op_storage).await
@@ -435,7 +438,7 @@ where
                 .map(Message::from);
             new_state = None;
             if &PutState::BroadcastComplete != state.sm.state() {
-                return Err(OpError::InvalidStateTransition);
+                return Err(OpError::InvalidStateTransition(id));
             }
         }
         PutMsg::SuccessfulUpdate { id, new_value } => {
@@ -475,7 +478,7 @@ where
             return_msg = None;
             new_state = None;
         }
-        _ => return Err(OpError::InvalidStateTransition),
+        _ => return Err(OpError::UnexpectedOpState),
     }
     Ok(OperationResult {
         return_msg,
@@ -506,7 +509,7 @@ where
             todo!("not a valid value update, notify back to requester")
         }
         Err(err) => Err(err.into()),
-        Ok(_) => Err(OpError::InvalidStateTransition),
+        Ok(_) => Err(OpError::UnexpectedOpState),
     }
 }
 
@@ -695,7 +698,7 @@ mod test {
             &peer,
         )
         .sm;
-        let mut target = StateMachine::<PutOpSm>::from_state(PutState::ReceivedRequest);
+        let mut target = StateMachine::<PutOpSm>::from_state(PutState::ReceivedRequest, id);
 
         let req_msg = requester
             .consume_to_output::<Err>(PutMsg::RouteValue {

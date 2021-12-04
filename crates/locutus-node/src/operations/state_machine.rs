@@ -1,6 +1,8 @@
 //! Inspired by `rust-fsm`, bought in tree for modifying and tailoring it to
 //! this application needs.
 
+use crate::message::Transaction;
+
 use super::OpError;
 
 pub trait StateMachineImpl {
@@ -44,6 +46,7 @@ pub trait StateMachineImpl {
 /// state and transition and output function calls.
 pub(crate) struct StateMachine<T: StateMachineImpl> {
     state: Option<T::State>,
+    id: Transaction,
 }
 
 impl<T> StateMachine<T>
@@ -52,8 +55,11 @@ where
 {
     /// Create a new instance of this wrapper which encapsulates the given
     /// state.
-    pub fn from_state(state: T::State) -> Self {
-        Self { state: Some(state) }
+    pub fn from_state(state: T::State, id: Transaction) -> Self {
+        Self {
+            state: Some(state),
+            id,
+        }
     }
 
     /// Consumes the provided input, gives an output and performs a state
@@ -65,13 +71,16 @@ where
         &mut self,
         input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {
-        let popped_state = self.state.take().ok_or(OpError::InvalidStateTransition)?;
+        let popped_state = self
+            .state
+            .take()
+            .ok_or_else(|| OpError::InvalidStateTransition(self.id))?;
         let output = T::output_from_input_as_ref(&popped_state, &input);
         if let Some(new_state) = T::state_transition_from_input(popped_state, input) {
             self.state = Some(new_state);
             Ok(output)
         } else {
-            Err(OpError::InvalidStateTransition)
+            Err(OpError::InvalidStateTransition(self.id))
         }
     }
 
@@ -81,13 +90,16 @@ where
         &mut self,
         mut input: T::Input,
     ) -> Result<Option<T::Output>, OpError<CErr>> {
-        let mut popped_state = self.state.take().ok_or(OpError::InvalidStateTransition)?;
+        let mut popped_state = self
+            .state
+            .take()
+            .ok_or_else(|| OpError::InvalidStateTransition(self.id))?;
         if let Some(new_state) = T::state_transition(&mut popped_state, &mut input) {
             let output = T::output_from_input(popped_state, input);
             self.state = Some(new_state);
             Ok(output)
         } else {
-            Err(OpError::InvalidStateTransition)
+            Err(OpError::InvalidStateTransition(self.id))
         }
     }
 
