@@ -89,6 +89,7 @@ impl SimNetwork {
     }
 
     fn build_gateways(&mut self, num: usize) {
+        let mut configs = Vec::with_capacity(num);
         for node_no in 0..num {
             let label = format!("gateway-{}", node_no);
             let pair = identity::Keypair::generate_ed25519();
@@ -109,21 +110,40 @@ impl SimNetwork {
 
             self.event_listener
                 .add_node(label.clone(), PeerKey::from(id));
+            configs.push((
+                config,
+                GatewayConfig {
+                    label,
+                    id,
+                    port,
+                    location,
+                },
+            ));
+        }
+
+        for (mut this_node, this_config) in configs.clone() {
+            for GatewayConfig {
+                port, id, location, ..
+            } in configs.iter().filter_map(|(_, config)| {
+                if this_config.label != config.label {
+                    Some(config)
+                } else {
+                    None
+                }
+            }) {
+                this_node.add_gateway(
+                    InitPeerNode::new(*id, *location)
+                        .listening_ip(Ipv6Addr::LOCALHOST)
+                        .listening_port(*port),
+                );
+            }
 
             let gateway = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
-                config,
+                this_node,
                 Some(Box::new(self.event_listener.clone())),
             )
             .unwrap();
-            self.gateways.push((
-                gateway,
-                GatewayConfig {
-                    label,
-                    port,
-                    location,
-                    id,
-                },
-            ));
+            self.gateways.push((gateway, this_config));
         }
     }
 

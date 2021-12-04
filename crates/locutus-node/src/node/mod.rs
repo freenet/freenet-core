@@ -68,6 +68,7 @@ where
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_provider()`] method, this node will
 /// be listening but also try to connect to an existing peer.
+#[derive(Clone)]
 pub struct NodeConfig {
     /// local peer private key in
     local_key: identity::Keypair,
@@ -232,20 +233,6 @@ impl InitPeerNode {
             self.addr = Some(Multiaddr::from(Protocol::Tcp(port)));
         }
         self
-    }
-}
-
-impl std::default::Default for InitPeerNode {
-    fn default() -> Self {
-        let conf = &CONF;
-        let identifier = conf.bootstrap_id
-        .expect("At least one public identifier is required to bootstrap the connection to the network.");
-        let multi_addr = multiaddr_from_connection((conf.bootstrap_ip, conf.bootstrap_port));
-        Self {
-            addr: Some(multi_addr),
-            identifier,
-            location: Location::random(),
-        }
     }
 }
 

@@ -460,7 +460,6 @@ where
     .await
 }
 
-// TODO: un
 async fn update_state<CB, CErr>(
     conn_manager: &mut CB,
     mut state: JoinRingOp,
@@ -1091,6 +1090,7 @@ mod test {
             .collect();
         if !missing.is_empty() {
             log::error!("Nodes without connection: {:?}", missing);
+            log::error!("Total nodes without connection: {:?}", missing.len());
         }
         assert!(missing.is_empty());
         log::info!(
@@ -1135,13 +1135,23 @@ mod test {
         assert!(sim_nodes.connected("node-0"));
     }
 
-    /// Given a network of N peers all nodes should have connections.
+    /// Once a gateway is left without remaining open slots, ensure forwarding connects
     #[tokio::test(flavor = "multi_thread")]
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 3usize;
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 2, 4, 2, 1);
         sim_nodes.build().await;
-        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(10)).await
+        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(5)).await
+    }
+
+    /// Given a network of N peers all nodes should have connections.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 48usize;
+        const NUM_GW: usize = 2usize;
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 7, 5, 20, 5);
+        sim_nodes.build().await;
+        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(30)).await
     }
 }

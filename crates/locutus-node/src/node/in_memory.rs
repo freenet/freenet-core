@@ -12,7 +12,7 @@ use crate::{
         join_ring::{self, JoinRingMsg, JoinRingOp},
         put, subscribe, OpError, Operation,
     },
-    ring::{Location, PeerKeyLocation, Ring},
+    ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     utils::{ExponentialBackoff, ExtendedIter},
     NodeConfig,
@@ -30,6 +30,7 @@ where
     pub conn_manager: MemoryConnManager,
     pub op_storage: Arc<OpManager<CErr>>,
     event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
+    is_gateway: bool,
 }
 
 impl<CErr> NodeInMemory<CErr>
@@ -64,15 +65,27 @@ where
                     None
                 }
             })
+            .filter(|pkloc| pkloc.peer != peer)
             .collect();
+
+        // config.location
+
         if (config.local_ip.is_none() || config.local_port.is_none()) && gateways.is_empty() {
-            return Err(anyhow::anyhow!("At least one remote gateway is required to join an existing network for non-gateway nodes."));
+            return Err(anyhow::anyhow!(
+                    "At least one remote gateway is required to join an existing network for non-gateway nodes."
+                ));
         }
 
         let mut ring = Ring::new(peer);
-        if gateways.is_empty() {
-            // assign a random location to this gateway
-            ring.update_location(Some(Location::random()));
+        if let Some(loc) = config.location {
+            if config.local_ip.is_none() || config.local_port.is_none() {
+                return Err(anyhow::anyhow!("IP and port are required for gateways"));
+            }
+            ring.update_location(Some(loc));
+            for PeerKeyLocation { peer, location } in &gateways {
+                // all gateways are aware of each other
+                ring.add_connection((*location).unwrap(), *peer);
+            }
         }
         if let Some(max_hops_to_live) = config.max_hops_to_live {
             ring.with_max_hops(max_hops_to_live);
@@ -101,6 +114,7 @@ where
             gateways,
             notification_channel,
             event_listener,
+            is_gateway: config.location.is_some(),
         })
     }
 
@@ -108,6 +122,9 @@ where
         &mut self,
         backoff: Option<ExponentialBackoff>,
     ) -> Result<(), OpError<CErr>> {
+        if self.is_gateway {
+            return Ok(());
+        }
         if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {
             let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &self.peer_key);
             // initiate join action action per each gateway
@@ -135,7 +152,7 @@ where
             join_ring::join_ring_request(tx_id, &self.op_storage, &mut self.conn_manager, op)
                 .await?;
         } else {
-            log::warn!("no gateways provided, single gateway node setup for this node");
+            log::warn!("No gateways provided, single gateway node setup for this node");
         }
         Ok(())
     }
@@ -180,11 +197,18 @@ where
                             Some(Operation::JoinRing(JoinRingOp {
                                 backoff: Some(backoff),
                                 ..
-                            })) => self.join_ring(Some(backoff)).await?,
-                            _ => {
-                                log::error!("{}", MSG);
-                                anyhow::bail!(MSG);
+                            })) => {
+                                if cfg!(test) {
+                                    self.join_ring(None).await?
+                                } else {
+                                    self.join_ring(Some(backoff)).await?
+                                }
                             }
+                            None => {
+                                log::error!("{}", MSG);
+                                self.join_ring(None).await?
+                            }
+                            _ => {}
                         }
                     }
                     _ => todo!(),
