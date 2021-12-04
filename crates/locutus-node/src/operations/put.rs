@@ -51,6 +51,10 @@ impl PutOp {
             _ttl: PEER_TIMEOUT,
         }
     }
+
+    pub fn id(&self) -> Transaction {
+        self.sm.id
+    }
 }
 
 struct PutOpSm;
