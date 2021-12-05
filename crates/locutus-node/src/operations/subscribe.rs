@@ -505,7 +505,7 @@ mod messages {
 mod test {
     use super::*;
     use crate::contract::Contract;
-    use crate::node::test_utils::{NodeSpecification, SimNetwork};
+    use crate::node::test_utils::{NodeSpecification, SimNetwork, check_connectivity};
     use crate::ring::Location;
     use crate::user_events::UserEvent;
     use crate::{conn_manager::PeerKey, node::SimStorageError};
@@ -602,30 +602,36 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 4usize;
+        const NUM_GW: usize = 1usize;
+
+
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let contract_key: ContractKey = contract.key();
+        
         let event = UserEvent::Subscribe { key: contract_key };
-
         let first_node = NodeSpecification {
             owned_contracts: Vec::new(),
             non_owned_contracts: vec![contract_key],
-            events_to_generate: vec![event],
+            events_to_generate: HashMap::from_iter([(1, event)]),
         };
 
         let second_node = NodeSpecification {
             owned_contracts: vec![contract],
             non_owned_contracts: Vec::new(),
-            events_to_generate: Vec::new(),
+            events_to_generate: HashMap::new(),
         };
 
         let subscribe_specs = HashMap::from_iter([
             ("node-0".to_string(), first_node),
             ("node-1".to_string(), second_node),
         ]);
-        let mut sim_nodes = SimNetwork::new(1, 2, 10, 7, 100, 20);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         sim_nodes.build_with_specs(subscribe_specs);
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+
         Ok(())
     }
 }

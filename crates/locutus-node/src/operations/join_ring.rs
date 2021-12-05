@@ -974,12 +974,15 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::*;
     use crate::{
         message::TxType,
-        node::{test_utils::SimNetwork, SimStorageError},
+        node::{
+            test_utils::{check_connectivity, SimNetwork},
+            SimStorageError,
+        },
     };
 
     #[test]
@@ -1064,68 +1067,6 @@ mod test {
         assert!(join_gw_1.consume_to_output::<SimStorageError>(res).is_err());
     }
 
-    async fn check_connectivity(
-        sim_nodes: SimNetwork,
-        num_nodes: usize,
-        wait_time: Duration,
-    ) -> Result<(), anyhow::Error> {
-        let mut connected = HashSet::new();
-        let elapsed = Instant::now();
-        while elapsed.elapsed() < wait_time && connected.len() < num_nodes {
-            for node in 0..num_nodes {
-                if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
-                    connected.insert(node);
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
-        let expected = HashSet::from_iter(0..num_nodes);
-        let missing: Vec<_> = expected
-            .difference(&connected)
-            .map(|n| {
-                let label = format!("node-{}", n);
-                let key = sim_nodes.labels[&label];
-                (label, key)
-            })
-            .collect();
-        if !missing.is_empty() {
-            log::error!("Nodes without connection: {:?}", missing);
-            log::error!("Total nodes without connection: {:?}", missing.len());
-        }
-        assert!(missing.is_empty());
-        log::info!(
-            "Required time for connecting all peers: {} secs",
-            elapsed.elapsed().as_secs()
-        );
-
-        let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
-        log::info!("Ring distribution: {:?}", hist);
-
-        let node_connectivity = sim_nodes.node_connectivity();
-        let mut connections_per_peer: Vec<_> = node_connectivity
-            .iter()
-            .map(|(k, v)| (k, v.len()))
-            .filter_map(|(k, v)| {
-                if !k.starts_with("gateway") {
-                    Some(v)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // ensure at least some normal nodes have more than one connection
-        connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
-        assert!(connections_per_peer.iter().last().unwrap() > &1);
-
-        // ensure the average number of connections per peer is above N
-        let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
-        log::info!("Average connections: {}", avg_connections);
-        assert!(avg_connections > 1);
-
-        Ok(())
-    }
-
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_connects_to_gw() {
@@ -1142,7 +1083,7 @@ mod test {
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         sim_nodes.build();
-        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(3)).await
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await
     }
 
     /// Given a network of N peers all nodes should have connections.
@@ -1150,8 +1091,8 @@ mod test {
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 2usize;
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 5, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 1000, 2);
         sim_nodes.build();
-        check_connectivity(sim_nodes, NUM_NODES, Duration::from_secs(20)).await
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(20)).await
     }
 }

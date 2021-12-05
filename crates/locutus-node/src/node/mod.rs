@@ -11,10 +11,13 @@ use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
+#[cfg(test)]
 use crate::conn_manager::PeerKey;
-use crate::contract::MemoryContractHandler;
-use crate::operations::{subscribe, OpError};
+#[cfg(test)]
 use crate::user_events::test_utils::MemoryEventsGen;
+
+use self::libp2p_impl::NodeLibP2P;
+use crate::operations::{subscribe, OpError};
 use crate::{
     config::CONF,
     contract::ContractError,
@@ -23,8 +26,8 @@ use crate::{
     user_events::{UserEvent, UserEventsProxy},
 };
 
-use self::libp2p_impl::NodeLibP2P;
 pub(crate) use event_listener::{EventListener, EventLog};
+#[cfg(test)]
 pub(crate) use in_memory::NodeInMemory;
 pub(crate) use op_state::OpManager;
 
@@ -37,12 +40,14 @@ pub(crate) mod test_utils;
 
 pub struct Node(NodeImpl);
 
+#[cfg(test)]
 impl Node {
     pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
             NodeImpl::InMemory(ref mut node) => {
-                let (_usr_ev_controller, rcv_copy) = tokio::sync::watch::channel(PeerKey::random());
+                let (_usr_ev_controller, rcv_copy) =
+                    tokio::sync::watch::channel((0, PeerKey::random()));
                 let user_events = MemoryEventsGen::new(rcv_copy, node.peer_key);
                 node.listen_on(user_events).await
             }
@@ -50,12 +55,27 @@ impl Node {
     }
 }
 
+#[cfg(not(test))]
+impl Node {
+    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
+        match self.0 {
+            NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
+        }
+    }
+}
+
+#[cfg(test)]
 enum NodeImpl<StorageErr = SimStorageError>
 where
     StorageErr: std::error::Error,
 {
     LibP2P(Box<NodeLibP2P>),
     InMemory(Box<NodeInMemory<StorageErr>>),
+}
+
+#[cfg(not(test))]
+enum NodeImpl {
+    LibP2P(Box<NodeLibP2P>),
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -161,19 +181,14 @@ impl NodeConfig {
         Ok(Node(NodeImpl::LibP2P(Box::new(NodeLibP2P::build(self)?))))
     }
 
+    #[cfg(test)]
     /// Builds a node using in-memory transport. Used for testing pourpouses.
     pub fn build_in_memory(self) -> Result<Node, anyhow::Error> {
+        use crate::contract::MemoryContractHandler;
+
         let listener;
-        #[cfg(test)]
-        {
-            use self::event_listener::TestEventListener;
-            listener = Box::new(TestEventListener::new())
-        }
-        #[cfg(not(test))]
-        {
-            use self::event_listener::EventRegister;
-            listener = Box::new(EventRegister::new())
-        }
+        use self::event_listener::TestEventListener;
+        listener = Box::new(TestEventListener::new());
         let in_mem =
             NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(self, Some(listener))?;
         Ok(Node(NodeImpl::InMemory(Box::new(in_mem))))

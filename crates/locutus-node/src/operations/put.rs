@@ -677,7 +677,16 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::{conn_manager::PeerKey, node::SimStorageError};
+    use std::collections::HashMap;
+
+    use crate::{
+        conn_manager::PeerKey,
+        node::{
+            test_utils::{check_connectivity, NodeSpecification, SimNetwork},
+            SimStorageError,
+        },
+        user_events::UserEvent,
+    };
 
     use super::*;
 
@@ -745,6 +754,43 @@ mod test {
         let finished = requester.consume_to_state::<SimStorageError>(res_msg)?;
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert!(finished.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 4usize;
+        const NUM_GW: usize = 1usize;
+
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary()?;
+        let value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
+
+        let put_event = UserEvent::Put {
+            contract: contract.clone(),
+            value,
+        };
+        let first_node = NodeSpecification {
+            owned_contracts: vec![contract.clone()],
+            non_owned_contracts: vec![],
+            events_to_generate: HashMap::from_iter([(1, put_event)]),
+        };
+
+        let second_node = NodeSpecification {
+            owned_contracts: vec![contract],
+            non_owned_contracts: vec![],
+            events_to_generate: HashMap::new(),
+        };
+
+        let put_specs = HashMap::from_iter([
+            ("node-0".to_string(), first_node),
+            ("node-1".to_string(), second_node),
+        ]);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        sim_nodes.build_with_specs(put_specs);
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+
         Ok(())
     }
 }

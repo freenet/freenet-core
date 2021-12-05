@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    collections::{HashMap, HashSet},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener}, time::{Duration, Instant},
 };
 
 use itertools::Itertools;
@@ -44,8 +44,8 @@ pub fn get_dynamic_port() -> u16 {
 pub(crate) struct SimNetwork {
     event_listener: TestEventListener,
     pub labels: HashMap<String, PeerKey>,
-    usr_ev_controller: Sender<PeerKey>,
-    receiver_ch: Receiver<PeerKey>,
+    usr_ev_controller: Sender<(EventId, PeerKey)>,
+    receiver_ch: Receiver<(EventId, PeerKey)>,
     gateways: Vec<(NodeInMemory<SimStorageError>, GatewayConfig)>,
     nodes: Vec<(NodeInMemory<SimStorageError>, String)>,
     ring_max_htl: usize,
@@ -54,11 +54,13 @@ pub(crate) struct SimNetwork {
     min_connections: usize,
 }
 
+pub(crate) type EventId = usize;
+
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
     pub owned_contracts: Vec<Contract>,
     pub non_owned_contracts: Vec<ContractKey>,
-    pub events_to_generate: Vec<UserEvent>,
+    pub events_to_generate: HashMap<EventId, UserEvent>,
 }
 
 #[derive(Clone)]
@@ -79,7 +81,7 @@ impl SimNetwork {
         min_connections: usize,
     ) -> Self {
         assert!(gateways > 0 && nodes > 0);
-        let (usr_ev_controller, _rcv_copy) = channel(PeerKey::random());
+        let (usr_ev_controller, _rcv_copy) = channel((0, PeerKey::random()));
         let mut net = Self {
             event_listener: TestEventListener::new(),
             labels: HashMap::new(),
@@ -281,6 +283,67 @@ fn group_locations_in_buckets(
     distances
         .into_iter()
         .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)) as f64, v))
+}
+
+pub(crate) async fn check_connectivity(
+    sim_nodes: &SimNetwork,
+    num_nodes: usize,
+    wait_time: Duration,
+) -> Result<(), anyhow::Error> {
+    let mut connected = HashSet::new();
+    let elapsed = Instant::now();
+    while elapsed.elapsed() < wait_time && connected.len() < num_nodes {
+        for node in 0..num_nodes {
+            if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
+                connected.insert(node);
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let expected = HashSet::from_iter(0..num_nodes);
+    let missing: Vec<_> = expected
+        .difference(&connected)
+        .map(|n| {
+            let label = format!("node-{}", n);
+            let key = sim_nodes.labels[&label];
+            (label, key)
+        })
+        .collect();
+    if !missing.is_empty() {
+        log::error!("Nodes without connection: {:?}", missing);
+        log::error!("Total nodes without connection: {:?}", missing.len());
+    }
+    assert!(missing.is_empty());
+    log::info!(
+        "Required time for connecting all peers: {} secs",
+        elapsed.elapsed().as_secs()
+    );
+
+    let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
+    log::info!("Ring distribution: {:?}", hist);
+
+    let node_connectivity = sim_nodes.node_connectivity();
+    let mut connections_per_peer: Vec<_> = node_connectivity
+        .iter()
+        .map(|(k, v)| (k, v.len()))
+        .filter_map(|(k, v)| {
+            if !k.starts_with("gateway") {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // ensure at least some normal nodes have more than one connection
+    connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
+    assert!(connections_per_peer.iter().last().unwrap() > &1);
+
+    // ensure the average number of connections per peer is above N
+    let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
+    log::info!("Average connections: {}", avg_connections);
+    assert!(avg_connections > 1);
+    Ok(())
 }
 
 #[test]

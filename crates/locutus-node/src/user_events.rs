@@ -28,32 +28,33 @@ pub(crate) enum UserEvent {
     Subscribe { key: ContractKey },
 }
 
+#[cfg(test)]
 pub(crate) mod test_utils {
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     use arbitrary::{Arbitrary, Unstructured};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
     use super::*;
-    use crate::{conn_manager::PeerKey, test_utils::random_bytes_128};
+    use crate::{conn_manager::PeerKey, node::test_utils::EventId, test_utils::random_bytes_128};
 
     pub(crate) struct MemoryEventsGen {
-        signal: Receiver<PeerKey>,
+        signal: Receiver<(EventId, PeerKey)>,
         id: PeerKey,
         non_owned_contracts: Vec<ContractKey>,
         owned_contracts: Vec<Contract>,
-        events_to_gen: Vec<UserEvent>,
+        events_to_gen: HashMap<EventId, UserEvent>,
     }
 
     impl MemoryEventsGen {
-        pub fn new(signal: Receiver<PeerKey>, id: PeerKey) -> Self {
+        pub fn new(signal: Receiver<(EventId, PeerKey)>, id: PeerKey) -> Self {
             Self {
                 signal,
                 id,
                 non_owned_contracts: Vec::new(),
                 owned_contracts: Vec::new(),
-                events_to_gen: Vec::new(),
+                events_to_gen: HashMap::new(),
             }
         }
 
@@ -68,12 +69,12 @@ pub(crate) mod test_utils {
         }
 
         /// Events that the user generate.
-        pub fn generate_events(&mut self, events: impl IntoIterator<Item = UserEvent>) {
+        pub fn generate_events(&mut self, events: impl IntoIterator<Item = (EventId, UserEvent)>) {
             self.events_to_gen.extend(events.into_iter())
         }
 
-        fn generate_deterministic_event(&mut self) -> UserEvent {
-            self.events_to_gen.remove(0)
+        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<UserEvent> {
+            self.events_to_gen.remove(id)
         }
 
         fn generate_rand_event(&mut self) -> UserEvent {
@@ -139,8 +140,11 @@ pub(crate) mod test_utils {
         async fn recv(&mut self) -> UserEvent {
             loop {
                 if self.signal.changed().await.is_ok() {
-                    if *self.signal.borrow() == self.id {
-                        return self.generate_deterministic_event();
+                    let (ev_id, pk) = *self.signal.borrow();
+                    if pk == self.id {
+                        return self
+                            .generate_deterministic_event(&ev_id)
+                            .expect("event not found");
                     }
                 } else {
                     log::debug!("sender half of user event gen dropped");
