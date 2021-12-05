@@ -285,6 +285,10 @@ where
                 }
                 UserEvent::Get { key, contract } => {
                     // Initialize a get op.
+                    log::info!(
+                        "Received get user event at node {}",
+                        &op_storage_cp.ring.peer_key
+                    );
                     let op = get::GetOp::start_op(key, contract, &op_storage_cp.ring.peer_key);
                     if let Err(err) = get::request_get(&op_storage_cp, op).await {
                         log::error!("{}", err);

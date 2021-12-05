@@ -235,6 +235,7 @@ where
                                 Self::report_result(op_result);
                             }
                             Message::Get(op) => {
+                                log::info!("Handling get request");
                                 let op_result =
                                     get::handle_get_request(&op_storage, &mut conn_manager, op)
                                         .await;

@@ -27,14 +27,14 @@ impl GetOp {
     const MAX_RETRIES: usize = 10;
 
     pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> Self {
-        let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), id);
+        let tx = Transaction::new(<GetMsg as TxType>::tx_type_id(), id);
         let sm = StateMachine::from_state(
             GetState::PrepareRequest {
                 key,
-                id,
+                id: tx,
                 fetch_contract,
             },
-            id,
+            tx,
         );
         GetOp {
             sm,
@@ -243,8 +243,14 @@ where
             *id,
         )
     } else {
+        log::info!("Unexpected op state");
         return Err(OpError::UnexpectedOpState);
     };
+    log::info!(
+        "Preparing get contract request to {} (tx: {})",
+        target.peer,
+        id
+    );
     if let Some(req_get) = get_op
         .sm
         .consume_to_output(GetMsg::FetchRouting { target, id })?
@@ -321,6 +327,13 @@ where
                 GetState::AwaitingResponse { .. }
             ));
             new_state = Some(state);
+            log::info!(
+                "Recived {} message, seek new node {} where to find the contract {} (tx: {})",
+                other_host_msg,
+                target.peer,
+                key,
+                id
+            );
             return_msg = Some(Message::from(GetMsg::SeekNode {
                 key,
                 id,
@@ -384,6 +397,8 @@ where
                     }) if fetch_contract => return Err(ContractError::ContractNotFound(key).into()),
                     _ => {}
                 }
+
+                log::info!("Contract {} found at node {}", returned_key, sender.peer);
 
                 return_msg = state
                     .sm
@@ -597,11 +612,14 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
+    use crate::user_events::UserEvent;
     use crate::{
         contract::{Contract, ContractValue},
         node::SimStorageError,
         ring::Location,
     };
+    use std::collections::HashMap;
 
     use super::*;
 
@@ -652,6 +670,45 @@ mod test {
         let res_msg = requester.consume_to_output::<Err>(res_msg)?;
         assert!(res_msg.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 2usize;
+        const NUM_GW: usize = 1usize;
+
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary()?;
+        let key = contract.key();
+
+        let get_event = UserEvent::Get {
+            key: key.clone(),
+            contract: false,
+        };
+
+        let first_node = NodeSpecification {
+            owned_contracts: vec![],
+            non_owned_contracts: vec![key],
+            events_to_generate: HashMap::from_iter([(1, get_event)]),
+        };
+
+        let second_node = NodeSpecification {
+            owned_contracts: vec![contract],
+            non_owned_contracts: vec![],
+            events_to_generate: HashMap::new(),
+        };
+
+        let get_specs = HashMap::from_iter([
+            ("node-0".to_string(), first_node),
+            ("node-1".to_string(), second_node),
+        ]);
+
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        sim_nodes.build_with_specs(get_specs);
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+        sim_nodes.trigger_event("node-0", 1)?;
         Ok(())
     }
 }
