@@ -790,6 +790,7 @@ mod test {
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         sim_nodes.build_with_specs(put_specs);
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+        sim_nodes.trigger_event("node-0", 1)?;
 
         Ok(())
     }

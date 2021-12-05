@@ -14,6 +14,7 @@ pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, StoreResponse,
 };
+#[cfg(test)]
 pub(crate) use test_utils::MemoryContractHandler;
 
 const CONTRACT_KEY_SIZE: usize = 64;

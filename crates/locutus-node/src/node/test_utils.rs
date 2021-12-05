@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener}, time::{Duration, Instant},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    time::{Duration, Instant},
 };
 
 use itertools::Itertools;
@@ -262,6 +263,17 @@ impl SimNetwork {
             );
         }
         peers_connections
+    }
+
+    pub fn trigger_event(&self, label: &str, event_id: EventId) -> Result<(), anyhow::Error> {
+        let peer = self
+            .labels
+            .get(label)
+            .ok_or_else(|| anyhow::anyhow!("node not found"))?;
+        self.usr_ev_controller
+            .send((event_id, *peer))
+            .expect("node listeners disconnected");
+        Ok(())
     }
 }
 
