@@ -44,3 +44,7 @@ Locutus is the development name for this software; it may change on launch.
 ### Status
 
 Locutus is currently in development, with an initial release planned for Q1 2022.
+
+### Chat with us
+
+We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
