@@ -595,6 +595,15 @@ mod messages {
                 _ => None,
             }
         }
+
+        pub fn target(&self) -> Option<&PeerKeyLocation> {
+            match self {
+                Self::FetchRouting { target, .. } => Some(target),
+                Self::SeekNode { target, .. } => Some(target),
+                Self::RequestGet { target, .. } => Some(target),
+                _ => None,
+            }
+        }
     }
 
     impl Display for GetMsg {
@@ -620,6 +629,7 @@ mod test {
         ring::Location,
     };
     use std::collections::HashMap;
+    use tokio::time::sleep;
 
     use super::*;
 
@@ -673,7 +683,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
@@ -709,6 +719,7 @@ mod test {
         sim_nodes.build_with_specs(get_specs);
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
         sim_nodes.trigger_event("node-0", 1)?;
+        sleep(Duration::from_secs(100)).await;
         Ok(())
     }
 }

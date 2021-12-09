@@ -100,7 +100,7 @@ where
                 self.put.insert(id, tx);
             }
             Operation::Get(tx) => {
-                check_id_op!(id.tx_type(), TransactionType::Put);
+                check_id_op!(id.tx_type(), TransactionType::Get);
                 self.get.insert(id, tx);
             }
             Operation::Subscribe(tx) => {
