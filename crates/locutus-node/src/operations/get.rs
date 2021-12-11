@@ -190,12 +190,14 @@ impl StateMachineImpl for GetOpSm {
                     key,
                     value,
                     sender,
+                    target,
                 },
             ) => Some(GetMsg::ReturnGet {
                 id,
                 key,
                 value,
                 sender,
+                target,
             }),
             _ => None,
         }
@@ -243,10 +245,9 @@ where
             *id,
         )
     } else {
-        log::info!("Unexpected op state");
         return Err(OpError::UnexpectedOpState);
     };
-    log::info!(
+    log::debug!(
         "Preparing get contract request to {} (tx: {})",
         target.peer,
         id
@@ -327,8 +328,8 @@ where
                 GetState::AwaitingResponse { .. }
             ));
             new_state = Some(state);
-            log::info!(
-                "Recived {} message, seek new node {} where to find the contract {} (tx: {})",
+            log::debug!(
+                "Received {} message, seek new node {} where to find the contract {} (tx: {})",
                 other_host_msg,
                 target.peer,
                 key,
@@ -338,6 +339,7 @@ where
                 key,
                 id,
                 target,
+                sender: op_storage.ring.own_location(),
                 fetch_contract,
             }));
         }
@@ -345,13 +347,16 @@ where
             key,
             id,
             fetch_contract,
+            sender,
             ..
         } => {
-            let sender = op_storage.ring.own_location();
             if !op_storage.ring.contract_exists(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
-                log::warn!("Contract {} not found while processing a get request", key);
+                log::warn!(
+                    "Contract `{}` not found while processing a get request",
+                    key
+                );
                 return Ok(OperationResult {
                     return_msg: Some(Message::from(GetMsg::ReturnGet {
                         key,
@@ -360,7 +365,8 @@ where
                             value: None,
                             contract: None,
                         },
-                        sender,
+                        sender: op_storage.ring.own_location(),
+                        target: sender, // return to requester
                     })),
                     state: None,
                 });
@@ -398,7 +404,7 @@ where
                     _ => {}
                 }
 
-                log::info!("Contract {} found at node {}", returned_key, sender.peer);
+                log::debug!("Contract `{}` found @ peer {}", returned_key, sender.peer);
 
                 return_msg = state
                     .sm
@@ -407,6 +413,7 @@ where
                         id,
                         value: value.map_err(ContractError::from)?,
                         sender,
+                        target: op_storage.ring.own_location(),
                     })?
                     .map(Message::from);
                 new_state = Some(state);
@@ -423,12 +430,14 @@ where
                     contract: None,
                 },
             sender,
+            target,
             ..
         } => {
+            let this_loc = target;
             log::warn!(
-                "Contract value for {} not available from peer {}, retrying with other peers.",
-                sender.peer,
-                key
+                "Neither contract or contract value for contract `{}` found at peer {}, retrying with other peers.",
+                key,
+                sender.peer
             );
             // will error out in case it has reached max number of retries
             state
@@ -437,6 +446,7 @@ where
                     id,
                     key,
                     sender,
+                    target,
                     value: StoreResponse {
                         value: None,
                         contract: None,
@@ -459,6 +469,7 @@ where
                         id,
                         key,
                         target,
+                        sender: this_loc,
                         fetch_contract: *fetch_contract,
                     }));
                     new_state = Some(state);
@@ -478,6 +489,7 @@ where
                 },
             id,
             sender,
+            target,
         } => {
             let require_contract = matches!(
                 state.sm.state(),
@@ -494,8 +506,13 @@ where
                     op_storage
                         .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                         .await?;
+                    log::debug!("Contract `{}` successfully put", contract.key());
                 } else {
                     // no contract, consider this like an error ignoring the incoming update value
+                    log::warn!(
+                        "Contract not received from peer {} while requested",
+                        sender.peer
+                    );
                     op_storage
                         .notify_change(
                             Message::from(GetMsg::ReturnGet {
@@ -506,6 +523,7 @@ where
                                     contract: None,
                                 },
                                 sender,
+                                target,
                             }),
                             Operation::Get(state),
                         )
@@ -531,6 +549,7 @@ where
                     },
                     id,
                     sender,
+                    target,
                 })?
                 .map(Message::from);
             new_state = None;
@@ -568,14 +587,16 @@ mod messages {
         SeekNode {
             id: Transaction,
             key: ContractKey,
-            target: PeerKeyLocation,
             fetch_contract: bool,
+            target: PeerKeyLocation,
+            sender: PeerKeyLocation,
         },
         ReturnGet {
             id: Transaction,
             key: ContractKey,
             value: StoreResponse,
             sender: PeerKeyLocation,
+            target: PeerKeyLocation,
         },
     }
 
@@ -601,7 +622,7 @@ mod messages {
                 Self::FetchRouting { target, .. } => Some(target),
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestGet { target, .. } => Some(target),
-                _ => None,
+                Self::ReturnGet { target, .. } => Some(target),
             }
         }
     }
@@ -629,7 +650,6 @@ mod test {
         ring::Location,
     };
     use std::collections::HashMap;
-    use tokio::time::sleep;
 
     use super::*;
 
@@ -643,6 +663,10 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
+            location: Some(Location::random()),
+            peer: PeerKey::random(),
+        };
+        let sender_loc = PeerKeyLocation {
             location: Some(Location::random()),
             peer: PeerKey::random(),
         };
@@ -672,6 +696,7 @@ mod test {
                     value: Some(ContractValue::new(b"abc".to_vec())),
                 },
                 sender: target_loc,
+                target: sender_loc,
             })?
             .ok_or_else(|| anyhow::anyhow!("no msg"))?;
         assert!(matches!(target.state(), GetState::Completed));
@@ -692,42 +717,82 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();
-        let value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
-        let put_event = UserEvent::Put {
-            contract: contract.clone(),
-            value,
+        let node_0 = NodeSpecification {
+            owned_contracts: vec![contract],
+            non_owned_contracts: vec![],
+            events_to_generate: HashMap::new(),
         };
 
         let get_event = UserEvent::Get {
-            key: key.clone(),
+            key,
             contract: false,
         };
-
-        let first_node = NodeSpecification {
+        let node_1 = NodeSpecification {
             owned_contracts: vec![],
             non_owned_contracts: vec![key],
-            events_to_generate: HashMap::from_iter([(1, put_event), (2, get_event)]),
+            events_to_generate: HashMap::from_iter([(1, get_event)]),
         };
 
-        let second_node = NodeSpecification {
+        let get_specs = HashMap::from_iter([
+            ("node-0".to_string(), node_0),
+            ("node-1".to_string(), node_1),
+        ]);
+
+        // establish network
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        sim_nodes.build_with_specs(get_specs);
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+
+        // trigger get @ node-1, which does not own the contract
+        sim_nodes.trigger_event("node-1", 1)?;
+
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        // FIXME: check tx finished succesfully
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+    async fn contract_not_found() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 2usize;
+        const NUM_GW: usize = 1usize;
+
+        let bytes = crate::test_utils::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary()?;
+        let key = contract.key();
+
+        let node_0 = NodeSpecification {
             owned_contracts: vec![],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
         };
 
+        let get_event = UserEvent::Get {
+            key,
+            contract: false,
+        };
+        let node_1 = NodeSpecification {
+            owned_contracts: vec![],
+            non_owned_contracts: vec![key],
+            events_to_generate: HashMap::from_iter([(1, get_event)]),
+        };
+
         let get_specs = HashMap::from_iter([
-            ("node-0".to_string(), first_node),
-            ("node-1".to_string(), second_node),
+            ("node-0".to_string(), node_0),
+            ("node-1".to_string(), node_1),
         ]);
 
+        // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         sim_nodes.build_with_specs(get_specs);
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
-        sim_nodes.trigger_event("node-0", 1)?;
-        sleep(Duration::from_secs(10)).await;
-        sim_nodes.trigger_event("node-0", 2)?;
-        sleep(Duration::from_secs(100)).await;
+
+        // trigger get @ node-1, which does not own the contract
+        sim_nodes.trigger_event("node-1", 1)?;
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // FIXME: check tx finished unsuccesfully
         Ok(())
     }
 }

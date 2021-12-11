@@ -18,6 +18,13 @@ use crate::{
     NodeConfig,
 };
 
+#[cfg(test)]
+use crate::contract::Contract;
+#[cfg(test)]
+use crate::contract::ContractError;
+#[cfg(test)]
+use crate::contract::ContractHandlerEvent;
+
 use super::{op_state::OpManager, EventListener};
 
 pub(crate) struct NodeInMemory<CErr>
@@ -116,6 +123,21 @@ where
             event_listener,
             is_gateway: config.location.is_some(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn append_contracts(
+        &self,
+        contracts: Vec<Contract>,
+    ) -> Result<(), ContractError<CErr>> {
+        for contract in contracts {
+            let key = contract.key();
+            self.op_storage
+                .notify_contract_handler(ContractHandlerEvent::Cache(contract))
+                .await?;
+            self.op_storage.ring.cached_contracts.insert(key);
+        }
+        Ok(())
     }
 
     async fn join_ring(
@@ -235,7 +257,7 @@ where
                                 Self::report_result(op_result);
                             }
                             Message::Get(op) => {
-                                log::info!("Handling get request");
+                                log::info!("Handling get request @ {}", op_storage.ring.peer_key);
                                 let op_result =
                                     get::handle_get_request(&op_storage, &mut conn_manager, op)
                                         .await;

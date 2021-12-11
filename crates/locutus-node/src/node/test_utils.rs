@@ -224,13 +224,20 @@ impl SimNetwork {
         node_specs: Option<NodeSpecification>,
     ) {
         let mut user_events = MemoryEventsGen::new(self.receiver_ch.clone(), peer.peer_key);
-        if let Some(specs) = node_specs {
+        if let Some(specs) = node_specs.clone() {
             user_events.has_contract(specs.owned_contracts);
             user_events.request_contracts(specs.non_owned_contracts);
             user_events.generate_events(specs.events_to_generate);
         }
         self.labels.insert(label, peer.peer_key);
-        tokio::spawn(async move { peer.listen_on(user_events).await });
+        tokio::spawn(async move {
+            if let Some(specs) = node_specs {
+                peer.append_contracts(specs.owned_contracts)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("failed inserting test owned contracts"))?;
+            }
+            peer.listen_on(user_events).await
+        });
     }
 
     pub fn connected(&self, peer: &str) -> bool {

@@ -3,7 +3,6 @@
 //! as well as will broadcast updates to the contract value to all subscribers.
 // FIXME: should allow to do partial value updates
 
-use log::info;
 use std::time::Duration;
 
 use crate::{
@@ -296,7 +295,7 @@ where
         } => {
             let sender = op_storage.ring.own_location();
 
-            log::info!(
+            log::debug!(
                 "Performing a RequestPut for contract {} from {} to {}",
                 contract.key(),
                 sender.peer,
@@ -309,7 +308,7 @@ where
                 target,
                 value,
                 contract,
-                htl: PutOp::MAX_RETRIES,
+                htl,
                 skip_list: vec![sender.peer],
             }));
 
@@ -328,34 +327,41 @@ where
             let key = contract.key();
             let cached_contract = op_storage.ring.contract_exists(&key);
 
-            log::info!(
-                "Performing a SeekNode into {}, trying put the contract {}",
+            log::debug!(
+                "Performing a SeekNode at {}, trying put the contract {}",
                 target.peer,
                 key
             );
 
             if !cached_contract && op_storage.ring.within_caching_distance(&key.location()) {
-                log::info!("Node {} has not cached the contract {}", target.peer, key);
-                log::info!("Caching the contract...");
+                log::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
                 // this node does not have the contract, so instead store the contract and execute the put op.
-                op_storage
+                let res = op_storage
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
+                if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
+                    op_storage.ring.cached_contracts.insert(key);
+                    log::debug!("Contract successfully cached");
+                } else {
+                    log::error!(
+                        "Contract handler returned wrong event when trying to cache contract, this should not happen!"
+                    );
+                    return Err(OpError::UnexpectedOpState);
+                }
             } else if !cached_contract {
-                log::info!(
-                    "Node {} is not within the distance needed to be cached",
-                    key
-                );
                 // in this case forward to a closer node to the target location and just wait for a response
                 // to give back to requesting peer
                 // FIXME
-                log::warn!("Contract {} not found while processing info", key);
+                log::warn!(
+                    "Contract {} not found while processing info, forwarding",
+                    key
+                );
             }
 
             // after the contract has been cached, push the update query
-            log::info!("Putting the contract after being cached...");
+            log::debug!("Attempting contrat value update");
             let new_value = put_contract(op_storage, key, value).await?;
-            log::info!("Contract successfully added!");
+            log::debug!("Contract successfully added!");
             // if the change was successful, communicate this back to the requestor and broadcast the change
             conn_manager
                 .send(
@@ -379,7 +385,7 @@ where
                     new_value.clone(),
                     id,
                     new_htl,
-                    &skip_list.as_slice(),
+                    skip_list.as_slice(),
                 )
                 .await;
             }
@@ -499,9 +505,18 @@ where
             let within_caching_dist = op_storage.ring.within_caching_distance(&key.location());
             if !cached_contract && within_caching_dist {
                 // this node does not have the contract, so instead store the contract and execute the put op.
-                op_storage
+                let res = op_storage
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
+                if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
+                    op_storage.ring.cached_contracts.insert(key);
+                    log::debug!("Contract successfully cached");
+                } else {
+                    log::error!(
+                            "Contract handler returned wrong event when trying to cache contract, this should not happen!"
+                        );
+                    return Err(OpError::UnexpectedOpState);
+                }
             } else if !within_caching_dist {
                 // not a contract this node cares about; do nothing
                 return Ok(OperationResult {
@@ -662,6 +677,8 @@ mod messages {
             contract: Contract,
             /// max hops to live
             htl: usize,
+            // FIXME: remove skip list once we deduplicate at top msg handling level
+            // using this is a tmp workaround until (https://github.com/freenet/locutus/issues/13) is done
             skip_list: Vec<PeerKey>,
         },
         /// Internal node instruction that  a change (either a first time insert or an update).
@@ -825,27 +842,31 @@ mod test {
             contract: contract.clone(),
             value,
         };
-        let first_node = NodeSpecification {
+        let node_0 = NodeSpecification {
             owned_contracts: vec![contract.clone()],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::from_iter([(1, put_event)]),
         };
 
-        let second_node = NodeSpecification {
+        let node_1 = NodeSpecification {
             owned_contracts: vec![contract],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
         };
 
+        // establish network
         let put_specs = HashMap::from_iter([
-            ("node-0".to_string(), first_node),
-            ("node-1".to_string(), second_node),
+            ("node-0".to_string(), node_0),
+            ("node-1".to_string(), node_1),
         ]);
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         sim_nodes.build_with_specs(put_specs);
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+
+        // trigger the put op @ node 0
         sim_nodes.trigger_event("node-0", 1)?;
 
+        tokio::time::sleep(Duration::from_secs(300)).await;
         Ok(())
     }
 }
