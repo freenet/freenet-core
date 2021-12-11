@@ -692,6 +692,12 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();
+        let value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
+
+        let put_event = UserEvent::Put {
+            contract: contract.clone(),
+            value,
+        };
 
         let get_event = UserEvent::Get {
             key: key.clone(),
@@ -701,11 +707,11 @@ mod test {
         let first_node = NodeSpecification {
             owned_contracts: vec![],
             non_owned_contracts: vec![key],
-            events_to_generate: HashMap::from_iter([(1, get_event)]),
+            events_to_generate: HashMap::from_iter([(1, put_event), (2, get_event)]),
         };
 
         let second_node = NodeSpecification {
-            owned_contracts: vec![contract],
+            owned_contracts: vec![],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
         };
@@ -719,6 +725,8 @@ mod test {
         sim_nodes.build_with_specs(get_specs);
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
         sim_nodes.trigger_event("node-0", 1)?;
+        sleep(Duration::from_secs(10)).await;
+        sim_nodes.trigger_event("node-0", 2)?;
         sleep(Duration::from_secs(100)).await;
         Ok(())
     }

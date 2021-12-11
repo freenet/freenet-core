@@ -3,6 +3,7 @@
 //! as well as will broadcast updates to the contract value to all subscribers.
 // FIXME: should allow to do partial value updates
 
+use log::info;
 use std::time::Duration;
 
 use crate::{
@@ -29,6 +30,8 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
+    const MAX_RETRIES: usize = 10;
+
     pub fn start_op(contract: Contract, value: ContractValue, htl: usize, peer: &PeerKey) -> Self {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
@@ -132,6 +135,7 @@ impl StateMachineImpl for PutOpSm {
                     contract,
                     value,
                     htl,
+                    skip_list,
                 },
             ) => Some(PutMsg::SeekNode {
                 id,
@@ -140,6 +144,7 @@ impl StateMachineImpl for PutOpSm {
                 contract,
                 value,
                 htl,
+                skip_list,
             }),
             // output from initial target
             (
@@ -202,12 +207,14 @@ where
         return Err(OpError::UnexpectedOpState);
     };
 
+    let sender = op_storage.ring.own_location();
+
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to put
     let target = op_storage
         .ring
-        .closest_caching(&key, 1, &[])
+        .closest_caching(&key, 1, &[sender.peer])
         .into_iter()
         .next()
         .ok_or_else(|| OpError::from(RingError::EmptyRing))?;
@@ -287,16 +294,25 @@ where
             htl,
             target,
         } => {
-            return_msg = state
-                .sm
-                .consume_to_state(PutMsg::RequestPut {
-                    id,
-                    contract,
-                    value,
-                    htl,
-                    target,
-                })?
-                .map(Message::from);
+            let sender = op_storage.ring.own_location();
+
+            log::info!(
+                "Performing a RequestPut for contract {} from {} to {}",
+                contract.key(),
+                sender.peer,
+                target.peer
+            );
+
+            return_msg = Some(Message::from(PutMsg::SeekNode {
+                id,
+                sender,
+                target,
+                value,
+                contract,
+                htl: PutOp::MAX_RETRIES,
+                skip_list: vec![sender.peer],
+            }));
+
             // no changes to state yet, still in AwaitResponse state
             new_state = Some(state);
         }
@@ -307,15 +323,29 @@ where
             contract,
             htl,
             target,
+            mut skip_list,
         } => {
             let key = contract.key();
             let cached_contract = op_storage.ring.contract_exists(&key);
+
+            log::info!(
+                "Performing a SeekNode into {}, trying put the contract {}",
+                target.peer,
+                key
+            );
+
             if !cached_contract && op_storage.ring.within_caching_distance(&key.location()) {
+                log::info!("Node {} has not cached the contract {}", target.peer, key);
+                log::info!("Caching the contract...");
                 // this node does not have the contract, so instead store the contract and execute the put op.
                 op_storage
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
             } else if !cached_contract {
+                log::info!(
+                    "Node {} is not within the distance needed to be cached",
+                    key
+                );
                 // in this case forward to a closer node to the target location and just wait for a response
                 // to give back to requesting peer
                 // FIXME
@@ -323,7 +353,9 @@ where
             }
 
             // after the contract has been cached, push the update query
+            log::info!("Putting the contract after being cached...");
             let new_value = put_contract(op_storage, key, value).await?;
+            log::info!("Contract successfully added!");
             // if the change was successful, communicate this back to the requestor and broadcast the change
             conn_manager
                 .send(
@@ -336,6 +368,8 @@ where
                 )
                 .await?;
 
+            skip_list.push(target.peer);
+
             if let Some(new_htl) = htl.checked_sub(1) {
                 // forward changes in the contract to nodes closer to the contract location, if possible
                 forward_changes(
@@ -345,6 +379,7 @@ where
                     new_value.clone(),
                     id,
                     new_htl,
+                    &skip_list.as_slice(),
                 )
                 .await;
             }
@@ -457,6 +492,7 @@ where
             contract,
             new_value,
             htl,
+            mut skip_list,
         } => {
             let key = contract.key();
             let cached_contract = op_storage.ring.contract_exists(&key);
@@ -475,9 +511,23 @@ where
             }
             // after the contract has been cached, push the update query
             let new_value = put_contract(op_storage, key, new_value).await?;
+
+            //update skip list
+            let peer_loc = op_storage.ring.own_location();
+            skip_list.push(peer_loc.peer);
+
             // if sucessful, forward to the next closest peers (if any)
             if let Some(new_htl) = htl.checked_sub(1) {
-                forward_changes(op_storage, conn_manager, &contract, new_value, id, new_htl).await;
+                forward_changes(
+                    op_storage,
+                    conn_manager,
+                    &contract,
+                    new_value,
+                    id,
+                    new_htl,
+                    skip_list.as_slice(),
+                )
+                .await;
             }
             return_msg = None;
             new_state = None;
@@ -528,13 +578,14 @@ async fn forward_changes<CErr, CB>(
     new_value: ContractValue,
     id: Transaction,
     htl: usize,
+    skip_list: &[PeerKey],
 ) where
     CErr: std::error::Error,
     CB: ConnectionBridge,
 {
     let key = contract.key();
     let contract_loc = key.location();
-    let forward_to = op_storage.ring.closest_caching(&key, 1, &[]);
+    let forward_to = op_storage.ring.closest_caching(&key, 1, skip_list);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     for peer in forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
@@ -551,6 +602,7 @@ async fn forward_changes<CErr, CB>(
                         contract: contract.clone(),
                         new_value: new_value.clone(),
                         htl,
+                        skip_list: skip_list.to_vec(),
                     })
                     .into(),
                 )
@@ -594,6 +646,7 @@ mod messages {
             new_value: ContractValue,
             /// current htl, reduced by one at each hop
             htl: usize,
+            skip_list: Vec<PeerKey>,
         },
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
@@ -609,6 +662,7 @@ mod messages {
             contract: Contract,
             /// max hops to live
             htl: usize,
+            skip_list: Vec<PeerKey>,
         },
         /// Internal node instruction that  a change (either a first time insert or an update).
         Broadcasting {

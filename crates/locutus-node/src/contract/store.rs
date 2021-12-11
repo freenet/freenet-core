@@ -26,6 +26,7 @@ impl ContractStore {
     where
         CErr: std::error::Error,
     {
-        todo!()
+        // TODO
+        Ok(())
     }
 }
