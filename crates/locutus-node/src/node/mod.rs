@@ -26,7 +26,7 @@ use crate::{
     user_events::{UserEvent, UserEventsProxy},
 };
 
-pub(crate) use event_listener::{EventListener, EventLog};
+pub(crate) use event_listener::EventListener;
 #[cfg(test)]
 pub(crate) use in_memory::NodeInMemory;
 pub(crate) use op_state::OpManager;

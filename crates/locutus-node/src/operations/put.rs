@@ -76,7 +76,7 @@ impl StateMachineImpl for PutOpSm {
                 Some(PutState::AwaitingResponse { contract })
             }
             (PutState::AwaitingResponse { contract, .. }, PutMsg::SuccessfulUpdate { .. }) => {
-                log::debug!("Successfully updated value for {}", contract);
+                log::debug!("Successfully updated value for {}", contract,);
                 Some(PutState::Done)
             }
             _ => None,
@@ -410,19 +410,21 @@ where
                     new_value,
                 })?
                 .ok_or(OpError::InvalidStateTransition(id))?;
-            #[cfg(test)]
-            {
-                if let PutMsg::SuccessfulUpdate { .. } = internal_cb {
-                    log::debug!(
-                        "Empty broadcast list while updating value for contract {}",
-                        key
-                    );
-                }
+
+            if let PutMsg::SuccessfulUpdate { .. } = internal_cb {
+                log::debug!(
+                    "Empty broadcast list while updating value for contract {}",
+                    key
+                );
+                // means the whole tx finished so can return early
+                return_msg = Some(internal_cb.into());
+                new_state = None;
+            } else {
+                op_storage
+                    .notify_change(internal_cb.into(), Operation::Put(state))
+                    .await?;
+                return Err(OpError::StatePushed);
             }
-            op_storage
-                .notify_change(internal_cb.into(), Operation::Put(state))
-                .await?;
-            return Err(OpError::StatePushed);
         }
         PutMsg::Broadcasting {
             id,
@@ -497,6 +499,10 @@ where
                 .sm
                 .consume_to_state(PutMsg::SuccessfulUpdate { id, new_value })?
                 .map(Message::from);
+            log::debug!(
+                "Peer {} completed contract value put",
+                op_storage.ring.peer_key
+            );
             new_state = None;
         }
         PutMsg::PutForward {
@@ -842,6 +848,7 @@ mod test {
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
+        let key = contract.key();
         let contract_val: ContractValue = gen.arbitrary()?;
         let new_value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
@@ -854,7 +861,7 @@ mod test {
 
         let put_event = UserEvent::Put {
             contract: contract.clone(),
-            value: new_value,
+            value: new_value.clone(),
         };
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(contract, contract_val)],
@@ -872,10 +879,10 @@ mod test {
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger the put op @ gw-0, this
-        sim_nodes.trigger_event("gateway-0", 1)?;
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        // FIXME: check that the new value is in node-0 actually
+        sim_nodes
+            .trigger_event("gateway-0", 1, Some(Duration::from_millis(100)))
+            .await?;
+        assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
         Ok(())
     }
 }

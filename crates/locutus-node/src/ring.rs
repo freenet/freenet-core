@@ -69,7 +69,7 @@ pub(crate) struct Ring {
     subscriptions: RwLock<Vec<ContractKey>>,
     /// A peer which has been blacklisted to perform actions regarding a given contract.
     contract_blacklist: DashMap<ContractKey, Vec<Blacklisted>>,
-    /// Interim connections ongoing haandshake or succesfully open connections
+    /// Interim connections ongoing haandshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
     incoming_connections: AtomicUsize,
 }

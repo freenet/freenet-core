@@ -16,7 +16,6 @@ use crate::{
     config::tracing::Logger,
     conn_manager::{ConnectionBridge, PeerKey},
     message::Message,
-    node::{EventListener, EventLog},
     ring::{Location, PeerKeyLocation},
 };
 
@@ -27,16 +26,10 @@ pub(crate) struct MemoryConnManager {
     pub transport: InMemoryTransport,
     msg_queue: Arc<Mutex<Vec<Message>>>,
     peer: PeerKey,
-    event_logger: Option<Box<dyn EventListener + Send + Sync + 'static>>,
 }
 
 impl MemoryConnManager {
-    pub fn new(
-        is_open: bool,
-        peer: PeerKey,
-        location: Option<Location>,
-        event_logger: Option<Box<dyn EventListener + Send + Sync + 'static>>,
-    ) -> Self {
+    pub fn new(is_open: bool, peer: PeerKey, location: Option<Location>) -> Self {
         Logger::init_logger();
         let transport = InMemoryTransport::new(is_open, peer, location);
         let msg_queue = Arc::new(Mutex::new(Vec::new()));
@@ -63,7 +56,6 @@ impl MemoryConnManager {
             transport,
             msg_queue,
             peer,
-            event_logger,
         }
     }
 }
@@ -74,7 +66,6 @@ impl Clone for MemoryConnManager {
             transport: self.transport.clone(),
             msg_queue: self.msg_queue.clone(),
             peer: self.peer,
-            event_logger: self.event_logger.as_ref().map(|l| l.trait_clone()),
         }
     }
 }
@@ -95,11 +86,6 @@ impl ConnectionBridge for MemoryConnManager {
     }
 
     async fn send(&self, target: PeerKey, msg: Message) -> Result<(), ConnError> {
-        if let Some(listener) = self.event_logger.as_ref() {
-            listener
-                .trait_clone()
-                .event_received(EventLog::new(&msg, &self.peer));
-        }
         let msg = bincode::serialize(&msg)?;
         self.transport.send(target, msg);
         Ok(())

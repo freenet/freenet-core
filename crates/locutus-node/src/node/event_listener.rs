@@ -1,7 +1,9 @@
 use std::sync::atomic::Ordering::SeqCst;
 use std::{sync::atomic::AtomicUsize, time::Instant};
 
+use crate::contract::{ContractKey, ContractValue};
 use crate::operations::join_ring::JoinRingMsg;
+use crate::operations::put::PutMsg;
 use crate::ring::{Location, PeerKeyLocation};
 use crate::{
     conn_manager::PeerKey,
@@ -10,6 +12,8 @@ use crate::{
 
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;
+
+use super::OpManager;
 
 static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -27,13 +31,16 @@ pub(crate) trait EventListener {
 }
 
 pub(crate) struct EventLog<'a> {
-    _tx: &'a Transaction,
+    tx: &'a Transaction,
     peer_id: &'a PeerKey,
     kind: EventKind,
 }
 
 impl<'a> EventLog<'a> {
-    pub fn new(msg: &'a Message, peer_id: &'a PeerKey) -> Self {
+    pub fn new<CErr>(msg: &'a Message, op_storage: &'a OpManager<CErr>) -> Self
+    where
+        CErr: std::error::Error,
+    {
         let kind = match msg {
             Message::JoinRing(JoinRingMsg::Response { sender, target, .. }) => {
                 EventKind::Connected {
@@ -41,11 +48,27 @@ impl<'a> EventLog<'a> {
                     to: *target,
                 }
             }
+            Message::Put(PutMsg::RequestPut {
+                contract, target, ..
+            }) => EventKind::Put(
+                PutEvent::Request {
+                    performer: target.peer,
+                    key: contract.key(),
+                },
+                *msg.id(),
+            ),
+            Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => EventKind::Put(
+                PutEvent::PutSuccess {
+                    requester: op_storage.ring.peer_key,
+                    value: new_value.clone(),
+                },
+                *msg.id(),
+            ),
             _ => EventKind::Unknown,
         };
         EventLog {
-            _tx: msg.id(),
-            peer_id,
+            tx: msg.id(),
+            peer_id: &op_storage.ring.peer_key,
             kind,
         }
     }
@@ -67,8 +90,8 @@ impl EventRegister {
 }
 
 impl EventListener for EventRegister {
-    fn event_received(&mut self, log: EventLog) {
-        let (_msg_log, _log_id) = create_log(log);
+    fn event_received(&mut self, _log: EventLog) {
+        // let (_msg_log, _log_id) = create_log(log);
         // TODO: save log
     }
 
@@ -77,22 +100,81 @@ impl EventListener for EventRegister {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 enum EventKind {
     Connected { loc: Location, to: PeerKeyLocation },
+    Put(PutEvent, Transaction),
     Unknown,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum PutEvent {
+    Request {
+        performer: PeerKey,
+        key: ContractKey,
+    },
+    PutSuccess {
+        requester: PeerKey,
+        value: ContractValue,
+    },
+    PutComplete {
+        /// peer who performed the event
+        performer: PeerKey,
+        /// peer who started the put op
+        requester: PeerKey,
+        /// key of the contract which value was being updated
+        key: ContractKey,
+        /// value that was put
+        value: ContractValue,
+    },
+}
+
 #[inline]
-fn create_log(log: EventLog) -> (MessageLog, ListenerLogId) {
+fn create_log(logs: &[MessageLog], log: EventLog) -> (MessageLog, ListenerLogId) {
     let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
-    let EventLog { peer_id, kind, .. } = log;
+    let EventLog {
+        tx: incoming_tx,
+        peer_id,
+        kind,
+        ..
+    } = log;
+
+    let find_put_ops = logs
+        .iter()
+        .filter_map(|l| {
+            if matches!(l, MessageLog { kind: EventKind::Put(_, id), .. } if incoming_tx == id ) {
+                Some(&l.kind)
+            } else {
+                None
+            }
+        })
+        .chain([&kind]);
+    let kind = fuse_events_msg(find_put_ops).unwrap_or(kind);
+
     let msg_log = MessageLog {
         ts: Instant::now(),
         peer_id: *peer_id,
         kind,
     };
     (msg_log, log_id)
+}
+
+fn fuse_events_msg<'a>(mut put_ops: impl Iterator<Item = &'a EventKind>) -> Option<EventKind> {
+    let prev_msgs = [put_ops.next().cloned(), put_ops.next().cloned()];
+    match prev_msgs {
+        [Some(EventKind::Put(PutEvent::Request { performer, key }, id)), Some(EventKind::Put(PutEvent::PutSuccess { requester, value }, _))] => {
+            Some(EventKind::Put(
+                PutEvent::PutComplete {
+                    performer,
+                    requester,
+                    key,
+                    value,
+                },
+                id,
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -102,7 +184,7 @@ mod test_utils {
     use dashmap::DashMap;
     use parking_lot::RwLock;
 
-    use crate::{message::TxType, ring::Distance};
+    use crate::{contract::ContractKey, message::TxType, ring::Distance};
 
     use super::*;
 
@@ -126,10 +208,23 @@ mod test_utils {
             self.node_labels.insert(label, peer);
         }
 
-        pub fn is_connected(&self, peer: PeerKey) -> bool {
+        pub fn is_connected(&self, peer: &PeerKey) -> bool {
             let logs = self.logs.read();
             logs.iter()
-                .any(|log| log.peer_id == peer && matches!(log.kind, EventKind::Connected { .. }))
+                .any(|log| &log.peer_id == peer && matches!(log.kind, EventKind::Connected { .. }))
+        }
+
+        pub fn has_put_contract(
+            &self,
+            peer: &PeerKey,
+            expected_key: &ContractKey,
+            expected_value: &ContractValue,
+        ) -> bool {
+            let logs = self.logs.read();
+            logs.iter().any(|log| {
+                &log.peer_id == peer
+                    && matches!(log.kind, EventKind::Put(PutEvent::PutComplete { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
+            })
         }
 
         /// Unique connections for a given peer and their relative distance to other peers.
@@ -159,9 +254,9 @@ mod test_utils {
 
     impl super::EventListener for TestEventListener {
         fn event_received(&mut self, log: EventLog) {
-            let tx = log._tx;
+            let tx = log.tx;
             let mut logs = self.logs.write();
-            let (msg_log, log_id) = create_log(log);
+            let (msg_log, log_id) = create_log(&*logs, log);
             logs.push(msg_log);
             std::mem::drop(logs);
             self.tx_log.entry(*tx).or_default().push(log_id);
@@ -186,7 +281,7 @@ mod test_utils {
         let mut listener = TestEventListener::new();
         locations.iter().for_each(|(other, location)| {
             listener.event_received(EventLog {
-                _tx: &tx,
+                tx: &tx,
                 peer_id: &peer_id,
                 kind: EventKind::Connected {
                     loc,

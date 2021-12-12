@@ -986,7 +986,7 @@ mod test {
     };
 
     #[test]
-    fn succesful_join_ring_seq() {
+    fn successful_join_ring_seq() {
         let peer = PeerKey::random();
         let id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer);
         let new_loc = Location::random();

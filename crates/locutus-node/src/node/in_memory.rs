@@ -59,10 +59,7 @@ where
         <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
     {
         let peer = PeerKey::from(config.local_key.public());
-        let ev_listener_cp = event_listener
-            .as_ref()
-            .map(|listener| listener.trait_clone());
-        let conn_manager = MemoryConnManager::new(true, peer, None, ev_listener_cp);
+        let conn_manager = MemoryConnManager::new(true, peer, None);
 
         let gateways: Vec<_> = config
             .remote_nodes
@@ -79,8 +76,6 @@ where
             })
             .filter(|pkloc| pkloc.peer != peer)
             .collect();
-
-        // config.location
 
         if (config.local_ip.is_none() || config.local_port.is_none()) && gateways.is_empty() {
             return Err(anyhow::anyhow!(
@@ -254,7 +249,7 @@ where
                 match msg {
                     Ok(msg) => {
                         if let Some(listener) = &mut event_listener {
-                            listener.event_received(EventLog::new(&msg, &op_storage.ring.peer_key));
+                            listener.event_received(EventLog::new(&msg, &op_storage));
                         }
                         match msg {
                             Message::JoinRing(op) => {
