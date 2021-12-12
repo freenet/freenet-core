@@ -747,8 +747,8 @@ mod test {
         sim_nodes
             .trigger_event("node-0", 1, Some(Duration::from_millis(100)))
             .await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        // FIXME: check tx finished successfully
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(sim_nodes.has_got_contract("node-0", &key));
         Ok(())
     }
 
@@ -762,12 +762,6 @@ mod test {
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();
 
-        let node_0 = NodeSpecification {
-            owned_contracts: vec![],
-            non_owned_contracts: vec![],
-            events_to_generate: HashMap::new(),
-        };
-
         let get_event = UserEvent::Get {
             key,
             contract: false,
@@ -778,10 +772,7 @@ mod test {
             events_to_generate: HashMap::from_iter([(1, get_event)]),
         };
 
-        let get_specs = HashMap::from_iter([
-            ("node-0".to_string(), node_0),
-            ("node-1".to_string(), node_1),
-        ]);
+        let get_specs = HashMap::from_iter([("node-1".to_string(), node_1)]);
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
@@ -792,7 +783,7 @@ mod test {
         sim_nodes
             .trigger_event("node-1", 1, Some(Duration::from_millis(100)))
             .await?;
-        // FIXME: check tx finished unsuccessfully
+        assert!(!sim_nodes.has_got_contract("node-1", &key));
         Ok(())
     }
 }

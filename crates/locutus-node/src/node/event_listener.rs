@@ -1,7 +1,8 @@
 use std::sync::atomic::Ordering::SeqCst;
 use std::{sync::atomic::AtomicUsize, time::Instant};
 
-use crate::contract::{ContractKey, ContractValue};
+use crate::contract::{ContractKey, ContractValue, StoreResponse};
+use crate::operations::get::GetMsg;
 use crate::operations::join_ring::JoinRingMsg;
 use crate::operations::put::PutMsg;
 use crate::ring::{Location, PeerKeyLocation};
@@ -64,6 +65,11 @@ impl<'a> EventLog<'a> {
                 },
                 *msg.id(),
             ),
+            Message::Get(GetMsg::ReturnGet {
+                key,
+                value: StoreResponse { value: Some(_), .. },
+                ..
+            }) => EventKind::Get { key: *key },
             _ => EventKind::Unknown,
         };
         EventLog {
@@ -104,6 +110,7 @@ impl EventListener for EventRegister {
 enum EventKind {
     Connected { loc: Location, to: PeerKeyLocation },
     Put(PutEvent, Transaction),
+    Get { key: ContractKey },
     Unknown,
 }
 
@@ -224,6 +231,14 @@ mod test_utils {
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Put(PutEvent::PutComplete { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
+            })
+        }
+
+        pub fn has_got_contract(&self, peer: &PeerKey, expected_key: &ContractKey) -> bool {
+            let logs = self.logs.read();
+            logs.iter().any(|log| {
+                &log.peer_id == peer
+                    && matches!(log.kind, EventKind::Get { ref key } if key == expected_key  )
             })
         }
 
