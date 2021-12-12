@@ -359,9 +359,9 @@ where
             }
 
             // after the contract has been cached, push the update query
-            log::debug!("Attempting contrat value update");
+            log::debug!("Attempting contract value update");
             let new_value = put_contract(op_storage, key, value).await?;
-            log::debug!("Contract successfully added!");
+            log::debug!("Contract successfully updated");
             // if the change was successful, communicate this back to the requestor and broadcast the change
             conn_manager
                 .send(
@@ -373,7 +373,6 @@ where
                     .into(),
                 )
                 .await?;
-
             skip_list.push(target.peer);
 
             if let Some(new_htl) = htl.checked_sub(1) {
@@ -393,30 +392,37 @@ where
             let broadcast_to = op_storage
                 .ring
                 .subscribers_of(&key)
-                .ok_or(ContractError::ContractNotFound(key))?
-                .iter()
-                .cloned()
-                .collect();
+                .map(|i| i.value().to_vec())
+                .unwrap_or_default();
             log::debug!(
                 "Successfully updated a value for contract {} @ {:?}",
                 key,
                 target.location
             );
 
-            if let Some(msg) = state.sm.consume_to_state(PutMsg::Broadcasting {
-                id,
-                broadcast_to,
-                broadcasted_to: 0,
-                key,
-                new_value,
-            })? {
-                op_storage
-                    .notify_change(msg.into(), Operation::Put(state))
-                    .await?;
-                return Err(OpError::StatePushed);
+            let internal_cb = state
+                .sm
+                .consume_to_output(PutMsg::Broadcasting {
+                    id,
+                    broadcast_to,
+                    broadcasted_to: 0,
+                    key,
+                    new_value,
+                })?
+                .ok_or(OpError::InvalidStateTransition(id))?;
+            #[cfg(test)]
+            {
+                if let PutMsg::SuccessfulUpdate { .. } = internal_cb {
+                    log::debug!(
+                        "Empty broadcast list while updating value for contract {}",
+                        key
+                    );
+                }
             }
-            return_msg = None;
-            new_state = Some(state);
+            op_storage
+                .notify_change(internal_cb.into(), Operation::Put(state))
+                .await?;
+            return Err(OpError::StatePushed);
         }
         PutMsg::Broadcasting {
             id,
@@ -830,44 +836,46 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 4usize;
+        const NUM_NODES: usize = 1usize;
         const NUM_GW: usize = 1usize;
 
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let contract_val: ContractValue = gen.arbitrary()?;
-        let value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
+        let new_value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
-        let put_event = UserEvent::Put {
-            contract: contract.clone(),
-            value,
-        };
+        // both own the contract, and one triggers an update
         let node_0 = NodeSpecification {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
-            events_to_generate: HashMap::from_iter([(1, put_event)]),
+            events_to_generate: HashMap::new(),
         };
 
-        let node_1 = NodeSpecification {
+        let put_event = UserEvent::Put {
+            contract: contract.clone(),
+            value: new_value,
+        };
+        let gw_0 = NodeSpecification {
             owned_contracts: vec![(contract, contract_val)],
             non_owned_contracts: vec![],
-            events_to_generate: HashMap::new(),
+            events_to_generate: HashMap::from_iter([(1, put_event)]),
         };
 
         // establish network
         let put_specs = HashMap::from_iter([
             ("node-0".to_string(), node_0),
-            ("node-1".to_string(), node_1),
+            ("gateway-0".to_string(), gw_0),
         ]);
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         sim_nodes.build_with_specs(put_specs);
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
-        // trigger the put op @ node 0
-        sim_nodes.trigger_event("node-0", 1)?;
+        // trigger the put op @ gw-0, this
+        sim_nodes.trigger_event("gateway-0", 1)?;
 
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // FIXME: check that the new value is in node-0 actually
         Ok(())
     }
 }

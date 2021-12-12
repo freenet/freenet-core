@@ -12,7 +12,7 @@ jobs:
 
     runs-on: ubuntu-latest
     env:
-      RUST_LOG: error
+      LOCUTUS_LOG_LEVEL: error
 
     steps:
       - uses: actions/checkout@v2

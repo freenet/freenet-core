@@ -249,7 +249,7 @@ mod sqlite {
     // Is fine to clone this as it wraps by an Arc.
     static POOL: Lazy<SqlitePool> = Lazy::new(|| {
         tokio::task::block_in_place(|| {
-            let conn_str = if cfg!(debug_assertions) {
+            let conn_str = if cfg!(test) {
                 "sqlite::memory:"
             } else {
                 // FIXME: initialize this with the actual connection string

@@ -14,6 +14,7 @@ pub(crate) enum UserEvent {
     Put {
         /// Value to upsert in the contract.
         value: ContractValue,
+        // TODO: this should be Either<ContractKey, Contract>
         contract: Contract,
     },
     /// Fetch the current value from a contract corresponding to the provided key.
@@ -32,12 +33,11 @@ pub(crate) enum UserEvent {
 pub(crate) mod test_utils {
     use std::{collections::HashMap, time::Duration};
 
-    use arbitrary::{Arbitrary, Unstructured};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
     use super::*;
-    use crate::{conn_manager::PeerKey, node::test_utils::EventId, test_utils::random_bytes_128};
+    use crate::{conn_manager::PeerKey, node::test_utils::EventId};
 
     pub(crate) struct MemoryEventsGen {
         signal: Receiver<(EventId, PeerKey)>,
