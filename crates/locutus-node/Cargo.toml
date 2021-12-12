@@ -48,5 +48,5 @@ sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
 [dev-dependencies]
 itertools = "0.10"
 
-[profile.dev.overrides."*"]
+[profile.dev.package."*"]
 opt-level = 3

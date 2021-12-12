@@ -420,9 +420,9 @@ impl TryFrom<f64> for Location {
 pub(crate) enum RingError {
     #[error(transparent)]
     ConnError(#[from] Box<conn_manager::ConnError>),
-    #[error("no ring connections found")]
+    #[error("No ring connections found")]
     EmptyRing,
-    #[error("ran out of, or haven't found any, caching peers for contract {0}")]
+    #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
     NoCachingPeers(ContractKey),
 }
 

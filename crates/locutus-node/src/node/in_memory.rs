@@ -22,6 +22,16 @@ use crate::{
 
 use super::{op_state::OpManager, EventListener};
 
+macro_rules! log_handling_msg {
+    ($op:expr, $id:expr, $op_storage:ident) => {
+        log::debug!(
+            concat!("Handling ", $op, " get request @ {} (tx: {})"),
+            $op_storage.ring.peer_key,
+            $id
+        );
+    };
+}
+
 pub(crate) struct NodeInMemory<CErr>
 where
     CErr: std::error::Error,
@@ -248,29 +258,28 @@ where
                         }
                         match msg {
                             Message::JoinRing(op) => {
+                                log_handling_msg!("join", op.id(), op_storage);
                                 let op_result =
                                     join_ring::handle_join_ring(&op_storage, &mut conn_manager, op)
                                         .await;
                                 Self::report_result(op_result);
                             }
                             Message::Put(op) => {
+                                log_handling_msg!("put", op.id(), op_storage);
                                 let op_result =
                                     put::handle_put_request(&op_storage, &mut conn_manager, op)
                                         .await;
                                 Self::report_result(op_result);
                             }
                             Message::Get(op) => {
-                                log::debug!(
-                                    "Handling get request @ {} (tx: {})",
-                                    op_storage.ring.peer_key,
-                                    op.id()
-                                );
+                                log_handling_msg!("get", op.id(), op_storage);
                                 let op_result =
                                     get::handle_get_request(&op_storage, &mut conn_manager, op)
                                         .await;
                                 Self::report_result(op_result);
                             }
                             Message::Subscribe(op) => {
+                                log_handling_msg!("subscribe", op.id(), op_storage);
                                 let op_result = subscribe::handle_subscribe_response(
                                     &op_storage,
                                     &mut conn_manager,
