@@ -257,6 +257,14 @@ impl SimNetwork {
         }
     }
 
+    pub fn has_got_contract(&self, peer: &str, key: &ContractKey) -> bool {
+        if let Some(pk) = self.labels.get(peer) {
+            self.event_listener.has_got_contract(pk, key)
+        } else {
+            panic!("peer not found");
+        }
+    }
+
     /// Builds an histogram of the distribution in the ring of each node relative to each other.
     pub fn ring_distribution(&self, scale: i32) -> impl Iterator<Item = (f64, usize)> {
         let mut all_dists = Vec::with_capacity(self.labels.len());
