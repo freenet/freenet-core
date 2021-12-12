@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use stretto::AsyncCache;
 use tokio::sync::mpsc;
 
 use super::runtime::{ContractRuntime, ContractUpdateError};
@@ -111,7 +112,7 @@ impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHSenderHalve> {
             let started_op = Instant::now();
             loop {
                 if started_op.elapsed() > CH_EV_RESPONSE_TIME_OUT {
-                    break Err(ContractError::NoHandlerEvResponse);
+                    break Err(ContractError::NoEvHandlerResponse);
                 }
                 while let Some(msg) = self.rx.recv().await {
                     if msg.id == id {
@@ -147,7 +148,7 @@ impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHListenerHalve> {
         if let Some(msg) = self.rx.recv().await {
             return Ok((EventId(msg.id), msg.ev));
         }
-        Err(ContractError::NoHandlerEvResponse)
+        Err(ContractError::NoEvHandlerResponse)
     }
 }
 
@@ -263,7 +264,7 @@ mod sqlite {
 
     #[derive(Debug, thiserror::Error)]
     pub(crate) enum DatabaseError {
-        #[error("contract nor found")]
+        #[error("Contract not found")]
         ContractNotFound,
         #[error(transparent)]
         SqliteError(#[from] sqlx::Error),
@@ -275,6 +276,7 @@ mod sqlite {
         channel: ContractHandlerChannel<DatabaseError, CHListenerHalve>,
         store: ContractStore,
         runtime: R,
+        value_mem_cache: AsyncCache<ContractKey, ContractValue>,
         pub(super) pool: SqlitePool,
     }
 
@@ -282,7 +284,12 @@ mod sqlite {
     where
         R: ContractRuntime,
     {
-        pub fn new(
+        /// max number of values stored in memory
+        const MEM_CACHE_ITEMS: usize = 10_000;
+        /// number of max bytes allowed to be stored in the cache
+        const MEM_SIZE: i64 = 10_000_000;
+
+        fn new(
             channel: ContractHandlerChannel<DatabaseError, CHListenerHalve>,
             store: ContractStore,
             runtime: R,
@@ -293,6 +300,8 @@ mod sqlite {
                 store,
                 pool,
                 runtime,
+                value_mem_cache: AsyncCache::new(Self::MEM_CACHE_ITEMS, Self::MEM_SIZE)
+                    .expect("failed to build mem cache"),
             }
         }
     }
@@ -328,6 +337,9 @@ mod sqlite {
             contract: &ContractKey,
         ) -> Result<Option<ContractValue>, Self::Error> {
             let encoded_key = hex::encode(contract.0);
+            if let Some(value) = self.value_mem_cache.get(contract) {
+                return Ok(Some(value.value().clone()));
+            }
             match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
                 .bind(encoded_key)
                 .map(|row: SqliteRow| Some(ContractValue::new(row.get("value"))))
@@ -363,7 +375,13 @@ mod sqlite {
             .fetch_one(&self.pool)
             .await
             {
-                Ok(contract_value) => Ok(contract_value),
+                Ok(contract_value) => {
+                    let size = contract_value.len() as i64;
+                    self.value_mem_cache
+                        .insert(*contract, contract_value.clone(), size)
+                        .await;
+                    Ok(contract_value)
+                }
                 Err(err) => Err(DatabaseError::SqliteError(err)),
             }
         }

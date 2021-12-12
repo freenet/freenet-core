@@ -33,7 +33,7 @@ where
     CB: ConnectionBridge,
     CErr: std::error::Error,
 {
-    // TODO: register changes in the future op commit log
+    // FIXME: register changes in the future op commit log
     match result {
         Err((OpError::StatePushed, _)) => {
             // do nothing and continue, the operation will just continue later on

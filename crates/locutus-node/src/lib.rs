@@ -1,4 +1,4 @@
-#![allow(dead_code)] // FIXME: remove when libp2p ndoe impl is done
+#![allow(dead_code)] // FIXME: remove when libp2p node impl is done
 mod config;
 pub mod conn_manager;
 mod contract;

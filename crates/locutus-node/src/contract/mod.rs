@@ -212,5 +212,5 @@ pub(crate) enum ContractError<SErr: std::error::Error> {
     #[error("handler channel dropped")]
     ChannelDropped(Box<ContractHandlerEvent<SErr>>),
     #[error("no response received from handler")]
-    NoHandlerEvResponse,
+    NoEvHandlerResponse,
 }
