@@ -96,7 +96,7 @@ static EV_ID: AtomicU64 = AtomicU64::new(0);
 const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
 
 impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHSenderHalve> {
-    /// Send an event to the contract handler and receive a response event if succesful.
+    /// Send an event to the contract handler and receive a response event if successful.
     pub async fn send_to_handler(
         &mut self,
         ev: ContractHandlerEvent<SErr>,

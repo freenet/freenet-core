@@ -243,9 +243,17 @@ impl SimNetwork {
 
     pub fn connected(&self, peer: &str) -> bool {
         if let Some(key) = self.labels.get(peer) {
-            self.event_listener.is_connected(*key)
+            self.event_listener.is_connected(key)
         } else {
-            false
+            panic!("peer not found");
+        }
+    }
+
+    pub fn has_put_contract(&self, peer: &str, key: &ContractKey, value: &ContractValue) -> bool {
+        if let Some(pk) = self.labels.get(peer) {
+            self.event_listener.has_put_contract(pk, key, value)
+        } else {
+            panic!("peer not found");
         }
     }
 
@@ -273,7 +281,12 @@ impl SimNetwork {
         peers_connections
     }
 
-    pub fn trigger_event(&self, label: &str, event_id: EventId) -> Result<(), anyhow::Error> {
+    pub async fn trigger_event(
+        &self,
+        label: &str,
+        event_id: EventId,
+        sleep_for: Option<Duration>,
+    ) -> Result<(), anyhow::Error> {
         let peer = self
             .labels
             .get(label)
@@ -281,6 +294,9 @@ impl SimNetwork {
         self.usr_ev_controller
             .send((event_id, *peer))
             .expect("node listeners disconnected");
+        if let Some(sleep_time) = sleep_for {
+            tokio::time::sleep(sleep_time).await;
+        }
         Ok(())
     }
 }
@@ -329,11 +345,13 @@ pub(crate) async fn check_connectivity(
             (label, key)
         })
         .collect();
+
     if !missing.is_empty() {
         log::error!("Nodes without connection: {:?}", missing);
         log::error!("Total nodes without connection: {:?}", missing.len());
+        anyhow::bail!("found disconnected nodes");
     }
-    assert!(missing.is_empty());
+
     log::info!(
         "Required time for connecting all peers: {} secs",
         elapsed.elapsed().as_secs()
@@ -357,12 +375,16 @@ pub(crate) async fn check_connectivity(
 
     // ensure at least some normal nodes have more than one connection
     connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
-    assert!(connections_per_peer.iter().last().unwrap() > &1);
+    if *connections_per_peer.iter().last().unwrap() < 1 {
+        anyhow::bail!("low connectivy; nodes didn't connect beyond the gateway");
+    }
 
     // ensure the average number of connections per peer is above N
     let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
     log::info!("Average connections: {}", avg_connections);
-    assert!(avg_connections > 1);
+    if avg_connections < 1 {
+        anyhow::bail!("average number of connections is low");
+    }
     Ok(())
 }
 

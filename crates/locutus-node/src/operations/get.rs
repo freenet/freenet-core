@@ -743,11 +743,12 @@ mod test {
         sim_nodes.build_with_specs(get_specs);
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
-        // trigger get @ node-1, which does not own the contract
-        sim_nodes.trigger_event("node-0", 1)?;
-
+        // trigger get @ node-0, which does not own the contract
+        sim_nodes
+            .trigger_event("node-0", 1, Some(Duration::from_millis(100)))
+            .await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
-        // FIXME: check tx finished succesfully
+        // FIXME: check tx finished successfully
         Ok(())
     }
 
@@ -788,10 +789,10 @@ mod test {
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger get @ node-1, which does not own the contract
-        sim_nodes.trigger_event("node-1", 1)?;
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        // FIXME: check tx finished unsuccesfully
+        sim_nodes
+            .trigger_event("node-1", 1, Some(Duration::from_millis(100)))
+            .await?;
+        // FIXME: check tx finished unsuccessfully
         Ok(())
     }
 }
