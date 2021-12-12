@@ -664,7 +664,7 @@ where
                             .await;
                     }
                 } else {
-                    log::warn!("Not accepting connection to {}", other_peer.peer);
+                    log::debug!("Not accepting connection to {}", other_peer.peer);
                 }
             }
             ring.update_location(Some(your_location));

@@ -504,8 +504,8 @@ mod messages {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::contract::Contract;
-    use crate::node::test_utils::{NodeSpecification, SimNetwork, check_connectivity};
+    use crate::contract::{Contract, ContractValue};
+    use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
     use crate::ring::Location;
     use crate::user_events::UserEvent;
     use crate::{conn_manager::PeerKey, node::SimStorageError};
@@ -605,12 +605,12 @@ mod test {
         const NUM_NODES: usize = 4usize;
         const NUM_GW: usize = 1usize;
 
-
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
+        let contract_val: ContractValue = gen.arbitrary()?;
         let contract_key: ContractKey = contract.key();
-        
+
         let event = UserEvent::Subscribe { key: contract_key };
         let first_node = NodeSpecification {
             owned_contracts: Vec::new(),
@@ -619,7 +619,7 @@ mod test {
         };
 
         let second_node = NodeSpecification {
-            owned_contracts: vec![contract],
+            owned_contracts: vec![(contract, contract_val)],
             non_owned_contracts: Vec::new(),
             events_to_generate: HashMap::new(),
         };

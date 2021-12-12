@@ -273,6 +273,10 @@ where
             match ev {
                 UserEvent::Put { value, contract } => {
                     // Initialize a put op.
+                    log::debug!(
+                        "Received put from user event @ {}",
+                        &op_storage_cp.ring.peer_key
+                    );
                     let op = put::PutOp::start_op(
                         contract,
                         value,
@@ -285,6 +289,10 @@ where
                 }
                 UserEvent::Get { key, contract } => {
                     // Initialize a get op.
+                    log::debug!(
+                        "Received get from user event @ {}",
+                        &op_storage_cp.ring.peer_key
+                    );
                     let op = get::GetOp::start_op(key, contract, &op_storage_cp.ring.peer_key);
                     if let Err(err) = get::request_get(&op_storage_cp, op).await {
                         log::error!("{}", err);

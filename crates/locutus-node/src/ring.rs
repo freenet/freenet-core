@@ -58,7 +58,7 @@ pub(crate) struct Ring {
     pub peer_key: PeerKey,
     connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
     /// contracts in the ring cached by this node
-    cached_contracts: DashSet<ContractKey>,
+    pub cached_contracts: DashSet<ContractKey>,
     own_location: AtomicU64,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because

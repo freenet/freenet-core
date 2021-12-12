@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Receiver};
 
+#[cfg(test)]
+use crate::contract::{Contract, ContractError, ContractHandlerEvent, ContractValue};
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
     contract::{self, ContractHandler},
@@ -116,6 +118,29 @@ where
             event_listener,
             is_gateway: config.location.is_some(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn append_contracts(
+        &self,
+        contracts: Vec<(Contract, ContractValue)>,
+    ) -> Result<(), ContractError<CErr>> {
+        for (contract, value) in contracts {
+            let key = contract.key();
+            self.op_storage
+                .notify_contract_handler(ContractHandlerEvent::Cache(contract))
+                .await?;
+            self.op_storage
+                .notify_contract_handler(ContractHandlerEvent::PushQuery { key, value })
+                .await?;
+            log::debug!(
+                "Appended contract {} to peer {}",
+                key,
+                self.op_storage.ring.peer_key
+            );
+            self.op_storage.ring.cached_contracts.insert(key);
+        }
+        Ok(())
     }
 
     async fn join_ring(
@@ -235,6 +260,11 @@ where
                                 Self::report_result(op_result);
                             }
                             Message::Get(op) => {
+                                log::debug!(
+                                    "Handling get request @ {} (tx: {})",
+                                    op_storage.ring.peer_key,
+                                    op.id()
+                                );
                                 let op_result =
                                     get::handle_get_request(&op_storage, &mut conn_manager, op)
                                         .await;
