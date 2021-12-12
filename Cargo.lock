@@ -1818,6 +1818,7 @@ dependencies = [
  "rand 0.8.4",
  "serde 1.0.130",
  "sqlx",
+ "stretto",
  "thiserror",
  "tokio",
  "typestate",
@@ -2889,6 +2890,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "stretto"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d1637e7b69f717f8ca0d466d1535475ee4ff88f254bb966ea97dc69f3689199"
+dependencies = [
+ "atomic",
+ "crossbeam-channel",
+ "parking_lot",
+ "rand 0.8.4",
+ "tokio",
+ "twox-hash",
+ "wg",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3003,6 +3019,8 @@ dependencies = [
  "memchr",
  "mio",
  "num_cpus",
+ "once_cell",
+ "parking_lot",
  "pin-project-lite 0.2.7",
  "tokio-macros",
  "winapi",
@@ -3093,6 +3111,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "trust-dns-proto",
+]
+
+[[package]]
+name = "twox-hash"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f559b464de2e2bdabcac6a210d12e9b5a5973c251e102c44c585c71d51bd78e"
+dependencies = [
+ "cfg-if",
+ "rand 0.8.4",
+ "static_assertions",
 ]
 
 [[package]]
@@ -3387,6 +3416,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d743fdedc5c64377b5fc2bc036b01c7fd642205a0d96356034ae3404d49eb7fb"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "wg"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b031c05c904a1f1a49a330bc4d8d9a6e53d2a8ff5f4115f4f2674c2784469c6"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]
