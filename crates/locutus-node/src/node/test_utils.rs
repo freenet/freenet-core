@@ -9,7 +9,7 @@ use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
-use crate::contract::{Contract, ContractKey};
+use crate::contract::{Contract, ContractKey, ContractValue};
 use crate::user_events::UserEvent;
 use crate::{
     conn_manager::PeerKey,
@@ -59,7 +59,8 @@ pub(crate) type EventId = usize;
 
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
-    pub owned_contracts: Vec<Contract>,
+    /// Pair of contract and the initial value
+    pub owned_contracts: Vec<(Contract, ContractValue)>,
     pub non_owned_contracts: Vec<ContractKey>,
     pub events_to_generate: HashMap<EventId, UserEvent>,
 }

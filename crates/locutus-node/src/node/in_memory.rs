@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Receiver};
 
+#[cfg(test)]
+use crate::contract::{Contract, ContractError, ContractHandlerEvent, ContractValue};
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
     contract::{self, ContractHandler},
@@ -17,13 +19,6 @@ use crate::{
     utils::{ExponentialBackoff, ExtendedIter},
     NodeConfig,
 };
-
-#[cfg(test)]
-use crate::contract::Contract;
-#[cfg(test)]
-use crate::contract::ContractError;
-#[cfg(test)]
-use crate::contract::ContractHandlerEvent;
 
 use super::{op_state::OpManager, EventListener};
 
@@ -128,13 +123,21 @@ where
     #[cfg(test)]
     pub(crate) async fn append_contracts(
         &self,
-        contracts: Vec<Contract>,
+        contracts: Vec<(Contract, ContractValue)>,
     ) -> Result<(), ContractError<CErr>> {
-        for contract in contracts {
+        for (contract, value) in contracts {
             let key = contract.key();
             self.op_storage
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract))
                 .await?;
+            self.op_storage
+                .notify_contract_handler(ContractHandlerEvent::PushQuery { key, value })
+                .await?;
+            log::debug!(
+                "Appended contract {} to peer {}",
+                key,
+                self.op_storage.ring.peer_key
+            );
             self.op_storage.ring.cached_contracts.insert(key);
         }
         Ok(())
@@ -257,7 +260,11 @@ where
                                 Self::report_result(op_result);
                             }
                             Message::Get(op) => {
-                                log::info!("Handling get request @ {}", op_storage.ring.peer_key);
+                                log::debug!(
+                                    "Handling get request @ {} (tx: {})",
+                                    op_storage.ring.peer_key,
+                                    op.id()
+                                );
                                 let op_result =
                                     get::handle_get_request(&op_storage, &mut conn_manager, op)
                                         .await;

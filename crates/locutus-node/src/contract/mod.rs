@@ -138,8 +138,8 @@ impl PartialEq for Contract {
 impl Eq for Contract {}
 
 /// The key representing a contract.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, arbitrary::Arbitrary)]
-// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct ContractKey(
     #[serde(deserialize_with = "contract_key_deser")]
     #[serde(serialize_with = "<[_]>::serialize")]
@@ -186,8 +186,7 @@ where
 
 /// The value for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
-// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-#[derive(arbitrary::Arbitrary)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) struct ContractValue(Arc<Vec<u8>>);
 
 impl ContractValue {

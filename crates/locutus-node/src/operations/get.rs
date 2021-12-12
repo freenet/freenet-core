@@ -116,14 +116,17 @@ impl StateMachineImpl for GetOpSm {
                 },
             ) => {
                 log::error!(
-                    "Get response received for contract {}, but the contract wasn't returned!",
+                    "Get response received for contract {}, but the contract wasn't returned",
                     key
                 );
                 // error out, should not be possible
                 None
             }
             // states of the receiver
-            (GetState::ReceivedRequest, GetMsg::ReturnGet { .. }) => Some(GetState::Completed),
+            (GetState::ReceivedRequest, GetMsg::ReturnGet { key, target, .. }) => {
+                log::debug!("Returning contract {} to {}", key, target.peer);
+                Some(GetState::Completed)
+            }
             _ => None,
         }
     }
@@ -328,13 +331,7 @@ where
                 GetState::AwaitingResponse { .. }
             ));
             new_state = Some(state);
-            log::debug!(
-                "Received {} message, seek new node {} where to find the contract {} (tx: {})",
-                other_host_msg,
-                target.peer,
-                key,
-                id
-            );
+            log::debug!("Seek contract {} @ {} (tx: {})", key, target.peer, id);
             return_msg = Some(Message::from(GetMsg::SeekNode {
                 key,
                 id,
@@ -348,6 +345,7 @@ where
             id,
             fetch_contract,
             sender,
+            target,
             ..
         } => {
             if !op_storage.ring.contract_exists(&key) {
@@ -404,7 +402,7 @@ where
                     _ => {}
                 }
 
-                log::debug!("Contract `{}` found @ peer {}", returned_key, sender.peer);
+                log::debug!("Contract {} found @ peer {}", returned_key, target.peer);
 
                 return_msg = state
                     .sm
@@ -412,11 +410,11 @@ where
                         key,
                         id,
                         value: value.map_err(ContractError::from)?,
-                        sender,
-                        target: op_storage.ring.own_location(),
+                        sender: target,
+                        target: sender,
                     })?
                     .map(Message::from);
-                new_state = Some(state);
+                new_state = None;
             } else {
                 return Err(OpError::InvalidStateTransition(id));
             }
@@ -435,7 +433,7 @@ where
         } => {
             let this_loc = target;
             log::warn!(
-                "Neither contract or contract value for contract `{}` found at peer {}, retrying with other peers.",
+                "Neither contract or contract value for contract `{}` found at peer {}, retrying with other peers",
                 key,
                 sender.peer
             );
@@ -708,35 +706,36 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 2usize;
+        const NUM_NODES: usize = 1usize;
         const NUM_GW: usize = 1usize;
 
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
+        let contract_val: ContractValue = gen.arbitrary()?;
         let key = contract.key();
-
-        let node_0 = NodeSpecification {
-            owned_contracts: vec![contract],
-            non_owned_contracts: vec![],
-            events_to_generate: HashMap::new(),
-        };
 
         let get_event = UserEvent::Get {
             key,
-            contract: false,
+            contract: true,
         };
-        let node_1 = NodeSpecification {
+        let node_0 = NodeSpecification {
             owned_contracts: vec![],
             non_owned_contracts: vec![key],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
         };
 
+        let gw_0 = NodeSpecification {
+            owned_contracts: vec![(contract, contract_val)],
+            non_owned_contracts: vec![],
+            events_to_generate: HashMap::new(),
+        };
+
         let get_specs = HashMap::from_iter([
             ("node-0".to_string(), node_0),
-            ("node-1".to_string(), node_1),
+            ("gateway-0".to_string(), gw_0),
         ]);
 
         // establish network
@@ -745,14 +744,14 @@ mod test {
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger get @ node-1, which does not own the contract
-        sim_nodes.trigger_event("node-1", 1)?;
+        sim_nodes.trigger_event("node-0", 1)?;
 
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         // FIXME: check tx finished succesfully
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contract_not_found() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
@@ -791,7 +790,7 @@ mod test {
         // trigger get @ node-1, which does not own the contract
         sim_nodes.trigger_event("node-1", 1)?;
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         // FIXME: check tx finished unsuccesfully
         Ok(())
     }

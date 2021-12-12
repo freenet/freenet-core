@@ -8,7 +8,7 @@ pub(crate) trait UserEventsProxy {
 }
 
 #[derive(Clone)]
-// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) enum UserEvent {
     /// Update or insert a new value in a contract corresponding with the provided key.
     Put {
@@ -43,7 +43,7 @@ pub(crate) mod test_utils {
         signal: Receiver<(EventId, PeerKey)>,
         id: PeerKey,
         non_owned_contracts: Vec<ContractKey>,
-        owned_contracts: Vec<Contract>,
+        owned_contracts: Vec<(Contract, ContractValue)>,
         events_to_gen: HashMap<EventId, UserEvent>,
     }
 
@@ -64,7 +64,10 @@ pub(crate) mod test_utils {
         }
 
         /// Contracts that the user updates.
-        pub fn has_contract(&mut self, contracts: impl IntoIterator<Item = Contract>) {
+        pub fn has_contract(
+            &mut self,
+            contracts: impl IntoIterator<Item = (Contract, ContractValue)>,
+        ) {
             self.owned_contracts.extend(contracts.into_iter())
         }
 
@@ -83,13 +86,7 @@ pub(crate) mod test_utils {
                 match rng.gen_range(0u8..3) {
                     0 if !self.owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                        let contract = self.owned_contracts[contract_no].clone();
-
-                        let bytes = random_bytes_128();
-                        let mut unst = Unstructured::new(&bytes);
-                        let value =
-                            ContractValue::arbitrary(&mut unst).expect("failed gen arb data");
-
+                        let (contract, value) = self.owned_contracts[contract_no].clone();
                         break UserEvent::Put { contract, value };
                     }
                     1 if !self.non_owned_contracts.is_empty() => {
@@ -114,7 +111,7 @@ pub(crate) mod test_utils {
                         };
                         let key = if get_owned {
                             let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                            self.owned_contracts[contract_no].key()
+                            self.owned_contracts[contract_no].0.key()
                         } else {
                             let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
 

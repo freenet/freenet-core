@@ -836,6 +836,7 @@ mod test {
         let bytes = crate::test_utils::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
+        let contract_val: ContractValue = gen.arbitrary()?;
         let value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
         let put_event = UserEvent::Put {
@@ -843,13 +844,13 @@ mod test {
             value,
         };
         let node_0 = NodeSpecification {
-            owned_contracts: vec![contract.clone()],
+            owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::from_iter([(1, put_event)]),
         };
 
         let node_1 = NodeSpecification {
-            owned_contracts: vec![contract],
+            owned_contracts: vec![(contract, contract_val)],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
         };
