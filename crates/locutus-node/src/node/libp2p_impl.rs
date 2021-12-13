@@ -217,7 +217,7 @@ mod test {
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2
                 .swarm
-                .dial_addr(peer1_config.addr.unwrap())
+                .dial(peer1_config.addr.unwrap())
                 .map_err(|_| ())?;
             let res = ping_ev_loop(&mut peer2).await;
             res

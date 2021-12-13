@@ -1,6 +1,6 @@
 use std::{ops::Deref, sync::Arc};
 
-use blake2::{Blake2b, Digest};
+use blake2::{Blake2b512, Digest};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ring::Location;
@@ -103,7 +103,7 @@ pub(crate) struct Contract {
 
 impl Contract {
     pub fn new(data: Vec<u8>) -> Self {
-        let mut hasher = Blake2b::new();
+        let mut hasher = Blake2b512::new();
         hasher.update(&data);
         let key_arr = hasher.finalize();
         debug_assert_eq!((&key_arr[..]).len(), CONTRACT_KEY_SIZE);

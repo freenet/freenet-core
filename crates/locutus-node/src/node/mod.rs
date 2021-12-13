@@ -224,8 +224,10 @@ impl InitPeerNode {
     /// Will panic if is not a valid representation.
     pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> PeerId {
         PeerId::from_public_key(
-            identity::Keypair::Ed25519(identity::ed25519::Keypair::decode(bytes.as_mut()).unwrap())
-                .public(),
+            &identity::Keypair::Ed25519(
+                identity::ed25519::Keypair::decode(bytes.as_mut()).unwrap(),
+            )
+            .public(),
         )
     }
 

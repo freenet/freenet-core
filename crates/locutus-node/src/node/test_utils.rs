@@ -106,7 +106,7 @@ impl SimNetwork {
         for node_no in 0..num {
             let label = format!("gateway-{}", node_no);
             let pair = identity::Keypair::generate_ed25519();
-            let id = pair.public().into_peer_id();
+            let id = pair.public().to_peer_id();
             let port = get_free_port().unwrap();
             let location = Location::random();
 
@@ -171,7 +171,7 @@ impl SimNetwork {
         for node_no in 0..num {
             let label = format!("node-{}", node_no);
             let pair = identity::Keypair::generate_ed25519();
-            let id = pair.public().into_peer_id();
+            let id = pair.public().to_peer_id();
 
             let mut config = NodeConfig::new();
             for GatewayConfig {
