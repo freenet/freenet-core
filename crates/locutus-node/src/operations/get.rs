@@ -724,12 +724,14 @@ mod test {
             owned_contracts: vec![],
             non_owned_contracts: vec![key],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
+            contract_subscribers: HashMap::new(),
         };
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(contract, contract_val)],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::new(),
         };
 
         let get_specs = HashMap::from_iter([
@@ -769,6 +771,7 @@ mod test {
             owned_contracts: vec![],
             non_owned_contracts: vec![key],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
+            contract_subscribers: HashMap::new(),
         };
 
         let get_specs = HashMap::from_iter([("node-1".to_string(), node_1)]);

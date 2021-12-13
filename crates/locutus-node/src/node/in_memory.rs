@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Receiver};
 
 use crate::contract::{
-    Contract, ContractError, ContractHandlerEvent, ContractValue, SimStoreError,
+    Contract, ContractError, ContractHandlerEvent, ContractKey, ContractValue, SimStoreError,
 };
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
@@ -84,6 +85,7 @@ where
     pub(crate) async fn append_contracts(
         &self,
         contracts: Vec<(Contract, ContractValue)>,
+        contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, value) in contracts {
             let key = contract.key();
@@ -98,7 +100,14 @@ where
                 key,
                 self.op_storage.ring.peer_key
             );
-            self.op_storage.ring.cached_contracts.insert(key);
+            self.op_storage.ring.cached_contracts.insert(key.clone());
+
+            if let Some(subscribers) = contract_subscribers.get(&key) {
+                // add contract subscribers
+                for subscriber in subscribers {
+                    self.op_storage.ring.add_subscriber(key, *subscriber);
+                }
+            }
         }
         Ok(())
     }
