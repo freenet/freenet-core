@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{
     core::{muxing, transport, upgrade},
@@ -10,44 +10,64 @@ use libp2p::{
     tcp::TokioTcpConfig,
     yamux, PeerId, Swarm, Transport,
 };
+use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
     config::{self, GlobalExecutor},
+    conn_manager::PeerKey,
+    contract::{self, ContractHandler, ContractStoreError},
+    message::Message,
+    ring::{PeerKeyLocation, Ring},
     NodeConfig,
 };
+
+use super::OpManager;
 
 const CURRENT_AGENT_VER: &str = "locutus/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "id/1.0.0";
 
-pub struct NodeLibP2P {
-    swarm: Swarm<NetBehaviour>,
+pub struct NodeLibP2P<CErr = ContractStoreError> {
     listen_on: Option<(IpAddr, u16)>,
+    pub(crate) peer_key: PeerKey,
+    gateways: Vec<PeerKeyLocation>,
+    notification_channel: Receiver<Message>,
+    pub(crate) conn_manager: P2pConnectionManager,
+    pub(crate) op_storage: Arc<OpManager<CErr>>,
+    // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
+    is_gateway: bool,
 }
 
-impl NodeLibP2P {
+pub(crate) struct P2pConnectionManager {
+    swarm: Swarm<NetBehaviour>,
+}
+
+impl<CErr> NodeLibP2P<CErr>
+where
+    CErr: std::error::Error,
+{
     pub(super) async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         if let Some(conn) = self.listen_on {
             let listening_addr = super::multiaddr_from_connection(conn);
-            self.swarm.listen_on(listening_addr).unwrap();
+            self.conn_manager.swarm.listen_on(listening_addr).unwrap();
             Ok(())
         } else {
             anyhow::bail!("failed listening to connections")
         }
     }
 
-    pub(super) fn build(config: NodeConfig) -> std::io::Result<Self> {
-        if (config.local_ip.is_none() || config.local_port.is_none())
-            && config.remote_nodes.is_empty()
-        {
-            // This is not an initial provider. At least one remote provider is required to join an existing network.
-            // return Err();
-            // todo!()
-        }
+    pub(super) fn build<CH>(
+        config: NodeConfig,
+    ) -> Result<NodeLibP2P<<CH as ContractHandler>::Error>, anyhow::Error>
+    where
+        CH: ContractHandler + Send + Sync + 'static,
+        <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let peer_key = PeerKey::from(config.local_key.public());
+        let gateways = config.get_gateways()?;
 
-        let transport = Self::config_transport(&config.local_key)?;
-        let behaviour = Self::config_behaviour(&config.local_key);
-
-        let swarm = {
+        let conn_manager = {
+            let transport = Self::config_transport(&config.local_key)?;
+            let behaviour = Self::config_behaviour(&config.local_key);
             // We set a global executor which is virtually the Tokio multi-threaded executor
             // to reuse it's thread pool and scheduler in order to drive futures.
             let global_executor = Box::new(GlobalExecutor);
@@ -57,12 +77,26 @@ impl NodeLibP2P {
                 PeerId::from(config.local_key.public()),
             )
             .executor(global_executor);
-            builder.build()
+            let swarm = builder.build();
+            P2pConnectionManager { swarm }
         };
 
-        Ok(Self {
-            swarm,
+        let ring = Ring::new(&config, &gateways)?;
+        let (notification_tx, notification_channel) = mpsc::channel(100);
+        let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
+        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
+        let contract_handler = CH::from(ch_channel);
+
+        tokio::spawn(contract::contract_handling(contract_handler));
+
+        Ok(NodeLibP2P {
+            peer_key,
+            conn_manager,
+            gateways,
+            notification_channel,
+            op_storage,
             listen_on: config.local_ip.zip(config.local_port),
+            is_gateway: config.location.is_some(),
         })
     }
 
@@ -160,16 +194,24 @@ mod test {
     use super::*;
     use crate::{
         config::tracing::Logger,
+        contract::CHandlerImpl,
         node::{test_utils::get_free_port, InitPeerNode},
         ring::Location,
     };
 
-    use libp2p::{futures::StreamExt, swarm::SwarmEvent};
+    use futures::StreamExt;
+    use libp2p::swarm::SwarmEvent;
 
     /// Ping test event loop
-    async fn ping_ev_loop(peer: &mut NodeLibP2P) -> Result<(), ()> {
+    async fn ping_ev_loop<CErr>(peer: &mut NodeLibP2P<CErr>) -> Result<(), ()>
+    where
+        CErr: std::error::Error,
+    {
         loop {
-            let ev = tokio::time::timeout(Duration::from_secs(1), peer.swarm.select_next_some());
+            let ev = tokio::time::timeout(
+                Duration::from_secs(1),
+                peer.conn_manager.swarm.select_next_some(),
+            );
             match ev.await {
                 Ok(SwarmEvent::Behaviour(NetEvent::Ping(ping))) => {
                     if ping.result.is_ok() {
@@ -205,17 +247,21 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 = NodeLibP2P::build(config).unwrap();
+            let mut peer1 =
+                NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap();
             peer1.listen_on().await.unwrap();
             ping_ev_loop(&mut peer1).await
         });
 
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
-            let mut peer2 = NodeLibP2P::build(NodeConfig::default()).unwrap();
+            let mut peer2 =
+                NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(NodeConfig::default())
+                    .unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2
+                .conn_manager
                 .swarm
                 .dial(peer1_config.addr.unwrap())
                 .map_err(|_| ())?;

@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Receiver};
 
-#[cfg(test)]
-use crate::contract::{Contract, ContractError, ContractHandlerEvent, ContractValue};
+use crate::contract::{
+    Contract, ContractError, ContractHandlerEvent, ContractValue, SimStoreError,
+};
 use crate::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
     contract::{self, ContractHandler},
@@ -20,7 +21,8 @@ use crate::{
     NodeConfig,
 };
 
-use super::{op_state::OpManager, EventListener};
+use super::event_listener::EventListener;
+use super::op_state::OpManager;
 
 macro_rules! log_handling_msg {
     ($op:expr, $id:expr, $op_storage:ident) => {
@@ -32,10 +34,7 @@ macro_rules! log_handling_msg {
     };
 }
 
-pub(crate) struct NodeInMemory<CErr>
-where
-    CErr: std::error::Error,
-{
+pub(crate) struct NodeInMemory<CErr = SimStoreError> {
     pub peer_key: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
@@ -58,55 +57,11 @@ where
         CH: ContractHandler + Send + Sync + 'static,
         <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
     {
-        let peer = PeerKey::from(config.local_key.public());
-        let conn_manager = MemoryConnManager::new(true, peer, None);
+        let peer_key = PeerKey::from(config.local_key.public());
+        let conn_manager = MemoryConnManager::new(true, peer_key, None);
+        let gateways = config.get_gateways()?;
 
-        let gateways: Vec<_> = config
-            .remote_nodes
-            .into_iter()
-            .filter_map(|node| {
-                if node.addr.is_some() {
-                    Some(PeerKeyLocation {
-                        peer: PeerKey::from(node.identifier),
-                        location: Some(node.location),
-                    })
-                } else {
-                    None
-                }
-            })
-            .filter(|pkloc| pkloc.peer != peer)
-            .collect();
-
-        if (config.local_ip.is_none() || config.local_port.is_none()) && gateways.is_empty() {
-            return Err(anyhow::anyhow!(
-                    "At least one remote gateway is required to join an existing network for non-gateway nodes."
-                ));
-        }
-
-        let mut ring = Ring::new(peer);
-        if let Some(loc) = config.location {
-            if config.local_ip.is_none() || config.local_port.is_none() {
-                return Err(anyhow::anyhow!("IP and port are required for gateways"));
-            }
-            ring.update_location(Some(loc));
-            for PeerKeyLocation { peer, location } in &gateways {
-                // all gateways are aware of each other
-                ring.add_connection((*location).unwrap(), *peer);
-            }
-        }
-        if let Some(max_hops_to_live) = config.max_hops_to_live {
-            ring.with_max_hops(max_hops_to_live);
-        }
-        if let Some(rnd_if_htl_above) = config.rnd_if_htl_above {
-            ring.with_rnd_walk_above(rnd_if_htl_above);
-        }
-        if let Some(max_conn) = config.max_number_conn {
-            ring.with_max_connections(max_conn);
-        }
-        if let Some(min_conn) = config.min_number_conn {
-            ring.with_min_connections(min_conn);
-        }
-
+        let ring = Ring::new(&config, &gateways)?;
         let (notification_tx, notification_channel) = mpsc::channel(100);
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
@@ -115,7 +70,7 @@ where
         tokio::spawn(contract::contract_handling(contract_handler));
 
         Ok(NodeInMemory {
-            peer_key: peer,
+            peer_key,
             conn_manager,
             op_storage,
             gateways,

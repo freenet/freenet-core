@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     conn_manager::{self, PeerKey},
     contract::ContractKey,
+    NodeConfig,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -101,45 +102,63 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new(key: PeerKey) -> Self {
+    pub fn new(config: &NodeConfig, gateways: &[PeerKeyLocation]) -> Result<Self, anyhow::Error> {
+        let peer_key = PeerKey::from(config.local_key.public());
+
         // for location here consider -1 == None
         let own_location = Arc::new(AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes())));
-        Ring {
-            rnd_if_htl_above: Self::RAND_WALK_ABOVE_HTL,
-            max_hops_to_live: Self::MAX_HOPS_TO_LIVE,
-            max_connections: Self::MAX_CONNECTIONS,
-            min_connections: Self::MIN_CONNECTIONS,
+
+        let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
+            v
+        } else {
+            Self::MAX_HOPS_TO_LIVE
+        };
+
+        let rnd_if_htl_above = if let Some(v) = config.rnd_if_htl_above {
+            v
+        } else {
+            Self::RAND_WALK_ABOVE_HTL
+        };
+
+        let min_connections = if let Some(v) = config.min_number_conn {
+            v
+        } else {
+            Self::MIN_CONNECTIONS
+        };
+
+        let max_connections = if let Some(v) = config.max_number_conn {
+            v
+        } else {
+            Self::MAX_CONNECTIONS
+        };
+
+        let ring = Ring {
+            rnd_if_htl_above,
+            max_hops_to_live,
+            max_connections,
+            min_connections,
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
             cached_contracts: DashSet::new(),
             own_location,
-            peer_key: key,
+            peer_key,
             subscribers: Arc::new(DashMap::new()),
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             contract_blacklist: Arc::new(DashMap::new()),
             incoming_connections: Arc::new(AtomicUsize::new(0)),
+        };
+
+        if let Some(loc) = config.location {
+            if config.local_ip.is_none() || config.local_port.is_none() {
+                return Err(anyhow::anyhow!("IP and port are required for gateways"));
+            }
+            ring.update_location(Some(loc));
+            for PeerKeyLocation { peer, location } in gateways {
+                // all gateways are aware of each other
+                ring.add_connection((*location).unwrap(), *peer);
+            }
         }
-    }
 
-    /// Set the threashold of HPL for which a random walk will be performed.
-    pub fn with_rnd_walk_above(&mut self, rnd_if_htl_above: usize) -> &mut Self {
-        self.rnd_if_htl_above = rnd_if_htl_above;
-        self
-    }
-
-    /// Set the maximum HTL for transactions.
-    pub fn with_max_hops(&mut self, max_hops_to_live: usize) -> &mut Self {
-        self.max_hops_to_live = max_hops_to_live;
-        self
-    }
-
-    pub fn with_max_connections(&mut self, connections: usize) -> &mut Self {
-        self.max_connections = connections;
-        self
-    }
-
-    pub fn with_min_connections(&mut self, connections: usize) -> &mut Self {
-        self.min_connections = connections;
-        self
+        Ok(ring)
     }
 
     #[inline(always)]
@@ -447,7 +466,8 @@ mod test {
 
     #[test]
     fn find_closest() {
-        let ring = Ring::new(PeerKey::random());
+        let config = NodeConfig::new();
+        let ring = Ring::new(&config, &[]).unwrap();
 
         fn build_pk(loc: Location) -> PeerKeyLocation {
             PeerKeyLocation {

@@ -9,7 +9,7 @@ use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
-use crate::contract::{Contract, ContractKey, ContractValue};
+use crate::contract::{Contract, ContractKey, ContractValue, SimStoreError};
 use crate::user_events::UserEvent;
 use crate::{
     conn_manager::PeerKey,
@@ -19,8 +19,6 @@ use crate::{
     user_events::test_utils::MemoryEventsGen,
     NodeConfig,
 };
-
-use super::SimStorageError;
 
 pub fn get_free_port() -> Result<u16, ()> {
     let mut port;
@@ -47,8 +45,8 @@ pub(crate) struct SimNetwork {
     pub labels: HashMap<String, PeerKey>,
     usr_ev_controller: Sender<(EventId, PeerKey)>,
     receiver_ch: Receiver<(EventId, PeerKey)>,
-    gateways: Vec<(NodeInMemory<SimStorageError>, GatewayConfig)>,
-    nodes: Vec<(NodeInMemory<SimStorageError>, String)>,
+    gateways: Vec<(NodeInMemory<SimStoreError>, GatewayConfig)>,
+    nodes: Vec<(NodeInMemory<SimStoreError>, String)>,
     ring_max_htl: usize,
     rnd_if_htl_above: usize,
     max_connections: usize,
@@ -151,7 +149,7 @@ impl SimNetwork {
                 );
             }
 
-            let gateway = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
+            let gateway = NodeInMemory::<SimStoreError>::build::<MemoryContractHandler>(
                 this_node,
                 Some(Box::new(self.event_listener.clone())),
             )
@@ -193,7 +191,7 @@ impl SimNetwork {
             self.event_listener
                 .add_node(label.clone(), PeerKey::from(id));
 
-            let node = NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(
+            let node = NodeInMemory::<SimStoreError>::build::<MemoryContractHandler>(
                 config,
                 Some(Box::new(self.event_listener.clone())),
             )
@@ -220,7 +218,7 @@ impl SimNetwork {
 
     fn initialize_peer(
         &mut self,
-        mut peer: NodeInMemory<SimStorageError>,
+        mut peer: NodeInMemory<SimStoreError>,
         label: String,
         node_specs: Option<NodeSpecification>,
     ) {

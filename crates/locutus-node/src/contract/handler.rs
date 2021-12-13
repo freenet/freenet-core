@@ -8,6 +8,8 @@ use stretto::AsyncCache;
 use tokio::sync::mpsc;
 
 use super::runtime::{ContractRuntime, ContractUpdateError};
+use super::test_utils::{MemKVStore, MockRuntime};
+use super::ContractStoreError;
 use crate::contract::store::ContractStore;
 use crate::contract::{Contract, ContractError, ContractKey, ContractValue};
 
@@ -40,15 +42,12 @@ pub struct EventId(u64);
 
 /// A bidirectional channel which keeps track of the initiator half
 /// and sends the corresponding response to the listener of the operation.
-pub(crate) struct ContractHandlerChannel<SErr, End>
-where
-    SErr: std::error::Error,
-{
-    rx: mpsc::UnboundedReceiver<InternalCHEvent<SErr>>,
-    tx: mpsc::UnboundedSender<InternalCHEvent<SErr>>,
+pub(crate) struct ContractHandlerChannel<CErr, End> {
+    rx: mpsc::UnboundedReceiver<InternalCHEvent<CErr>>,
+    tx: mpsc::UnboundedSender<InternalCHEvent<CErr>>,
     //TODO:  change queue to btree once pop_first is stabilized
     // (https://github.com/rust-lang/rust/issues/62924)
-    queue: VecDeque<(u64, ContractHandlerEvent<SErr>)>,
+    queue: VecDeque<(u64, ContractHandlerEvent<CErr>)>,
     _halve: PhantomData<End>,
 }
 
@@ -62,12 +61,12 @@ mod sealed {
     impl ChannelHalve for CHSenderHalve {}
 }
 
-pub(crate) fn contract_handler_channel<SErr>() -> (
-    ContractHandlerChannel<SErr, CHSenderHalve>,
-    ContractHandlerChannel<SErr, CHListenerHalve>,
+pub(crate) fn contract_handler_channel<CErr>() -> (
+    ContractHandlerChannel<CErr, CHSenderHalve>,
+    ContractHandlerChannel<CErr, CHListenerHalve>,
 )
 where
-    SErr: std::error::Error,
+    CErr: std::error::Error,
 {
     let (notification_tx, notification_channel) = mpsc::unbounded_channel();
     let (ch_tx, ch_listener) = mpsc::unbounded_channel();
@@ -96,12 +95,12 @@ static EV_ID: AtomicU64 = AtomicU64::new(0);
 // kind of event and can be optimized on a case basis
 const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
 
-impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHSenderHalve> {
+impl<CErr: std::error::Error> ContractHandlerChannel<CErr, CHSenderHalve> {
     /// Send an event to the contract handler and receive a response event if successful.
     pub async fn send_to_handler(
         &mut self,
-        ev: ContractHandlerEvent<SErr>,
-    ) -> Result<ContractHandlerEvent<SErr>, ContractError<SErr>> {
+        ev: ContractHandlerEvent<CErr>,
+    ) -> Result<ContractHandlerEvent<CErr>, ContractError<CErr>> {
         let id = EV_ID.fetch_add(1, SeqCst);
         self.tx
             .send(InternalCHEvent { ev, id })
@@ -127,12 +126,12 @@ impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHSenderHalve> {
     }
 }
 
-impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHListenerHalve> {
+impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
     pub async fn send_to_listener(
         &self,
         id: EventId,
-        ev: ContractHandlerEvent<SErr>,
-    ) -> Result<(), ContractError<SErr>> {
+        ev: ContractHandlerEvent<CErr>,
+    ) -> Result<(), ContractError<CErr>> {
         Ok(self
             .tx
             .send(InternalCHEvent { ev, id: id.0 })
@@ -141,7 +140,7 @@ impl<SErr: std::error::Error> ContractHandlerChannel<SErr, CHListenerHalve> {
 
     pub async fn recv_from_listener(
         &mut self,
-    ) -> Result<(EventId, ContractHandlerEvent<SErr>), ContractError<SErr>> {
+    ) -> Result<(EventId, ContractHandlerEvent<CErr>), ContractError<CErr>> {
         if let Some((id, ev)) = self.queue.pop_front() {
             return Ok((EventId(id), ev));
         }
@@ -158,19 +157,13 @@ pub(crate) struct StoreResponse {
     pub contract: Option<Contract>,
 }
 
-struct InternalCHEvent<Err>
-where
-    Err: std::error::Error,
-{
-    ev: ContractHandlerEvent<Err>,
+struct InternalCHEvent<CErr> {
+    ev: ContractHandlerEvent<CErr>,
     id: u64,
 }
 
 #[derive(Debug)]
-pub(crate) enum ContractHandlerEvent<Err>
-where
-    Err: std::error::Error,
-{
+pub(crate) enum ContractHandlerEvent<Err> {
     /// Try to push/put a new value into the contract.
     PushQuery {
         key: ContractKey,
@@ -196,15 +189,80 @@ where
     CacheResult(Result<(), ContractError<Err>>),
 }
 
+pub(crate) struct CHandlerImpl<KVStore = MemKVStore> {
+    channel: ContractHandlerChannel<ContractStoreError, CHListenerHalve>,
+    kv_store: KVStore,
+    contract_store: ContractStore,
+    _runtime: MockRuntime,
+}
+
+impl<KVStore> CHandlerImpl<KVStore> {
+    pub fn new(
+        channel: ContractHandlerChannel<ContractStoreError, CHListenerHalve>,
+        kv_store: KVStore,
+    ) -> Self {
+        CHandlerImpl {
+            channel,
+            kv_store,
+            contract_store: ContractStore::new(),
+            _runtime: MockRuntime {},
+        }
+    }
+}
+
+impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>>
+    for CHandlerImpl
+{
+    fn from(
+        channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
+    ) -> Self {
+        let store = MemKVStore::new();
+        CHandlerImpl::new(channel, store)
+    }
+}
+
+#[async_trait::async_trait]
+impl ContractHandler for CHandlerImpl {
+    type Error = ContractStoreError;
+
+    #[inline(always)]
+    fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
+        &mut self.channel
+    }
+
+    #[inline(always)]
+    fn contract_store(&mut self) -> &mut ContractStore {
+        &mut self.contract_store
+    }
+
+    /// Get current contract value, if present, otherwise get none.
+    async fn get_value(
+        &self,
+        contract: &ContractKey,
+    ) -> Result<Option<ContractValue>, Self::Error> {
+        Ok(self.kv_store.get(contract).cloned())
+    }
+
+    async fn put_value(
+        &mut self,
+        contract: &ContractKey,
+        value: ContractValue,
+    ) -> Result<ContractValue, Self::Error> {
+        let new_val = value.clone();
+        self.kv_store.insert(*contract, value);
+        Ok(new_val)
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::node::SimStorageError;
+    use crate::contract::test_utils::SimStoreError;
 
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_test() -> Result<(), anyhow::Error> {
-        let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStorageError>();
+        let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
         let h = tokio::spawn(async move {
             send_halve

@@ -409,7 +409,7 @@ where
                     .consume_to_output(GetMsg::ReturnGet {
                         key,
                         id,
-                        value: value.map_err(ContractError::from)?,
+                        value: value.map_err(|err| ContractError::StorageError(err))?,
                         sender: target,
                         target: sender,
                     })?
@@ -643,15 +643,14 @@ mod test {
     use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
     use crate::user_events::UserEvent;
     use crate::{
-        contract::{Contract, ContractValue},
-        node::SimStorageError,
+        contract::{Contract, ContractValue, SimStoreError},
         ring::Location,
     };
     use std::collections::HashMap;
 
     use super::*;
 
-    type Err = OpError<SimStorageError>;
+    type Err = OpError<SimStoreError>;
 
     #[test]
     fn successful_get_op_seq() -> Result<(), anyhow::Error> {

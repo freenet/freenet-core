@@ -764,16 +764,14 @@ mod test {
 
     use crate::{
         conn_manager::PeerKey,
-        node::{
-            test_utils::{check_connectivity, NodeSpecification, SimNetwork},
-            SimStorageError,
-        },
+        contract::SimStoreError,
+        node::test_utils::{check_connectivity, NodeSpecification, SimNetwork},
         user_events::UserEvent,
     };
 
     use super::*;
 
-    type Err = OpError<SimStorageError>;
+    type Err = OpError<SimStoreError>;
 
     #[test]
     fn successful_put_op_seq() -> Result<(), anyhow::Error> {
@@ -834,7 +832,7 @@ mod test {
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert_eq!(res_msg, expected);
 
-        let finished = requester.consume_to_state::<SimStorageError>(res_msg)?;
+        let finished = requester.consume_to_state::<SimStoreError>(res_msg)?;
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert!(finished.is_none());
         Ok(())

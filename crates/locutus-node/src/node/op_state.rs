@@ -19,10 +19,7 @@ use crate::{
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 #[derive(Clone)]
-pub(crate) struct OpManager<CErr>
-where
-    CErr: std::error::Error,
-{
+pub(crate) struct OpManager<CErr> {
     join_ring: Arc<DashMap<Transaction, JoinRingOp>>,
     put: Arc<DashMap<Transaction, PutOp>>,
     get: Arc<DashMap<Transaction, GetOp>>,
@@ -42,11 +39,10 @@ macro_rules! check_id_op {
     };
 }
 
-async fn op_manager_svc<CErr>(manager: OpManager<CErr>)
+async fn op_manager_svc<CErr>(_manager: OpManager<CErr>)
 where
     CErr: std::error::Error,
 {
-
     //
 }
 
