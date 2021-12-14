@@ -45,3 +45,6 @@ impl ContractStore {
         Ok(())
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum ContractStoreError {}

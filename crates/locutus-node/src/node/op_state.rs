@@ -1,6 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use tokio::sync::{
     mpsc::{error::SendError, Sender},
     Mutex,
@@ -17,18 +18,16 @@ use crate::{
 
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
-pub(crate) struct OpManager<CErr>
-where
-    CErr: std::error::Error,
-{
-    join_ring: DashMap<Transaction, JoinRingOp>,
-    put: DashMap<Transaction, PutOp>,
-    get: DashMap<Transaction, GetOp>,
-    subscribe: DashMap<Transaction, SubscribeOp>,
+#[derive(Clone)]
+pub(crate) struct OpManager<CErr> {
+    join_ring: Arc<DashMap<Transaction, JoinRingOp>>,
+    put: Arc<DashMap<Transaction, PutOp>>,
+    get: Arc<DashMap<Transaction, GetOp>>,
+    subscribe: Arc<DashMap<Transaction, SubscribeOp>>,
     notification_channel: Sender<Message>,
-    contract_handler: Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>,
+    contract_handler: Arc<Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>>,
     // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
-    _ops_ttl: BTreeMap<Duration, Vec<Transaction>>,
+    _ops_ttl: Arc<RwLock<BTreeMap<Instant, Vec<Transaction>>>>,
     pub ring: Ring,
 }
 
@@ -38,6 +37,13 @@ macro_rules! check_id_op {
             return Err(OpError::IncorrectTxType($var, $get_ty));
         }
     };
+}
+
+async fn op_manager_svc<CErr>(_manager: OpManager<CErr>)
+where
+    CErr: std::error::Error,
+{
+    //
 }
 
 impl<CErr> OpManager<CErr>
@@ -50,14 +56,14 @@ where
         contract_handler: ContractHandlerChannel<CErr, CHSenderHalve>,
     ) -> Self {
         Self {
-            join_ring: DashMap::default(),
-            put: DashMap::default(),
-            get: DashMap::default(),
-            subscribe: DashMap::default(),
+            join_ring: Arc::new(DashMap::default()),
+            put: Arc::new(DashMap::default()),
+            get: Arc::new(DashMap::default()),
+            subscribe: Arc::new(DashMap::default()),
             ring,
             notification_channel,
-            contract_handler: Mutex::new(contract_handler),
-            _ops_ttl: BTreeMap::new(),
+            contract_handler: Arc::new(Mutex::new(contract_handler)),
+            _ops_ttl: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 

@@ -11,37 +11,37 @@ use std::{net::IpAddr, sync::Arc};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
-#[cfg(test)]
-use crate::conn_manager::PeerKey;
-#[cfg(test)]
-use crate::user_events::test_utils::MemoryEventsGen;
-
 use self::libp2p_impl::NodeLibP2P;
-use crate::operations::{subscribe, OpError};
 use crate::{
     config::CONF,
-    contract::ContractError,
-    operations::{get, put},
-    ring::Location,
+    conn_manager::PeerKey,
+    contract::{CHandlerImpl, ContractError, ContractStoreError},
+    operations::{get, put, subscribe, OpError},
+    ring::{Location, PeerKeyLocation},
     user_events::{UserEvent, UserEventsProxy},
 };
+#[cfg(test)]
+use crate::{contract::SimStoreError, user_events::test_utils::MemoryEventsGen};
 
-pub(crate) use event_listener::EventListener;
 #[cfg(test)]
 pub(crate) use in_memory::NodeInMemory;
 pub(crate) use op_state::OpManager;
 
 mod event_listener;
+#[cfg(test)]
 mod in_memory;
 mod libp2p_impl;
 mod op_state;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-pub struct Node(NodeImpl);
+pub struct Node<CErr>(NodeImpl<CErr>);
 
 #[cfg(test)]
-impl Node {
+impl<CErr> Node<CErr>
+where
+    CErr: std::error::Error + Send + Sync + 'static,
+{
     pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
@@ -56,7 +56,10 @@ impl Node {
 }
 
 #[cfg(not(test))]
-impl Node {
+impl<CErr> Node<CErr> 
+where
+    CErr: std::error::Error + Send + Sync + 'static,
+{
     pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         match self.0 {
             NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
@@ -65,17 +68,14 @@ impl Node {
 }
 
 #[cfg(test)]
-enum NodeImpl<StorageErr = SimStorageError>
-where
-    StorageErr: std::error::Error,
-{
-    LibP2P(Box<NodeLibP2P>),
-    InMemory(Box<NodeInMemory<StorageErr>>),
+enum NodeImpl<CErr> {
+    LibP2P(Box<NodeLibP2P<CErr>>),
+    InMemory(Box<NodeInMemory<CErr>>),
 }
 
 #[cfg(not(test))]
-enum NodeImpl {
-    LibP2P(Box<NodeLibP2P>),
+enum NodeImpl<CErr> {
+    LibP2P(Box<NodeLibP2P<CErr>>),
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -91,21 +91,21 @@ enum NodeImpl {
 #[derive(Clone)]
 pub struct NodeConfig {
     /// local peer private key in
-    local_key: identity::Keypair,
+    pub(crate) local_key: identity::Keypair,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
-    local_ip: Option<IpAddr>,
+    pub(crate) local_ip: Option<IpAddr>,
     /// socket port to bind to the listener
-    local_port: Option<u16>,
+    pub(crate) local_port: Option<u16>,
     /// At least an other running listener node is required for joining the network.
     /// Not necessary if this is an initial node.
-    remote_nodes: Vec<InitPeerNode>,
+    pub(crate) remote_nodes: Vec<InitPeerNode>,
     /// the location of this node, used for gateways.
-    location: Option<Location>,
-    max_hops_to_live: Option<usize>,
-    rnd_if_htl_above: Option<usize>,
-    max_number_conn: Option<usize>,
-    min_number_conn: Option<usize>,
+    pub(crate) location: Option<Location>,
+    pub(crate) max_hops_to_live: Option<usize>,
+    pub(crate) rnd_if_htl_above: Option<usize>,
+    pub(crate) max_number_conn: Option<usize>,
+    pub(crate) min_number_conn: Option<usize>,
 }
 
 impl NodeConfig {
@@ -177,21 +177,49 @@ impl NodeConfig {
     }
 
     /// Builds a node using libp2p as backend connection manager.
-    pub fn build_libp2p(self) -> std::io::Result<Node> {
-        Ok(Node(NodeImpl::LibP2P(Box::new(NodeLibP2P::build(self)?))))
+    pub fn build_libp2p(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
+        let node = NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
+        Ok(Node(NodeImpl::LibP2P(Box::new(node))))
     }
 
     #[cfg(test)]
     /// Builds a node using in-memory transport. Used for testing pourpouses.
-    pub fn build_in_memory(self) -> Result<Node, anyhow::Error> {
+    pub(crate) fn build_in_memory(self) -> Result<Node<SimStoreError>, anyhow::Error> {
+        use self::event_listener::TestEventListener;
         use crate::contract::MemoryContractHandler;
 
-        let listener;
-        use self::event_listener::TestEventListener;
-        listener = Box::new(TestEventListener::new());
+        let listener = Box::new(TestEventListener::new());
         let in_mem =
-            NodeInMemory::<SimStorageError>::build::<MemoryContractHandler>(self, Some(listener))?;
+            NodeInMemory::<SimStoreError>::build::<MemoryContractHandler>(self, Some(listener))?;
         Ok(Node(NodeImpl::InMemory(Box::new(in_mem))))
+    }
+
+    /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
+    /// and no gateways are specified.
+    fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
+        let peer = PeerKey::from(self.local_key.public());
+        let gateways: Vec<_> = self
+            .remote_nodes
+            .iter()
+            .filter_map(|node| {
+                if node.addr.is_some() {
+                    Some(PeerKeyLocation {
+                        peer: PeerKey::from(node.identifier),
+                        location: Some(node.location),
+                    })
+                } else {
+                    None
+                }
+            })
+            .filter(|pkloc| pkloc.peer != peer)
+            .collect();
+        if (self.local_ip.is_none() || self.local_port.is_none()) && gateways.is_empty() {
+            anyhow::bail!(
+                        "At least one remote gateway is required to join an existing network for non-gateway nodes."
+                    )
+        } else {
+            Ok(gateways)
+        }
     }
 }
 
@@ -224,8 +252,10 @@ impl InitPeerNode {
     /// Will panic if is not a valid representation.
     pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> PeerId {
         PeerId::from_public_key(
-            identity::Keypair::Ed25519(identity::ed25519::Keypair::decode(bytes.as_mut()).unwrap())
-                .public(),
+            &identity::Keypair::Ed25519(
+                identity::ed25519::Keypair::decode(bytes.as_mut()).unwrap(),
+            )
+            .public(),
         )
     }
 
@@ -324,14 +354,3 @@ where
         });
     }
 }
-
-#[derive(Debug)]
-pub(crate) struct SimStorageError(String);
-
-impl std::fmt::Display for SimStorageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for SimStorageError {}

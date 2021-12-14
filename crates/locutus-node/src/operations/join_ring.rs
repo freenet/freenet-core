@@ -978,11 +978,9 @@ mod test {
 
     use super::*;
     use crate::{
+        contract::SimStoreError,
         message::TxType,
-        node::{
-            test_utils::{check_connectivity, SimNetwork},
-            SimStorageError,
-        },
+        node::test_utils::{check_connectivity, SimNetwork},
     };
 
     #[test]
@@ -1012,7 +1010,7 @@ mod test {
             },
         };
         let res = join_new_peer_2
-            .consume_to_output::<SimStorageError>(req)
+            .consume_to_output::<SimStoreError>(req)
             .unwrap()
             .unwrap();
         let expected = JoinRingMsg::Response {
@@ -1029,7 +1027,7 @@ mod test {
         assert!(matches!(join_new_peer_2.state(), JRState::OCReceived));
 
         let res = join_gw_1
-            .consume_to_output::<SimStorageError>(res)
+            .consume_to_output::<SimStoreError>(res)
             .unwrap()
             .unwrap();
         new_peer.location = Some(new_loc);
@@ -1043,7 +1041,7 @@ mod test {
         assert!(matches!(join_gw_1.state(), JRState::OCReceived));
 
         let res = join_new_peer_2
-            .consume_to_output::<SimStorageError>(res)
+            .consume_to_output::<SimStoreError>(res)
             .unwrap()
             .unwrap();
         let expected = JoinRingMsg::Connected {
@@ -1055,16 +1053,16 @@ mod test {
         assert!(matches!(join_new_peer_2.state(), JRState::Connected { .. }));
 
         assert!(join_gw_1
-            .consume_to_output::<SimStorageError>(res.clone())
+            .consume_to_output::<SimStoreError>(res.clone())
             .unwrap()
             .is_none());
         assert!(matches!(join_gw_1.state(), JRState::Connected { .. }));
 
         // transaction finished, should not return anymore
         assert!(join_new_peer_2
-            .consume_to_output::<SimStorageError>(res.clone())
+            .consume_to_output::<SimStoreError>(res.clone())
             .is_err());
-        assert!(join_gw_1.consume_to_output::<SimStorageError>(res).is_err());
+        assert!(join_gw_1.consume_to_output::<SimStoreError>(res).is_err());
     }
 
     /// Given a network of one node and one gateway test that both are connected.

@@ -504,11 +504,11 @@ mod messages {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::contract::{Contract, ContractValue};
+    use crate::conn_manager::PeerKey;
+    use crate::contract::{Contract, ContractValue, SimStoreError};
     use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
     use crate::ring::Location;
     use crate::user_events::UserEvent;
-    use crate::{conn_manager::PeerKey, node::SimStorageError};
     use std::collections::HashMap;
 
     #[test]
@@ -538,7 +538,7 @@ mod test {
         let mut target =
             StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest, id);
 
-        subscriber.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::FetchRouting {
+        subscriber.consume_to_output::<OpError<SimStoreError>>(SubscribeMsg::FetchRouting {
             id,
             target: first_target_loc,
         })?;
@@ -552,7 +552,7 @@ mod test {
         );
 
         let res_msg = target
-            .consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::SeekNode {
+            .consume_to_output::<OpError<SimStoreError>>(SubscribeMsg::SeekNode {
                 id,
                 key,
                 target: first_target_loc,
@@ -574,7 +574,7 @@ mod test {
         assert_eq!(target.state(), &SubscribeState::Completed);
         assert_eq!(res_msg, expected_msg);
 
-        subscriber.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::ReturnSub {
+        subscriber.consume_to_output::<OpError<SimStoreError>>(SubscribeMsg::ReturnSub {
             id,
             key,
             sender: first_target_loc,
@@ -585,7 +585,7 @@ mod test {
         assert_eq!(subscriber.state(), &SubscribeState::Completed);
 
         target = StateMachine::<SubscribeOpSm>::from_state(SubscribeState::ReceivedRequest, id);
-        target.consume_to_output::<OpError<SimStorageError>>(SubscribeMsg::SeekNode {
+        target.consume_to_output::<OpError<SimStoreError>>(SubscribeMsg::SeekNode {
             id,
             key,
             target: second_target_loc,

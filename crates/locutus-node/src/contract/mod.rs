@@ -1,6 +1,6 @@
 use std::{ops::Deref, sync::Arc};
 
-use blake2::{Blake2b, Digest};
+use blake2::{Blake2b512, Digest};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ring::Location;
@@ -11,11 +11,12 @@ mod store;
 mod test_utils;
 
 pub(crate) use handler::{
-    contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
+    contract_handler_channel, CHSenderHalve, CHandlerImpl, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, StoreResponse,
 };
+pub(crate) use store::ContractStoreError;
 #[cfg(test)]
-pub(crate) use test_utils::MemoryContractHandler;
+pub(crate) use test_utils::{MemoryContractHandler, SimStoreError};
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
@@ -103,7 +104,7 @@ pub(crate) struct Contract {
 
 impl Contract {
     pub fn new(data: Vec<u8>) -> Self {
-        let mut hasher = Blake2b::new();
+        let mut hasher = Blake2b512::new();
         hasher.update(&data);
         let key_arr = hasher.finalize();
         debug_assert_eq!((&key_arr[..]).len(), CONTRACT_KEY_SIZE);
@@ -204,13 +205,13 @@ impl Deref for ContractValue {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ContractError<SErr: std::error::Error> {
+pub(crate) enum ContractError<CErr> {
     #[error("failed while storing a contract")]
-    StorageError(#[from] SErr),
+    StorageError(CErr),
     #[error("contract {0} not found in storage")]
     ContractNotFound(ContractKey),
     #[error("handler channel dropped")]
-    ChannelDropped(Box<ContractHandlerEvent<SErr>>),
+    ChannelDropped(Box<ContractHandlerEvent<CErr>>),
     #[error("no response received from handler")]
-    NoHandlerEvResponse,
+    NoEvHandlerResponse,
 }

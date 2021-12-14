@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use crate::node::SimStorageError;
-
 use super::{
     handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
     runtime::{ContractRuntime, ContractUpdateResult},
@@ -32,7 +30,7 @@ impl ContractRuntime for MockRuntime {
 pub(crate) type MemKVStore = HashMap<ContractKey, ContractValue>;
 
 pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
-    channel: ContractHandlerChannel<SimStorageError, CHListenerHalve>,
+    channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
     kv_store: KVStore,
     contract_store: ContractStore,
     _runtime: MockRuntime,
@@ -40,7 +38,7 @@ pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
 
 impl<KVStore> MemoryContractHandler<KVStore> {
     pub fn new(
-        channel: ContractHandlerChannel<SimStorageError, CHListenerHalve>,
+        channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
         kv_store: KVStore,
     ) -> Self {
         MemoryContractHandler {
@@ -65,7 +63,7 @@ impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHal
 
 #[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
-    type Error = SimStorageError;
+    type Error = SimStoreError;
 
     #[inline(always)]
     fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
@@ -95,6 +93,17 @@ impl ContractHandler for MemoryContractHandler {
         Ok(new_val)
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct SimStoreError(String);
+
+impl std::fmt::Display for SimStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SimStoreError {}
 
 #[cfg(test)]
 mod test {
