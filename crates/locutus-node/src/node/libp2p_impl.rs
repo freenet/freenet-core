@@ -1,20 +1,18 @@
-use std::{net::IpAddr, sync::Arc};
+use std::sync::Arc;
 
 use libp2p::{
     core::{muxing, transport, upgrade},
     dns::TokioDnsConfig,
-    identify,
     identity::Keypair,
-    noise, ping,
-    swarm::SwarmBuilder,
+    noise,
     tcp::TokioTcpConfig,
-    yamux, PeerId, Swarm, Transport,
+    yamux, PeerId, Transport,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
-    config::{self, GlobalExecutor},
-    conn_manager::PeerKey,
+    config,
+    conn_manager::{locutus_cm::LocutusConnManager, PeerKey},
     contract::{self, ContractHandler, ContractStoreError},
     message::Message,
     ring::{PeerKeyLocation, Ring},
@@ -23,22 +21,14 @@ use crate::{
 
 use super::OpManager;
 
-const CURRENT_AGENT_VER: &str = "locutus/0.1.0";
-const CURRENT_IDENTIFY_PROTOC_VER: &str = "id/1.0.0";
-
 pub struct NodeLibP2P<CErr = ContractStoreError> {
-    listen_on: Option<(IpAddr, u16)>,
     pub(crate) peer_key: PeerKey,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
-    pub(crate) conn_manager: P2pConnectionManager,
+    pub(crate) conn_manager: LocutusConnManager,
     pub(crate) op_storage: Arc<OpManager<CErr>>,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
-}
-
-pub(crate) struct P2pConnectionManager {
-    swarm: Swarm<NetBehaviour>,
 }
 
 impl<CErr> NodeLibP2P<CErr>
@@ -46,13 +36,7 @@ where
     CErr: std::error::Error,
 {
     pub(super) async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(conn) = self.listen_on {
-            let listening_addr = super::multiaddr_from_connection(conn);
-            self.conn_manager.swarm.listen_on(listening_addr).unwrap();
-            Ok(())
-        } else {
-            anyhow::bail!("failed listening to connections")
-        }
+        self.conn_manager.listen_on()
     }
 
     pub(super) fn build<CH>(
@@ -67,18 +51,7 @@ where
 
         let conn_manager = {
             let transport = Self::config_transport(&config.local_key)?;
-            let behaviour = Self::config_behaviour(&config.local_key);
-            // We set a global executor which is virtually the Tokio multi-threaded executor
-            // to reuse it's thread pool and scheduler in order to drive futures.
-            let global_executor = Box::new(GlobalExecutor);
-            let builder = SwarmBuilder::new(
-                transport,
-                behaviour,
-                PeerId::from(config.local_key.public()),
-            )
-            .executor(global_executor);
-            let swarm = builder.build();
-            P2pConnectionManager { swarm }
+            LocutusConnManager::build(transport, &config)
         };
 
         let ring = Ring::new(&config, &gateways)?;
@@ -95,7 +68,6 @@ where
             gateways,
             notification_channel,
             op_storage,
-            listen_on: config.local_ip.zip(config.local_port),
             is_gateway: config.location.is_some(),
         })
     }
@@ -136,55 +108,6 @@ where
             .map(|(peer, muxer), _| (peer, muxing::StreamMuxerBox::new(muxer)))
             .boxed())
     }
-
-    fn config_behaviour(local_key: &Keypair) -> NetBehaviour {
-        let ident_config = identify::IdentifyConfig::new(
-            CURRENT_IDENTIFY_PROTOC_VER.to_string(),
-            local_key.public(),
-        )
-        .with_agent_version(CURRENT_AGENT_VER.to_string());
-
-        let ping = if cfg!(debug_assertions) {
-            ping::Ping::new(ping::PingConfig::new().with_keep_alive(true))
-        } else {
-            ping::Ping::default()
-        };
-        NetBehaviour {
-            identify: identify::Identify::new(ident_config),
-            ping,
-        }
-    }
-}
-
-/// The network behaviour implements the following capabilities:
-///
-/// - [Identify](https://github.com/libp2p/specs/tree/master/identify) libp2p protocol.
-/// - Pinging between peers.
-// TODO: - locutus routing and messaging protocol
-#[derive(libp2p::NetworkBehaviour)]
-#[behaviour(event_process = false)]
-#[behaviour(out_event = "NetEvent")]
-struct NetBehaviour {
-    identify: identify::Identify,
-    ping: ping::Ping,
-}
-
-#[derive(Debug)]
-pub(crate) enum NetEvent {
-    Identify(Box<identify::IdentifyEvent>),
-    Ping(ping::PingEvent),
-}
-
-impl From<identify::IdentifyEvent> for NetEvent {
-    fn from(event: identify::IdentifyEvent) -> NetEvent {
-        Self::Identify(Box::new(event))
-    }
-}
-
-impl From<ping::PingEvent> for NetEvent {
-    fn from(event: ping::PingEvent) -> NetEvent {
-        Self::Ping(event)
-    }
 }
 
 #[cfg(test)]
@@ -193,7 +116,8 @@ mod test {
 
     use super::*;
     use crate::{
-        config::tracing::Logger,
+        config::{tracing::Logger, GlobalExecutor},
+        conn_manager::locutus_cm::NetEvent,
         contract::CHandlerImpl,
         node::{test_utils::get_free_port, InitPeerNode},
         ring::Location,

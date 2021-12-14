@@ -9,7 +9,8 @@ use crate::{
     ring::{Location, PeerKeyLocation},
 };
 
-pub mod in_memory;
+pub(crate) mod in_memory;
+pub(crate) mod locutus_cm;
 
 // TODO: use this constants when we do real net i/o
 // const PING_EVERY: Duration = Duration::from_secs(30);

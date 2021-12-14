@@ -56,7 +56,7 @@ where
 }
 
 #[cfg(not(test))]
-impl<CErr> Node<CErr> 
+impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
@@ -281,14 +281,6 @@ impl InitPeerNode {
     }
 }
 
-/// Small helper function to convert a tuple composed of an IP address and a port
-/// to a libp2p Multiaddr type.
-fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
-    let mut addr = Multiaddr::with_capacity(2);
-    addr.push(Protocol::from(conn.0));
-    addr.push(Protocol::Tcp(conn.1));
-    addr
-}
 
 /// Process user events.
 async fn user_event_handling<UsrEv, CErr>(op_storage: Arc<OpManager<CErr>>, mut user_events: UsrEv)
