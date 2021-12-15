@@ -9,14 +9,12 @@ use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
-use crate::contract::{Contract, ContractKey, ContractValue, SimStoreError};
-use crate::user_events::UserEvent;
+use super::PeerKey;
 use crate::{
-    conn_manager::PeerKey,
-    contract::MemoryContractHandler,
+    contract::{Contract, ContractKey, ContractValue, MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location},
-    user_events::test_utils::MemoryEventsGen,
+    user_events::{test_utils::MemoryEventsGen, UserEvent},
     NodeConfig,
 };
 

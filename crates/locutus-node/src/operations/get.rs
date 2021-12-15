@@ -2,10 +2,9 @@ use std::time::Duration;
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey},
     contract::{ContractError, ContractHandlerEvent, ContractKey, StoreResponse},
     message::{Message, Transaction, TxType},
-    node::OpManager,
+    node::{ConnectionBridge, OpManager, PeerKey},
     ring::{PeerKeyLocation, RingError},
 };
 
@@ -640,11 +639,11 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
-    use crate::user_events::UserEvent;
     use crate::{
         contract::{Contract, ContractValue, SimStoreError},
+        node::test_utils::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
+        user_events::UserEvent,
     };
     use std::collections::HashMap;
 

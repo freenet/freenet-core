@@ -37,11 +37,11 @@ pub(crate) mod test_utils {
     use tokio::sync::watch::Receiver;
 
     use super::*;
-    use crate::{conn_manager::PeerKey, node::test_utils::EventId};
+    use crate::node::{test_utils::EventId, PeerKey};
 
     pub(crate) struct MemoryEventsGen {
-        signal: Receiver<(EventId, PeerKey)>,
         id: PeerKey,
+        signal: Receiver<(EventId, PeerKey)>,
         non_owned_contracts: Vec<ContractKey>,
         owned_contracts: Vec<(Contract, ContractValue)>,
         events_to_gen: HashMap<EventId, UserEvent>,

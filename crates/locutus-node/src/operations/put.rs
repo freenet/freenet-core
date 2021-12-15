@@ -7,10 +7,9 @@ use std::time::Duration;
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey},
     contract::{Contract, ContractError, ContractHandlerEvent, ContractKey, ContractValue},
     message::{Message, Transaction, TxType},
-    node::OpManager,
+    node::{ConnectionBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -763,7 +762,6 @@ mod test {
     use std::collections::HashMap;
 
     use crate::{
-        conn_manager::PeerKey,
         contract::SimStoreError,
         node::test_utils::{check_connectivity, NodeSpecification, SimNetwork},
         user_events::UserEvent,

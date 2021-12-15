@@ -29,8 +29,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    conn_manager::{self, PeerKey},
     contract::ContractKey,
+    node::{self, PeerKey},
     NodeConfig,
 };
 
@@ -441,7 +441,7 @@ impl TryFrom<f64> for Location {
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]
-    ConnError(#[from] Box<conn_manager::ConnError>),
+    ConnError(#[from] Box<node::ConnectionError>),
     #[error("No ring connections found")]
     EmptyRing,
     #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
@@ -451,7 +451,6 @@ pub(crate) enum RingError {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::conn_manager::PeerKey;
 
     #[test]
     fn location_dist() {

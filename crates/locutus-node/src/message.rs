@@ -12,7 +12,7 @@ use uuid::{
 };
 
 use crate::{
-    conn_manager::PeerKey,
+    node::PeerKey,
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation},
 };

@@ -17,7 +17,7 @@ use libp2p::{
 
 use crate::{config::GlobalExecutor, NodeConfig};
 
-use super::ConnError;
+use super::ConnectionError;
 
 const CURRENT_AGENT_VER: &str = "locutus/agent/0.1.0";
 const CURRENT_PROTOC_VER: &[u8] = b"locutus/agent/0.1.0";
@@ -49,7 +49,7 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
     addr
 }
 
-pub(crate) struct LocutusConnManager {
+pub(in crate::node) struct LocutusConnManager {
     pub swarm: Swarm<NetBehaviour>,
     listen_on: Option<(IpAddr, u16)>,
 }
@@ -124,7 +124,7 @@ impl ProtocolsHandler for Handler {
 
     type OutEvent = ();
 
-    type Error = ConnError;
+    type Error = ConnectionError;
 
     type InboundProtocol = LocutusProtocol;
 
@@ -198,7 +198,7 @@ impl UpgradeInfo for LocutusProtocol {
 
 impl InboundUpgrade<NegotiatedSubstream> for LocutusProtocol {
     type Output = NegotiatedSubstream;
-    type Error = ConnError;
+    type Error = ConnectionError;
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
     fn upgrade_inbound(self, stream: NegotiatedSubstream, _: Self::Info) -> Self::Future {
@@ -209,7 +209,7 @@ impl InboundUpgrade<NegotiatedSubstream> for LocutusProtocol {
 
 impl OutboundUpgrade<NegotiatedSubstream> for LocutusProtocol {
     type Output = NegotiatedSubstream;
-    type Error = ConnError;
+    type Error = ConnectionError;
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
     fn upgrade_outbound(self, stream: NegotiatedSubstream, _: Self::Info) -> Self::Future {

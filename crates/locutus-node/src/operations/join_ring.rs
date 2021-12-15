@@ -3,9 +3,8 @@ use std::{collections::HashSet, time::Duration};
 use super::{handle_op_result, state_machine::StateMachineImpl, OpError, OperationResult};
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{self, ConnError, ConnectionBridge, PeerKey},
     message::{Message, Transaction},
-    node::OpManager,
+    node::{ConnectionError, ConnectionBridge, OpManager, PeerKey},
     operations::{state_machine::StateMachine, Operation},
     ring::{Location, PeerKeyLocation, Ring},
     utils::ExponentialBackoff,
@@ -395,9 +394,7 @@ where
     log::info!(
         "Joining ring via {} (at {}) (tx: {})",
         gateway.peer,
-        gateway
-            .location
-            .ok_or(conn_manager::ConnError::LocationUnknown)?,
+        gateway.location.ok_or(ConnectionError::LocationUnknown)?,
         tx
     );
 
@@ -557,7 +554,7 @@ where
             let accepted_by = if ring.should_accept(
                 &joiner
                     .location
-                    .ok_or_else(|| OpError::from(ConnError::LocationUnknown))?,
+                    .ok_or_else(|| OpError::from(ConnectionError::LocationUnknown))?,
             ) {
                 log::debug!("Accepting proxy connection from {}", joiner.peer);
                 HashSet::from_iter([own_loc])
@@ -634,17 +631,11 @@ where
             };
             ring.update_location(Some(your_location));
             for other_peer in accepted_by {
-                if ring.should_accept(
-                    &other_peer
-                        .location
-                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
-                ) {
+                if ring.should_accept(&other_peer.location.ok_or(ConnectionError::LocationUnknown)?) {
                     log::info!("Established connection to {}", other_peer.peer);
                     conn_manager.add_connection(other_peer, false);
                     ring.add_connection(
-                        other_peer
-                            .location
-                            .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                        other_peer.location.ok_or(ConnectionError::LocationUnknown)?,
                         other_peer.peer,
                     );
                     if other_peer.peer != sender.peer {
@@ -714,9 +705,7 @@ where
             } else {
                 conn_manager.add_connection(sender, false);
                 ring.add_connection(
-                    sender
-                        .location
-                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                    sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,
                 );
                 log::debug!("Openned connection with peer {}", by_peer.peer);
@@ -738,9 +727,7 @@ where
                 );
                 conn_manager.add_connection(sender, false);
                 ring.add_connection(
-                    sender
-                        .location
-                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                    sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,
                 );
                 new_state = None;

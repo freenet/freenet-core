@@ -4,10 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey},
     contract::{ContractError, ContractKey},
     message::{Message, Transaction, TxType},
-    node::OpManager,
+    node::{ConnectionBridge, OpManager, PeerKey},
     ring::{PeerKeyLocation, RingError},
 };
 
@@ -504,11 +503,12 @@ mod messages {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::conn_manager::PeerKey;
-    use crate::contract::{Contract, ContractValue, SimStoreError};
-    use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
-    use crate::ring::Location;
-    use crate::user_events::UserEvent;
+    use crate::{
+        contract::{Contract, ContractValue, SimStoreError},
+        node::test_utils::{check_connectivity, NodeSpecification, SimNetwork},
+        ring::Location,
+        user_events::UserEvent,
+    };
     use std::collections::HashMap;
 
     #[test]

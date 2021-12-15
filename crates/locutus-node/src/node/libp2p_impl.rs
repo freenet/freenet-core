@@ -10,9 +10,9 @@ use libp2p::{
 };
 use tokio::sync::mpsc::{self, Receiver};
 
+use super::{conn_manager::locutus_cm::LocutusConnManager, PeerKey};
 use crate::{
     config,
-    conn_manager::{locutus_cm::LocutusConnManager, PeerKey},
     contract::{self, ContractHandler, ContractStoreError},
     message::Message,
     ring::{PeerKeyLocation, Ring},
@@ -21,12 +21,12 @@ use crate::{
 
 use super::OpManager;
 
-pub struct NodeLibP2P<CErr = ContractStoreError> {
+pub(super) struct NodeLibP2P<CErr = ContractStoreError> {
     pub(crate) peer_key: PeerKey,
+    pub(crate) op_storage: Arc<OpManager<CErr>>,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
-    pub(crate) conn_manager: LocutusConnManager,
-    pub(crate) op_storage: Arc<OpManager<CErr>>,
+    conn_manager: LocutusConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
@@ -35,11 +35,11 @@ impl<CErr> NodeLibP2P<CErr>
 where
     CErr: std::error::Error,
 {
-    pub(super) async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         self.conn_manager.listen_on()
     }
 
-    pub(super) fn build<CH>(
+    pub fn build<CH>(
         config: NodeConfig,
     ) -> Result<NodeLibP2P<<CH as ContractHandler>::Error>, anyhow::Error>
     where
@@ -114,10 +114,10 @@ where
 mod test {
     use std::{net::Ipv4Addr, time::Duration};
 
+    use super::super::conn_manager::locutus_cm::NetEvent;
     use super::*;
     use crate::{
         config::{tracing::Logger, GlobalExecutor},
-        conn_manager::locutus_cm::NetEvent,
         contract::CHandlerImpl,
         node::{test_utils::get_free_port, InitPeerNode},
         ring::Location,

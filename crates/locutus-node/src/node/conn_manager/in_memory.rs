@@ -11,10 +11,9 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use rand::{prelude::StdRng, thread_rng, Rng, SeedableRng};
 
-use super::{ConnError, Transport};
+use super::{ConnectionError, ConnectionBridge, PeerKey };
 use crate::{
     config::tracing::Logger,
-    conn_manager::{ConnectionBridge, PeerKey},
     message::Message,
     ring::{Location, PeerKeyLocation},
 };
@@ -22,7 +21,7 @@ use crate::{
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
     OnceCell::new();
 
-pub(crate) struct MemoryConnManager {
+pub(in crate::node) struct MemoryConnManager {
     pub transport: InMemoryTransport,
     msg_queue: Arc<Mutex<Vec<Message>>>,
     peer: PeerKey,
@@ -72,7 +71,7 @@ impl Clone for MemoryConnManager {
 
 #[async_trait::async_trait]
 impl ConnectionBridge for MemoryConnManager {
-    async fn recv(&self) -> Result<Message, ConnError> {
+    async fn recv(&self) -> Result<Message, ConnectionError> {
         loop {
             if let Some(mut queue) = self.msg_queue.try_lock() {
                 let msg = queue.pop();
@@ -85,7 +84,7 @@ impl ConnectionBridge for MemoryConnManager {
         }
     }
 
-    async fn send(&self, target: PeerKey, msg: Message) -> Result<(), ConnError> {
+    async fn send(&self, target: PeerKey, msg: Message) -> Result<(), ConnectionError> {
         let msg = bincode::serialize(&msg)?;
         self.transport.send(target, msg);
         Ok(())
@@ -201,15 +200,5 @@ impl InMemoryTransport {
             let idx = rng.gen_range(0..=i);
             iter.swap(idx, i);
         }
-    }
-}
-
-impl Transport for InMemoryTransport {
-    fn is_open(&self) -> bool {
-        self.is_open
-    }
-
-    fn location(&self) -> Option<Location> {
-        self.location
     }
 }

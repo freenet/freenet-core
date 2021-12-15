@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use stretto::AsyncCache;
 use tokio::sync::mpsc;
 
-use super::runtime::{ContractRuntime, ContractUpdateError};
-use super::test_utils::{MemKVStore, MockRuntime};
-use super::ContractStoreError;
-use crate::contract::store::ContractStore;
-use crate::contract::{Contract, ContractError, ContractKey, ContractValue};
+use super::{
+    runtime::{ContractRuntime, ContractUpdateError},
+    test_utils::{MemKVStore, MockRuntime},
+    ContractStoreError,
+};
+use crate::contract::{store::ContractStore, Contract, ContractError, ContractKey, ContractValue};
 
 #[async_trait::async_trait]
 pub(crate) trait ContractHandler:

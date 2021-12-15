@@ -1,15 +1,13 @@
 use std::sync::atomic::Ordering::SeqCst;
 use std::{sync::atomic::AtomicUsize, time::Instant};
 
-use crate::contract::{ContractKey, ContractValue, StoreResponse};
-use crate::operations::get::GetMsg;
-use crate::operations::join_ring::JoinRingMsg;
-use crate::operations::put::PutMsg;
-use crate::ring::{Location, PeerKeyLocation};
 use crate::{
-    conn_manager::PeerKey,
+    contract::{ContractKey, ContractValue, StoreResponse},
     message::{Message, Transaction},
+    operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
+    ring::{Location, PeerKeyLocation},
 };
+use super::PeerKey;
 
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;

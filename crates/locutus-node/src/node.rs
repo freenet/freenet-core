@@ -7,14 +7,20 @@
 //! - libp2p: all the connection is handled by libp2p.
 //! - In memory: a simplifying node used for emulation pourpouses mainly.
 
-use std::{net::IpAddr, sync::Arc};
+use std::{fmt::Display, net::IpAddr, sync::Arc};
 
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{
+    core::PublicKey,
+    identity::{self, Keypair},
+    multiaddr::Protocol,
+    Multiaddr, PeerId,
+};
 
+#[cfg(test)]
+use self::in_memory::NodeInMemory;
 use self::libp2p_impl::NodeLibP2P;
 use crate::{
     config::CONF,
-    conn_manager::PeerKey,
     contract::{CHandlerImpl, ContractError, ContractStoreError},
     operations::{get, put, subscribe, OpError},
     ring::{Location, PeerKeyLocation},
@@ -23,10 +29,10 @@ use crate::{
 #[cfg(test)]
 use crate::{contract::SimStoreError, user_events::test_utils::MemoryEventsGen};
 
-#[cfg(test)]
-pub(crate) use in_memory::NodeInMemory;
+pub(crate) use conn_manager::{ConnectionError, ConnectionBridge};
 pub(crate) use op_state::OpManager;
 
+mod conn_manager;
 mod event_listener;
 #[cfg(test)]
 mod in_memory;
@@ -281,7 +287,6 @@ impl InitPeerNode {
     }
 }
 
-
 /// Process user events.
 async fn user_event_handling<UsrEv, CErr>(op_storage: Arc<OpManager<CErr>>, mut user_events: UsrEv)
 where
@@ -344,5 +349,64 @@ where
                 }
             }
         });
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+pub struct PeerKey(PeerId);
+
+impl PeerKey {
+    pub fn random() -> Self {
+        PeerKey::from(Keypair::generate_ed25519().public())
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        self.0.to_bytes()
+    }
+}
+
+impl Display for PeerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<PublicKey> for PeerKey {
+    fn from(val: PublicKey) -> Self {
+        PeerKey(PeerId::from(val))
+    }
+}
+
+impl From<PeerId> for PeerKey {
+    fn from(val: PeerId) -> Self {
+        PeerKey(val)
+    }
+}
+
+mod serialization {
+    use libp2p::PeerId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::PeerKey;
+
+    impl Serialize for PeerKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_bytes(&self.0.to_bytes())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for PeerKey {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+            Ok(PeerKey(
+                PeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
+            ))
+        }
     }
 }

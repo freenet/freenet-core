@@ -1,10 +1,9 @@
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
-    conn_manager::{self, ConnectionBridge, PeerKey},
     contract::ContractError,
     message::{Message, Transaction, TransactionType},
-    node::OpManager,
+    node::{ConnectionError, ConnectionBridge, OpManager, PeerKey},
     ring::RingError,
 };
 
@@ -104,7 +103,7 @@ impl Operation {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpError<S: std::error::Error> {
     #[error(transparent)]
-    ConnError(#[from] conn_manager::ConnError),
+    ConnError(#[from] ConnectionError),
     #[error(transparent)]
     RingError(#[from] RingError),
     #[error(transparent)]

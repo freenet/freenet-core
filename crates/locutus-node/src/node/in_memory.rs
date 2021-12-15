@@ -2,12 +2,15 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Receiver};
 
-use crate::contract::{
-    Contract, ContractError, ContractHandlerEvent, ContractValue, SimStoreError,
+use super::{
+    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge},
+    PeerKey,
 };
 use crate::{
-    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge, PeerKey},
-    contract::{self, ContractHandler},
+    contract::{
+        self, Contract, ContractError, ContractHandler, ContractHandlerEvent, ContractValue,
+        SimStoreError,
+    },
     message::{Message, Transaction, TransactionType, TxType},
     node::event_listener::EventLog,
     operations::{
@@ -34,12 +37,12 @@ macro_rules! log_handling_msg {
     };
 }
 
-pub(crate) struct NodeInMemory<CErr = SimStoreError> {
+pub(super) struct NodeInMemory<CErr = SimStoreError> {
     pub peer_key: PeerKey,
+    pub op_storage: Arc<OpManager<CErr>>,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
-    pub conn_manager: MemoryConnManager,
-    pub op_storage: Arc<OpManager<CErr>>,
+    conn_manager: MemoryConnManager,
     event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
