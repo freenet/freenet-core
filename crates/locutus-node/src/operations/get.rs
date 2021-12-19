@@ -259,7 +259,7 @@ where
         .consume_to_output(GetMsg::FetchRouting { target, id })?
     {
         op_storage
-            .notify_change(Message::from(req_get), Operation::Get(get_op))
+            .notify_op_change(Message::from(req_get), Operation::Get(get_op))
             .await?;
     }
     Ok(())
@@ -347,7 +347,7 @@ where
             target,
             ..
         } => {
-            if !op_storage.ring.contract_exists(&key) {
+            if !op_storage.ring.is_contract_cached(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
                 log::warn!(
@@ -511,7 +511,7 @@ where
                         sender.peer
                     );
                     op_storage
-                        .notify_change(
+                        .notify_op_change(
                             Message::from(GetMsg::ReturnGet {
                                 id,
                                 key,

@@ -18,18 +18,19 @@ use libp2p::{
 
 #[cfg(test)]
 use self::in_memory::NodeInMemory;
-use self::libp2p_impl::NodeLibP2P;
+use self::{libp2p_impl::NodeLibP2P, event_listener::{EventListener, EventLog}};
 use crate::{
-    config::CONF,
+    config::{GlobalExecutor, CONF},
     contract::{CHandlerImpl, ContractError, ContractStoreError},
-    operations::{get, put, subscribe, OpError},
+    message::{Maintenance, Message},
+    operations::{get, put, subscribe, OpError, join_ring},
     ring::{Location, PeerKeyLocation},
     user_events::{UserEvent, UserEventsProxy},
 };
 #[cfg(test)]
 use crate::{contract::SimStoreError, user_events::test_utils::MemoryEventsGen};
 
-pub(crate) use conn_manager::{ConnectionError, ConnectionBridge};
+pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use op_state::OpManager;
 
 mod conn_manager;
@@ -48,14 +49,14 @@ impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run(mut self) -> Result<(), anyhow::Error> {
         match self.0 {
-            NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
+            NodeImpl::LibP2P(node) => node.run_node().await,
             NodeImpl::InMemory(ref mut node) => {
                 let (_usr_ev_controller, rcv_copy) =
                     tokio::sync::watch::channel((0, PeerKey::random()));
                 let user_events = MemoryEventsGen::new(rcv_copy, node.peer_key);
-                node.listen_on(user_events).await
+                node.run_node(user_events).await
             }
         }
     }
@@ -66,9 +67,9 @@ impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run(self) -> Result<(), anyhow::Error> {
         match self.0 {
-            NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
+            NodeImpl::LibP2P(node) => node.run_node().await,
         }
     }
 }
@@ -295,8 +296,18 @@ where
 {
     loop {
         let ev = user_events.recv().await;
+        if let UserEvent::Shutdown = ev {
+            if let Err(err) = op_storage
+                .notify_maintenance_op(Message::Maintenance(Maintenance::ShutdownNode))
+                .await
+            {
+                log::error!("{}", err);
+            }
+            break;
+        }
+
         let op_storage_cp = op_storage.clone();
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             match ev {
                 UserEvent::Put { value, contract } => {
                     // Initialize a put op.
@@ -328,6 +339,8 @@ where
                 UserEvent::Subscribe { key } => {
                     // Initialize a subscribe op.
                     loop {
+                        // fixme: this will block the event loop until the subscribe op succeeds
+                        // instead the op should be deferred for later execution
                         let op =
                             subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.peer_key);
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
@@ -347,8 +360,78 @@ where
                         }
                     }
                 }
+                UserEvent::Shutdown => unreachable!(),
             }
         });
+    }
+}
+
+macro_rules! log_handling_msg {
+    ($op:expr, $id:expr, $op_storage:ident) => {
+        log::debug!(
+            concat!("Handling ", $op, " get request @ {} (tx: {})"),
+            $op_storage.ring.peer_key,
+            $id
+        );
+    };
+}
+
+#[inline(always)]
+fn report_result<CErr>(op_result: Result<(), OpError<CErr>>)
+where
+    CErr: std::error::Error,
+{
+    if let Err(err) = op_result {
+        log::debug!("Finished tx w/ error: {}", err)
+    }
+}
+
+async fn process_message<CErr, CB>(
+    msg: Result<Message, ConnectionError>,
+    op_storage: Arc<OpManager<CErr>>,
+    mut conn_manager: CB,
+    event_listener: Option<Box<dyn EventListener + Send + Sync>>,
+) where
+    CB: ConnectionBridge,
+    CErr: std::error::Error + Sync + Send + 'static,
+{
+    match msg {
+        Ok(msg) => {
+            if let Some(mut listener) = event_listener {
+                listener.event_received(EventLog::new(&msg, &op_storage));
+            }
+            match msg {
+                Message::JoinRing(op) => {
+                    log_handling_msg!("join", op.id(), op_storage);
+                    let op_result =
+                        join_ring::handle_join_ring(&op_storage, &mut conn_manager, op).await;
+                    report_result(op_result);
+                }
+                Message::Put(op) => {
+                    log_handling_msg!("put", op.id(), op_storage);
+                    let op_result =
+                        put::handle_put_request(&op_storage, &mut conn_manager, op).await;
+                    report_result(op_result);
+                }
+                Message::Get(op) => {
+                    log_handling_msg!("get", op.id(), op_storage);
+                    let op_result =
+                        get::handle_get_request(&op_storage, &mut conn_manager, op).await;
+                    report_result(op_result);
+                }
+                Message::Subscribe(op) => {
+                    log_handling_msg!("subscribe", op.id(), op_storage);
+                    let op_result =
+                        subscribe::handle_subscribe_response(&op_storage, &mut conn_manager, op)
+                            .await;
+                    report_result(op_result);
+                }
+                _ => {}
+            }
+        }
+        Err(err) => {
+            report_result::<CErr>(Err(err.into()));
+        }
     }
 }
 

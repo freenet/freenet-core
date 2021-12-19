@@ -1,8 +1,9 @@
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
-use futures::future;
+use either::{Left, Right};
+use futures::{future, FutureExt, StreamExt};
 use libp2p::{
-    core::{muxing, transport, UpgradeInfo},
+    core::{muxing, transport, ConnectedPoint, UpgradeInfo},
     identify,
     identity::Keypair,
     multiaddr::Protocol,
@@ -10,14 +11,21 @@ use libp2p::{
     swarm::{
         protocols_handler::{InboundUpgradeSend, OutboundUpgradeSend},
         KeepAlive, NegotiatedSubstream, NetworkBehaviour, ProtocolsHandler, ProtocolsHandlerEvent,
-        ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder,
+        ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder, SwarmEvent,
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
+use tokio::sync::mpsc::Receiver;
 
-use crate::{config::GlobalExecutor, NodeConfig};
+use crate::{
+    config::GlobalExecutor,
+    message::Message,
+    node::{process_message, OpManager, PeerKey},
+    ring::PeerKeyLocation,
+    NodeConfig,
+};
 
-use super::ConnectionError;
+use super::{ConnectionBridge, ConnectionError};
 
 const CURRENT_AGENT_VER: &str = "locutus/agent/0.1.0";
 const CURRENT_PROTOC_VER: &[u8] = b"locutus/agent/0.1.0";
@@ -49,9 +57,36 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
     addr
 }
 
+#[derive(Debug, Clone)]
+struct P2pConnBridge {}
+
+#[async_trait::async_trait]
+impl ConnectionBridge for P2pConnBridge {
+    fn peer_key(&self) -> PeerKey {
+        todo!()
+    }
+
+    fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool) {
+        todo!()
+    }
+
+    fn drop_connection(&mut self, peer: PeerKey) {
+        todo!()
+    }
+
+    async fn recv(&self) -> super::ConnResult<Message> {
+        todo!()
+    }
+
+    async fn send(&self, target: PeerKey, msg: Message) -> super::ConnResult<()> {
+        todo!()
+    }
+}
+
 pub(in crate::node) struct LocutusConnManager {
     pub swarm: Swarm<NetBehaviour>,
     listen_on: Option<(IpAddr, u16)>,
+    active_connections: HashMap<PeerKey, Multiaddr>,
 }
 
 impl LocutusConnManager {
@@ -72,18 +107,100 @@ impl LocutusConnManager {
         LocutusConnManager {
             swarm,
             listen_on: config.local_ip.zip(config.local_port),
+            active_connections: HashMap::new(),
         }
     }
 
     pub fn listen_on(&mut self) -> Result<(), anyhow::Error> {
         if let Some(conn) = self.listen_on {
             let listening_addr = multiaddr_from_connection(conn);
-            self.swarm.listen_on(listening_addr).unwrap();
-            Ok(())
-        } else {
-            anyhow::bail!("failed listening to connections")
+            self.swarm.listen_on(listening_addr)?;
+        }
+        Ok(())
+    }
+
+    pub async fn run_event_listener<CErr>(
+        mut self,
+        gateways: Vec<PeerKeyLocation>,
+        op_manager: Arc<OpManager<CErr>>,
+        mut notification_channel: Receiver<Message>,
+    ) where
+        CErr: std::error::Error + Send + Sync + 'static,
+    {
+        use ConnMngrActions::*;
+
+        let conn_manager = P2pConnBridge {};
+
+        loop {
+            let net_msg = self.swarm.select_next_some().map(|event| match event {
+                SwarmEvent::Behaviour(NetEvent::Locutus(msg)) => Ok(Left(msg)),
+                SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    endpoint: ConnectedPoint::Listener { send_back_addr, .. },
+                    ..
+                } => Ok(Right(ConnMngrActions::ConnectionEstablished {
+                    peer_id: PeerKey(peer_id),
+                    addr: send_back_addr,
+                })),
+                SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    endpoint: ConnectedPoint::Dialer { address },
+                    ..
+                } => Ok(Right(ConnMngrActions::ConnectionEstablished {
+                    peer_id: PeerKey(peer_id),
+                    addr: address,
+                })),
+                other_event => {
+                    log::debug!("{:?}", other_event);
+                    Ok(Right(ConnMngrActions::NoAction))
+                }
+            });
+
+            let notification_msg = notification_channel.recv().map(|m| match m {
+                Some(m) => Ok(Left(m)),
+                None => Ok(Right(ClosedChannel)),
+            });
+
+            let msg: Result<_, ConnectionError> = tokio::select! {
+                msg = notification_msg => { msg }
+                msg = net_msg => { msg }
+            };
+
+            match msg {
+                Ok(Left(msg)) => {
+                    let cb = conn_manager.clone();
+                    GlobalExecutor::spawn(process_message(Ok(msg), op_manager.clone(), cb, None));
+                }
+                Ok(Right(NoAction)) => {}
+                Ok(Right(ConnectionEstablished { addr, peer_id })) => {
+                    self.active_connections.insert(peer_id, addr);
+                }
+                Ok(Right(ClosedChannel)) => {
+                    log::info!("notification channel closed");
+                    break;
+                }
+                Err(err) => {
+                    let cb = conn_manager.clone();
+                    GlobalExecutor::spawn(process_message(Err(err), op_manager.clone(), cb, None));
+                    break;
+                }
+            }
         }
     }
+
+    async fn join(&self) {
+        todo!()
+    }
+}
+
+enum ConnMngrActions {
+    /// Received a new connection
+    ConnectionEstablished {
+        peer_id: PeerKey,
+        addr: Multiaddr,
+    },
+    ClosedChannel,
+    NoAction,
 }
 
 pub(crate) struct LocutusBehaviour {}
@@ -91,10 +208,10 @@ pub(crate) struct LocutusBehaviour {}
 impl NetworkBehaviour for LocutusBehaviour {
     type ProtocolsHandler = Handler;
 
-    type OutEvent = LocutusEvent;
+    type OutEvent = Message;
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
-        todo!()
+        Handler {}
     }
 
     fn inject_event(
@@ -120,9 +237,9 @@ impl NetworkBehaviour for LocutusBehaviour {
 pub(crate) struct Handler {}
 
 impl ProtocolsHandler for Handler {
-    type InEvent = ();
+    type InEvent = Message;
 
-    type OutEvent = ();
+    type OutEvent = Message;
 
     type Error = ConnectionError;
 
@@ -235,7 +352,7 @@ pub(crate) struct NetBehaviour {
 pub(crate) enum NetEvent {
     Identify(Box<identify::IdentifyEvent>),
     Ping(ping::PingEvent),
-    Locutus(LocutusEvent),
+    Locutus(Message),
 }
 
 impl From<identify::IdentifyEvent> for NetEvent {
@@ -250,11 +367,8 @@ impl From<ping::PingEvent> for NetEvent {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum LocutusEvent {}
-
-impl From<LocutusEvent> for NetEvent {
-    fn from(event: LocutusEvent) -> NetEvent {
+impl From<Message> for NetEvent {
+    fn from(event: Message) -> NetEvent {
         Self::Locutus(event)
     }
 }

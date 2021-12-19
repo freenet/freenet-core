@@ -159,7 +159,7 @@ where
     CErr: std::error::Error,
 {
     let (target, id) = if let SubscribeState::PrepareRequest { id, key } = sub_op.sm.state() {
-        if !op_storage.ring.contract_exists(key) {
+        if !op_storage.ring.is_contract_cached(key) {
             return Err(OpError::ContractError(ContractError::ContractNotFound(
                 *key,
             )));
@@ -182,7 +182,7 @@ where
         .consume_to_output(SubscribeMsg::FetchRouting { target, id })?
     {
         op_storage
-            .notify_change(Message::from(req_sub), Operation::Subscribe(sub_op))
+            .notify_op_change(Message::from(req_sub), Operation::Subscribe(sub_op))
             .await?;
     }
     Ok(())
@@ -282,7 +282,7 @@ where
                 }
             };
 
-            if !op_storage.ring.contract_exists(&key) {
+            if !op_storage.ring.is_contract_cached(&key) {
                 log::info!("Contract {} not found while processing info", key);
                 log::info!("Trying to found the contract from another node");
 

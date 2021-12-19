@@ -11,6 +11,7 @@ use tokio::sync::watch::{channel, Receiver, Sender};
 
 use super::PeerKey;
 use crate::{
+    config::GlobalExecutor,
     contract::{Contract, ContractKey, ContractValue, MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location},
@@ -227,13 +228,13 @@ impl SimNetwork {
             user_events.generate_events(specs.events_to_generate);
         }
         self.labels.insert(label, peer.peer_key);
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             if let Some(specs) = node_specs {
                 peer.append_contracts(specs.owned_contracts)
                     .await
                     .map_err(|_| anyhow::anyhow!("failed inserting test owned contracts"))?;
             }
-            peer.listen_on(user_events).await
+            peer.run_node(user_events).await
         });
     }
 

@@ -1896,6 +1896,7 @@ dependencies = [
  "config",
  "crossbeam",
  "dashmap",
+ "either",
  "env_logger",
  "futures",
  "hex",

@@ -224,7 +224,7 @@ where
         target,
     })? {
         op_storage
-            .notify_change(Message::from(req_put), Operation::Put(put_op))
+            .notify_op_change(Message::from(req_put), Operation::Put(put_op))
             .await?;
     } else {
         return Err(OpError::UnexpectedOpState);
@@ -324,7 +324,7 @@ where
             mut skip_list,
         } => {
             let key = contract.key();
-            let cached_contract = op_storage.ring.contract_exists(&key);
+            let cached_contract = op_storage.ring.is_contract_cached(&key);
 
             log::debug!(
                 "Performing a SeekNode at {}, trying put the contract {}",
@@ -339,7 +339,7 @@ where
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
                 if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
-                    op_storage.ring.cached_contracts.insert(key);
+                    op_storage.ring.contract_cached(key);
                     log::debug!("Contract successfully cached");
                 } else {
                     log::error!(
@@ -420,7 +420,7 @@ where
                 new_state = None;
             } else {
                 op_storage
-                    .notify_change(internal_cb.into(), Operation::Put(state))
+                    .notify_op_change(internal_cb.into(), Operation::Put(state))
                     .await?;
                 return Err(OpError::StatePushed);
             }
@@ -512,7 +512,7 @@ where
             mut skip_list,
         } => {
             let key = contract.key();
-            let cached_contract = op_storage.ring.contract_exists(&key);
+            let cached_contract = op_storage.ring.is_contract_cached(&key);
             let within_caching_dist = op_storage.ring.within_caching_distance(&key.location());
             if !cached_contract && within_caching_dist {
                 // this node does not have the contract, so instead store the contract and execute the put op.
@@ -520,7 +520,7 @@ where
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
                 if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
-                    op_storage.ring.cached_contracts.insert(key);
+                    op_storage.ring.contract_cached(key);
                     log::debug!("Contract successfully cached");
                 } else {
                     log::error!(

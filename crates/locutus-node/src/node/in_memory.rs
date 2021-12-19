@@ -4,38 +4,26 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
     conn_manager::{in_memory::MemoryConnManager, ConnectionBridge},
-    PeerKey,
+    event_listener::EventListener,
+    op_state::OpManager,
+    process_message, user_event_handling, PeerKey,
 };
 use crate::{
+    config::GlobalExecutor,
     contract::{
         self, Contract, ContractError, ContractHandler, ContractHandlerEvent, ContractValue,
         SimStoreError,
     },
     message::{Message, Transaction, TransactionType, TxType},
-    node::event_listener::EventLog,
     operations::{
-        get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
-        put, subscribe, OpError, Operation,
+        OpError, Operation,
     },
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     utils::{ExponentialBackoff, ExtendedIter},
     NodeConfig,
 };
-
-use super::event_listener::EventListener;
-use super::op_state::OpManager;
-
-macro_rules! log_handling_msg {
-    ($op:expr, $id:expr, $op_storage:ident) => {
-        log::debug!(
-            concat!("Handling ", $op, " get request @ {} (tx: {})"),
-            $op_storage.ring.peer_key,
-            $id
-        );
-    };
-}
 
 pub(super) struct NodeInMemory<CErr = SimStoreError> {
     pub peer_key: PeerKey,
@@ -70,7 +58,7 @@ where
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
         let contract_handler = CH::from(ch_channel);
 
-        tokio::spawn(contract::contract_handling(contract_handler));
+        GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
         Ok(NodeInMemory {
             peer_key,
@@ -83,8 +71,16 @@ where
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn append_contracts(
+    pub async fn run_node<UsrEv>(&mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
+        self.join_ring(None).await?;
+        GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
+        self.run_event_listener().await
+    }
+
+    pub async fn append_contracts(
         &self,
         contracts: Vec<(Contract, ContractValue)>,
     ) -> Result<(), ContractError<CErr>> {
@@ -101,7 +97,7 @@ where
                 key,
                 self.op_storage.ring.peer_key
             );
-            self.op_storage.ring.cached_contracts.insert(key);
+            self.op_storage.ring.contract_cached(key);
         }
         Ok(())
     }
@@ -146,17 +142,7 @@ where
     }
 
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
-    pub async fn listen_on<UsrEv>(&mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
-    where
-        UsrEv: UserEventsProxy + Send + Sync + 'static,
-    {
-        self.join_ring(None).await?;
-        tokio::spawn(super::user_event_handling(
-            self.op_storage.clone(),
-            user_events,
-        ));
-
-        // loop for processings messages
+    async fn run_event_listener(&mut self) -> Result<(), anyhow::Error> {
         loop {
             let msg = tokio::select! {
                 msg = self.conn_manager.recv() => { msg }
@@ -167,13 +153,6 @@ where
                 }
             };
 
-            let op_storage = self.op_storage.clone();
-            let mut conn_manager = self.conn_manager.clone();
-            let mut event_listener = self
-                .event_listener
-                .as_ref()
-                .map(|listener| listener.trait_clone());
-
             if let Ok(Message::Canceled(tx)) = msg {
                 log::warn!("Failed tx `{}`, potentially attempting a retry", tx);
                 match tx.tx_type() {
@@ -181,7 +160,7 @@ where
                         const MSG: &str = "Fatal error: unable to connect to the network";
                         // the attempt to join the network failed, this could be a fatal error since the node
                         // is useless without connecting to the network, we will retry with exponential backoff
-                        match op_storage.pop(&tx) {
+                        match self.op_storage.pop(&tx) {
                             Some(Operation::JoinRing(JoinRingOp {
                                 backoff: Some(backoff),
                                 ..
@@ -199,56 +178,23 @@ where
                             _ => {}
                         }
                     }
-                    _ => todo!(),
+                    _ => unreachable!(),
                 }
             }
 
-            tokio::spawn(async move {
-                match msg {
-                    Ok(msg) => {
-                        if let Some(listener) = &mut event_listener {
-                            listener.event_received(EventLog::new(&msg, &op_storage));
-                        }
-                        match msg {
-                            Message::JoinRing(op) => {
-                                log_handling_msg!("join", op.id(), op_storage);
-                                let op_result =
-                                    join_ring::handle_join_ring(&op_storage, &mut conn_manager, op)
-                                        .await;
-                                Self::report_result(op_result);
-                            }
-                            Message::Put(op) => {
-                                log_handling_msg!("put", op.id(), op_storage);
-                                let op_result =
-                                    put::handle_put_request(&op_storage, &mut conn_manager, op)
-                                        .await;
-                                Self::report_result(op_result);
-                            }
-                            Message::Get(op) => {
-                                log_handling_msg!("get", op.id(), op_storage);
-                                let op_result =
-                                    get::handle_get_request(&op_storage, &mut conn_manager, op)
-                                        .await;
-                                Self::report_result(op_result);
-                            }
-                            Message::Subscribe(op) => {
-                                log_handling_msg!("subscribe", op.id(), op_storage);
-                                let op_result = subscribe::handle_subscribe_response(
-                                    &op_storage,
-                                    &mut conn_manager,
-                                    op,
-                                )
-                                .await;
-                                Self::report_result(op_result);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(err) => {
-                        Self::report_result(Err(err.into()));
-                    }
-                }
-            });
+            let op_storage = self.op_storage.clone();
+            let conn_manager = self.conn_manager.clone();
+            let event_listener = self
+                .event_listener
+                .as_ref()
+                .map(|listener| listener.trait_clone());
+
+            GlobalExecutor::spawn(process_message(
+                msg,
+                op_storage,
+                conn_manager,
+                event_listener,
+            ));
         }
     }
 

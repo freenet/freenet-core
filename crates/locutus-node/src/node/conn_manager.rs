@@ -4,14 +4,13 @@ use super::PeerKey;
 use crate::{message::Message, ring::PeerKeyLocation};
 
 pub(crate) mod in_memory;
-pub(crate) mod locutus_cm;
+pub(crate) mod locutus_protoc;
 
 // TODO: use this constants when we do real net i/o
 // const PING_EVERY: Duration = Duration::from_secs(30);
 // const DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 
-// pub(crate) type RemoveConnHandler<'t> = Box<dyn FnOnce(&'t PeerKey, String)>;
-pub(crate) type Result<T> = std::result::Result<T, ConnectionError>;
+pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
 #[async_trait::async_trait]
 pub(crate) trait ConnectionBridge {
@@ -24,9 +23,9 @@ pub(crate) trait ConnectionBridge {
 
     /// # Cancellation Safety
     /// This async fn must be cancellation safe!
-    async fn recv(&self) -> Result<Message>;
+    async fn recv(&self) -> ConnResult<Message>;
 
-    async fn send(&self, target: PeerKey, msg: Message) -> Result<()>;
+    async fn send(&self, target: PeerKey, msg: Message) -> ConnResult<()>;
 }
 
 #[derive(Debug, thiserror::Error)]

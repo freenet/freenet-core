@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::contract::{Contract, ContractKey, ContractValue};
 
 #[async_trait::async_trait]
@@ -27,6 +29,19 @@ pub(crate) enum UserEvent {
     /// Subscribe to teh changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
     Subscribe { key: ContractKey },
+    /// Shutdown the node
+    Shutdown,
+}
+
+pub(crate) struct UserEventHandler;
+
+#[async_trait::async_trait]
+impl UserEventsProxy for UserEventHandler {
+    async fn recv(&mut self) -> UserEvent {
+        loop {
+            tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
+        }
+    }
 }
 
 #[cfg(test)]

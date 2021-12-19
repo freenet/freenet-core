@@ -11,9 +11,9 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use rand::{prelude::StdRng, thread_rng, Rng, SeedableRng};
 
-use super::{ConnectionError, ConnectionBridge, PeerKey };
+use super::{ConnectionBridge, ConnectionError, PeerKey};
 use crate::{
-    config::tracing::Logger,
+    config::{tracing::Logger, GlobalExecutor},
     message::Message,
     ring::{Location, PeerKeyLocation},
 };
@@ -35,7 +35,7 @@ impl MemoryConnManager {
 
         let msg_queue_cp = msg_queue.clone();
         let tr_cp = transport.clone();
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             // evaluate the messages as they arrive
             loop {
                 let msg = { tr_cp.msg_stack_queue.lock().pop() };
@@ -126,7 +126,7 @@ impl InMemoryTransport {
         let rcv_msg_c = msg_stack_queue.clone();
         let rx = rx.clone();
         let tx_cp = tx.clone();
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             const MAX_DELAYED_MSG: usize = 10;
             let mut rng = StdRng::from_entropy();
             // delayed messages per target

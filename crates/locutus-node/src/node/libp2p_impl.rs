@@ -10,12 +10,13 @@ use libp2p::{
 };
 use tokio::sync::mpsc::{self, Receiver};
 
-use super::{conn_manager::locutus_cm::LocutusConnManager, PeerKey};
+use super::{conn_manager::locutus_protoc::LocutusConnManager, user_event_handling, PeerKey};
 use crate::{
-    config,
+    config::{self, GlobalExecutor},
     contract::{self, ContractHandler, ContractStoreError},
     message::Message,
     ring::{PeerKeyLocation, Ring},
+    user_events::UserEventHandler,
     NodeConfig,
 };
 
@@ -33,10 +34,26 @@ pub(super) struct NodeLibP2P<CErr = ContractStoreError> {
 
 impl<CErr> NodeLibP2P<CErr>
 where
-    CErr: std::error::Error,
+    CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
-        self.conn_manager.listen_on()
+    pub(super) async fn run_node(mut self: Box<Self>) -> Result<(), anyhow::Error> {
+        // 1. start listening in case this is a listening node (gateway)
+        if self.is_gateway {
+            self.conn_manager.listen_on()?;
+        }
+
+        // 2. start the user event handler loop
+        let user_events = UserEventHandler;
+        GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
+        // 3. start the p2p event loop
+        self.conn_manager
+            .run_event_listener(
+                self.gateways,
+                self.op_storage.clone(),
+                self.notification_channel,
+            )
+            .await;
+        Ok(())
     }
 
     pub fn build<CH>(
@@ -60,7 +77,7 @@ where
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
         let contract_handler = CH::from(ch_channel);
 
-        tokio::spawn(contract::contract_handling(contract_handler));
+        GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
         Ok(NodeLibP2P {
             peer_key,
@@ -114,7 +131,7 @@ where
 mod test {
     use std::{net::Ipv4Addr, time::Duration};
 
-    use super::super::conn_manager::locutus_cm::NetEvent;
+    use super::super::conn_manager::locutus_protoc::NetEvent;
     use super::*;
     use crate::{
         config::{tracing::Logger, GlobalExecutor},
@@ -154,6 +171,7 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping() -> Result<(), ()> {
+        todo!();
         Logger::init_logger();
 
         let peer1_key = Keypair::generate_ed25519();
@@ -171,10 +189,10 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 =
-                NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap();
-            peer1.listen_on().await.unwrap();
-            ping_ev_loop(&mut peer1).await
+            let peer1 =
+                Box::new(NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap());
+            peer1.run_node().await.unwrap();
+            // ping_ev_loop(&mut peer1).await
         });
 
         // Start up the dialing node

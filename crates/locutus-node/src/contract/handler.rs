@@ -257,7 +257,7 @@ impl ContractHandler for CHandlerImpl {
 
 #[cfg(test)]
 mod test {
-    use crate::contract::test_utils::SimStoreError;
+    use crate::{contract::test_utils::SimStoreError, config::GlobalExecutor};
 
     use super::*;
 
@@ -265,7 +265,7 @@ mod test {
     async fn channel_test() -> Result<(), anyhow::Error> {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
-        let h = tokio::spawn(async move {
+        let h = GlobalExecutor::spawn(async move {
             send_halve
                 .send_to_handler(ContractHandlerEvent::Cache(Contract::new(vec![0, 1, 2, 3])))
                 .await

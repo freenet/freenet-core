@@ -146,6 +146,18 @@ pub(crate) enum Message {
     Subscribe(SubscribeMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
+    Maintenance(Maintenance),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) enum Maintenance {
+    ShutdownNode,
+}
+
+impl Display for Maintenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
 }
 
 impl Message {
@@ -157,6 +169,7 @@ impl Message {
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
             Canceled(tx) => tx,
+            Maintenance(_) => unreachable!(),
         }
     }
 
@@ -167,7 +180,7 @@ impl Message {
             Put(op) => op.target(),
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
-            _ => todo!(),
+            Canceled(_) | Maintenance(_) => None,
         }
     }
 }
@@ -182,6 +195,7 @@ impl Display for Message {
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
             Canceled(msg) => msg.fmt(f)?,
+            Maintenance(msg) => msg.fmt(f)?,
         };
         write!(f, "}}")
     }

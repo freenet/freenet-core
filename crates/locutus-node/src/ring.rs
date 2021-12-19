@@ -62,7 +62,7 @@ pub(crate) struct Ring {
     pub peer_key: PeerKey,
     connections_by_location: Arc<RwLock<BTreeMap<Location, PeerKeyLocation>>>,
     /// contracts in the ring cached by this node
-    pub cached_contracts: DashSet<ContractKey>,
+    cached_contracts: DashSet<ContractKey>,
     own_location: Arc<AtomicU64>,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
@@ -173,8 +173,13 @@ impl Ring {
 
     /// Whether this node already has this contract cached or not.
     #[inline]
-    pub fn contract_exists(&self, key: &ContractKey) -> bool {
+    pub fn is_contract_cached(&self, key: &ContractKey) -> bool {
         self.cached_contracts.contains(key)
+    }
+
+    #[inline]
+    pub fn contract_cached(&self, key: ContractKey) {
+        self.cached_contracts.insert(key);
     }
 
     /// Update this node location.
