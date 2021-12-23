@@ -23,7 +23,7 @@ Locutus' purpose is to make it easy to build decentralized services and also to 
 
 "Fred" is the software commonly known as Freenet, which Ian Clarke and other volunteers created in 2000 and have continually maintained since then.
 
-Locutus will be a general-purpose, cryptographically secure, decentralized, distributed computation and communication platform. Anyone can write and run software on it, and that software can interact in ways that would be difficult otherwise.
+Locutus will be a general-purpose, cryptographically secure, decentralized, distributed computation and communication platform.
 
 Locutus won't replace Fred; they're trying to solve different (but related) problems. Key differences between Locutus and Fred:
 
