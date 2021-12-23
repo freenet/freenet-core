@@ -39,7 +39,7 @@ Locutus won't replace Fred; they're trying to solve different (but related) prob
 
 ### Name
 
-Locutus is the development name for this software; it may change on launch.
+Locutus is the development name for this software; it will probably change before launch.
 
 ### Status
 
