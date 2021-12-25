@@ -15,7 +15,7 @@ use super::{ConnectionBridge, ConnectionError, PeerKey};
 use crate::{
     config::{tracing::Logger, GlobalExecutor},
     message::Message,
-    ring::{Location, PeerKeyLocation},
+    ring::Location,
 };
 
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
@@ -57,6 +57,19 @@ impl MemoryConnManager {
             peer,
         }
     }
+
+    pub async fn recv(&self) -> Result<Message, ConnectionError> {
+        loop {
+            if let Some(mut queue) = self.msg_queue.try_lock() {
+                let msg = queue.pop();
+                std::mem::drop(queue);
+                if let Some(msg) = msg {
+                    return Ok(msg);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 impl Clone for MemoryConnManager {
@@ -71,32 +84,17 @@ impl Clone for MemoryConnManager {
 
 #[async_trait::async_trait]
 impl ConnectionBridge for MemoryConnManager {
-    async fn recv(&self) -> Result<Message, ConnectionError> {
-        loop {
-            if let Some(mut queue) = self.msg_queue.try_lock() {
-                let msg = queue.pop();
-                std::mem::drop(queue);
-                if let Some(msg) = msg {
-                    return Ok(msg);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn send(&self, target: PeerKey, msg: Message) -> Result<(), ConnectionError> {
+    async fn send(&self, target: &PeerKey, msg: Message) -> Result<(), ConnectionError> {
         let msg = bincode::serialize(&msg)?;
-        self.transport.send(target, msg);
+        self.transport.send(*target, msg);
         Ok(())
     }
 
-    fn add_connection(&mut self, _peer: PeerKeyLocation, _unsolicited: bool) {}
-
-    fn drop_connection(&mut self, _peer: PeerKey) {}
-
-    fn peer_key(&self) -> PeerKey {
-        self.peer
+    fn add_connection(&mut self, _peer: PeerKey) -> super::ConnResult<()> {
+        Ok(())
     }
+
+    fn drop_connection(&mut self, _peer: &PeerKey) {}
 }
 
 #[derive(Clone, Debug)]

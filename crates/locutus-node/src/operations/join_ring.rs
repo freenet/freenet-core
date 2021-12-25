@@ -4,7 +4,7 @@ use super::{handle_op_result, state_machine::StateMachineImpl, OpError, Operatio
 use crate::{
     config::PEER_TIMEOUT,
     message::{Message, Transaction},
-    node::{ConnectionError, ConnectionBridge, OpManager, PeerKey},
+    node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
     operations::{state_machine::StateMachine, Operation},
     ring::{Location, PeerKeyLocation, Ring},
     utils::ExponentialBackoff,
@@ -398,7 +398,7 @@ where
         tx
     );
 
-    conn_manager.add_connection(gateway, true);
+    conn_manager.add_connection(gateway.peer)?;
     let join_req = Message::from(messages::JoinRingMsg::Request {
         id: tx,
         msg: messages::JoinRequest::StartReq {
@@ -408,7 +408,7 @@ where
             max_hops_to_live,
         },
     });
-    conn_manager.send(gateway.peer, join_req).await?;
+    conn_manager.send(&gateway.peer, join_req).await?;
     op_storage.push(tx, Operation::JoinRing(join_op))?;
     Ok(())
 }
@@ -631,11 +631,17 @@ where
             };
             ring.update_location(Some(your_location));
             for other_peer in accepted_by {
-                if ring.should_accept(&other_peer.location.ok_or(ConnectionError::LocationUnknown)?) {
+                if ring.should_accept(
+                    &other_peer
+                        .location
+                        .ok_or(ConnectionError::LocationUnknown)?,
+                ) {
                     log::info!("Established connection to {}", other_peer.peer);
-                    conn_manager.add_connection(other_peer, false);
+                    conn_manager.add_connection(other_peer.peer)?;
                     ring.add_connection(
-                        other_peer.location.ok_or(ConnectionError::LocationUnknown)?,
+                        other_peer
+                            .location
+                            .ok_or(ConnectionError::LocationUnknown)?,
                         other_peer.peer,
                     );
                     if other_peer.peer != sender.peer {
@@ -643,7 +649,7 @@ where
                         // the gateway will be notified in the last message
                         let _ = conn_manager
                             .send(
-                                other_peer.peer,
+                                &other_peer.peer,
                                 JoinRingMsg::Response {
                                     id,
                                     target: other_peer,
@@ -703,7 +709,7 @@ where
             if !state.sm.state().is_connected() {
                 return Err(OpError::InvalidStateTransition(id));
             } else {
-                conn_manager.add_connection(sender, false);
+                conn_manager.add_connection(sender.peer)?;
                 ring.add_connection(
                     sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,
@@ -725,7 +731,7 @@ where
                     target.peer,
                     ring.own_location().location
                 );
-                conn_manager.add_connection(sender, false);
+                conn_manager.add_connection(sender.peer)?;
                 ring.add_connection(
                     sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,
@@ -805,7 +811,7 @@ where
             req_peer.peer,
             forward_to.peer
         );
-        conn_manager.send(forward_to.peer, forwarded).await?;
+        conn_manager.send(&forward_to.peer, forwarded).await?;
         // awaiting for responses from forward nodes
         let new_state = JRState::AwaitingProxyResponse {
             target: req_peer,

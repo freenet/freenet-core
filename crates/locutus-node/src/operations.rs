@@ -3,7 +3,7 @@ use tokio::sync::mpsc::error::SendError;
 use crate::{
     contract::ContractError,
     message::{Message, Transaction, TransactionType},
-    node::{ConnectionError, ConnectionBridge, OpManager, PeerKey},
+    node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
     ring::RingError,
 };
 
@@ -40,7 +40,7 @@ where
         }
         Err((err, tx_id)) => {
             if let Some(sender) = sender {
-                conn_manager.send(sender, Message::Canceled(tx_id)).await?;
+                conn_manager.send(&sender, Message::Canceled(tx_id)).await?;
             }
             return Err(err);
         }
@@ -50,8 +50,8 @@ where
         }) => {
             // updated op
             let id = *msg.id();
-            if let Some(target) = msg.target() {
-                conn_manager.send(target.peer, msg).await?;
+            if let Some(target) = msg.target().cloned() {
+                conn_manager.send(&target.peer, msg).await?;
             }
             op_storage.push(id, updated_state)?;
         }
@@ -67,8 +67,8 @@ where
             state: None,
         }) => {
             // finished the operation at this node, informing back
-            if let Some(target) = msg.target() {
-                conn_manager.send(target.peer, msg).await?;
+            if let Some(target) = msg.target().cloned() {
+                conn_manager.send(&target.peer, msg).await?;
             }
         }
         Ok(OperationResult {

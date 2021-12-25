@@ -299,7 +299,7 @@ where
                 // Retry seek node when the contract to subscribe has not been found in this node
                 conn_manager
                     .send(
-                        new_target.peer,
+                        &new_target.peer,
                         (SubscribeMsg::SeekNode {
                             id,
                             key,

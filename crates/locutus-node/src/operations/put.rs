@@ -364,7 +364,7 @@ where
             // if the change was successful, communicate this back to the requestor and broadcast the change
             conn_manager
                 .send(
-                    sender.peer,
+                    &sender.peer,
                     (PutMsg::SuccessfulUpdate {
                         id,
                         new_value: new_value.clone(),
@@ -442,7 +442,7 @@ where
 
             let mut broadcasting = Vec::with_capacity(broadcast_to.len());
             for peer in &broadcast_to {
-                let f = conn_manager.send(peer.peer, msg.clone().into());
+                let f = conn_manager.send(&peer.peer, msg.clone().into());
                 broadcasting.push(f);
             }
             let error_futures = futures::future::join_all(broadcasting)
@@ -467,7 +467,7 @@ where
                     peer.peer,
                     err
                 );
-                conn_manager.drop_connection(peer.peer);
+                conn_manager.drop_connection(&peer.peer);
                 incorrect_results += 1;
             }
 
@@ -622,7 +622,7 @@ async fn forward_changes<CErr, CB>(
             // and forget about it, no need to keep track of this op or wait for response
             let _ = conn_manager
                 .send(
-                    peer.peer,
+                    &peer.peer,
                     (PutMsg::PutForward {
                         id,
                         contract: contract.clone(),

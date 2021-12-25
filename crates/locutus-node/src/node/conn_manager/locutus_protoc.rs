@@ -1,5 +1,6 @@
-use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use std::{collections::VecDeque, net::IpAddr, sync::Arc};
 
+use dashmap::{DashMap, DashSet};
 use either::{Left, Right};
 use futures::{future, FutureExt, StreamExt};
 use libp2p::{
@@ -10,18 +11,18 @@ use libp2p::{
     ping,
     swarm::{
         protocols_handler::{InboundUpgradeSend, OutboundUpgradeSend},
-        KeepAlive, NegotiatedSubstream, NetworkBehaviour, ProtocolsHandler, ProtocolsHandlerEvent,
-        ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder, SwarmEvent,
+        AddressScore, KeepAlive, NegotiatedSubstream, NetworkBehaviour, ProtocolsHandler,
+        ProtocolsHandlerEvent, ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder,
+        SwarmEvent,
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     config::GlobalExecutor,
     message::Message,
     node::{process_message, OpManager, PeerKey},
-    ring::PeerKeyLocation,
     NodeConfig,
 };
 
@@ -44,7 +45,9 @@ fn config_behaviour(local_key: &Keypair) -> NetBehaviour {
     NetBehaviour {
         identify: identify::Identify::new(ident_config),
         ping,
-        locutus: LocutusBehaviour {},
+        locutus: LocutusBehaviour {
+            queue: VecDeque::new(),
+        },
     }
 }
 
@@ -58,35 +61,47 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 }
 
 #[derive(Debug, Clone)]
-struct P2pConnBridge {}
+struct P2pConnBridge {
+    active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
+    accepted_peers: Arc<DashSet<PeerKey>>,
+    sender: Sender<(PeerKey, Box<Message>)>,
+}
+
+impl P2pConnBridge {
+    fn new(sender: Sender<(PeerKey, Box<Message>)>) -> Self {
+        Self {
+            active_net_connections: Arc::new(DashMap::new()),
+            accepted_peers: Arc::new(DashSet::new()),
+            sender,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl ConnectionBridge for P2pConnBridge {
-    fn peer_key(&self) -> PeerKey {
-        todo!()
+    fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
+        if self.active_net_connections.contains_key(&peer) {
+            self.accepted_peers.insert(peer);
+        }
+        Ok(())
     }
 
-    fn add_connection(&mut self, peer: PeerKeyLocation, unsolicited: bool) {
-        todo!()
+    fn drop_connection(&mut self, peer: &PeerKey) {
+        self.accepted_peers.remove(peer);
     }
 
-    fn drop_connection(&mut self, peer: PeerKey) {
-        todo!()
-    }
-
-    async fn recv(&self) -> super::ConnResult<Message> {
-        todo!()
-    }
-
-    async fn send(&self, target: PeerKey, msg: Message) -> super::ConnResult<()> {
-        todo!()
+    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+        self.sender
+            .send((*target, Box::new(msg)))
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted)?;
+        Ok(())
     }
 }
 
 pub(in crate::node) struct LocutusConnManager {
     pub swarm: Swarm<NetBehaviour>,
     listen_on: Option<(IpAddr, u16)>,
-    active_connections: HashMap<PeerKey, Multiaddr>,
 }
 
 impl LocutusConnManager {
@@ -103,11 +118,15 @@ impl LocutusConnManager {
             PeerId::from(config.local_key.public()),
         )
         .executor(global_executor);
-        let swarm = builder.build();
+
+        let mut swarm = builder.build();
+        for remote_addr in config.remote_nodes.iter().filter_map(|r| r.addr.clone()) {
+            swarm.add_external_address(remote_addr, AddressScore::Infinite);
+        }
+
         LocutusConnManager {
             swarm,
             listen_on: config.local_ip.zip(config.local_port),
-            active_connections: HashMap::new(),
         }
     }
 
@@ -121,7 +140,6 @@ impl LocutusConnManager {
 
     pub async fn run_event_listener<CErr>(
         mut self,
-        gateways: Vec<PeerKeyLocation>,
         op_manager: Arc<OpManager<CErr>>,
         mut notification_channel: Receiver<Message>,
     ) where
@@ -129,7 +147,8 @@ impl LocutusConnManager {
     {
         use ConnMngrActions::*;
 
-        let conn_manager = P2pConnBridge {};
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let conn_manager = P2pConnBridge::new(tx);
 
         loop {
             let net_msg = self.swarm.select_next_some().map(|event| match event {
@@ -157,23 +176,37 @@ impl LocutusConnManager {
             });
 
             let notification_msg = notification_channel.recv().map(|m| match m {
-                Some(m) => Ok(Left(m)),
+                Some(m) => Ok(Left(Box::new(m))),
                 None => Ok(Right(ClosedChannel)),
             });
 
             let msg: Result<_, ConnectionError> = tokio::select! {
                 msg = notification_msg => { msg }
                 msg = net_msg => { msg }
+                msg = rx.recv() => {
+                    if let Some((peer,msg)) = msg {
+                        Ok(Right(SendMessage { peer, msg }))
+                    } else {
+                        Ok(Right(ClosedChannel))
+                    }
+                }
             };
 
             match msg {
                 Ok(Left(msg)) => {
                     let cb = conn_manager.clone();
-                    GlobalExecutor::spawn(process_message(Ok(msg), op_manager.clone(), cb, None));
+                    GlobalExecutor::spawn(process_message(Ok(*msg), op_manager.clone(), cb, None));
                 }
-                Ok(Right(NoAction)) => {}
                 Ok(Right(ConnectionEstablished { addr, peer_id })) => {
-                    self.active_connections.insert(peer_id, addr);
+                    conn_manager.active_net_connections.insert(peer_id, addr);
+                }
+                Ok(Right(SendMessage { peer, msg })) => {
+                    self.swarm
+                        .behaviour_mut()
+                        .locutus
+                        .queue
+                        .push_back((peer.0, *msg));
+                    todo!()
                 }
                 Ok(Right(ClosedChannel)) => {
                     log::info!("notification channel closed");
@@ -184,6 +217,7 @@ impl LocutusConnManager {
                     GlobalExecutor::spawn(process_message(Err(err), op_manager.clone(), cb, None));
                     break;
                 }
+                Ok(Right(NoAction)) => {}
             }
         }
     }
@@ -200,10 +234,16 @@ enum ConnMngrActions {
         addr: Multiaddr,
     },
     ClosedChannel,
+    SendMessage {
+        peer: PeerKey,
+        msg: Box<Message>,
+    },
     NoAction,
 }
 
-pub(crate) struct LocutusBehaviour {}
+pub(crate) struct LocutusBehaviour {
+    queue: VecDeque<(PeerId, Message)>,
+}
 
 impl NetworkBehaviour for LocutusBehaviour {
     type ProtocolsHandler = Handler;
@@ -252,7 +292,7 @@ impl ProtocolsHandler for Handler {
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        todo!()
+        SubstreamProtocol::new(LocutusProtocol {}, ())
     }
 
     fn inject_fully_negotiated_inbound(
@@ -350,9 +390,9 @@ pub(crate) struct NetBehaviour {
 
 #[derive(Debug)]
 pub(crate) enum NetEvent {
+    Locutus(Box<Message>),
     Identify(Box<identify::IdentifyEvent>),
     Ping(ping::PingEvent),
-    Locutus(Message),
 }
 
 impl From<identify::IdentifyEvent> for NetEvent {
@@ -369,6 +409,6 @@ impl From<ping::PingEvent> for NetEvent {
 
 impl From<Message> for NetEvent {
     fn from(event: Message) -> NetEvent {
-        Self::Locutus(event)
+        Self::Locutus(Box::new(event))
     }
 }

@@ -17,13 +17,16 @@ use libp2p::{
 };
 
 #[cfg(test)]
-use self::in_memory::NodeInMemory;
-use self::{libp2p_impl::NodeLibP2P, event_listener::{EventListener, EventLog}};
+use self::in_memory_impl::NodeInMemory;
+use self::{
+    event_listener::{EventListener, EventLog},
+    p2p_impl::NodeP2P,
+};
 use crate::{
     config::{GlobalExecutor, CONF},
     contract::{CHandlerImpl, ContractError, ContractStoreError},
     message::{Maintenance, Message},
-    operations::{get, put, subscribe, OpError, join_ring},
+    operations::{get, join_ring, put, subscribe, OpError},
     ring::{Location, PeerKeyLocation},
     user_events::{UserEvent, UserEventsProxy},
 };
@@ -36,9 +39,9 @@ pub(crate) use op_state::OpManager;
 mod conn_manager;
 mod event_listener;
 #[cfg(test)]
-mod in_memory;
-mod libp2p_impl;
+mod in_memory_impl;
 mod op_state;
+mod p2p_impl;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
@@ -76,13 +79,13 @@ where
 
 #[cfg(test)]
 enum NodeImpl<CErr> {
-    LibP2P(Box<NodeLibP2P<CErr>>),
+    LibP2P(Box<NodeP2P<CErr>>),
     InMemory(Box<NodeInMemory<CErr>>),
 }
 
 #[cfg(not(test))]
 enum NodeImpl<CErr> {
-    LibP2P(Box<NodeLibP2P<CErr>>),
+    LibP2P(Box<NodeP2P<CErr>>),
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -185,7 +188,7 @@ impl NodeConfig {
 
     /// Builds a node using libp2p as backend connection manager.
     pub fn build_libp2p(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
-        let node = NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
+        let node = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
         Ok(Node(NodeImpl::LibP2P(Box::new(node))))
     }
 

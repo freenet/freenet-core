@@ -22,7 +22,7 @@ use crate::{
 
 use super::OpManager;
 
-pub(super) struct NodeLibP2P<CErr = ContractStoreError> {
+pub(super) struct NodeP2P<CErr = ContractStoreError> {
     pub(crate) peer_key: PeerKey,
     pub(crate) op_storage: Arc<OpManager<CErr>>,
     gateways: Vec<PeerKeyLocation>,
@@ -32,7 +32,7 @@ pub(super) struct NodeLibP2P<CErr = ContractStoreError> {
     is_gateway: bool,
 }
 
-impl<CErr> NodeLibP2P<CErr>
+impl<CErr> NodeP2P<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
@@ -45,20 +45,17 @@ where
         // 2. start the user event handler loop
         let user_events = UserEventHandler;
         GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
+
         // 3. start the p2p event loop
         self.conn_manager
-            .run_event_listener(
-                self.gateways,
-                self.op_storage.clone(),
-                self.notification_channel,
-            )
+            .run_event_listener(self.op_storage.clone(), self.notification_channel)
             .await;
         Ok(())
     }
 
     pub fn build<CH>(
         config: NodeConfig,
-    ) -> Result<NodeLibP2P<<CH as ContractHandler>::Error>, anyhow::Error>
+    ) -> Result<NodeP2P<<CH as ContractHandler>::Error>, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
         <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
@@ -79,7 +76,7 @@ where
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
-        Ok(NodeLibP2P {
+        Ok(NodeP2P {
             peer_key,
             conn_manager,
             gateways,
@@ -144,7 +141,7 @@ mod test {
     use libp2p::swarm::SwarmEvent;
 
     /// Ping test event loop
-    async fn ping_ev_loop<CErr>(peer: &mut NodeLibP2P<CErr>) -> Result<(), ()>
+    async fn ping_ev_loop<CErr>(peer: &mut NodeP2P<CErr>) -> Result<(), ()>
     where
         CErr: std::error::Error,
     {
@@ -190,7 +187,7 @@ mod test {
                 .with_port(peer1_port)
                 .with_key(peer1_key);
             let peer1 =
-                Box::new(NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap());
+                Box::new(NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap());
             peer1.run_node().await.unwrap();
             // ping_ev_loop(&mut peer1).await
         });
@@ -198,7 +195,7 @@ mod test {
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
             let mut peer2 =
-                NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(NodeConfig::default())
+                NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(NodeConfig::default())
                     .unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
