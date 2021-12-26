@@ -29,4 +29,6 @@ pub(crate) enum ConnectionError {
     Serialization(#[from] Box<bincode::ErrorKind>),
     #[error("unable to send message")]
     SendNotCompleted,
+    #[error(transparent)]
+    IOError(#[from] std::io::Error),
 }

@@ -1891,6 +1891,7 @@ dependencies = [
  "anyhow",
  "arbitrary",
  "async-trait",
+ "asynchronous-codec",
  "bincode",
  "blake2 0.10.0",
  "config",
@@ -1912,6 +1913,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "typestate",
+ "unsigned-varint",
  "uuid",
 ]
 

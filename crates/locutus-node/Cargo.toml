@@ -16,6 +16,7 @@ doc = false
 [dependencies]
 anyhow = "1.0"
 arbitrary = { version = "1.0", features = ["derive"] }
+asynchronous-codec = "0.6"
 async-trait = "0.1.51"
 bincode = "1.3"
 blake2 = { version =  "0.10", features = [ "std" ] }
@@ -43,6 +44,7 @@ stretto = { version = "0.3.1", features = ["async"] }
 thiserror = "1.0"
 tokio = { version = "1.12", features = ["rt-multi-thread", "sync", "macros"] }
 typestate = "0.8.0"
+unsigned-varint = "0.7"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
 sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
 

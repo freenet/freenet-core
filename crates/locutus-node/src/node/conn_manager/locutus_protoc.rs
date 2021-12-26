@@ -1,8 +1,19 @@
-use std::{collections::VecDeque, net::IpAddr, sync::Arc};
+use std::{
+    collections::VecDeque,
+    io,
+    net::IpAddr,
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
+use asynchronous_codec::{BytesMut, Framed};
 use dashmap::{DashMap, DashSet};
 use either::{Left, Right};
-use futures::{future, FutureExt, StreamExt};
+use futures::{
+    future::{self, BoxFuture},
+    sink, stream, AsyncRead, AsyncReadExt, AsyncWrite, FutureExt, SinkExt, StreamExt, TryStreamExt,
+};
 use libp2p::{
     core::{muxing, transport, ConnectedPoint, UpgradeInfo},
     identify,
@@ -10,17 +21,18 @@ use libp2p::{
     multiaddr::Protocol,
     ping,
     swarm::{
-        protocols_handler::{InboundUpgradeSend, OutboundUpgradeSend},
-        AddressScore, KeepAlive, NegotiatedSubstream, NetworkBehaviour, ProtocolsHandler,
+        protocols_handler::OutboundUpgradeSend, AddressScore, IntoProtocolsHandler, KeepAlive,
+        NegotiatedSubstream, NetworkBehaviour, NetworkBehaviourAction, ProtocolsHandler,
         ProtocolsHandlerEvent, ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder,
         SwarmEvent,
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
+use unsigned_varint::codec::UviBytes;
 
 use crate::{
-    config::GlobalExecutor,
+    config::{self, GlobalExecutor},
     message::Message,
     node::{process_message, OpManager, PeerKey},
     NodeConfig,
@@ -28,8 +40,11 @@ use crate::{
 
 use super::{ConnectionBridge, ConnectionError};
 
+/// The default maximum size for a varint length-delimited packet.
+pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024;
+
 const CURRENT_AGENT_VER: &str = "locutus/agent/0.1.0";
-const CURRENT_PROTOC_VER: &[u8] = b"locutus/agent/0.1.0";
+const CURRENT_PROTOC_VER: &[u8] = b"locutus/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "id/1.0.0";
 
 fn config_behaviour(local_key: &Keypair) -> NetBehaviour {
@@ -233,14 +248,15 @@ enum ConnMngrActions {
         peer_id: PeerKey,
         addr: Multiaddr,
     },
-    ClosedChannel,
     SendMessage {
         peer: PeerKey,
         msg: Box<Message>,
     },
+    ClosedChannel,
     NoAction,
 }
 
+/// Manages network connections with different peers and event routing within the swarm.
 pub(crate) struct LocutusBehaviour {
     queue: VecDeque<(PeerId, Message)>,
 }
@@ -251,30 +267,49 @@ impl NetworkBehaviour for LocutusBehaviour {
     type OutEvent = Message;
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
-        Handler {}
+        Handler::new()
     }
 
     fn inject_event(
         &mut self,
         peer_id: PeerId,
-        connection: libp2p::core::connection::ConnectionId,
-        event: <<Self::ProtocolsHandler as libp2p::swarm::IntoProtocolsHandler>::Handler as libp2p::swarm::ProtocolsHandler>::OutEvent,
+        _connection: libp2p::core::connection::ConnectionId,
+        msg: Message,
     ) {
-        todo!()
+        self.queue.push_front((peer_id, msg));
     }
 
     fn poll(
         &mut self,
-        cx: &mut std::task::Context<'_>,
-        params: &mut impl libp2p::swarm::PollParameters,
-    ) -> std::task::Poll<
-        libp2p::swarm::NetworkBehaviourAction<Self::OutEvent, Self::ProtocolsHandler>,
-    > {
-        todo!()
+        _: &mut std::task::Context<'_>,
+        _: &mut impl libp2p::swarm::PollParameters,
+    ) -> std::task::Poll<NetworkBehaviourAction<Self::OutEvent, Self::ProtocolsHandler>> {
+        if let Some((_peer, msg)) = self.queue.pop_back() {
+            Poll::Ready(NetworkBehaviourAction::GenerateEvent(msg))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
-pub(crate) struct Handler {}
+/// Handles the connection with a given peer.
+pub(crate) struct Handler {
+    substreams: Vec<SubstreamState>,
+    keep_alive: KeepAlive,
+}
+
+enum SubstreamState {}
+
+impl Handler {
+    const KEEP_ALIVE: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            substreams: vec![],
+            keep_alive: KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT),
+        }
+    }
+}
 
 impl ProtocolsHandler for Handler {
     type InEvent = Message;
@@ -297,15 +332,15 @@ impl ProtocolsHandler for Handler {
 
     fn inject_fully_negotiated_inbound(
         &mut self,
-        protocol: <Self::InboundProtocol as InboundUpgradeSend>::Output,
-        info: Self::InboundOpenInfo,
+        stream: <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Output,
+        _info: Self::InboundOpenInfo,
     ) {
         todo!()
     }
 
     fn inject_fully_negotiated_outbound(
         &mut self,
-        protocol: <Self::OutboundProtocol as OutboundUpgradeSend>::Output,
+        protocol: <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Output,
         info: Self::OutboundOpenInfo,
     ) {
         todo!()
@@ -353,26 +388,66 @@ impl UpgradeInfo for LocutusProtocol {
     }
 }
 
-impl InboundUpgrade<NegotiatedSubstream> for LocutusProtocol {
-    type Output = NegotiatedSubstream;
+pub(crate) type LocutusStream<S> = stream::AndThen<
+    sink::With<
+        stream::ErrInto<Framed<S, UviBytes<io::Cursor<Vec<u8>>>>, ConnectionError>,
+        io::Cursor<Vec<u8>>,
+        Message,
+        future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
+        fn(Message) -> future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
+    >,
+    future::Ready<Result<Message, ConnectionError>>,
+    fn(BytesMut) -> future::Ready<Result<Message, ConnectionError>>,
+>;
+
+impl<S> InboundUpgrade<S> for LocutusProtocol
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    type Output = LocutusStream<S>;
     type Error = ConnectionError;
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
-    fn upgrade_inbound(self, stream: NegotiatedSubstream, _: Self::Info) -> Self::Future {
-        // TODO: check protocol ver
-        future::ok(stream)
+    fn upgrade_inbound(self, incoming: S, _: Self::Info) -> Self::Future {
+        frame_stream(incoming)
     }
 }
 
-impl OutboundUpgrade<NegotiatedSubstream> for LocutusProtocol {
-    type Output = NegotiatedSubstream;
+impl<S> OutboundUpgrade<S> for LocutusProtocol
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    type Output = LocutusStream<S>;
     type Error = ConnectionError;
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
-    fn upgrade_outbound(self, stream: NegotiatedSubstream, _: Self::Info) -> Self::Future {
-        // TODO: check protocol ver
-        future::ok(stream)
+    fn upgrade_outbound(self, incoming: S, _: Self::Info) -> Self::Future {
+        frame_stream(incoming)
     }
+}
+
+fn frame_stream<S>(incoming: S) -> future::Ready<Result<LocutusStream<S>, ConnectionError>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut codec = UviBytes::default();
+    codec.set_max_len(DEFAULT_MAX_PACKET_SIZE);
+    let framed = Framed::new(incoming, codec)
+        .err_into()
+        .with::<_, _, fn(_) -> _, _>(|response| {
+            let buf = encode_msg(response);
+            future::ready(Ok(io::Cursor::new(buf)))
+        })
+        .and_then::<_, fn(_) -> _>(|bytes| future::ready(decode_msg(bytes)));
+    future::ok(framed)
+}
+
+fn encode_msg(msg: Message) -> Vec<u8> {
+    todo!()
+}
+
+fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
+    todo!()
 }
 
 /// The network behaviour implements the following capabilities:
