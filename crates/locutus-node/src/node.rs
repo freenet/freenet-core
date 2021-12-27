@@ -25,7 +25,7 @@ use self::{
 use crate::{
     config::{GlobalExecutor, CONF},
     contract::{CHandlerImpl, ContractError, ContractStoreError},
-    message::{Maintenance, Message},
+    message::{Message, NodeActions},
     operations::{get, join_ring, put, subscribe, OpError},
     ring::{Location, PeerKeyLocation},
     user_events::{UserEvent, UserEventsProxy},
@@ -301,7 +301,7 @@ where
         let ev = user_events.recv().await;
         if let UserEvent::Shutdown = ev {
             if let Err(err) = op_storage
-                .notify_maintenance_op(Message::Maintenance(Maintenance::ShutdownNode))
+                .notify_maintenance_op(Message::Internal(NodeActions::ShutdownNode))
                 .await
             {
                 log::error!("{}", err);

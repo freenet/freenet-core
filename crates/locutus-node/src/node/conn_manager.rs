@@ -1,5 +1,8 @@
 //! Types and definitions to handle all socket communication for the peer nodes.
 
+use libp2p::swarm::ProtocolsHandlerUpgrErr;
+use serde::{Deserialize, Serialize};
+
 use super::PeerKey;
 use crate::message::Message;
 
@@ -21,14 +24,33 @@ pub(crate) trait ConnectionBridge {
     async fn send(&self, target: &PeerKey, msg: Message) -> ConnResult<()>;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub(crate) enum ConnectionError {
     #[error("location unknown for this node")]
     LocationUnknown,
-    #[error("error while de/serializing message")]
-    Serialization(#[from] Box<bincode::ErrorKind>),
     #[error("unable to send message")]
     SendNotCompleted,
-    #[error(transparent)]
-    IOError(#[from] std::io::Error),
+    #[error("error while de/serializing message")]
+    #[serde(skip)]
+    Serialization(#[from] Option<Box<bincode::ErrorKind>>),
+
+    // errors produced while handling the connection:
+    #[serde(skip)]
+    #[error("IO connection error")]
+    IOError(#[from] Option<std::io::Error>),
+    #[serde(skip)]
+    #[error("upgrade connection error")]
+    NegotiationError(#[from] Option<Box<ProtocolsHandlerUpgrErr<Self>>>),
+}
+
+impl Clone for ConnectionError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::LocationUnknown => Self::LocationUnknown,
+            Self::Serialization(_) => Self::Serialization(None),
+            Self::SendNotCompleted => Self::SendNotCompleted,
+            Self::IOError(_) => Self::IOError(None),
+            Self::NegotiationError(_) => Self::NegotiationError(None),
+        }
+    }
 }

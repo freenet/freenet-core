@@ -3,9 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    conn_manager::{in_memory::MemoryConnManager, ConnectionBridge},
-    event_listener::EventListener,
-    op_state::OpManager,
+    conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, op_state::OpManager,
     process_message, user_event_handling, PeerKey,
 };
 use crate::{

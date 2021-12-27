@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     net::IpAddr,
+    pin::Pin,
     sync::Arc,
     task::Poll,
     time::{Duration, Instant},
@@ -11,20 +12,19 @@ use asynchronous_codec::{BytesMut, Framed};
 use dashmap::{DashMap, DashSet};
 use either::{Left, Right};
 use futures::{
-    future::{self, BoxFuture},
-    sink, stream, AsyncRead, AsyncReadExt, AsyncWrite, FutureExt, SinkExt, StreamExt, TryStreamExt,
+    future::{self},
+    sink, stream, AsyncRead, AsyncWrite, FutureExt, Sink, SinkExt, Stream, StreamExt, TryStreamExt,
 };
 use libp2p::{
-    core::{muxing, transport, ConnectedPoint, UpgradeInfo},
+    core::{muxing, transport, UpgradeInfo},
     identify,
     identity::Keypair,
     multiaddr::Protocol,
     ping,
     swarm::{
-        protocols_handler::OutboundUpgradeSend, AddressScore, IntoProtocolsHandler, KeepAlive,
-        NegotiatedSubstream, NetworkBehaviour, NetworkBehaviourAction, ProtocolsHandler,
-        ProtocolsHandlerEvent, ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder,
-        SwarmEvent,
+        protocols_handler::OutboundUpgradeSend, AddressScore, KeepAlive, NegotiatedSubstream,
+        NetworkBehaviour, NetworkBehaviourAction, ProtocolsHandler, ProtocolsHandlerEvent,
+        ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder, SwarmEvent,
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
@@ -33,7 +33,7 @@ use unsigned_varint::codec::UviBytes;
 
 use crate::{
     config::{self, GlobalExecutor},
-    message::Message,
+    message::{Message, NodeActions, Transaction},
     node::{process_message, OpManager, PeerKey},
     NodeConfig,
 };
@@ -115,7 +115,7 @@ impl ConnectionBridge for P2pConnBridge {
 }
 
 pub(in crate::node) struct LocutusConnManager {
-    pub swarm: Swarm<NetBehaviour>,
+    pub(in crate::node) swarm: Swarm<NetBehaviour>,
     listen_on: Option<(IpAddr, u16)>,
 }
 
@@ -169,21 +169,14 @@ impl LocutusConnManager {
             let net_msg = self.swarm.select_next_some().map(|event| match event {
                 SwarmEvent::Behaviour(NetEvent::Locutus(msg)) => Ok(Left(msg)),
                 SwarmEvent::ConnectionEstablished {
-                    peer_id,
-                    endpoint: ConnectedPoint::Listener { send_back_addr, .. },
-                    ..
+                    peer_id, endpoint, ..
                 } => Ok(Right(ConnMngrActions::ConnectionEstablished {
                     peer_id: PeerKey(peer_id),
-                    addr: send_back_addr,
+                    addr: endpoint.get_remote_address().clone(),
                 })),
-                SwarmEvent::ConnectionEstablished {
-                    peer_id,
-                    endpoint: ConnectedPoint::Dialer { address },
-                    ..
-                } => Ok(Right(ConnMngrActions::ConnectionEstablished {
-                    peer_id: PeerKey(peer_id),
-                    addr: address,
-                })),
+                SwarmEvent::ConnectionClosed { .. } => {
+                    todo!("remove from the ring");
+                }
                 other_event => {
                     log::debug!("{:?}", other_event);
                     Ok(Right(ConnMngrActions::NoAction))
@@ -195,16 +188,18 @@ impl LocutusConnManager {
                 None => Ok(Right(ClosedChannel)),
             });
 
-            let msg: Result<_, ConnectionError> = tokio::select! {
-                msg = notification_msg => { msg }
-                msg = net_msg => { msg }
-                msg = rx.recv() => {
-                    if let Some((peer,msg)) = msg {
-                        Ok(Right(SendMessage { peer, msg }))
-                    } else {
-                        Ok(Right(ClosedChannel))
-                    }
+            let bridge_msg = rx.recv().map(|msg| {
+                if let Some((peer, msg)) = msg {
+                    Ok(Right(SendMessage { peer, msg }))
+                } else {
+                    Ok(Right(ClosedChannel))
                 }
+            });
+
+            let msg: Result<_, ConnectionError> = tokio::select! {
+                msg = net_msg => { msg }
+                msg = notification_msg => { msg }
+                msg = bridge_msg => { msg }
             };
 
             match msg {
@@ -213,7 +208,12 @@ impl LocutusConnManager {
                     GlobalExecutor::spawn(process_message(Ok(*msg), op_manager.clone(), cb, None));
                 }
                 Ok(Right(ConnectionEstablished { addr, peer_id })) => {
+                    log::debug!("established connection with peer {} @ {}", peer_id, addr);
                     conn_manager.active_net_connections.insert(peer_id, addr);
+                }
+                Ok(Right(ConnectionClosed { peer_id })) => {
+                    conn_manager.active_net_connections.remove(&peer_id);
+                    log::debug!("dropped connection with peer {}", peer_id);
                 }
                 Ok(Right(SendMessage { peer, msg })) => {
                     self.swarm
@@ -230,7 +230,6 @@ impl LocutusConnManager {
                 Err(err) => {
                     let cb = conn_manager.clone();
                     GlobalExecutor::spawn(process_message(Err(err), op_manager.clone(), cb, None));
-                    break;
                 }
                 Ok(Right(NoAction)) => {}
             }
@@ -248,6 +247,10 @@ enum ConnMngrActions {
         peer_id: PeerKey,
         addr: Multiaddr,
     },
+    /// Closed a connection with the peer
+    ConnectionClosed {
+        peer_id: PeerKey,
+    },
     SendMessage {
         peer: PeerKey,
         msg: Box<Message>,
@@ -257,7 +260,7 @@ enum ConnMngrActions {
 }
 
 /// Manages network connections with different peers and event routing within the swarm.
-pub(crate) struct LocutusBehaviour {
+pub(in crate::node) struct LocutusBehaviour {
     queue: VecDeque<(PeerId, Message)>,
 }
 
@@ -292,13 +295,59 @@ impl NetworkBehaviour for LocutusBehaviour {
     }
 }
 
+type UniqConnId = usize;
+
 /// Handles the connection with a given peer.
-pub(crate) struct Handler {
+pub(in crate::node) struct Handler {
     substreams: Vec<SubstreamState>,
     keep_alive: KeepAlive,
+    uniq_connection_id: UniqConnId,
+    protocol_status: ProtocolStatus,
 }
 
-enum SubstreamState {}
+enum ProtocolStatus {
+    Unconfirmed,
+    Confirmed,
+    Reported,
+    FailedUpgrade,
+}
+
+enum SubstreamState {
+    /// We haven't started opening the outgoing substream yet.
+    /// Contains the request we want to send.
+    OutPendingOpen(Message),
+    /// Waiting to send a message to the remote.
+    PendingSend {
+        substream: LocutusStream<NegotiatedSubstream>,
+        init_msg: Box<Message>,
+    },
+    /// Waiting to flush the substream so that the data arrives to the remote.
+    PendingFlush {
+        substream: LocutusStream<NegotiatedSubstream>,
+        id: Transaction,
+    },
+    /// Waiting for an answer back from the remote.
+    WaitingMsg {
+        substream: LocutusStream<NegotiatedSubstream>,
+        id: Transaction,
+    },
+    /// An error happened on the substream and we should report the error to the user.
+    ReportError {
+        error: ConnectionError,
+        msg: Box<Message>,
+    },
+    /// Waiting for a request from the remote
+    InWaitingMsg {
+        conn_id: UniqConnId,
+        substream: LocutusStream<NegotiatedSubstream>,
+    },
+    /// Waiting to send an answer back to the remote.
+    InPendingSend {
+        conn_id: UniqConnId,
+        substream: LocutusStream<NegotiatedSubstream>,
+        msg: Box<Message>,
+    },
+}
 
 impl Handler {
     const KEEP_ALIVE: Duration = Duration::from_secs(30);
@@ -307,13 +356,26 @@ impl Handler {
         Self {
             substreams: vec![],
             keep_alive: KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT),
+            uniq_connection_id: 0,
+            protocol_status: ProtocolStatus::Unconfirmed,
         }
     }
 }
 
-impl ProtocolsHandler for Handler {
-    type InEvent = Message;
+#[derive(Debug)]
+pub(in crate::node) struct HandlerInputEvent {
+    msg: Message,
+    conn_id: Option<UniqConnId>,
+    is_response: bool,
+}
 
+type HandlePollingEv = ProtocolsHandlerEvent<LocutusProtocol, Message, Message, ConnectionError>;
+
+impl ProtocolsHandler for Handler {
+    /// Event received from the network by the handler
+    type InEvent = HandlerInputEvent;
+
+    /// Event producer by the handler and processed by the swarm
     type OutEvent = Message;
 
     type Error = ConnectionError;
@@ -324,10 +386,22 @@ impl ProtocolsHandler for Handler {
 
     type InboundOpenInfo = ();
 
-    type OutboundOpenInfo = ();
+    /// Initial message due to be sent to the remote.
+    type OutboundOpenInfo = Message;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
         SubstreamProtocol::new(LocutusProtocol {}, ())
+    }
+
+    fn inject_fully_negotiated_outbound(
+        &mut self,
+        stream: <Self::OutboundProtocol as InboundUpgrade<NegotiatedSubstream>>::Output,
+        init_msg: Self::OutboundOpenInfo,
+    ) {
+        self.substreams.push(SubstreamState::PendingSend {
+            substream: stream,
+            init_msg: Box::new(init_msg),
+        });
     }
 
     fn inject_fully_negotiated_inbound(
@@ -335,44 +409,192 @@ impl ProtocolsHandler for Handler {
         stream: <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Output,
         _info: Self::InboundOpenInfo,
     ) {
-        todo!()
-    }
-
-    fn inject_fully_negotiated_outbound(
-        &mut self,
-        protocol: <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Output,
-        info: Self::OutboundOpenInfo,
-    ) {
-        todo!()
+        self.substreams.push(SubstreamState::InWaitingMsg {
+            substream: stream,
+            conn_id: self.uniq_connection_id,
+        });
+        self.uniq_connection_id += 1;
+        if let ProtocolStatus::Unconfirmed = self.protocol_status {
+            self.protocol_status = ProtocolStatus::Confirmed;
+        }
     }
 
     fn inject_event(&mut self, event: Self::InEvent) {
-        todo!()
+        if event.is_response {
+            debug_assert!(event.conn_id.is_some());
+            // is a reponse to a previous msg and a substream should exist,
+            // the msg is available and the chain can be now identified by id
+            let pos = self.substreams.iter().position(|state| match state {
+                SubstreamState::InWaitingMsg { conn_id, .. } => {
+                    Some(conn_id) == event.conn_id.as_ref()
+                }
+                _ => false,
+            });
+
+            if let Some(pos) = pos {
+                let (conn_id, substream) = match self.substreams.remove(pos) {
+                    SubstreamState::InWaitingMsg {
+                        substream: stream,
+                        conn_id,
+                    } => (conn_id, stream),
+                    _ => unreachable!(),
+                };
+
+                self.substreams.push(SubstreamState::InPendingSend {
+                    msg: Box::new(event.msg),
+                    conn_id,
+                    substream,
+                });
+            }
+        } else {
+            // is a request, initiate a chain of messages, identificable by the tx id
+            self.substreams
+                .push(SubstreamState::OutPendingOpen(event.msg));
+        }
     }
 
     fn inject_dial_upgrade_error(
         &mut self,
-        info: Self::OutboundOpenInfo,
+        msg: Self::OutboundOpenInfo,
         error: ProtocolsHandlerUpgrErr<<Self::OutboundProtocol as OutboundUpgradeSend>::Error>,
     ) {
-        todo!()
+        self.protocol_status = ProtocolStatus::FailedUpgrade;
+        self.substreams.push(SubstreamState::ReportError {
+            error: (Box::new(error)).into(),
+            msg: Box::new(msg),
+        });
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
-        todo!()
+        self.keep_alive
     }
 
-    fn poll(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<
-        ProtocolsHandlerEvent<
-            Self::OutboundProtocol,
-            Self::OutboundOpenInfo,
-            Self::OutEvent,
-            Self::Error,
-        >,
-    > {
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<HandlePollingEv> {
+        if self.substreams.is_empty() {
+            return Poll::Pending;
+        }
+
+        if let ProtocolStatus::Confirmed = self.protocol_status {
+            self.protocol_status = ProtocolStatus::Reported;
+            return Poll::Ready(ProtocolsHandlerEvent::Custom(Message::Internal(
+                NodeActions::ConfirmedInbound,
+            )));
+        }
+
+        for n in (0..self.substreams.len()).rev() {
+            let mut stream = self.substreams.swap_remove(n);
+            loop {
+                match stream {
+                    SubstreamState::OutPendingOpen(msg) => {
+                        let event = ProtocolsHandlerEvent::OutboundSubstreamRequest {
+                            protocol: SubstreamProtocol::new(LocutusProtocol {}, msg),
+                        };
+                        if self.substreams.is_empty() {
+                            self.keep_alive =
+                                KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
+                        }
+                        return Poll::Ready(event);
+                    }
+                    SubstreamState::PendingSend {
+                        mut substream,
+                        init_msg,
+                    } => match Sink::poll_ready(Pin::new(&mut substream), cx) {
+                        Poll::Ready(Ok(())) => {
+                            let id = *init_msg.id();
+                            match Sink::start_send(Pin::new(&mut substream), *init_msg) {
+                                Ok(()) => {
+                                    stream = SubstreamState::PendingFlush { substream, id };
+                                }
+                                Err(err) => {
+                                    let event = ProtocolsHandlerEvent::Custom(Message::Internal(
+                                        NodeActions::Error(err, id),
+                                    ));
+                                    return Poll::Ready(event);
+                                }
+                            }
+                        }
+                        Poll::Pending => {
+                            stream = SubstreamState::PendingSend {
+                                substream,
+                                init_msg,
+                            };
+                            continue;
+                        }
+                        Poll::Ready(Err(err)) => {
+                            let event = ProtocolsHandlerEvent::Custom(Message::Internal(
+                                NodeActions::Error(err, *init_msg.id()),
+                            ));
+                            return Poll::Ready(event);
+                        }
+                    },
+                    SubstreamState::PendingFlush { mut substream, id } => {
+                        match Sink::poll_flush(Pin::new(&mut substream), cx) {
+                            Poll::Ready(Ok(())) => {
+                                stream = SubstreamState::WaitingMsg { substream, id };
+                                continue;
+                            }
+                            Poll::Pending => {
+                                self.substreams
+                                    .push(SubstreamState::PendingFlush { substream, id });
+                                break;
+                            }
+                            Poll::Ready(Err(err)) => {
+                                let event = ProtocolsHandlerEvent::Custom(Message::Internal(
+                                    NodeActions::Error(err, id),
+                                ));
+                                return Poll::Ready(event);
+                            }
+                        }
+                    }
+                    SubstreamState::WaitingMsg { mut substream, id } => {
+                        match Stream::poll_next(Pin::new(&mut substream), cx) {
+                            Poll::Ready(Some(Ok(msg))) => {
+                                // FIXME: probably check this is not a final message and shut down the stream in case it is
+                                self.substreams
+                                    .push(SubstreamState::WaitingMsg { substream, id });
+                                let event = ProtocolsHandlerEvent::Custom(msg);
+                                return Poll::Ready(event);
+                            }
+                            Poll::Pending => {
+                                self.substreams
+                                    .push(SubstreamState::WaitingMsg { substream, id });
+                                break;
+                            }
+                            Poll::Ready(Some(Err(err))) => {
+                                let event = ProtocolsHandlerEvent::Custom(Message::Internal(
+                                    NodeActions::Error(err, id),
+                                ));
+                                return Poll::Ready(event);
+                            }
+                            Poll::Ready(None) => {
+                                let event = ProtocolsHandlerEvent::Custom(Message::Internal(
+                                    NodeActions::Error(
+                                        ConnectionError::IOError(Some(
+                                            io::ErrorKind::UnexpectedEof.into(),
+                                        )),
+                                        id,
+                                    ),
+                                ));
+                                return Poll::Ready(event);
+                            }
+                        }
+                    }
+                    SubstreamState::ReportError { error, msg } => {
+                        let event = ProtocolsHandlerEvent::Custom(Message::Internal(
+                            NodeActions::Error(error, *msg.id()),
+                        ));
+                        return Poll::Ready(event);
+                    }
+                    SubstreamState::InWaitingMsg { conn_id, substream } => todo!(),
+                    SubstreamState::InPendingSend {
+                        conn_id,
+                        substream,
+                        msg,
+                    } => todo!(),
+                }
+            }
+        }
+
         todo!()
     }
 }
@@ -457,7 +679,7 @@ fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
 #[derive(libp2p::NetworkBehaviour)]
 #[behaviour(event_process = false)]
 #[behaviour(out_event = "NetEvent")]
-pub(crate) struct NetBehaviour {
+pub(in crate::node) struct NetBehaviour {
     identify: identify::Identify,
     ping: ping::Ping,
     locutus: LocutusBehaviour,

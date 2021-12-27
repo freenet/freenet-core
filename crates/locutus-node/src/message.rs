@@ -12,7 +12,7 @@ use uuid::{
 };
 
 use crate::{
-    node::PeerKey,
+    node::{ConnectionError, PeerKey},
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation},
 };
@@ -146,17 +146,29 @@ pub(crate) enum Message {
     Subscribe(SubscribeMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
-    Maintenance(Maintenance),
+    /// This are messages that will be received at the internal message event loop
+    /// sent by this same node from other point of the application.  
+    Internal(NodeActions),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) enum Maintenance {
+pub(crate) enum NodeActions {
+    /// For unspecified reasons the node is gracefully shutting down.
     ShutdownNode,
+    /// Received a confirmation from a peer that a physical connection was established.
+    ConfirmedInbound,
+    /// Error while sending an other message
+    #[serde(skip)]
+    Error(ConnectionError, Transaction),
 }
 
-impl Display for Maintenance {
+impl Display for NodeActions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        match self {
+            Self::ShutdownNode => f.write_str("ShutdownNode"),
+            Self::ConfirmedInbound => f.write_str("ConfirmedInbound"),
+            Self::Error(_, _) => todo!(),
+        }
     }
 }
 
@@ -169,7 +181,7 @@ impl Message {
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
             Canceled(tx) => tx,
-            Maintenance(_) => unreachable!(),
+            Internal(_) => unreachable!(),
         }
     }
 
@@ -180,7 +192,7 @@ impl Message {
             Put(op) => op.target(),
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
-            Canceled(_) | Maintenance(_) => None,
+            Canceled(_) | Internal(_) => None,
         }
     }
 }
@@ -195,7 +207,7 @@ impl Display for Message {
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
             Canceled(msg) => msg.fmt(f)?,
-            Maintenance(msg) => msg.fmt(f)?,
+            Internal(msg) => msg.fmt(f)?,
         };
         write!(f, "}}")
     }
