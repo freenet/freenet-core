@@ -737,20 +737,23 @@ where
     codec.set_max_len(DEFAULT_MAX_PACKET_SIZE);
     let framed = Framed::new(incoming, codec)
         .err_into()
-        .with::<_, _, fn(_) -> _, _>(|response| {
-            let buf = encode_msg(response);
-            future::ready(Ok(io::Cursor::new(buf)))
+        .with::<_, _, fn(_) -> _, _>(|response| match encode_msg(response) {
+            Ok(msg) => future::ready(Ok(io::Cursor::new(msg))),
+            Err(err) => future::ready(Err(err)),
         })
         .and_then::<_, fn(_) -> _>(|bytes| future::ready(decode_msg(bytes)));
     future::ok(framed)
 }
 
-fn encode_msg(msg: Message) -> Vec<u8> {
-    todo!()
+#[inline]
+fn encode_msg(msg: Message) -> Result<Vec<u8>, ConnectionError> {
+    bincode::serialize(&msg).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
+#[inline]
 fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
-    todo!()
+    let cursor = std::io::Cursor::new(buf);
+    bincode::deserialize_from(cursor).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
 /// The network behaviour implements the following capabilities:
