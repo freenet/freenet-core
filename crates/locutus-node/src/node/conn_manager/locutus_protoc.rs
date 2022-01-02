@@ -347,6 +347,11 @@ enum SubstreamState {
         substream: LocutusStream<NegotiatedSubstream>,
         msg: Box<Message>,
     },
+    /// Waiting to send an answer back to the remote.
+    InPendingFlush {
+        conn_id: UniqConnId,
+        substream: LocutusStream<NegotiatedSubstream>,
+    },
 }
 
 impl Handler {
@@ -585,17 +590,93 @@ impl ProtocolsHandler for Handler {
                         ));
                         return Poll::Ready(event);
                     }
-                    SubstreamState::InWaitingMsg { conn_id, substream } => todo!(),
+                    SubstreamState::InWaitingMsg {
+                        conn_id,
+                        mut substream,
+                    } => match Stream::poll_next(Pin::new(&mut substream), cx) {
+                        Poll::Ready(Some(Ok(msg))) => {
+                            // FIXME: probably need to keep stream alive here
+                            self.substreams.push(SubstreamState::WaitingMsg {
+                                id: *msg.id(),
+                                substream,
+                            });
+                            let event = ProtocolsHandlerEvent::Custom(msg);
+                            return Poll::Ready(event);
+                        }
+                        Poll::Pending => {
+                            self.substreams
+                                .push(SubstreamState::InWaitingMsg { conn_id, substream });
+                            break;
+                        }
+                        Poll::Ready(None) => {
+                            log::trace!("Inbound substream: EOF");
+                            break;
+                        }
+                        Poll::Ready(Some(Err(e))) => {
+                            log::debug!("Inbound substream error: {}", e);
+                            break;
+                        }
+                    },
                     SubstreamState::InPendingSend {
                         conn_id,
-                        substream,
+                        mut substream,
                         msg,
-                    } => todo!(),
+                    } => match Sink::poll_ready(Pin::new(&mut substream), cx) {
+                        Poll::Ready(Ok(_)) => {
+                            match Sink::start_send(Pin::new(&mut substream), *msg) {
+                                Ok(_) => {
+                                    stream = SubstreamState::InPendingFlush { conn_id, substream };
+                                    continue;
+                                }
+                                Err(err) => {
+                                    log::debug!("{}", err);
+                                    break;
+                                }
+                            }
+                        }
+                        Poll::Pending => {
+                            self.substreams.push(SubstreamState::InPendingSend {
+                                conn_id,
+                                substream,
+                                msg,
+                            });
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Err(err)) => {
+                            log::debug!("{}", err);
+                            break;
+                        }
+                    },
+                    SubstreamState::InPendingFlush {
+                        conn_id,
+                        mut substream,
+                    } => match Sink::poll_flush(Pin::new(&mut substream), cx) {
+                        Poll::Ready(Ok(_)) => {
+                            stream = SubstreamState::InWaitingMsg { conn_id, substream };
+                            continue;
+                        }
+                        Poll::Pending => {
+                            self.substreams
+                                .push(SubstreamState::InPendingFlush { conn_id, substream });
+                            break;
+                        }
+                        Poll::Ready(Err(err)) => {
+                            log::debug!("{}", err);
+                            break;
+                        }
+                    },
                 }
             }
         }
 
-        todo!()
+        if self.substreams.is_empty() {
+            // We destroyed all substreams in this function.
+            self.keep_alive = KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
+        } else {
+            self.keep_alive = KeepAlive::Yes;
+        }
+
+        Poll::Pending
     }
 }
 
