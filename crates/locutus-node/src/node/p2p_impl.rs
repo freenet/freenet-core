@@ -147,12 +147,13 @@ mod test {
     {
         loop {
             let ev = tokio::time::timeout(
-                Duration::from_secs(1),
+                Duration::from_secs(30),
                 peer.conn_manager.swarm.select_next_some(),
             );
             match ev.await {
                 Ok(SwarmEvent::Behaviour(NetEvent::Ping(ping))) => {
                     if ping.result.is_ok() {
+                        log::info!("ping done @ {}", peer.peer_key);
                         return Ok(());
                     }
                 }
@@ -168,12 +169,10 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping() -> Result<(), ()> {
-        todo!();
         Logger::init_logger();
-
+        let peer1_port = get_free_port().unwrap();
         let peer1_key = Keypair::generate_ed25519();
         let peer1_id: PeerId = peer1_key.public().into();
-        let peer1_port = get_free_port().unwrap();
         let peer1_config = InitPeerNode::new(peer1_id, Location::random())
             .listening_ip(Ipv4Addr::LOCALHOST)
             .listening_port(peer1_port);
@@ -186,19 +185,25 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let peer1 =
-                Box::new(NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap());
-            peer1.run_node().await.unwrap();
-            // ping_ev_loop(&mut peer1).await
+            let mut peer1 = Box::new(NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(
+                config,
+            )?);
+            peer1.conn_manager.listen_on()?;
+            ping_ev_loop(&mut peer1).await.unwrap();
+            Ok::<_, anyhow::Error>(())
         });
 
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
-            let mut peer2 =
-                NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(NodeConfig::default())
-                    .unwrap();
+            let mut config = NodeConfig::default();
+            config.add_gateway(InitPeerNode {
+                addr: peer1_config.addr.clone(),
+                identifier: peer1_id,
+                location: Location::random(),
+            });
+            let mut peer2 = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap();
             // wait a bit to make sure the first peer is up and listening
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             peer2
                 .conn_manager
                 .swarm

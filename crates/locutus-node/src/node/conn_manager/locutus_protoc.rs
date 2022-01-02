@@ -43,9 +43,9 @@ use super::{ConnectionBridge, ConnectionError};
 /// The default maximum size for a varint length-delimited packet.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024;
 
-const CURRENT_AGENT_VER: &str = "locutus/agent/0.1.0";
-const CURRENT_PROTOC_VER: &[u8] = b"locutus/0.1.0";
-const CURRENT_IDENTIFY_PROTOC_VER: &str = "id/1.0.0";
+const CURRENT_AGENT_VER: &str = "/locutus/agent/0.1.0";
+const CURRENT_PROTOC_VER: &[u8] = b"/locutus/0.1.0";
+const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 
 fn config_behaviour(local_key: &Keypair) -> NetBehaviour {
     let ident_config =
@@ -595,7 +595,6 @@ impl ProtocolsHandler for Handler {
                         mut substream,
                     } => match Stream::poll_next(Pin::new(&mut substream), cx) {
                         Poll::Ready(Some(Ok(msg))) => {
-                            // FIXME: probably need to keep stream alive here
                             self.substreams.push(SubstreamState::WaitingMsg {
                                 id: *msg.id(),
                                 substream,
@@ -745,12 +744,12 @@ where
     future::ok(framed)
 }
 
-#[inline]
+#[inline(always)]
 fn encode_msg(msg: Message) -> Result<Vec<u8>, ConnectionError> {
     bincode::serialize(&msg).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
-#[inline]
+#[inline(always)]
 fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
     let cursor = std::io::Cursor::new(buf);
     bincode::deserialize_from(cursor).map_err(|err| ConnectionError::Serialization(Some(err)))
