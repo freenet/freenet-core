@@ -7,7 +7,7 @@ use super::PeerKey;
 use crate::message::Message;
 
 pub(crate) mod in_memory;
-pub(crate) mod locutus_protoc;
+pub(crate) mod p2p_protoc;
 
 // TODO: use this constants when we do real net i/o
 // const PING_EVERY: Duration = Duration::from_secs(30);

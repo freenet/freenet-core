@@ -10,7 +10,7 @@ use libp2p::{
 };
 use tokio::sync::mpsc::{self, Receiver};
 
-use super::{conn_manager::locutus_protoc::LocutusConnManager, user_event_handling, PeerKey};
+use super::{conn_manager::p2p_protoc::P2pConnManager, user_event_handling, PeerKey};
 use crate::{
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler, ContractStoreError},
@@ -27,7 +27,7 @@ pub(super) struct NodeP2P<CErr = ContractStoreError> {
     pub(crate) op_storage: Arc<OpManager<CErr>>,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
-    pub(super) conn_manager: LocutusConnManager,
+    pub(super) conn_manager: P2pConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
@@ -65,7 +65,7 @@ where
 
         let conn_manager = {
             let transport = Self::config_transport(&config.local_key)?;
-            LocutusConnManager::build(transport, &config)
+            P2pConnManager::build(transport, &config)
         };
 
         let ring = Ring::new(&config, &gateways)?;
@@ -128,7 +128,7 @@ where
 mod test {
     use std::{net::Ipv4Addr, time::Duration};
 
-    use super::super::conn_manager::locutus_protoc::NetEvent;
+    use super::super::conn_manager::p2p_protoc::NetEvent;
     use super::*;
     use crate::{
         config::{tracing::Logger, GlobalExecutor},

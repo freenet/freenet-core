@@ -114,12 +114,12 @@ impl ConnectionBridge for P2pConnBridge {
     }
 }
 
-pub(in crate::node) struct LocutusConnManager {
+pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) swarm: Swarm<NetBehaviour>,
     listen_on: Option<(IpAddr, u16)>,
 }
 
-impl LocutusConnManager {
+impl P2pConnManager {
     pub fn build(
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeConfig,
@@ -139,7 +139,7 @@ impl LocutusConnManager {
             swarm.add_external_address(remote_addr, AddressScore::Infinite);
         }
 
-        LocutusConnManager {
+        P2pConnManager {
             swarm,
             listen_on: config.local_ip.zip(config.local_port),
         }
