@@ -111,7 +111,7 @@ mod test {
 
     #[test]
     fn serialization() -> Result<(), anyhow::Error> {
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
 

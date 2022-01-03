@@ -7,7 +7,7 @@ use crate::{
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
     operations::{state_machine::StateMachine, Operation},
     ring::{Location, PeerKeyLocation, Ring},
-    utils::ExponentialBackoff,
+    util::ExponentialBackoff,
 };
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
@@ -973,7 +973,7 @@ mod test {
     use crate::{
         contract::SimStoreError,
         message::TxType,
-        node::test_utils::{check_connectivity, SimNetwork},
+        node::test::{check_connectivity, SimNetwork},
     };
 
     #[test]

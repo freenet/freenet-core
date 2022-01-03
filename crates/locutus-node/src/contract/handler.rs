@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use super::{
     runtime::{ContractRuntime, ContractUpdateError},
-    test_utils::{MemKVStore, MockRuntime},
+    test::{MemKVStore, MockRuntime},
     ContractStoreError,
 };
 use crate::contract::{store::ContractStore, Contract, ContractError, ContractKey, ContractValue};
@@ -257,7 +257,7 @@ impl ContractHandler for CHandlerImpl {
 
 #[cfg(test)]
 mod test {
-    use crate::{contract::test_utils::SimStoreError, config::GlobalExecutor};
+    use crate::{config::GlobalExecutor, contract::test::SimStoreError};
 
     use super::*;
 
@@ -302,7 +302,7 @@ mod sqlite {
     use once_cell::sync::Lazy;
     use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 
-    use crate::contract::test_utils::MockRuntime;
+    use crate::contract::test::MockRuntime;
 
     use super::*;
 

@@ -1,7 +1,6 @@
 //! A contract is PUT within a location distance, this entails that all nodes within
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
-// FIXME: should allow to do partial value updates
 
 use std::time::Duration;
 
@@ -763,7 +762,7 @@ mod test {
 
     use crate::{
         contract::SimStoreError,
-        node::test_utils::{check_connectivity, NodeSpecification, SimNetwork},
+        node::test::{check_connectivity, NodeSpecification, SimNetwork},
         user_events::UserEvent,
     };
 
@@ -775,7 +774,7 @@ mod test {
     fn successful_put_op_seq() -> Result<(), anyhow::Error> {
         let peer = PeerKey::random();
         let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), &peer);
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
@@ -841,7 +840,7 @@ mod test {
         const NUM_NODES: usize = 1usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();

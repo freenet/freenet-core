@@ -52,7 +52,7 @@ pub(crate) mod test_utils {
     use tokio::sync::watch::Receiver;
 
     use super::*;
-    use crate::node::{test_utils::EventId, PeerKey};
+    use crate::node::{test::EventId, PeerKey};
 
     pub(crate) struct MemoryEventsGen {
         id: PeerKey,

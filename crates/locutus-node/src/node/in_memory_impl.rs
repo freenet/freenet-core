@@ -19,7 +19,7 @@ use crate::{
     },
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
-    utils::{ExponentialBackoff, ExtendedIter},
+    util::{ExponentialBackoff, ExtendedIter},
     NodeConfig,
 };
 

@@ -220,7 +220,7 @@ impl LocutusConnManager {
                         .behaviour_mut()
                         .locutus
                         .queue
-                        .push_back((peer.0, *msg));
+                        .push_front((peer.0, *msg));
                     todo!()
                 }
                 Ok(Right(ClosedChannel)) => {

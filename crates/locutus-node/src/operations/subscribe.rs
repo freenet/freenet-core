@@ -505,7 +505,7 @@ mod test {
     use super::*;
     use crate::{
         contract::{Contract, ContractValue, SimStoreError},
-        node::test_utils::{check_connectivity, NodeSpecification, SimNetwork},
+        node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
         user_events::UserEvent,
     };
@@ -515,7 +515,7 @@ mod test {
     fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
         let peer = PeerKey::random();
         let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), &peer);
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
 
@@ -605,7 +605,7 @@ mod test {
         const NUM_NODES: usize = 4usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let contract_val: ContractValue = gen.arbitrary()?;

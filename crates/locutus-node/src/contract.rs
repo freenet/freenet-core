@@ -8,7 +8,7 @@ use crate::ring::Location;
 mod handler;
 mod runtime;
 mod store;
-mod test_utils;
+mod test;
 
 pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, CHandlerImpl, ContractHandler, ContractHandlerChannel,
@@ -16,7 +16,7 @@ pub(crate) use handler::{
 };
 pub(crate) use store::ContractStoreError;
 #[cfg(test)]
-pub(crate) use test_utils::{MemoryContractHandler, SimStoreError};
+pub(crate) use test::{MemoryContractHandler, SimStoreError};
 
 const CONTRACT_KEY_SIZE: usize = 64;
 

@@ -27,7 +27,7 @@ pub(super) struct NodeP2P<CErr = ContractStoreError> {
     pub(crate) op_storage: Arc<OpManager<CErr>>,
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
-    conn_manager: LocutusConnManager,
+    pub(super) conn_manager: LocutusConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
@@ -133,7 +133,7 @@ mod test {
     use crate::{
         config::{tracing::Logger, GlobalExecutor},
         contract::CHandlerImpl,
-        node::{test_utils::get_free_port, InitPeerNode},
+        node::{test::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -179,7 +179,6 @@ mod test {
 
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
-            log::debug!("Initial peer port: {}", peer1_port);
             let mut config = NodeConfig::default();
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
@@ -196,14 +195,10 @@ mod test {
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
             let mut config = NodeConfig::default();
-            config.add_gateway(InitPeerNode {
-                addr: peer1_config.addr.clone(),
-                identifier: peer1_id,
-                location: Location::random(),
-            });
+            config.add_gateway(peer1_config.clone());
             let mut peer2 = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap();
             // wait a bit to make sure the first peer is up and listening
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             peer2
                 .conn_manager
                 .swarm

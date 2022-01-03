@@ -5,8 +5,9 @@ mod message;
 mod node;
 mod operations;
 mod ring;
-pub(crate) mod test_utils;
+pub(crate) mod test;
 mod user_events;
-pub(crate) mod utils;
+pub(crate) mod util;
 
-pub use node::NodeConfig;
+pub use node::{InitPeerNode, NodeConfig};
+pub use ring::Location;

@@ -154,7 +154,6 @@ pub(super) mod tracing {
 
     impl Logger {
         /// Get or initialize a logger
-        #[allow(unused)]
         pub fn init_logger() {
             Lazy::force(&LOGGER);
         }

@@ -43,7 +43,7 @@ mod in_memory_impl;
 mod op_state;
 mod p2p_impl;
 #[cfg(test)]
-pub(crate) mod test_utils;
+pub(crate) mod test;
 
 pub struct Node<CErr>(NodeImpl<CErr>);
 
@@ -186,8 +186,8 @@ impl NodeConfig {
         self
     }
 
-    /// Builds a node using libp2p as backend connection manager.
-    pub fn build_libp2p(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
+    /// Builds a node using the default backend connection manager.
+    pub fn build(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
         let node = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
         Ok(Node(NodeImpl::LibP2P(Box::new(node))))
     }
