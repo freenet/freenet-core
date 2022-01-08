@@ -3,8 +3,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, op_state::OpManager,
-    process_message, user_event_handling, PeerKey,
+    conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, join_ring_request,
+    op_state::OpManager, process_message, user_event_handling, PeerKey,
 };
 use crate::{
     config::GlobalExecutor,
@@ -12,14 +12,10 @@ use crate::{
         self, Contract, ContractError, ContractHandler, ContractHandlerEvent, ContractValue,
         SimStoreError,
     },
-    message::{Message, Transaction, TransactionType, TxType},
-    operations::{
-        join_ring::{self, JoinRingMsg, JoinRingOp},
-        OpError, Operation,
-    },
+    message::{Message, TransactionType},
+    operations::{join_ring::JoinRingOp, OpError, Operation},
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
-    util::{ExponentialBackoff, ExtendedIter},
     NodeConfig,
 };
 
@@ -73,7 +69,14 @@ where
     where
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
-        self.join_ring(None).await?;
+        join_ring_request(
+            None,
+            self.peer_key,
+            self.gateways.iter(),
+            &self.op_storage,
+            &mut self.conn_manager,
+        )
+        .await?;
         GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
         self.run_event_listener().await
     }
@@ -96,45 +99,6 @@ where
                 self.op_storage.ring.peer_key
             );
             self.op_storage.ring.contract_cached(key);
-        }
-        Ok(())
-    }
-
-    async fn join_ring(
-        &mut self,
-        backoff: Option<ExponentialBackoff>,
-    ) -> Result<(), OpError<CErr>> {
-        if self.is_gateway {
-            return Ok(());
-        }
-        if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {
-            let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &self.peer_key);
-            // initiate join action action per each gateway
-            let mut op = join_ring::JoinRingOp::initial_request(
-                self.peer_key,
-                *gateway,
-                self.op_storage.ring.max_hops_to_live,
-                tx_id,
-            );
-            if let Some(mut backoff) = backoff {
-                // backoff to retry later in case it failed
-                log::warn!(
-                    "Performing a new join attempt, attempt number: {}",
-                    backoff.retries()
-                );
-                if backoff.sleep_async().await.is_none() {
-                    log::error!("Max number of retries reached");
-                    return Err(OpError::MaxRetriesExceeded(
-                        tx_id,
-                        format!("{:?}", tx_id.tx_type()),
-                    ));
-                }
-                op.backoff = Some(backoff);
-            }
-            join_ring::join_ring_request(tx_id, &self.op_storage, &mut self.conn_manager, op)
-                .await?;
-        } else {
-            log::warn!("No gateways provided, single gateway node setup for this node");
         }
         Ok(())
     }
@@ -164,14 +128,35 @@ where
                                 ..
                             })) => {
                                 if cfg!(test) {
-                                    self.join_ring(None).await?
+                                    join_ring_request(
+                                        None,
+                                        self.peer_key,
+                                        self.gateways.iter(),
+                                        &self.op_storage,
+                                        &mut self.conn_manager,
+                                    )
+                                    .await?;
                                 } else {
-                                    self.join_ring(Some(backoff)).await?
+                                    join_ring_request(
+                                        Some(backoff),
+                                        self.peer_key,
+                                        self.gateways.iter(),
+                                        &self.op_storage,
+                                        &mut self.conn_manager,
+                                    )
+                                    .await?;
                                 }
                             }
                             None => {
                                 log::error!("{}", MSG);
-                                self.join_ring(None).await?
+                                join_ring_request(
+                                    None,
+                                    self.peer_key,
+                                    self.gateways.iter(),
+                                    &self.op_storage,
+                                    &mut self.conn_manager,
+                                )
+                                .await?;
                             }
                             _ => {}
                         }

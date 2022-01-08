@@ -27,10 +27,15 @@ use crate::contract::SimStoreError;
 use crate::{
     config::{tracing::Logger, GlobalExecutor, CONF},
     contract::{CHandlerImpl, ContractError, ContractStoreError},
-    message::{Message, NodeActions},
-    operations::{get, join_ring, put, subscribe, OpError},
+    message::{Message, NodeActions, Transaction, TxType},
+    operations::{
+        get,
+        join_ring::{self, JoinRingMsg},
+        put, subscribe, OpError,
+    },
     ring::{Location, PeerKeyLocation},
     user_events::{UserEvent, UserEventsProxy},
+    util::{ExponentialBackoff, IterExt},
 };
 
 pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
@@ -292,6 +297,48 @@ impl InitPeerNode {
         }
         self
     }
+}
+
+async fn join_ring_request<CErr, CM>(
+    backoff: Option<ExponentialBackoff>,
+    peer_key: PeerKey,
+    gateways: impl Iterator<Item = &PeerKeyLocation>,
+    op_storage: &OpManager<CErr>,
+    conn_manager: &mut CM,
+) -> Result<(), OpError<CErr>>
+where
+    CErr: std::error::Error,
+    CM: ConnectionBridge + Send + Sync,
+{
+    if let Some(gateway) = gateways.shuffle().take(1).next() {
+        let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
+        // initiate join action action per each gateway
+        let mut op = join_ring::JoinRingOp::initial_request(
+            peer_key,
+            *gateway,
+            op_storage.ring.max_hops_to_live,
+            tx_id,
+        );
+        if let Some(mut backoff) = backoff {
+            // backoff to retry later in case it failed
+            log::warn!(
+                "Performing a new join attempt, attempt number: {}",
+                backoff.retries()
+            );
+            if backoff.sleep_async().await.is_none() {
+                log::error!("Max number of retries reached");
+                return Err(OpError::MaxRetriesExceeded(
+                    tx_id,
+                    format!("{:?}", tx_id.tx_type()),
+                ));
+            }
+            op.backoff = Some(backoff);
+        }
+        join_ring::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
+    } else {
+        log::warn!("No gateways provided, single gateway node setup for this node");
+    }
+    Ok(())
 }
 
 /// Process user events.

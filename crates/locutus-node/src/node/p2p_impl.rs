@@ -10,7 +10,10 @@ use libp2p::{
 };
 use tokio::sync::mpsc::{self, Receiver};
 
-use super::{conn_manager::p2p_protoc::P2pConnManager, user_event_handling, PeerKey};
+use super::{
+    conn_manager::p2p_protoc::{P2pBridge, P2pConnManager},
+    user_event_handling, PeerKey,
+};
 use crate::{
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler, ContractStoreError},
@@ -27,6 +30,7 @@ pub(super) struct NodeP2P<CErr = ContractStoreError> {
     gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
     pub(super) conn_manager: P2pConnManager,
+    bridge: P2pBridge,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
@@ -64,7 +68,7 @@ where
         let peer_key = PeerKey::from(config.local_key.public());
         let gateways = config.get_gateways()?;
 
-        let conn_manager = {
+        let (conn_manager, bridge) = {
             let transport = Self::config_transport(&config.local_key)?;
             P2pConnManager::build(transport, &config)
         };
@@ -80,6 +84,7 @@ where
         Ok(NodeP2P {
             peer_key,
             conn_manager,
+            bridge,
             gateways,
             notification_channel,
             op_storage,

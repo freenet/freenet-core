@@ -28,7 +28,7 @@ use libp2p::{
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use unsigned_varint::codec::UviBytes;
 
 use crate::{
@@ -114,8 +114,28 @@ impl ConnectionBridge for P2pConnBridge {
     }
 }
 
+pub(in crate::node) struct P2pBridge {
+    tx_bridge_cmd: Sender<()>,
+}
+
+#[async_trait::async_trait]
+impl ConnectionBridge for P2pBridge {
+    fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
+        todo!()
+    }
+
+    fn drop_connection(&mut self, peer: &PeerKey) {
+        todo!()
+    }
+
+    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+        todo!()
+    }
+}
+
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) swarm: Swarm<NetBehaviour>,
+    rx_bridge_cmd: Receiver<()>,
     listen_on: Option<(IpAddr, u16)>,
 }
 
@@ -123,7 +143,7 @@ impl P2pConnManager {
     pub fn build(
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeConfig,
-    ) -> Self {
+    ) -> (Self, P2pBridge) {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
         let global_executor = Box::new(GlobalExecutor);
@@ -139,10 +159,16 @@ impl P2pConnManager {
             swarm.add_external_address(remote_addr, AddressScore::Infinite);
         }
 
-        P2pConnManager {
-            swarm,
-            listen_on: config.local_ip.zip(config.local_port),
-        }
+        let (tx_bridge_cmd, rx_bridge_cmd) = channel(100);
+
+        (
+            P2pConnManager {
+                swarm,
+                rx_bridge_cmd,
+                listen_on: config.local_ip.zip(config.local_port),
+            },
+            P2pBridge { tx_bridge_cmd },
+        )
     }
 
     pub fn listen_on(&mut self) -> Result<(), anyhow::Error> {
