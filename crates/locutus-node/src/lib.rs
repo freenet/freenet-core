@@ -9,5 +9,8 @@ pub(crate) mod test;
 mod user_events;
 pub(crate) mod util;
 
+// exports:
+pub use contract::{Contract, ContractKey, ContractValue};
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;
+pub use user_events::{UserEvent, UserEventsProxy};

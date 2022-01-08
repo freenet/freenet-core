@@ -16,8 +16,7 @@ use crate::{
     contract::{self, ContractHandler, ContractStoreError},
     message::Message,
     ring::{PeerKeyLocation, Ring},
-    user_events::UserEventHandler,
-    NodeConfig,
+    NodeConfig, UserEventsProxy,
 };
 
 use super::OpManager;
@@ -36,14 +35,16 @@ impl<CErr> NodeP2P<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub(super) async fn run_node(mut self: Box<Self>) -> Result<(), anyhow::Error> {
+    pub(super) async fn run_node<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
         // 1. start listening in case this is a listening node (gateway)
         if self.is_gateway {
             self.conn_manager.listen_on()?;
         }
 
         // 2. start the user event handler loop
-        let user_events = UserEventHandler;
         GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
 
         // 3. start the p2p event loop

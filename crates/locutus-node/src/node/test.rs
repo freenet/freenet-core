@@ -15,7 +15,7 @@ use crate::{
     contract::{Contract, ContractKey, ContractValue, MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location},
-    user_events::{test_utils::MemoryEventsGen, UserEvent},
+    user_events::{test::MemoryEventsGen, UserEvent},
     NodeConfig,
 };
 

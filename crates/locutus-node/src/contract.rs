@@ -95,7 +95,7 @@ where
 
 /// Main abstraction for representing a contract in binary form.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct Contract {
+pub struct Contract {
     data: Arc<Vec<u8>>,
     #[serde(serialize_with = "<[_]>::serialize")]
     #[serde(deserialize_with = "contract_key_deser")]
@@ -188,7 +188,7 @@ where
 /// The value for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub(crate) struct ContractValue(Arc<Vec<u8>>);
+pub struct ContractValue(Arc<Vec<u8>>);
 
 impl ContractValue {
     pub fn new(bytes: Vec<u8>) -> Self {

@@ -106,7 +106,7 @@ impl std::fmt::Display for SimStoreError {
 impl std::error::Error for SimStoreError {}
 
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::contract::Contract;
 
     #[test]

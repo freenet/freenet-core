@@ -22,16 +22,16 @@ use self::{
     event_listener::{EventListener, EventLog},
     p2p_impl::NodeP2P,
 };
+#[cfg(test)]
+use crate::contract::SimStoreError;
 use crate::{
-    config::{GlobalExecutor, CONF},
+    config::{tracing::Logger, GlobalExecutor, CONF},
     contract::{CHandlerImpl, ContractError, ContractStoreError},
     message::{Message, NodeActions},
     operations::{get, join_ring, put, subscribe, OpError},
     ring::{Location, PeerKeyLocation},
     user_events::{UserEvent, UserEventsProxy},
 };
-#[cfg(test)]
-use crate::{contract::SimStoreError, user_events::test_utils::MemoryEventsGen};
 
 pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use op_state::OpManager;
@@ -52,15 +52,14 @@ impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn run(mut self) -> Result<(), anyhow::Error> {
+    pub async fn run<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
+        Logger::init_logger();
         match self.0 {
-            NodeImpl::LibP2P(node) => node.run_node().await,
-            NodeImpl::InMemory(ref mut node) => {
-                let (_usr_ev_controller, rcv_copy) =
-                    tokio::sync::watch::channel((0, PeerKey::random()));
-                let user_events = MemoryEventsGen::new(rcv_copy, node.peer_key);
-                node.run_node(user_events).await
-            }
+            NodeImpl::P2P(node) => node.run_node(user_events).await,
+            NodeImpl::InMemory(ref mut node) => node.run_node(user_events).await,
         }
     }
 }
@@ -70,22 +69,26 @@ impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn run(self) -> Result<(), anyhow::Error> {
+    pub async fn run<UsrEv>(self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
+        Logger::init_logger();
         match self.0 {
-            NodeImpl::LibP2P(node) => node.run_node().await,
+            NodeImpl::P2P(node) => node.run_node(user_events).await,
         }
     }
 }
 
 #[cfg(test)]
 enum NodeImpl<CErr> {
-    LibP2P(Box<NodeP2P<CErr>>),
+    P2P(Box<NodeP2P<CErr>>),
     InMemory(Box<NodeInMemory<CErr>>),
 }
 
 #[cfg(not(test))]
 enum NodeImpl<CErr> {
-    LibP2P(Box<NodeP2P<CErr>>),
+    P2P(Box<NodeP2P<CErr>>),
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -189,7 +192,7 @@ impl NodeConfig {
     /// Builds a node using the default backend connection manager.
     pub fn build(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
         let node = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
-        Ok(Node(NodeImpl::LibP2P(Box::new(node))))
+        Ok(Node(NodeImpl::P2P(Box::new(node))))
     }
 
     #[cfg(test)]

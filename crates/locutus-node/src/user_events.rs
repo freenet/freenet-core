@@ -1,9 +1,7 @@
-use std::time::Duration;
-
 use crate::contract::{Contract, ContractKey, ContractValue};
 
 #[async_trait::async_trait]
-pub(crate) trait UserEventsProxy {
+pub trait UserEventsProxy {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
     async fn recv(&mut self) -> UserEvent;
@@ -11,7 +9,7 @@ pub(crate) trait UserEventsProxy {
 
 #[derive(Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub(crate) enum UserEvent {
+pub enum UserEvent {
     /// Update or insert a new value in a contract corresponding with the provided key.
     Put {
         /// Value to upsert in the contract.
@@ -33,19 +31,8 @@ pub(crate) enum UserEvent {
     Shutdown,
 }
 
-pub(crate) struct UserEventHandler;
-
-#[async_trait::async_trait]
-impl UserEventsProxy for UserEventHandler {
-    async fn recv(&mut self) -> UserEvent {
-        loop {
-            tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
-        }
-    }
-}
-
 #[cfg(test)]
-pub(crate) mod test_utils {
+pub(crate) mod test {
     use std::{collections::HashMap, time::Duration};
 
     use rand::{prelude::Rng, thread_rng};
@@ -60,6 +47,7 @@ pub(crate) mod test_utils {
         non_owned_contracts: Vec<ContractKey>,
         owned_contracts: Vec<(Contract, ContractValue)>,
         events_to_gen: HashMap<EventId, UserEvent>,
+        random: bool,
     }
 
     impl MemoryEventsGen {
@@ -70,6 +58,7 @@ pub(crate) mod test_utils {
                 non_owned_contracts: Vec::new(),
                 owned_contracts: Vec::new(),
                 events_to_gen: HashMap::new(),
+                random: false,
             }
         }
 
@@ -153,10 +142,12 @@ pub(crate) mod test_utils {
             loop {
                 if self.signal.changed().await.is_ok() {
                     let (ev_id, pk) = *self.signal.borrow();
-                    if pk == self.id {
+                    if pk == self.id && !self.random {
                         return self
                             .generate_deterministic_event(&ev_id)
                             .expect("event not found");
+                    } else if pk == self.id {
+                        return self.generate_rand_event();
                     }
                 } else {
                     log::debug!("sender half of user event gen dropped");
