@@ -34,7 +34,8 @@ use unsigned_varint::codec::UviBytes;
 use crate::{
     config::{self, GlobalExecutor},
     message::{Message, NodeActions, Transaction},
-    node::{process_message, OpManager, PeerKey},
+    node::{handle_cancelled_op, process_message, OpManager, PeerKey},
+    ring::PeerKeyLocation,
     NodeConfig,
 };
 
@@ -77,24 +78,30 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 
 #[derive(Debug, Clone)]
 struct P2pConnBridge {
-    active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
-    accepted_peers: Arc<DashSet<PeerKey>>,
     sender: Sender<(PeerKey, Box<Message>)>,
 }
 
-impl P2pConnBridge {
+#[derive(Clone)]
+pub(in crate::node) struct P2pBridge {
+    active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
+    accepted_peers: Arc<DashSet<PeerKey>>,
+    ev_listener_tx: Sender<(PeerKey, Box<Message>)>,
+}
+
+impl P2pBridge {
     fn new(sender: Sender<(PeerKey, Box<Message>)>) -> Self {
         Self {
             active_net_connections: Arc::new(DashMap::new()),
             accepted_peers: Arc::new(DashSet::new()),
-            sender,
+            ev_listener_tx: sender,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl ConnectionBridge for P2pConnBridge {
+impl ConnectionBridge for P2pBridge {
     fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
+        // todo: notify ev listener thought the channel to filter this peer messages
         if self.active_net_connections.contains_key(&peer) {
             self.accepted_peers.insert(peer);
         }
@@ -103,10 +110,11 @@ impl ConnectionBridge for P2pConnBridge {
 
     fn drop_connection(&mut self, peer: &PeerKey) {
         self.accepted_peers.remove(peer);
+        // todo: notify ev listener thought the channel to filter this peer messages
     }
 
     async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
-        self.sender
+        self.ev_listener_tx
             .send((*target, Box::new(msg)))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
@@ -114,36 +122,19 @@ impl ConnectionBridge for P2pConnBridge {
     }
 }
 
-pub(in crate::node) struct P2pBridge {
-    tx_bridge_cmd: Sender<()>,
-}
-
-#[async_trait::async_trait]
-impl ConnectionBridge for P2pBridge {
-    fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
-        todo!()
-    }
-
-    fn drop_connection(&mut self, peer: &PeerKey) {
-        todo!()
-    }
-
-    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
-        todo!()
-    }
-}
-
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) swarm: Swarm<NetBehaviour>,
-    rx_bridge_cmd: Receiver<()>,
+    conn_bridge_rx: Receiver<(PeerKey, Box<Message>)>,
     listen_on: Option<(IpAddr, u16)>,
+    pub(in crate::node) gateways: Vec<PeerKeyLocation>,
+    pub(in crate::node) bridge: P2pBridge,
 }
 
 impl P2pConnManager {
     pub fn build(
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeConfig,
-    ) -> (Self, P2pBridge) {
+    ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
         let global_executor = Box::new(GlobalExecutor);
@@ -160,15 +151,15 @@ impl P2pConnManager {
         }
 
         let (tx_bridge_cmd, rx_bridge_cmd) = channel(100);
+        let bridge = P2pBridge::new(tx_bridge_cmd);
 
-        (
-            P2pConnManager {
-                swarm,
-                rx_bridge_cmd,
-                listen_on: config.local_ip.zip(config.local_port),
-            },
-            P2pBridge { tx_bridge_cmd },
-        )
+        Ok(P2pConnManager {
+            swarm,
+            conn_bridge_rx: rx_bridge_cmd,
+            listen_on: config.local_ip.zip(config.local_port),
+            gateways: config.get_gateways()?,
+            bridge,
+        })
     }
 
     pub fn listen_on(&mut self) -> Result<(), anyhow::Error> {
@@ -183,13 +174,11 @@ impl P2pConnManager {
         mut self,
         op_manager: Arc<OpManager<CErr>>,
         mut notification_channel: Receiver<Message>,
-    ) where
+    ) -> Result<(), anyhow::Error>
+    where
         CErr: std::error::Error + Send + Sync + 'static,
     {
         use ConnMngrActions::*;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let conn_manager = P2pConnBridge::new(tx);
 
         loop {
             let net_msg = self.swarm.select_next_some().map(|event| match event {
@@ -214,7 +203,7 @@ impl P2pConnManager {
                 None => Ok(Right(ClosedChannel)),
             });
 
-            let bridge_msg = rx.recv().map(|msg| {
+            let bridge_msg = self.conn_bridge_rx.recv().map(|msg| {
                 if let Some((peer, msg)) = msg {
                     Ok(Right(SendMessage { peer, msg }))
                 } else {
@@ -230,15 +219,26 @@ impl P2pConnManager {
 
             match msg {
                 Ok(Left(msg)) => {
-                    let cb = conn_manager.clone();
+                    let cb = self.bridge.clone();
+                    if let Message::Canceled(tx) = *msg {
+                        handle_cancelled_op(
+                            tx,
+                            op_manager.ring.peer_key,
+                            self.gateways.iter(),
+                            &op_manager,
+                            &mut self.bridge,
+                        )
+                        .await?;
+                        continue;
+                    }
                     GlobalExecutor::spawn(process_message(Ok(*msg), op_manager.clone(), cb, None));
                 }
                 Ok(Right(ConnectionEstablished { addr, peer_id })) => {
                     log::debug!("established connection with peer {} @ {}", peer_id, addr);
-                    conn_manager.active_net_connections.insert(peer_id, addr);
+                    self.bridge.active_net_connections.insert(peer_id, addr);
                 }
                 Ok(Right(ConnectionClosed { peer_id })) => {
-                    conn_manager.active_net_connections.remove(&peer_id);
+                    self.bridge.active_net_connections.remove(&peer_id);
                     log::debug!("dropped connection with peer {}", peer_id);
                 }
                 Ok(Right(SendMessage { peer, msg })) => {
@@ -247,23 +247,19 @@ impl P2pConnManager {
                         .locutus
                         .queue
                         .push_front((peer.0, *msg));
-                    todo!()
                 }
                 Ok(Right(ClosedChannel)) => {
                     log::info!("notification channel closed");
                     break;
                 }
                 Err(err) => {
-                    let cb = conn_manager.clone();
+                    let cb = self.bridge.clone();
                     GlobalExecutor::spawn(process_message(Err(err), op_manager.clone(), cb, None));
                 }
                 Ok(Right(NoAction)) => {}
             }
         }
-    }
-
-    async fn join(&self) {
-        todo!()
+        Ok(())
     }
 }
 

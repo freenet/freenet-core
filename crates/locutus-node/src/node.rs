@@ -7,7 +7,7 @@
 //! - libp2p: all the connection is handled by libp2p.
 //! - In memory: a simplifying node used for emulation pourpouses mainly.
 
-use std::{fmt::Display, net::IpAddr, sync::Arc};
+use std::{fmt::Display, net::IpAddr, sync::Arc, time::Duration};
 
 use libp2p::{
     core::PublicKey,
@@ -27,11 +27,11 @@ use crate::contract::SimStoreError;
 use crate::{
     config::{tracing::Logger, GlobalExecutor, CONF},
     contract::{CHandlerImpl, ContractError, ContractStoreError},
-    message::{Message, NodeActions, Transaction, TxType},
+    message::{Message, NodeActions, Transaction, TransactionType, TxType},
     operations::{
         get,
-        join_ring::{self, JoinRingMsg},
-        put, subscribe, OpError,
+        join_ring::{self, JoinRingMsg, JoinRingOp},
+        put, subscribe, OpError, Operation,
     },
     ring::{Location, PeerKeyLocation},
     user_events::{UserEvent, UserEventsProxy},
@@ -336,7 +336,7 @@ where
         }
         join_ring::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
     } else {
-        log::warn!("No gateways provided, single gateway node setup for this node");
+        log::warn!("No gateways provided, single gateway node @ {}", peer_key);
     }
     Ok(())
 }
@@ -403,6 +403,7 @@ where
                                     get::GetOp::start_op(key, true, &op_storage_cp.ring.peer_key);
                                 if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
                                     log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
                                 }
                             }
                             Err(err) => {
@@ -486,6 +487,54 @@ async fn process_message<CErr, CB>(
             report_result::<CErr>(Err(err.into()));
         }
     }
+}
+
+async fn handle_cancelled_op<CErr, CM>(
+    tx: Transaction,
+    peer_key: PeerKey,
+    gateways: impl Iterator<Item = &PeerKeyLocation>,
+    op_storage: &OpManager<CErr>,
+    conn_manager: &mut CM,
+) -> Result<(), OpError<CErr>>
+where
+    CErr: std::error::Error,
+    CM: ConnectionBridge + Send + Sync,
+{
+    log::warn!("Failed tx `{}`, potentially attempting a retry", tx);
+    match tx.tx_type() {
+        TransactionType::JoinRing => {
+            const MSG: &str = "Fatal error: unable to connect to the network";
+            // the attempt to join the network failed, this could be a fatal error since the node
+            // is useless without connecting to the network, we will retry with exponential backoff
+            match op_storage.pop(&tx) {
+                Some(Operation::JoinRing(JoinRingOp {
+                    backoff: Some(backoff),
+                    ..
+                })) => {
+                    if cfg!(test) {
+                        join_ring_request(None, peer_key, gateways, op_storage, conn_manager)
+                            .await?;
+                    } else {
+                        join_ring_request(
+                            Some(backoff),
+                            peer_key,
+                            gateways,
+                            op_storage,
+                            conn_manager,
+                        )
+                        .await?;
+                    }
+                }
+                None => {
+                    log::error!("{}", MSG);
+                    join_ring_request(None, peer_key, gateways, op_storage, conn_manager).await?;
+                }
+                _ => {}
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]

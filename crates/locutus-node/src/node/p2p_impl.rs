@@ -11,14 +11,13 @@ use libp2p::{
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    conn_manager::p2p_protoc::{P2pBridge, P2pConnManager},
-    user_event_handling, PeerKey,
+    conn_manager::p2p_protoc::P2pConnManager, join_ring_request, user_event_handling, PeerKey,
 };
 use crate::{
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler, ContractStoreError},
     message::Message,
-    ring::{PeerKeyLocation, Ring},
+    ring::Ring,
     NodeConfig, UserEventsProxy,
 };
 
@@ -27,10 +26,8 @@ use super::OpManager;
 pub(super) struct NodeP2P<CErr = ContractStoreError> {
     pub(crate) peer_key: PeerKey,
     pub(crate) op_storage: Arc<OpManager<CErr>>,
-    gateways: Vec<PeerKeyLocation>,
     notification_channel: Receiver<Message>,
     pub(super) conn_manager: P2pConnManager,
-    bridge: P2pBridge,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
@@ -43,10 +40,18 @@ where
     where
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
-        // 1. start listening in case this is a listening node (gateway)
+        // 1. start listening in case this is a listening node (gateway) and join the ring
         if self.is_gateway {
             self.conn_manager.listen_on()?;
         }
+        join_ring_request(
+            None,
+            self.peer_key,
+            self.conn_manager.gateways.iter(),
+            &self.op_storage,
+            &mut self.conn_manager.bridge,
+        )
+        .await?;
 
         // 2. start the user event handler loop
         GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
@@ -54,8 +59,7 @@ where
         // 3. start the p2p event loop
         self.conn_manager
             .run_event_listener(self.op_storage.clone(), self.notification_channel)
-            .await;
-        Ok(())
+            .await
     }
 
     pub fn build<CH>(
@@ -68,9 +72,9 @@ where
         let peer_key = PeerKey::from(config.local_key.public());
         let gateways = config.get_gateways()?;
 
-        let (conn_manager, bridge) = {
+        let conn_manager = {
             let transport = Self::config_transport(&config.local_key)?;
-            P2pConnManager::build(transport, &config)
+            P2pConnManager::build(transport, &config)?
         };
 
         let ring = Ring::new(&config, &gateways)?;
@@ -84,8 +88,6 @@ where
         Ok(NodeP2P {
             peer_key,
             conn_manager,
-            bridge,
-            gateways,
             notification_channel,
             op_storage,
             is_gateway: config.location.is_some(),

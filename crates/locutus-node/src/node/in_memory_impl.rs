@@ -3,8 +3,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, join_ring_request,
-    op_state::OpManager, process_message, user_event_handling, PeerKey,
+    conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, handle_cancelled_op,
+    join_ring_request, op_state::OpManager, process_message, user_event_handling, PeerKey,
 };
 use crate::{
     config::GlobalExecutor,
@@ -12,8 +12,8 @@ use crate::{
         self, Contract, ContractError, ContractHandler, ContractHandlerEvent, ContractValue,
         SimStoreError,
     },
-    message::{Message, TransactionType},
-    operations::{join_ring::JoinRingOp, OpError, Operation},
+    message::Message,
+    operations::OpError,
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     NodeConfig,
@@ -116,53 +116,15 @@ where
             };
 
             if let Ok(Message::Canceled(tx)) = msg {
-                log::warn!("Failed tx `{}`, potentially attempting a retry", tx);
-                match tx.tx_type() {
-                    TransactionType::JoinRing => {
-                        const MSG: &str = "Fatal error: unable to connect to the network";
-                        // the attempt to join the network failed, this could be a fatal error since the node
-                        // is useless without connecting to the network, we will retry with exponential backoff
-                        match self.op_storage.pop(&tx) {
-                            Some(Operation::JoinRing(JoinRingOp {
-                                backoff: Some(backoff),
-                                ..
-                            })) => {
-                                if cfg!(test) {
-                                    join_ring_request(
-                                        None,
-                                        self.peer_key,
-                                        self.gateways.iter(),
-                                        &self.op_storage,
-                                        &mut self.conn_manager,
-                                    )
-                                    .await?;
-                                } else {
-                                    join_ring_request(
-                                        Some(backoff),
-                                        self.peer_key,
-                                        self.gateways.iter(),
-                                        &self.op_storage,
-                                        &mut self.conn_manager,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            None => {
-                                log::error!("{}", MSG);
-                                join_ring_request(
-                                    None,
-                                    self.peer_key,
-                                    self.gateways.iter(),
-                                    &self.op_storage,
-                                    &mut self.conn_manager,
-                                )
-                                .await?;
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => unreachable!(),
-                }
+                handle_cancelled_op(
+                    tx,
+                    self.peer_key,
+                    self.gateways.iter(),
+                    &self.op_storage,
+                    &mut self.conn_manager,
+                )
+                .await?;
+                continue;
             }
 
             let op_storage = self.op_storage.clone();

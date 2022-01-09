@@ -33,7 +33,7 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_secs(300)).await;
 
     let contract = Contract::new(vec![1, 2, 3, 4]);
     let key = contract.key();
@@ -61,7 +61,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn node_communication() -> Result<(), anyhow::Error> {
     let gw_port = 64510;
     let gw_key = Keypair::generate_ed25519();

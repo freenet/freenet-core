@@ -151,6 +151,7 @@ impl Ring {
             if config.local_ip.is_none() || config.local_port.is_none() {
                 return Err(anyhow::anyhow!("IP and port are required for gateways"));
             }
+            log::error!("{}", peer_key);
             ring.update_location(Some(loc));
             for PeerKeyLocation { peer, location } in gateways {
                 // all gateways are aware of each other
@@ -195,6 +196,7 @@ impl Ring {
 
     /// Returns this node location in the ring, if any (must have join the ring already).
     pub fn own_location(&self) -> PeerKeyLocation {
+        log::debug!("Getting loc for peer {}", self.peer_key);
         let location = f64::from_le_bytes(self.own_location.load(SeqCst).to_le_bytes());
         let location = if (location - -1f64).abs() < f64::EPSILON {
             None
