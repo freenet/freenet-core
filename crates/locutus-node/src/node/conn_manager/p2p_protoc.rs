@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     io,
     net::IpAddr,
     pin::Pin,
@@ -22,9 +22,10 @@ use libp2p::{
     multiaddr::Protocol,
     ping,
     swarm::{
-        protocols_handler::OutboundUpgradeSend, AddressScore, KeepAlive, NegotiatedSubstream,
-        NetworkBehaviour, NetworkBehaviourAction, ProtocolsHandler, ProtocolsHandlerEvent,
-        ProtocolsHandlerUpgrErr, SubstreamProtocol, SwarmBuilder, SwarmEvent,
+        dial_opts::DialOpts, protocols_handler::OutboundUpgradeSend, AddressScore, KeepAlive,
+        NegotiatedSubstream, NetworkBehaviour, NetworkBehaviourAction, NotifyHandler,
+        ProtocolsHandler, ProtocolsHandlerEvent, ProtocolsHandlerUpgrErr, SubstreamProtocol,
+        SwarmBuilder, SwarmEvent,
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
@@ -36,7 +37,7 @@ use crate::{
     message::{Message, NodeActions, Transaction},
     node::{handle_cancelled_op, process_message, OpManager, PeerKey},
     ring::PeerKeyLocation,
-    NodeConfig,
+    InitPeerNode, NodeConfig,
 };
 
 use super::{ConnectionBridge, ConnectionError};
@@ -48,7 +49,16 @@ const CURRENT_AGENT_VER: &str = "/locutus/agent/0.1.0";
 const CURRENT_PROTOC_VER: &[u8] = b"/locutus/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 
-fn config_behaviour(local_key: &Keypair) -> NetBehaviour {
+fn config_behaviour(local_key: &Keypair, gateways: &[InitPeerNode]) -> NetBehaviour {
+    let routing_table = gateways
+        .iter()
+        .filter_map(|p| {
+            p.addr
+                .as_ref()
+                .map(|addr| (p.identifier, vec![addr.clone()]))
+        })
+        .collect();
+
     let ident_config =
         identify::IdentifyConfig::new(CURRENT_IDENTIFY_PROTOC_VER.to_string(), local_key.public())
             .with_agent_version(CURRENT_AGENT_VER.to_string());
@@ -63,6 +73,9 @@ fn config_behaviour(local_key: &Keypair) -> NetBehaviour {
         ping,
         locutus: LocutusBehaviour {
             queue: VecDeque::new(),
+            routing_table,
+            connected: HashSet::new(),
+            pending: HashMap::new(),
         },
     }
 }
@@ -140,7 +153,7 @@ impl P2pConnManager {
         let global_executor = Box::new(GlobalExecutor);
         let builder = SwarmBuilder::new(
             transport,
-            config_behaviour(&config.local_key),
+            config_behaviour(&config.local_key, &config.remote_nodes),
             PeerId::from(config.local_key.public()),
         )
         .executor(global_executor);
@@ -153,11 +166,12 @@ impl P2pConnManager {
         let (tx_bridge_cmd, rx_bridge_cmd) = channel(100);
         let bridge = P2pBridge::new(tx_bridge_cmd);
 
+        let gateways = config.get_gateways()?;
         Ok(P2pConnManager {
             swarm,
             conn_bridge_rx: rx_bridge_cmd,
             listen_on: config.local_ip.zip(config.local_port),
-            gateways: config.get_gateways()?,
+            gateways,
             bridge,
         })
     }
@@ -185,15 +199,22 @@ impl P2pConnManager {
                 SwarmEvent::Behaviour(NetEvent::Locutus(msg)) => Ok(Left(msg)),
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
-                } => Ok(Right(ConnMngrActions::ConnectionEstablished {
-                    peer_id: PeerKey(peer_id),
-                    addr: endpoint.get_remote_address().clone(),
-                })),
+                } => {
+                    log::debug!("Established connection to {}", peer_id);
+                    Ok(Right(ConnMngrActions::ConnectionEstablished {
+                        peer_id: PeerKey(peer_id),
+                        addr: endpoint.get_remote_address().clone(),
+                    }))
+                }
                 SwarmEvent::ConnectionClosed { .. } => {
                     todo!("remove from the ring");
                 }
+                SwarmEvent::Dialing(peer_id) => {
+                    log::debug!("Attempting connection to {}", peer_id);
+                    Ok(Right(ConnMngrActions::NoAction))
+                }
                 other_event => {
-                    log::debug!("{:?}", other_event);
+                    log::debug!("Received other swarm event: {:?}", other_event);
                     Ok(Right(ConnMngrActions::NoAction))
                 }
             });
@@ -219,6 +240,7 @@ impl P2pConnManager {
 
             match msg {
                 Ok(Left(msg)) => {
+                    log::debug!("Received swarm message at {}", op_manager.ring.peer_key);
                     let cb = self.bridge.clone();
                     if let Message::Canceled(tx) = *msg {
                         handle_cancelled_op(
@@ -242,6 +264,11 @@ impl P2pConnManager {
                     log::debug!("dropped connection with peer {}", peer_id);
                 }
                 Ok(Right(SendMessage { peer, msg })) => {
+                    log::debug!(
+                        "Sending swarm message from {} to {}",
+                        op_manager.ring.peer_key,
+                        peer
+                    );
                     self.swarm
                         .behaviour_mut()
                         .locutus
@@ -284,6 +311,9 @@ enum ConnMngrActions {
 /// Manages network connections with different peers and event routing within the swarm.
 pub(in crate::node) struct LocutusBehaviour {
     queue: VecDeque<(PeerId, Message)>,
+    routing_table: HashMap<PeerId, Vec<Multiaddr>>,
+    connected: HashSet<PeerId>,
+    pending: HashMap<PeerId, Vec<Message>>,
 }
 
 impl NetworkBehaviour for LocutusBehaviour {
@@ -293,6 +323,10 @@ impl NetworkBehaviour for LocutusBehaviour {
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
         Handler::new()
+    }
+
+    fn inject_connected(&mut self, peer: &PeerId) {
+        self.connected.insert(*peer);
     }
 
     fn inject_event(
@@ -309,8 +343,33 @@ impl NetworkBehaviour for LocutusBehaviour {
         _: &mut std::task::Context<'_>,
         _: &mut impl libp2p::swarm::PollParameters,
     ) -> std::task::Poll<NetworkBehaviourAction<Self::OutEvent, Self::ProtocolsHandler>> {
-        if let Some((_peer, msg)) = self.queue.pop_back() {
-            Poll::Ready(NetworkBehaviourAction::GenerateEvent(msg))
+        if let Some((peer_id, msg)) = self.queue.pop_back() {
+            if self.connected.contains(&peer_id) {
+                let send_to_handler = NetworkBehaviourAction::NotifyHandler {
+                    peer_id,
+                    handler: NotifyHandler::Any,
+                    event: HandlerInputEvent {
+                        msg,
+                        conn_id: None,
+                        is_response: false,
+                    },
+                };
+                Poll::Ready(send_to_handler)
+            } else if let Some(conn) = self.routing_table.get(&peer_id) {
+                // initiate a connection if one does not exist
+                let peer_opts = DialOpts::peer_id(peer_id)
+                    .addresses(conn.clone())
+                    .extend_addresses_through_behaviour();
+                let initiate_conn = NetworkBehaviourAction::Dial {
+                    opts: peer_opts.build(),
+                    handler: self.new_handler(),
+                };
+                self.queue.push_front((peer_id, msg));
+                Poll::Ready(initiate_conn)
+            } else {
+                log::error!("unknown addresses for peer {}", peer_id);
+                Poll::Pending
+            }
         } else {
             Poll::Pending
         }

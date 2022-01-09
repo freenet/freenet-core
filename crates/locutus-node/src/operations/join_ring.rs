@@ -1063,7 +1063,7 @@ mod test {
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
         sim_nodes.build();
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(sim_nodes.connected("node-0"));
     }
 
