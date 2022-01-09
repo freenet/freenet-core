@@ -27,7 +27,7 @@ Locutus will be a general-purpose, cryptographically secure, decentralized, dist
 
 Locutus won't replace Fred; they're trying to solve different (but related) problems. Key differences between Locutus and Fred:
 
-* Locutus is designed to support real-time communication, fast enough for IM (less than 1 second). Fred has been improving in this regard but is still limited to several minutes. 
+* Locutus is designed to support real-time communication, fast enough for IM (less than 1 second). Fred has been improving in this regard but is still limited 1 minute round-trip-time for small messages. 
 
 * Fred is primarily a research platform, and this has limited its adoption. While it continues to improve, ease of use has always been an issue for Fred. Locutus is being designed from the ground up to be no more difficult to use than a web browser.
 
