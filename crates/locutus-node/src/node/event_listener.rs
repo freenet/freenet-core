@@ -65,6 +65,32 @@ impl<'a> EventLog<'a> {
                 },
                 *msg.id(),
             ),
+            Message::Put(PutMsg::Broadcasting {
+                new_value,
+                broadcast_to,
+                key,
+                ..
+            }) => EventKind::Put(
+                PutEvent::BroadcastEmitted {
+                    broadcast_to: broadcast_to.clone(),
+                    key: key.clone(),
+                    value: new_value.clone(),
+                },
+                *msg.id(),
+            ),
+            Message::Put(PutMsg::BroadcastTo {
+                sender,
+                new_value,
+                key,
+                ..
+            }) => EventKind::Put(
+                PutEvent::BroadcastReceived {
+                    requester: sender.peer.clone(),
+                    key: key.clone(),
+                    value: new_value.clone(),
+                },
+                *msg.id(),
+            ),
             Message::Get(GetMsg::ReturnGet {
                 key,
                 value: StoreResponse { value: Some(_), .. },
@@ -134,6 +160,32 @@ enum PutEvent {
         /// value that was put
         value: ContractValue,
     },
+    BroadcastEmitted {
+        /// subscribed peers
+        broadcast_to: Vec<PeerKeyLocation>,
+        /// key of the contract which value was being updated
+        key: ContractKey,
+        /// value that was put
+        value: ContractValue,
+    },
+    BroadcastReceived {
+        /// peer who started the broadcast op
+        requester: PeerKey,
+        /// key of the contract which value was being updated
+        key: ContractKey,
+        /// value that was put
+        value: ContractValue,
+    },
+    BroadcastComplete {
+        /// peer who performed the event
+        performer: PeerKey,
+        /// peer who started the broadcast op
+        requester: PeerKey,
+        /// key of the contract which value was being updated
+        key: ContractKey,
+        /// value that was put
+        value: ContractValue,
+    },
 }
 
 #[inline]
@@ -150,13 +202,16 @@ fn create_log(logs: &[MessageLog], log: EventLog) -> (MessageLog, ListenerLogId)
         .iter()
         .filter_map(|l| {
             if matches!(l, MessageLog { kind: EventKind::Put(_, id), .. } if incoming_tx == id ) {
-                Some(&l.kind)
+                match l.kind {
+                    EventKind::Put(PutEvent::BroadcastEmitted { .. }, _) => None,
+                    _ => Some(&l.kind),
+                }
             } else {
                 None
             }
         })
         .chain([&kind]);
-    let kind = fuse_events_msg(find_put_ops).unwrap_or(kind);
+    let kind = fuse_successful_put_op(find_put_ops).unwrap_or(kind);
 
     let msg_log = MessageLog {
         ts: Instant::now(),
@@ -166,7 +221,9 @@ fn create_log(logs: &[MessageLog], log: EventLog) -> (MessageLog, ListenerLogId)
     (msg_log, log_id)
 }
 
-fn fuse_events_msg<'a>(mut put_ops: impl Iterator<Item = &'a EventKind>) -> Option<EventKind> {
+fn fuse_successful_put_op<'a>(
+    mut put_ops: impl Iterator<Item = &'a EventKind>,
+) -> Option<EventKind> {
     let prev_msgs = [put_ops.next().cloned(), put_ops.next().cloned()];
     match prev_msgs {
         [Some(EventKind::Put(PutEvent::Request { performer, key }, id)), Some(EventKind::Put(PutEvent::PutSuccess { requester, value }, _))] => {
@@ -189,6 +246,7 @@ mod test_utils {
     use std::{collections::HashMap, sync::Arc};
 
     use dashmap::DashMap;
+    use itertools::Itertools;
     use parking_lot::RwLock;
 
     use crate::{contract::ContractKey, message::TxType, ring::Distance};
@@ -232,6 +290,86 @@ mod test_utils {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Put(PutEvent::PutComplete { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
             })
+        }
+
+        pub fn get_broadcast_count(
+            &self,
+            expected_key: &ContractKey,
+            expected_value: &ContractValue,
+        ) -> usize {
+            let mut logs = self.logs.read();
+            logs.iter().filter(|log| {
+                matches!(log.kind, EventKind::Put(PutEvent::BroadcastEmitted { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
+            }).count()
+        }
+
+        pub fn has_broadcast_contract(
+            &self,
+            mut broadcast_pairs: Vec<(PeerKey, PeerKey)>,
+            expected_key: &ContractKey,
+            expected_value: &ContractValue,
+        ) -> bool {
+            let logs = self.logs.read();
+            let mut broadcast_ops = logs.iter().filter_map(|l| {
+                if matches!(
+                    l,
+                    MessageLog {
+                        kind: EventKind::Put(_, id),
+                        ..
+                    }
+                ) {
+                    match l.kind {
+                        EventKind::Put(PutEvent::BroadcastEmitted { .. }, _)
+                        | EventKind::Put(PutEvent::BroadcastReceived { .. }, _) => Some(&l.kind),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
+
+            let prev_msgs = [broadcast_ops.next().cloned(), broadcast_ops.next().cloned()];
+            let broadcast = match prev_msgs {
+                [Some(EventKind::Put(PutEvent::BroadcastEmitted { broadcast_to, .. }, id1)), Some(EventKind::Put(
+                    PutEvent::BroadcastReceived {
+                        requester,
+                        key,
+                        value,
+                    },
+                    id2,
+                ))] => {
+                    if id1 == id2 {
+                        Some(EventKind::Put(
+                            PutEvent::BroadcastComplete {
+                                performer: broadcast_to.get(0).unwrap().peer,
+                                requester,
+                                key,
+                                value,
+                            },
+                            id1,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            match broadcast {
+                Some(EventKind::Put(
+                    PutEvent::BroadcastComplete {
+                        ref performer,
+                        ref requester,
+                        ..
+                    },
+                    _,
+                )) => {
+                    let expected_pair = (performer, requester);
+                    broadcast_pairs.retain(|pair| matches!(pair, expected_pair));
+                    !broadcast_pairs.is_empty()
+                }
+                _ => false,
+            }
         }
 
         pub fn has_got_contract(&self, peer: &PeerKey, expected_key: &ContractKey) -> bool {

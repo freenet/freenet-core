@@ -10,6 +10,7 @@ use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
 use crate::contract::{Contract, ContractKey, ContractValue, SimStoreError};
+use crate::ring::PeerKeyLocation;
 use crate::user_events::UserEvent;
 use crate::{
     conn_manager::PeerKey,
@@ -61,6 +62,7 @@ pub(crate) struct NodeSpecification {
     pub owned_contracts: Vec<(Contract, ContractValue)>,
     pub non_owned_contracts: Vec<ContractKey>,
     pub events_to_generate: HashMap<EventId, UserEvent>,
+    pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
 
 #[derive(Clone)]
@@ -231,12 +233,31 @@ impl SimNetwork {
         self.labels.insert(label, peer.peer_key);
         tokio::spawn(async move {
             if let Some(specs) = node_specs {
-                peer.append_contracts(specs.owned_contracts)
+                peer.append_contracts(specs.owned_contracts, specs.contract_subscribers)
                     .await
                     .map_err(|_| anyhow::anyhow!("failed inserting test owned contracts"))?;
             }
             peer.listen_on(user_events).await
         });
+    }
+
+    pub fn get_locations_by_node(&self) -> HashMap<String, PeerKeyLocation> {
+        let mut locations_by_node: HashMap<String, PeerKeyLocation> = HashMap::new();
+
+        // Get node and gateways location by label
+        for (node, label) in &self.nodes {
+            locations_by_node.insert(
+                label.to_string(),
+                node.op_storage.ring.own_location().clone(),
+            );
+        }
+        for (node, config) in &self.gateways {
+            locations_by_node.insert(
+                config.label.to_string(),
+                node.op_storage.ring.own_location().clone(),
+            );
+        }
+        locations_by_node
     }
 
     pub fn connected(&self, peer: &str) -> bool {
@@ -253,6 +274,30 @@ impl SimNetwork {
         } else {
             panic!("peer not found");
         }
+    }
+
+    pub fn has_broadcast_contract(
+        &self,
+        broadcast_pairs: Vec<(&str, &str)>,
+        key: &ContractKey,
+        value: &ContractValue,
+    ) -> bool {
+        let peers = broadcast_pairs
+            .into_iter()
+            .step_by(2)
+            .map(
+                |(peer1, peer2)| match (self.labels.get(peer1), self.labels.get(peer2)) {
+                    (Some(pk1), Some(pk2)) => (*pk1, *pk2),
+                    _ => panic!("peer not found"),
+                },
+            )
+            .collect();
+        self.event_listener
+            .has_broadcast_contract(peers, key, value)
+    }
+
+    pub fn count_broadcasts(&self, key: &ContractKey, value: &ContractValue) -> usize {
+        self.event_listener.get_broadcast_count(key, value)
     }
 
     pub fn has_got_contract(&self, peer: &str, key: &ContractKey) -> bool {

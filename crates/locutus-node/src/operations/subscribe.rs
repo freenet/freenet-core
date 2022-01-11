@@ -616,12 +616,14 @@ mod test {
             owned_contracts: Vec::new(),
             non_owned_contracts: vec![contract_key],
             events_to_generate: HashMap::from_iter([(1, event)]),
+            contract_subscribers: HashMap::new(),
         };
 
         let second_node = NodeSpecification {
             owned_contracts: vec![(contract, contract_val)],
             non_owned_contracts: Vec::new(),
             events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::new(),
         };
 
         let subscribe_specs = HashMap::from_iter([

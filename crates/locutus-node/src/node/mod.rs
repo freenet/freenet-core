@@ -56,7 +56,7 @@ where
 }
 
 #[cfg(not(test))]
-impl<CErr> Node<CErr> 
+impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
