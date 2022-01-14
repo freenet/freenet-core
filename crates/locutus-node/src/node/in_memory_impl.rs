@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -16,7 +16,7 @@ use crate::{
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
-    NodeConfig,
+    ContractKey, NodeConfig,
 };
 
 pub(super) struct NodeInMemory<CErr = SimStoreError> {
@@ -84,6 +84,7 @@ where
     pub async fn append_contracts(
         &self,
         contracts: Vec<(Contract, ContractValue)>,
+        contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, value) in contracts {
             let key = contract.key();
@@ -99,6 +100,12 @@ where
                 self.op_storage.ring.peer_key
             );
             self.op_storage.ring.contract_cached(key);
+            if let Some(subscribers) = contract_subscribers.get(&key) {
+                // add contract subscribers
+                for subscriber in subscribers {
+                    self.op_storage.ring.add_subscriber(key, *subscriber);
+                }
+            }
         }
         Ok(())
     }

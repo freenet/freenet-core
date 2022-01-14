@@ -38,8 +38,9 @@ pub(crate) mod test {
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
+    use crate::node::{PeerKey, test::EventId};
+
     use super::*;
-    use crate::node::{test::EventId, PeerKey};
 
     pub(crate) struct MemoryEventsGen {
         id: PeerKey,
@@ -72,7 +73,7 @@ pub(crate) mod test {
             &mut self,
             contracts: impl IntoIterator<Item = (Contract, ContractValue)>,
         ) {
-            self.owned_contracts.extend(contracts.into_iter())
+            self.owned_contracts.extend(contracts);
         }
 
         /// Events that the user generate.

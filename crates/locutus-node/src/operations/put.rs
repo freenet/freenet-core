@@ -2,6 +2,7 @@
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::{
@@ -149,14 +150,21 @@ impl StateMachineImpl for PutOpSm {
                 PutMsg::Broadcasting {
                     id,
                     new_value,
+                    broadcasted_to,
                     broadcast_to,
-                    ..
+                    key,
                 },
             ) => {
                 if broadcast_to.is_empty() {
                     Some(PutMsg::SuccessfulUpdate { id, new_value })
                 } else {
-                    None
+                    Some(PutMsg::Broadcasting {
+                        id,
+                        new_value,
+                        broadcasted_to,
+                        broadcast_to,
+                        key,
+                    })
                 }
             }
             _ => None,
@@ -424,6 +432,65 @@ where
                 return Err(OpError::StatePushed);
             }
         }
+        PutMsg::BroadcastTo {
+            id,
+            key,
+            new_value,
+            sender,
+            sender_subscribers,
+        } => {
+            let target = op_storage.ring.own_location();
+
+            log::debug!("Attempting contract value update");
+            let new_value = put_contract(op_storage, key, new_value).await?;
+            log::debug!("Contract successfully updated");
+
+            let broadcast_to = op_storage
+                .ring
+                .subscribers_of(&key)
+                .map(|i| {
+                    // Avoid already broadcast nodes and sender from broadcasting
+                    let mut subscribers: Vec<PeerKeyLocation> = i.value().to_vec();
+                    let mut avoid_list: HashSet<PeerKey> =
+                        sender_subscribers.into_iter().map(|pl| pl.peer).collect();
+                    avoid_list.insert(sender.peer);
+                    subscribers.retain(|s| !avoid_list.contains(&s.peer));
+                    subscribers
+                })
+                .unwrap_or_default();
+            log::debug!(
+                "Successfully updated a value for contract {} @ {:?}",
+                key,
+                target.location
+            );
+
+            let internal_cb = state
+                .sm
+                .consume_to_output(PutMsg::Broadcasting {
+                    id,
+                    broadcast_to,
+                    broadcasted_to: 0,
+                    key,
+                    new_value,
+                })?
+                .ok_or(OpError::InvalidStateTransition(id))?;
+
+            if let PutMsg::SuccessfulUpdate { .. } = internal_cb {
+                log::debug!(
+                    "Empty broadcast list while updating value for contract {}",
+                    key
+                );
+                // means the whole tx finished so can return early
+                return_msg = Some(internal_cb.into());
+                new_state = None;
+            } else {
+                log::debug!("Callback to start broadcasting to other nodes");
+                op_storage
+                    .notify_op_change(internal_cb.into(), Operation::Put(state))
+                    .await?;
+                return Err(OpError::StatePushed);
+            }
+        }
         PutMsg::Broadcasting {
             id,
             mut broadcast_to,
@@ -437,6 +504,7 @@ where
                 key,
                 new_value: new_value.clone(),
                 sender,
+                sender_subscribers: broadcast_to.clone(),
             };
 
             let mut broadcasting = Vec::with_capacity(broadcast_to.len());
@@ -477,20 +545,9 @@ where
                 broadcasted_to
             );
 
-            return_msg = state
-                .sm
-                .consume_to_state(PutMsg::Broadcasting {
-                    id,
-                    broadcasted_to,
-                    broadcast_to,
-                    key,
-                    new_value,
-                })?
-                .map(Message::from);
+            // Subscriber nodes have been notified of the change, the operation is completed
+            return_msg = None;
             new_state = None;
-            if &PutState::BroadcastComplete != state.sm.state() {
-                return Err(OpError::InvalidStateTransition(id));
-            }
         }
         PutMsg::SuccessfulUpdate { id, new_value } => {
             return_msg = state
@@ -705,6 +762,7 @@ mod messages {
             sender: PeerKeyLocation,
             key: ContractKey,
             new_value: ContractValue,
+            sender_subscribers: Vec<PeerKeyLocation>,
         },
     }
 
@@ -835,9 +893,9 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 1usize;
+        const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
         let bytes = crate::test::random_bytes_1024();
@@ -847,37 +905,61 @@ mod test {
         let contract_val: ContractValue = gen.arbitrary()?;
         let new_value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        let mut locations = sim_nodes.get_locations_by_node();
+        let node0_loc = locations.remove("node-0").unwrap();
+        let node1_loc = locations.remove("node-1").unwrap();
+        let gateway0_loc = locations.remove("gateway-0").unwrap();
+
         // both own the contract, and one triggers an update
         let node_0 = NodeSpecification {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node1_loc.clone()])]),
+        };
+
+        let node_1 = NodeSpecification {
+            owned_contracts: vec![(contract.clone(), contract_val.clone())],
+            non_owned_contracts: vec![],
+            events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node0_loc.clone()])]),
         };
 
         let put_event = UserEvent::Put {
             contract: contract.clone(),
             value: new_value.clone(),
         };
+
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(contract, contract_val)],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::from_iter([(1, put_event)]),
+            contract_subscribers: HashMap::new(),
         };
 
         // establish network
         let put_specs = HashMap::from_iter([
             ("node-0".to_string(), node_0),
+            ("node-1".to_string(), node_1),
             ("gateway-0".to_string(), gw_0),
         ]);
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+
         sim_nodes.build_with_specs(put_specs);
+        tokio::time::sleep(Duration::from_secs(5)).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger the put op @ gw-0, this
         sim_nodes
-            .trigger_event("gateway-0", 1, Some(Duration::from_millis(100)))
+            .trigger_event("gateway-0", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
+        assert_eq!(1, sim_nodes.count_broadcasts(&key, &new_value));
+        assert!(sim_nodes.has_broadcast_contract(
+            vec![("node-0", "node-1"), ("node-1", "node-0")],
+            &key,
+            &new_value
+        ));
         Ok(())
     }
 }

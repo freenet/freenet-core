@@ -23,11 +23,11 @@ Locutus' purpose is to make it easy to build decentralized services and also to 
 
 "Fred" is the software commonly known as Freenet, which Ian Clarke and other volunteers created in 2000 and have continually maintained since then.
 
-Locutus will be a general-purpose, cryptographically secure, decentralized, distributed computation and communication platform. Anyone can write and run software on it, and that software can interact in ways that would be difficult otherwise.
+Locutus will be a general-purpose, cryptographically secure, decentralized, distributed computation and communication platform.
 
 Locutus won't replace Fred; they're trying to solve different (but related) problems. Key differences between Locutus and Fred:
 
-* Locutus is designed to support real-time communication, fast enough for IM (less than 1 second). Fred has been improving in this regard but is still limited to several minutes. 
+* Locutus is designed to support real-time communication, fast enough for IM - less than 1 second, compared to 1 minute for Fred. 
 
 * Fred is primarily a research platform, and this has limited its adoption. While it continues to improve, ease of use has always been an issue for Fred. Locutus is being designed from the ground up to be no more difficult to use than a web browser.
 
@@ -39,7 +39,7 @@ Locutus won't replace Fred; they're trying to solve different (but related) prob
 
 ### Name
 
-Locutus is the development name for this software; it may change on launch.
+Locutus is the development name for this software; it will probably change before launch.
 
 ### Status
 

@@ -151,7 +151,6 @@ impl Ring {
             if config.local_ip.is_none() || config.local_port.is_none() {
                 return Err(anyhow::anyhow!("IP and port are required for gateways"));
             }
-            log::error!("{}", peer_key);
             ring.update_location(Some(loc));
             for PeerKeyLocation { peer, location } in gateways {
                 // all gateways are aware of each other
