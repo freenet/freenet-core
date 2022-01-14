@@ -909,21 +909,20 @@ mod test {
         let mut locations = sim_nodes.get_locations_by_node();
         let node0_loc = locations.remove("node-0").unwrap();
         let node1_loc = locations.remove("node-1").unwrap();
-        let gateway0_loc = locations.remove("gateway-0").unwrap();
 
         // both own the contract, and one triggers an update
         let node_0 = NodeSpecification {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node1_loc.clone()])]),
+            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node1_loc])]),
         };
 
         let node_1 = NodeSpecification {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node0_loc.clone()])]),
+            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node0_loc])]),
         };
 
         let put_event = UserEvent::Put {
@@ -955,11 +954,7 @@ mod test {
             .await?;
         assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
         assert_eq!(1, sim_nodes.count_broadcasts(&key, &new_value));
-        assert!(sim_nodes.has_broadcast_contract(
-            vec![("node-0", "node-1"), ("node-1", "node-0")],
-            &key,
-            &new_value
-        ));
+        assert!(sim_nodes.has_broadcast_contract(vec![("node-0", "node-1"), ("node-1", "node-0")]));
         Ok(())
     }
 }

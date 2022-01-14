@@ -103,7 +103,15 @@ where
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers
                 for subscriber in subscribers {
-                    self.op_storage.ring.add_subscriber(key, *subscriber);
+                    if self
+                        .op_storage
+                        .ring
+                        .add_subscriber(key, *subscriber)
+                        .is_err()
+                    {
+                        log::warn!("Max subscribers for contract {} reached", key);
+                        break;
+                    }
                 }
             }
         }

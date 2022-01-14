@@ -110,9 +110,7 @@ impl StateMachineImpl for SubscribeOpSm {
                     key,
                     target,
                     subscriber,
-                    skip_list,
-                    htl,
-                    found: true,
+                    ..
                 },
             ) => {
                 log::info!(
@@ -256,7 +254,6 @@ where
                 subscriber: sender,
                 skip_list: vec![sender.peer],
                 htl: 0,
-                found: false,
             }));
         }
         SubscribeMsg::SeekNode {
@@ -266,7 +263,6 @@ where
             target,
             skip_list,
             htl,
-            found,
         } => {
             let sender = op_storage.ring.own_location();
             let return_err = || -> OperationResult {
@@ -307,7 +303,6 @@ where
                             target: new_target,
                             skip_list: new_skip_list.clone(),
                             htl: new_htl,
-                            found: false,
                         })
                         .into(),
                     )
@@ -322,7 +317,6 @@ where
                         target,
                         skip_list,
                         htl,
-                        found: false,
                     })?
                     .map(Message::from);
                 new_state = Some(state);
@@ -341,7 +335,6 @@ where
                         subscriber,
                         skip_list,
                         htl,
-                        found: true,
                     })?
                     .map(Message::from);
             }
@@ -384,7 +377,6 @@ where
                         target,
                         skip_list: vec![target.peer],
                         htl: 0,
-                        found: false,
                     }));
                     new_state = Some(state);
                 } else {
@@ -450,7 +442,6 @@ mod messages {
             subscriber: PeerKeyLocation,
             skip_list: Vec<PeerKey>,
             htl: usize,
-            found: bool,
         },
         ReturnSub {
             id: Transaction,
@@ -559,7 +550,6 @@ mod test {
                 subscriber: subscriber_loc,
                 skip_list: vec![subscriber_loc.peer],
                 htl: 0,
-                found: true,
             })?
             .ok_or_else(|| anyhow::anyhow!("no output"))?;
 
@@ -592,7 +582,6 @@ mod test {
             subscriber: subscriber_loc,
             skip_list: vec![subscriber_loc.peer, first_target_loc.peer],
             htl: 0,
-            found: false,
         })?;
 
         assert_eq!(target.state(), &SubscribeState::Completed);

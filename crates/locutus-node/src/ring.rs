@@ -324,6 +324,9 @@ impl Ring {
             .subscribers
             .entry(contract)
             .or_insert(Vec::with_capacity(Self::MAX_SUBSCRIBERS));
+        if subs.len() >= Self::MAX_SUBSCRIBERS {
+            return Err(());
+        }
         if let Err(next_idx) = subs.value_mut().binary_search(&subscriber) {
             let subs = subs.value_mut();
             if subs.len() == Self::MAX_SUBSCRIBERS {
