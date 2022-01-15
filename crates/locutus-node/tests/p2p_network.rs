@@ -83,6 +83,7 @@ async fn node_communication() -> Result<(), anyhow::Error> {
         gw_loc,
         UserEvents { rx_ev: rx_gw_ev },
     ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     tokio::spawn(start_new_peer(gw_config, UserEvents { rx_ev: rx_node_ev }));
     run_test(manager).await
 }

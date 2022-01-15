@@ -891,6 +891,17 @@ mod messages {
                 _ => None,
             }
         }
+
+        pub fn terminal(&self) -> bool {
+            use JoinRingMsg::*;
+            matches!(
+                self,
+                Response {
+                    msg: JoinResponse::Proxy { .. },
+                    ..
+                } | Connected { .. }
+            )
+        }
     }
 
     impl Display for JoinRingMsg {

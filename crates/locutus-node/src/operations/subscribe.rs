@@ -476,6 +476,11 @@ mod messages {
                 _ => None,
             }
         }
+
+        pub fn terminal(&self) -> bool {
+            use SubscribeMsg::*;
+            matches!(self, ReturnSub { .. } | SeekNode { .. })
+        }
     }
 
     impl Display for SubscribeMsg {

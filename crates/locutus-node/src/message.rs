@@ -195,6 +195,18 @@ impl Message {
             Canceled(_) | Internal(_) => None,
         }
     }
+
+    /// Is the last expected message for this chain of messages.
+    pub fn terminal(&self) -> bool {
+        use Message::*;
+        match self {
+            JoinRing(op) => op.terminal(),
+            Put(op) => op.terminal(),
+            Get(op) => op.terminal(),
+            Subscribe(op) => op.terminal(),
+            Canceled(_) | Internal(_) => true,
+        }
+    }
 }
 
 impl Display for Message {

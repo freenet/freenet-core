@@ -795,6 +795,14 @@ mod messages {
                 _ => None,
             }
         }
+
+        pub fn terminal(&self) -> bool {
+            use PutMsg::*;
+            matches!(
+                self,
+                SuccessfulUpdate { .. } | SeekNode { .. } | PutForward { .. }
+            )
+        }
     }
 
     impl Display for PutMsg {

@@ -622,6 +622,11 @@ mod messages {
                 Self::ReturnGet { target, .. } => Some(target),
             }
         }
+
+        pub fn terminal(&self) -> bool {
+            use GetMsg::*;
+            matches!(self, ReturnGet { .. } | SeekNode { .. })
+        }
     }
 
     impl Display for GetMsg {

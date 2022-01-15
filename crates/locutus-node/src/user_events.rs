@@ -38,7 +38,7 @@ pub(crate) mod test {
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
-    use crate::node::{PeerKey, test::EventId};
+    use crate::node::{test::EventId, PeerKey};
 
     use super::*;
 
