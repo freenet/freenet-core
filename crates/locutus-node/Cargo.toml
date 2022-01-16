@@ -43,7 +43,7 @@ rand = "0.8"
 serde = { version = "1.0", features = ["rc"] }
 stretto = { version = "0.3.1", features = ["async"] }
 thiserror = "1.0"
-tokio = { version = "1.12", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.15", features = ["rt-multi-thread", "sync", "macros"] }
 typestate = "0.8.0"
 unsigned-varint = "0.7"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
