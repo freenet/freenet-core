@@ -160,14 +160,14 @@ pub(super) mod tracing {
     }
 
     static LOGGER: Lazy<Logger> = Lazy::new(|| {
-        if let Err(err) = env_logger::builder()
+        let mut builder = env_logger::builder();
+        builder
             .format_indent(Some(4))
             .format_module_path(false)
             .format_timestamp_nanos()
             .target(env_logger::Target::Stdout)
-            .filter(None, CONF.log_level)
-            .try_init()
-        {
+            .filter(None, CONF.log_level);
+        if let Err(err) = builder.try_init() {
             eprintln!("Failed to initialize logger with error: {}", err);
         };
 

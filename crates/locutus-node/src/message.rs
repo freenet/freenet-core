@@ -159,7 +159,7 @@ pub(crate) enum NodeActions {
     ConfirmedInbound,
     /// Error while sending an other message
     #[serde(skip)]
-    Error(ConnectionError, Transaction),
+    Error(ConnectionError),
 }
 
 impl Display for NodeActions {
@@ -167,7 +167,7 @@ impl Display for NodeActions {
         match self {
             Self::ShutdownNode => f.write_str("ShutdownNode"),
             Self::ConfirmedInbound => f.write_str("ConfirmedInbound"),
-            Self::Error(_, _) => todo!(),
+            Self::Error(_) => todo!(),
         }
     }
 }

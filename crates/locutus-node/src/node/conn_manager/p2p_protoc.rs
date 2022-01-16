@@ -34,7 +34,7 @@ use unsigned_varint::codec::UviBytes;
 
 use crate::{
     config::{self, GlobalExecutor},
-    message::{Message, NodeActions, Transaction},
+    message::{Message, NodeActions},
     node::{handle_cancelled_op, process_message, OpManager, PeerKey},
     ring::PeerKeyLocation,
     InitPeerNode, NodeConfig,
@@ -254,18 +254,30 @@ impl P2pConnManager {
                 Ok(Left(msg)) => {
                     log::debug!("Received swarm message at {}", op_manager.ring.peer_key);
                     let cb = self.bridge.clone();
-                    if let Message::Canceled(tx) = *msg {
-                        handle_cancelled_op(
-                            tx,
-                            op_manager.ring.peer_key,
-                            self.gateways.iter(),
-                            &op_manager,
-                            &mut self.bridge,
-                        )
-                        .await?;
-                        continue;
+                    match *msg {
+                        Message::Canceled(tx) => {
+                            handle_cancelled_op(
+                                tx,
+                                op_manager.ring.peer_key,
+                                self.gateways.iter(),
+                                &op_manager,
+                                &mut self.bridge,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Message::Internal(action) => {
+                            log::debug!("internal action: {:?}", action);
+                        }
+                        msg => {
+                            GlobalExecutor::spawn(process_message(
+                                Ok(msg),
+                                op_manager.clone(),
+                                cb,
+                                None,
+                            ));
+                        }
                     }
-                    GlobalExecutor::spawn(process_message(Ok(*msg), op_manager.clone(), cb, None));
                 }
                 Ok(Right(ConnectionEstablished { addr, peer_id })) => {
                     log::debug!("Established connection with peer {} @ {}", peer_id, addr);
@@ -365,6 +377,7 @@ impl NetworkBehaviour for LocutusBehaviour {
     }
 
     fn inject_event(&mut self, peer_id: PeerId, _connection: ConnectionId, msg: Message) {
+        log::debug!("injected event in swarm: {:?}", msg);
         self.queue.push_front((peer_id, msg));
     }
 
@@ -378,6 +391,11 @@ impl NetworkBehaviour for LocutusBehaviour {
         _: &mut impl libp2p::swarm::PollParameters,
     ) -> std::task::Poll<NetworkBehaviourAction<Self::OutEvent, Self::ProtocolsHandler>> {
         if let Some((peer_id, msg)) = self.queue.pop_back() {
+            if let Message::Internal(NodeActions::Error(err)) = msg {
+                log::warn!("connection error: {}", err);
+                return Poll::Pending;
+            }
+
             if let Some(id) = self.connected.get(&peer_id) {
                 let send_to_handler = NetworkBehaviourAction::NotifyHandler {
                     peer_id,
@@ -417,8 +435,9 @@ type UniqConnId = usize;
 pub(in crate::node) struct Handler {
     substreams: Vec<SubstreamState>,
     keep_alive: KeepAlive,
-    uniq_connection_id: UniqConnId,
+    uniq_conn_id: UniqConnId,
     protocol_status: ProtocolStatus,
+    pending: Vec<Message>,
 }
 
 enum ProtocolStatus {
@@ -431,7 +450,9 @@ enum ProtocolStatus {
 enum SubstreamState {
     /// We haven't started opening the outgoing substream yet.
     /// Contains the initial request we want to send.
-    OutPendingOpen(Message),
+    OutPendingOpen { msg: Message, conn_id: UniqConnId },
+    /// Waiting for the first message after requesting an outbound open connection.
+    AwaitingFirst { conn_id: UniqConnId },
     FreeStream {
         conn_id: UniqConnId,
         substream: LocutusStream<NegotiatedSubstream>,
@@ -446,20 +467,23 @@ enum SubstreamState {
     PendingFlush {
         conn_id: UniqConnId,
         substream: LocutusStream<NegotiatedSubstream>,
-        id: Transaction,
     },
     /// Waiting for an answer back from the remote.
     WaitingMsg {
         conn_id: UniqConnId,
         substream: LocutusStream<NegotiatedSubstream>,
-        id: Transaction,
     },
     /// An error happened on the substream and we should report the error to the user.
     ReportError {
         conn_id: UniqConnId,
         error: ConnectionError,
-        msg: Box<Message>,
     },
+}
+
+impl SubstreamState {
+    fn is_free(&self) -> bool {
+        matches!(self, SubstreamState::FreeStream { .. })
+    }
 }
 
 impl Handler {
@@ -469,8 +493,9 @@ impl Handler {
         Self {
             substreams: vec![],
             keep_alive: KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT),
-            uniq_connection_id: 0,
+            uniq_conn_id: 0,
             protocol_status: ProtocolStatus::Unconfirmed,
+            pending: Vec::new(),
         }
     }
 
@@ -501,7 +526,7 @@ impl Handler {
     }
 }
 
-type HandlePollingEv = ProtocolsHandlerEvent<LocutusProtocol, Message, Message, ConnectionError>;
+type HandlePollingEv = ProtocolsHandlerEvent<LocutusProtocol, (), Message, ConnectionError>;
 
 impl ProtocolsHandler for Handler {
     /// Event received from the network by the handler
@@ -518,8 +543,7 @@ impl ProtocolsHandler for Handler {
 
     type InboundOpenInfo = ();
 
-    /// Initial message due to be sent to the remote.
-    type OutboundOpenInfo = Message;
+    type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
         SubstreamProtocol::new(LocutusProtocol, ())
@@ -528,14 +552,24 @@ impl ProtocolsHandler for Handler {
     fn inject_fully_negotiated_outbound(
         &mut self,
         stream: <Self::OutboundProtocol as InboundUpgrade<NegotiatedSubstream>>::Output,
-        init_msg: Self::OutboundOpenInfo,
+        _info: Self::OutboundOpenInfo,
     ) {
-        self.substreams.push(SubstreamState::PendingSend {
-            conn_id: self.uniq_connection_id,
-            substream: stream,
-            msg: Box::new(init_msg),
-        });
-        self.uniq_connection_id += 1;
+        if let Some(pos) = self
+            .substreams
+            .iter()
+            .position(|state| matches!(state, SubstreamState::AwaitingFirst { .. }))
+        {
+            let conn_id = match self.substreams.swap_remove(pos) {
+                SubstreamState::AwaitingFirst { conn_id } => conn_id,
+                _ => unreachable!(),
+            };
+            self.substreams.push(SubstreamState::WaitingMsg {
+                conn_id,
+                substream: stream,
+            });
+        } else {
+            panic!()
+        }
     }
 
     fn inject_fully_negotiated_inbound(
@@ -543,39 +577,54 @@ impl ProtocolsHandler for Handler {
         stream: <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Output,
         _info: Self::InboundOpenInfo,
     ) {
-        self.substreams.push(SubstreamState::FreeStream {
-            conn_id: self.uniq_connection_id,
-            substream: stream,
-        });
-        self.uniq_connection_id += 1;
+        if !self.substreams.iter().any(|state| {
+            matches!(
+                state,
+                SubstreamState::AwaitingFirst { .. } | SubstreamState::WaitingMsg { .. }
+            )
+        }) {
+            self.substreams.push(SubstreamState::WaitingMsg {
+                conn_id: self.uniq_conn_id,
+                substream: stream,
+            });
+            self.uniq_conn_id += 1;
+        }
         if let ProtocolStatus::Unconfirmed = self.protocol_status {
             self.protocol_status = ProtocolStatus::Confirmed;
         }
     }
 
     fn inject_event(&mut self, msg: Self::InEvent) {
+        log::debug!(
+            "inject event (dest: {:?}):\n  {:?}",
+            msg.target().map(|pkl| pkl.peer),
+            msg
+        );
         if let Some(msg) = self.send_to_free_substream(msg) {
-            // is the first request initiate and/or there are no free substreams, open a new one
-            self.substreams.push(SubstreamState::OutPendingOpen(msg));
+            let conn_id = self.uniq_conn_id;
+            self.uniq_conn_id += 1;
+            // is the first request initiated and/or there are no free substreams, open a new one
+            self.substreams
+                .push(SubstreamState::OutPendingOpen { msg, conn_id });
         }
     }
 
     fn inject_dial_upgrade_error(
         &mut self,
-        msg: Self::OutboundOpenInfo,
+        _: Self::OutboundOpenInfo,
         error: ProtocolsHandlerUpgrErr<<Self::OutboundProtocol as OutboundUpgradeSend>::Error>,
     ) {
         self.protocol_status = ProtocolStatus::FailedUpgrade;
         self.substreams.push(SubstreamState::ReportError {
-            conn_id: self.uniq_connection_id,
+            conn_id: self.uniq_conn_id,
             error: (Box::new(error)).into(),
-            msg: Box::new(msg),
         });
-        self.uniq_connection_id += 1;
+        self.uniq_conn_id += 1;
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
-        self.keep_alive
+        // fixme self.keep_alive
+        KeepAlive::Yes
     }
 
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<HandlePollingEv> {
@@ -594,20 +643,37 @@ impl ProtocolsHandler for Handler {
             let mut stream = self.substreams.swap_remove(n);
             loop {
                 match stream {
-                    SubstreamState::OutPendingOpen(msg) => {
+                    SubstreamState::OutPendingOpen { msg, conn_id } => {
                         let event = ProtocolsHandlerEvent::OutboundSubstreamRequest {
-                            protocol: SubstreamProtocol::new(LocutusProtocol, msg),
+                            protocol: SubstreamProtocol::new(LocutusProtocol, ()),
                         };
+                        self.substreams
+                            .push(SubstreamState::AwaitingFirst { conn_id });
+                        self.pending.push(msg);
                         if self.substreams.is_empty() {
                             self.keep_alive =
                                 KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
                         }
                         return Poll::Ready(event);
                     }
-                    SubstreamState::FreeStream { substream, conn_id } => {
+                    SubstreamState::AwaitingFirst { conn_id } => {
                         self.substreams
-                            .push(SubstreamState::FreeStream { substream, conn_id });
+                            .push(SubstreamState::AwaitingFirst { conn_id });
                         break;
+                    }
+                    SubstreamState::FreeStream { substream, conn_id } => {
+                        if let Some(msg) = self.pending.pop() {
+                            stream = SubstreamState::PendingSend {
+                                substream,
+                                conn_id,
+                                msg: Box::new(msg),
+                            };
+                            continue;
+                        } else {
+                            self.substreams
+                                .push(SubstreamState::FreeStream { substream, conn_id });
+                            break;
+                        }
                     }
                     SubstreamState::PendingSend {
                         mut substream,
@@ -615,22 +681,25 @@ impl ProtocolsHandler for Handler {
                         conn_id,
                     } => match Sink::poll_ready(Pin::new(&mut substream), cx) {
                         Poll::Ready(Ok(())) => {
-                            if let Message::Internal(_) = *msg {
-                                stream = SubstreamState::FreeStream { substream, conn_id };
-                                continue;
+                            if let Message::Internal(action) = *msg {
+                                match action {
+                                    NodeActions::ConfirmedInbound => {
+                                        log::debug!("waiting to send back msg (id: {})", conn_id);
+                                        stream = SubstreamState::FreeStream { substream, conn_id };
+                                        continue;
+                                    }
+                                    NodeActions::ShutdownNode | NodeActions::Error(_) => break,
+                                }
                             }
-                            let id = *msg.id();
+                            log::debug!("sending (id: {})", conn_id);
                             match Sink::start_send(Pin::new(&mut substream), *msg) {
                                 Ok(()) => {
-                                    stream = SubstreamState::PendingFlush {
-                                        substream,
-                                        id,
-                                        conn_id,
-                                    };
+                                    log::debug!("sent (id: {})", conn_id);
+                                    stream = SubstreamState::PendingFlush { substream, conn_id };
                                 }
                                 Err(err) => {
                                     let event = ProtocolsHandlerEvent::Custom(Message::Internal(
-                                        NodeActions::Error(err, id),
+                                        NodeActions::Error(err),
                                     ));
                                     return Poll::Ready(event);
                                 }
@@ -646,87 +715,70 @@ impl ProtocolsHandler for Handler {
                         }
                         Poll::Ready(Err(err)) => {
                             let event = ProtocolsHandlerEvent::Custom(Message::Internal(
-                                NodeActions::Error(err, *msg.id()),
+                                NodeActions::Error(err),
                             ));
                             return Poll::Ready(event);
                         }
                     },
                     SubstreamState::PendingFlush {
                         mut substream,
-                        id,
                         conn_id,
                     } => match Sink::poll_flush(Pin::new(&mut substream), cx) {
                         Poll::Ready(Ok(())) => {
-                            stream = SubstreamState::WaitingMsg {
-                                substream,
-                                id,
-                                conn_id,
-                            };
+                            log::debug!("flushed (id: {})", conn_id);
+                            stream = SubstreamState::WaitingMsg { substream, conn_id };
                             continue;
                         }
                         Poll::Pending => {
-                            self.substreams.push(SubstreamState::PendingFlush {
-                                substream,
-                                id,
-                                conn_id,
-                            });
+                            self.substreams
+                                .push(SubstreamState::PendingFlush { substream, conn_id });
                             break;
                         }
                         Poll::Ready(Err(err)) => {
                             let event = ProtocolsHandlerEvent::Custom(Message::Internal(
-                                NodeActions::Error(err, id),
+                                NodeActions::Error(err),
                             ));
                             return Poll::Ready(event);
                         }
                     },
                     SubstreamState::WaitingMsg {
                         mut substream,
-                        id,
                         conn_id,
                     } => match Stream::poll_next(Pin::new(&mut substream), cx) {
                         Poll::Ready(Some(Ok(msg))) => {
-                            if msg.terminal() {
+                            log::debug!("received (id: {}) msg: {:?}", conn_id, msg);
+                            if !msg.terminal() {
+                                // received a message, the other peer is waiting for an answer
+                                log::debug!("waiting to send back more (id: {})", conn_id);
                                 self.substreams
-                                    .push(SubstreamState::FreeStream { conn_id, substream });
-                            } else {
-                                self.substreams.push(SubstreamState::WaitingMsg {
-                                    substream,
-                                    id,
-                                    conn_id,
-                                });
+                                    .push(SubstreamState::FreeStream { substream, conn_id });
                             }
                             let event = ProtocolsHandlerEvent::Custom(msg);
                             return Poll::Ready(event);
                         }
                         Poll::Pending => {
-                            self.substreams.push(SubstreamState::WaitingMsg {
-                                substream,
-                                id,
-                                conn_id,
-                            });
+                            self.substreams
+                                .push(SubstreamState::WaitingMsg { substream, conn_id });
                             break;
                         }
                         Poll::Ready(Some(Err(err))) => {
                             let event = ProtocolsHandlerEvent::Custom(Message::Internal(
-                                NodeActions::Error(err, id),
+                                NodeActions::Error(err),
                             ));
                             return Poll::Ready(event);
                         }
                         Poll::Ready(None) => {
                             let event = ProtocolsHandlerEvent::Custom(Message::Internal(
-                                NodeActions::Error(
-                                    ConnectionError::IOError(Some(
-                                        io::ErrorKind::UnexpectedEof.into(),
-                                    )),
-                                    id,
-                                ),
+                                NodeActions::Error(ConnectionError::IOError(Some(
+                                    io::ErrorKind::UnexpectedEof.into(),
+                                ))),
                             ));
                             return Poll::Ready(event);
                         }
                     },
-                    SubstreamState::ReportError { error, msg, .. } => {
+                    SubstreamState::ReportError { error, .. } => {
                         let event = ProtocolsHandlerEvent::Custom(Message::Internal(
-                            NodeActions::Error(error, *msg.id()),
+                            NodeActions::Error(error),
                         ));
                         return Poll::Ready(event);
                     }
@@ -734,8 +786,8 @@ impl ProtocolsHandler for Handler {
             }
         }
 
-        if self.substreams.is_empty() {
-            // We destroyed all substreams in this function.
+        if self.substreams.is_empty() || self.substreams.iter().all(|s| s.is_free()) {
+            // We destroyed all substreams in this iteration or all substreams are free
             self.keep_alive = KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
         } else {
             self.keep_alive = KeepAlive::Yes;

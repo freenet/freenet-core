@@ -887,6 +887,10 @@ mod messages {
             use JoinRingMsg::*;
             match self {
                 Response { target, .. } => Some(target),
+                Request {
+                    msg: JoinRequest::StartReq { target, .. },
+                    ..
+                } => Some(target),
                 Connected { target, .. } => Some(target),
                 _ => None,
             }
