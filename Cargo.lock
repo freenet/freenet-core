@@ -196,9 +196,9 @@ dependencies = [
 
 [[package]]
 name = "blake2"
-version = "0.10.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a58bdf5134c5beae6fc382002c4d88950bad1feea20f8f7165494b6b43b049de"
+checksum = "b94ba84325db59637ffc528bbe8c7f86c02c57cff5c0e2b9b00f9a851f42f309"
 dependencies = [
  "digest 0.10.0",
 ]
@@ -1289,7 +1289,7 @@ dependencies = [
  "async-trait",
  "asynchronous-codec",
  "bincode",
- "blake2 0.10.0",
+ "blake2 0.10.2",
  "config",
  "crossbeam",
  "dashmap",
