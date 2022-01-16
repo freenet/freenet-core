@@ -50,3 +50,4 @@ sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
 
 [dev-dependencies]
 itertools = "0.10"
+pico-args = "0.4"

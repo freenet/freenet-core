@@ -1,12 +1,17 @@
 use std::{net::Ipv4Addr, time::Duration};
 
-use libp2p::{identity::Keypair, PeerId};
+use anyhow::bail;
+use libp2p::{
+    identity::{ed25519, Keypair},
+    PeerId,
+};
 use locutus_node::{
     Contract, ContractValue, InitPeerNode, Location, NodeConfig, UserEvent, UserEventsProxy,
 };
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-#[cfg(test)]
+const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");
+
 async fn start_gateway(
     key: Keypair,
     port: u16,
@@ -22,7 +27,6 @@ async fn start_gateway(
     config.build()?.run(user_events).await
 }
 
-#[cfg(test)]
 async fn start_new_peer(
     gateway_config: InitPeerNode,
     user_events: UserEvents,
@@ -33,7 +37,7 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    tokio::time::sleep(Duration::from_secs(300)).await;
+    tokio::time::sleep(Duration::from_secs(3000)).await;
 
     let contract = Contract::new(vec![1, 2, 3, 4]);
     let key = contract.key();
@@ -61,10 +65,12 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn node_communication() -> Result<(), anyhow::Error> {
+#[tokio::main(worker_threads = 2)]
+async fn main() -> Result<(), anyhow::Error> {
+    let args = Args::parse_args()?;
+
     let gw_port = 64510;
-    let gw_key = Keypair::generate_ed25519();
+    let gw_key: Keypair = Keypair::Ed25519(ed25519::Keypair::decode(&mut ENCODED_GW_KEY.to_vec())?);
     let gw_id: PeerId = gw_key.public().into();
     let gw_loc = Location::random();
     let gw_config = InitPeerNode::new(gw_id, gw_loc)
@@ -73,18 +79,36 @@ async fn node_communication() -> Result<(), anyhow::Error> {
 
     let (tx_gw_ev, rx_gw_ev) = channel(100);
     let (tx_node_ev, rx_node_ev) = channel(100);
+
+    match (args.is_gw, args.is_peer) {
+        (true, true) => bail!("a node cannot be both a gateway and a normal peer"),
+        (true, _) => {
+            tokio::spawn(start_gateway(
+                gw_key,
+                gw_port,
+                gw_loc,
+                UserEvents { rx_ev: rx_gw_ev },
+            ));
+        }
+        (_, true) => {
+            tokio::spawn(start_new_peer(gw_config, UserEvents { rx_ev: rx_node_ev }));
+        }
+        (false, false) => {
+            tokio::spawn(start_gateway(
+                gw_key,
+                gw_port,
+                gw_loc,
+                UserEvents { rx_ev: rx_gw_ev },
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::spawn(start_new_peer(gw_config, UserEvents { rx_ev: rx_node_ev }));
+        }
+    }
+
     let manager = EventManager {
         tx_gw_ev,
         tx_node_ev,
     };
-    tokio::spawn(start_gateway(
-        gw_key,
-        gw_port,
-        gw_loc,
-        UserEvents { rx_ev: rx_gw_ev },
-    ));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    tokio::spawn(start_new_peer(gw_config, UserEvents { rx_ev: rx_node_ev }));
     run_test(manager).await
 }
 
@@ -102,5 +126,20 @@ struct UserEvents {
 impl UserEventsProxy for UserEvents {
     async fn recv(&mut self) -> locutus_node::UserEvent {
         self.rx_ev.recv().await.expect("channel open")
+    }
+}
+
+struct Args {
+    is_gw: bool,
+    is_peer: bool,
+}
+
+impl Args {
+    fn parse_args() -> Result<Self, anyhow::Error> {
+        let mut pargs = pico_args::Arguments::from_env();
+        Ok(Args {
+            is_gw: pargs.contains("--gateway"),
+            is_peer: pargs.contains("--peer"),
+        })
     }
 }
