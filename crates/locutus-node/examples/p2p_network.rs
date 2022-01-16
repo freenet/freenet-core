@@ -37,7 +37,7 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    tokio::time::sleep(Duration::from_secs(3000)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let contract = Contract::new(vec![1, 2, 3, 4]);
     let key = contract.key();
@@ -61,7 +61,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .map_err(|_| "channel closed")
         .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(300)).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
     Ok(())
 }
 
