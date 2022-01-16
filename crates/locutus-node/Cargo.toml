@@ -33,8 +33,9 @@ libp2p = { version = "0.41.0", features = [
     "noise",
     "tcp-tokio",
     "dns-tokio",
+    "ping",
     "yamux"
-] }
+], default-features = false }
 log = { version = "0.4", features = ["serde"] }
 once_cell = "1.8"
 parking_lot = "0.11.2"
