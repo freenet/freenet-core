@@ -3,12 +3,11 @@ use std::{collections::HashSet, time::Duration};
 use super::{handle_op_result, state_machine::StateMachineImpl, OpError, OperationResult};
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{self, ConnError, ConnectionBridge, PeerKey},
     message::{Message, Transaction},
-    node::OpManager,
+    node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
     operations::{state_machine::StateMachine, Operation},
     ring::{Location, PeerKeyLocation, Ring},
-    utils::ExponentialBackoff,
+    util::ExponentialBackoff,
 };
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
@@ -395,13 +394,11 @@ where
     log::info!(
         "Joining ring via {} (at {}) (tx: {})",
         gateway.peer,
-        gateway
-            .location
-            .ok_or(conn_manager::ConnError::LocationUnknown)?,
+        gateway.location.ok_or(ConnectionError::LocationUnknown)?,
         tx
     );
 
-    conn_manager.add_connection(gateway, true);
+    conn_manager.add_connection(gateway.peer)?;
     let join_req = Message::from(messages::JoinRingMsg::Request {
         id: tx,
         msg: messages::JoinRequest::StartReq {
@@ -411,7 +408,7 @@ where
             max_hops_to_live,
         },
     });
-    conn_manager.send(gateway.peer, join_req).await?;
+    conn_manager.send(&gateway.peer, join_req).await?;
     op_storage.push(tx, Operation::JoinRing(join_op))?;
     Ok(())
 }
@@ -557,7 +554,7 @@ where
             let accepted_by = if ring.should_accept(
                 &joiner
                     .location
-                    .ok_or_else(|| OpError::from(ConnError::LocationUnknown))?,
+                    .ok_or_else(|| OpError::from(ConnectionError::LocationUnknown))?,
             ) {
                 log::debug!("Accepting proxy connection from {}", joiner.peer);
                 HashSet::from_iter([own_loc])
@@ -637,14 +634,14 @@ where
                 if ring.should_accept(
                     &other_peer
                         .location
-                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                        .ok_or(ConnectionError::LocationUnknown)?,
                 ) {
                     log::info!("Established connection to {}", other_peer.peer);
-                    conn_manager.add_connection(other_peer, false);
+                    conn_manager.add_connection(other_peer.peer)?;
                     ring.add_connection(
                         other_peer
                             .location
-                            .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                            .ok_or(ConnectionError::LocationUnknown)?,
                         other_peer.peer,
                     );
                     if other_peer.peer != sender.peer {
@@ -652,7 +649,7 @@ where
                         // the gateway will be notified in the last message
                         let _ = conn_manager
                             .send(
-                                other_peer.peer,
+                                &other_peer.peer,
                                 JoinRingMsg::Response {
                                     id,
                                     target: other_peer,
@@ -712,11 +709,9 @@ where
             if !state.sm.state().is_connected() {
                 return Err(OpError::InvalidStateTransition(id));
             } else {
-                conn_manager.add_connection(sender, false);
+                conn_manager.add_connection(sender.peer)?;
                 ring.add_connection(
-                    sender
-                        .location
-                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                    sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,
                 );
                 log::debug!("Openned connection with peer {}", by_peer.peer);
@@ -736,11 +731,9 @@ where
                     target.peer,
                     ring.own_location().location
                 );
-                conn_manager.add_connection(sender, false);
+                conn_manager.add_connection(sender.peer)?;
                 ring.add_connection(
-                    sender
-                        .location
-                        .ok_or(conn_manager::ConnError::LocationUnknown)?,
+                    sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,
                 );
                 new_state = None;
@@ -818,7 +811,7 @@ where
             req_peer.peer,
             forward_to.peer
         );
-        conn_manager.send(forward_to.peer, forwarded).await?;
+        conn_manager.send(&forward_to.peer, forwarded).await?;
         // awaiting for responses from forward nodes
         let new_state = JRState::AwaitingProxyResponse {
             target: req_peer,
@@ -894,9 +887,24 @@ mod messages {
             use JoinRingMsg::*;
             match self {
                 Response { target, .. } => Some(target),
+                Request {
+                    msg: JoinRequest::StartReq { target, .. },
+                    ..
+                } => Some(target),
                 Connected { target, .. } => Some(target),
                 _ => None,
             }
+        }
+
+        pub fn terminal(&self) -> bool {
+            use JoinRingMsg::*;
+            matches!(
+                self,
+                Response {
+                    msg: JoinResponse::Proxy { .. },
+                    ..
+                } | Connected { .. }
+            )
         }
     }
 
@@ -980,7 +988,7 @@ mod test {
     use crate::{
         contract::SimStoreError,
         message::TxType,
-        node::test_utils::{check_connectivity, SimNetwork},
+        node::test::{check_connectivity, SimNetwork},
     };
 
     #[test]
@@ -1070,7 +1078,7 @@ mod test {
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
         sim_nodes.build();
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(sim_nodes.connected("node-0"));
     }
 

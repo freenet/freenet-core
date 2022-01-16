@@ -12,7 +12,7 @@ use uuid::{
 };
 
 use crate::{
-    conn_manager::PeerKey,
+    node::{ConnectionError, PeerKey},
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation},
 };
@@ -146,6 +146,30 @@ pub(crate) enum Message {
     Subscribe(SubscribeMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
+    /// This are messages that will be received at the internal message event loop
+    /// sent by this same node from other point of the application.  
+    Internal(NodeActions),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) enum NodeActions {
+    /// For unspecified reasons the node is gracefully shutting down.
+    ShutdownNode,
+    /// Received a confirmation from a peer that a physical connection was established.
+    ConfirmedInbound,
+    /// Error while sending an other message
+    #[serde(skip)]
+    Error(ConnectionError),
+}
+
+impl Display for NodeActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShutdownNode => f.write_str("ShutdownNode"),
+            Self::ConfirmedInbound => f.write_str("ConfirmedInbound"),
+            Self::Error(_) => todo!(),
+        }
+    }
 }
 
 impl Message {
@@ -157,6 +181,7 @@ impl Message {
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
             Canceled(tx) => tx,
+            Internal(_) => unreachable!(),
         }
     }
 
@@ -167,7 +192,19 @@ impl Message {
             Put(op) => op.target(),
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
-            _ => todo!(),
+            Canceled(_) | Internal(_) => None,
+        }
+    }
+
+    /// Is the last expected message for this chain of messages.
+    pub fn terminal(&self) -> bool {
+        use Message::*;
+        match self {
+            JoinRing(op) => op.terminal(),
+            Put(op) => op.terminal(),
+            Get(op) => op.terminal(),
+            Subscribe(op) => op.terminal(),
+            Canceled(_) | Internal(_) => true,
         }
     }
 }
@@ -182,6 +219,7 @@ impl Display for Message {
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
             Canceled(msg) => msg.fmt(f)?,
+            Internal(msg) => msg.fmt(f)?,
         };
         write!(f, "}}")
     }

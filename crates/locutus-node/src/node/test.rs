@@ -9,17 +9,16 @@ use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
-use crate::contract::{Contract, ContractKey, ContractValue, SimStoreError};
-use crate::ring::PeerKeyLocation;
-use crate::user_events::UserEvent;
 use crate::{
-    conn_manager::PeerKey,
-    contract::MemoryContractHandler,
+    config::GlobalExecutor,
+    contract::{Contract, ContractKey, ContractValue, MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
-    ring::{Distance, Location},
-    user_events::test_utils::MemoryEventsGen,
+    ring::{Distance, Location, PeerKeyLocation},
+    user_events::{test::MemoryEventsGen, UserEvent},
     NodeConfig,
 };
+
+use super::PeerKey;
 
 pub fn get_free_port() -> Result<u16, ()> {
     let mut port;
@@ -231,13 +230,13 @@ impl SimNetwork {
             user_events.generate_events(specs.events_to_generate);
         }
         self.labels.insert(label, peer.peer_key);
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             if let Some(specs) = node_specs {
                 peer.append_contracts(specs.owned_contracts, specs.contract_subscribers)
                     .await
                     .map_err(|_| anyhow::anyhow!("failed inserting test owned contracts"))?;
             }
-            peer.listen_on(user_events).await
+            peer.run_node(user_events).await
         });
     }
 
@@ -246,15 +245,12 @@ impl SimNetwork {
 
         // Get node and gateways location by label
         for (node, label) in &self.nodes {
-            locations_by_node.insert(
-                label.to_string(),
-                node.op_storage.ring.own_location().clone(),
-            );
+            locations_by_node.insert(label.to_string(), node.op_storage.ring.own_location());
         }
         for (node, config) in &self.gateways {
             locations_by_node.insert(
                 config.label.to_string(),
-                node.op_storage.ring.own_location().clone(),
+                node.op_storage.ring.own_location(),
             );
         }
         locations_by_node
@@ -276,12 +272,7 @@ impl SimNetwork {
         }
     }
 
-    pub fn has_broadcast_contract(
-        &self,
-        broadcast_pairs: Vec<(&str, &str)>,
-        key: &ContractKey,
-        value: &ContractValue,
-    ) -> bool {
+    pub fn has_broadcast_contract(&self, broadcast_pairs: Vec<(&str, &str)>) -> bool {
         let peers = broadcast_pairs
             .into_iter()
             .step_by(2)
@@ -292,8 +283,7 @@ impl SimNetwork {
                 },
             )
             .collect();
-        self.event_listener
-            .has_broadcast_contract(peers, key, value)
+        self.event_listener.has_broadcasted_contract(peers)
     }
 
     pub fn count_broadcasts(&self, key: &ContractKey, value: &ContractValue) -> usize {

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -18,16 +18,15 @@ use crate::{
 
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
-#[derive(Clone)]
 pub(crate) struct OpManager<CErr> {
-    join_ring: Arc<DashMap<Transaction, JoinRingOp>>,
-    put: Arc<DashMap<Transaction, PutOp>>,
-    get: Arc<DashMap<Transaction, GetOp>>,
-    subscribe: Arc<DashMap<Transaction, SubscribeOp>>,
+    join_ring: DashMap<Transaction, JoinRingOp>,
+    put: DashMap<Transaction, PutOp>,
+    get: DashMap<Transaction, GetOp>,
+    subscribe: DashMap<Transaction, SubscribeOp>,
     notification_channel: Sender<Message>,
-    contract_handler: Arc<Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>>,
+    contract_handler: Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>,
     // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
-    _ops_ttl: Arc<RwLock<BTreeMap<Instant, Vec<Transaction>>>>,
+    _ops_ttl: RwLock<BTreeMap<Instant, Vec<Transaction>>>,
     pub ring: Ring,
 }
 
@@ -56,14 +55,14 @@ where
         contract_handler: ContractHandlerChannel<CErr, CHSenderHalve>,
     ) -> Self {
         Self {
-            join_ring: Arc::new(DashMap::default()),
-            put: Arc::new(DashMap::default()),
-            get: Arc::new(DashMap::default()),
-            subscribe: Arc::new(DashMap::default()),
+            join_ring: DashMap::default(),
+            put: DashMap::default(),
+            get: DashMap::default(),
+            subscribe: DashMap::default(),
             ring,
             notification_channel,
-            contract_handler: Arc::new(Mutex::new(contract_handler)),
-            _ops_ttl: Arc::new(RwLock::new(BTreeMap::new())),
+            contract_handler: Mutex::new(contract_handler),
+            _ops_ttl: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -73,13 +72,17 @@ where
     ///
     /// Useful when transitioning between states that do not require any network communication
     /// with other nodes, like intermediate states before returning.
-    pub async fn notify_change(
+    pub async fn notify_op_change(
         &self,
         msg: Message,
         op: Operation,
     ) -> Result<(), SendError<Message>> {
         // push back the state to the stack
         self.push(*msg.id(), op).expect("infallible");
+        self.notification_channel.send(msg).await
+    }
+
+    pub async fn notify_maintenance_op(&self, msg: Message) -> Result<(), SendError<Message>> {
         self.notification_channel.send(msg).await
     }
 

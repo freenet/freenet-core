@@ -17,7 +17,7 @@ use tokio::runtime::Runtime;
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 pub(crate) static CONF: Lazy<Config> =
     Lazy::new(|| Config::load_conf().expect("Failed to load configuration"));
-pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Initialize the executor once.
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_async_rt);
@@ -154,21 +154,20 @@ pub(super) mod tracing {
 
     impl Logger {
         /// Get or initialize a logger
-        #[allow(unused)]
         pub fn init_logger() {
             Lazy::force(&LOGGER);
         }
     }
 
     static LOGGER: Lazy<Logger> = Lazy::new(|| {
-        if let Err(err) = env_logger::builder()
+        let mut builder = env_logger::builder();
+        builder
             .format_indent(Some(4))
             .format_module_path(false)
             .format_timestamp_nanos()
             .target(env_logger::Target::Stdout)
-            .filter(None, CONF.log_level)
-            .try_init()
-        {
+            .filter(None, CONF.log_level);
+        if let Err(err) = builder.try_init() {
             eprintln!("Failed to initialize logger with error: {}", err);
         };
 

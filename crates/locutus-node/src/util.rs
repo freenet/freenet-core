@@ -104,7 +104,7 @@ where
     }
 }
 
-pub(crate) trait ExtendedIter: Iterator
+pub(crate) trait IterExt: Iterator
 where
     Self: Sized,
 {
@@ -125,7 +125,7 @@ where
     }
 }
 
-impl<T> ExtendedIter for T where T: Iterator {}
+impl<T> IterExt for T where T: Iterator {}
 
 #[test]
 fn randomize_iter() {

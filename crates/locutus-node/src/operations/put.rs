@@ -1,17 +1,15 @@
 //! A contract is PUT within a location distance, this entails that all nodes within
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
-// FIXME: should allow to do partial value updates
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey},
     contract::{Contract, ContractError, ContractHandlerEvent, ContractKey, ContractValue},
     message::{Message, Transaction, TxType},
-    node::OpManager,
+    node::{ConnectionBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -233,7 +231,7 @@ where
         target,
     })? {
         op_storage
-            .notify_change(Message::from(req_put), Operation::Put(put_op))
+            .notify_op_change(Message::from(req_put), Operation::Put(put_op))
             .await?;
     } else {
         return Err(OpError::UnexpectedOpState);
@@ -333,7 +331,7 @@ where
             mut skip_list,
         } => {
             let key = contract.key();
-            let cached_contract = op_storage.ring.contract_exists(&key);
+            let cached_contract = op_storage.ring.is_contract_cached(&key);
 
             log::debug!(
                 "Performing a SeekNode at {}, trying put the contract {}",
@@ -348,7 +346,7 @@ where
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
                 if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
-                    op_storage.ring.cached_contracts.insert(key);
+                    op_storage.ring.contract_cached(key);
                     log::debug!("Contract successfully cached");
                 } else {
                     log::error!(
@@ -373,7 +371,7 @@ where
             // if the change was successful, communicate this back to the requestor and broadcast the change
             conn_manager
                 .send(
-                    sender.peer,
+                    &sender.peer,
                     (PutMsg::SuccessfulUpdate {
                         id,
                         new_value: new_value.clone(),
@@ -429,7 +427,7 @@ where
                 new_state = None;
             } else {
                 op_storage
-                    .notify_change(internal_cb.into(), Operation::Put(state))
+                    .notify_op_change(internal_cb.into(), Operation::Put(state))
                     .await?;
                 return Err(OpError::StatePushed);
             }
@@ -488,7 +486,7 @@ where
             } else {
                 log::debug!("Callback to start broadcasting to other nodes");
                 op_storage
-                    .notify_change(internal_cb.into(), Operation::Put(state))
+                    .notify_op_change(internal_cb.into(), Operation::Put(state))
                     .await?;
                 return Err(OpError::StatePushed);
             }
@@ -511,7 +509,7 @@ where
 
             let mut broadcasting = Vec::with_capacity(broadcast_to.len());
             for peer in &broadcast_to {
-                let f = conn_manager.send(peer.peer, msg.clone().into());
+                let f = conn_manager.send(&peer.peer, msg.clone().into());
                 broadcasting.push(f);
             }
             let error_futures = futures::future::join_all(broadcasting)
@@ -536,7 +534,7 @@ where
                     peer.peer,
                     err
                 );
-                conn_manager.drop_connection(peer.peer);
+                conn_manager.drop_connection(&peer.peer);
                 incorrect_results += 1;
             }
 
@@ -570,7 +568,7 @@ where
             mut skip_list,
         } => {
             let key = contract.key();
-            let cached_contract = op_storage.ring.contract_exists(&key);
+            let cached_contract = op_storage.ring.is_contract_cached(&key);
             let within_caching_dist = op_storage.ring.within_caching_distance(&key.location());
             if !cached_contract && within_caching_dist {
                 // this node does not have the contract, so instead store the contract and execute the put op.
@@ -578,7 +576,7 @@ where
                     .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                     .await?;
                 if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
-                    op_storage.ring.cached_contracts.insert(key);
+                    op_storage.ring.contract_cached(key);
                     log::debug!("Contract successfully cached");
                 } else {
                     log::error!(
@@ -680,7 +678,7 @@ async fn forward_changes<CErr, CB>(
             // and forget about it, no need to keep track of this op or wait for response
             let _ = conn_manager
                 .send(
-                    peer.peer,
+                    &peer.peer,
                     (PutMsg::PutForward {
                         id,
                         contract: contract.clone(),
@@ -797,6 +795,14 @@ mod messages {
                 _ => None,
             }
         }
+
+        pub fn terminal(&self) -> bool {
+            use PutMsg::*;
+            matches!(
+                self,
+                SuccessfulUpdate { .. } | SeekNode { .. } | PutForward { .. }
+            )
+        }
     }
 
     impl Display for PutMsg {
@@ -821,9 +827,8 @@ mod test {
     use std::collections::HashMap;
 
     use crate::{
-        conn_manager::PeerKey,
         contract::SimStoreError,
-        node::test_utils::{check_connectivity, NodeSpecification, SimNetwork},
+        node::test::{check_connectivity, NodeSpecification, SimNetwork},
         user_events::UserEvent,
     };
 
@@ -835,7 +840,7 @@ mod test {
     fn successful_put_op_seq() -> Result<(), anyhow::Error> {
         let peer = PeerKey::random();
         let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), &peer);
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
@@ -901,7 +906,7 @@ mod test {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();
@@ -912,21 +917,20 @@ mod test {
         let mut locations = sim_nodes.get_locations_by_node();
         let node0_loc = locations.remove("node-0").unwrap();
         let node1_loc = locations.remove("node-1").unwrap();
-        let gateway0_loc = locations.remove("gateway-0").unwrap();
 
         // both own the contract, and one triggers an update
         let node_0 = NodeSpecification {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node1_loc.clone()])]),
+            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node1_loc])]),
         };
 
         let node_1 = NodeSpecification {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node0_loc.clone()])]),
+            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node0_loc])]),
         };
 
         let put_event = UserEvent::Put {
@@ -958,11 +962,7 @@ mod test {
             .await?;
         assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
         assert_eq!(1, sim_nodes.count_broadcasts(&key, &new_value));
-        assert!(sim_nodes.has_broadcast_contract(
-            vec![("node-0", "node-1"), ("node-1", "node-0")],
-            &key,
-            &new_value
-        ));
+        assert!(sim_nodes.has_broadcast_contract(vec![("node-0", "node-1"), ("node-1", "node-0")]));
         Ok(())
     }
 }

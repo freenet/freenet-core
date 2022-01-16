@@ -1,63 +1,70 @@
-use std::{net::IpAddr, sync::Arc};
+use std::sync::Arc;
 
 use libp2p::{
     core::{muxing, transport, upgrade},
     dns::TokioDnsConfig,
-    identify,
     identity::Keypair,
-    noise, ping,
-    swarm::SwarmBuilder,
+    noise,
     tcp::TokioTcpConfig,
-    yamux, PeerId, Swarm, Transport,
+    yamux, PeerId, Transport,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
+use super::{
+    conn_manager::p2p_protoc::P2pConnManager, join_ring_request, user_event_handling, PeerKey,
+};
 use crate::{
     config::{self, GlobalExecutor},
-    conn_manager::PeerKey,
     contract::{self, ContractHandler, ContractStoreError},
     message::Message,
-    ring::{PeerKeyLocation, Ring},
-    NodeConfig,
+    ring::Ring,
+    NodeConfig, UserEventsProxy,
 };
 
 use super::OpManager;
 
-const CURRENT_AGENT_VER: &str = "locutus/0.1.0";
-const CURRENT_IDENTIFY_PROTOC_VER: &str = "id/1.0.0";
-
-pub struct NodeLibP2P<CErr = ContractStoreError> {
-    listen_on: Option<(IpAddr, u16)>,
+pub(super) struct NodeP2P<CErr = ContractStoreError> {
     pub(crate) peer_key: PeerKey,
-    gateways: Vec<PeerKeyLocation>,
-    notification_channel: Receiver<Message>,
-    pub(crate) conn_manager: P2pConnectionManager,
     pub(crate) op_storage: Arc<OpManager<CErr>>,
+    notification_channel: Receiver<Message>,
+    pub(super) conn_manager: P2pConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
 
-pub(crate) struct P2pConnectionManager {
-    swarm: Swarm<NetBehaviour>,
-}
-
-impl<CErr> NodeLibP2P<CErr>
+impl<CErr> NodeP2P<CErr>
 where
-    CErr: std::error::Error,
+    CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub(super) async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(conn) = self.listen_on {
-            let listening_addr = super::multiaddr_from_connection(conn);
-            self.conn_manager.swarm.listen_on(listening_addr).unwrap();
-            Ok(())
-        } else {
-            anyhow::bail!("failed listening to connections")
+    pub(super) async fn run_node<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
+        // 1. start listening in case this is a listening node (gateway) and join the ring
+        if self.is_gateway {
+            self.conn_manager.listen_on()?;
         }
+        join_ring_request(
+            None,
+            self.peer_key,
+            self.conn_manager.gateways.iter(),
+            &self.op_storage,
+            &mut self.conn_manager.bridge,
+        )
+        .await?;
+
+        // 2. start the user event handler loop
+        GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
+
+        // 3. start the p2p event loop
+        self.conn_manager
+            .run_event_listener(self.op_storage.clone(), self.notification_channel)
+            .await
     }
 
-    pub(super) fn build<CH>(
+    pub fn build<CH>(
         config: NodeConfig,
-    ) -> Result<NodeLibP2P<<CH as ContractHandler>::Error>, anyhow::Error>
+    ) -> Result<NodeP2P<<CH as ContractHandler>::Error>, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
         <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
@@ -67,18 +74,7 @@ where
 
         let conn_manager = {
             let transport = Self::config_transport(&config.local_key)?;
-            let behaviour = Self::config_behaviour(&config.local_key);
-            // We set a global executor which is virtually the Tokio multi-threaded executor
-            // to reuse it's thread pool and scheduler in order to drive futures.
-            let global_executor = Box::new(GlobalExecutor);
-            let builder = SwarmBuilder::new(
-                transport,
-                behaviour,
-                PeerId::from(config.local_key.public()),
-            )
-            .executor(global_executor);
-            let swarm = builder.build();
-            P2pConnectionManager { swarm }
+            P2pConnManager::build(transport, &config)?
         };
 
         let ring = Ring::new(&config, &gateways)?;
@@ -87,15 +83,13 @@ where
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
         let contract_handler = CH::from(ch_channel);
 
-        tokio::spawn(contract::contract_handling(contract_handler));
+        GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
-        Ok(NodeLibP2P {
+        Ok(NodeP2P {
             peer_key,
             conn_manager,
-            gateways,
             notification_channel,
             op_storage,
-            listen_on: config.local_ip.zip(config.local_port),
             is_gateway: config.location.is_some(),
         })
     }
@@ -136,66 +130,18 @@ where
             .map(|(peer, muxer), _| (peer, muxing::StreamMuxerBox::new(muxer)))
             .boxed())
     }
-
-    fn config_behaviour(local_key: &Keypair) -> NetBehaviour {
-        let ident_config = identify::IdentifyConfig::new(
-            CURRENT_IDENTIFY_PROTOC_VER.to_string(),
-            local_key.public(),
-        )
-        .with_agent_version(CURRENT_AGENT_VER.to_string());
-
-        let ping = if cfg!(debug_assertions) {
-            ping::Ping::new(ping::PingConfig::new().with_keep_alive(true))
-        } else {
-            ping::Ping::default()
-        };
-        NetBehaviour {
-            identify: identify::Identify::new(ident_config),
-            ping,
-        }
-    }
-}
-
-/// The network behaviour implements the following capabilities:
-///
-/// - [Identify](https://github.com/libp2p/specs/tree/master/identify) libp2p protocol.
-/// - Pinging between peers.
-// TODO: - locutus routing and messaging protocol
-#[derive(libp2p::NetworkBehaviour)]
-#[behaviour(event_process = false)]
-#[behaviour(out_event = "NetEvent")]
-struct NetBehaviour {
-    identify: identify::Identify,
-    ping: ping::Ping,
-}
-
-#[derive(Debug)]
-pub(crate) enum NetEvent {
-    Identify(Box<identify::IdentifyEvent>),
-    Ping(ping::PingEvent),
-}
-
-impl From<identify::IdentifyEvent> for NetEvent {
-    fn from(event: identify::IdentifyEvent) -> NetEvent {
-        Self::Identify(Box::new(event))
-    }
-}
-
-impl From<ping::PingEvent> for NetEvent {
-    fn from(event: ping::PingEvent) -> NetEvent {
-        Self::Ping(event)
-    }
 }
 
 #[cfg(test)]
 mod test {
     use std::{net::Ipv4Addr, time::Duration};
 
+    use super::super::conn_manager::p2p_protoc::NetEvent;
     use super::*;
     use crate::{
-        config::tracing::Logger,
+        config::{tracing::Logger, GlobalExecutor},
         contract::CHandlerImpl,
-        node::{test_utils::get_free_port, InitPeerNode},
+        node::{test::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -203,18 +149,19 @@ mod test {
     use libp2p::swarm::SwarmEvent;
 
     /// Ping test event loop
-    async fn ping_ev_loop<CErr>(peer: &mut NodeLibP2P<CErr>) -> Result<(), ()>
+    async fn ping_ev_loop<CErr>(peer: &mut NodeP2P<CErr>) -> Result<(), ()>
     where
         CErr: std::error::Error,
     {
         loop {
             let ev = tokio::time::timeout(
-                Duration::from_secs(1),
+                Duration::from_secs(30),
                 peer.conn_manager.swarm.select_next_some(),
             );
             match ev.await {
                 Ok(SwarmEvent::Behaviour(NetEvent::Ping(ping))) => {
                     if ping.result.is_ok() {
+                        log::info!("ping done @ {}", peer.peer_key);
                         return Ok(());
                     }
                 }
@@ -231,33 +178,33 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping() -> Result<(), ()> {
         Logger::init_logger();
-
+        let peer1_port = get_free_port().unwrap();
         let peer1_key = Keypair::generate_ed25519();
         let peer1_id: PeerId = peer1_key.public().into();
-        let peer1_port = get_free_port().unwrap();
         let peer1_config = InitPeerNode::new(peer1_id, Location::random())
             .listening_ip(Ipv4Addr::LOCALHOST)
             .listening_port(peer1_port);
 
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
-            log::debug!("Initial peer port: {}", peer1_port);
             let mut config = NodeConfig::default();
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 =
-                NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap();
-            peer1.listen_on().await.unwrap();
-            ping_ev_loop(&mut peer1).await
+            let mut peer1 = Box::new(NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(
+                config,
+            )?);
+            peer1.conn_manager.listen_on()?;
+            ping_ev_loop(&mut peer1).await.unwrap();
+            Ok::<_, anyhow::Error>(())
         });
 
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
-            let mut peer2 =
-                NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(NodeConfig::default())
-                    .unwrap();
+            let mut config = NodeConfig::default();
+            config.add_gateway(peer1_config.clone());
+            let mut peer2 = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2

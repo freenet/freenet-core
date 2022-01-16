@@ -2,10 +2,9 @@ use std::time::Duration;
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey},
     contract::{ContractError, ContractHandlerEvent, ContractKey, StoreResponse},
     message::{Message, Transaction, TxType},
-    node::OpManager,
+    node::{ConnectionBridge, OpManager, PeerKey},
     ring::{PeerKeyLocation, RingError},
 };
 
@@ -260,7 +259,7 @@ where
         .consume_to_output(GetMsg::FetchRouting { target, id })?
     {
         op_storage
-            .notify_change(Message::from(req_get), Operation::Get(get_op))
+            .notify_op_change(Message::from(req_get), Operation::Get(get_op))
             .await?;
     }
     Ok(())
@@ -348,7 +347,7 @@ where
             target,
             ..
         } => {
-            if !op_storage.ring.contract_exists(&key) {
+            if !op_storage.ring.is_contract_cached(&key) {
                 //FIXME: should try forward to someone else who may have it first
                 // this node does not have the contract, return a void result to the requester
                 log::warn!(
@@ -512,7 +511,7 @@ where
                         sender.peer
                     );
                     op_storage
-                        .notify_change(
+                        .notify_op_change(
                             Message::from(GetMsg::ReturnGet {
                                 id,
                                 key,
@@ -623,6 +622,11 @@ mod messages {
                 Self::ReturnGet { target, .. } => Some(target),
             }
         }
+
+        pub fn terminal(&self) -> bool {
+            use GetMsg::*;
+            matches!(self, ReturnGet { .. } | SeekNode { .. })
+        }
     }
 
     impl Display for GetMsg {
@@ -640,11 +644,11 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
-    use crate::user_events::UserEvent;
     use crate::{
         contract::{Contract, ContractValue, SimStoreError},
+        node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
+        user_events::UserEvent,
     };
     use std::collections::HashMap;
 
@@ -656,7 +660,7 @@ mod test {
     fn successful_get_op_seq() -> Result<(), anyhow::Error> {
         let requester = PeerKey::random();
         let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), &requester);
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
@@ -710,7 +714,7 @@ mod test {
         const NUM_NODES: usize = 1usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let contract_val: ContractValue = gen.arbitrary()?;
@@ -758,7 +762,7 @@ mod test {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();

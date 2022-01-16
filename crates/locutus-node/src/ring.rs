@@ -29,8 +29,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    conn_manager::{self, PeerKey},
     contract::ContractKey,
+    node::{self, PeerKey},
     NodeConfig,
 };
 
@@ -62,7 +62,7 @@ pub(crate) struct Ring {
     pub peer_key: PeerKey,
     connections_by_location: Arc<RwLock<BTreeMap<Location, PeerKeyLocation>>>,
     /// contracts in the ring cached by this node
-    pub cached_contracts: DashSet<ContractKey>,
+    cached_contracts: DashSet<ContractKey>,
     own_location: Arc<AtomicU64>,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
@@ -173,8 +173,13 @@ impl Ring {
 
     /// Whether this node already has this contract cached or not.
     #[inline]
-    pub fn contract_exists(&self, key: &ContractKey) -> bool {
+    pub fn is_contract_cached(&self, key: &ContractKey) -> bool {
         self.cached_contracts.contains(key)
+    }
+
+    #[inline]
+    pub fn contract_cached(&self, key: ContractKey) {
+        self.cached_contracts.insert(key);
     }
 
     /// Update this node location.
@@ -190,6 +195,7 @@ impl Ring {
 
     /// Returns this node location in the ring, if any (must have join the ring already).
     pub fn own_location(&self) -> PeerKeyLocation {
+        log::debug!("Getting loc for peer {}", self.peer_key);
         let location = f64::from_le_bytes(self.own_location.load(SeqCst).to_le_bytes());
         let location = if (location - -1f64).abs() < f64::EPSILON {
             None
@@ -318,6 +324,9 @@ impl Ring {
             .subscribers
             .entry(contract)
             .or_insert(Vec::with_capacity(Self::MAX_SUBSCRIBERS));
+        if subs.len() >= Self::MAX_SUBSCRIBERS {
+            return Err(());
+        }
         if let Err(next_idx) = subs.value_mut().binary_search(&subscriber) {
             let subs = subs.value_mut();
             if subs.len() == Self::MAX_SUBSCRIBERS {
@@ -441,7 +450,7 @@ impl TryFrom<f64> for Location {
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]
-    ConnError(#[from] Box<conn_manager::ConnError>),
+    ConnError(#[from] Box<node::ConnectionError>),
     #[error("No ring connections found")]
     EmptyRing,
     #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
@@ -451,7 +460,6 @@ pub(crate) enum RingError {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::conn_manager::PeerKey;
 
     #[test]
     fn location_dist() {

@@ -106,12 +106,12 @@ impl std::fmt::Display for SimStoreError {
 impl std::error::Error for SimStoreError {}
 
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::contract::Contract;
 
     #[test]
     fn serialization() -> Result<(), anyhow::Error> {
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
 

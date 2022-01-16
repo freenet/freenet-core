@@ -4,10 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PEER_TIMEOUT,
-    conn_manager::{ConnectionBridge, PeerKey},
     contract::{ContractError, ContractKey},
     message::{Message, Transaction, TxType},
-    node::OpManager,
+    node::{ConnectionBridge, OpManager, PeerKey},
     ring::{PeerKeyLocation, RingError},
 };
 
@@ -111,9 +110,7 @@ impl StateMachineImpl for SubscribeOpSm {
                     key,
                     target,
                     subscriber,
-                    skip_list,
-                    htl,
-                    found: true,
+                    ..
                 },
             ) => {
                 log::info!(
@@ -160,7 +157,7 @@ where
     CErr: std::error::Error,
 {
     let (target, id) = if let SubscribeState::PrepareRequest { id, key } = sub_op.sm.state() {
-        if !op_storage.ring.contract_exists(key) {
+        if !op_storage.ring.is_contract_cached(key) {
             return Err(OpError::ContractError(ContractError::ContractNotFound(
                 *key,
             )));
@@ -183,7 +180,7 @@ where
         .consume_to_output(SubscribeMsg::FetchRouting { target, id })?
     {
         op_storage
-            .notify_change(Message::from(req_sub), Operation::Subscribe(sub_op))
+            .notify_op_change(Message::from(req_sub), Operation::Subscribe(sub_op))
             .await?;
     }
     Ok(())
@@ -257,7 +254,6 @@ where
                 subscriber: sender,
                 skip_list: vec![sender.peer],
                 htl: 0,
-                found: false,
             }));
         }
         SubscribeMsg::SeekNode {
@@ -267,7 +263,6 @@ where
             target,
             skip_list,
             htl,
-            found,
         } => {
             let sender = op_storage.ring.own_location();
             let return_err = || -> OperationResult {
@@ -283,7 +278,7 @@ where
                 }
             };
 
-            if !op_storage.ring.contract_exists(&key) {
+            if !op_storage.ring.is_contract_cached(&key) {
                 log::info!("Contract {} not found while processing info", key);
                 log::info!("Trying to found the contract from another node");
 
@@ -300,7 +295,7 @@ where
                 // Retry seek node when the contract to subscribe has not been found in this node
                 conn_manager
                     .send(
-                        new_target.peer,
+                        &new_target.peer,
                         (SubscribeMsg::SeekNode {
                             id,
                             key,
@@ -308,7 +303,6 @@ where
                             target: new_target,
                             skip_list: new_skip_list.clone(),
                             htl: new_htl,
-                            found: false,
                         })
                         .into(),
                     )
@@ -323,7 +317,6 @@ where
                         target,
                         skip_list,
                         htl,
-                        found: false,
                     })?
                     .map(Message::from);
                 new_state = Some(state);
@@ -342,7 +335,6 @@ where
                         subscriber,
                         skip_list,
                         htl,
-                        found: true,
                     })?
                     .map(Message::from);
             }
@@ -385,7 +377,6 @@ where
                         target,
                         skip_list: vec![target.peer],
                         htl: 0,
-                        found: false,
                     }));
                     new_state = Some(state);
                 } else {
@@ -451,7 +442,6 @@ mod messages {
             subscriber: PeerKeyLocation,
             skip_list: Vec<PeerKey>,
             htl: usize,
-            found: bool,
         },
         ReturnSub {
             id: Transaction,
@@ -486,6 +476,11 @@ mod messages {
                 _ => None,
             }
         }
+
+        pub fn terminal(&self) -> bool {
+            use SubscribeMsg::*;
+            matches!(self, ReturnSub { .. } | SeekNode { .. })
+        }
     }
 
     impl Display for SubscribeMsg {
@@ -504,18 +499,19 @@ mod messages {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::conn_manager::PeerKey;
-    use crate::contract::{Contract, ContractValue, SimStoreError};
-    use crate::node::test_utils::{check_connectivity, NodeSpecification, SimNetwork};
-    use crate::ring::Location;
-    use crate::user_events::UserEvent;
+    use crate::{
+        contract::{Contract, ContractValue, SimStoreError},
+        node::test::{check_connectivity, NodeSpecification, SimNetwork},
+        ring::Location,
+        user_events::UserEvent,
+    };
     use std::collections::HashMap;
 
     #[test]
     fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
         let peer = PeerKey::random();
         let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), &peer);
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
 
@@ -559,7 +555,6 @@ mod test {
                 subscriber: subscriber_loc,
                 skip_list: vec![subscriber_loc.peer],
                 htl: 0,
-                found: true,
             })?
             .ok_or_else(|| anyhow::anyhow!("no output"))?;
 
@@ -592,7 +587,6 @@ mod test {
             subscriber: subscriber_loc,
             skip_list: vec![subscriber_loc.peer, first_target_loc.peer],
             htl: 0,
-            found: false,
         })?;
 
         assert_eq!(target.state(), &SubscribeState::Completed);
@@ -605,7 +599,7 @@ mod test {
         const NUM_NODES: usize = 4usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::test_utils::random_bytes_1024();
+        let bytes = crate::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let contract_val: ContractValue = gen.arbitrary()?;

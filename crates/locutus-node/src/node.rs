@@ -7,33 +7,48 @@
 //! - libp2p: all the connection is handled by libp2p.
 //! - In memory: a simplifying node used for emulation pourpouses mainly.
 
-use std::{net::IpAddr, sync::Arc};
+use std::{fmt::Display, net::IpAddr, sync::Arc, time::Duration};
 
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{
+    core::PublicKey,
+    identity::{self, Keypair},
+    multiaddr::Protocol,
+    Multiaddr, PeerId,
+};
 
-use self::libp2p_impl::NodeLibP2P;
-use crate::{
-    config::CONF,
-    conn_manager::PeerKey,
-    contract::{CHandlerImpl, ContractError, ContractStoreError},
-    operations::{get, put, subscribe, OpError},
-    ring::{Location, PeerKeyLocation},
-    user_events::{UserEvent, UserEventsProxy},
+#[cfg(test)]
+use self::in_memory_impl::NodeInMemory;
+use self::{
+    event_listener::{EventListener, EventLog},
+    p2p_impl::NodeP2P,
 };
 #[cfg(test)]
-use crate::{contract::SimStoreError, user_events::test_utils::MemoryEventsGen};
+use crate::contract::SimStoreError;
+use crate::{
+    config::{tracing::Logger, GlobalExecutor, CONF},
+    contract::{CHandlerImpl, ContractError, ContractStoreError},
+    message::{Message, NodeActions, Transaction, TransactionType, TxType},
+    operations::{
+        get,
+        join_ring::{self, JoinRingMsg, JoinRingOp},
+        put, subscribe, OpError, Operation,
+    },
+    ring::{Location, PeerKeyLocation},
+    user_events::{UserEvent, UserEventsProxy},
+    util::{ExponentialBackoff, IterExt},
+};
 
-#[cfg(test)]
-pub(crate) use in_memory::NodeInMemory;
+pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use op_state::OpManager;
 
+mod conn_manager;
 mod event_listener;
 #[cfg(test)]
-mod in_memory;
-mod libp2p_impl;
+mod in_memory_impl;
 mod op_state;
+mod p2p_impl;
 #[cfg(test)]
-pub(crate) mod test_utils;
+pub(crate) mod test;
 
 pub struct Node<CErr>(NodeImpl<CErr>);
 
@@ -42,15 +57,14 @@ impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
+        Logger::init_logger();
         match self.0 {
-            NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
-            NodeImpl::InMemory(ref mut node) => {
-                let (_usr_ev_controller, rcv_copy) =
-                    tokio::sync::watch::channel((0, PeerKey::random()));
-                let user_events = MemoryEventsGen::new(rcv_copy, node.peer_key);
-                node.listen_on(user_events).await
-            }
+            NodeImpl::P2P(node) => node.run_node(user_events).await,
+            NodeImpl::InMemory(ref mut node) => node.run_node(user_events).await,
         }
     }
 }
@@ -60,22 +74,26 @@ impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn listen_on(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run<UsrEv>(self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: UserEventsProxy + Send + Sync + 'static,
+    {
+        Logger::init_logger();
         match self.0 {
-            NodeImpl::LibP2P(ref mut node) => node.listen_on().await,
+            NodeImpl::P2P(node) => node.run_node(user_events).await,
         }
     }
 }
 
 #[cfg(test)]
 enum NodeImpl<CErr> {
-    LibP2P(Box<NodeLibP2P<CErr>>),
+    P2P(Box<NodeP2P<CErr>>),
     InMemory(Box<NodeInMemory<CErr>>),
 }
 
 #[cfg(not(test))]
 enum NodeImpl<CErr> {
-    LibP2P(Box<NodeLibP2P<CErr>>),
+    P2P(Box<NodeP2P<CErr>>),
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -176,10 +194,10 @@ impl NodeConfig {
         self
     }
 
-    /// Builds a node using libp2p as backend connection manager.
-    pub fn build_libp2p(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
-        let node = NodeLibP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
-        Ok(Node(NodeImpl::LibP2P(Box::new(node))))
+    /// Builds a node using the default backend connection manager.
+    pub fn build(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
+        let node = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
+        Ok(Node(NodeImpl::P2P(Box::new(node))))
     }
 
     #[cfg(test)]
@@ -281,13 +299,46 @@ impl InitPeerNode {
     }
 }
 
-/// Small helper function to convert a tuple composed of an IP address and a port
-/// to a libp2p Multiaddr type.
-fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
-    let mut addr = Multiaddr::with_capacity(2);
-    addr.push(Protocol::from(conn.0));
-    addr.push(Protocol::Tcp(conn.1));
-    addr
+async fn join_ring_request<CErr, CM>(
+    backoff: Option<ExponentialBackoff>,
+    peer_key: PeerKey,
+    gateways: impl Iterator<Item = &PeerKeyLocation>,
+    op_storage: &OpManager<CErr>,
+    conn_manager: &mut CM,
+) -> Result<(), OpError<CErr>>
+where
+    CErr: std::error::Error,
+    CM: ConnectionBridge + Send + Sync,
+{
+    if let Some(gateway) = gateways.shuffle().take(1).next() {
+        let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
+        // initiate join action action per each gateway
+        let mut op = join_ring::JoinRingOp::initial_request(
+            peer_key,
+            *gateway,
+            op_storage.ring.max_hops_to_live,
+            tx_id,
+        );
+        if let Some(mut backoff) = backoff {
+            // backoff to retry later in case it failed
+            log::warn!(
+                "Performing a new join attempt, attempt number: {}",
+                backoff.retries()
+            );
+            if backoff.sleep_async().await.is_none() {
+                log::error!("Max number of retries reached");
+                return Err(OpError::MaxRetriesExceeded(
+                    tx_id,
+                    format!("{:?}", tx_id.tx_type()),
+                ));
+            }
+            op.backoff = Some(backoff);
+        }
+        join_ring::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
+    } else {
+        log::warn!("No gateways provided, single gateway node @ {}", peer_key);
+    }
+    Ok(())
 }
 
 /// Process user events.
@@ -298,8 +349,18 @@ where
 {
     loop {
         let ev = user_events.recv().await;
+        if let UserEvent::Shutdown = ev {
+            if let Err(err) = op_storage
+                .notify_maintenance_op(Message::Internal(NodeActions::ShutdownNode))
+                .await
+            {
+                log::error!("{}", err);
+            }
+            break;
+        }
+
         let op_storage_cp = op_storage.clone();
-        tokio::spawn(async move {
+        GlobalExecutor::spawn(async move {
             match ev {
                 UserEvent::Put { value, contract } => {
                     // Initialize a put op.
@@ -331,6 +392,8 @@ where
                 UserEvent::Subscribe { key } => {
                     // Initialize a subscribe op.
                     loop {
+                        // fixme: this will block the event loop until the subscribe op succeeds
+                        // instead the op should be deferred for later execution
                         let op =
                             subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.peer_key);
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
@@ -340,6 +403,7 @@ where
                                     get::GetOp::start_op(key, true, &op_storage_cp.ring.peer_key);
                                 if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
                                     log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
                                 }
                             }
                             Err(err) => {
@@ -350,7 +414,184 @@ where
                         }
                     }
                 }
+                UserEvent::Shutdown => unreachable!(),
             }
         });
+    }
+}
+
+macro_rules! log_handling_msg {
+    ($op:expr, $id:expr, $op_storage:ident) => {
+        log::debug!(
+            concat!("Handling ", $op, " get request @ {} (tx: {})"),
+            $op_storage.ring.peer_key,
+            $id
+        );
+    };
+}
+
+#[inline(always)]
+fn report_result<CErr>(op_result: Result<(), OpError<CErr>>)
+where
+    CErr: std::error::Error,
+{
+    if let Err(err) = op_result {
+        log::debug!("Finished tx w/ error: {}", err)
+    }
+}
+
+async fn process_message<CErr, CB>(
+    msg: Result<Message, ConnectionError>,
+    op_storage: Arc<OpManager<CErr>>,
+    mut conn_manager: CB,
+    event_listener: Option<Box<dyn EventListener + Send + Sync>>,
+) where
+    CB: ConnectionBridge,
+    CErr: std::error::Error + Sync + Send + 'static,
+{
+    match msg {
+        Ok(msg) => {
+            if let Some(mut listener) = event_listener {
+                listener.event_received(EventLog::new(&msg, &op_storage));
+            }
+            match msg {
+                Message::JoinRing(op) => {
+                    log_handling_msg!("join", op.id(), op_storage);
+                    let op_result =
+                        join_ring::handle_join_ring(&op_storage, &mut conn_manager, op).await;
+                    report_result(op_result);
+                }
+                Message::Put(op) => {
+                    log_handling_msg!("put", op.id(), op_storage);
+                    let op_result =
+                        put::handle_put_request(&op_storage, &mut conn_manager, op).await;
+                    report_result(op_result);
+                }
+                Message::Get(op) => {
+                    log_handling_msg!("get", op.id(), op_storage);
+                    let op_result =
+                        get::handle_get_request(&op_storage, &mut conn_manager, op).await;
+                    report_result(op_result);
+                }
+                Message::Subscribe(op) => {
+                    log_handling_msg!("subscribe", op.id(), op_storage);
+                    let op_result =
+                        subscribe::handle_subscribe_response(&op_storage, &mut conn_manager, op)
+                            .await;
+                    report_result(op_result);
+                }
+                _ => {}
+            }
+        }
+        Err(err) => {
+            report_result::<CErr>(Err(err.into()));
+        }
+    }
+}
+
+async fn handle_cancelled_op<CErr, CM>(
+    tx: Transaction,
+    peer_key: PeerKey,
+    gateways: impl Iterator<Item = &PeerKeyLocation>,
+    op_storage: &OpManager<CErr>,
+    conn_manager: &mut CM,
+) -> Result<(), OpError<CErr>>
+where
+    CErr: std::error::Error,
+    CM: ConnectionBridge + Send + Sync,
+{
+    log::warn!("Failed tx `{}`, potentially attempting a retry", tx);
+    match tx.tx_type() {
+        TransactionType::JoinRing => {
+            const MSG: &str = "Fatal error: unable to connect to the network";
+            // the attempt to join the network failed, this could be a fatal error since the node
+            // is useless without connecting to the network, we will retry with exponential backoff
+            match op_storage.pop(&tx) {
+                Some(Operation::JoinRing(JoinRingOp {
+                    backoff: Some(backoff),
+                    ..
+                })) => {
+                    if cfg!(test) {
+                        join_ring_request(None, peer_key, gateways, op_storage, conn_manager)
+                            .await?;
+                    } else {
+                        join_ring_request(
+                            Some(backoff),
+                            peer_key,
+                            gateways,
+                            op_storage,
+                            conn_manager,
+                        )
+                        .await?;
+                    }
+                }
+                None => {
+                    log::error!("{}", MSG);
+                    join_ring_request(None, peer_key, gateways, op_storage, conn_manager).await?;
+                }
+                _ => {}
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+pub struct PeerKey(PeerId);
+
+impl PeerKey {
+    pub fn random() -> Self {
+        PeerKey::from(Keypair::generate_ed25519().public())
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        self.0.to_bytes()
+    }
+}
+
+impl Display for PeerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<PublicKey> for PeerKey {
+    fn from(val: PublicKey) -> Self {
+        PeerKey(PeerId::from(val))
+    }
+}
+
+impl From<PeerId> for PeerKey {
+    fn from(val: PeerId) -> Self {
+        PeerKey(val)
+    }
+}
+
+mod serialization {
+    use libp2p::PeerId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::PeerKey;
+
+    impl Serialize for PeerKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_bytes(&self.0.to_bytes())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for PeerKey {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+            Ok(PeerKey(
+                PeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
+            ))
+        }
     }
 }

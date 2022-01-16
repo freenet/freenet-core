@@ -1,14 +1,12 @@
 use std::sync::atomic::Ordering::SeqCst;
 use std::{sync::atomic::AtomicUsize, time::Instant};
 
-use crate::contract::{ContractKey, ContractValue, StoreResponse};
-use crate::operations::get::GetMsg;
-use crate::operations::join_ring::JoinRingMsg;
-use crate::operations::put::PutMsg;
-use crate::ring::{Location, PeerKeyLocation};
+use super::PeerKey;
 use crate::{
-    conn_manager::PeerKey,
+    contract::{ContractKey, ContractValue, StoreResponse},
     message::{Message, Transaction},
+    operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
+    ring::{Location, PeerKeyLocation},
 };
 
 #[cfg(test)]
@@ -73,7 +71,7 @@ impl<'a> EventLog<'a> {
             }) => EventKind::Put(
                 PutEvent::BroadcastEmitted {
                     broadcast_to: broadcast_to.clone(),
-                    key: key.clone(),
+                    key: *key,
                     value: new_value.clone(),
                 },
                 *msg.id(),
@@ -85,8 +83,8 @@ impl<'a> EventLog<'a> {
                 ..
             }) => EventKind::Put(
                 PutEvent::BroadcastReceived {
-                    requester: sender.peer.clone(),
-                    key: key.clone(),
+                    requester: sender.peer,
+                    key: *key,
                     value: new_value.clone(),
                 },
                 *msg.id(),
@@ -246,7 +244,6 @@ mod test_utils {
     use std::{collections::HashMap, sync::Arc};
 
     use dashmap::DashMap;
-    use itertools::Itertools;
     use parking_lot::RwLock;
 
     use crate::{contract::ContractKey, message::TxType, ring::Distance};
@@ -297,24 +294,22 @@ mod test_utils {
             expected_key: &ContractKey,
             expected_value: &ContractValue,
         ) -> usize {
-            let mut logs = self.logs.read();
+            let logs = self.logs.read();
             logs.iter().filter(|log| {
                 matches!(log.kind, EventKind::Put(PutEvent::BroadcastEmitted { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
             }).count()
         }
 
-        pub fn has_broadcast_contract(
+        pub fn has_broadcasted_contract(
             &self,
             mut broadcast_pairs: Vec<(PeerKey, PeerKey)>,
-            expected_key: &ContractKey,
-            expected_value: &ContractValue,
         ) -> bool {
             let logs = self.logs.read();
             let mut broadcast_ops = logs.iter().filter_map(|l| {
                 if matches!(
                     l,
                     MessageLog {
-                        kind: EventKind::Put(_, id),
+                        kind: EventKind::Put(_, _id),
                         ..
                     }
                 ) {
@@ -355,17 +350,16 @@ mod test_utils {
                 _ => None,
             };
 
-            match broadcast {
+            match &broadcast {
                 Some(EventKind::Put(
                     PutEvent::BroadcastComplete {
-                        ref performer,
-                        ref requester,
+                        performer,
+                        requester,
                         ..
                     },
                     _,
                 )) => {
-                    let expected_pair = (performer, requester);
-                    broadcast_pairs.retain(|pair| matches!(pair, expected_pair));
+                    broadcast_pairs.retain(|(p, r)| p == performer && r == requester);
                     !broadcast_pairs.is_empty()
                 }
                 _ => false,

@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use stretto::AsyncCache;
 use tokio::sync::mpsc;
 
-use super::runtime::{ContractRuntime, ContractUpdateError};
-use super::test_utils::{MemKVStore, MockRuntime};
-use super::ContractStoreError;
-use crate::contract::store::ContractStore;
-use crate::contract::{Contract, ContractError, ContractKey, ContractValue};
+use super::{
+    runtime::{ContractRuntime, ContractUpdateError},
+    test::{MemKVStore, MockRuntime},
+    ContractStoreError,
+};
+use crate::contract::{store::ContractStore, Contract, ContractError, ContractKey, ContractValue};
 
 #[async_trait::async_trait]
 pub(crate) trait ContractHandler:
@@ -256,7 +257,7 @@ impl ContractHandler for CHandlerImpl {
 
 #[cfg(test)]
 mod test {
-    use crate::contract::test_utils::SimStoreError;
+    use crate::{config::GlobalExecutor, contract::test::SimStoreError};
 
     use super::*;
 
@@ -264,7 +265,7 @@ mod test {
     async fn channel_test() -> Result<(), anyhow::Error> {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
-        let h = tokio::spawn(async move {
+        let h = GlobalExecutor::spawn(async move {
             send_halve
                 .send_to_handler(ContractHandlerEvent::Cache(Contract::new(vec![0, 1, 2, 3])))
                 .await
@@ -301,7 +302,7 @@ mod sqlite {
     use once_cell::sync::Lazy;
     use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 
-    use crate::contract::test_utils::MockRuntime;
+    use crate::contract::test::MockRuntime;
 
     use super::*;
 
