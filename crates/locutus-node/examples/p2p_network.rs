@@ -37,6 +37,7 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
+    // wait for connection
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let contract = Contract::new(vec![1, 2, 3, 4]);
@@ -52,7 +53,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .await
         .map_err(|_| "channel closed")
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     manager
         .tx_gw_ev
@@ -79,6 +80,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let (tx_gw_ev, rx_gw_ev) = channel(100);
     let (tx_node_ev, rx_node_ev) = channel(100);
+    let manager = EventManager {
+        tx_gw_ev,
+        tx_node_ev,
+    };
 
     match (args.is_gw, args.is_peer) {
         (true, true) => bail!("a node cannot be both a gateway and a normal peer"),
@@ -89,9 +94,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 gw_loc,
                 UserEvents { rx_ev: rx_gw_ev },
             ));
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            Ok(())
         }
         (_, true) => {
             tokio::spawn(start_new_peer(gw_config, UserEvents { rx_ev: rx_node_ev }));
+            run_test(manager).await
         }
         (false, false) => {
             tokio::spawn(start_gateway(
@@ -102,14 +110,9 @@ async fn main() -> Result<(), anyhow::Error> {
             ));
             tokio::time::sleep(Duration::from_millis(100)).await;
             tokio::spawn(start_new_peer(gw_config, UserEvents { rx_ev: rx_node_ev }));
+            run_test(manager).await
         }
     }
-
-    let manager = EventManager {
-        tx_gw_ev,
-        tx_node_ev,
-    };
-    run_test(manager).await
 }
 
 #[derive(Clone)]
