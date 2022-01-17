@@ -48,16 +48,28 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .tx_node_ev
         .send(UserEvent::Put {
             value: init_val,
-            contract,
+            contract: contract.clone(),
         })
         .await
         .map_err(|_| "channel closed")
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(3)).await;
 
     manager
         .tx_gw_ev
         .send(UserEvent::Subscribe { key })
+        .await
+        .map_err(|_| "channel closed")
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let second_val = ContractValue::new(vec![2, 3, 1, 4]);
+    manager
+        .tx_node_ev
+        .send(UserEvent::Put {
+            value: second_val,
+            contract,
+        })
         .await
         .map_err(|_| "channel closed")
         .unwrap();
