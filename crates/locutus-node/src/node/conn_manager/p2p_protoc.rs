@@ -241,7 +241,7 @@ impl P2pConnManager {
 
             let bridge_msg = self.conn_bridge_rx.recv().map(|msg| {
                 if let Some((peer, msg)) = msg {
-                    log::info!("New message outbound: {:?}", msg);
+                    log::info!("Message outbound: {:?}", msg);
                     Ok(Right(SendMessage { peer, msg }))
                 } else {
                     Ok(Right(ClosedChannel))

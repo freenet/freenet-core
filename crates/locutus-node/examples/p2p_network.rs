@@ -1,6 +1,6 @@
 use std::{net::Ipv4Addr, time::Duration};
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
@@ -37,31 +37,30 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    // wait for connection
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    let contract = Contract::new(vec![1, 2, 3, 4]);
+    let contract = Contract::new(vec![7, 3, 9, 5]);
     let key = contract.key();
     let init_val = ContractValue::new(vec![1, 2, 3, 4]);
 
+    tokio::time::sleep(Duration::from_secs(10)).await;
     manager
-        .tx_node_ev
+        .tx_gw_ev
         .send(UserEvent::Put {
             value: init_val,
             contract: contract.clone(),
         })
         .await
-        .map_err(|_| "channel closed")
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(3)).await;
+        .map_err(|_| anyhow!("channel closed"))?;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     manager
         .tx_gw_ev
-        .send(UserEvent::Subscribe { key })
+        .send(UserEvent::Get {
+            key,
+            contract: false,
+        })
         .await
-        .map_err(|_| "channel closed")
-        .unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+        .map_err(|_| anyhow!("channel closed"))?;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let second_val = ContractValue::new(vec![2, 3, 1, 4]);
     manager
@@ -71,10 +70,8 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
             contract,
         })
         .await
-        .map_err(|_| "channel closed")
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_secs(60)).await;
+        .map_err(|_| anyhow!("channel closed"))?;
+    tokio::time::sleep(Duration::from_secs(300)).await;
     Ok(())
 }
 
@@ -106,14 +103,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 gw_loc,
                 UserEvents { rx_ev: rx_gw_ev },
             ));
-            tokio::time::sleep(Duration::from_secs(300)).await;
-            Ok(())
+            run_test(manager).await
         }
         (_, true) => {
             tokio::spawn(start_new_peer(gw_config, UserEvents { rx_ev: rx_node_ev }));
             run_test(manager).await
         }
-        (false, false) => {
+        _ => {
             tokio::spawn(start_gateway(
                 gw_key,
                 gw_port,
