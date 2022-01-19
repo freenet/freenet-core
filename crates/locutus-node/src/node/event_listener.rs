@@ -244,7 +244,6 @@ mod test_utils {
     use std::{collections::HashMap, sync::Arc};
 
     use dashmap::DashMap;
-    use log::log;
     use parking_lot::RwLock;
 
     use crate::{contract::ContractKey, message::TxType, ring::Distance};
