@@ -289,10 +289,7 @@ mod test_utils {
             })
         }
 
-        pub fn has_broadcasted_contract(
-            &self,
-            broadcast_pairs: Vec<(PeerKey, PeerKey)>,
-        ) -> bool {
+        pub fn has_broadcasted_contract(&self, broadcast_pairs: Vec<(PeerKey, PeerKey)>) -> bool {
             let logs = self.logs.read();
             let mut broadcast_ops = logs.iter().filter_map(|l| {
                 if matches!(
