@@ -275,7 +275,6 @@ impl SimNetwork {
     pub fn has_broadcast_contract(&self, broadcast_pairs: Vec<(&str, &str)>) -> bool {
         let peers = broadcast_pairs
             .into_iter()
-            .step_by(2)
             .map(
                 |(peer1, peer2)| match (self.labels.get(peer1), self.labels.get(peer2)) {
                     (Some(pk1), Some(pk2)) => (*pk1, *pk2),
@@ -284,10 +283,6 @@ impl SimNetwork {
             )
             .collect();
         self.event_listener.has_broadcasted_contract(peers)
-    }
-
-    pub fn count_broadcasts(&self, key: &ContractKey, value: &ContractValue) -> usize {
-        self.event_listener.get_broadcast_count(key, value)
     }
 
     pub fn has_got_contract(&self, peer: &str, key: &ContractKey) -> bool {

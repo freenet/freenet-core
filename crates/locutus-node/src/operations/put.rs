@@ -961,7 +961,6 @@ mod test {
             .trigger_event("gateway-0", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
-        assert_eq!(1, sim_nodes.count_broadcasts(&key, &new_value));
         assert!(sim_nodes.has_broadcast_contract(vec![("node-0", "node-1"), ("node-1", "node-0")]));
         Ok(())
     }

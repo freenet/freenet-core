@@ -244,6 +244,7 @@ mod test_utils {
     use std::{collections::HashMap, sync::Arc};
 
     use dashmap::DashMap;
+    use log::log;
     use parking_lot::RwLock;
 
     use crate::{contract::ContractKey, message::TxType, ring::Distance};
@@ -287,17 +288,6 @@ mod test_utils {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Put(PutEvent::PutComplete { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
             })
-        }
-
-        pub fn get_broadcast_count(
-            &self,
-            expected_key: &ContractKey,
-            expected_value: &ContractValue,
-        ) -> usize {
-            let logs = self.logs.read();
-            logs.iter().filter(|log| {
-                matches!(log.kind, EventKind::Put(PutEvent::BroadcastEmitted { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
-            }).count()
         }
 
         pub fn has_broadcasted_contract(
@@ -359,8 +349,11 @@ mod test_utils {
                     },
                     _,
                 )) => {
-                    broadcast_pairs.retain(|(p, r)| p == performer && r == requester);
-                    !broadcast_pairs.is_empty()
+                    let count = broadcast_pairs
+                        .iter()
+                        .filter(|(p, r)| p == performer && r == requester)
+                        .count();
+                    count > 0
                 }
                 _ => false,
             }
