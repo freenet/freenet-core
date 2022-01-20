@@ -828,7 +828,7 @@ mod test {
 
     use crate::{
         contract::SimStoreError,
-        node::test::{check_connectivity, NodeSpecification, SimNetwork},
+        node::test::{NodeSpecification, SimNetwork},
         user_events::UserEvent,
     };
 
@@ -953,15 +953,17 @@ mod test {
         ]);
 
         sim_nodes.build_with_specs(put_specs);
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
-        // trigger the put op @ gw-0, this
+        tokio::time::sleep(Duration::from_secs(3)).await;
         sim_nodes
             .trigger_event("gateway-0", 1, Some(Duration::from_secs(3)))
             .await?;
-        assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
-        assert!(sim_nodes.has_broadcast_contract(vec![("node-0", "node-1"), ("node-1", "node-0")]));
+
+        let contract_added = sim_nodes.has_put_contract("gateway-0", &key, &new_value);
+        let broadcast_contract =
+            sim_nodes.has_broadcast_contract(vec![("node-0", "node-1"), ("node-1", "node-0")]);
+        assert!(contract_added);
+        assert!(broadcast_contract);
         Ok(())
     }
 }
