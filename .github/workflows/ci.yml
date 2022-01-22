@@ -11,24 +11,24 @@ jobs:
     name: Test
 
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        args: [
+          "--no-default-features",
+          "--all-features",
+          "--benches --all-features",
+        ]
     env:
       LOCUTUS_LOG_LEVEL: error
 
     steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.9.1
+        with:
+          access_token: ${{ github.token }}
+
       - uses: actions/checkout@v2
 
-      - name: Cache
-        uses: actions/cache@v2.1.7
-        timeout-minutes: 1
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo
-            target
-          key: ${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-            ${{ github.job }}-${{ runner.os }}-
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -36,11 +36,13 @@ jobs:
           override: "true"
           default: "true"
 
+      - uses: Swatinem/rust-cache@v1
+
       - name: Build
         run: cargo build --locked
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace ${{ matrix.args }}
 
   clippy_check:
     name: Clippy
@@ -48,21 +50,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.9.1
+        with:
+          access_token: ${{ github.token }}
+
       - uses: actions/checkout@v2
 
-      - name: Cache
-        uses: actions/cache@v2.1.7
-        timeout-minutes: 1
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo
-            target
-          key: ${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-            ${{ github.job }}-${{ runner.os }}-
-      - uses: actions-rs/toolchain@v1.0.7
+      - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           profile: minimal
@@ -70,7 +65,9 @@ jobs:
           override: "true"
           default: "true"
 
-      - name: Use clippy to lint code
+      - uses: Swatinem/rust-cache@v1
+
+      - name: Clippy
         run: cargo clippy -- -D warnings
 
   fmt_check:
@@ -81,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - uses: actions-rs/toolchain@v1.0.7
+      - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           profile: minimal

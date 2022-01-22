@@ -1,6 +1,6 @@
 # Locutus 
 
-[![Build Status](https://github.com/freenet/locutus/actions/workflows/build.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/build.yml)
+[![Build Status](https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/ci.yml)
 
 ### Purpose
 
