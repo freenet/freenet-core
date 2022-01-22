@@ -33,7 +33,7 @@ pub(crate) trait ContractRuntime {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub(crate) enum ContractUpdateError {
+pub enum ContractUpdateError {
     #[error("invalid put value")]
     InvalidValue(Vec<u8>),
 }

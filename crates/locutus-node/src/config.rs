@@ -16,7 +16,7 @@ use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
-pub(crate) static CONF: Lazy<Config> =
+pub(crate) static CONFIG: Lazy<Config> =
     Lazy::new(|| Config::load_conf().expect("Failed to load configuration"));
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -33,28 +33,36 @@ pub(crate) struct Config {
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::Keypair>,
     pub log_level: log::LevelFilter,
-    pub config_paths: Paths,
+    pub config_paths: ConfigPaths,
 }
 
-pub struct Paths {
+#[derive(Debug)]
+pub(crate) struct ConfigPaths {
     pub app_data_dir: PathBuf,
     pub contracts_dir: PathBuf,
+    pub db_dir: PathBuf,
 }
 
-impl Paths {
-    fn new() -> std::io::Result<Paths> {
+impl ConfigPaths {
+    fn new() -> std::io::Result<ConfigPaths> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
         let app_data_dir: PathBuf = project_dir.data_dir().into();
         let contracts_dir = app_data_dir.join("contracts");
+        let db_dir = app_data_dir.join("db");
 
-        if !app_data_dir.exists() {
+        if !contracts_dir.exists() {
             fs::create_dir_all(&contracts_dir)?;
+        }
+
+        if !db_dir.exists() {
+            fs::create_dir_all(&db_dir)?;
         }
 
         Ok(Self {
             app_data_dir,
             contracts_dir,
+            db_dir,
         })
     }
 }
@@ -65,7 +73,6 @@ impl Config {
         settings
             .merge(config::Environment::with_prefix("LOCUTUS"))
             .unwrap();
-
         let local_peer_keypair =
             if let Ok(path_to_key) = settings.get_str("local_peer_key_file").map(PathBuf::from) {
                 let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
@@ -83,14 +90,14 @@ impl Config {
             } else {
                 None
             };
-
         let log_level = settings
-            .get_str("LOG")
+            .get_str("log")
             .map(|lvl| lvl.parse().ok())
             .ok()
             .flatten()
             .unwrap_or(log::LevelFilter::Info);
         let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
+        let config_paths = ConfigPaths::new()?;
 
         Ok(Config {
             bootstrap_ip,
@@ -98,7 +105,7 @@ impl Config {
             bootstrap_id,
             local_peer_keypair,
             log_level,
-            config_paths: Paths::new()?,
+            config_paths,
         })
     }
 
@@ -207,10 +214,14 @@ pub(super) mod tracing {
             .format_module_path(false)
             .format_timestamp_nanos()
             .target(env_logger::Target::Stdout)
-            .filter(None, CONF.log_level);
+            .filter(None, CONFIG.log_level);
         if let Err(err) = builder.try_init() {
             eprintln!("Failed to initialize logger with error: {}", err);
         };
+
+        if CONFIG.log_level == log::LevelFilter::Debug {
+            log::debug!("Configuration settings: {:?}", CONFIG.config_paths);
+        }
 
         Logger
     });

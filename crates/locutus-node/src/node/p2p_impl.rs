@@ -140,7 +140,7 @@ mod test {
     use super::*;
     use crate::{
         config::{tracing::Logger, GlobalExecutor},
-        contract::CHandlerImpl,
+        contract::TestContractHandler,
         node::{test::get_free_port, InitPeerNode},
         ring::Location,
     };
@@ -192,7 +192,7 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 = Box::new(NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(
+            let mut peer1 = Box::new(NodeP2P::<ContractStoreError>::build::<TestContractHandler>(
                 config,
             )?);
             peer1.conn_manager.listen_on()?;
@@ -204,7 +204,8 @@ mod test {
         let dialer = GlobalExecutor::spawn(async move {
             let mut config = NodeConfig::default();
             config.add_gateway(peer1_config.clone());
-            let mut peer2 = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(config).unwrap();
+            let mut peer2 =
+                NodeP2P::<ContractStoreError>::build::<TestContractHandler>(config).unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2

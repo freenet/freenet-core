@@ -7,7 +7,7 @@ use super::{
     ContractKey, ContractValue,
 };
 
-pub(super) struct MockRuntime {}
+pub(crate) struct MockRuntime {}
 
 impl ContractRuntime for MockRuntime {
     fn validate_value(&self, _value: &[u8]) -> bool {
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn serialization() -> Result<(), anyhow::Error> {
-        let bytes = crate::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
 

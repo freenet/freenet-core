@@ -6,7 +6,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
-use crate::config::CONF;
+use crate::config::CONFIG;
 
 use super::{Contract, ContractError, ContractKey};
 
@@ -15,6 +15,7 @@ pub(crate) struct ContractStore {
     mem_cache: AsyncCache<ContractKey, Contract>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
+//       to keep the total speed used under a configured threshold
 
 impl ContractStore {
     const MAX_MEM_CACHE: i64 = 10_000_000;
@@ -37,7 +38,7 @@ impl ContractStore {
             Ok(Some(contract.as_ref().clone()))
         } else {
             let key_path: PathBuf = (*key).into();
-            let key_path = CONF.config_paths.app_data_dir.join(key_path);
+            let key_path = CONFIG.config_paths.contracts_dir.join(key_path);
             let mut contract_file = File::open(key_path).await?;
             let mut contract_data = if let Ok(md) = contract_file.metadata().await {
                 Vec::with_capacity(md.len() as usize)
@@ -69,7 +70,7 @@ impl ContractStore {
         // write to disc
         {
             let key_path: PathBuf = key.into();
-            let key_path = CONF.config_paths.app_data_dir.join(key_path);
+            let key_path = CONFIG.config_paths.contracts_dir.join(key_path);
             if key_path.exists() {
                 return Ok(());
             }

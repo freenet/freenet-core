@@ -840,7 +840,7 @@ mod test {
     fn successful_put_op_seq() -> Result<(), anyhow::Error> {
         let peer = PeerKey::random();
         let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), &peer);
-        let bytes = crate::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
@@ -906,7 +906,7 @@ mod test {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();

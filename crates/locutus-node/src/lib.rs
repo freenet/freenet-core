@@ -5,7 +5,6 @@ mod message;
 mod node;
 mod operations;
 mod ring;
-pub(crate) mod test;
 mod user_events;
 pub(crate) mod util;
 

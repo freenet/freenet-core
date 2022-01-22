@@ -25,8 +25,8 @@ use self::{
 #[cfg(test)]
 use crate::contract::SimStoreError;
 use crate::{
-    config::{tracing::Logger, GlobalExecutor, CONF},
-    contract::{CHandlerImpl, ContractError, ContractStoreError},
+    config::{tracing::Logger, GlobalExecutor, CONFIG},
+    contract::{ContractError, ContractStoreError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{Message, NodeActions, Transaction, TransactionType, TxType},
     operations::{
         get,
@@ -128,7 +128,7 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn new() -> NodeConfig {
-        let local_key = if let Some(key) = &CONF.local_peer_keypair {
+        let local_key = if let Some(key) = &CONFIG.local_peer_keypair {
             key.clone()
         } else {
             identity::Keypair::generate_ed25519()
@@ -195,8 +195,9 @@ impl NodeConfig {
     }
 
     /// Builds a node using the default backend connection manager.
-    pub fn build(self) -> Result<Node<ContractStoreError>, anyhow::Error> {
-        let node = NodeP2P::<ContractStoreError>::build::<CHandlerImpl>(self)?;
+    pub fn build(self) -> Result<Node<SqlDbError>, anyhow::Error> {
+        let node =
+            NodeP2P::<ContractStoreError>::build::<SQLiteContractHandler<MockRuntime>>(self)?;
         Ok(Node(NodeImpl::P2P(Box::new(node))))
     }
 

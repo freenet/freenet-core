@@ -10,11 +10,14 @@ mod runtime;
 mod store;
 mod test;
 
+#[cfg(test)]
+pub(crate) use handler::test::TestContractHandler;
 pub(crate) use handler::{
-    contract_handler_channel, CHSenderHalve, CHandlerImpl, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, StoreResponse,
+    contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
+    ContractHandlerEvent, SQLiteContractHandler, SqlDbError, StoreResponse,
 };
 pub(crate) use store::ContractStoreError;
+pub(crate) use test::MockRuntime;
 #[cfg(test)]
 pub(crate) use test::{MemoryContractHandler, SimStoreError};
 
