@@ -1,6 +1,7 @@
 # Locutus 
 
 [![Build Status](https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/ci.yml)
+[![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/NWpN5mmg3x)
 
 ### Purpose
 
@@ -48,3 +49,14 @@ Locutus is currently in development, with an initial release planned for Q1 2022
 ### Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
+
+## License
+
+This project is licensed under either of
+
+- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+  [http://www.apache.org/licenses/LICENSE-2.0])
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  [http://opensource.org/licenses/MIT])
+
+at your option.
