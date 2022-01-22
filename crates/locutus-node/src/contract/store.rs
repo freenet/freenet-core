@@ -1,4 +1,12 @@
+use std::path::PathBuf;
+
 use stretto::AsyncCache;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
+
+use crate::config::CONF;
 
 use super::{Contract, ContractError, ContractKey};
 
@@ -6,6 +14,7 @@ use super::{Contract, ContractError, ContractKey};
 pub(crate) struct ContractStore {
     mem_cache: AsyncCache<ContractKey, Contract>,
 }
+// TODO: add functionality to delete old contracts which have not been used for a while
 
 impl ContractStore {
     const MAX_MEM_CACHE: i64 = 10_000_000;
@@ -27,7 +36,19 @@ impl ContractStore {
         if let Some(contract) = self.mem_cache.get(key) {
             Ok(Some(contract.as_ref().clone()))
         } else {
-            todo!("fetch from disc")
+            let key_path: PathBuf = (*key).into();
+            let key_path = CONF.config_paths.app_data_dir.join(key_path);
+            let mut contract_file = File::open(key_path).await?;
+            let mut contract_data = if let Ok(md) = contract_file.metadata().await {
+                Vec::with_capacity(md.len() as usize)
+            } else {
+                Vec::new()
+            };
+            contract_file.read_to_end(&mut contract_data).await?;
+            let contract = Contract::new(contract_data);
+            let size = contract.data.len() as i64;
+            self.mem_cache.insert(*key, contract.clone(), size).await;
+            Ok(Some(contract))
         }
     }
 
@@ -40,8 +61,21 @@ impl ContractStore {
         CErr: std::error::Error,
     {
         let key = contract.key();
-        let size = contract.data.len() as i64;
-        self.mem_cache.insert(key, contract, size).await;
+        // insert in the memory cache
+        {
+            let size = contract.data.len() as i64;
+            self.mem_cache.insert(key, contract.clone(), size).await;
+        }
+        // write to disc
+        {
+            let key_path: PathBuf = key.into();
+            let key_path = CONF.config_paths.app_data_dir.join(key_path);
+            if key_path.exists() {
+                return Ok(());
+            }
+            let mut file = File::create(key_path).await?;
+            file.write_all(&*contract.data).await?;
+        }
         Ok(())
     }
 }

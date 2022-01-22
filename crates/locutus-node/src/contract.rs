@@ -1,4 +1,4 @@
-use std::{ops::Deref, sync::Arc};
+use std::{ops::Deref, path::PathBuf, sync::Arc};
 
 use blake2::{Blake2b512, Digest};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -159,6 +159,13 @@ impl ContractKey {
     }
 }
 
+impl From<ContractKey> for PathBuf {
+    fn from(val: ContractKey) -> Self {
+        let r = hex::encode(val.0);
+        PathBuf::from(r)
+    }
+}
+
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let r = hex::encode(self.0);
@@ -214,4 +221,6 @@ pub(crate) enum ContractError<CErr> {
     ChannelDropped(Box<ContractHandlerEvent<CErr>>),
     #[error("no response received from handler")]
     NoEvHandlerResponse,
+    #[error(transparent)]
+    IOError(#[from] std::io::Error),
 }

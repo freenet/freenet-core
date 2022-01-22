@@ -199,7 +199,7 @@ impl P2pConnManager {
         loop {
             let net_msg = self.swarm.select_next_some().map(|event| match event {
                 SwarmEvent::Behaviour(NetEvent::Locutus(msg)) => {
-                    log::info!("Message inbound: {:?}", msg);
+                    log::debug!("Message inbound: {:?}", msg);
                     Ok(Left(*msg))
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -241,7 +241,7 @@ impl P2pConnManager {
 
             let bridge_msg = self.conn_bridge_rx.recv().map(|msg| {
                 if let Some((peer, msg)) = msg {
-                    log::info!("Message outbound: {:?}", msg);
+                    log::debug!("Message outbound: {:?}", msg);
                     Ok(Right(SendMessage { peer, msg }))
                 } else {
                     Ok(Right(ClosedChannel))

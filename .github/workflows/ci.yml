@@ -13,13 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        args: [
-          "--no-default-features",
-          "--all-features",
-          "--benches --all-features",
-        ]
+        args:
+          [
+            "--no-default-features",
+            "--all-features",
+            "--benches --all-features",
+          ]
     env:
-      LOCUTUS_LOG_LEVEL: error
+      LOCUTUS_LOG: error
 
     steps:
       - name: Cancel Previous Runs

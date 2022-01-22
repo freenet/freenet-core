@@ -1,6 +1,6 @@
 use std::{
     convert::TryFrom,
-    fs::File,
+    fs::{self, File},
     future::Future,
     io::Read,
     net::{IpAddr, Ipv4Addr},
@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use directories::ProjectDirs;
 use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
@@ -22,16 +23,44 @@ pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 // Initialize the executor once.
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_async_rt);
 
+const QUALIFIER: &str = "";
+const ORGANIZATION: &str = "The Freenet Project Inc";
+const APPLICATION: &str = "Locutus";
+
 pub(crate) struct Config {
     pub bootstrap_ip: IpAddr,
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::Keypair>,
     pub log_level: log::LevelFilter,
+    pub config_paths: Paths,
+}
+
+pub struct Paths {
+    pub app_data_dir: PathBuf,
+    pub contracts_dir: PathBuf,
+}
+
+impl Paths {
+    fn new() -> std::io::Result<Paths> {
+        let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        let app_data_dir: PathBuf = project_dir.data_dir().into();
+        let contracts_dir = app_data_dir.join("contracts");
+
+        if !app_data_dir.exists() {
+            fs::create_dir_all(&contracts_dir)?;
+        }
+
+        Ok(Self {
+            app_data_dir,
+            contracts_dir,
+        })
+    }
 }
 
 impl Config {
-    pub fn load_conf() -> Result<Config, ()> {
+    pub fn load_conf() -> std::io::Result<Config> {
         let mut settings = config::Config::new();
         settings
             .merge(config::Environment::with_prefix("LOCUTUS"))
@@ -47,46 +76,58 @@ impl Config {
                 });
                 let mut buf = Vec::new();
                 key_file.read_to_end(&mut buf).unwrap();
-                Some(identity::Keypair::from_protobuf_encoding(&buf).map_err(|_| ())?)
+                Some(
+                    identity::Keypair::from_protobuf_encoding(&buf)
+                        .map_err(|_| std::io::ErrorKind::InvalidData)?,
+                )
             } else {
                 None
             };
 
         let log_level = settings
-            .get_str("log_level")
+            .get_str("LOG")
             .map(|lvl| lvl.parse().ok())
             .ok()
             .flatten()
             .unwrap_or(log::LevelFilter::Info);
         let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
+
         Ok(Config {
             bootstrap_ip,
             bootstrap_port,
             bootstrap_id,
             local_peer_keypair,
             log_level,
+            config_paths: Paths::new()?,
         })
     }
 
-    fn get_bootstrap_host(settings: &config::Config) -> Result<(IpAddr, u16, Option<PeerId>), ()> {
+    fn get_bootstrap_host(
+        settings: &config::Config,
+    ) -> std::io::Result<(IpAddr, u16, Option<PeerId>)> {
         let bootstrap_ip = IpAddr::from_str(
             &settings
                 .get_str("bootstrap_host")
                 .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
         )
-        .map_err(|_err| ())?;
+        .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
 
         let bootstrap_port = settings
             .get_int("bootstrap_port")
+            .ok()
             .map(u16::try_from)
             .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
-            .map_err(|_err| ())?;
+            .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
 
-        let id_str = settings
+        let id_str = if let Some(id_str) = settings
             .get_str("bootstrap_id")
             .ok()
-            .map(|id| id.parse().map_err(|_err| ()).ok())
-            .flatten();
+            .map(|id| id.parse().map_err(|_err| std::io::ErrorKind::InvalidInput))
+        {
+            Some(id_str?)
+        } else {
+            None
+        };
 
         Ok((bootstrap_ip, bootstrap_port, id_str))
     }

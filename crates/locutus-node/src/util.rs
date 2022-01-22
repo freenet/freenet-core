@@ -57,7 +57,7 @@ impl ExponentialBackoff {
 
 // This is extremely inefficient for large sizes but is not what
 // we are really using this for so this ok for now.
-// todo: if necessary implement in the future randomization via `modular multiplicative inverse`
+// TODO: if necessary implement in the future randomization via `modular multiplicative inverse` method
 pub(crate) struct Shuffle<Iter, T>
 where
     Iter: Iterator<Item = T>,
