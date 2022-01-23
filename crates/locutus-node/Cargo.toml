@@ -8,11 +8,6 @@ resolver = "2"
 [lib]
 path = "src/lib.rs"
 
-[[bin]]
-name = "node-deploy" 
-path = "bin/gateway-deploy.rs"
-doc = false
-
 [dependencies]
 anyhow = "1"
 arbitrary = { version = "1", features = ["derive"] }
