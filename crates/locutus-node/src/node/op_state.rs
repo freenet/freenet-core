@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use dashmap::DashMap;
+use either::Either;
 use parking_lot::RwLock;
 use tokio::sync::{
     mpsc::{error::SendError, Sender},
@@ -9,7 +10,7 @@ use tokio::sync::{
 
 use crate::{
     contract::{CHSenderHalve, ContractError, ContractHandlerChannel, ContractHandlerEvent},
-    message::{Message, Transaction, TransactionType},
+    message::{Message, NodeEvent, Transaction, TransactionType},
     operations::{
         get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpError, Operation,
     },
@@ -23,7 +24,7 @@ pub(crate) struct OpManager<CErr> {
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
-    notification_channel: Sender<Message>,
+    notification_channel: Sender<Either<Message, NodeEvent>>,
     contract_handler: Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>,
     // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
     _ops_ttl: RwLock<BTreeMap<Instant, Vec<Transaction>>>,
@@ -44,7 +45,7 @@ where
 {
     pub fn new(
         ring: Ring,
-        notification_channel: Sender<Message>,
+        notification_channel: Sender<Either<Message, NodeEvent>>,
         contract_handler: ContractHandlerChannel<CErr, CHSenderHalve>,
     ) -> Self {
         Self {
@@ -72,11 +73,18 @@ where
     ) -> Result<(), SendError<Message>> {
         // push back the state to the stack
         self.push(*msg.id(), op).expect("infallible");
-        self.notification_channel.send(msg).await
+        self.notification_channel
+            .send(Either::Left(msg))
+            .await
+            .map_err(|err| SendError(err.0.unwrap_left()))
     }
 
-    pub async fn notify_maintenance_op(&self, msg: Message) -> Result<(), SendError<Message>> {
-        self.notification_channel.send(msg).await
+    /// Send an internal message to this node event loop.
+    pub async fn notify_internal_op(&self, msg: NodeEvent) -> Result<(), SendError<NodeEvent>> {
+        self.notification_channel
+            .send(Either::Right(msg))
+            .await
+            .map_err(|err| SendError(err.0.unwrap_right()))
     }
 
     /// Send an event to the contract handler and await a response event from it if successful.

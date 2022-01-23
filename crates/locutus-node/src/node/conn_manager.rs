@@ -18,9 +18,9 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
 #[async_trait::async_trait]
 pub(crate) trait ConnectionBridge {
-    fn add_connection(&mut self, peer: PeerKey) -> ConnResult<()>;
+    async fn add_connection(&mut self, peer: PeerKey) -> ConnResult<()>;
 
-    fn drop_connection(&mut self, peer: &PeerKey);
+    async fn drop_connection(&mut self, peer: &PeerKey) -> ConnResult<()>;
 
     async fn send(&self, target: &PeerKey, msg: Message) -> ConnResult<()>;
 }

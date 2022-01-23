@@ -25,7 +25,7 @@ use self::{
 use crate::{
     config::{tracing::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, ContractStoreError, MockRuntime, SQLiteContractHandler, SqlDbError},
-    message::{Message, NodeActions, Transaction, TransactionType, TxType},
+    message::{Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
@@ -306,10 +306,7 @@ where
     loop {
         let ev = user_events.recv().await;
         if let UserEvent::Shutdown = ev {
-            if let Err(err) = op_storage
-                .notify_maintenance_op(Message::Internal(NodeActions::ShutdownNode))
-                .await
-            {
+            if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
                 log::error!("{}", err);
             }
             break;

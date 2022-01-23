@@ -83,17 +83,19 @@ impl Clone for MemoryConnManager {
 
 #[async_trait::async_trait]
 impl ConnectionBridge for MemoryConnManager {
-    async fn send(&self, target: &PeerKey, msg: Message) -> Result<(), ConnectionError> {
+    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
         let msg = bincode::serialize(&msg)?;
         self.transport.send(*target, msg);
         Ok(())
     }
 
-    fn add_connection(&mut self, _peer: PeerKey) -> super::ConnResult<()> {
+    async fn add_connection(&mut self, _peer: PeerKey) -> super::ConnResult<()> {
         Ok(())
     }
 
-    fn drop_connection(&mut self, _peer: &PeerKey) {}
+    async fn drop_connection(&mut self, _peer: &PeerKey) -> super::ConnResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]

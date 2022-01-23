@@ -532,7 +532,7 @@ where
                     peer.peer,
                     err
                 );
-                conn_manager.drop_connection(&peer.peer);
+                conn_manager.drop_connection(&peer.peer).await?;
                 incorrect_results += 1;
             }
 

@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use either::Either;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -12,7 +13,7 @@ use crate::{
         self, Contract, ContractError, ContractHandler, ContractHandlerEvent, ContractValue,
         SimStoreError,
     },
-    message::Message,
+    message::{Message, NodeEvent},
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     ContractKey, NodeConfig,
@@ -22,7 +23,7 @@ pub(super) struct NodeInMemory<CErr = SimStoreError> {
     pub peer_key: PeerKey,
     pub op_storage: Arc<OpManager<CErr>>,
     gateways: Vec<PeerKeyLocation>,
-    notification_channel: Receiver<Message>,
+    notification_channel: Receiver<Either<Message, NodeEvent>>,
     conn_manager: MemoryConnManager,
     event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
 }
@@ -119,7 +120,7 @@ where
     async fn run_event_listener(&mut self) -> Result<(), anyhow::Error> {
         loop {
             let msg = tokio::select! {
-                msg = self.conn_manager.recv() => { msg }
+                msg = self.conn_manager.recv() => { msg.map(Either::Left) }
                 msg = self.notification_channel.recv() => if let Some(msg) = msg {
                     Ok(msg)
                 } else {
@@ -127,7 +128,7 @@ where
                 }
             };
 
-            if let Ok(Message::Canceled(tx)) = msg {
+            if let Ok(Either::Left(Message::Canceled(tx))) = msg {
                 handle_cancelled_op(
                     tx,
                     self.peer_key,
@@ -138,6 +139,21 @@ where
                 .await?;
                 continue;
             }
+
+            let msg = match msg {
+                Ok(Either::Left(msg)) => Ok(msg),
+                Ok(Either::Right(action)) => match action {
+                    NodeEvent::ShutdownNode => break Ok(()),
+                    NodeEvent::ConfirmedInbound => continue,
+                    NodeEvent::DropConnection(_) => continue,
+                    NodeEvent::AcceptConnection(_) => continue,
+                    NodeEvent::Error(err) => {
+                        log::error!("Connection error within ops: {err}");
+                        continue;
+                    }
+                },
+                Err(err) => Err(err),
+            };
 
             let op_storage = self.op_storage.clone();
             let conn_manager = self.conn_manager.clone();

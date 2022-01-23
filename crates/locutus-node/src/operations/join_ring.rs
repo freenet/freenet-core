@@ -398,7 +398,7 @@ where
         tx
     );
 
-    conn_manager.add_connection(gateway.peer)?;
+    conn_manager.add_connection(gateway.peer).await?;
     let join_req = Message::from(messages::JoinRingMsg::Request {
         id: tx,
         msg: messages::JoinRequest::StartReq {
@@ -637,7 +637,7 @@ where
                         .ok_or(ConnectionError::LocationUnknown)?,
                 ) {
                     log::info!("Established connection to {}", other_peer.peer);
-                    conn_manager.add_connection(other_peer.peer)?;
+                    conn_manager.add_connection(other_peer.peer).await?;
                     ring.add_connection(
                         other_peer
                             .location
@@ -709,7 +709,7 @@ where
             if !state.sm.state().is_connected() {
                 return Err(OpError::InvalidStateTransition(id));
             } else {
-                conn_manager.add_connection(sender.peer)?;
+                conn_manager.add_connection(sender.peer).await?;
                 ring.add_connection(
                     sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,
@@ -731,7 +731,7 @@ where
                     target.peer,
                     ring.own_location().location
                 );
-                conn_manager.add_connection(sender.peer)?;
+                conn_manager.add_connection(sender.peer).await?;
                 ring.add_connection(
                     sender.location.ok_or(ConnectionError::LocationUnknown)?,
                     sender.peer,

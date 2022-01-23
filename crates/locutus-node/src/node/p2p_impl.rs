@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use either::Either;
 use libp2p::{
     core::{muxing, transport, upgrade},
     dns::TokioDnsConfig,
@@ -16,7 +17,7 @@ use super::{
 use crate::{
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler, ContractStoreError},
-    message::Message,
+    message::{Message, NodeEvent},
     ring::Ring,
     NodeConfig, UserEventsProxy,
 };
@@ -26,7 +27,7 @@ use super::OpManager;
 pub(super) struct NodeP2P<CErr = ContractStoreError> {
     pub(crate) peer_key: PeerKey,
     pub(crate) op_storage: Arc<OpManager<CErr>>,
-    notification_channel: Receiver<Message>,
+    notification_channel: Receiver<Either<Message, NodeEvent>>,
     pub(super) conn_manager: P2pConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
