@@ -27,18 +27,17 @@ const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Locutus";
 
-pub(crate) struct Config {
+pub struct Config {
     pub bootstrap_ip: IpAddr,
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::Keypair>,
-    pub log_level: log::LevelFilter,
-    pub config_paths: ConfigPaths,
+    pub(crate) log_level: log::LevelFilter,
+    pub(crate) config_paths: ConfigPaths,
 }
 
 #[derive(Debug)]
 pub(crate) struct ConfigPaths {
-    pub app_data_dir: PathBuf,
     pub contracts_dir: PathBuf,
     pub db_dir: PathBuf,
 }
@@ -60,7 +59,6 @@ impl ConfigPaths {
         }
 
         Ok(Self {
-            app_data_dir,
             contracts_dir,
             db_dir,
         })

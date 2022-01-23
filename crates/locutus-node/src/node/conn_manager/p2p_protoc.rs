@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::Poll,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use asynchronous_codec::{BytesMut, Framed};
@@ -455,15 +455,6 @@ pub(in crate::node) enum HandlerEvent {
     Outbound(Message),
 }
 
-impl HandlerEvent {
-    fn unwrap_inbound(self) -> Message {
-        match self {
-            Self::Inbound(msg) => msg,
-            _ => panic!(),
-        }
-    }
-}
-
 /// Handles the connection with a given peer.
 pub(in crate::node) struct Handler {
     substreams: Vec<SubstreamState>,
@@ -507,10 +498,7 @@ enum SubstreamState {
         substream: LocutusStream<NegotiatedSubstream>,
     },
     /// An error happened on the substream and we should report the error to the user.
-    ReportError {
-        conn_id: UniqConnId,
-        error: ConnectionError,
-    },
+    ReportError { error: ConnectionError },
 }
 
 impl SubstreamState {
@@ -520,8 +508,6 @@ impl SubstreamState {
 }
 
 impl Handler {
-    const KEEP_ALIVE: Duration = Duration::from_secs(30);
-
     fn new() -> Self {
         Self {
             substreams: vec![],
@@ -661,7 +647,6 @@ impl ProtocolsHandler for Handler {
     ) {
         self.protocol_status = ProtocolStatus::FailedUpgrade;
         self.substreams.push(SubstreamState::ReportError {
-            conn_id: self.uniq_conn_id,
             error: (Box::new(error)).into(),
         });
         self.uniq_conn_id += 1;

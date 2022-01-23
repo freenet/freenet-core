@@ -11,7 +11,7 @@ use std::{fmt::Display, net::IpAddr, sync::Arc, time::Duration};
 
 use libp2p::{
     core::PublicKey,
-    identity::{self, Keypair},
+    identity::{self},
     multiaddr::Protocol,
     Multiaddr, PeerId,
 };
@@ -22,8 +22,6 @@ use self::{
     event_listener::{EventListener, EventLog},
     p2p_impl::NodeP2P,
 };
-#[cfg(test)]
-use crate::contract::SimStoreError;
 use crate::{
     config::{tracing::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, ContractStoreError, MockRuntime, SQLiteContractHandler, SqlDbError},
@@ -50,26 +48,8 @@ mod p2p_impl;
 #[cfg(test)]
 pub(crate) mod test;
 
-pub struct Node<CErr>(NodeImpl<CErr>);
+pub struct Node<CErr>(NodeP2P<CErr>);
 
-#[cfg(test)]
-impl<CErr> Node<CErr>
-where
-    CErr: std::error::Error + Send + Sync + 'static,
-{
-    pub async fn run<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
-    where
-        UsrEv: UserEventsProxy + Send + Sync + 'static,
-    {
-        Logger::init_logger();
-        match self.0 {
-            NodeImpl::P2P(node) => node.run_node(user_events).await,
-            NodeImpl::InMemory(ref mut node) => node.run_node(user_events).await,
-        }
-    }
-}
-
-#[cfg(not(test))]
 impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
@@ -79,21 +59,8 @@ where
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
         Logger::init_logger();
-        match self.0 {
-            NodeImpl::P2P(node) => node.run_node(user_events).await,
-        }
+        self.0.run_node(user_events).await
     }
-}
-
-#[cfg(test)]
-enum NodeImpl<CErr> {
-    P2P(Box<NodeP2P<CErr>>),
-    InMemory(Box<NodeInMemory<CErr>>),
-}
-
-#[cfg(not(test))]
-enum NodeImpl<CErr> {
-    P2P(Box<NodeP2P<CErr>>),
 }
 
 /// When instancing a node you can either join an existing network or bootstrap a new network with a listener
@@ -198,19 +165,7 @@ impl NodeConfig {
     pub fn build(self) -> Result<Node<SqlDbError>, anyhow::Error> {
         let node =
             NodeP2P::<ContractStoreError>::build::<SQLiteContractHandler<MockRuntime>>(self)?;
-        Ok(Node(NodeImpl::P2P(Box::new(node))))
-    }
-
-    #[cfg(test)]
-    /// Builds a node using in-memory transport. Used for testing pourpouses.
-    pub(crate) fn build_in_memory(self) -> Result<Node<SimStoreError>, anyhow::Error> {
-        use self::event_listener::TestEventListener;
-        use crate::contract::MemoryContractHandler;
-
-        let listener = Box::new(TestEventListener::new());
-        let in_mem =
-            NodeInMemory::<SimStoreError>::build::<MemoryContractHandler>(self, Some(listener))?;
-        Ok(Node(NodeImpl::InMemory(Box::new(in_mem))))
+        Ok(Node(node))
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
@@ -393,7 +348,7 @@ where
                 UserEvent::Subscribe { key } => {
                     // Initialize a subscribe op.
                     loop {
-                        // fixme: this will block the event loop until the subscribe op succeeds
+                        // FIXME: this will block the event loop until the subscribe op succeeds
                         // instead the op should be deferred for later execution
                         let op =
                             subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.peer_key);
@@ -542,7 +497,9 @@ where
 pub struct PeerKey(PeerId);
 
 impl PeerKey {
+    #[cfg(test)]
     pub fn random() -> Self {
+        use libp2p::identity::Keypair;
         PeerKey::from(Keypair::generate_ed25519().public())
     }
 

@@ -1,4 +1,3 @@
-#![allow(unused)] // FIXME: remove this attr
 //! Interface and related utilities for interaction with the compiled WASM contracts.
 //! All valid contracts must implement this interface.
 //!

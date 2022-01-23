@@ -1,6 +1,3 @@
-use std::sync::atomic::Ordering::SeqCst;
-use std::{sync::atomic::AtomicUsize, time::Instant};
-
 use super::PeerKey;
 use crate::{
     contract::{ContractKey, ContractValue, StoreResponse},
@@ -13,8 +10,6 @@ use crate::{
 pub(super) use test_utils::TestEventListener;
 
 use super::OpManager;
-
-static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy)]
 struct ListenerLogId(usize);
@@ -104,20 +99,14 @@ impl<'a> EventLog<'a> {
     }
 }
 
+#[cfg(test)]
 struct MessageLog {
     peer_id: PeerKey,
-    ts: Instant,
     kind: EventKind,
 }
 
 #[derive(Clone)]
 pub(super) struct EventRegister {}
-
-impl EventRegister {
-    pub fn new() -> Self {
-        EventRegister {}
-    }
-}
 
 impl EventListener for EventRegister {
     fn event_received(&mut self, _log: EventLog) {
@@ -148,6 +137,7 @@ enum PutEvent {
         requester: PeerKey,
         value: ContractValue,
     },
+    #[cfg(test)]
     PutComplete {
         /// peer who performed the event
         performer: PeerKey,
@@ -174,6 +164,7 @@ enum PutEvent {
         /// value that was put
         value: ContractValue,
     },
+    #[cfg(test)]
     BroadcastComplete {
         /// peer who performed the event
         performer: PeerKey,
@@ -186,69 +177,76 @@ enum PutEvent {
     },
 }
 
-#[inline]
-fn create_log(logs: &[MessageLog], log: EventLog) -> (MessageLog, ListenerLogId) {
-    let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
-    let EventLog {
-        tx: incoming_tx,
-        peer_id,
-        kind,
-        ..
-    } = log;
-
-    let find_put_ops = logs
-        .iter()
-        .filter_map(|l| {
-            if matches!(l, MessageLog { kind: EventKind::Put(_, id), .. } if incoming_tx == id ) {
-                match l.kind {
-                    EventKind::Put(PutEvent::BroadcastEmitted { .. }, _) => None,
-                    _ => Some(&l.kind),
-                }
-            } else {
-                None
-            }
-        })
-        .chain([&kind]);
-    let kind = fuse_successful_put_op(find_put_ops).unwrap_or(kind);
-
-    let msg_log = MessageLog {
-        ts: Instant::now(),
-        peer_id: *peer_id,
-        kind,
-    };
-    (msg_log, log_id)
-}
-
-fn fuse_successful_put_op<'a>(
-    mut put_ops: impl Iterator<Item = &'a EventKind>,
-) -> Option<EventKind> {
-    let prev_msgs = [put_ops.next().cloned(), put_ops.next().cloned()];
-    match prev_msgs {
-        [Some(EventKind::Put(PutEvent::Request { performer, key }, id)), Some(EventKind::Put(PutEvent::PutSuccess { requester, value }, _))] => {
-            Some(EventKind::Put(
-                PutEvent::PutComplete {
-                    performer,
-                    requester,
-                    key,
-                    value,
-                },
-                id,
-            ))
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod test_utils {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering::SeqCst},
+            Arc,
+        },
+    };
 
     use dashmap::DashMap;
     use parking_lot::RwLock;
 
+    use super::*;
     use crate::{contract::ContractKey, message::TxType, ring::Distance};
 
-    use super::*;
+    static LOG_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline]
+    fn create_log(logs: &[MessageLog], log: EventLog) -> (MessageLog, ListenerLogId) {
+        let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
+        let EventLog {
+            tx: incoming_tx,
+            peer_id,
+            kind,
+            ..
+        } = log;
+
+        let find_put_ops = logs
+            .iter()
+            .filter_map(|l| {
+                if matches!(l, MessageLog { kind: EventKind::Put(_, id), .. } if incoming_tx == id )
+                {
+                    match l.kind {
+                        EventKind::Put(PutEvent::BroadcastEmitted { .. }, _) => None,
+                        _ => Some(&l.kind),
+                    }
+                } else {
+                    None
+                }
+            })
+            .chain([&kind]);
+        let kind = fuse_successful_put_op(find_put_ops).unwrap_or(kind);
+
+        let msg_log = MessageLog {
+            peer_id: *peer_id,
+            kind,
+        };
+        (msg_log, log_id)
+    }
+
+    fn fuse_successful_put_op<'a>(
+        mut put_ops: impl Iterator<Item = &'a EventKind>,
+    ) -> Option<EventKind> {
+        let prev_msgs = [put_ops.next().cloned(), put_ops.next().cloned()];
+        match prev_msgs {
+            [Some(EventKind::Put(PutEvent::Request { performer, key }, id)), Some(EventKind::Put(PutEvent::PutSuccess { requester, value }, _))] => {
+                Some(EventKind::Put(
+                    PutEvent::PutComplete {
+                        performer,
+                        requester,
+                        key,
+                        value,
+                    },
+                    id,
+                ))
+            }
+            _ => None,
+        }
+    }
 
     #[derive(Clone)]
     pub(in crate::node) struct TestEventListener {

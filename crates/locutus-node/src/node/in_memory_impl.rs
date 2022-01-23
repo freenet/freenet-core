@@ -13,7 +13,6 @@ use crate::{
         SimStoreError,
     },
     message::Message,
-    operations::OpError,
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     ContractKey, NodeConfig,
@@ -26,7 +25,6 @@ pub(super) struct NodeInMemory<CErr = SimStoreError> {
     notification_channel: Receiver<Message>,
     conn_manager: MemoryConnManager,
     event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
-    is_gateway: bool,
 }
 
 impl<CErr> NodeInMemory<CErr>
@@ -43,7 +41,7 @@ where
         <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
     {
         let peer_key = PeerKey::from(config.local_key.public());
-        let conn_manager = MemoryConnManager::new(true, peer_key, None);
+        let conn_manager = MemoryConnManager::new(peer_key);
         let gateways = config.get_gateways()?;
 
         let ring = Ring::new(&config, &gateways)?;
@@ -61,7 +59,6 @@ where
             gateways,
             notification_channel,
             event_listener,
-            is_gateway: config.location.is_some(),
         })
     }
 
@@ -155,13 +152,6 @@ where
                 conn_manager,
                 event_listener,
             ));
-        }
-    }
-
-    #[inline(always)]
-    fn report_result(op_result: Result<(), OpError<CErr>>) {
-        if let Err(err) = op_result {
-            log::debug!("Finished tx w/ error: {}", err)
         }
     }
 }

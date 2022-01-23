@@ -38,13 +38,6 @@ macro_rules! check_id_op {
     };
 }
 
-async fn op_manager_svc<CErr>(_manager: OpManager<CErr>)
-where
-    CErr: std::error::Error,
-{
-    //
-}
-
 impl<CErr> OpManager<CErr>
 where
     CErr: std::error::Error,

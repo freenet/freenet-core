@@ -15,7 +15,6 @@ use super::{ConnectionBridge, ConnectionError, PeerKey};
 use crate::{
     config::{tracing::Logger, GlobalExecutor},
     message::Message,
-    ring::Location,
 };
 
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
@@ -28,9 +27,9 @@ pub(in crate::node) struct MemoryConnManager {
 }
 
 impl MemoryConnManager {
-    pub fn new(is_open: bool, peer: PeerKey, location: Option<Location>) -> Self {
+    pub fn new(peer: PeerKey) -> Self {
         Logger::init_logger();
-        let transport = InMemoryTransport::new(is_open, peer, location);
+        let transport = InMemoryTransport::new(peer);
         let msg_queue = Arc::new(Mutex::new(Vec::new()));
 
         let msg_queue_cp = msg_queue.clone();
@@ -107,8 +106,6 @@ struct MessageOnTransit {
 #[derive(Clone, Debug)]
 pub struct InMemoryTransport {
     interface_peer: PeerKey,
-    location: Option<Location>,
-    is_open: bool,
     /// received messages per each peer awaiting processing
     msg_stack_queue: Arc<Mutex<Vec<MessageOnTransit>>>,
     /// all messages 'traversing' the network at a given time
@@ -116,7 +113,7 @@ pub struct InMemoryTransport {
 }
 
 impl InMemoryTransport {
-    fn new(is_open: bool, interface_peer: PeerKey, location: Option<Location>) -> Self {
+    fn new(interface_peer: PeerKey) -> Self {
         let msg_stack_queue = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = NETWORK_WIRES.get_or_init(crossbeam::channel::unbounded);
 
@@ -174,8 +171,6 @@ impl InMemoryTransport {
         let network = tx.clone();
         Self {
             interface_peer,
-            location,
-            is_open,
             msg_stack_queue,
             network,
         }

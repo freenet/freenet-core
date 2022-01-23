@@ -1,4 +1,3 @@
-#![allow(dead_code)] // FIXME: remove when libp2p node impl is done
 mod config;
 mod contract;
 mod message;
@@ -9,6 +8,7 @@ mod user_events;
 pub(crate) mod util;
 
 // exports:
+pub use crate::config::Config;
 pub use contract::{Contract, ContractKey, ContractValue};
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::PeerKey;
 use crate::message::Message;
 
+#[cfg(test)]
 pub(crate) mod in_memory;
 pub(crate) mod p2p_protoc;
 

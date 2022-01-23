@@ -19,7 +19,6 @@ pub(crate) struct ContractStore {
 
 impl ContractStore {
     const MAX_MEM_CACHE: i64 = 10_000_000;
-    const MAX_NUM_CONTRACTS: usize = 10;
 
     pub fn new() -> Self {
         Self {

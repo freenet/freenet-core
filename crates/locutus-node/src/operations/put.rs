@@ -28,8 +28,6 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    const MAX_RETRIES: usize = 10;
-
     pub fn start_op(contract: Contract, value: ContractValue, htl: usize, peer: &PeerKey) -> Self {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
