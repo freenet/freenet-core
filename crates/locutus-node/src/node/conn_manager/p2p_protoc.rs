@@ -16,6 +16,7 @@ use futures::{
     sink, stream, AsyncRead, AsyncWrite, FutureExt, Sink, SinkExt, Stream, StreamExt, TryStreamExt,
 };
 use libp2p::{
+    autonat,
     core::{connection::ConnectionId, muxing, transport, ConnectedPoint, UpgradeInfo},
     identify::{self, IdentifyEvent, IdentifyInfo},
     identity::Keypair,
@@ -50,13 +51,17 @@ const CURRENT_PROTOC_VER: &[u8] = b"/locutus/0.1.0";
 const CURRENT_PROTOC_VER_STR: &str = "/locutus/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 
-fn config_behaviour(local_key: &Keypair, gateways: &[InitPeerNode]) -> NetBehaviour {
-    let routing_table = gateways
+fn config_behaviour(
+    local_key: &Keypair,
+    gateways: &[InitPeerNode],
+    _public_addr: &Option<Multiaddr>,
+) -> NetBehaviour {
+    let routing_table: HashMap<_, _> = gateways
         .iter()
         .filter_map(|p| {
             p.addr
                 .as_ref()
-                .map(|addr| (p.identifier, vec![addr.clone()]))
+                .map(|addr| (p.identifier, HashSet::from_iter([addr.clone()])))
         })
         .collect();
 
@@ -69,9 +74,24 @@ fn config_behaviour(local_key: &Keypair, gateways: &[InitPeerNode]) -> NetBehavi
     } else {
         ping::Ping::default()
     };
+
+    let peer_id = local_key.public().to_peer_id();
+    let auto_nat = {
+        let config = autonat::Config {
+            ..Default::default()
+        };
+        let mut behaviour = autonat::Behaviour::new(peer_id, config);
+
+        for (peer, addr) in gateways.iter().map(|p| (&p.identifier, &p.addr)) {
+            behaviour.add_server(*peer, addr.clone());
+        }
+        behaviour
+    };
+
     NetBehaviour {
-        identify: identify::Identify::new(ident_config),
         ping,
+        identify: identify::Identify::new(ident_config),
+        auto_nat,
         locutus: LocutusBehaviour {
             outbound: VecDeque::new(),
             routing_table,
@@ -143,10 +163,11 @@ impl ConnectionBridge for P2pBridge {
 
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) swarm: Swarm<NetBehaviour>,
-    conn_bridge_rx: Receiver<P2pBridgeEvent>,
-    listen_on: Option<(IpAddr, u16)>,
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
+    conn_bridge_rx: Receiver<P2pBridgeEvent>,
+    /// last valid observed public address
+    public_addr: Option<Multiaddr>,
 }
 
 impl P2pConnManager {
@@ -157,9 +178,17 @@ impl P2pConnManager {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
         let global_executor = Box::new(GlobalExecutor);
+
+        let public_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
+            let public_addr = multiaddr_from_connection(conn);
+            Some(public_addr)
+        } else {
+            None
+        };
+
         let builder = SwarmBuilder::new(
             transport,
-            config_behaviour(&config.local_key, &config.remote_nodes),
+            config_behaviour(&config.local_key, &config.remote_nodes, &public_addr),
             PeerId::from(config.local_key.public()),
         )
         .executor(global_executor);
@@ -175,17 +204,16 @@ impl P2pConnManager {
         let gateways = config.get_gateways()?;
         Ok(P2pConnManager {
             swarm,
-            conn_bridge_rx: rx_bridge_cmd,
-            listen_on: config.local_ip.zip(config.local_port),
             gateways,
             bridge,
+            conn_bridge_rx: rx_bridge_cmd,
+            public_addr,
         })
     }
 
     pub fn listen_on(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(conn) = self.listen_on {
-            let listening_addr = multiaddr_from_connection(conn);
-            self.swarm.listen_on(listening_addr)?;
+        if let Some(listening_addr) = &self.public_addr {
+            self.swarm.listen_on(listening_addr.clone())?;
         }
         Ok(())
     }
@@ -208,7 +236,7 @@ impl P2pConnManager {
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     Ok(Right(ConnMngrActions::ConnectionClosed {
-                        peer_id: PeerKey::from(peer_id),
+                        peer: PeerKey::from(peer_id),
                     }))
                 }
                 SwarmEvent::Dialing(peer_id) => {
@@ -219,19 +247,52 @@ impl P2pConnManager {
                     if let IdentifyEvent::Received { peer_id, info } = *id {
                         if Self::is_compatible_peer(&info) {
                             Ok(Right(ConnMngrActions::ConnectionEstablished {
-                                peer_id: PeerKey(peer_id),
-                                addr: info.observed_addr,
+                                peer: PeerKey(peer_id),
+                                address: info.observed_addr,
                             }))
                         } else {
                             log::warn!("Incompatible peer: {}, disconnecting", peer_id);
                             Ok(Right(ConnMngrActions::ConnectionClosed {
-                                peer_id: PeerKey::from(peer_id),
+                                peer: PeerKey::from(peer_id),
                             }))
                         }
                     } else {
                         Ok(Right(ConnMngrActions::NoAction))
                     }
                 }
+                SwarmEvent::Behaviour(NetEvent::Autonat(event)) => match event {
+                    autonat::Event::InboundProbe(autonat::InboundProbeEvent::Response {
+                        address,
+                        peer,
+                        ..
+                    }) => {
+                        log::debug!(
+                            "Successful autonat probe, established conn with {peer} @ {address}"
+                        );
+                        Ok(Right(ConnMngrActions::ConnectionEstablished {
+                            peer: PeerKey(peer),
+                            address,
+                        }))
+                    }
+                    autonat::Event::InboundProbe(autonat::InboundProbeEvent::Error {
+                        peer,
+                        error: autonat::InboundProbeError::Response(err),
+                        ..
+                    }) => match err {
+                        autonat::ResponseError::DialError | autonat::ResponseError::DialRefused => {
+                            Ok(Right(ConnMngrActions::IsPrivatePeer(peer)))
+                        }
+                        _ => Ok(Right(ConnMngrActions::NoAction)),
+                    },
+                    autonat::Event::StatusChanged {
+                        new: autonat::NatStatus::Public(address),
+                        ..
+                    } => {
+                        log::debug!("NAT status: public @ {address}");
+                        Ok(Right(ConnMngrActions::UpdatePublicAddr(address)))
+                    }
+                    _ => Ok(Right(ConnMngrActions::NoAction)),
+                },
                 other_event => {
                     log::debug!("Received other swarm event: {:?}", other_event);
                     Ok(Right(ConnMngrActions::NoAction))
@@ -307,16 +368,25 @@ impl P2pConnManager {
                     // todo: if we prefilter connections, should only accept ones informed this way
                     //       (except 'join ring' requests)
                 }
-                Ok(Right(ConnectionEstablished { addr, peer_id })) => {
-                    log::debug!("Established connection with peer {} @ {}", peer_id, addr);
-                    self.bridge.active_net_connections.insert(peer_id, addr);
+                Ok(Right(ConnectionEstablished {
+                    address: addr,
+                    peer,
+                })) => {
+                    log::debug!("Established connection with peer {} @ {}", peer, addr);
+                    self.bridge.active_net_connections.insert(peer, addr);
                 }
-                Ok(Right(ConnectionClosed { peer_id }))
+                Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     let _ = self.swarm.disconnect_peer_id(peer_id.0);
                     log::debug!("Dropped connection with peer {}", peer_id);
+                }
+                Ok(Right(UpdatePublicAddr(address))) => {
+                    self.public_addr = Some(address);
+                }
+                Ok(Right(IsPrivatePeer(peer))) => {
+                    todo!("attempt hole punching")
                 }
                 Ok(Right(ClosedChannel)) => {
                     log::info!("Notification channel closed");
@@ -345,17 +415,22 @@ impl P2pConnManager {
 enum ConnMngrActions {
     /// Received a new connection
     ConnectionEstablished {
-        peer_id: PeerKey,
-        addr: Multiaddr,
+        peer: PeerKey,
+        address: Multiaddr,
     },
     /// Closed a connection with the peer
     ConnectionClosed {
-        peer_id: PeerKey,
+        peer: PeerKey,
     },
+    /// Outbound message
     SendMessage {
         peer: PeerKey,
         msg: Box<Message>,
     },
+    /// Update self own public address, useful when communicating for first time
+    UpdatePublicAddr(Multiaddr),
+    /// A peer which we attempted connection to is private, attempt hole-punching
+    IsPrivatePeer(PeerId),
     NodeAction(NodeEvent),
     ClosedChannel,
     NoAction,
@@ -367,7 +442,7 @@ pub(in crate::node) struct LocutusBehaviour {
     outbound: VecDeque<(PeerId, Either<Message, NodeEvent>)>,
     // FIFO queue for inbound messages
     inbound: VecDeque<Either<Message, NodeEvent>>,
-    routing_table: HashMap<PeerId, Vec<Multiaddr>>,
+    routing_table: HashMap<PeerId, HashSet<Multiaddr>>,
     connected: HashMap<PeerId, ConnectionId>,
     openning_connection: HashSet<PeerId>,
 }
@@ -393,7 +468,7 @@ impl NetworkBehaviour for LocutusBehaviour {
         self.routing_table
             .entry(*peer_id)
             .or_default()
-            .push(endpoint.get_remote_address().clone());
+            .insert(endpoint.get_remote_address().clone());
     }
 
     fn inject_event(
@@ -445,8 +520,10 @@ impl NetworkBehaviour for LocutusBehaviour {
                 Poll::Pending
             } else if let Some(conn) = self.routing_table.get(&peer_id) {
                 // initiate a connection if one does not exist
+                // FIXME: we dial as listener to perform NAT hole-punching,
+                // though the `override_role` method
                 let peer_opts = DialOpts::peer_id(peer_id)
-                    .addresses(conn.clone())
+                    .addresses(conn.iter().cloned().collect())
                     .extend_addresses_through_behaviour();
                 let initiate_conn = NetworkBehaviourAction::Dial {
                     opts: peer_opts.build(),
@@ -918,6 +995,8 @@ fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
 ///
 /// - [Identify](https://github.com/libp2p/specs/tree/master/identify) libp2p protocol.
 /// - Pinging between peers.
+/// - Locutus ring protocol.
+/// - AutoNAT
 #[derive(libp2p::NetworkBehaviour)]
 #[behaviour(event_process = false)]
 #[behaviour(out_event = "NetEvent")]
@@ -925,6 +1004,7 @@ pub(in crate::node) struct NetBehaviour {
     identify: identify::Identify,
     ping: ping::Ping,
     locutus: LocutusBehaviour,
+    auto_nat: autonat::Behaviour,
 }
 
 #[derive(Debug)]
@@ -932,6 +1012,13 @@ pub(in crate::node) enum NetEvent {
     Locutus(Box<Message>),
     Identify(Box<identify::IdentifyEvent>),
     Ping(ping::PingEvent),
+    Autonat(autonat::Event),
+}
+
+impl From<autonat::Event> for NetEvent {
+    fn from(event: autonat::Event) -> NetEvent {
+        Self::Autonat(event)
+    }
 }
 
 impl From<identify::IdentifyEvent> for NetEvent {

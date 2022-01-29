@@ -3,6 +3,7 @@ use std::sync::Arc;
 use either::Either;
 use libp2p::{
     core::{muxing, transport, upgrade},
+    deflate::DeflateConfig,
     dns::TokioDnsConfig,
     identity::Keypair,
     noise,
@@ -109,20 +110,17 @@ where
             .into_authentic(local_key)
             .expect("signing libp2p-noise static DH keypair failed");
 
-        let tcp = TokioTcpConfig::new()
-            .nodelay(true)
-            .port_reuse(true)
-            // FIXME: there seems to be a problem with the deflate upgrade 
-            // that repeteadly allocates more space on the heap until OOM
-            // .and_then(|conn, endpoint| {
-            //     upgrade::apply(
-            //         conn,
-            //         DeflateConfig::default(),
-            //         endpoint,
-            //         upgrade::Version::V1,
-            //     )
-            // });
-            ;
+        let tcp = TokioTcpConfig::new().nodelay(true).port_reuse(true);
+        // FIXME: there seems to be a problem with the deflate upgrade
+        // that repeteadly allocates more space on the heap until OOM
+        // .and_then(|conn, endpoint| {
+        //     upgrade::apply(
+        //         conn,
+        //         DeflateConfig::default(),
+        //         endpoint,
+        //         upgrade::Version::V1,
+        //     )
+        // });
         Ok(TokioDnsConfig::system(tcp)?
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
