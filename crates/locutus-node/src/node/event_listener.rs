@@ -137,17 +137,6 @@ enum PutEvent {
         requester: PeerKey,
         value: ContractValue,
     },
-    #[cfg(test)]
-    PutComplete {
-        /// peer who performed the event
-        performer: PeerKey,
-        /// peer who started the put op
-        requester: PeerKey,
-        /// key of the contract which value was being updated
-        key: ContractKey,
-        /// value that was put
-        value: ContractValue,
-    },
     BroadcastEmitted {
         /// subscribed peers
         broadcast_to: Vec<PeerKeyLocation>,
@@ -157,17 +146,6 @@ enum PutEvent {
         value: ContractValue,
     },
     BroadcastReceived {
-        /// peer who started the broadcast op
-        requester: PeerKey,
-        /// key of the contract which value was being updated
-        key: ContractKey,
-        /// value that was put
-        value: ContractValue,
-    },
-    #[cfg(test)]
-    BroadcastComplete {
-        /// peer who performed the event
-        performer: PeerKey,
         /// peer who started the broadcast op
         requester: PeerKey,
         /// key of the contract which value was being updated
@@ -199,28 +177,8 @@ mod test_utils {
     fn create_log(logs: &[MessageLog], log: EventLog) -> (MessageLog, ListenerLogId) {
         let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
         let EventLog {
-            tx: incoming_tx,
-            peer_id,
-            kind,
-            ..
+            tx, peer_id, kind, ..
         } = log;
-
-        let find_put_ops = logs
-            .iter()
-            .filter_map(|l| {
-                if matches!(l, MessageLog { kind: EventKind::Put(_, id), .. } if incoming_tx == id )
-                {
-                    match l.kind {
-                        EventKind::Put(PutEvent::BroadcastEmitted { .. }, _) => None,
-                        _ => Some(&l.kind),
-                    }
-                } else {
-                    None
-                }
-            })
-            .chain([&kind]);
-        let kind = fuse_successful_put_op(find_put_ops).unwrap_or(kind);
-
         let msg_log = MessageLog {
             peer_id: *peer_id,
             kind,
@@ -228,28 +186,8 @@ mod test_utils {
         (msg_log, log_id)
     }
 
-    fn fuse_successful_put_op<'a>(
-        mut put_ops: impl Iterator<Item = &'a EventKind>,
-    ) -> Option<EventKind> {
-        let prev_msgs = [put_ops.next().cloned(), put_ops.next().cloned()];
-        match prev_msgs {
-            [Some(EventKind::Put(PutEvent::Request { performer, key }, id)), Some(EventKind::Put(PutEvent::PutSuccess { requester, value }, _))] => {
-                Some(EventKind::Put(
-                    PutEvent::PutComplete {
-                        performer,
-                        requester,
-                        key,
-                        value,
-                    },
-                    id,
-                ))
-            }
-            _ => None,
-        }
-    }
-
     #[derive(Clone)]
-    pub(in crate::node) struct TestEventListener {
+    pub(crate) struct TestEventListener {
         node_labels: Arc<DashMap<String, PeerKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
         logs: Arc<RwLock<Vec<MessageLog>>>,
@@ -277,91 +215,77 @@ mod test_utils {
         pub fn has_put_contract(
             &self,
             peer: &PeerKey,
-            expected_key: &ContractKey,
+            for_key: &ContractKey,
             expected_value: &ContractValue,
         ) -> bool {
             let logs = self.logs.read();
-            logs.iter().any(|log| {
-                &log.peer_id == peer
-                    && matches!(log.kind, EventKind::Put(PutEvent::PutComplete { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
-            })
-        }
-
-        pub fn get_broadcast_count(
-            &self,
-            expected_key: &ContractKey,
-            expected_value: &ContractValue,
-        ) -> usize {
-            let logs = self.logs.read();
-            logs.iter().filter(|log| {
-                matches!(log.kind, EventKind::Put(PutEvent::BroadcastEmitted { ref key, ref value, .. }, ..) if key == expected_key && value == expected_value )
-            }).count()
-        }
-
-        pub fn has_broadcasted_contract(
-            &self,
-            mut broadcast_pairs: Vec<(PeerKey, PeerKey)>,
-        ) -> bool {
-            let logs = self.logs.read();
-            let mut broadcast_ops = logs.iter().filter_map(|l| {
-                if matches!(
-                    l,
-                    MessageLog {
-                        kind: EventKind::Put(_, _id),
-                        ..
-                    }
-                ) {
-                    match l.kind {
-                        EventKind::Put(PutEvent::BroadcastEmitted { .. }, _)
-                        | EventKind::Put(PutEvent::BroadcastReceived { .. }, _) => Some(&l.kind),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
+            let put_ops = logs.iter().filter_map(|l| match &l.kind {
+                EventKind::Put(ev, id) => Some((id, ev)),
+                _ => None,
+            });
+            let put_ops: HashMap<_, Vec<_>> = put_ops.fold(HashMap::new(), |mut acc, (id, ev)| {
+                acc.entry(id).or_default().push(ev);
+                acc
             });
 
-            let prev_msgs = [broadcast_ops.next().cloned(), broadcast_ops.next().cloned()];
-            let broadcast = match prev_msgs {
-                [Some(EventKind::Put(PutEvent::BroadcastEmitted { broadcast_to, .. }, id1)), Some(EventKind::Put(
-                    PutEvent::BroadcastReceived {
-                        requester,
-                        key,
-                        value,
-                    },
-                    id2,
-                ))] => {
-                    if id1 == id2 {
-                        Some(EventKind::Put(
-                            PutEvent::BroadcastComplete {
-                                performer: broadcast_to.get(0).unwrap().peer,
-                                requester,
-                                key,
-                                value,
-                            },
-                            id1,
-                        ))
-                    } else {
-                        None
+            for (_tx, events) in put_ops {
+                let mut is_expected_value = false;
+                let mut is_expected_key = false;
+                let mut is_expected_peer = false;
+                for ev in events {
+                    match ev {
+                        PutEvent::Request { key, .. } if key != for_key => break,
+                        PutEvent::Request { key, .. } if key == for_key => {
+                            is_expected_key = true;
+                        }
+                        PutEvent::PutSuccess { requester, value }
+                            if requester == peer && value == expected_value =>
+                        {
+                            is_expected_peer = true;
+                            is_expected_value = true;
+                        }
+                        _ => {}
                     }
                 }
-                _ => None,
-            };
-
-            match &broadcast {
-                Some(EventKind::Put(
-                    PutEvent::BroadcastComplete {
-                        performer,
-                        requester,
-                        ..
-                    },
-                    _,
-                )) => {
-                    broadcast_pairs.retain(|(p, r)| p == performer && r == requester);
-                    !broadcast_pairs.is_empty()
+                if is_expected_value && is_expected_peer && is_expected_key {
+                    return true;
                 }
-                _ => false,
             }
+            false
+        }
+
+        /// The contract was broadcasted from one peer to an other successfully.
+        pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
+            let logs = self.logs.read();
+            let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
+                EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. }, id)
+                | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }, id) => Some((id, ev)),
+                _ => None,
+            });
+            let put_broadcast_by_tx: HashMap<_, Vec<_>> =
+                put_broadcast_ops.fold(HashMap::new(), |mut acc, (id, ev)| {
+                    acc.entry(id).or_default().push(ev);
+                    acc
+                });
+            for (_tx, events) in put_broadcast_by_tx {
+                let mut was_emitted = false;
+                let mut was_broadcasted = false;
+                for ev in events {
+                    match ev {
+                        PutEvent::BroadcastEmitted { key, .. } if key == for_key => {
+                            was_emitted = true;
+                        }
+                        PutEvent::BroadcastReceived { key, .. } if key == for_key => {
+                            was_broadcasted = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if was_emitted && was_broadcasted {
+                    return true;
+                }
+            }
+            false
         }
 
         pub fn has_got_contract(&self, peer: &PeerKey, expected_key: &ContractKey) -> bool {
