@@ -20,7 +20,6 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
-    time::Instant,
 };
 
 use anyhow::bail;
@@ -71,20 +70,22 @@ pub(crate) struct Ring {
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: Arc<DashMap<ContractKey, Vec<PeerKeyLocation>>>,
     subscriptions: Arc<RwLock<Vec<ContractKey>>>,
-    /// A peer which has been blacklisted to perform actions regarding a given contract.
-    contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
+
+    // A peer which has been blacklisted to perform actions regarding a given contract.
+    // todo: add blacklist
+    // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
     /// Interim connections ongoing haandshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
     incoming_connections: Arc<AtomicUsize>,
 }
 
-/// A data type that represents the fact that a peer has been blacklisted
-/// for some action. Has to be coupled with that action
-#[derive(Debug)]
-struct Blacklisted {
-    since: Instant,
-    peer: PeerKey,
-}
+// /// A data type that represents the fact that a peer has been blacklisted
+// /// for some action. Has to be coupled with that action
+// #[derive(Debug)]
+// struct Blacklisted {
+//     since: Instant,
+//     peer: PeerKey,
+// }
 
 impl Ring {
     const MIN_CONNECTIONS: usize = 10;
@@ -143,7 +144,7 @@ impl Ring {
             peer_key,
             subscribers: Arc::new(DashMap::new()),
             subscriptions: Arc::new(RwLock::new(Vec::new())),
-            contract_blacklist: Arc::new(DashMap::new()),
+            // contract_blacklist: Arc::new(DashMap::new()),
             incoming_connections: Arc::new(AtomicUsize::new(0)),
         };
 

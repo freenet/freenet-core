@@ -24,6 +24,7 @@ pub(crate) trait EventListener {
     fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static>;
 }
 
+#[allow(dead_code)] // fixme: remove this
 pub(crate) struct EventLog<'a> {
     tx: &'a Transaction,
     peer_id: &'a PeerKey,
@@ -174,11 +175,9 @@ mod test_utils {
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[inline]
-    fn create_log(logs: &[MessageLog], log: EventLog) -> (MessageLog, ListenerLogId) {
+    fn create_log(log: EventLog) -> (MessageLog, ListenerLogId) {
         let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
-        let EventLog {
-            tx, peer_id, kind, ..
-        } = log;
+        let EventLog { peer_id, kind, .. } = log;
         let msg_log = MessageLog {
             peer_id: *peer_id,
             kind,
@@ -325,7 +324,7 @@ mod test_utils {
         fn event_received(&mut self, log: EventLog) {
             let tx = log.tx;
             let mut logs = self.logs.write();
-            let (msg_log, log_id) = create_log(&*logs, log);
+            let (msg_log, log_id) = create_log(log);
             logs.push(msg_log);
             std::mem::drop(logs);
             self.tx_log.entry(*tx).or_default().push(log_id);

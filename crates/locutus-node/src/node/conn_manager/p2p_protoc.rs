@@ -385,7 +385,7 @@ impl P2pConnManager {
                 Ok(Right(UpdatePublicAddr(address))) => {
                     self.public_addr = Some(address);
                 }
-                Ok(Right(IsPrivatePeer(peer))) => {
+                Ok(Right(IsPrivatePeer(_peer))) => {
                     todo!("attempt hole punching")
                 }
                 Ok(Right(ClosedChannel)) => {
@@ -994,9 +994,9 @@ fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
 /// The network behaviour implements the following capabilities:
 ///
 /// - [Identify](https://github.com/libp2p/specs/tree/master/identify) libp2p protocol.
-/// - Pinging between peers.
-/// - Locutus ring protocol.
-/// - AutoNAT
+/// - [Ping](https://docs.rs/libp2p/latest/libp2p/ping/index.html) `/ipfs/ping/1.0.0` protocol.
+/// - Locutus ring protocol, which handles the messages.
+/// - [AutoNAT](https://github.com/libp2p/specs/tree/master/autonat) libp2p protocol.
 #[derive(libp2p::NetworkBehaviour)]
 #[behaviour(event_process = false)]
 #[behaviour(out_event = "NetEvent")]
