@@ -3,7 +3,6 @@ use std::sync::Arc;
 use either::Either;
 use libp2p::{
     core::{muxing, transport, upgrade},
-    deflate::DeflateConfig,
     dns::TokioDnsConfig,
     identity::Keypair,
     noise,

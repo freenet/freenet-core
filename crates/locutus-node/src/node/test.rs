@@ -41,8 +41,8 @@ pub fn get_dynamic_port() -> u16 {
 
 /// A simulated in-memory network topology.
 pub(crate) struct SimNetwork {
-    event_listener: TestEventListener,
     pub labels: HashMap<String, PeerKey>,
+    pub event_listener: TestEventListener,
     usr_ev_controller: Sender<(EventId, PeerKey)>,
     receiver_ch: Receiver<(EventId, PeerKey)>,
     gateways: Vec<(NodeInMemory<SimStoreError>, GatewayConfig)>,
@@ -272,24 +272,6 @@ impl SimNetwork {
         }
     }
 
-    pub fn has_broadcast_contract(&self, broadcast_pairs: Vec<(&str, &str)>) -> bool {
-        let peers = broadcast_pairs
-            .into_iter()
-            .step_by(2)
-            .map(
-                |(peer1, peer2)| match (self.labels.get(peer1), self.labels.get(peer2)) {
-                    (Some(pk1), Some(pk2)) => (*pk1, *pk2),
-                    _ => panic!("peer not found"),
-                },
-            )
-            .collect();
-        self.event_listener.has_broadcasted_contract(peers)
-    }
-
-    pub fn count_broadcasts(&self, key: &ContractKey, value: &ContractValue) -> usize {
-        self.event_listener.get_broadcast_count(key, value)
-    }
-
     pub fn has_got_contract(&self, peer: &str, key: &ContractKey) -> bool {
         if let Some(pk) = self.labels.get(peer) {
             self.event_listener.has_got_contract(pk, key)
@@ -326,7 +308,7 @@ impl SimNetwork {
         &self,
         label: &str,
         event_id: EventId,
-        sleep_for: Option<Duration>,
+        await_for: Option<Duration>,
     ) -> Result<(), anyhow::Error> {
         let peer = self
             .labels
@@ -335,7 +317,7 @@ impl SimNetwork {
         self.usr_ev_controller
             .send((event_id, *peer))
             .expect("node listeners disconnected");
-        if let Some(sleep_time) = sleep_for {
+        if let Some(sleep_time) = await_for {
             tokio::time::sleep(sleep_time).await;
         }
         Ok(())
@@ -365,11 +347,11 @@ fn group_locations_in_buckets(
 pub(crate) async fn check_connectivity(
     sim_nodes: &SimNetwork,
     num_nodes: usize,
-    wait_time: Duration,
+    time_out: Duration,
 ) -> Result<(), anyhow::Error> {
     let mut connected = HashSet::new();
     let elapsed = Instant::now();
-    while elapsed.elapsed() < wait_time && connected.len() < num_nodes {
+    while elapsed.elapsed() < time_out && connected.len() < num_nodes {
         for node in 0..num_nodes {
             if !connected.contains(&node) && sim_nodes.connected(&format!("node-{}", node)) {
                 connected.insert(node);
