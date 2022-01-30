@@ -17,6 +17,8 @@ use crate::{
     ring::Ring,
 };
 
+use super::PeerKey;
+
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 pub(crate) struct OpManager<CErr> {
@@ -137,5 +139,10 @@ where
                 .map(Operation::Subscribe),
             TransactionType::Canceled => unreachable!(),
         }
+    }
+
+    pub fn prune_connection(&self, peer: PeerKey) {
+        // pending ops will be cleaned up by the garbage collector on time out
+        self.ring.prune_connection(peer);
     }
 }

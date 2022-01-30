@@ -268,19 +268,19 @@ mod test_utils {
                 });
             for (_tx, events) in put_broadcast_by_tx {
                 let mut was_emitted = false;
-                let mut was_broadcasted = false;
+                let mut was_received = false;
                 for ev in events {
                     match ev {
                         PutEvent::BroadcastEmitted { key, .. } if key == for_key => {
                             was_emitted = true;
                         }
                         PutEvent::BroadcastReceived { key, .. } if key == for_key => {
-                            was_broadcasted = true;
+                            was_received = true;
                         }
                         _ => {}
                     }
                 }
-                if was_emitted && was_broadcasted {
+                if was_emitted && was_received {
                     return true;
                 }
             }

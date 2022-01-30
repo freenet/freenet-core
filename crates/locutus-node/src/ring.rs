@@ -56,10 +56,11 @@ impl From<PeerKey> for PeerKeyLocation {
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
+    pub peer_key: PeerKey,
     max_connections: usize,
     min_connections: usize,
-    pub peer_key: PeerKey,
     connections_by_location: Arc<RwLock<BTreeMap<Location, PeerKeyLocation>>>,
+    location_for_peer: Arc<RwLock<BTreeMap<PeerKey, Location>>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
     own_location: Arc<AtomicU64>,
@@ -139,6 +140,7 @@ impl Ring {
             max_connections,
             min_connections,
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
+            location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
             cached_contracts: DashSet::new(),
             own_location,
             peer_key,
@@ -238,6 +240,7 @@ impl Ring {
 
     pub fn add_connection(&self, loc: Location, peer: PeerKey) {
         let mut cbl = self.connections_by_location.write();
+        self.location_for_peer.write().insert(peer, loc);
         cbl.insert(
             loc,
             PeerKeyLocation {
@@ -353,6 +356,22 @@ impl Ring {
 
     pub fn num_connections(&self) -> usize {
         self.connections_by_location.read().len()
+    }
+
+    pub fn prune_connection(&self, peer: PeerKey) {
+        let loc = self.location_for_peer.write().remove(&peer).unwrap();
+        {
+            let conns = &mut *self.connections_by_location.write();
+            conns.remove(&loc);
+        }
+        {
+            self.subscribers.alter_all(|_, mut subs| {
+                if let Some(pos) = subs.iter().position(|l| l.location == Some(loc)) {
+                    subs.swap_remove(pos);
+                }
+                subs
+            });
+        }
     }
 }
 

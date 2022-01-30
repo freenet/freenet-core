@@ -33,6 +33,7 @@ use libp2p::{
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use unsigned_varint::codec::UviBytes;
 
+use super::{ConnectionBridge, ConnectionError};
 use crate::{
     config::{self, GlobalExecutor},
     message::{Message, NodeEvent},
@@ -40,8 +41,6 @@ use crate::{
     ring::PeerKeyLocation,
     InitPeerNode, NodeConfig,
 };
-
-use super::{ConnectionBridge, ConnectionError};
 
 /// The default maximum size for a varint length-delimited packet.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024;
@@ -378,6 +377,7 @@ impl P2pConnManager {
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
+                    op_manager.prune_connection(peer_id);
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     let _ = self.swarm.disconnect_peer_id(peer_id.0);
                     log::debug!("Dropped connection with peer {}", peer_id);
@@ -520,8 +520,8 @@ impl NetworkBehaviour for LocutusBehaviour {
                 Poll::Pending
             } else if let Some(conn) = self.routing_table.get(&peer_id) {
                 // initiate a connection if one does not exist
-                // FIXME: we dial as listener to perform NAT hole-punching,
-                // though the `override_role` method
+                // FIXME: we dial as listener to perform NAT hole-punching though the `override_role` method,
+                //        if this is required because the other peer
                 let peer_opts = DialOpts::peer_id(peer_id)
                     .addresses(conn.iter().cloned().collect())
                     .extend_addresses_through_behaviour();

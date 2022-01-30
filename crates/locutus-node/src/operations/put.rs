@@ -958,8 +958,8 @@ mod test {
         sim_nodes
             .trigger_event("gateway-0", 1, Some(Duration::from_secs(3)))
             .await?;
-        assert!(sim_nodes.event_listener.contract_broadcasted(&key));
         assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
+        assert!(sim_nodes.event_listener.contract_broadcasted(&key));
         Ok(())
     }
 }
