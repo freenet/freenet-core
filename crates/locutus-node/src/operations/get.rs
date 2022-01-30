@@ -24,7 +24,10 @@ pub(crate) struct GetOp {
 impl GetOp {
     /// Maximum number of retries to get values.
     const MAX_RETRIES: usize = 10;
-    const MAX_RETRIES_BEFORE_BACK: usize = 1;
+    /** Maximum number of hops performed while trying to perform a get (a hop will be performed
+    when the current node cannot perform a get for whichever reason, eg. being out of the caching
+    distance for the contract) */
+    const MAX_GET_RETRY_HOPS: usize = 1;
 
     pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> Self {
         let tx = Transaction::new(<GetMsg as TxType>::tx_type_id(), id);
@@ -338,7 +341,7 @@ where
                 target,
                 sender: op_storage.ring.own_location(),
                 fetch_contract,
-                htl: 0,
+                htl: GetOp::MAX_GET_RETRY_HOPS,
             }));
         }
         GetMsg::SeekNode {
@@ -356,10 +359,12 @@ where
                     target.peer
                 );
 
-                let new_target = op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
-                let new_htl = htl + 1;
-
-                if new_htl > GetOp::MAX_RETRIES_BEFORE_BACK {
+                if htl == 0 {
+                    log::warn!(
+                        "The maximum HOPS number has been exceeded, sending the error \
+                        back to the node @ {}",
+                        sender.peer
+                    );
                     return Ok(OperationResult {
                         return_msg: Some(Message::from(GetMsg::ReturnGet {
                             key,
@@ -374,6 +379,9 @@ where
                         state: None,
                     });
                 }
+
+                let new_htl = htl - 1;
+                let new_target = op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
 
                 log::info!(
                     "Retrying to get the contract from node @ {}",
@@ -460,7 +468,8 @@ where
         } => {
             let this_loc = target;
             log::warn!(
-                "Neither contract or contract value for contract `{}` found at peer {}, retrying with other peers",
+                "Neither contract or contract value for contract `{}` found at peer {}, \
+                retrying with other peers",
                 key,
                 sender.peer
             );
@@ -496,7 +505,7 @@ where
                         target,
                         sender: this_loc,
                         fetch_contract: *fetch_contract,
-                        htl: 0,
+                        htl: GetOp::MAX_GET_RETRY_HOPS,
                     }));
                     new_state = Some(state);
                 } else {
