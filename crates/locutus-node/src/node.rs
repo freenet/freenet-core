@@ -346,7 +346,7 @@ where
                     // Initialize a subscribe op.
                     loop {
                         // FIXME: this will block the event loop until the subscribe op succeeds
-                        // instead the op should be deferred for later execution
+                        //        instead the op should be deferred for later execution
                         let op =
                             subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.peer_key);
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
@@ -479,7 +479,11 @@ where
                     }
                 }
                 None => {
-                    log::error!("{}", MSG);
+                    if !cfg!(test) {
+                        log::error!("{}", MSG);
+                    } else {
+                        log::debug!("{}", MSG);
+                    }
                     join_ring_request(None, peer_key, gateways, op_storage, conn_manager).await?;
                 }
                 _ => {}
