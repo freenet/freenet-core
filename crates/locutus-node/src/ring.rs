@@ -77,7 +77,7 @@ pub(crate) struct Ring {
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
     /// Interim connections ongoing haandshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
-    incoming_connections: Arc<AtomicUsize>,
+    open_connections: Arc<AtomicUsize>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -147,7 +147,7 @@ impl Ring {
             subscribers: Arc::new(DashMap::new()),
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             // contract_blacklist: Arc::new(DashMap::new()),
-            incoming_connections: Arc::new(AtomicUsize::new(0)),
+            open_connections: Arc::new(AtomicUsize::new(0)),
         };
 
         if let Some(loc) = config.location {
@@ -217,14 +217,13 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: &Location) -> bool {
-        // FIXME: when a join ring op expires or a peer connection is closed this should be reduced
-        let open_conn = self.incoming_connections.fetch_add(1, SeqCst);
+        let open_conn = self.open_connections.fetch_add(1, SeqCst);
         let my_location = &self
             .own_location()
             .location
             .expect("this node has no location assigned!");
         let cbl = &*self.connections_by_location.read();
-        if location == my_location || cbl.contains_key(location) {
+        let accepted = if location == my_location || cbl.contains_key(location) {
             false
         } else if open_conn < self.min_connections {
             true
@@ -235,7 +234,11 @@ impl Ring {
                 < self
                     .median_distance_to(my_location)
                     .unwrap_or_else(|| Distance::try_from(0.5).unwrap())
+        };
+        if !accepted {
+            self.open_connections.fetch_sub(1, SeqCst);
         }
+        accepted
     }
 
     pub fn add_connection(&self, loc: Location, peer: PeerKey) {
@@ -372,6 +375,7 @@ impl Ring {
                 subs
             });
         }
+        self.open_connections.fetch_sub(1, SeqCst);
     }
 }
 
