@@ -26,6 +26,7 @@ pub(super) struct NodeInMemory<CErr = SimStoreError> {
     notification_channel: Receiver<Either<Message, NodeEvent>>,
     conn_manager: MemoryConnManager,
     event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
+    is_gateway: bool,
 }
 
 impl<CErr> NodeInMemory<CErr>
@@ -44,6 +45,7 @@ where
         let peer_key = PeerKey::from(config.local_key.public());
         let conn_manager = MemoryConnManager::new(peer_key);
         let gateways = config.get_gateways()?;
+        let is_gateway = config.local_ip.zip(config.local_port).is_some();
 
         let ring = Ring::new(&config, &gateways)?;
         let (notification_tx, notification_channel) = mpsc::channel(100);
@@ -60,6 +62,7 @@ where
             gateways,
             notification_channel,
             event_listener,
+            is_gateway,
         })
     }
 
@@ -67,14 +70,17 @@ where
     where
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
-        join_ring_request(
-            None,
-            self.peer_key,
-            self.gateways.iter(),
-            &self.op_storage,
-            &mut self.conn_manager,
-        )
-        .await?;
+        let join_gateways = super::initial_join_requests(self.is_gateway, self.gateways.iter());
+        for gw in join_gateways {
+            join_ring_request(
+                None,
+                self.peer_key,
+                gw,
+                &self.op_storage,
+                &mut self.conn_manager,
+            )
+            .await?;
+        }
         GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
         self.run_event_listener().await
     }

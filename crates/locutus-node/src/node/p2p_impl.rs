@@ -45,14 +45,18 @@ where
         if self.is_gateway {
             self.conn_manager.listen_on()?;
         }
-        join_ring_request(
-            None,
-            self.peer_key,
-            self.conn_manager.gateways.iter(),
-            &self.op_storage,
-            &mut self.conn_manager.bridge,
-        )
-        .await?;
+        let gateways_to_join =
+            super::initial_join_requests(self.is_gateway, self.conn_manager.gateways.iter());
+        for gateway in gateways_to_join {
+            join_ring_request(
+                None,
+                self.peer_key,
+                gateway,
+                &self.op_storage,
+                &mut self.conn_manager.bridge,
+            )
+            .await?;
+        }
 
         // 2. start the user event handler loop
         GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));

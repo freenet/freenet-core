@@ -255,10 +255,22 @@ impl InitPeerNode {
     }
 }
 
+fn initial_join_requests<'a>(
+    is_gateway: bool,
+    peers: impl Iterator<Item = &'a PeerKeyLocation> + Send + 'a,
+) -> Box<dyn Iterator<Item = &'a PeerKeyLocation> + Send + 'a> {
+    if is_gateway {
+        // gateways should have complete interconnectivity
+        Box::new(peers)
+    } else {
+        Box::new(peers.shuffle().take(1))
+    }
+}
+
 async fn join_ring_request<CErr, CM>(
     backoff: Option<ExponentialBackoff>,
     peer_key: PeerKey,
-    gateways: impl Iterator<Item = &PeerKeyLocation>,
+    gateway: &PeerKeyLocation,
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CM,
 ) -> Result<(), OpError<CErr>>
@@ -266,34 +278,30 @@ where
     CErr: std::error::Error,
     CM: ConnectionBridge + Send + Sync,
 {
-    if let Some(gateway) = gateways.shuffle().take(1).next() {
-        let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
-        // initiate join action action per each gateway
-        let mut op = join_ring::JoinRingOp::initial_request(
-            peer_key,
-            *gateway,
-            op_storage.ring.max_hops_to_live,
-            tx_id,
+    let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
+    // initiate join action action per each gateway
+    let mut op = join_ring::JoinRingOp::initial_request(
+        peer_key,
+        *gateway,
+        op_storage.ring.max_hops_to_live,
+        tx_id,
+    );
+    if let Some(mut backoff) = backoff {
+        // backoff to retry later in case it failed
+        log::warn!(
+            "Performing a new join attempt, attempt number: {}",
+            backoff.retries()
         );
-        if let Some(mut backoff) = backoff {
-            // backoff to retry later in case it failed
-            log::warn!(
-                "Performing a new join attempt, attempt number: {}",
-                backoff.retries()
-            );
-            if backoff.sleep_async().await.is_none() {
-                log::error!("Max number of retries reached");
-                return Err(OpError::MaxRetriesExceeded(
-                    tx_id,
-                    format!("{:?}", tx_id.tx_type()),
-                ));
-            }
-            op.backoff = Some(backoff);
+        if backoff.sleep_async().await.is_none() {
+            log::error!("Max number of retries reached");
+            return Err(OpError::MaxRetriesExceeded(
+                tx_id,
+                format!("{:?}", tx_id.tx_type()),
+            ));
         }
-        join_ring::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
-    } else {
-        log::warn!("No gateways provided, single gateway node @ {}", peer_key);
+        op.backoff = Some(backoff);
     }
+    join_ring::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
     Ok(())
 }
 
@@ -462,16 +470,17 @@ where
             match op_storage.pop(&tx) {
                 Some(Operation::JoinRing(JoinRingOp {
                     backoff: Some(backoff),
+                    gateway,
                     ..
                 })) => {
                     if cfg!(test) {
-                        join_ring_request(None, peer_key, gateways, op_storage, conn_manager)
+                        join_ring_request(None, peer_key, &gateway, op_storage, conn_manager)
                             .await?;
                     } else {
                         join_ring_request(
                             Some(backoff),
                             peer_key,
-                            gateways,
+                            &gateway,
                             op_storage,
                             conn_manager,
                         )
@@ -479,12 +488,17 @@ where
                     }
                 }
                 None => {
+                    let rand_gw = gateways
+                        .shuffle()
+                        .take(1)
+                        .next()
+                        .expect("at least one gateway");
                     if !cfg!(test) {
                         log::error!("{}", MSG);
                     } else {
                         log::debug!("{}", MSG);
                     }
-                    join_ring_request(None, peer_key, gateways, op_storage, conn_manager).await?;
+                    join_ring_request(None, peer_key, rand_gw, op_storage, conn_manager).await?;
                 }
                 _ => {}
             }

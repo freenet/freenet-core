@@ -16,6 +16,7 @@ const MAX_JOIN_RETRIES: usize = 10;
 
 pub(crate) struct JoinRingOp {
     sm: StateMachine<JROpSm>,
+    pub gateway: Box<PeerKeyLocation>,
     /// keeps track of the number of retries and applies an exponential backoff cooldown period
     pub backoff: Option<ExponentialBackoff>,
     /// time left until time out, when this reaches zero it will be removed from the state
@@ -40,6 +41,7 @@ impl JoinRingOp {
         );
         JoinRingOp {
             sm,
+            gateway: Box::new(gateway),
             backoff: Some(ExponentialBackoff::new(
                 Duration::from_secs(1),
                 Duration::from_secs(120),
@@ -442,6 +444,7 @@ where
             let machine = JoinRingOp {
                 sm: StateMachine::from_state(JRState::Initializing, tx),
                 backoff: None,
+                gateway: Box::new(op_storage.ring.own_location()),
                 _ttl: PEER_TIMEOUT,
             };
             update_state(conn_manager, machine, join_op, &op_storage.ring).await
