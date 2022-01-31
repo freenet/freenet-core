@@ -24,9 +24,9 @@ pub(crate) struct GetOp {
 impl GetOp {
     /// Maximum number of retries to get values.
     const MAX_RETRIES: usize = 10;
-    /** Maximum number of hops performed while trying to perform a get (a hop will be performed
-    when the current node cannot perform a get for whichever reason, eg. being out of the caching
-    distance for the contract) */
+    /// Maximum number of hops performed while trying to perform a get (a hop will be performed
+    /// when the current node cannot perform a get for whichever reason, eg. being out of the caching
+    /// distance for the contract)
     const MAX_GET_RETRY_HOPS: usize = 1;
 
     pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> Self {
