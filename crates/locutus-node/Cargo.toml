@@ -36,7 +36,7 @@ libp2p = { version = "0.42.0", features = [
 ], default-features = false }
 log = { version = "0.4", features = ["serde"] }
 once_cell = "1"
-parking_lot = "0.11.2"
+parking_lot = "0.12.0"
 rand = "0.8"
 serde = { version = "1", features = ["rc", "derive"] }
 stretto = { version = "0.3.2", features = ["async"] }
