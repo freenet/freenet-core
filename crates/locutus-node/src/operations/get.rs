@@ -24,6 +24,10 @@ pub(crate) struct GetOp {
 impl GetOp {
     /// Maximum number of retries to get values.
     const MAX_RETRIES: usize = 10;
+    /// Maximum number of hops performed while trying to perform a get (a hop will be performed
+    /// when the current node cannot perform a get for whichever reason, eg. being out of the caching
+    /// distance for the contract)
+    const MAX_GET_RETRY_HOPS: usize = 1;
 
     pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> Self {
         let tx = Transaction::new(<GetMsg as TxType>::tx_type_id(), id);
@@ -305,7 +309,7 @@ where
 }
 
 async fn update_state<CB, CErr>(
-    _conn_manager: &mut CB,
+    conn_manager: &mut CB,
     mut state: GetOp,
     other_host_msg: GetMsg,
     op_storage: &OpManager<CErr>,
@@ -337,6 +341,7 @@ where
                 target,
                 sender: op_storage.ring.own_location(),
                 fetch_contract,
+                htl: GetOp::MAX_GET_RETRY_HOPS,
             }));
         }
         GetMsg::SeekNode {
@@ -345,31 +350,62 @@ where
             fetch_contract,
             sender,
             target,
-            ..
+            htl,
         } => {
             if !op_storage.ring.is_contract_cached(&key) {
-                //FIXME: should try forward to someone else who may have it first
-                // this node does not have the contract, return a void result to the requester
                 log::warn!(
-                    "Contract `{}` not found while processing a get request",
-                    key
+                    "Contract `{}` not found while processing a get request at node @ {}",
+                    key,
+                    target.peer
                 );
-                return Ok(OperationResult {
-                    return_msg: Some(Message::from(GetMsg::ReturnGet {
-                        key,
-                        id,
-                        value: StoreResponse {
-                            value: None,
-                            contract: None,
-                        },
-                        sender: op_storage.ring.own_location(),
-                        target: sender, // return to requester
-                    })),
-                    state: None,
-                });
-            }
 
-            if let ContractHandlerEvent::FetchResponse {
+                if htl == 0 {
+                    log::warn!(
+                        "The maximum HOPS number has been exceeded, sending the error \
+                        back to the node @ {}",
+                        sender.peer
+                    );
+                    return Ok(OperationResult {
+                        return_msg: Some(Message::from(GetMsg::ReturnGet {
+                            key,
+                            id,
+                            value: StoreResponse {
+                                value: None,
+                                contract: None,
+                            },
+                            sender: op_storage.ring.own_location(),
+                            target: sender, // return to requester
+                        })),
+                        state: None,
+                    });
+                }
+
+                let new_htl = htl - 1;
+                let new_target = op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
+
+                log::info!(
+                    "Retrying to get the contract from node @ {}",
+                    new_target.peer
+                );
+
+                conn_manager
+                    .send(
+                        &new_target.peer,
+                        (GetMsg::SeekNode {
+                            id,
+                            key,
+                            fetch_contract,
+                            sender,
+                            target: new_target,
+                            htl: new_htl,
+                        })
+                        .into(),
+                    )
+                    .await?;
+
+                return_msg = None;
+                new_state = None;
+            } else if let ContractHandlerEvent::FetchResponse {
                 response: value,
                 key: returned_key,
             } = op_storage
@@ -432,7 +468,8 @@ where
         } => {
             let this_loc = target;
             log::warn!(
-                "Neither contract or contract value for contract `{}` found at peer {}, retrying with other peers",
+                "Neither contract or contract value for contract `{}` found at peer {}, \
+                retrying with other peers",
                 key,
                 sender.peer
             );
@@ -468,6 +505,7 @@ where
                         target,
                         sender: this_loc,
                         fetch_contract: *fetch_contract,
+                        htl: GetOp::MAX_GET_RETRY_HOPS,
                     }));
                     new_state = Some(state);
                 } else {
@@ -587,6 +625,7 @@ mod messages {
             fetch_contract: bool,
             target: PeerKeyLocation,
             sender: PeerKeyLocation,
+            htl: usize,
         },
         ReturnGet {
             id: Transaction,
@@ -790,6 +829,61 @@ mod test {
             .trigger_event("node-1", 1, Some(Duration::from_millis(100)))
             .await?;
         assert!(!sim_nodes.has_got_contract("node-1", &key));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contract_found_after_retry() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 2usize;
+        const NUM_GW: usize = 1usize;
+
+        let bytes = crate::util::test::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: Contract = gen.arbitrary()?;
+        let contract_val: ContractValue = gen.arbitrary()?;
+        let key = contract.key();
+
+        let get_event = UserEvent::Get {
+            key,
+            contract: false,
+        };
+
+        let node_0 = NodeSpecification {
+            owned_contracts: vec![],
+            non_owned_contracts: vec![key],
+            events_to_generate: HashMap::from_iter([(1, get_event)]),
+            contract_subscribers: HashMap::new(),
+        };
+
+        let node_1 = NodeSpecification {
+            owned_contracts: vec![(contract, contract_val)],
+            non_owned_contracts: vec![key],
+            events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::new(),
+        };
+
+        let gw_0 = NodeSpecification {
+            owned_contracts: vec![],
+            non_owned_contracts: vec![],
+            events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::new(),
+        };
+
+        let get_specs = HashMap::from_iter([
+            ("node-0".to_string(), node_0),
+            ("node-1".to_string(), node_1),
+            ("gateway-0".to_string(), gw_0),
+        ]);
+
+        // establish network
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 3);
+        sim_nodes.build_with_specs(get_specs);
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+
+        sim_nodes
+            .trigger_event("node-0", 1, Some(Duration::from_millis(500)))
+            .await?;
+        assert!(sim_nodes.has_got_contract("node-0", &key));
         Ok(())
     }
 }
