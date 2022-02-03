@@ -625,7 +625,7 @@ mod test {
             ("node-1".to_string(), second_node),
         ]);
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
-        sim_nodes.build_with_specs(subscribe_specs);
+        sim_nodes.build_with_specs(subscribe_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         Ok(())

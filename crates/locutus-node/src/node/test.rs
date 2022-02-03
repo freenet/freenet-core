@@ -201,19 +201,21 @@ impl SimNetwork {
         }
     }
 
-    pub fn build(&mut self) {
-        self.build_with_specs(HashMap::new())
+    pub async fn build(&mut self) {
+        self.build_with_specs(HashMap::new()).await
     }
 
-    pub fn build_with_specs(&mut self, mut specs: HashMap<String, NodeSpecification>) {
-        for (node, label) in self
-            .nodes
-            .drain(..)
-            .chain(self.gateways.drain(..).map(|(n, c)| (n, c.label)))
-            .collect::<Vec<_>>()
-        {
+    pub async fn build_with_specs(&mut self, mut specs: HashMap<String, NodeSpecification>) {
+        let mut gw_not_init = self.gateways.len();
+        let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
+        for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             let node_spec = specs.remove(&label);
             self.initialize_peer(node, label, node_spec);
+            if gw_not_init != 0 {
+                gw_not_init -= 1;
+            } else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
         }
     }
 
@@ -291,13 +293,15 @@ impl SimNetwork {
 
     /// Returns the connectivity in the network per peer (that is all the connections
     /// this peers has registered).
-    pub fn node_connectivity(&self) -> HashMap<String, HashMap<PeerKey, Distance>> {
+    pub fn node_connectivity(&self) -> HashMap<String, HashMap<String, Distance>> {
         let mut peers_connections = HashMap::with_capacity(self.labels.len());
+        let key_to_label: HashMap<_, _> = self.labels.iter().map(|(k, v)| (v, k)).collect();
         for (label, key) in &self.labels {
             peers_connections.insert(
                 label.clone(),
                 self.event_listener
                     .connections(*key)
+                    .map(|(k, d)| (key_to_label[&k].clone(), d))
                     .collect::<HashMap<_, _>>(),
             );
         }
@@ -360,16 +364,17 @@ pub(crate) async fn check_connectivity(
     }
     tokio::time::sleep(Duration::from_millis(1_000)).await;
     let expected = HashSet::from_iter(0..num_nodes);
-    let missing: Vec<_> = expected
+    let mut missing: Vec<_> = expected
         .difference(&connected)
-        .map(|n| {
-            let label = format!("node-{}", n);
-            let key = sim_nodes.labels[&label];
-            (label, key)
-        })
+        .map(|n| format!("node-{}", n))
         .collect();
 
+    let node_connectivity = sim_nodes.node_connectivity();
+    let connections = pretty_print_connections(&node_connectivity);
+    log::info!("{connections}");
+
     if !missing.is_empty() {
+        missing.sort();
         log::error!("Nodes without connection: {:?}", missing);
         log::error!("Total nodes without connection: {:?}", missing.len());
         anyhow::bail!("found disconnected nodes");
@@ -383,7 +388,6 @@ pub(crate) async fn check_connectivity(
     let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
     log::info!("Ring distribution: {:?}", hist);
 
-    let node_connectivity = sim_nodes.node_connectivity();
     let mut connections_per_peer: Vec<_> = node_connectivity
         .iter()
         .map(|(k, v)| (k, v.len()))
@@ -409,6 +413,24 @@ pub(crate) async fn check_connectivity(
         anyhow::bail!("average number of connections is low");
     }
     Ok(())
+}
+
+fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Location>>) -> String {
+    let mut connections = String::from("Node connections:\n");
+    let mut conns = conns.iter().collect::<Vec<_>>();
+    conns.sort_by(|a, b| a.0.cmp(b.0));
+    for (peer, conns) in conns {
+        if peer.starts_with("gateway") {
+            continue;
+        }
+        connections.push_str(&format!("{peer}:"));
+        connections.push('\n');
+        for (conn, dist) in conns {
+            let dist = dist.0;
+            connections.push_str(&format!("    {conn} (dist: {dist:.3})\n"))
+        }
+    }
+    connections
 }
 
 #[test]

@@ -950,7 +950,7 @@ mod test {
             ("gateway-0".to_string(), gw_0),
         ]);
 
-        sim_nodes.build_with_specs(put_specs);
+        sim_nodes.build_with_specs(put_specs).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 

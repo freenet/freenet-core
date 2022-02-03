@@ -12,7 +12,7 @@ use crate::{
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 
-const MAX_JOIN_RETRIES: usize = 10;
+const MAX_JOIN_RETRIES: usize = 3;
 
 pub(crate) struct JoinRingOp {
     sm: StateMachine<JROpSm>,
@@ -1080,7 +1080,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
-        sim_nodes.build();
+        sim_nodes.build().await;
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(sim_nodes.connected("node-0"));
     }
@@ -1088,10 +1088,10 @@ mod test {
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 4usize;
+        const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
-        sim_nodes.build();
+        sim_nodes.build().await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await
     }
 
@@ -1099,9 +1099,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
-        const NUM_GW: usize = 2usize;
+        const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 1000, 2);
-        sim_nodes.build();
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(20)).await
+        sim_nodes.build().await;
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(5)).await
     }
 }

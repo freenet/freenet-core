@@ -37,10 +37,11 @@ impl<'a> EventLog<'a> {
         CErr: std::error::Error,
     {
         let kind = match msg {
-            Message::JoinRing(JoinRingMsg::Response { sender, target, .. }) => {
+            Message::JoinRing(JoinRingMsg::Connected { sender, target, .. }) => {
                 EventKind::Connected {
-                    loc: sender.location.unwrap(),
-                    to: *target,
+                    loc: target.location.unwrap(),
+                    from: target.peer,
+                    to: *sender,
                 }
             }
             Message::Put(PutMsg::RequestPut {
@@ -122,9 +123,15 @@ impl EventListener for EventRegister {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum EventKind {
-    Connected { loc: Location, to: PeerKeyLocation },
+    Connected {
+        loc: Location,
+        from: PeerKey,
+        to: PeerKeyLocation,
+    },
     Put(PutEvent, Transaction),
-    Get { key: ContractKey },
+    Get {
+        key: ContractKey,
+    },
     Unknown,
 }
 
@@ -296,21 +303,13 @@ mod test_utils {
         }
 
         /// Unique connections for a given peer and their relative distance to other peers.
-        pub fn connections(&self, key: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
+        pub fn connections(&self, peer: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
             let logs = self.logs.read();
             logs.iter()
                 .filter_map(|l| {
-                    if let EventKind::Connected {
-                        loc,
-                        to:
-                            PeerKeyLocation {
-                                location: Some(other_loc),
-                                peer,
-                            },
-                    } = l.kind
-                    {
-                        if l.peer_id == key {
-                            return Some((peer, loc.distance(&other_loc)));
+                    if let EventKind::Connected { loc, from, to } = l.kind {
+                        if from == peer {
+                            return Some((to.peer, loc.distance(&to.location.unwrap())));
                         }
                     }
                     None
@@ -353,6 +352,7 @@ mod test_utils {
                 peer_id: &peer_id,
                 kind: EventKind::Connected {
                     loc,
+                    from: peer_id,
                     to: PeerKeyLocation {
                         peer: *other,
                         location: Some(*location),

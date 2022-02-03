@@ -13,9 +13,11 @@ use crate::{
         self, Contract, ContractError, ContractHandler, ContractHandlerEvent, ContractValue,
         SimStoreError,
     },
-    message::{Message, NodeEvent},
+    message::{Message, NodeEvent, TransactionType},
+    operations::OpError,
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
+    util::IterExt,
     ContractKey, NodeConfig,
 };
 
@@ -70,16 +72,19 @@ where
     where
         UsrEv: UserEventsProxy + Send + Sync + 'static,
     {
-        let join_gateways = super::initial_join_requests(self.is_gateway, self.gateways.iter());
-        for gw in join_gateways {
-            join_ring_request(
-                None,
-                self.peer_key,
-                gw,
-                &self.op_storage,
-                &mut self.conn_manager,
-            )
-            .await?;
+        if !self.is_gateway {
+            if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {
+                join_ring_request(
+                    None,
+                    self.peer_key,
+                    gateway,
+                    &self.op_storage,
+                    &mut self.conn_manager,
+                )
+                .await?;
+            } else {
+                anyhow::bail!("requires at least one gateway");
+            }
         }
         GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
         self.run_event_listener().await
@@ -135,14 +140,33 @@ where
             };
 
             if let Ok(Either::Left(Message::Canceled(tx))) = msg {
-                handle_cancelled_op(
+                let tx_type = tx.tx_type();
+                let res = handle_cancelled_op(
                     tx,
                     self.peer_key,
                     self.gateways.iter(),
                     &self.op_storage,
                     &mut self.conn_manager,
                 )
-                .await?;
+                .await;
+                match res {
+                    Err(OpError::MaxRetriesExceeded(_, _))
+                        if tx_type == TransactionType::JoinRing =>
+                    {
+                        log::warn!("Retrying joining the ring with an other peer");
+                        let gateway = self.gateways.iter().shuffle().next().unwrap();
+                        join_ring_request(
+                            None,
+                            self.peer_key,
+                            gateway,
+                            &self.op_storage,
+                            &mut self.conn_manager,
+                        )
+                        .await?
+                    }
+                    Err(err) => return Err(anyhow::anyhow!(err)),
+                    Ok(_) => {}
+                }
                 continue;
             }
 

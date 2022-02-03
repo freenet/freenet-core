@@ -19,6 +19,7 @@ use crate::{
     contract::{self, ContractHandler, ContractStoreError},
     message::{Message, NodeEvent},
     ring::Ring,
+    util::IterExt,
     NodeConfig, UserEventsProxy,
 };
 
@@ -45,17 +46,20 @@ where
         if self.is_gateway {
             self.conn_manager.listen_on()?;
         }
-        let gateways_to_join =
-            super::initial_join_requests(self.is_gateway, self.conn_manager.gateways.iter());
-        for gateway in gateways_to_join {
-            join_ring_request(
-                None,
-                self.peer_key,
-                gateway,
-                &self.op_storage,
-                &mut self.conn_manager.bridge,
-            )
-            .await?;
+
+        if !self.is_gateway {
+            if let Some(gateway) = self.conn_manager.gateways.iter().shuffle().take(1).next() {
+                join_ring_request(
+                    None,
+                    self.peer_key,
+                    gateway,
+                    &self.op_storage,
+                    &mut self.conn_manager.bridge,
+                )
+                .await?;
+            } else {
+                anyhow::bail!("requires at least one gateway");
+            }
         }
 
         // 2. start the user event handler loop

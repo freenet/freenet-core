@@ -784,7 +784,7 @@ mod test {
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
-        sim_nodes.build_with_specs(get_specs);
+        sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger get @ node-0, which does not own the contract
@@ -821,7 +821,7 @@ mod test {
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
-        sim_nodes.build_with_specs(get_specs);
+        sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger get @ node-1, which does not own the contract
@@ -877,7 +877,7 @@ mod test {
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 3);
-        sim_nodes.build_with_specs(get_specs);
+        sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         sim_nodes

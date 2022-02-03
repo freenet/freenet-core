@@ -255,18 +255,6 @@ impl InitPeerNode {
     }
 }
 
-fn initial_join_requests<'a>(
-    is_gateway: bool,
-    peers: impl Iterator<Item = &'a PeerKeyLocation> + Send + 'a,
-) -> Box<dyn Iterator<Item = &'a PeerKeyLocation> + Send + 'a> {
-    if is_gateway {
-        // gateways should have complete interconnectivity
-        Box::new(peers)
-    } else {
-        Box::new(peers.shuffle().take(1))
-    }
-}
-
 async fn join_ring_request<CErr, CM>(
     backoff: Option<ExponentialBackoff>,
     peer_key: PeerKey,
@@ -279,7 +267,6 @@ where
     CM: ConnectionBridge + Send + Sync,
 {
     let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
-    // initiate join action action per each gateway
     let mut op = join_ring::JoinRingOp::initial_request(
         peer_key,
         *gateway,
@@ -487,7 +474,7 @@ where
                         .await?;
                     }
                 }
-                None => {
+                None | Some(Operation::JoinRing(_)) => {
                     let rand_gw = gateways
                         .shuffle()
                         .take(1)
