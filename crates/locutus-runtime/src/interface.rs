@@ -5,8 +5,6 @@
 
 use crate::contract::ContractKey;
 
-pub(super) type ContractUpdateResult<T> = Result<T, ContractUpdateError>;
-
 pub trait ContractRuntime {
     /// Determine whether this value is valid for this contract
     fn validate_value(&self, value: &[u8]) -> bool;
@@ -18,7 +16,11 @@ pub trait ContractRuntime {
     /// - If the same `value_update` is applied twice to a value, then the second will be ignored.
     /// - Application of `value_update` is "order invariant", no matter what the order in which the values are
     ///   applied, the resulting value must be exactly the same.
-    fn update_value(&self, value: &[u8], value_update: &[u8]) -> ContractUpdateResult<Vec<u8>>;
+    fn update_value(
+        &self,
+        value: &[u8],
+        value_update: &[u8],
+    ) -> Result<Vec<u8>, ContractUpdateError>;
 
     /// Obtain any other related contracts for this value update. Typically used to ensure
     /// update has been fully propagated.

@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use stretto::AsyncCache;
 use tokio::sync::mpsc;
 
-use super::runtime::{ContractRuntime, ContractUpdateError};
 use crate::contract::{store::ContractStore, ContractError, ContractKey};
 pub(crate) use sqlite::{SQLiteContractHandler, SqlDbError};
 
@@ -191,6 +190,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
 mod sqlite {
     use std::str::FromStr;
 
+    use locutus_runtime::{ContractRuntime, ContractUpdateError};
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},

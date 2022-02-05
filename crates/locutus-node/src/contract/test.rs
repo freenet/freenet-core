@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
-use locutus_runtime::{ContractKey, ContractValue};
+use locutus_runtime::{ContractKey, ContractRuntime, ContractUpdateError, ContractValue};
 
 use super::{
     handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
-    runtime::{ContractRuntime, ContractUpdateResult},
     store::ContractStore,
 };
 
@@ -15,7 +14,11 @@ impl ContractRuntime for MockRuntime {
         true
     }
 
-    fn update_value(&self, _value: &[u8], value_update: &[u8]) -> ContractUpdateResult<Vec<u8>> {
+    fn update_value(
+        &self,
+        _value: &[u8],
+        value_update: &[u8],
+    ) -> Result<Vec<u8>, ContractUpdateError> {
         Ok(value_update.to_vec())
     }
 

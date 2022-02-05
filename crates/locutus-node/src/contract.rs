@@ -1,7 +1,6 @@
 use locutus_runtime::ContractKey;
 
 mod handler;
-mod runtime;
 mod store;
 mod test;
 
