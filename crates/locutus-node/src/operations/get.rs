@@ -1,8 +1,10 @@
 use std::time::Duration;
 
+use locutus_runtime::ContractKey;
+
 use crate::{
     config::PEER_TIMEOUT,
-    contract::{ContractError, ContractHandlerEvent, ContractKey, StoreResponse},
+    contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
     ring::{PeerKeyLocation, RingError},
@@ -683,8 +685,10 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use locutus_runtime::{Contract, ContractValue};
+
     use crate::{
-        contract::{Contract, ContractValue, SimStoreError},
+        contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
         user_events::UserEvent,

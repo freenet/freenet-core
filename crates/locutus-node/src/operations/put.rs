@@ -5,9 +5,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use locutus_runtime::{Contract, ContractKey, ContractValue};
+
 use crate::{
     config::PEER_TIMEOUT,
-    contract::{Contract, ContractError, ContractHandlerEvent, ContractKey, ContractValue},
+    contract::{ContractError, ContractHandlerEvent},
     message::{Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
@@ -32,7 +34,7 @@ impl PutOp {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
             contract.key(),
-            Location::from(contract.key())
+            Location::from(&contract.key())
         );
 
         let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), peer);
@@ -337,7 +339,11 @@ where
                 key
             );
 
-            if !cached_contract && op_storage.ring.within_caching_distance(&key.location()) {
+            if !cached_contract
+                && op_storage
+                    .ring
+                    .within_caching_distance(&Location::from(&key))
+            {
                 log::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
                 // this node does not have the contract, so instead store the contract and execute the put op.
                 let res = op_storage
@@ -567,7 +573,9 @@ where
         } => {
             let key = contract.key();
             let cached_contract = op_storage.ring.is_contract_cached(&key);
-            let within_caching_dist = op_storage.ring.within_caching_distance(&key.location());
+            let within_caching_dist = op_storage
+                .ring
+                .within_caching_distance(&Location::from(&key));
             if !cached_contract && within_caching_dist {
                 // this node does not have the contract, so instead store the contract and execute the put op.
                 let res = op_storage
@@ -664,7 +672,7 @@ async fn forward_changes<CErr, CB>(
     CB: ConnectionBridge,
 {
     let key = contract.key();
-    let contract_loc = key.location();
+    let contract_loc = Location::from(&key);
     let forward_to = op_storage.ring.closest_caching(&key, 1, skip_list);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     for peer in forward_to {
@@ -693,8 +701,6 @@ async fn forward_changes<CErr, CB>(
 
 mod messages {
     use std::fmt::Display;
-
-    use crate::contract::ContractValue;
 
     use super::*;
 

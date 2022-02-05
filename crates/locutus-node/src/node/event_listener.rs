@@ -1,11 +1,12 @@
 use super::PeerKey;
 use crate::{
-    contract::{ContractKey, ContractValue, StoreResponse},
+    contract::StoreResponse,
     message::{Message, Transaction},
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
     ring::{Location, PeerKeyLocation},
 };
 
+use locutus_runtime::{ContractKey, ContractValue};
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;
 
@@ -177,7 +178,7 @@ mod test_utils {
     use parking_lot::RwLock;
 
     use super::*;
-    use crate::{contract::ContractKey, message::TxType, ring::Distance};
+    use crate::{message::TxType, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 

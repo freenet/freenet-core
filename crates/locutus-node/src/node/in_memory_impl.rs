@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use either::Either;
+use locutus_runtime::{Contract, ContractKey, ContractValue};
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -9,16 +10,13 @@ use super::{
 };
 use crate::{
     config::GlobalExecutor,
-    contract::{
-        self, Contract, ContractError, ContractHandler, ContractHandlerEvent, ContractValue,
-        SimStoreError,
-    },
+    contract::{self, ContractError, ContractHandler, ContractHandlerEvent, SimStoreError},
     message::{Message, NodeEvent, TransactionType},
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
     user_events::UserEventsProxy,
     util::IterExt,
-    ContractKey, NodeConfig,
+    NodeConfig,
 };
 
 pub(super) struct NodeInMemory<CErr = SimStoreError> {
@@ -151,7 +149,7 @@ where
                 .await;
                 match res {
                     Err(OpError::MaxRetriesExceeded(_, _))
-                        if tx_type == TransactionType::JoinRing =>
+                        if tx_type == TransactionType::JoinRing && !self.is_gateway =>
                     {
                         log::warn!("Retrying joining the ring with an other peer");
                         let gateway = self.gateways.iter().shuffle().next().unwrap();

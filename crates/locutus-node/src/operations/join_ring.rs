@@ -1102,6 +1102,6 @@ mod test {
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 1000, 2);
         sim_nodes.build().await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(5)).await
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(10)).await
     }
 }

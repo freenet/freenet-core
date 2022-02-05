@@ -3,12 +3,13 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
+use locutus_runtime::{Contract, ContractValue};
 use serde::{Deserialize, Serialize};
 use stretto::AsyncCache;
 use tokio::sync::mpsc;
 
 use super::runtime::{ContractRuntime, ContractUpdateError};
-use crate::contract::{store::ContractStore, Contract, ContractError, ContractKey, ContractValue};
+use crate::contract::{store::ContractStore, ContractError, ContractKey};
 pub(crate) use sqlite::{SQLiteContractHandler, SqlDbError};
 
 #[async_trait::async_trait]
@@ -306,10 +307,10 @@ mod sqlite {
 
         async fn get_value(
             &self,
-            contract: &ContractKey,
+            contract_key: &ContractKey,
         ) -> Result<Option<ContractValue>, Self::Error> {
-            let encoded_key = hex::encode(contract.0);
-            if let Some(value) = self.value_mem_cache.get(contract) {
+            let encoded_key = hex::encode(&**contract_key);
+            if let Some(value) = self.value_mem_cache.get(contract_key) {
                 return Ok(Some(value.value().clone()));
             }
             match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
@@ -326,17 +327,17 @@ mod sqlite {
 
         async fn put_value(
             &mut self,
-            contract: &ContractKey,
+            contract_key: &ContractKey,
             value: ContractValue,
         ) -> Result<ContractValue, Self::Error> {
-            let old_value: ContractValue = match self.get_value(contract).await {
+            let old_value: ContractValue = match self.get_value(contract_key).await {
                 Ok(Some(contract_value)) => contract_value,
                 Ok(None) => value.clone(),
                 Err(_) => value.clone(),
             };
 
-            let value: Vec<u8> = self.runtime.update_value(&*old_value, &value.0)?;
-            let encoded_key = hex::encode(contract.0);
+            let value: Vec<u8> = self.runtime.update_value(&*old_value, &*value)?;
+            let encoded_key = hex::encode(contract_key.as_ref());
             match sqlx::query(
                 "INSERT OR REPLACE INTO contracts (key, value) VALUES ($1, $2) \
                      RETURNING value",
@@ -350,7 +351,7 @@ mod sqlite {
                 Ok(contract_value) => {
                     let size = contract_value.len() as i64;
                     self.value_mem_cache
-                        .insert(*contract, contract_value.clone(), size)
+                        .insert(*contract_key, contract_value.clone(), size)
                         .await;
                     Ok(contract_value)
                 }
@@ -366,7 +367,6 @@ mod sqlite {
     mod test {
         use super::sqlite::SQLiteContractHandler;
         use super::*;
-        use crate::contract::Contract;
 
         // Prepare and get handler for an in-memory sqlite db
         async fn get_handler() -> Result<SQLiteContractHandler<MockRuntime>, SqlDbError> {

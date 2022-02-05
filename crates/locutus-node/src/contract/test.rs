@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
+use locutus_runtime::{ContractKey, ContractValue};
+
 use super::{
     handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
     runtime::{ContractRuntime, ContractUpdateResult},
     store::ContractStore,
-    ContractKey, ContractValue,
 };
 
 pub(crate) struct MockRuntime {}
@@ -107,7 +108,7 @@ impl std::error::Error for SimStoreError {}
 
 #[cfg(test)]
 mod tests {
-    use crate::contract::Contract;
+    use locutus_runtime::Contract;
 
     #[test]
     fn serialization() -> Result<(), anyhow::Error> {
@@ -117,8 +118,8 @@ mod tests {
 
         let serialized = bincode::serialize(&contract)?;
         let deser: Contract = bincode::deserialize(&serialized)?;
-        assert_eq!(deser.data, contract.data);
-        assert_eq!(deser.key, contract.key);
+        assert_eq!(deser.data(), contract.data());
+        assert_eq!(deser.key(), contract.key());
         Ok(())
     }
 }

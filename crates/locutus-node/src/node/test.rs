@@ -6,12 +6,13 @@ use std::{
 
 use itertools::Itertools;
 use libp2p::{identity, PeerId};
+use locutus_runtime::{Contract, ContractKey, ContractValue};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
 use crate::{
     config::GlobalExecutor,
-    contract::{Contract, ContractKey, ContractValue, MemoryContractHandler, SimStoreError},
+    contract::{MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
     user_events::{test::MemoryEventsGen, UserEvent},

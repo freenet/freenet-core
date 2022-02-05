@@ -1,4 +1,4 @@
-use crate::contract::{Contract, ContractKey, ContractValue};
+use locutus_runtime::{Contract, ContractKey, ContractValue};
 
 #[async_trait::async_trait]
 pub trait UserEventsProxy {

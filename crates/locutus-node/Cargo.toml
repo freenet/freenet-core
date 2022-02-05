@@ -10,7 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
-arbitrary = { version = "1", features = ["derive"] }
 asynchronous-codec = "0.6"
 async-trait = "0.1.52"
 bincode = "1"
@@ -22,7 +21,7 @@ directories = "4"
 either = "1"
 env_logger = "0.9.0"
 futures = "0.3.19"
-hex = "0.4.3"
+hex = "0.4"
 libp2p = { version = "0.42.1", features = [
     "autonat",
     "deflate",
@@ -46,6 +45,10 @@ unsigned-varint = "0.7"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
 sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
 
+# internal deps
+locutus-runtime = { path = "../locutus-runtime" }
+
 [dev-dependencies]
+arbitrary = { version = "1", features = ["derive"] }
 itertools = "0.10"
 pico-args = "0.4"

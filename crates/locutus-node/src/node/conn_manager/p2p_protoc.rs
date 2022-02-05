@@ -36,9 +36,11 @@ use unsigned_varint::codec::UviBytes;
 use super::{ConnectionBridge, ConnectionError};
 use crate::{
     config::{self, GlobalExecutor},
-    message::{Message, NodeEvent},
-    node::{handle_cancelled_op, process_message, OpManager, PeerKey},
+    message::{Message, NodeEvent, TransactionType},
+    node::{handle_cancelled_op, join_ring_request, process_message, OpManager, PeerKey},
+    operations::OpError,
     ring::PeerKeyLocation,
+    util::IterExt,
     InitPeerNode, NodeConfig,
 };
 
@@ -324,14 +326,34 @@ impl P2pConnManager {
                     let cb = self.bridge.clone();
                     match msg {
                         Message::Canceled(tx) => {
-                            handle_cancelled_op(
+                            let tx_type = tx.tx_type();
+                            let res = handle_cancelled_op(
                                 tx,
                                 op_manager.ring.peer_key,
                                 self.gateways.iter(),
                                 &op_manager,
                                 &mut self.bridge,
                             )
-                            .await?;
+                            .await;
+                            match res {
+                                Err(OpError::MaxRetriesExceeded(_, _))
+                                    if tx_type == TransactionType::JoinRing
+                                        && self.public_addr.is_none() /* FIXME: this should be not a gateway instead */ =>
+                                {
+                                    log::warn!("Retrying joining the ring with an other peer");
+                                    let gateway = self.gateways.iter().shuffle().next().unwrap();
+                                    join_ring_request(
+                                        None,
+                                        op_manager.ring.peer_key,
+                                        gateway,
+                                        &op_manager,
+                                        &mut self.bridge,
+                                    )
+                                    .await?
+                                }
+                                Err(err) => return Err(anyhow::anyhow!(err)),
+                                Ok(_) => {}
+                            }
                             continue;
                         }
                         msg => {

@@ -5,9 +5,8 @@ use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
 };
-use locutus_node::{
-    Contract, ContractValue, InitPeerNode, Location, NodeConfig, UserEvent, UserEventsProxy,
-};
+use locutus_node::{InitPeerNode, Location, NodeConfig, UserEvent, UserEventsProxy};
+use locutus_runtime::{Contract, ContractValue};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");

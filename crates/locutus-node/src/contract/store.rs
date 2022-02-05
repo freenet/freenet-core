@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use locutus_runtime::Contract;
 use stretto::AsyncCache;
 use tokio::{
     fs::File,
@@ -8,7 +9,7 @@ use tokio::{
 
 use crate::config::CONFIG;
 
-use super::{Contract, ContractError, ContractKey};
+use super::{ContractError, ContractKey};
 
 /// Handle contract blob storage on the file system.
 pub(crate) struct ContractStore {
@@ -46,7 +47,7 @@ impl ContractStore {
             };
             contract_file.read_to_end(&mut contract_data).await?;
             let contract = Contract::new(contract_data);
-            let size = contract.data.len() as i64;
+            let size = contract.data().len() as i64;
             self.mem_cache.insert(*key, contract.clone(), size).await;
             Ok(Some(contract))
         }
@@ -63,7 +64,7 @@ impl ContractStore {
         let key = contract.key();
         // insert in the memory cache
         {
-            let size = contract.data.len() as i64;
+            let size = contract.data().len() as i64;
             self.mem_cache.insert(key, contract.clone(), size).await;
         }
         // write to disc
@@ -74,7 +75,7 @@ impl ContractStore {
                 return Ok(());
             }
             let mut file = File::create(key_path).await?;
-            file.write_all(&*contract.data).await?;
+            file.write_all(contract.data()).await?;
         }
         Ok(())
     }

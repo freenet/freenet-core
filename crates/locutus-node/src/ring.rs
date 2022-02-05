@@ -24,11 +24,11 @@ use std::{
 
 use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
+use locutus_runtime::ContractKey;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    contract::ContractKey,
     node::{self, PeerKey},
     NodeConfig,
 };
@@ -274,13 +274,13 @@ impl Ring {
     #[inline]
     pub fn closest_caching(
         &self,
-        contract: &ContractKey,
+        contract_key: &ContractKey,
         n: usize,
         skip_list: &[PeerKey],
     ) -> Vec<PeerKeyLocation> {
         // Right now we return just the closest known peers to that location.
         // In the future this may change to the ones closest which are actually already caching it.
-        self.routing(&contract.location(), None, n, skip_list)
+        self.routing(&Location::from(contract_key), None, n, skip_list)
     }
 
     /// Find the closest number of peers to a given location. Result is returned sorted by proximity.
@@ -406,11 +406,8 @@ impl Location {
 
 /// Ensure at compile time locations can only be constructed from well formed contract keys
 /// (which have been hashed with a strong, cryptographically safe, hash function first).
-impl<T> From<T> for Location
-where
-    T: Borrow<ContractKey>,
-{
-    fn from(key: T) -> Self {
+impl From<&ContractKey> for Location {
+    fn from(key: &ContractKey) -> Self {
         let mut value = 0.0;
         let mut divisor = 256.0;
         for byte in key.borrow().bytes().iter().take(7) {
