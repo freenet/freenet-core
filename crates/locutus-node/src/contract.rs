@@ -1,7 +1,6 @@
 use locutus_runtime::ContractKey;
 
 mod handler;
-mod store;
 mod test;
 
 #[cfg(test)]
@@ -10,7 +9,6 @@ pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, SQLiteContractHandler, SqlDbError, StoreResponse,
 };
-pub(crate) use store::ContractStoreError;
 pub(crate) use test::MockRuntime;
 #[cfg(test)]
 pub(crate) use test::{MemoryContractHandler, SimStoreError};
@@ -20,7 +18,7 @@ pub(crate) async fn contract_handling<CH, Err>(
 ) -> Result<(), ContractError<Err>>
 where
     CH: ContractHandler<Error = Err> + Send + 'static,
-    Err: std::error::Error + Send + 'static,
+    Err: std::error::Error + From<std::io::Error> + Send + 'static,
 {
     loop {
         let res = contract_handler.channel().recv_from_listener().await?;
@@ -35,8 +33,9 @@ where
                 let contract = if fetch_contract {
                     contract_handler
                         .contract_store()
-                        .fetch_contract(&key)
-                        .await?
+                        .fetch_contract::<Err>(&key)
+                        .await
+                        .map_err(ContractError::StorageError)?
                 } else {
                     None
                 };
@@ -100,4 +99,10 @@ pub(crate) enum ContractError<CErr> {
     NoEvHandlerResponse,
     #[error(transparent)]
     IOError(#[from] std::io::Error),
+}
+
+impl From<SqlDbError> for ContractError<SqlDbError> {
+    fn from(err: SqlDbError) -> Self {
+        Self::StorageError(err)
+    }
 }

@@ -9,6 +9,7 @@ use libp2p::{
     tcp::TokioTcpConfig,
     yamux, PeerId, Transport,
 };
+use locutus_runtime::ContractStoreError;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -16,7 +17,7 @@ use super::{
 };
 use crate::{
     config::{self, GlobalExecutor},
-    contract::{self, ContractHandler, ContractStoreError},
+    contract::{self, ContractHandler},
     message::{Message, NodeEvent},
     ring::Ring,
     util::IterExt,
@@ -71,12 +72,10 @@ where
             .await
     }
 
-    pub fn build<CH>(
-        config: NodeConfig,
-    ) -> Result<NodeP2P<<CH as ContractHandler>::Error>, anyhow::Error>
+    pub fn build<CH, Err>(config: NodeConfig) -> Result<NodeP2P<Err>, anyhow::Error>
     where
-        CH: ContractHandler + Send + Sync + 'static,
-        <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
+        CH: ContractHandler<Error = Err> + Send + Sync + 'static,
+        Err: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
     {
         let peer_key = PeerKey::from(config.local_key.public());
         let gateways = config.get_gateways()?;
@@ -198,9 +197,10 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 = Box::new(NodeP2P::<ContractStoreError>::build::<TestContractHandler>(
-                config,
-            )?);
+            let mut peer1 = Box::new(NodeP2P::<ContractStoreError>::build::<
+                TestContractHandler,
+                ContractStoreError,
+            >(config)?);
             peer1.conn_manager.listen_on()?;
             ping_ev_loop(&mut peer1).await.unwrap();
             Ok::<_, anyhow::Error>(())
@@ -210,8 +210,11 @@ mod test {
         let dialer = GlobalExecutor::spawn(async move {
             let mut config = NodeConfig::default();
             config.add_gateway(peer1_config.clone());
-            let mut peer2 =
-                NodeP2P::<ContractStoreError>::build::<TestContractHandler>(config).unwrap();
+            let mut peer2 = NodeP2P::<ContractStoreError>::build::<
+                TestContractHandler,
+                ContractStoreError,
+            >(config)
+            .unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2

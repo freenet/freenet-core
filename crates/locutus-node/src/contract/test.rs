@@ -1,32 +1,38 @@
 use std::collections::HashMap;
 
-use locutus_runtime::{ContractKey, ContractRuntime, ContractUpdateError, ContractValue};
-
-use super::{
-    handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
-    store::ContractStore,
+use locutus_runtime::{
+    ContractKey, ContractStore, ContractUpdateError, ContractValue, RuntimeInterface,
 };
+
+use crate::config::CONFIG;
+
+use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 
 pub(crate) struct MockRuntime {}
 
-impl ContractRuntime for MockRuntime {
-    fn validate_value(&self, _value: &[u8]) -> bool {
+impl RuntimeInterface for MockRuntime {
+    fn validate_value(&self, _key: &ContractKey, _value: &[u8]) -> bool {
         true
     }
 
     fn update_value(
         &self,
+        _key: &ContractKey,
         _value: &[u8],
         value_update: &[u8],
     ) -> Result<Vec<u8>, ContractUpdateError> {
         Ok(value_update.to_vec())
     }
 
-    fn related_contracts(&self, _value_update: &[u8]) -> Vec<crate::contract::ContractKey> {
+    fn related_contracts(
+        &self,
+        _key: &ContractKey,
+        __value_update: &[u8],
+    ) -> Vec<crate::contract::ContractKey> {
         todo!()
     }
 
-    fn extract(&self, _extractor: Option<&[u8]>, _value: &[u8]) -> Vec<u8> {
+    fn extract(&self, _key: &ContractKey, _extractor: Option<&[u8]>, _value: &[u8]) -> Vec<u8> {
         todo!()
     }
 }
@@ -41,6 +47,8 @@ pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
 }
 
 impl<KVStore> MemoryContractHandler<KVStore> {
+    const MAX_MEM_CACHE: i64 = 10_000_000;
+
     pub fn new(
         channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
         kv_store: KVStore,
@@ -48,7 +56,10 @@ impl<KVStore> MemoryContractHandler<KVStore> {
         MemoryContractHandler {
             channel,
             kv_store,
-            contract_store: ContractStore::new(),
+            contract_store: ContractStore::new(
+                CONFIG.config_paths.contracts_dir.clone(),
+                Self::MAX_MEM_CACHE,
+            ),
             _runtime: MockRuntime {},
         }
     }
@@ -108,6 +119,12 @@ impl std::fmt::Display for SimStoreError {
 }
 
 impl std::error::Error for SimStoreError {}
+
+impl From<std::io::Error> for SimStoreError {
+    fn from(err: std::io::Error) -> Self {
+        Self(format!("{err}"))
+    }
+}
 
 #[cfg(test)]
 mod tests {

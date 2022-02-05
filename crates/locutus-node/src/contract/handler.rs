@@ -3,13 +3,14 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{Contract, ContractValue};
+use locutus_runtime::{Contract, ContractStore, ContractValue};
 use serde::{Deserialize, Serialize};
-use stretto::AsyncCache;
 use tokio::sync::mpsc;
 
-use crate::contract::{store::ContractStore, ContractError, ContractKey};
+use crate::contract::{ContractError, ContractKey};
 pub(crate) use sqlite::{SQLiteContractHandler, SqlDbError};
+
+const MAX_MEM_CACHE: i64 = 10_000_000;
 
 #[async_trait::async_trait]
 pub(crate) trait ContractHandler:
@@ -190,12 +191,13 @@ pub(crate) enum ContractHandlerEvent<Err> {
 mod sqlite {
     use std::str::FromStr;
 
-    use locutus_runtime::{ContractRuntime, ContractUpdateError};
+    use locutus_runtime::{ContractUpdateError, RuntimeInterface};
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},
         ConnectOptions, Row, SqlitePool,
     };
+    use stretto::AsyncCache;
 
     use super::*;
     use crate::{config::CONFIG, contract::test::MockRuntime};
@@ -226,6 +228,8 @@ mod sqlite {
         SqliteError(#[from] sqlx::Error),
         #[error(transparent)]
         RuntimeError(#[from] ContractUpdateError),
+        #[error(transparent)]
+        IOError(#[from] std::io::Error),
     }
 
     pub(crate) struct SQLiteContractHandler<R> {
@@ -238,7 +242,7 @@ mod sqlite {
 
     impl<R> SQLiteContractHandler<R>
     where
-        R: ContractRuntime + 'static,
+        R: RuntimeInterface + 'static,
     {
         /// max number of values stored in memory
         const MEM_CACHE_ITEMS: usize = 10_000;
@@ -281,7 +285,8 @@ mod sqlite {
         fn from(
             channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
         ) -> Self {
-            let store = ContractStore::new();
+            let store =
+                ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE);
             let runtime = MockRuntime {};
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current()
@@ -336,7 +341,9 @@ mod sqlite {
                 Err(_) => value.clone(),
             };
 
-            let value: Vec<u8> = self.runtime.update_value(&*old_value, &*value)?;
+            let value: Vec<u8> = self
+                .runtime
+                .update_value(contract_key, &*old_value, &*value)?;
             let encoded_key = hex::encode(contract_key.as_ref());
             match sqlx::query(
                 "INSERT OR REPLACE INTO contracts (key, value) VALUES ($1, $2) \
@@ -371,7 +378,8 @@ mod sqlite {
         // Prepare and get handler for an in-memory sqlite db
         async fn get_handler() -> Result<SQLiteContractHandler<MockRuntime>, SqlDbError> {
             let (_, ch_handler) = contract_handler_channel();
-            let store: ContractStore = ContractStore::new();
+            let store: ContractStore =
+                ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE);
             SQLiteContractHandler::new(ch_handler, store, MockRuntime {}).await
         }
 
@@ -417,12 +425,14 @@ mod sqlite {
 
 #[cfg(test)]
 pub mod test {
+    use locutus_runtime::ContractStoreError;
+
     use super::*;
     use crate::{
-        config::GlobalExecutor,
+        config::{GlobalExecutor, CONFIG},
         contract::{
             test::{MemKVStore, SimStoreError},
-            ContractStoreError, MockRuntime,
+            MockRuntime,
         },
     };
 
@@ -438,7 +448,10 @@ pub mod test {
             TestContractHandler {
                 channel,
                 kv_store: MemKVStore::new(),
-                contract_store: ContractStore::new(),
+                contract_store: ContractStore::new(
+                    CONFIG.config_paths.contracts_dir.clone(),
+                    MAX_MEM_CACHE,
+                ),
                 _runtime: MockRuntime {},
             }
         }

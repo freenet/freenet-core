@@ -100,6 +100,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b62fc65de8e4e7f52534fb52b0f3ed04746ae267519eef2a83941e8085068b"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8da52d66c7071e2e3fa2a1e5c6d088fec47b593032b254f5e980de8ea54454d6"
+dependencies = [
+ "serde 1.0.136",
+]
+
+[[package]]
 name = "asn1_der"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1115,7 +1124,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6607c62aa161d23d17a9072cc5da0be67cdfc89d3afb1e8d9c842bebc2525ffe"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "bitflags",
  "cfg-if",
  "ryu",
@@ -1475,10 +1484,17 @@ name = "locutus-runtime"
 version = "0.0.1"
 dependencies = [
  "arbitrary",
+ "arrayvec 0.7.2",
+ "bincode",
  "blake2 0.10.2",
+ "futures",
  "hex",
+ "once_cell",
+ "rand 0.8.4",
  "serde 1.0.136",
+ "stretto",
  "thiserror",
+ "wasm-bindgen",
  "wasmer",
 ]
 
@@ -2955,9 +2971,9 @@ dependencies = [
 
 [[package]]
 name = "twox-hash"
-version = "1.6.1"
+version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f559b464de2e2bdabcac6a210d12e9b5a5973c251e102c44c585c71d51bd78e"
+checksum = "4ee73e6e4924fe940354b8d4d98cad5231175d615cd855b758adc658c0aac6a0"
 dependencies = [
  "cfg-if",
  "rand 0.8.4",

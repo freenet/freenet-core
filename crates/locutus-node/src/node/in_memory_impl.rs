@@ -40,7 +40,8 @@ where
     ) -> Result<NodeInMemory<<CH as ContractHandler>::Error>, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
-        <CH as ContractHandler>::Error: std::error::Error + Send + Sync + 'static,
+        <CH as ContractHandler>::Error:
+            std::error::Error + From<std::io::Error> + Send + Sync + 'static,
     {
         let peer_key = PeerKey::from(config.local_key.public());
         let conn_manager = MemoryConnManager::new(peer_key);

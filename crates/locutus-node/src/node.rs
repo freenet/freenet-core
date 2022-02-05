@@ -24,7 +24,7 @@ use self::{
 };
 use crate::{
     config::{tracing::Logger, GlobalExecutor, CONFIG},
-    contract::{ContractError, ContractStoreError, MockRuntime, SQLiteContractHandler, SqlDbError},
+    contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
         get,
@@ -164,7 +164,7 @@ impl NodeConfig {
     /// Builds a node using the default backend connection manager.
     pub fn build(self) -> Result<Node<SqlDbError>, anyhow::Error> {
         let node =
-            NodeP2P::<ContractStoreError>::build::<SQLiteContractHandler<MockRuntime>>(self)?;
+            NodeP2P::<SqlDbError>::build::<SQLiteContractHandler<MockRuntime>, SqlDbError>(self)?;
         Ok(Node(node))
     }
 

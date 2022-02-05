@@ -1,4 +1,5 @@
 [workspace]
+edition = "2021"
 resolver = "2"
 
 members = ["crates/*"]
