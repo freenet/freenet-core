@@ -46,7 +46,11 @@ impl ConfigPaths {
     fn new() -> std::io::Result<ConfigPaths> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
-        let app_data_dir: PathBuf = project_dir.data_dir().into();
+        let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
+            std::env::temp_dir().join("locutus")
+        } else {
+            project_dir.data_dir().into()
+        };
         let contracts_dir = app_data_dir.join("contracts");
         let db_dir = app_data_dir.join("db");
 

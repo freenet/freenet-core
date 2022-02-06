@@ -1,4 +1,4 @@
-use std::{ops::Deref, path::PathBuf, sync::Arc};
+use std::{fs::File, io::Read, ops::Deref, path::PathBuf, sync::Arc};
 
 use arrayvec::ArrayVec;
 use blake2::{Blake2b512, Digest};
@@ -38,6 +38,21 @@ impl Contract {
 
     pub fn data(&self) -> &[u8] {
         &*self.data
+    }
+}
+
+impl TryFrom<PathBuf> for Contract {
+    type Error = ContractRuntimeError;
+
+    fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
+        let mut contract_file = File::open(path)?;
+        let mut contract_data = if let Ok(md) = contract_file.metadata() {
+            Vec::with_capacity(md.len() as usize)
+        } else {
+            Vec::new()
+        };
+        contract_file.read_to_end(&mut contract_data)?;
+        Ok(Contract::new(contract_data))
     }
 }
 

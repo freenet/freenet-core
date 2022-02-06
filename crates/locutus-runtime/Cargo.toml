@@ -14,7 +14,7 @@ hex = "0.4"
 serde = { version = "1", features = ["rc", "derive"] }
 stretto = { version = "0.3.2", features = ["sync"], default-features = false }
 thiserror = "1"
-wasmer = { version = "^2.0", default-features = false, features = [ "cranelift", "universal", "dylib" ] }
+wasmer = { version = "^2.0", default-features = false, features = [ "llvm", "universal", "dylib" ] }
 
 [features]
 default = [ "wasmer-default" ]

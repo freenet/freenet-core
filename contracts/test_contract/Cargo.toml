@@ -1,0 +1,17 @@
+[package]
+name = "test-contract"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.58.0"
+resolver = "2"
+
+[dependencies]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+opt-level = 's'
+debug = false
+codegen-units = 1

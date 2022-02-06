@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use wasmer::{
-    imports, Bytes, Cranelift, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc,
-    Store, Universal,
+    imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
+    Universal, LLVM,
 };
 
 use crate::{
@@ -24,11 +24,11 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn build(contracts: ContractStore) -> Result<Self, ContractRuntimeError> {
-        let store = Store::new(&Universal::new(Cranelift::default()).engine());
+        let store = Store::new(&Universal::new(LLVM::new()).engine());
         let host_memory = Self::get_host_mem(&store)?;
         let top_level_imports = imports! {
             "locutus" => {
-                "memory" =>  host_memory.clone(),
+                "mem" =>  host_memory.clone(),
             }
         };
 
@@ -55,6 +55,15 @@ impl Runtime {
         self.modules.insert(*key, module);
         Ok(())
     }
+
+    fn copy_data(&mut self, data: &[u8], offset: usize) {
+        // SAFETY: this is safe because is guaranteed to live for the duration of self
+        // and unique write access is guaranteed by the &mut self reference.
+        unsafe {
+            let mem = self.host_memory.data_unchecked_mut();
+            (&mut mem[offset..data.len()]).copy_from_slice(data);
+        }
+    }
 }
 
 impl RuntimeInterface for Runtime {
@@ -75,14 +84,7 @@ impl RuntimeInterface for Runtime {
             }
             .into());
         }
-        {
-            let data = unsafe {
-                // SAFETY: this is safe because is guaranteed to live for the duration of self
-                // and unique write access is guaranteed by the &mut self reference.
-                self.host_memory.data_unchecked_mut()
-            };
-            data.copy_from_slice(value);
-        }
+        self.copy_data(value, 0);
 
         let ptr = self.host_memory.data_ptr() as i32;
         let len = i32::try_from(value.len()).map_err(|_| {
@@ -121,16 +123,78 @@ impl RuntimeInterface for Runtime {
     }
 }
 
-#[repr(C)]
-pub struct WasmSlice {
-    pub ptr: u32,
-    pub len: u32,
-}
+#[cfg(test)]
+mod test {
+    use std::path::PathBuf;
 
-enum ContractResults {}
+    use wasmer::wat2wasm;
 
-type UpdateResult = u32;
+    use super::*;
+    use crate::Contract;
 
-fn update_value(ptr: u32, len: u32) {
-    let value: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+    fn test_dir() -> PathBuf {
+        let test_dir = std::env::temp_dir().join("locutus").join("contracts");
+        if !test_dir.exists() {
+            std::fs::create_dir_all(&test_dir).unwrap();
+        }
+        test_dir
+    }
+
+    fn test_contract() -> Contract {
+        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
+        let contracts = PathBuf::from(CONTRACTS_DIR);
+        let mut dirs = contracts.ancestors();
+        let path = dirs.nth(2).unwrap();
+        let contract_path = path
+            .join("contracts")
+            .join("test_contract")
+            .join("test_contract.wasm");
+        Contract::try_from(contract_path).expect("contract found")
+    }
+
+    #[test]
+    fn validate() -> Result<(), Box<dyn std::error::Error>> {
+        let wasm_bytes = wat2wasm(r#"
+        (module
+            (import "locutus" "mem" (memory $locutus_mem 1))
+            (type $validate_value_t (func (param i32) (param i32) (result i32)))
+
+            (func $validate_value (type $validate_value_t) (param $ptr i32) (param $len i32) (result i32) 
+                                  (local $start i32) (
+                set_local $start (i32.const 0)
+                (set_local $start (i32.load8_u (get_local $start)))
+
+                i32.const 1
+                get_local $start 
+                i32.eq return
+            ))
+
+            (export "validate_value" (func $validate_value))
+        )"#.as_bytes())?;
+
+        let mut store = ContractStore::new(test_dir(), 10_000);
+        let contract = Contract::new(wasm_bytes.to_vec());
+        let key = contract.key();
+        store.store_contract(contract)?;
+
+        let mut runtime = Runtime::build(store).unwrap();
+        let not_valid = !runtime.validate_value(&key, &[3])?;
+        assert!(not_valid);
+        let valid = runtime.validate_value(&key, &[1])?;
+        assert!(valid);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_compiled() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = ContractStore::new(test_dir(), 10_000);
+        let contract = test_contract();
+        let key = contract.key();
+        store.store_contract(contract)?;
+
+        let mut runtime = Runtime::build(store).unwrap();
+        let is_valid = runtime.validate_value(&key, &[1, 2, 3, 4])?;
+        assert!(is_valid);
+        Ok(())
+    }
 }

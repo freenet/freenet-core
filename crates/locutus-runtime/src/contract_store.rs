@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::PathBuf,
-};
+use std::{fs::File, io::Write, path::PathBuf};
 
 use stretto::Cache;
 
@@ -33,15 +29,8 @@ impl ContractStore {
             let key_path = self
                 .contracts_dir
                 .join(Into::<PathBuf>::into(*key))
-                .join(".wasm");
-            let mut contract_file = File::open(key_path)?;
-            let mut contract_data = if let Ok(md) = contract_file.metadata() {
-                Vec::with_capacity(md.len() as usize)
-            } else {
-                Vec::new()
-            };
-            contract_file.read_to_end(&mut contract_data)?;
-            let contract = Contract::new(contract_data);
+                .with_extension("wasm");
+            let contract = Contract::try_from(key_path)?;
             let size = contract.data().len() as i64;
             self.mem_cache.insert(*key, contract.clone(), size);
             Ok(Some(contract))
@@ -59,7 +48,7 @@ impl ContractStore {
         // write to disc
         {
             let key_path: PathBuf = key.into();
-            let key_path = self.contracts_dir.join(key_path).join(".wasm");
+            let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
             if key_path.exists() {
                 return Ok(());
             }
