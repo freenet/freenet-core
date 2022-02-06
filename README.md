@@ -5,7 +5,7 @@
 
 ### Purpose
 
-A distributed, decentralized, key-value store in which keys are cryptographic contracts that determine what values are valid under that key.
+A distributed, decentralized, key-value store in which keys are cryptographic contracts that determine what values are valid under that key, and how those values can be updated.
 
 The store is observable, allowing applications built on Locutus to listen for changes to values and be notified immediately. The cryptographic contracts are specified in webassembly.
 
