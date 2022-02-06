@@ -1,10 +1,10 @@
-use locutus_runtime::ContractKey;
+use locutus_runtime::{ContractKey, ContractRuntimeError};
 
 mod handler;
 mod test;
 
 #[cfg(test)]
-pub(crate) use handler::test::TestContractHandler;
+pub(crate) use handler::test::{TestContractHandler, TestContractStoreError};
 pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, SQLiteContractHandler, SqlDbError, StoreResponse,
@@ -18,7 +18,7 @@ pub(crate) async fn contract_handling<CH, Err>(
 ) -> Result<(), ContractError<Err>>
 where
     CH: ContractHandler<Error = Err> + Send + 'static,
-    Err: std::error::Error + From<std::io::Error> + Send + 'static,
+    Err: std::error::Error + Send + 'static,
 {
     loop {
         let res = contract_handler.channel().recv_from_listener().await?;
@@ -33,9 +33,8 @@ where
                 let contract = if fetch_contract {
                     contract_handler
                         .contract_store()
-                        .fetch_contract::<Err>(&key)
-                        .await
-                        .map_err(ContractError::StorageError)?
+                        .fetch_contract(&key)
+                        .map_err(|err| ContractError::ContractRuntimeError(err))?
                 } else {
                     None
                 };
@@ -51,11 +50,7 @@ where
                     .await?;
             }
             (id, ContractHandlerEvent::Cache(contract)) => {
-                match contract_handler
-                    .contract_store()
-                    .store_contract(contract)
-                    .await
-                {
+                match contract_handler.contract_store().store_contract(contract) {
                     Ok(_) => {
                         contract_handler
                             .channel()
@@ -63,6 +58,7 @@ where
                             .await?;
                     }
                     Err(err) => {
+                        let err = ContractError::ContractRuntimeError(err);
                         contract_handler
                             .channel()
                             .send_to_listener(id, ContractHandlerEvent::CacheResult(Err(err)))
@@ -89,16 +85,18 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ContractError<CErr> {
-    #[error("failed while storing a contract")]
-    StorageError(CErr),
-    #[error("contract {0} not found in storage")]
-    ContractNotFound(ContractKey),
     #[error("handler channel dropped")]
     ChannelDropped(Box<ContractHandlerEvent<CErr>>),
-    #[error("no response received from handler")]
-    NoEvHandlerResponse,
+    #[error("contract {0} not found in storage")]
+    ContractNotFound(ContractKey),
+    #[error("")]
+    ContractRuntimeError(ContractRuntimeError),
     #[error(transparent)]
     IOError(#[from] std::io::Error),
+    #[error("no response received from handler")]
+    NoEvHandlerResponse,
+    #[error("failed while storing a contract")]
+    StorageError(CErr),
 }
 
 impl From<SqlDbError> for ContractError<SqlDbError> {

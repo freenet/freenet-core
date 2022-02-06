@@ -9,7 +9,6 @@ use libp2p::{
     tcp::TokioTcpConfig,
     yamux, PeerId, Transport,
 };
-use locutus_runtime::ContractStoreError;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -26,7 +25,7 @@ use crate::{
 
 use super::OpManager;
 
-pub(super) struct NodeP2P<CErr = ContractStoreError> {
+pub(super) struct NodeP2P<CErr> {
     pub(crate) peer_key: PeerKey,
     pub(crate) op_storage: Arc<OpManager<CErr>>,
     notification_channel: Receiver<Either<Message, NodeEvent>>,
@@ -145,7 +144,7 @@ mod test {
     use super::*;
     use crate::{
         config::{tracing::Logger, GlobalExecutor},
-        contract::TestContractHandler,
+        contract::{TestContractHandler, TestContractStoreError},
         node::{test::get_free_port, InitPeerNode},
         ring::Location,
     };
@@ -197,9 +196,9 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 = Box::new(NodeP2P::<ContractStoreError>::build::<
+            let mut peer1 = Box::new(NodeP2P::<TestContractStoreError>::build::<
                 TestContractHandler,
-                ContractStoreError,
+                TestContractStoreError,
             >(config)?);
             peer1.conn_manager.listen_on()?;
             ping_ev_loop(&mut peer1).await.unwrap();
@@ -210,9 +209,9 @@ mod test {
         let dialer = GlobalExecutor::spawn(async move {
             let mut config = NodeConfig::default();
             config.add_gateway(peer1_config.clone());
-            let mut peer2 = NodeP2P::<ContractStoreError>::build::<
+            let mut peer2 = NodeP2P::<TestContractStoreError>::build::<
                 TestContractHandler,
-                ContractStoreError,
+                TestContractStoreError,
             >(config)
             .unwrap();
             // wait a bit to make sure the first peer is up and listening

@@ -1494,7 +1494,6 @@ dependencies = [
  "serde 1.0.136",
  "stretto",
  "thiserror",
- "wasm-bindgen",
  "wasmer",
 ]
 

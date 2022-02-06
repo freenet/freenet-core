@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use locutus_runtime::{
-    ContractKey, ContractStore, ContractUpdateError, ContractValue, RuntimeInterface,
+    ContractKey, ContractRuntimeError, ContractStore, ContractValue, RuntimeInterface,
 };
 
 use crate::config::CONFIG;
@@ -11,28 +11,37 @@ use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 pub(crate) struct MockRuntime {}
 
 impl RuntimeInterface for MockRuntime {
-    fn validate_value(&self, _key: &ContractKey, _value: &[u8]) -> bool {
-        true
+    fn validate_value(
+        &mut self,
+        _key: &ContractKey,
+        _value: &[u8],
+    ) -> Result<bool, ContractRuntimeError> {
+        Ok(true)
     }
 
     fn update_value(
-        &self,
+        &mut self,
         _key: &ContractKey,
         _value: &[u8],
         value_update: &[u8],
-    ) -> Result<Vec<u8>, ContractUpdateError> {
+    ) -> Result<Vec<u8>, ContractRuntimeError> {
         Ok(value_update.to_vec())
     }
 
     fn related_contracts(
-        &self,
+        &mut self,
         _key: &ContractKey,
         __value_update: &[u8],
-    ) -> Vec<crate::contract::ContractKey> {
+    ) -> Result<Vec<ContractKey>, ContractRuntimeError> {
         todo!()
     }
 
-    fn extract(&self, _key: &ContractKey, _extractor: Option<&[u8]>, _value: &[u8]) -> Vec<u8> {
+    fn extract(
+        &mut self,
+        _key: &ContractKey,
+        _extractor: Option<&[u8]>,
+        _value: &[u8],
+    ) -> Result<Vec<u8>, ContractRuntimeError> {
         todo!()
     }
 }

@@ -191,7 +191,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
 mod sqlite {
     use std::str::FromStr;
 
-    use locutus_runtime::{ContractUpdateError, RuntimeInterface};
+    use locutus_runtime::{ContractRuntimeError, RuntimeInterface};
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},
@@ -227,7 +227,7 @@ mod sqlite {
         #[error(transparent)]
         SqliteError(#[from] sqlx::Error),
         #[error(transparent)]
-        RuntimeError(#[from] ContractUpdateError),
+        RuntimeError(#[from] ContractRuntimeError),
         #[error(transparent)]
         IOError(#[from] std::io::Error),
     }
@@ -425,8 +425,6 @@ mod sqlite {
 
 #[cfg(test)]
 pub mod test {
-    use locutus_runtime::ContractStoreError;
-
     use super::*;
     use crate::{
         config::{GlobalExecutor, CONFIG},
@@ -436,15 +434,23 @@ pub mod test {
         },
     };
 
+    #[derive(Debug, thiserror::Error)]
+    pub(crate) enum TestContractStoreError {
+        #[error(transparent)]
+        IOError(#[from] std::io::Error),
+    }
+
     pub(crate) struct TestContractHandler {
-        channel: ContractHandlerChannel<ContractStoreError, CHListenerHalve>,
+        channel: ContractHandlerChannel<TestContractStoreError, CHListenerHalve>,
         kv_store: MemKVStore,
         contract_store: ContractStore,
         _runtime: MockRuntime,
     }
 
     impl TestContractHandler {
-        pub fn new(channel: ContractHandlerChannel<ContractStoreError, CHListenerHalve>) -> Self {
+        pub fn new(
+            channel: ContractHandlerChannel<TestContractStoreError, CHListenerHalve>,
+        ) -> Self {
             TestContractHandler {
                 channel,
                 kv_store: MemKVStore::new(),
@@ -469,7 +475,7 @@ pub mod test {
 
     #[async_trait::async_trait]
     impl ContractHandler for TestContractHandler {
-        type Error = ContractStoreError;
+        type Error = TestContractStoreError;
 
         #[inline(always)]
         fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
