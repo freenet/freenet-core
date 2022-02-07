@@ -3,11 +3,12 @@
 [![Build Status](https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/ci.yml)
 [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/Q2FWzCqKQD)
 
-### Purpose
+### Overview
 
-A distributed, decentralized, key-value store in which keys are cryptographic contracts that determine what values are valid under that key, and how those values can be updated.
+A distributed, decentralized, key-value store in which values are arbitrary data representing *state*, and keys are *cryptographic contracts* that determine
+what *state* is valid for that contract, and how that state can be updated in response to *messages*.
 
-The store is observable, allowing applications built on Locutus to listen for changes to values and be notified immediately. The cryptographic contracts are specified in webassembly.
+The store is observable, allowing applications built on Locutus to listen for changes to contract state and be notified immediately. The cryptographic contracts are specified in webassembly.
 
 This key-value store serves as a foundation for decentralized, scalable, and trustless alternatives to centralized services, including email, instant messaging, and social networks, many of which rely on closed proprietary protocols.
 
