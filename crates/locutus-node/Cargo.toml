@@ -20,7 +20,7 @@ dashmap = "4" # See RUSTSEC-2022-0002: Do NOT upgrade to 5.0.0
 directories = "4"
 either = "1"
 env_logger = "0.9.0"
-futures = "0.3.19"
+futures = "0.3.21"
 hex = "0.4"
 libp2p = { version = "0.42.1", features = [
     "autonat",
