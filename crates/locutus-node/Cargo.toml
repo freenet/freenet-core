@@ -16,7 +16,7 @@ bincode = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 config = { version = "0.11.0", features = [ "toml" ] } 
 crossbeam = "0.8.1"
-dashmap = "4" # See RUSTSEC-2022-0002: Do NOT upgrade to 5.0.0 
+dashmap = "5" # See RUSTSEC-2022-0002: Do NOT upgrade to 5.0.0 
 directories = "4"
 either = "1"
 env_logger = "0.9.0"
