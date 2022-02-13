@@ -1,15 +1,16 @@
 #[no_mangle]
-#[allow(clippy::missing_safety_doc)]
 pub extern "C" fn validate_value(ptr: *mut u8, len: i32) -> i32 {
     // eprintln!("accessing ptr: ({ptr:p}, {len})");
     let data = get_data(ptr, len as usize);
     // eprintln!("current data: {data:?}");
-    if data[0] == 1 && data[3] == 4 {
-        // eprintln!("is valid");
-        1
-    } else {
-        // eprintln!("is not valid");
-        0
+    unsafe {
+        if *data.get_unchecked(0) == 1 && *data.get_unchecked(3) == 4 {
+            // eprintln!("is valid");
+            1
+        } else {
+            // eprintln!("is not valid");
+            0
+        }
     }
 }
 

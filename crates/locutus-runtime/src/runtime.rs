@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use wasmer::{
-    imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
-    Universal, WasmPtr, LLVM,
+    imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store, WasmPtr,
 };
 
 use crate::{
@@ -26,8 +25,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn build(contracts: ContractStore, host_mem: bool) -> Result<Self, ContractRuntimeError> {
-        let store = Store::new(&Universal::new(LLVM::new()).engine());
-
+        let store = Self::instance_store();
         let (host_memory, top_level_imports) = if host_mem {
             let mem = Self::instance_host_mem(&store)?;
             let imports = imports! {
@@ -106,6 +104,18 @@ impl Runtime {
 
         let instance = Instance::new(module, &imports)?;
         Ok(instance)
+    }
+
+    #[cfg(not(test))]
+    fn instance_store() -> Store {
+        use wasmer::Dylib;
+        Store::new(&Dylib::headless().engine())
+    }
+
+    #[cfg(test)]
+    fn instance_store() -> Store {
+        use wasmer::{Cranelift, Universal};
+        Store::new(&Universal::new(Cranelift::new()).engine())
     }
 }
 
@@ -247,7 +257,7 @@ mod test {
     fn validate_with_program_mem() -> Result<(), Box<dyn std::error::Error>> {
         let module = VALIDATE_WAT.to_owned().replace(
             "<DECL MEM>",
-            r#"(memory $locutus_mem (export "memory") 17)"#,
+            r#"(memory $locutus_mem (export "memory") 20)"#,
         );
         let wasm_bytes = wat2wasm(module.as_bytes())?;
         let contract = Contract::new(wasm_bytes.to_vec());

@@ -15,13 +15,23 @@ serde = { version = "1", features = ["rc", "derive"] }
 stretto = { version = "0.3.2", features = ["sync"], default-features = false }
 tracing = "0.1"
 thiserror = "1"
-wasmer = { version = "^2.0", default-features = false, features = [ "llvm", "universal", "dylib" ] }
+wasmer = { version = "^2.0", default-features = false, features = [ 
+	"sys" 
+]}
 
 [features]
 default = [ "wasmer-default" ]
-wasmer-default = [ "wasmer/sys-default" ]
+wasmer-default = [ 
+	"wasmer/llvm",
+	"wasmer/dylib"
+]
+wasmser-universal = [
+	"wasmer/default-cranelift",
+	"wasmer/universal"
+]
 
 [dev-dependencies]
+wasmer = { features = [ "sys-default", "wat"] }
 bincode = "1"
 once_cell = "1"
 rand = { version = "0.8", features = ["small_rng"] }
