@@ -15,3 +15,7 @@ lto = true
 opt-level = 's'
 debug = false
 codegen-units = 1
+panic = 'abort'
+
+#[target.wasm32-unknown-unknown]
+#rustflags = ["-C", "link-arg=--import-memory"]
