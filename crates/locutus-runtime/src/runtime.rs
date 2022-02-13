@@ -95,14 +95,14 @@ impl Runtime {
             imports.register("env", namespace!("memory" => mem.clone()));
         }
 
-        // let mut namespaces = HashMap::new();
-        // for (module, name, import) in self.top_level_imports.externs_vec() {
-        //     let namespace: &mut wasmer::Exports = namespaces.entry(module).or_default();
-        //     namespace.insert(name, import);
-        // }
-        // for (module, ns) in namespaces {
-        //     imports.register(module, ns);
-        // }
+        let mut namespaces = HashMap::new();
+        for (module, name, import) in self.top_level_imports.externs_vec() {
+            let namespace: &mut wasmer::Exports = namespaces.entry(module).or_default();
+            namespace.insert(name, import);
+        }
+        for (module, ns) in namespaces {
+            imports.register(module, ns);
+        }
 
         let instance = Instance::new(module, &imports)?;
         Ok(instance)
