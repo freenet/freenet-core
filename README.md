@@ -3,11 +3,12 @@
 [![Build Status](https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/ci.yml)
 [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/Q2FWzCqKQD)
 
-### Purpose
+### Overview
 
-A distributed, decentralized, key-value store in which keys are cryptographic contracts that determine what values are valid under that key.
+A distributed, decentralized, key-value store in which values are arbitrary data representing *state*, and keys are *cryptographic contracts* that determine
+what *state* is valid for that contract, and how that state can be updated in response to *messages*.
 
-The store is observable, allowing applications built on Locutus to listen for changes to values and be notified immediately. The cryptographic contracts are specified in webassembly.
+The store is observable, allowing applications built on Locutus to listen for changes to contract state and be notified immediately. The cryptographic contracts are specified in webassembly.
 
 This key-value store serves as a foundation for decentralized, scalable, and trustless alternatives to centralized services, including email, instant messaging, and social networks, many of which rely on closed proprietary protocols.
 
@@ -32,7 +33,8 @@ Locutus won't replace Fred; they're trying to solve different (but related) prob
 
 * Fred is primarily a research platform, and this has limited its adoption. While it continues to improve, ease of use has always been an issue for Fred. Locutus is being designed from the ground up to be no more difficult to use than a web browser.
 
-* Fred has [signed subspace keys](https://freenetproject.org/pages/documentation.html), Locutus will have a greatly generalized version of this called cryptographic contracts which are specified in webassembly. These contracts are the software for the distributed, decentralized computer.
+* Fred has [signed subspace keys](https://freenetproject.org/pages/documentation.html), Locutus' contracts are a greatly generalized version of this concept
+  that form the building blocks of a flexible distributed computation platform.
 
 * Fred has a strong focus on anonymity. Anonymity is not a core design goal for Locutus itself, but systems that provide greater privacy can be built on top of it.
 
@@ -55,8 +57,8 @@ We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
 This project is licensed under either of
 
 - Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-  [http://www.apache.org/licenses/LICENSE-2.0])
+  http://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  [http://opensource.org/licenses/MIT])
+  http://opensource.org/licenses/MIT)
 
 at your option.
