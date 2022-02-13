@@ -7,6 +7,7 @@ use crate::{Contract, RuntimeResult};
 use super::ContractKey;
 
 /// Handle contract blob storage on the file system.
+#[derive(Clone)]
 pub struct ContractStore {
     contracts_dir: PathBuf,
     mem_cache: Cache<ContractKey, Contract>,

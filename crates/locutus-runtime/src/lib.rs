@@ -24,6 +24,14 @@ pub enum ContractRuntimeError {
     #[error("failed while unwrapping contract to raw bytes")]
     UnwrapContract,
 
+    #[cfg(test)]
+    #[error(transparent)]
+    WasiEnvError(#[from] wasmer_wasi::WasiStateCreationError),
+
+    #[cfg(test)]
+    #[error(transparent)]
+    WasiError(#[from] wasmer_wasi::WasiError),
+
     #[error(transparent)]
     WasmCompileError(#[from] wasmer::CompileError),
 
