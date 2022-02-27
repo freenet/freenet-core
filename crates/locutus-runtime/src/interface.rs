@@ -50,7 +50,7 @@ pub enum ExecError {
     #[error("invalid put value")]
     InvalidPutValue(Vec<u8>),
 
-    #[error("insufficient memory, needed {req} KB but had {free} KB")]
+    #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
     InsufficientMemory { req: usize, free: usize },
 
     #[error("could not cast array length of {0} to max size (i32::MAX)")]

@@ -31,7 +31,7 @@ wasmser-universal = [
 ]
 
 [dev-dependencies]
-wasmer = { features = [ "sys-default", "wat"] }
+wasmer = { version = "^2.0", features = [ "sys-default", "wat"] }
 bincode = "1"
 once_cell = "1"
 rand = { version = "0.8", features = ["small_rng"] }

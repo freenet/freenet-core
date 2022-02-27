@@ -1,3 +1,4 @@
+mod buffer;
 mod contract;
 mod contract_store;
 mod interface;

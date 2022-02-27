@@ -139,21 +139,19 @@ impl RuntimeInterface for Runtime {
             if let Err(err) = memory.grow(req_pages - memory.size()) {
                 tracing::error!("wasm runtime failed with memory error: {err}");
                 return Err(ExecError::InsufficientMemory {
-                    req: (req_pages.0 as usize * wasmer::WASM_PAGE_SIZE) / 1024,
-                    free: (memory.size().0 as usize * wasmer::WASM_PAGE_SIZE) / 1024,
+                    req: (req_pages.0 as usize * wasmer::WASM_PAGE_SIZE),
+                    free: (memory.size().0 as usize * wasmer::WASM_PAGE_SIZE),
                 }
                 .into());
             }
         }
         self.copy_data(&memory, value, 0);
 
-        let ptr = memory.data_ptr();
         let len = i32::try_from(value.len()).map_err(|_| {
             ContractRuntimeError::ExecError(ExecError::InvalidArrayLength(value.len()))
         })?;
         let validate_func: NativeFunc<(WasmPtr<&[u8]>, i32), u8> =
             instance.exports.get_native_function("validate_value")?;
-        eprintln!("passing ptr: ({ptr:p}, {len}) -> {}", ptr as i32);
         let is_valid = validate_func.call(WasmPtr::new(0), len)? != 0;
         Ok(is_valid)
     }
@@ -219,15 +217,9 @@ mod test {
         <DECL MEM>
         (type $validate_value_t (func (param i32) (param i32) (result i32)))
 
-        (func $validate_value (type $validate_value_t) (param $ptr i32) (param $len i32) (result i32) 
-                              (local $start i32) (
-            set_local $start (i32.const 0)
-            (set_local $start (i32.load8_u (get_local $start)))
-
-            i32.const 3
-            get_local $start 
-            i32.eq return
-        ))
+        (func $validate_value (type $validate_value_t) (param $ptr i32) (param $len i32) (result i32)
+            (return (i32.eq (i32.const 3) (i32.load8_u (i32.const 0))))
+        )
 
         (export "validate_value" (func $validate_value))
     )"#;
@@ -236,7 +228,7 @@ mod test {
     fn validate_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
         let module = VALIDATE_WAT.to_owned().replace(
             "<DECL MEM>",
-            r#"(import "env" "memory" (memory $locutus_mem 17))"#,
+            r#"(import "env" "memory" (memory $locutus_mem 20))"#,
         );
         let wasm_bytes = wat2wasm(module.as_bytes())?;
         let contract = Contract::new(wasm_bytes.to_vec());
@@ -275,14 +267,14 @@ mod test {
     }
 
     #[test]
-    fn validate_compiled_with_program_mem() -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> {
         let mut store = ContractStore::new(test_dir(), 10_000);
-        let contract = test_contract("test_contract_prog.wasm");
+        let contract = test_contract("test_contract_guest.wasm");
         let key = contract.key();
         store.store_contract(contract)?;
 
         let mut runtime = Runtime::build(store, false).unwrap();
-        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING
+        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires buding for wasi
         let is_valid = runtime.validate_value(&key, &[1, 2, 3, 4])?;
         assert!(is_valid);
         let not_valid = !runtime.validate_value(&key, &[1, 0, 0, 1])?;
@@ -298,7 +290,7 @@ mod test {
         store.store_contract(contract)?;
 
         let mut runtime = Runtime::build(store, true).unwrap();
-        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING
+        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
         let is_valid = runtime.validate_value(&key, &[1, 2, 3, 4])?;
         assert!(is_valid);
         let not_valid = !runtime.validate_value(&key, &[1, 0, 0, 1])?;
