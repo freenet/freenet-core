@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
 use wasmer::{
-    imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store, WasmPtr,
+    imports, Bytes, Function, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
 };
 
 use crate::{
+    buffer::{Buffer, BufferMut, Host},
+    interface::{Parameters, State, UpdateResult},
     ContractKey, ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, RuntimeResult,
 };
 
@@ -31,6 +33,14 @@ impl Runtime {
             let imports = imports! {
                 "env" => {
                     "memory" =>  mem.clone(),
+                },
+                "locutus" => {
+                    "validate_state" => {
+                        Function::new_native(&store, crate::interface::validate_state)
+                    },
+                    "validate_delta" => {
+                        Function::new_native(&store, crate::interface::validate_delta)
+                    }
                 }
             };
             (Some(mem), imports)
@@ -49,12 +59,12 @@ impl Runtime {
         })
     }
 
-    fn instance_host_mem(store: &Store) -> Result<Memory, ContractRuntimeError> {
+    fn instance_host_mem(store: &Store) -> RuntimeResult<Memory> {
         // todo: max memory assigned for this runtime
         Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
     }
 
-    fn get_module(&mut self, key: &ContractKey) -> Result<(), ContractRuntimeError> {
+    fn get_module(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract = self
             .contracts
             .fetch_contract(key)?
@@ -64,13 +74,17 @@ impl Runtime {
         Ok(())
     }
 
-    fn copy_data(&mut self, memory: &Memory, data: &[u8], offset: usize) {
-        // SAFETY: this is safe because is guaranteed to live for the duration of self
-        // and unique write access is guaranteed by the &mut self reference.
-        unsafe {
-            let mem = memory.data_unchecked_mut();
-            (&mut mem[offset..data.len()]).copy_from_slice(data);
-        }
+    fn init_buf<T>(buf: &Instance, data: T) -> RuntimeResult<BufferMut>
+    where
+        T: AsRef<[u8]>,
+    {
+        let data = data.as_ref();
+        BufferMut::new(
+            buf,
+            data.len().try_into().map_err(|_| {
+                ContractRuntimeError::ExecError(ExecError::InvalidArrayLength(data.len()))
+            })?,
+        )
     }
 
     #[cfg(not(test))]
@@ -117,24 +131,21 @@ impl Runtime {
         use wasmer::{Cranelift, Universal};
         Store::new(&Universal::new(Cranelift::new()).engine())
     }
-}
 
-impl RuntimeInterface for Runtime {
-    fn validate_value(&mut self, key: &ContractKey, value: &[u8]) -> RuntimeResult<bool> {
+    fn prepare_call(&mut self, key: &ContractKey, req_bytes: usize) -> RuntimeResult<Instance> {
         let module = if let Some(module) = self.modules.get(key) {
             module
         } else {
             self.get_module(key)?;
             self.modules.get(key).unwrap()
         };
-
         let instance = self.prepare_instance(module)?;
         let memory = self
             .host_memory
             .clone()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory").map(|m| m.clone()))?;
-        let req_pages = Bytes::from(value.len()).try_into().unwrap();
+        let req_pages = Bytes::from(req_bytes).try_into().unwrap();
         if memory.size() < req_pages {
             if let Err(err) = memory.grow(req_pages - memory.size()) {
                 tracing::error!("wasm runtime failed with memory error: {err}");
@@ -145,40 +156,116 @@ impl RuntimeInterface for Runtime {
                 .into());
             }
         }
-        self.copy_data(&memory, value, 0);
+        Ok(instance)
+    }
 
-        let len = i32::try_from(value.len()).map_err(|_| {
-            ContractRuntimeError::ExecError(ExecError::InvalidArrayLength(value.len()))
-        })?;
-        let validate_func: NativeFunc<(WasmPtr<&[u8]>, i32), u8> =
-            instance.exports.get_native_function("validate_value")?;
-        let is_valid = validate_func.call(WasmPtr::new(0), len)? != 0;
+    /// Determine whether this state is valid for this contract.
+    // when do we know we need to validate the whole state
+    pub fn validate_state<'a>(
+        &mut self,
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+    ) -> RuntimeResult<bool> {
+        let req_bytes = parameters.size() + state.size();
+        let instance = self.prepare_call(key, req_bytes)?;
+        let mut param_buf = Self::init_buf(&instance, &parameters)?;
+        param_buf.write(parameters)?;
+        let mut state_buf = Self::init_buf(&instance, &state)?;
+        state_buf.write(state)?;
+
+        let validate_func: NativeFunc<(i64, i64), i32> =
+            instance.exports.get_native_function("validate_state")?;
+        let is_valid =
+            validate_func.call(param_buf.builder_ptr as i64, state_buf.builder_ptr as i64)? != 0;
         Ok(is_valid)
     }
 
-    fn update_value(
+    /// Determine whether this delta is valid for this contract.
+    // when do we know we need to validate only the delta
+    fn validate_delta<'a>(
         &mut self,
         key: &ContractKey,
-        value: &[u8],
-        value_update: &[u8],
-    ) -> RuntimeResult<Vec<u8>> {
+        parameters: Parameters<'a>,
+        delta: crate::interface::StateDelta<'a>,
+    ) -> RuntimeResult<bool> {
+        // todo: if we keep this hot in memory on next calls overwrite the buffer with new delta
+        let req_bytes = parameters.size() + delta.size();
+        let instance = self.prepare_call(key, req_bytes)?;
+        let mut param_buf = Self::init_buf(&instance, &parameters)?;
+        param_buf.write(parameters)?;
+        let delta_buf = Self::init_buf(&instance, &delta)?;
+        delta_buf.write(delta)?;
+
+        let validate_func: NativeFunc<(i64, i64), i32> =
+            instance.exports.get_native_function("validate_delta")?;
+        let is_valid =
+            validate_func.call(param_buf.builder_ptr as i64, delta_buf.builder_ptr as i64)? != 0;
+        Ok(is_valid)
+    }
+
+    /// Determine whether this delta is a valid update for this contract. If it is, return the modified state,
+    /// else return error.
+    ///
+    /// The contract must be implemented in a way such that this function call is idempotent:
+    /// - If the same `update_state` is applied twice to a value, then the second will be ignored.
+    /// - Application of `update_state` is "order invariant", no matter what the order in which the values are
+    ///   applied, the resulting value must be exactly the same.
+    fn update_state<'a>(
+        &mut self,
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+        delta: crate::interface::StateDelta<'a>,
+    ) -> RuntimeResult<State<'a>> {
+        // todo: if we keep this hot in memory some things to take into account:
+        //       - over subsequent requests state size may change
+        //       - the delta may not be necessarily the same size
+        let req_bytes = parameters.size() + state.size() + delta.size();
+        let instance = self.prepare_call(key, req_bytes)?;
+        let mut param_buf = Self::init_buf(&instance, &parameters)?;
+        param_buf.write(parameters)?;
+        let mut state_buf = Self::init_buf(&instance, &state)?;
+        state_buf.write(delta)?;
+        let mut delta_buf = Self::init_buf(&instance, &delta)?;
+        delta_buf.write(delta)?;
+
+        let validate_func: NativeFunc<(i64, i64), i32> =
+            instance.exports.get_native_function("update_state")?;
+        let update_res = UpdateResult::try_from(
+            validate_func.call(param_buf.builder_ptr as i64, delta_buf.builder_ptr as i64)?,
+        )
+        .map_err(|_| ContractRuntimeError::from(ExecError::UnexpectedResult))?;
+        match update_res {
+            UpdateResult::ValidNoChange => Ok(state),
+            UpdateResult::ValidUpdate => {
+                let state_buf = state_buf.flip_ownership();
+                // todo: get diff from buf and only then read and append if necessary
+                let new_state = state_buf.read_bytes(state.size());
+                Ok(State::from(new_state.to_vec()))
+            }
+            UpdateResult::Invalid => {
+                Err(ExecError::InvalidPutValue.into())
+            }
+        }
+    }
+
+    fn summarize_state<'a>(
+        &mut self,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+    ) -> crate::interface::StateSummary<'a> {
+        let req_bytes = parameters.size() + state.size();
+
         todo!()
     }
 
-    fn related_contracts(
+    fn get_state_delta<'a>(
         &mut self,
-        key: &ContractKey,
-        value_update: &[u8],
-    ) -> RuntimeResult<Vec<ContractKey>> {
-        todo!()
-    }
-
-    fn extract(
-        &mut self,
-        key: &ContractKey,
-        extractor: Option<&[u8]>,
-        value: &[u8],
-    ) -> RuntimeResult<Vec<u8>> {
+        parameters: Parameters<'a>,
+        state: State<'a>,
+        delta_to: crate::interface::StateSummary<'a>,
+    ) -> crate::interface::StateDelta<'a> {
         todo!()
     }
 }
@@ -237,9 +324,9 @@ mod test {
         store.store_contract(contract)?;
 
         let mut runtime = Runtime::build(store.clone(), true).unwrap();
-        let not_valid = !runtime.validate_value(&key, &[1])?;
+        let not_valid = !runtime.validate_state(&key, &[1])?;
         assert!(not_valid);
-        let valid = runtime.validate_value(&key, &[3])?;
+        let valid = runtime.validate_state(&key, &[3])?;
         assert!(valid);
 
         Ok(())
@@ -258,9 +345,9 @@ mod test {
         store.store_contract(contract)?;
 
         let mut runtime = Runtime::build(store.clone(), false).unwrap();
-        let not_valid = !runtime.validate_value(&key, &[1])?;
+        let not_valid = !runtime.validate_state(&key, &[1])?;
         assert!(not_valid);
-        let valid = runtime.validate_value(&key, &[3])?;
+        let valid = runtime.validate_state(&key, &[3])?;
         assert!(valid);
 
         Ok(())
@@ -275,9 +362,9 @@ mod test {
 
         let mut runtime = Runtime::build(store, false).unwrap();
         // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires buding for wasi
-        let is_valid = runtime.validate_value(&key, &[1, 2, 3, 4])?;
+        let is_valid = runtime.validate_state(&key, &[1, 2, 3, 4])?;
         assert!(is_valid);
-        let not_valid = !runtime.validate_value(&key, &[1, 0, 0, 1])?;
+        let not_valid = !runtime.validate_state(&key, &[1, 0, 0, 1])?;
         assert!(not_valid);
         Ok(())
     }
@@ -291,9 +378,9 @@ mod test {
 
         let mut runtime = Runtime::build(store, true).unwrap();
         // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
-        let is_valid = runtime.validate_value(&key, &[1, 2, 3, 4])?;
+        let is_valid = runtime.validate_state(&key, &[1, 2, 3, 4])?;
         assert!(is_valid);
-        let not_valid = !runtime.validate_value(&key, &[1, 0, 0, 1])?;
+        let not_valid = !runtime.validate_state(&key, &[1, 0, 0, 1])?;
         assert!(not_valid);
         Ok(())
     }

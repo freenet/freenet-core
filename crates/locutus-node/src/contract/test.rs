@@ -11,39 +11,83 @@ use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 pub(crate) struct MockRuntime {}
 
 impl RuntimeInterface for MockRuntime {
-    fn validate_value(
+    fn validate_state<'a>(
         &mut self,
-        _key: &ContractKey,
-        _value: &[u8],
-    ) -> Result<bool, ContractRuntimeError> {
-        Ok(true)
-    }
-
-    fn update_value(
-        &mut self,
-        _key: &ContractKey,
-        _value: &[u8],
-        value_update: &[u8],
-    ) -> Result<Vec<u8>, ContractRuntimeError> {
-        Ok(value_update.to_vec())
-    }
-
-    fn related_contracts(
-        &mut self,
-        _key: &ContractKey,
-        __value_update: &[u8],
-    ) -> Result<Vec<ContractKey>, ContractRuntimeError> {
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+    ) -> RuntimeResult<bool> {
         todo!()
     }
 
-    fn extract(
+    fn validate_delta<'a>(
         &mut self,
-        _key: &ContractKey,
-        _extractor: Option<&[u8]>,
-        _value: &[u8],
-    ) -> Result<Vec<u8>, ContractRuntimeError> {
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        delta: StateDelta<'a>,
+    ) -> RuntimeResult<bool> {
         todo!()
     }
+
+    fn update_state<'a>(
+        &mut self,
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+        delta: StateDelta<'a>,
+    ) -> RuntimeResult<State<'a>> {
+        todo!()
+    }
+
+    fn summarize_state<'a>(
+        &mut self,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+    ) -> StateSummary<'a> {
+        todo!()
+    }
+
+    fn get_state_delta<'a>(
+        &mut self,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+        delta_to: StateSummary<'a>,
+    ) -> StateDelta<'a> {
+        todo!()
+    }
+    // fn validate_state(
+    //     &mut self,
+    //     _key: &ContractKey,
+    //     _value: &[u8],
+    // ) -> Result<bool, ContractRuntimeError> {
+    //     Ok(true)
+    // }
+
+    // fn update_value(
+    //     &mut self,
+    //     _key: &ContractKey,
+    //     _value: &[u8],
+    //     value_update: &[u8],
+    // ) -> Result<Vec<u8>, ContractRuntimeError> {
+    //     Ok(value_update.to_vec())
+    // }
+
+    // fn related_contracts(
+    //     &mut self,
+    //     _key: &ContractKey,
+    //     __value_update: &[u8],
+    // ) -> Result<Vec<ContractKey>, ContractRuntimeError> {
+    //     todo!()
+    // }
+
+    // fn extract(
+    //     &mut self,
+    //     _key: &ContractKey,
+    //     _extractor: Option<&[u8]>,
+    //     _value: &[u8],
+    // ) -> Result<Vec<u8>, ContractRuntimeError> {
+    //     todo!()
+    // }
 }
 
 pub(crate) type MemKVStore = HashMap<ContractKey, ContractValue>;

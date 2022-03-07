@@ -6,7 +6,7 @@ mod runtime;
 
 pub use contract::{Contract, ContractKey, ContractValue};
 pub use contract_store::ContractStore;
-pub use interface::{ExecError, RuntimeInterface};
+pub use interface::ExecError;
 pub use runtime::Runtime;
 
 type RuntimeResult<T> = std::result::Result<T, ContractRuntimeError>;

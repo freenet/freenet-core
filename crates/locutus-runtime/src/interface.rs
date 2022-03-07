@@ -4,55 +4,203 @@
 //!
 //! This abstraction layer shouldn't leak beyond the contract handler.
 
-use crate::{contract::ContractKey, RuntimeResult};
+use std::{
+    borrow::Cow,
+    ops::{Deref, DerefMut},
+};
 
-pub trait RuntimeInterface {
-    /// Determine whether this value is valid for this contract
-    fn validate_value(&mut self, key: &ContractKey, value: &[u8]) -> RuntimeResult<bool>;
+use crate::buffer::BufferBuilder;
 
-    /// Determine whether this value is a valid update for this contract. If it is, return the modified value,
-    /// else return error and the original value.
-    ///
-    /// The contract must be implemented in a way such that this function call is idempotent:
-    /// - If the same `value_update` is applied twice to a value, then the second will be ignored.
-    /// - Application of `value_update` is "order invariant", no matter what the order in which the values are
-    ///   applied, the resulting value must be exactly the same.
-    fn update_value(
-        &mut self,
-        key: &ContractKey,
-        value: &[u8],
-        value_update: &[u8],
-    ) -> RuntimeResult<Vec<u8>>;
+pub struct Parameters<'a>(&'a [u8]);
 
-    /// Obtain any other related contracts for this value update. Typically used to ensure
-    /// update has been fully propagated.
-    fn related_contracts(
-        &mut self,
-        key: &ContractKey,
-        value_update: &[u8],
-    ) -> RuntimeResult<Vec<ContractKey>>;
+impl<'a> Parameters<'a> {
+    pub fn size(&self) -> usize {
+        self.0.len()
+    }
+}
 
-    /// Extract some data from the value and return it.
-    /// E.g. `extractor` might contain a byte range, which will be extracted
-    /// from the value and returned.
-    ///
-    /// In case extractor is none, then return the whole value.
-    fn extract(
-        &mut self,
-        key: &ContractKey,
-        extractor: Option<&[u8]>,
-        value: &[u8],
-    ) -> RuntimeResult<Vec<u8>>;
+impl<'a> From<&'a [u8]> for Parameters<'a> {
+    fn from(s: &'a [u8]) -> Self {
+        Parameters(s)
+    }
+}
+
+impl<'a> AsRef<[u8]> for Parameters<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+pub struct State<'a>(Cow<'a, [u8]>);
+
+impl<'a> State<'a> {
+    pub fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a> From<Vec<u8>> for State<'a> {
+    fn from(state: Vec<u8>) -> Self {
+        State(Cow::from(state))
+    }
+}
+
+impl<'a> From<&'a [u8]> for State<'a> {
+    fn from(state: &'a [u8]) -> Self {
+        State(Cow::from(state))
+    }
+}
+
+impl<'a> AsRef<[u8]> for State<'a> {
+    fn as_ref(&self) -> &[u8] {
+        match self.0 {
+            Cow::Borrowed(arr) => arr,
+            Cow::Owned(arr) => &*arr,
+        }
+    }
+}
+
+impl<'a> Deref for State<'a> {
+    type Target = Cow<'a, [u8]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> DerefMut for State<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+pub struct StateDelta<'a>(&'a [u8]);
+
+impl<'a> StateDelta<'a> {
+    pub fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a> AsRef<[u8]> for StateDelta<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+impl<'a> From<&'a [u8]> for StateDelta<'a> {
+    fn from(delta: &'a [u8]) -> Self {
+        StateDelta(delta)
+    }
+}
+
+pub struct StateSummary<'a>(pub(crate) &'a [u8]);
+impl<'a> AsRef<[u8]> for StateSummary<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum ExecError {
     #[error("invalid put value")]
-    InvalidPutValue(Vec<u8>),
+    InvalidPutValue,
 
     #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
     InsufficientMemory { req: usize, free: usize },
 
     #[error("could not cast array length of {0} to max size (i32::MAX)")]
     InvalidArrayLength(usize),
+
+    #[error("unexpected result from contract interface")]
+    UnexpectedResult,
+}
+
+#[repr(i32)]
+pub enum UpdateResult {
+    ValidUpdate = 0i32,
+    ValidNoChange = 1i32,
+    Invalid = 2i32,
+}
+
+impl TryFrom<i32> for UpdateResult {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ValidUpdate),
+            1 => Ok(Self::ValidNoChange),
+            2 => Ok(Self::Invalid),
+            _ => Err(()),
+        }
+    }
+}
+
+pub trait ContractInterface {
+    fn validate_state(parameters: Parameters<'static>, state: State<'static>);
+    fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>);
+    fn update_state(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        delta: StateDelta<'static>,
+    ) -> UpdateResult;
+}
+
+// todo: the trait is implemented by contracts and wrapped by this functions
+//       through a proc macro
+#[no_mangle]
+pub(crate) fn validate_state(parameters: i64, state: i64) -> i32 {
+    let params = unsafe {
+        let param_buf = Box::from_raw(parameters as *mut BufferBuilder);
+        let bytes =
+            &*std::ptr::slice_from_raw_parts(param_buf.start as *const u8, param_buf.size as usize);
+        Parameters::from(bytes)
+    };
+    let state = unsafe {
+        let state_buf = Box::from_raw(state as *mut BufferBuilder);
+        let bytes =
+            &*std::ptr::slice_from_raw_parts(state_buf.start as *const u8, state_buf.size as usize);
+        State::from(bytes)
+    };
+    todo!()
+}
+
+#[no_mangle]
+pub(crate) fn validate_delta(parameters: i64, delta: i64) -> i32 {
+    let params = unsafe {
+        let param_buf = Box::from_raw(parameters as *mut BufferBuilder);
+        let bytes =
+            &*std::ptr::slice_from_raw_parts(param_buf.start as *const u8, param_buf.size as usize);
+        Parameters::from(bytes)
+    };
+    let delta_buf = unsafe {
+        let delta_buf = Box::from_raw(delta as *mut BufferBuilder);
+        let bytes =
+            &*std::ptr::slice_from_raw_parts(delta_buf.start as *const u8, delta_buf.size as usize);
+        StateDelta::from(bytes)
+    };
+    todo!()
+}
+
+#[no_mangle]
+pub(crate) fn update_state(parameters: i64, state: i64, delta: i64) -> i32 {
+    let params = unsafe {
+        let param_buf = Box::from_raw(parameters as *mut BufferBuilder);
+        let bytes =
+            &*std::ptr::slice_from_raw_parts(param_buf.start as *const u8, param_buf.size as usize);
+        Parameters::from(bytes)
+    };
+    let state = unsafe {
+        let state_buf = Box::from_raw(state as *mut BufferBuilder);
+        let bytes =
+            &*std::ptr::slice_from_raw_parts(state_buf.start as *const u8, state_buf.size as usize);
+        State::from(bytes)
+    };
+    let delta_buf = unsafe {
+        let delta_buf = Box::from_raw(delta as *mut BufferBuilder);
+        let bytes =
+            &*std::ptr::slice_from_raw_parts(delta_buf.start as *const u8, delta_buf.size as usize);
+        StateDelta::from(bytes)
+    };
+    todo!()
 }
