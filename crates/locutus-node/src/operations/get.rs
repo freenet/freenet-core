@@ -16,6 +16,9 @@ use super::{
     OpError, Operation, OperationResult,
 };
 
+use tracing::{info, Level};
+use tracing::instrument;
+
 pub(crate) use self::messages::GetMsg;
 
 pub(crate) struct GetOp {
@@ -690,10 +693,13 @@ mod test {
     use crate::{
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
+        node::tracer::init_tracer,
         ring::Location,
         user_events::UserEvent,
     };
     use std::collections::HashMap;
+    use tracing::{span, Level};
+
 
     use super::*;
 
@@ -785,6 +791,12 @@ mod test {
             ("node-0".to_string(), node_0),
             ("gateway-0".to_string(), gw_0),
         ]);
+
+        init_tracer("test".to_string())?;
+
+        // Create the application root span.
+        let root_span = span!(Level::TRACE, "successful_get_op_between_nodes");
+        let _enter = root_span.enter();
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);

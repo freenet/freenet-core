@@ -47,6 +47,7 @@ mod op_state;
 mod p2p_impl;
 #[cfg(test)]
 pub(crate) mod test;
+pub(crate) mod tracer;
 
 pub struct Node<CErr>(NodeP2P<CErr>);
 

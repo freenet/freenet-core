@@ -45,6 +45,14 @@ unsigned-varint = "0.7"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
 sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
 
+# Tracing deps
+tracing = "0.1.30"
+opentelemetry = { version = "0.17.0" , default-features = false, features = ["rt-tokio", "trace"] }
+opentelemetry-jaeger = { version = "0.16.0", features = ["rt-tokio","collector_client", "isahc"] }
+tracing-opentelemetry = { version = "0.17.0"}
+tracing-subscriber = "0.3.8"
+# tracing-attributes = "0.1.19"
+
 # internal deps
 locutus-runtime = { path = "../locutus-runtime" }
 locutus-stdlib = { path = "../locutus-stdlib" }
