@@ -7,7 +7,7 @@
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. This happened because building decentralized applications is much more difficult than building their centralized equivalents.
 
-Locutus is a distributed, decentralized application layer for the Internet. It provides a foundation for decentralized, scalable, and trustless alternatives to centralized services, including email, instant messaging, search engines, and social networks.
+Locutus is a distributed, decentralized application layer for the Internet. It provides a foundation for decentralized, scalable, and trustless alternatives to centralized services, including email, instant messaging, search engines, and social networks. It solves the hardest part of building decentralized applications.
 
 ### Architecture
 
