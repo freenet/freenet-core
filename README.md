@@ -43,10 +43,6 @@ Locutus won't replace Fred; they're trying to solve different (but related) prob
 
 Locutus is the development name for this software; it will probably change before launch.
 
-### Status
-
-Locutus is currently in development, with an initial release planned for Q1 2022.
-
 ### Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
