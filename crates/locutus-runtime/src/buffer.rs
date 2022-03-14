@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use wasmer::{Instance, NativeFunc, ValueType};
 
 use crate::{ExecError, RuntimeResult};
@@ -74,6 +72,12 @@ impl<'instance> BufferMut<'instance> {
         Ok(())
     }
 
+    pub fn read_bytes(&self, len: usize) -> &[u8] {
+        let next_offset = *self.read_ptr as usize;
+        // don't update the read ptr
+        &self.buffer[next_offset..next_offset + len]
+    }
+
     /// Give ownership of the buffer back to the guest.
     pub fn flip_ownership(self) -> Buffer<'instance> {
         let BufferMut {
@@ -87,6 +91,31 @@ impl<'instance> BufferMut<'instance> {
             read_ptr,
             write_ptr,
             builder_ptr,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        let p = unsafe { &*self.builder_ptr };
+        p.size as usize
+    }
+}
+
+impl From<*mut BufferBuilder> for BufferMut<'static> {
+    fn from(builder_ptr: *mut BufferBuilder) -> Self {
+        unsafe {
+            let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
+            let read_ptr = Box::leak(Box::from_raw(buf_builder.last_read as *mut u32));
+            let write_ptr = Box::leak(Box::from_raw(buf_builder.last_write as *mut u32));
+            let buffer = &mut *std::ptr::slice_from_raw_parts_mut(
+                buf_builder.start as *mut u8,
+                buf_builder.size as usize,
+            );
+            BufferMut {
+                buffer,
+                read_ptr,
+                write_ptr,
+                builder_ptr,
+            }
         }
     }
 }

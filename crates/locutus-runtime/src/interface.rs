@@ -53,9 +53,9 @@ impl<'a> From<&'a [u8]> for State<'a> {
 
 impl<'a> AsRef<[u8]> for State<'a> {
     fn as_ref(&self) -> &[u8] {
-        match self.0 {
+        match &self.0 {
             Cow::Borrowed(arr) => arr,
-            Cow::Owned(arr) => &*arr,
+            Cow::Owned(arr) => arr.as_ref(),
         }
     }
 }
@@ -76,6 +76,12 @@ impl<'a> DerefMut for State<'a> {
 
 pub struct StateDelta<'a>(&'a [u8]);
 
+impl<'a> From<StateDelta<'a>> for Vec<u8> {
+    fn from(val: StateDelta<'a>) -> Self {
+        val.0.to_owned()
+    }
+}
+
 impl<'a> StateDelta<'a> {
     pub fn size(&self) -> usize {
         self.0.len()
@@ -94,10 +100,29 @@ impl<'a> From<&'a [u8]> for StateDelta<'a> {
     }
 }
 
-pub struct StateSummary<'a>(pub(crate) &'a [u8]);
+pub struct StateSummary<'a>(&'a [u8]);
+
+impl<'a> From<StateSummary<'a>> for Vec<u8> {
+    fn from(val: StateSummary<'a>) -> Self {
+        val.0.to_owned()
+    }
+}
+
+impl<'a> StateSummary<'a> {
+    pub fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
 impl<'a> AsRef<[u8]> for StateSummary<'a> {
     fn as_ref(&self) -> &[u8] {
         self.0
+    }
+}
+
+impl<'a> From<&'a [u8]> for StateSummary<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        StateSummary(bytes)
     }
 }
 
@@ -202,5 +227,10 @@ pub(crate) fn update_state(parameters: i64, state: i64, delta: i64) -> i32 {
             &*std::ptr::slice_from_raw_parts(delta_buf.start as *const u8, delta_buf.size as usize);
         StateDelta::from(bytes)
     };
+    todo!()
+}
+
+#[no_mangle]
+pub(crate) fn summarize_state(parameters: i64, state: i64) -> i64 {
     todo!()
 }

@@ -5,9 +5,9 @@ use wasmer::{
 };
 
 use crate::{
-    buffer::{Buffer, BufferMut, Host},
-    interface::{Parameters, State, UpdateResult},
-    ContractKey, ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, RuntimeResult,
+    buffer::{BufferBuilder, BufferMut},
+    interface::{Parameters, State, StateDelta, StateSummary, UpdateResult},
+    ContractKey, ContractRuntimeError, ContractStore, ExecError, RuntimeResult,
 };
 
 pub struct Runtime {
@@ -194,7 +194,7 @@ impl Runtime {
         let instance = self.prepare_call(key, req_bytes)?;
         let mut param_buf = Self::init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
-        let delta_buf = Self::init_buf(&instance, &delta)?;
+        let mut delta_buf = Self::init_buf(&instance, &delta)?;
         delta_buf.write(delta)?;
 
         let validate_func: NativeFunc<(i64, i64), i32> =
@@ -226,7 +226,7 @@ impl Runtime {
         let mut param_buf = Self::init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = Self::init_buf(&instance, &state)?;
-        state_buf.write(delta)?;
+        state_buf.write(state.clone())?;
         let mut delta_buf = Self::init_buf(&instance, &delta)?;
         delta_buf.write(delta)?;
 
@@ -239,34 +239,102 @@ impl Runtime {
         match update_res {
             UpdateResult::ValidNoChange => Ok(state),
             UpdateResult::ValidUpdate => {
-                let state_buf = state_buf.flip_ownership();
+                let mut state_buf = state_buf.flip_ownership();
                 // todo: get diff from buf and only then read and append if necessary
                 let new_state = state_buf.read_bytes(state.size());
                 Ok(State::from(new_state.to_vec()))
             }
-            UpdateResult::Invalid => {
-                Err(ExecError::InvalidPutValue.into())
-            }
+            UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
         }
     }
 
+    /// Used to communicate the current state to other nodes so they can keep track of.
     fn summarize_state<'a>(
         &mut self,
+        key: &ContractKey,
         parameters: Parameters<'a>,
         state: State<'a>,
-    ) -> crate::interface::StateSummary<'a> {
+    ) -> RuntimeResult<Vec<u8>> {
         let req_bytes = parameters.size() + state.size();
+        let instance = self.prepare_call(key, req_bytes)?;
+        let mut param_buf = Self::init_buf(&instance, &parameters)?;
+        param_buf.write(parameters)?;
+        let mut state_buf = Self::init_buf(&instance, &state)?;
+        state_buf.write(state.clone())?;
 
-        todo!()
+        let validate_func: NativeFunc<(i64, i64), i64> =
+            instance.exports.get_native_function("summarize_state")?;
+        let res_ptr = validate_func
+            .call(param_buf.builder_ptr as i64, state_buf.builder_ptr as i64)?
+            as *mut BufferBuilder;
+        let summary_buf = BufferMut::from(res_ptr);
+        let summary: StateSummary = summary_buf.read_bytes(summary_buf.size()).into();
+        Ok(summary.into())
     }
 
+    /// Used to return a delta to subscribers when there are updates.
     fn get_state_delta<'a>(
         &mut self,
+        key: &ContractKey,
         parameters: Parameters<'a>,
         state: State<'a>,
-        delta_to: crate::interface::StateSummary<'a>,
-    ) -> crate::interface::StateDelta<'a> {
-        todo!()
+        summary: crate::interface::StateSummary<'a>,
+    ) -> RuntimeResult<Vec<u8>> {
+        let req_bytes = parameters.size() + state.size() + summary.size();
+        let instance = self.prepare_call(key, req_bytes)?;
+        let mut param_buf = Self::init_buf(&instance, &parameters)?;
+        param_buf.write(parameters)?;
+        let mut state_buf = Self::init_buf(&instance, &state)?;
+        state_buf.write(state.clone())?;
+        let mut summary_buf = Self::init_buf(&instance, &summary)?;
+        summary_buf.write(summary)?;
+
+        let get_state_delta_func: NativeFunc<(i64, i64, i64), i64> =
+            instance.exports.get_native_function("get_state_delta")?;
+        let res_ptr = get_state_delta_func.call(
+            param_buf.builder_ptr as i64,
+            state_buf.builder_ptr as i64,
+            summary_buf.builder_ptr as i64,
+        )? as *mut BufferBuilder;
+        let delta_buf = BufferMut::from(res_ptr);
+        let delta: StateDelta = delta_buf.read_bytes(delta_buf.size()).into();
+        Ok(delta.into())
+    }
+
+    fn update_state_from_summary<'a>(
+        &mut self,
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        current_state: State<'a>,
+        current_summary: StateSummary<'a>,
+    ) -> RuntimeResult<State<'a>> {
+        let req_bytes = parameters.size() + current_state.size() + current_summary.size();
+        let instance = self.prepare_call(key, req_bytes)?;
+        let mut param_buf = Self::init_buf(&instance, &parameters)?;
+        param_buf.write(parameters)?;
+        let mut state_buf = Self::init_buf(&instance, &current_state)?;
+        state_buf.write(current_state.clone())?;
+        let mut summary_buf = Self::init_buf(&instance, &current_summary)?;
+        summary_buf.write(current_summary)?;
+
+        let validate_func: NativeFunc<(i64, i64, i64), i32> = instance
+            .exports
+            .get_native_function("update_state_from_summary")?;
+        let update_res = UpdateResult::try_from(validate_func.call(
+            param_buf.builder_ptr as i64,
+            state_buf.builder_ptr as i64,
+            summary_buf.builder_ptr as i64,
+        )?)
+        .map_err(|_| ContractRuntimeError::from(ExecError::UnexpectedResult))?;
+        match update_res {
+            UpdateResult::ValidNoChange => Ok(current_state),
+            UpdateResult::ValidUpdate => {
+                let mut state_buf = state_buf.flip_ownership();
+                let new_state = state_buf.read_bytes(current_state.size());
+                Ok(State::from(new_state.to_vec()))
+            }
+            UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
+        }
     }
 }
 
