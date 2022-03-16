@@ -3,7 +3,9 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{Contract, ContractStore, ContractValue};
+use locutus_runtime::{
+    Contract, ContractStore, ContractValue, Parameters, RuntimeResult, State, StateDelta,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -188,10 +190,57 @@ pub(crate) enum ContractHandlerEvent<Err> {
     CacheResult(Result<(), ContractError<Err>>),
 }
 
+pub(super) trait RuntimeInterface {
+    fn validate_state<'a>(
+        &mut self,
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+    ) -> RuntimeResult<bool> {
+        todo!()
+    }
+
+    fn validate_delta<'a>(
+        &mut self,
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        delta: StateDelta<'a>,
+    ) -> RuntimeResult<bool> {
+        todo!()
+    }
+
+    fn update_state<'a>(
+        &mut self,
+        key: &ContractKey,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+        delta: StateDelta<'a>,
+    ) -> RuntimeResult<State<'a>> {
+        todo!()
+    }
+
+    fn summarize_state<'a>(
+        &mut self,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+    ) -> StateSummary<'a> {
+        todo!()
+    }
+
+    fn get_state_delta<'a>(
+        &mut self,
+        parameters: Parameters<'a>,
+        state: State<'a>,
+        delta_to: StateSummary<'a>,
+    ) -> StateDelta<'a> {
+        todo!()
+    }
+}
+
 mod sqlite {
     use std::str::FromStr;
 
-    use locutus_runtime::{ContractRuntimeError, RuntimeInterface};
+    use locutus_runtime::ContractRuntimeError;
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},

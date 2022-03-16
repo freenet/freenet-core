@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use wasmer::{
-    imports, Bytes, Function, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
+    imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
 };
 
 use crate::{
@@ -34,14 +34,6 @@ impl Runtime {
                 "env" => {
                     "memory" =>  mem.clone(),
                 },
-                "locutus" => {
-                    "validate_state" => {
-                        Function::new_native(&store, crate::interface::validate_state)
-                    },
-                    "validate_delta" => {
-                        Function::new_native(&store, crate::interface::validate_delta)
-                    }
-                }
             };
             (Some(mem), imports)
         } else {
@@ -68,7 +60,7 @@ impl Runtime {
         let contract = self
             .contracts
             .fetch_contract(key)?
-            .ok_or_else(|| ContractRuntimeError::ContractNotFound(*key))?;
+            .ok_or(ContractRuntimeError::ContractNotFound(*key))?;
         let module = Module::new(&self.store, contract.data())?;
         self.modules.insert(*key, module);
         Ok(())

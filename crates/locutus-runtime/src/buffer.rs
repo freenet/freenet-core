@@ -4,7 +4,8 @@ use crate::{ExecError, RuntimeResult};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub(crate) struct BufferBuilder {
+#[doc(hidden)]
+pub struct BufferBuilder {
     pub size: u32,
     pub start: i64,
     last_read: i64,
@@ -18,7 +19,7 @@ unsafe impl ValueType for BufferBuilder {}
 pub(crate) struct BufferMut<'instance> {
     buffer: &'instance mut [u8],
     /// stores the last read in the buffer
-    read_ptr: &'instance mut u32,
+    _read_ptr: &'instance mut u32,
     /// stores the last write in the buffer
     write_ptr: &'instance mut u32,
     pub builder_ptr: *mut BufferBuilder,
@@ -40,7 +41,7 @@ impl<'instance> BufferMut<'instance> {
             );
             Ok(BufferMut {
                 buffer,
-                read_ptr,
+                _read_ptr: read_ptr,
                 write_ptr,
                 builder_ptr,
             })
@@ -73,7 +74,7 @@ impl<'instance> BufferMut<'instance> {
     }
 
     pub fn read_bytes(&self, len: usize) -> &[u8] {
-        let next_offset = *self.read_ptr as usize;
+        let next_offset = *self._read_ptr as usize;
         // don't update the read ptr
         &self.buffer[next_offset..next_offset + len]
     }
@@ -82,7 +83,7 @@ impl<'instance> BufferMut<'instance> {
     pub fn flip_ownership(self) -> Buffer<'instance> {
         let BufferMut {
             buffer,
-            read_ptr,
+            _read_ptr: read_ptr,
             write_ptr,
             builder_ptr,
         } = self;
@@ -112,7 +113,7 @@ impl From<*mut BufferBuilder> for BufferMut<'static> {
             );
             BufferMut {
                 buffer,
-                read_ptr,
+                _read_ptr: read_ptr,
                 write_ptr,
                 builder_ptr,
             }
@@ -159,7 +160,7 @@ impl<'instance> Buffer<'instance> {
         } = self;
         BufferMut {
             buffer,
-            read_ptr,
+            _read_ptr: read_ptr,
             write_ptr,
             builder_ptr,
         }

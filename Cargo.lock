@@ -1518,6 +1518,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "locutus-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "locutus-node"
 version = "0.0.1"
 dependencies = [
@@ -1554,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "locutus-runtime"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "arbitrary",
  "arrayvec 0.7.2",
@@ -1562,6 +1571,7 @@ dependencies = [
  "blake2 0.10.2",
  "futures",
  "hex",
+ "locutus-macros",
  "once_cell",
  "rand 0.8.4",
  "serde 1.0.136",

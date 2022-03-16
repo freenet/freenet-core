@@ -4,12 +4,15 @@ mod contract_store;
 mod interface;
 mod runtime;
 
+pub use buffer::BufferBuilder;
 pub use contract::{Contract, ContractKey, ContractValue};
 pub use contract_store::ContractStore;
-pub use interface::ExecError;
+pub use interface::{
+    ContractInterface, ExecError, Parameters, State, StateDelta, StateSummary, UpdateResult,
+};
 pub use runtime::Runtime;
 
-type RuntimeResult<T> = std::result::Result<T, ContractRuntimeError>;
+pub type RuntimeResult<T> = std::result::Result<T, ContractRuntimeError>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ContractRuntimeError {

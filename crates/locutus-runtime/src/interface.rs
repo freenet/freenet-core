@@ -162,75 +162,11 @@ impl TryFrom<i32> for UpdateResult {
 }
 
 pub trait ContractInterface {
-    fn validate_state(parameters: Parameters<'static>, state: State<'static>);
-    fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>);
+    fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
+    fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool;
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
         delta: StateDelta<'static>,
     ) -> UpdateResult;
-}
-
-// todo: the trait is implemented by contracts and wrapped by this functions
-//       through a proc macro
-#[no_mangle]
-pub(crate) fn validate_state(parameters: i64, state: i64) -> i32 {
-    let params = unsafe {
-        let param_buf = Box::from_raw(parameters as *mut BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(param_buf.start as *const u8, param_buf.size as usize);
-        Parameters::from(bytes)
-    };
-    let state = unsafe {
-        let state_buf = Box::from_raw(state as *mut BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(state_buf.start as *const u8, state_buf.size as usize);
-        State::from(bytes)
-    };
-    todo!()
-}
-
-#[no_mangle]
-pub(crate) fn validate_delta(parameters: i64, delta: i64) -> i32 {
-    let params = unsafe {
-        let param_buf = Box::from_raw(parameters as *mut BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(param_buf.start as *const u8, param_buf.size as usize);
-        Parameters::from(bytes)
-    };
-    let delta_buf = unsafe {
-        let delta_buf = Box::from_raw(delta as *mut BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(delta_buf.start as *const u8, delta_buf.size as usize);
-        StateDelta::from(bytes)
-    };
-    todo!()
-}
-
-#[no_mangle]
-pub(crate) fn update_state(parameters: i64, state: i64, delta: i64) -> i32 {
-    let params = unsafe {
-        let param_buf = Box::from_raw(parameters as *mut BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(param_buf.start as *const u8, param_buf.size as usize);
-        Parameters::from(bytes)
-    };
-    let state = unsafe {
-        let state_buf = Box::from_raw(state as *mut BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(state_buf.start as *const u8, state_buf.size as usize);
-        State::from(bytes)
-    };
-    let delta_buf = unsafe {
-        let delta_buf = Box::from_raw(delta as *mut BufferBuilder);
-        let bytes =
-            &*std::ptr::slice_from_raw_parts(delta_buf.start as *const u8, delta_buf.size as usize);
-        StateDelta::from(bytes)
-    };
-    todo!()
-}
-
-#[no_mangle]
-pub(crate) fn summarize_state(parameters: i64, state: i64) -> i64 {
-    todo!()
 }
