@@ -3,23 +3,22 @@
 [![Build Status](https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/ci.yml)
 [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/Q2FWzCqKQD)
 
-### Overview
-
-A distributed, decentralized, key-value store in which values are arbitrary data representing *state*, and keys are *cryptographic contracts* that determine
-what *state* is valid for that contract, and how that state can be updated in response to *messages*.
-
-The store is observable, allowing applications built on Locutus to listen for changes to contract state and be notified immediately. The cryptographic contracts are specified in webassembly.
-
-This key-value store serves as a foundation for decentralized, scalable, and trustless alternatives to centralized services, including email, instant messaging, and social networks, many of which rely on closed proprietary protocols.
-
-Locutus is implemented in Rust on top of the libp2p library and will be available across all major operating systems, desktop and mobile.
-
-### Value
+### Purpose
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. This happened because building decentralized applications is much more difficult than building their centralized equivalents.
 
-Locutus' purpose is to make it easy to build decentralized services and also to provide reference implementations of the most popular services such as email and instant messaging.
+Locutus is a distributed, decentralized application layer for the Internet. It provides a foundation for decentralized, scalable, and trustless alternatives to centralized services, including email, instant messaging, search engines, and social networks. It solves the hardest part of building decentralized applications.
 
+### Architecture
+
+A decentralized, scalable key-value store in which values are arbitrary data we call *state*, and keys are *cryptographic contracts* that control 
+the creation and modification of its associated state. Contracts are implemented in [Web Assembly](https://webassembly.org/). Any participant in the network can request a contract's state, and also *subscribe* to state changes.
+
+Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
+
+### Status
+
+We're working hard and expect an early prototype in May 2022. If you're a Rust developer and would like to help please talk to us in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord. You can also support Freenet through a [donation](https://freenetproject.org/pages/donate.html).
 
 ### Relationship to "Fred"
 
@@ -43,10 +42,6 @@ Locutus won't replace Fred; they're trying to solve different (but related) prob
 ### Name
 
 Locutus is the development name for this software; it will probably change before launch.
-
-### Status
-
-Locutus is currently in development, with an initial release planned for Q1 2022.
 
 ### Chat with us
 
