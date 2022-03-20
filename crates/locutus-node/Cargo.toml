@@ -51,7 +51,6 @@ opentelemetry = { version = "0.17.0" , default-features = false, features = ["rt
 opentelemetry-jaeger = { version = "0.16.0", features = ["rt-tokio","collector_client", "isahc"] }
 tracing-opentelemetry = { version = "0.17.0"}
 tracing-subscriber = "0.3.8"
-# tracing-attributes = "0.1.19"
 
 # internal deps
 locutus-runtime = { path = "../locutus-runtime" }

@@ -10,8 +10,8 @@ use locutus_runtime::{Contract, ContractKey, ContractValue};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 
+use tracing::info;
 use tracing::instrument;
-use tracing::{info, Level};
 
 use crate::{
     config::GlobalExecutor,

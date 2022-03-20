@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use either::Either;
 use locutus_runtime::{Contract, ContractKey, ContractValue};
 use tokio::sync::mpsc::{self, Receiver};
+use tracing::{span, Instrument, Level};
 
 use super::{
     conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, handle_cancelled_op,
@@ -191,12 +192,9 @@ where
                 .as_ref()
                 .map(|listener| listener.trait_clone());
 
-            GlobalExecutor::spawn(process_message(
-                msg,
-                op_storage,
-                conn_manager,
-                event_listener,
-            ));
+            GlobalExecutor::spawn(
+                process_message(msg, op_storage, conn_manager, event_listener).in_current_span(),
+            );
         }
     }
 }
