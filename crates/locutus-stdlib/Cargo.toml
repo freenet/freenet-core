@@ -1,0 +1,15 @@
+[package]
+name = "locutus-stdlib"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.58.0"
+
+[dependencies]
+thiserror = "1"
+
+# internal
+locutus-macros = { path = "../locutus-macros" }
+
+[dev-dependencies]
+wasmer = { version = "^2.0", features = [ "sys-default", "wat"] }
+wasmer-wasi = "*"

@@ -9,8 +9,6 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use crate::buffer::BufferBuilder;
-
 pub struct Parameters<'a>(&'a [u8]);
 
 impl<'a> Parameters<'a> {
@@ -124,21 +122,6 @@ impl<'a> From<&'a [u8]> for StateSummary<'a> {
     fn from(bytes: &'a [u8]) -> Self {
         StateSummary(bytes)
     }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum ExecError {
-    #[error("invalid put value")]
-    InvalidPutValue,
-
-    #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
-    InsufficientMemory { req: usize, free: usize },
-
-    #[error("could not cast array length of {0} to max size (i32::MAX)")]
-    InvalidArrayLength(usize),
-
-    #[error("unexpected result from contract interface")]
-    UnexpectedResult,
 }
 
 #[repr(i32)]

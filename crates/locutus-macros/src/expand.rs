@@ -29,7 +29,8 @@ impl ImplStruct {
             #[no_mangle]
             pub fn validate_state(parameters: i64, state: i64) -> i32 {
                 let parameters = unsafe {
-                    let param_buf = Box::from_raw(parameters as *mut BufferBuilder);
+                    // eprintln!("getting params: {:p}", state as *mut BufferBuilder);
+                    let param_buf = &*(parameters as *const BufferBuilder);
                     let bytes = &*std::ptr::slice_from_raw_parts(
                         param_buf.start as *const u8,
                         param_buf.size as usize,
@@ -37,14 +38,15 @@ impl ImplStruct {
                     Parameters::from(bytes)
                 };
                 let state = unsafe {
-                    let state_buf = Box::from_raw(state as *mut BufferBuilder);
+                    // eprintln!("getting state: {:p}", state as *mut BufferBuilder);
+                    let state_buf = &*(state as *const BufferBuilder);
                     let bytes = &*std::ptr::slice_from_raw_parts(
                         state_buf.start as *const u8,
                         state_buf.size as usize,
                     );
                     State::from(bytes)
                 };
-                let result = <#type_name as ::locutus_runtime::ContractInterface>::validate_state(parameters, state);
+                let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::validate_state(parameters, state);
                 result as i32
             }
         };
@@ -68,7 +70,7 @@ impl ImplStruct {
                         &*std::ptr::slice_from_raw_parts(delta_buf.start as *const u8, delta_buf.size as usize);
                     StateDelta::from(bytes)
                 };
-                let result = <#type_name as ::locutus_runtime::ContractInterface>::validate_delta(parameters, delta);
+                let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::validate_delta(parameters, delta);
                 result as i32
             }
         };
@@ -81,24 +83,24 @@ impl ImplStruct {
             #[no_mangle]
             pub fn update_state(parameters: i64, state: i64, delta: i64) -> i32 {
                 let parameters = unsafe {
-                    let param_buf = Box::from_raw(parameters as *mut ::locutus_runtime::BufferBuilder);
+                    let param_buf = Box::from_raw(parameters as *mut ::locutus_stdlib::prelude::BufferBuilder);
                     let bytes =
                     &*std::ptr::slice_from_raw_parts(param_buf.start as *const u8, param_buf.size as usize);
-                    ::locutus_runtime::Parameters::from(bytes)
+                    ::locutus_stdlib::prelude::Parameters::from(bytes)
                 };
                 let state = unsafe {
-                    let state_buf = Box::from_raw(state as *mut ::locutus_runtime::BufferBuilder);
+                    let state_buf = Box::from_raw(state as *mut ::locutus_stdlib::prelude::BufferBuilder);
                     let bytes =
                     &*std::ptr::slice_from_raw_parts(state_buf.start as *const u8, state_buf.size as usize);
-                    ::locutus_runtime::State::from(bytes)
+                    ::locutus_stdlib::prelude::State::from(bytes)
                 };
                 let delta = unsafe {
-                    let delta_buf = Box::from_raw(delta as *mut ::locutus_runtime::BufferBuilder);
+                    let delta_buf = Box::from_raw(delta as *mut ::locutus_stdlib::prelude::BufferBuilder);
                     let bytes =
                     &*std::ptr::slice_from_raw_parts(delta_buf.start as *const u8, delta_buf.size as usize);
-                    ::locutus_runtime::StateDelta::from(bytes)
+                    ::locutus_stdlib::prelude::StateDelta::from(bytes)
                 };
-                let result = <#type_name as ::locutus_runtime::ContractInterface>::update_state(parameters, state, delta);
+                let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::update_state(parameters, state, delta);
                 result as i32
             }
         };

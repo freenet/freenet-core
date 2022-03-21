@@ -1,21 +1,19 @@
-mod buffer;
 mod contract;
 mod contract_store;
-mod interface;
 mod runtime;
 
-pub use buffer::BufferBuilder;
 pub use contract::{Contract, ContractKey, ContractValue};
 pub use contract_store::ContractStore;
-pub use interface::{
-    ContractInterface, ExecError, Parameters, State, StateDelta, StateSummary, UpdateResult,
-};
-pub use runtime::Runtime;
+use locutus_stdlib::prelude::BufferError;
+pub use runtime::{ExecError, Runtime};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractRuntimeError>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ContractRuntimeError {
+    #[error(transparent)]
+    BufferError(#[from] BufferError),
+
     #[error("contract {0} not found in store")]
     ContractNotFound(ContractKey),
 

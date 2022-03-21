@@ -1,20 +1,24 @@
-#[no_mangle]
-pub extern "C" fn validate_value(ptr: *mut u8, len: i32) -> i32 {
-    // eprintln!("accessing ptr: ({ptr:p}, {len})");
-    let data = get_data(ptr, len as usize);
-    // eprintln!("current data: {data:?}");
-    unsafe {
-        if *data.get_unchecked(0) == 1 && *data.get_unchecked(3) == 4 {
-            // eprintln!("is valid");
-            1
-        } else {
-            // eprintln!("is not valid");
-            0
-        }
-    }
-}
+use locutus_stdlib::prelude::*;
 
-fn get_data(ptr: *mut u8, len: usize) -> &'static mut [u8] {
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-    slice
+struct Contract;
+
+#[contract]
+impl ContractInterface for Contract {
+    fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool {
+        let state_bytes = state.as_ref();
+        // eprintln!("state: {state_bytes:?}");
+        state[0] == 1 && state[3] == 4
+    }
+
+    fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool {
+        todo!()
+    }
+
+    fn update_state(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        delta: StateDelta<'static>,
+    ) -> UpdateResult {
+        todo!()
+    }
 }

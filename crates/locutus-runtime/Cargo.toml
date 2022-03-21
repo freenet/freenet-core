@@ -18,6 +18,9 @@ wasmer = { version = "^2.0", default-features = false, features = [
 	"sys" 
 ]}
 
+# internal
+locutus-stdlib = { path = "../locutus-stdlib" }
+
 [features]
 default = [ "wasmer-default" ]
 wasmer-default = [ 
@@ -35,6 +38,3 @@ bincode = "1"
 once_cell = "1"
 rand = { version = "0.8", features = ["small_rng"] }
 wasmer-wasi = "*"
-
-# internal
-locutus-macros = { path = "../locutus-macros" }
