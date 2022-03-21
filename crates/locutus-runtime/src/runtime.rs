@@ -377,12 +377,12 @@ mod test {
     #[test]
     fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> {
         let mut store = ContractStore::new(test_dir(), 10_000);
-        let contract = test_contract("test_contract_guest.wasi.wasm");
+        let contract = test_contract("test_contract_guest.wasm");
         let key = contract.key();
         store.store_contract(contract)?;
 
         let mut runtime = Runtime::build(store, false).unwrap();
-        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires buding for wasi
+        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires buding for wasi
         let is_valid = runtime.validate_state(
             &key,
             Parameters::from([].as_ref()),
@@ -401,12 +401,12 @@ mod test {
     #[test]
     fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
         let mut store = ContractStore::new(test_dir(), 10_000);
-        let contract = test_contract("test_contract_host.wasi.wasm");
+        let contract = test_contract("test_contract_host.wasm");
         let key = contract.key();
         store.store_contract(contract)?;
 
         let mut runtime = Runtime::build(store, true).unwrap();
-        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
         let is_valid = runtime.validate_state(
             &key,
             Parameters::from([].as_ref()),
