@@ -184,7 +184,8 @@ impl<'instance> Buffer<'instance> {
     }
 }
 
-/// Returns the pointer to the BufferBuilder
+/// Returns the pointer to a new BufferBuilder
+#[doc(hidden)]
 #[no_mangle]
 pub fn initiate_buffer(size: u32, host_writer: i32) -> i64 {
     let buf: Vec<u8> = Vec::with_capacity(size as usize);

@@ -21,6 +21,30 @@ impl ContractInterface for Contract {
     ) -> UpdateResult {
         unimplemented!()
     }
+
+    fn summarize_state(
+        _parameters: Parameters<'static>,
+        state: State<'static>,
+    ) -> StateSummary<'static> {
+        let state = state.as_ref();
+        StateSummary::from(state[0..3].to_vec())
+    }
+
+    fn get_state_delta(
+        _parameters: Parameters<'static>,
+        _state: State<'static>,
+        _summary: StateSummary<'static>,
+    ) -> StateDelta<'static> {
+        unimplemented!()
+    }
+
+    fn update_state_from_summary(
+        _parameters: Parameters<'static>,
+        _state: State<'static>,
+        _summary: StateSummary<'static>,
+    ) -> UpdateResult {
+        unimplemented!()
+    }
 }
 
 fn main() {}

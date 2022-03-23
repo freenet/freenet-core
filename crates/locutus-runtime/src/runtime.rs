@@ -249,6 +249,8 @@ impl Runtime {
         match update_res {
             UpdateResult::ValidNoChange => Ok(state),
             UpdateResult::ValidUpdate => {
+                // fixme: potentially could require a resize of the state and invalidate
+                //        the previous ptr, take care of that with the builder
                 let mut state_buf = state_buf.flip_ownership();
                 // todo: get diff from buf and only then read and append if necessary
                 let new_state = state_buf.read_bytes(state.size());
@@ -264,7 +266,7 @@ impl Runtime {
         key: &ContractKey,
         parameters: Parameters<'a>,
         state: State<'a>,
-    ) -> RuntimeResult<Vec<u8>> {
+    ) -> RuntimeResult<StateSummary<'a>> {
         let req_bytes = parameters.size() + state.size();
         let instance = self.prepare_call(key, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
@@ -276,9 +278,14 @@ impl Runtime {
             instance.exports.get_native_function("summarize_state")?;
         let res_ptr = validate_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?
             as *mut BufferBuilder;
-        let summary_buf = unsafe { BufferMut::from_ptr(res_ptr, None) };
+        let memory = self
+            .host_memory
+            .as_ref()
+            .map(Ok)
+            .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
+        let summary_buf = unsafe { BufferMut::from_ptr(res_ptr, Some(memory.data_ptr())) };
         let summary: StateSummary = summary_buf.read_bytes(summary_buf.size()).into();
-        Ok(summary.into())
+        Ok(StateSummary::from(summary.to_vec()))
     }
 
     /// Used to return a delta to subscribers when there are updates.
@@ -288,7 +295,7 @@ impl Runtime {
         parameters: Parameters<'a>,
         state: State<'a>,
         summary: StateSummary<'a>,
-    ) -> RuntimeResult<Vec<u8>> {
+    ) -> RuntimeResult<StateDelta<'a>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
         let instance = self.prepare_call(key, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
@@ -305,9 +312,14 @@ impl Runtime {
             state_buf.ptr() as i64,
             summary_buf.ptr() as i64,
         )? as *mut BufferBuilder;
-        let delta_buf = unsafe { BufferMut::from_ptr(res_ptr, None) };
-        let delta: StateDelta = delta_buf.read_bytes(delta_buf.size()).into();
-        Ok(delta.into())
+        let memory = self
+            .host_memory
+            .as_ref()
+            .map(Ok)
+            .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
+        let delta_buf = unsafe { BufferMut::from_ptr(res_ptr, Some(memory.data_ptr())) };
+        let delta = delta_buf.read_bytes(delta_buf.size());
+        Ok(StateDelta::from(delta.to_owned()))
     }
 
     pub fn update_state_from_summary<'a>(
@@ -338,7 +350,10 @@ impl Runtime {
         match update_res {
             UpdateResult::ValidNoChange => Ok(current_state),
             UpdateResult::ValidUpdate => {
+                // fixme: potentially could require a resize of the state and invalidate
+                //        the previous ptr, take care of that with the builder
                 let mut state_buf = state_buf.flip_ownership();
+                // todo: get diff from buf and only then read and append if necessary
                 let new_state = state_buf.read_bytes(current_state.size());
                 Ok(State::from(new_state.to_vec()))
             }

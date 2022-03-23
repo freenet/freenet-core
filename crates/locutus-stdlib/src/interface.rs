@@ -72,13 +72,7 @@ impl<'a> DerefMut for State<'a> {
     }
 }
 
-pub struct StateDelta<'a>(&'a [u8]);
-
-impl<'a> From<StateDelta<'a>> for Vec<u8> {
-    fn from(val: StateDelta<'a>) -> Self {
-        val.0.to_owned()
-    }
-}
+pub struct StateDelta<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateDelta<'a> {
     pub fn size(&self) -> usize {
@@ -86,23 +80,52 @@ impl<'a> StateDelta<'a> {
     }
 }
 
-impl<'a> AsRef<[u8]> for StateDelta<'a> {
-    fn as_ref(&self) -> &[u8] {
-        self.0
+impl<'a> From<Vec<u8>> for StateDelta<'a> {
+    fn from(state: Vec<u8>) -> Self {
+        StateDelta(Cow::from(state))
     }
 }
 
 impl<'a> From<&'a [u8]> for StateDelta<'a> {
-    fn from(delta: &'a [u8]) -> Self {
-        StateDelta(delta)
+    fn from(state: &'a [u8]) -> Self {
+        StateDelta(Cow::from(state))
     }
 }
 
-pub struct StateSummary<'a>(&'a [u8]);
+impl<'a> AsRef<[u8]> for StateDelta<'a> {
+    fn as_ref(&self) -> &[u8] {
+        match &self.0 {
+            Cow::Borrowed(arr) => arr,
+            Cow::Owned(arr) => arr.as_ref(),
+        }
+    }
+}
 
-impl<'a> From<StateSummary<'a>> for Vec<u8> {
-    fn from(val: StateSummary<'a>) -> Self {
-        val.0.to_owned()
+impl<'a> Deref for StateDelta<'a> {
+    type Target = Cow<'a, [u8]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> DerefMut for StateDelta<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+pub struct StateSummary<'a>(Cow<'a, [u8]>);
+
+impl<'a> From<Vec<u8>> for StateSummary<'a> {
+    fn from(state: Vec<u8>) -> Self {
+        StateSummary(Cow::from(state))
+    }
+}
+
+impl<'a> From<&'a [u8]> for StateSummary<'a> {
+    fn from(state: &'a [u8]) -> Self {
+        StateSummary(Cow::from(state))
     }
 }
 
@@ -114,13 +137,24 @@ impl<'a> StateSummary<'a> {
 
 impl<'a> AsRef<[u8]> for StateSummary<'a> {
     fn as_ref(&self) -> &[u8] {
-        self.0
+        match &self.0 {
+            Cow::Borrowed(arr) => arr,
+            Cow::Owned(arr) => arr.as_ref(),
+        }
     }
 }
 
-impl<'a> From<&'a [u8]> for StateSummary<'a> {
-    fn from(bytes: &'a [u8]) -> Self {
-        StateSummary(bytes)
+impl<'a> Deref for StateSummary<'a> {
+    type Target = Cow<'a, [u8]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> DerefMut for StateSummary<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -146,10 +180,29 @@ impl TryFrom<i32> for UpdateResult {
 
 pub trait ContractInterface {
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
+
     fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool;
+
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
         delta: StateDelta<'static>,
+    ) -> UpdateResult;
+
+    fn summarize_state(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+    ) -> StateSummary<'static>;
+
+    fn get_state_delta(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        summary: StateSummary<'static>,
+    ) -> StateDelta<'static>;
+
+    fn update_state_from_summary(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        summary: StateSummary<'static>,
     ) -> UpdateResult;
 }
