@@ -1,14 +1,42 @@
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct BufferBuilder {
-    pub size: u32,
-    pub start: i64,
+    size: u32,
+    start: i64,
     last_read: i64,
     last_write: i64,
     host_writer: i32,
 }
 
-#[doc(hidden)]
+impl BufferBuilder {
+    pub fn size(&self) -> usize {
+        self.size as _
+    }
+
+    pub fn start(&self) -> *const u8 {
+        self.start as _
+    }
+
+    /// # Safety
+    /// Requires that there are no living references to the current
+    /// underlying buffer or will trigger UB
+    pub unsafe fn update_buffer(&mut self, data: Vec<u8>) {
+        // drop previous buffer
+        let prev = Vec::from_raw_parts(self.start as *mut u8, self.size(), self.size());
+        std::mem::drop(prev);
+        let new_ptr = data.as_ptr() as i64;
+        self.start = new_ptr;
+        self.size = data.capacity() as _;
+
+        // write the new buffer read/write pointers
+        let read_ptr = Box::leak(Box::from_raw(self.last_read as *mut u32));
+        *read_ptr = 0;
+        let write_ptr = Box::leak(Box::from_raw(self.last_write as *mut u32));
+        *write_ptr = data.len() as _;
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
@@ -84,6 +112,7 @@ impl<'instance> BufferMut<'instance> {
         p.size as usize
     }
 
+    #[doc(hidden)]
     /// # Safety
     /// The pointer passed come from a previous call to `initiate_buffer` exported function from the contract.
     pub unsafe fn from_ptr(
