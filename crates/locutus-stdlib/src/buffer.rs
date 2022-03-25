@@ -6,7 +6,6 @@ pub struct BufferBuilder {
     start: i64,
     last_read: i64,
     last_write: i64,
-    host_writer: i32,
 }
 
 impl BufferBuilder {
@@ -22,18 +21,39 @@ impl BufferBuilder {
     /// Requires that there are no living references to the current
     /// underlying buffer or will trigger UB
     pub unsafe fn update_buffer(&mut self, data: Vec<u8>) {
+        let read_ptr = Box::leak(Box::from_raw(self.last_read as *mut u32));
+        let write_ptr = Box::leak(Box::from_raw(self.last_write as *mut u32));
+
         // drop previous buffer
-        let prev = Vec::from_raw_parts(self.start as *mut u8, self.size(), self.size());
+        let prev = Vec::from_raw_parts(self.start as *mut u8, *write_ptr as usize, self.size());
         std::mem::drop(prev);
         let new_ptr = data.as_ptr() as i64;
         self.start = new_ptr;
         self.size = data.capacity() as _;
 
         // write the new buffer read/write pointers
-        let read_ptr = Box::leak(Box::from_raw(self.last_read as *mut u32));
         *read_ptr = 0;
-        let write_ptr = Box::leak(Box::from_raw(self.last_write as *mut u32));
         *write_ptr = data.len() as _;
+    }
+
+    pub fn to_ptr(self) -> *mut BufferBuilder {
+        Box::into_raw(Box::new(self))
+    }
+}
+
+impl From<Vec<u8>> for BufferBuilder {
+    fn from(data: Vec<u8>) -> Self {
+        let last_read = Box::into_raw(Box::new(0u32)) as i64;
+        let last_write = Box::into_raw(Box::new(data.len() as u32)) as i64;
+        let start = data.as_ptr() as _;
+        let size = data.capacity() as _;
+        std::mem::forget(data);
+        BufferBuilder {
+            start,
+            size,
+            last_read,
+            last_write,
+        }
     }
 }
 
@@ -216,7 +236,7 @@ impl<'instance> Buffer<'instance> {
 /// Returns the pointer to a new BufferBuilder
 #[doc(hidden)]
 #[no_mangle]
-pub fn initiate_buffer(size: u32, host_writer: i32) -> i64 {
+pub fn initiate_buffer(size: u32) -> i64 {
     let buf: Vec<u8> = Vec::with_capacity(size as usize);
     // eprintln!("allocated {size} bytes @ {:p}", buf.as_ptr());
     let start = buf.as_ptr() as i64;
@@ -229,7 +249,6 @@ pub fn initiate_buffer(size: u32, host_writer: i32) -> i64 {
         size,
         last_read,
         last_write,
-        host_writer,
     }));
     buffer as i64
 }

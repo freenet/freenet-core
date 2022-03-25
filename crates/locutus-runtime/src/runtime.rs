@@ -83,9 +83,9 @@ impl Runtime {
         T: AsRef<[u8]>,
     {
         let data = data.as_ref();
-        let initiate_buffer: NativeFunc<(u32, i32), i64> =
+        let initiate_buffer: NativeFunc<u32, i64> =
             instance.exports.get_native_function("initiate_buffer")?;
-        let builder_ptr = initiate_buffer.call(data.len() as u32, true as i32)?;
+        let builder_ptr = initiate_buffer.call(data.len() as u32)?;
         let memory = self
             .host_memory
             .as_ref()
@@ -272,7 +272,7 @@ impl Runtime {
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
-        state_buf.write(state.clone())?;
+        state_buf.write(state)?;
 
         let validate_func: NativeFunc<(i64, i64), i64> =
             instance.exports.get_native_function("summarize_state")?;
@@ -389,12 +389,17 @@ mod test {
         Contract::try_from(contract_path).expect("contract found")
     }
 
-    #[test]
-    fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> {
+    fn get_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
         let mut store = ContractStore::new(test_dir(), 10_000);
         let contract = test_contract("test_contract_guest.wasm");
         let key = contract.key();
         store.store_contract(contract)?;
+        Ok((store, key))
+    }
+
+    #[test]
+    fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, key) = get_test_contract()?;
 
         let mut runtime = Runtime::build(store, false).unwrap();
         // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires buding for wasi
@@ -434,6 +439,21 @@ mod test {
             State::from([1, 0, 0, 1].as_ref()),
         )?;
         assert!(not_valid);
+        Ok(())
+    }
+
+    #[test]
+    fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, key) = get_test_contract()?;
+        let mut runtime = Runtime::build(store, false).unwrap();
+        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+        let summary = runtime.summarize_state(
+            &key,
+            Parameters::from([].as_ref()),
+            State::from([5, 2, 3, 4].as_ref()),
+        )?;
+        assert!(summary.as_ref().len() == 1);
+        assert!(summary.as_ref()[0] == 5);
         Ok(())
     }
 }

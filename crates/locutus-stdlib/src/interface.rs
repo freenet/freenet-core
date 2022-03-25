@@ -86,6 +86,10 @@ impl<'a> StateDelta<'a> {
     pub fn size(&self) -> usize {
         self.0.len()
     }
+
+    pub fn into_owned(self) -> Vec<u8> {
+        self.0.into_owned()
+    }
 }
 
 impl<'a> From<Vec<u8>> for StateDelta<'a> {
@@ -124,6 +128,12 @@ impl<'a> DerefMut for StateDelta<'a> {
 }
 
 pub struct StateSummary<'a>(Cow<'a, [u8]>);
+
+impl<'a> StateSummary<'a> {
+    pub fn into_owned(self) -> Vec<u8> {
+        self.0.into_owned()
+    }
+}
 
 impl<'a> From<Vec<u8>> for StateSummary<'a> {
     fn from(state: Vec<u8>) -> Self {
@@ -237,7 +247,7 @@ pub trait ContractInterface {
         summary: StateSummary<'static>,
     ) -> StateDelta<'static>;
 
-    /// Updates the current state from 
+    /// Updates the current state from the provided summary.
     fn update_state_from_summary(
         parameters: Parameters<'static>,
         state: State<'static>,

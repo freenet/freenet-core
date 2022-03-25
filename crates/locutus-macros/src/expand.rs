@@ -129,7 +129,7 @@ impl ImplStruct {
                     ::locutus_stdlib::prelude::State::from(bytes)
                 };
                 let summary = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::summarize_state(parameters, state);
-                ::locutus_stdlib::buffer::initiate_buffer(summary.size() as u32, false as i32)
+                ::locutus_stdlib::buffer::BufferBuilder::from(summary.into_owned()).to_ptr() as _
             }
         }
     }
@@ -158,7 +158,7 @@ impl ImplStruct {
                     ::locutus_stdlib::prelude::StateSummary::from(bytes)
                 };
                 let new_delta = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::get_state_delta(parameters, state, summary);
-                ::locutus_stdlib::buffer::initiate_buffer(new_delta.size() as u32, false as i32)
+                ::locutus_stdlib::buffer::BufferBuilder::from(new_delta.into_owned()).to_ptr() as _
             }
         }
     }
