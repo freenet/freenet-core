@@ -2,11 +2,17 @@
 
 [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/Q2FWzCqKQD)
 
-### Purpose
+### Problem
 
-The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. This happened because building decentralized applications is much more difficult than building their centralized equivalents.
+The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The fact that the public square is now privately owned is a threat to freedom of speech, and therefore a threat to democracy.
 
-Locutus is a distributed, decentralized application layer for the Internet. It provides a foundation for decentralized, scalable, and trustless alternatives to centralized services, including email, instant messaging, search engines, and social networks. It solves the hardest part of building decentralized applications.
+### Solution
+
+Locutus' goal is to make it easy to create completely decentralized alternatives to today's centralized tech companies.
+
+Decentralized apps on Locutus can be built with the tools developers already know, such as [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
+
+Locutus apps can often be bridged to their legacy centralized equivolents, and Freenet will provide several such bridges, likely beginning with email.
 
 ### Architecture
 
