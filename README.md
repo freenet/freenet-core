@@ -8,11 +8,11 @@ The Internet has grown increasingly centralized over the past 25 years, such tha
 
 ### Solution
 
-Locutus' goal is to make it easy to create completely decentralized alternatives to today's centralized tech companies.
+Our goal is to make it easy to create completely decentralized alternatives to today's centralized tech companies.
 
 Decentralized apps on Locutus can be built with the tools developers already know, such as [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
 
-Locutus apps can often be bridged to their legacy centralized equivolents, and Freenet will provide several such bridges, likely beginning with email.
+Locutus apps can often be bridged to their legacy centralized equivolents, to make adoption easier - an early example will be email.
 
 ### Architecture
 
