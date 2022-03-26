@@ -2,13 +2,9 @@
 
 [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/Q2FWzCqKQD)
 
-### Problem
-
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The fact that the public square is now privately owned is a threat to freedom of speech, and therefore a threat to democracy.
 
-### Solution
-
-Our goal is to make it easy to create completely decentralized alternatives to today's centralized tech companies.
+Locutus is a software platform that makes it easy to create completely decentralized alternatives to today's centralized tech companies.
 
 Decentralized apps on Locutus can be built with the tools developers already know, such as [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
 
