@@ -93,14 +93,14 @@ impl<'a> StateDelta<'a> {
 }
 
 impl<'a> From<Vec<u8>> for StateDelta<'a> {
-    fn from(state: Vec<u8>) -> Self {
-        StateDelta(Cow::from(state))
+    fn from(delta: Vec<u8>) -> Self {
+        StateDelta(Cow::from(delta))
     }
 }
 
 impl<'a> From<&'a [u8]> for StateDelta<'a> {
-    fn from(state: &'a [u8]) -> Self {
-        StateDelta(Cow::from(state))
+    fn from(delta: &'a [u8]) -> Self {
+        StateDelta(Cow::from(delta))
     }
 }
 
@@ -216,16 +216,13 @@ pub enum ContractError {
 }
 
 pub trait ContractInterface {
-    /// Verify that the state is valid, given the parameters. This will be used before a peer
-    /// caches a new state.
+    /// Verify that the state is valid, given the parameters. 
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
 
-    /// Verify that a delta is valid - at least as much as possible. The goal is to prevent DDoS of
-    /// a contract by sending a large number of invalid delta updates. This allows peers
-    /// to verify a delta before forwarding it.
+    /// Verify that a delta is valid - at least as much as possible. 
     fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool;
 
-    /// Update the state to account for the state_delta, assuming it is valid
+    /// Update the state to account for the state_delta, assuming it is valid.
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -233,14 +230,15 @@ pub trait ContractInterface {
     ) -> Result<UpdateModification, ContractError>;
 
     /// Generate a concise summary of a state that can be used to create deltas
-    /// relative to this state. This allows flexible and efficient state synchronization between peers.
+    /// relative to this state.
     fn summarize_state(
         parameters: Parameters<'static>,
         state: State<'static>,
     ) -> StateSummary<'static>;
 
-    /// Generate a state delta using a summary from the current state. This along with
-    /// [`Self::summarize_state`] allows flexible and efficient state synchronization between peers.
+    /// Generate a state delta using a summary from the current state. 
+    /// This along with [`Self::summarize_state`] allows flexible and efficient 
+    /// state synchronization between peers.
     fn get_state_delta(
         parameters: Parameters<'static>,
         state: State<'static>,

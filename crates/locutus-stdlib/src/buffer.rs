@@ -1,3 +1,5 @@
+use std::cell::UnsafeCell;
+
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -66,7 +68,7 @@ pub enum Error {
 /// Represents a buffer in the wasm module.
 #[derive(Debug)]
 pub struct BufferMut<'instance> {
-    buffer: &'instance mut [u8],
+    buffer: UnsafeCell<&'instance mut [u8]>,
     /// stores the last read in the buffer
     read_ptr: &'instance mut u32,
     /// stores the last write in the buffer
@@ -84,16 +86,16 @@ impl<'instance> BufferMut<'instance> {
         T: AsRef<[u8]>,
     {
         let obj = obj.as_ref();
-        if obj.len() > self.buffer.len() {
+        if obj.len() > self.buffer.get_mut().len() {
             return Err(Error::InsufficientMemory {
                 req: obj.len(),
-                free: self.buffer.len(),
+                free: self.buffer.get_mut().len(),
             });
         }
         let mut last_write = (*self.write_ptr) as usize;
-        let free_right = self.buffer.len() - last_write;
+        let free_right = self.buffer.get_mut().len() - last_write;
         if obj.len() <= free_right {
-            let copy_to = &mut self.buffer[last_write..last_write + obj.len()];
+            let copy_to = &mut self.buffer.get_mut()[last_write..last_write + obj.len()];
             copy_to.copy_from_slice(obj);
             last_write += obj.len();
             *self.write_ptr = last_write as u32;
@@ -106,7 +108,8 @@ impl<'instance> BufferMut<'instance> {
     pub fn read_bytes(&self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         // don't update the read ptr
-        &self.buffer[next_offset..next_offset + len]
+        let b = unsafe { &**self.buffer.get() };
+        &b[next_offset..next_offset + len]
     }
 
     /// Give ownership of the buffer back to the guest.
@@ -149,10 +152,10 @@ impl<'instance> BufferMut<'instance> {
             let write_ptr = Box::leak(Box::from_raw(
                 (buf_builder.last_write as usize + start_ptr as usize) as *mut u32,
             ));
-            let buffer = &mut *std::ptr::slice_from_raw_parts_mut(
+            let buffer = UnsafeCell::new(&mut *std::ptr::slice_from_raw_parts_mut(
                 (buf_builder.start as usize + start_ptr as usize) as *mut u8,
                 buf_builder.size as usize,
-            );
+            ));
             BufferMut {
                 buffer,
                 read_ptr,
@@ -164,10 +167,10 @@ impl<'instance> BufferMut<'instance> {
             let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
             let read_ptr = Box::leak(Box::from_raw(buf_builder.last_read as *mut u32));
             let write_ptr = Box::leak(Box::from_raw(buf_builder.last_write as *mut u32));
-            let buffer = &mut *std::ptr::slice_from_raw_parts_mut(
+            let buffer = UnsafeCell::new(&mut *std::ptr::slice_from_raw_parts_mut(
                 buf_builder.start as *mut u8,
                 buf_builder.size as usize,
-            );
+            ));
             BufferMut {
                 buffer,
                 read_ptr,
@@ -186,7 +189,7 @@ impl<'instance> BufferMut<'instance> {
 
 /// Represents a buffer in the wasm module.
 pub struct Buffer<'instance> {
-    buffer: &'instance mut [u8],
+    buffer: UnsafeCell<&'instance mut [u8]>,
     /// stores the last read in the buffer
     read_ptr: &'instance mut u32,
     /// stores the last write in the buffer
@@ -202,7 +205,7 @@ impl<'instance> Buffer<'instance> {
     /// the same underlying data and break aliasing rules).
     pub unsafe fn read<T: Sized>(&mut self) -> T {
         let next_offset = *self.read_ptr as usize;
-        let bytes = &self.buffer[next_offset..next_offset + std::mem::size_of::<T>()];
+        let bytes = &(&**self.buffer.get())[next_offset..next_offset + std::mem::size_of::<T>()];
         let t = std::ptr::read(bytes.as_ptr() as *const T);
         *self.read_ptr += std::mem::size_of::<T>() as u32;
         t
@@ -211,11 +214,15 @@ impl<'instance> Buffer<'instance> {
     pub fn read_bytes(&mut self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         *self.read_ptr += len as u32;
-        &self.buffer[next_offset..next_offset + len]
+        &(unsafe { &**self.buffer.get() })[next_offset..next_offset + len]
     }
 
     /// Give ownership of the buffer back to the guest.
-    pub fn flip_ownership(self) -> BufferMut<'instance> {
+    ///
+    /// # Safety
+    /// Must guarantee that there are not underlying alive shared references.
+    #[doc(hidden)]
+    pub unsafe fn flip_ownership(self) -> BufferMut<'instance> {
         let Buffer {
             buffer,
             read_ptr,
@@ -317,7 +324,7 @@ mod test {
         let r: [u8; 2] = unsafe { reader.read() };
         assert_eq!(r, [1, 2]);
 
-        let mut writer = reader.flip_ownership();
+        let mut writer = unsafe { reader.flip_ownership() };
         writer.write(&[3u8, 4])?;
         let mut reader = writer.flip_ownership();
         let r: [u8; 2] = unsafe { reader.read() };
@@ -336,7 +343,7 @@ mod test {
         let r = reader.read_bytes(2);
         assert_eq!(r, &[1, 2]);
 
-        let mut writer = reader.flip_ownership();
+        let mut writer = unsafe { reader.flip_ownership() };
         writer.write(&[3u8, 4])?;
         let mut reader = writer.flip_ownership();
         let r = reader.read_bytes(2);

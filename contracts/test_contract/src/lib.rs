@@ -17,10 +17,10 @@ impl ContractInterface for Contract {
     fn update_state(
         _parameters: Parameters<'static>,
         mut state: State<'static>,
-        _delta: StateDelta<'static>,
+        delta: StateDelta<'static>,
     ) -> Result<UpdateModification, ContractError> {
         let new_state = state.to_mut();
-        new_state.extend([1, 2, 3]);
+        new_state.extend(delta.as_ref());
         Ok(UpdateModification::ValidUpdate(state))
     }
 
@@ -36,10 +36,15 @@ impl ContractInterface for Contract {
 
     fn get_state_delta(
         _parameters: Parameters<'static>,
-        _state: State<'static>,
-        _summary: StateSummary<'static>,
+        state: State<'static>,
+        summary: StateSummary<'static>,
     ) -> StateDelta<'static> {
-        unimplemented!()
+        let state = state.as_ref();
+        assert!(state.len() == 4);
+        let summary = summary.as_ref();
+        assert!(summary.len() == 2);
+        assert!(&state[1..=2] == summary);
+        StateDelta::from((&state[3..=3]).to_vec())
     }
 
     fn update_state_from_summary(
