@@ -15,6 +15,19 @@ the creation and modification of its associated state. Contracts are implemented
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
+### Applications
+
+Examples of what can be built on Locutus include:
+
+* Decentralized email (with a gateway to legacy email via the @freenet.org domain)
+* Decentralized microblogging (think Twitter or Facebook)
+* Instant Messaging (Whatsapp, Signal)
+* Online Store (think Amazon)
+* Video discovery (Youtube, TikTok)
+* Search (Google, Bing)
+
+All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
+
 ### Status
 
 We're working hard and expect an early prototype in May 2022. If you're a Rust developer and would like to help please talk to us in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord. You can also support Freenet through a [donation](https://freenetproject.org/pages/donate.html).
