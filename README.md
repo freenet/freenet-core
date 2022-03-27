@@ -28,6 +28,14 @@ Examples of what can be built on Locutus include:
 
 All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
 
+### Components
+
+Decentralized services that can be used by other decentralized services:
+
+#### Reputation system
+
+Allows users to build up reputation over time based on feedback from those they interact with. This is similar to the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. This is similar to Freenet's [Web of Trust](https://github.com/freenet/plugin-WebOfTrust#:~:text=The%20Freenet%20plugin%20Web%20of,by%20drowning%20it%20in%20spam.) plugin. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
+
 ### Status
 
 We're working hard and expect an early prototype in May 2022. If you're a Rust developer and would like to help please talk to us in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord. You can also support Freenet through a [donation](https://freenetproject.org/pages/donate.html).
