@@ -2,11 +2,11 @@
 
 [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/Q2FWzCqKQD)
 
-The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
+The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy. It is imperative that we provide a viable alternative to big tech, but which won't just become what it seeks to replace.
 
-Locutus is a software platform that makes it easy to create completely decentralized alternatives to today's centralized tech companies. These apps will be easy to use, entirely decentralized, scalable, and secured through cryptography.
+Locutus is a software platform that makes it easy to create completely decentralized alternatives to today's centralized tech companies. These decentralized apps will be easy to use, scalable, and secured through cryptography.
 
-Decentralized apps on Locutus can be built with the tools developers already know, such as [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/), and can be "bridged" to legacy centralized systems to ease transition.
+Locutus apps can be built with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/), and can be "bridged" to the legacy centralized apps they replace.
 
 ### Architecture
 
