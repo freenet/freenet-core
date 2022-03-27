@@ -8,7 +8,7 @@ Locutus is a software platform that makes it easy to create completely decentral
 
 Decentralized apps on Locutus can be built with the tools developers already know, such as [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
 
-Locutus apps can often be bridged to their legacy centralized equivolents, to make adoption easier - an early example will be email.
+Locutus apps can often be bridged to their legacy centralized equivalents, to make adoption easier - an early example will be email.
 
 ### Architecture
 
