@@ -27,6 +27,10 @@ Locutus is the development name for this software; it will probably change befor
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
 
+### Stay up to date
+
+Follow [FreenetOrg](https://twitter.com/freenetorg) on Twitter.
+
 ## License
 
 This project is licensed under either of
