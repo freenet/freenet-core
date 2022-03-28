@@ -8,6 +8,17 @@ Locutus is a software platform that makes it easy to create completely decentral
 
 Locutus apps can be built with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/), and can be "bridged" to the legacy centralized apps they replace.
 
+### Applications
+
+The following applications can be built on the Locutus platform:
+
+* Decentralized email (with a gateway to legacy email via the @freenet.org domain)
+* Decentralized microblogging (think Twitter or Facebook)
+* Instant Messaging (Whatsapp, Signal)
+* Online Store (think Amazon)
+* Video discovery (Youtube, TikTok)
+* Search (Google, Bing)
+
 ### Architecture
 
 A decentralized, scalable key-value store in which values are arbitrary data we call *state*, and keys are *cryptographic contracts* that control 
