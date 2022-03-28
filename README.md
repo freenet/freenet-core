@@ -43,7 +43,7 @@ Arbiters are trusted services that can perform tasks and authenticate the result
 
 #### Cryptocurrency
 
-In addition to integrating with legacy blockchains via arbiters, we plan to build a native Locutus cryptocurrency. It will avoid high transaction costs because transactions won't need to be broadcast through the network, rather arbiters will be used to prevent [double spending](https://en.wikipedia.org/wiki/Double-spending).
+In addition to integrating with legacy blockchains via arbiters, we plan to build a native Locutus cryptocurrency. It will avoid high transaction costs because transactions won't need to be broadcast through the network thanks to Locutus' small-world network. Arbiters will be used to prevent [double spending](https://en.wikipedia.org/wiki/Double-spending).
 
 ### Status
 
