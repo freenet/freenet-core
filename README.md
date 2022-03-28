@@ -23,8 +23,9 @@ All will be completely decentralized, scalable, and cryptographically secure. We
 
 ### Architecture
 
-A decentralized, scalable key-value store in which values are arbitrary data we call *state*, and keys are *cryptographic contracts* that control 
-the creation and modification of its associated state. Contracts are implemented in [Web Assembly](https://webassembly.org/). Any participant in the network can request a contract's state, and also *subscribe* to state changes.
+
+
+A decentralized, scalable key-value store based on [small world routing](https://freenetproject.org/assets/papers/lic.pdf), in which values are arbitrary data we call *state*, and keys are *cryptographic contracts* that control the creation and modification of its associated state. Contracts are implemented in [Web Assembly](https://webassembly.org/). Any participant in the network can request a contract's state, and also *subscribe* to state changes.
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
