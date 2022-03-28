@@ -8,7 +8,7 @@ Locutus is a software platform that makes it easy to create completely decentral
 
 Locutus apps can be built with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/), and can be "bridged" to the legacy centralized apps they replace.
 
-### Applications
+### 1. Applications
 
 The following applications can be built on the Locutus platform:
 
@@ -21,7 +21,15 @@ The following applications can be built on the Locutus platform:
 
 All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
 
-### Architecture
+### 2. Components
+
+The following components are built on the Locutus platform and are available to use by applicatiions.
+
+#### 2.1 Reputation
+
+A decentralized reputation system that could be used to build something like Uber's feedback mechanism. This could be used for feedback on transctions as with an online store, or spam prevention.
+
+### 3. Architecture
 
 Locutus is built on a decentralized key-value store based on [small world routing](https://freenetproject.org/assets/papers/lic.pdf) - the same principle as the original Freenet. Keys in Locutus are cryptographic contracts specified in [Web Assembly](https://webassembly.org/). This contract controls what data may be associated with the contract, and the circumstances under which this data may be updated.
 
@@ -31,25 +39,23 @@ This can be viewed as a distributed, decentralized database with extremely fine-
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
-### Status
+### 4. Status
 
 We're working hard and expect an early prototype in May 2022. If you're a Rust developer and would like to help please talk to us in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord. You can also support Freenet through a [donation](https://freenetproject.org/pages/donate.html).
 
-### Name
+### 5. Name
 
 Locutus is the development name for this software; it will probably change before launch.
 
-### Chat with us
+### 6. Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
 
-## License
+## 7. License
 
-This project is licensed under either of
+This project is licensed under either of:
 
 - Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
   http://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or
   http://opensource.org/licenses/MIT)
-
-at your option.
