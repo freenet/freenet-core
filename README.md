@@ -8,13 +8,6 @@ Locutus is a software platform that makes it easy to create decentralized altern
 
 Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/), and can be "bridged" to the legacy centralized apps they replace.
 
-### Architecture
-
-A decentralized, scalable key-value store in which values are arbitrary data we call *state*, and keys are *cryptographic contracts* that control 
-the creation and modification of its associated state. Contracts are implemented in [Web Assembly](https://webassembly.org/). Any participant in the network can request a contract's state, and also *subscribe* to state changes.
-
-Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
-
 ### Applications
 
 Examples of what can be built on Locutus include:
@@ -44,6 +37,16 @@ Arbiters are trusted services that can perform tasks and authenticate the result
 #### Cryptocurrency
 
 In addition to integrating with legacy blockchains via arbiters, we plan to build a native Locutus cryptocurrency. It will avoid high transaction costs because transactions won't need to be broadcast through the network thanks to Locutus' small-world network. Arbiters will be used to prevent [double spending](https://en.wikipedia.org/wiki/Double-spending).
+
+### How does it work?
+
+### Architecture
+
+Locutus is a decentralized key-value database. It uses the same [small world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as the original Freenet design, but each key is a cryptographic contract implemented in [Web Assembly](https://webassembly.org/), and the value associated with each contract is called its *state*. The role of the cryptographic contract is to specify what state is allowed for this contract, and how the state is modified.
+
+A very simple contract might require that the state is a list of messages, each signed with a specific cryptographic keypair. The state can be updated to add new messages if appropriately signed. Something like this could serve as the basis for a blog or Twitter feed.
+
+Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
 ### Status
 
