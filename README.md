@@ -36,10 +36,6 @@ This is conceptually similar to Freenet's [Web of Trust](http://www.draketo.de/e
 
 Arbiters are trusted services that can perform tasks and authenticate the results, such as verifying that a contract had a particular state at a given time, or that external blockchains (Bitcoin, Ethereum, Solana etc) contain specific transactions. Trust is achieved through the reputation system.
 
-#### 2.3 Cryptocurrency
-
-In addition to integrating with legacy blockchains via arbiters, we plan to build a native Locutus cryptocurrency. It will avoid high transaction costs because transactions won't need to be broadcast through the network thanks to Locutus' small-world network. Arbiters will be used to prevent [double spending](https://en.wikipedia.org/wiki/Double-spending).
-
 ### 3. How does it work?
 
 Locutus is a decentralized key-value database. It uses the same [small world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as the original Freenet design, but each key is a cryptographic contract implemented in [Web Assembly](https://webassembly.org/), and the value associated with each contract is called its *state*. The role of the cryptographic contract is to specify what state is allowed for this contract, and how the state is modified.
