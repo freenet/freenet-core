@@ -19,6 +19,8 @@ The following applications can be built on the Locutus platform:
 * Video discovery (Youtube, TikTok)
 * Search (Google, Bing)
 
+All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
+
 ### Architecture
 
 A decentralized, scalable key-value store in which values are arbitrary data we call *state*, and keys are *cryptographic contracts* that control 
