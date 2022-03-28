@@ -22,7 +22,8 @@ Examples of what can be built on Locutus include:
 * Decentralized email (with a gateway to legacy email via the @freenet.org domain)
 * Decentralized microblogging (think Twitter or Facebook)
 * Instant Messaging (Whatsapp, Signal)
-* Online Store (think Amazon)
+* Online Store (Amazon)
+* Discussion (Reddit, HN)
 * Video discovery (Youtube, TikTok)
 * Search (Google, Bing)
 
@@ -35,6 +36,14 @@ Decentralized services that can be used by other decentralized services:
 #### Reputation system
 
 Allows users to build up reputation over time based on feedback from those they interact with. This is similar to the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. This is similar to Freenet's [Web of Trust](https://github.com/freenet/plugin-WebOfTrust#:~:text=The%20Freenet%20plugin%20Web%20of,by%20drowning%20it%20in%20spam.) plugin. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
+
+#### Arbiters
+
+Arbiters are trusted services that can perform tasks and authenticate the results, such as verifying that a contract had a particular state at a given time, or that external blockchains (Bitcoin, Ethereum, Solana etc) contain specific transactions. Trust is achieved through the reputation system.
+
+#### Cryptocurrency
+
+In addition to integrating with legacy blockchains via arbiters, we plan to build a native Locutus cryptocurrency. It will avoid high transaction costs because transactions won't need to be broadcast through the network, rather arbiters will be used to prevent [double spending](https://en.wikipedia.org/wiki/Double-spending).
 
 ### Status
 
