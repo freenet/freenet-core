@@ -217,7 +217,7 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: &Location) -> bool {
-        let open_conn = self.open_connections.fetch_add(1, SeqCst);
+        let open_conn = self.open_connections.fetch_add(1, SeqCst) + 1;
         let my_location = &self
             .own_location()
             .location
