@@ -24,14 +24,6 @@ All will be completely decentralized, scalable, and cryptographically secure. We
 
 ### 2. Components
 
-The following components are built on the Locutus platform and are available to use by applicatiions.
-
-#### 2.1 Reputation
-
-A decentralized reputation system that could be used to build something like Uber's feedback mechanism. This could be used for feedback on transctions as with an online store, or spam prevention.
-
-### 3. Architecture
-
 Decentralized services that can be used by other decentralized services:
 
 #### 2.1 Reputation system
@@ -69,8 +61,6 @@ We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
 Follow [FreenetOrg](https://twitter.com/freenetorg) on Twitter.
 
 ### 8. License
-
-## 7. License
 
 This project is licensed under either of:
 
