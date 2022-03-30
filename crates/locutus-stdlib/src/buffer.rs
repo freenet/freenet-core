@@ -1,11 +1,12 @@
-use std::cell::UnsafeCell;
+//! A memory buffer to interact with the WASM contracts.
+//! This buffer leakes it's own memory and will only be freed by the runtime when a contract instance is dropped.
 
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct BufferBuilder {
-    size: u32,
     start: i64,
+    size: u32,
     last_read: i64,
     last_write: i64,
 }
@@ -29,13 +30,15 @@ impl BufferBuilder {
         // drop previous buffer
         let prev = Vec::from_raw_parts(self.start as *mut u8, *write_ptr as usize, self.size());
         std::mem::drop(prev);
-        let new_ptr = data.as_ptr() as i64;
-        self.start = new_ptr;
-        self.size = data.capacity() as _;
 
-        // write the new buffer read/write pointers
+        // write the new buffer information
+        let new_ptr = data.as_ptr();
+        eprintln!("new ptr: {new_ptr:p} -> {}", new_ptr as i64);
+        self.start = new_ptr as i64; // FIXME: this is not assigning what it should ???
+        self.size = data.capacity() as _;
         *read_ptr = 0;
-        *write_ptr = data.len() as _;
+        *write_ptr = data.len().saturating_sub(1) as _;
+        std::mem::forget(data)
     }
 
     pub fn to_ptr(self) -> *mut BufferBuilder {
@@ -68,16 +71,15 @@ pub enum Error {
 /// Represents a buffer in the wasm module.
 #[derive(Debug)]
 pub struct BufferMut<'instance> {
-    buffer: UnsafeCell<&'instance mut [u8]>,
+    buffer: &'instance mut [u8],
     /// stores the last read in the buffer
     read_ptr: &'instance mut u32,
     /// stores the last write in the buffer
     write_ptr: &'instance mut u32,
     /// A pointer to the underlying builder
     builder_ptr: *mut BufferBuilder,
-    /// A pointer to the builder in the linear memory address space,
-    /// in case it is different than the address set at the `builder_ptr`
-    original_ptr: Option<*mut BufferBuilder>,
+    /// Linear memory pointer and size in bytes
+    mem: (*const u8, u64),
 }
 
 impl<'instance> BufferMut<'instance> {
@@ -86,16 +88,16 @@ impl<'instance> BufferMut<'instance> {
         T: AsRef<[u8]>,
     {
         let obj = obj.as_ref();
-        if obj.len() > self.buffer.get_mut().len() {
+        if obj.len() > self.buffer.len() {
             return Err(Error::InsufficientMemory {
                 req: obj.len(),
-                free: self.buffer.get_mut().len(),
+                free: self.buffer.len(),
             });
         }
         let mut last_write = (*self.write_ptr) as usize;
-        let free_right = self.buffer.get_mut().len() - last_write;
+        let free_right = self.buffer.len() - last_write;
         if obj.len() <= free_right {
-            let copy_to = &mut self.buffer.get_mut()[last_write..last_write + obj.len()];
+            let copy_to = &mut self.buffer[last_write..last_write + obj.len()];
             copy_to.copy_from_slice(obj);
             last_write += obj.len();
             *self.write_ptr = last_write as u32;
@@ -108,31 +110,31 @@ impl<'instance> BufferMut<'instance> {
     pub fn read_bytes(&self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         // don't update the read ptr
-        let b = unsafe { &**self.buffer.get() };
-        &b[next_offset..next_offset + len]
+        &self.buffer[next_offset..next_offset + len]
     }
 
     /// Give ownership of the buffer back to the guest.
-    pub fn flip_ownership(self) -> Buffer<'instance> {
+    pub fn shared(self) -> Buffer<'instance> {
         let BufferMut {
-            buffer,
-            read_ptr,
-            write_ptr,
-            builder_ptr,
-            original_ptr,
+            builder_ptr, mem, ..
         } = self;
+        let BuilderInfo {
+            buffer, read_ptr, ..
+        } = from_raw_builder(builder_ptr, mem);
         Buffer {
             buffer,
             read_ptr,
-            write_ptr,
             builder_ptr,
-            original_ptr,
+            mem,
         }
     }
 
     pub fn size(&self) -> usize {
-        let p = unsafe { &*self.builder_ptr };
-        p.size as usize
+        unsafe {
+            let end_ptr = self.mem.0.offset(self.mem.1 as isize);
+            let p = &*compute_ptr(self.builder_ptr, self.mem.0, end_ptr);
+            p.size as _
+        }
     }
 
     #[doc(hidden)]
@@ -140,62 +142,87 @@ impl<'instance> BufferMut<'instance> {
     /// The pointer passed come from a previous call to `initiate_buffer` exported function from the contract.
     pub unsafe fn from_ptr(
         builder_ptr: *mut BufferBuilder,
-        linear_mem_start: Option<*mut u8>,
+        linear_mem_space: (*const u8, u64),
     ) -> Self {
-        if let Some(start_ptr) = linear_mem_start {
-            let original_ptr = Some(builder_ptr);
-            let builder_ptr = (builder_ptr as usize + start_ptr as usize) as *mut BufferBuilder;
-            let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
-            let read_ptr = Box::leak(Box::from_raw(
-                (buf_builder.last_read as usize + start_ptr as usize) as *mut u32,
-            ));
-            let write_ptr = Box::leak(Box::from_raw(
-                (buf_builder.last_write as usize + start_ptr as usize) as *mut u32,
-            ));
-            let buffer = UnsafeCell::new(&mut *std::ptr::slice_from_raw_parts_mut(
-                (buf_builder.start as usize + start_ptr as usize) as *mut u8,
-                buf_builder.size as usize,
-            ));
-            BufferMut {
-                buffer,
-                read_ptr,
-                write_ptr,
-                builder_ptr,
-                original_ptr,
-            }
-        } else {
-            let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
-            let read_ptr = Box::leak(Box::from_raw(buf_builder.last_read as *mut u32));
-            let write_ptr = Box::leak(Box::from_raw(buf_builder.last_write as *mut u32));
-            let buffer = UnsafeCell::new(&mut *std::ptr::slice_from_raw_parts_mut(
-                buf_builder.start as *mut u8,
-                buf_builder.size as usize,
-            ));
-            BufferMut {
-                buffer,
-                read_ptr,
-                write_ptr,
-                builder_ptr,
-                original_ptr: None,
-            }
+        let BuilderInfo {
+            buffer,
+            read_ptr,
+            write_ptr,
+        } = from_raw_builder(builder_ptr, linear_mem_space);
+        BufferMut {
+            buffer,
+            read_ptr,
+            write_ptr,
+            builder_ptr,
+            mem: linear_mem_space,
         }
     }
 
     /// A pointer to the linear memory address.
     pub fn ptr(&self) -> *mut BufferBuilder {
-        self.original_ptr.unwrap_or(self.builder_ptr)
+        self.builder_ptr
     }
 }
 
+#[inline(always)]
+unsafe fn compute_ptr<T>(ptr: *mut T, start_ptr: *const u8, end_ptr: *const u8) -> *mut T {
+    let c_ptr = ptr as *const u8;
+    if c_ptr < start_ptr && c_ptr > end_ptr {
+        ptr
+    } else {
+        (start_ptr as isize + ptr as isize) as _
+    }
+}
+
+struct BuilderInfo<'instance> {
+    buffer: &'instance mut [u8],
+    read_ptr: &'instance mut u32,
+    write_ptr: &'instance mut u32,
+}
+
+fn from_raw_builder<'a>(
+    builder_ptr: *mut BufferBuilder,
+    linear_mem_space: (*const u8, u64),
+) -> BuilderInfo<'a> {
+    let (start_ptr, size) = linear_mem_space;
+    unsafe {
+        let end_ptr = start_ptr.offset(size as isize);
+        let builder_ptr = compute_ptr(builder_ptr, start_ptr, end_ptr);
+        let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
+        let read_ptr = Box::leak(Box::from_raw(compute_ptr(
+            buf_builder.last_read as *mut u32,
+            start_ptr,
+            end_ptr,
+        )));
+        let write_ptr = Box::leak(Box::from_raw(compute_ptr(
+            buf_builder.last_write as *mut u32,
+            start_ptr,
+            end_ptr,
+        )));
+        eprintln!(
+            "checking new ptr: {:p} -> {}; {start_ptr:p} - {end_ptr:p}",
+            buf_builder.start as *mut u8, buf_builder.start
+        );
+        let buffer = &mut *std::ptr::slice_from_raw_parts_mut(
+            compute_ptr(buf_builder.start as *mut u8, start_ptr, end_ptr),
+            buf_builder.size as usize,
+        );
+        BuilderInfo {
+            buffer,
+            read_ptr,
+            write_ptr,
+        }
+    }
+}
+
+#[derive(Debug)]
 /// Represents a buffer in the wasm module.
 pub struct Buffer<'instance> {
-    buffer: UnsafeCell<&'instance mut [u8]>,
+    buffer: &'instance mut [u8],
     /// stores the last read in the buffer
     read_ptr: &'instance mut u32,
-    /// stores the last write in the buffer
-    write_ptr: &'instance mut u32,
     builder_ptr: *mut BufferBuilder,
-    original_ptr: Option<*mut BufferBuilder>,
+    mem: (*const u8, u64),
 }
 
 impl<'instance> Buffer<'instance> {
@@ -205,7 +232,7 @@ impl<'instance> Buffer<'instance> {
     /// the same underlying data and break aliasing rules).
     pub unsafe fn read<T: Sized>(&mut self) -> T {
         let next_offset = *self.read_ptr as usize;
-        let bytes = &(&**self.buffer.get())[next_offset..next_offset + std::mem::size_of::<T>()];
+        let bytes = &self.buffer[next_offset..next_offset + std::mem::size_of::<T>()];
         let t = std::ptr::read(bytes.as_ptr() as *const T);
         *self.read_ptr += std::mem::size_of::<T>() as u32;
         t
@@ -214,7 +241,13 @@ impl<'instance> Buffer<'instance> {
     pub fn read_bytes(&mut self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         *self.read_ptr += len as u32;
-        &(unsafe { &**self.buffer.get() })[next_offset..next_offset + len]
+        &self.buffer[next_offset..next_offset + len]
+    }
+
+    pub fn read_all(&mut self) -> &[u8] {
+        let next_offset = *self.read_ptr as usize;
+        *self.read_ptr += self.buffer.len() as u32;
+        &self.buffer[next_offset..]
     }
 
     /// Give ownership of the buffer back to the guest.
@@ -222,20 +255,21 @@ impl<'instance> Buffer<'instance> {
     /// # Safety
     /// Must guarantee that there are not underlying alive shared references.
     #[doc(hidden)]
-    pub unsafe fn flip_ownership(self) -> BufferMut<'instance> {
+    pub unsafe fn exclusive(self) -> BufferMut<'instance> {
         let Buffer {
+            builder_ptr, mem, ..
+        } = self;
+        let BuilderInfo {
             buffer,
             read_ptr,
             write_ptr,
-            builder_ptr,
-            original_ptr,
-        } = self;
+        } = from_raw_builder(builder_ptr, mem);
         BufferMut {
             buffer,
             read_ptr,
             write_ptr,
             builder_ptr,
-            original_ptr,
+            mem,
         }
     }
 }
@@ -271,12 +305,11 @@ mod test {
 
     const TEST_MODULE: &str = r#"
         (module
-            (func $initiate_buffer (import "locutus" "initiate_buffer") (param i32 i32) (result i64))
+            (func $initiate_buffer (import "locutus" "initiate_buffer") (param i32) (result i64))
             (memory $locutus_mem (export "memory") 20)
             (export "initiate_buffer" (func $initiate_buffer))
         )"#;
 
-    #[allow(dead_code)]
     fn build_test_mod() -> Result<(Store, Instance), Box<dyn std::error::Error>> {
         let wasm_bytes = wat2wasm(TEST_MODULE.as_bytes())?;
         let store = Store::new(&Universal::new(Cranelift::new()).engine());
@@ -307,47 +340,72 @@ mod test {
     }
 
     fn init_buf(instance: &Instance, size: u32) -> *mut BufferBuilder {
-        let initiate_buffer: NativeFunc<(u32, i32), i64> = instance
+        let initiate_buffer: NativeFunc<u32, i64> = instance
             .exports
             .get_native_function("initiate_buffer")
             .unwrap();
-        initiate_buffer.call(size, true as i32).unwrap() as *mut BufferBuilder
+        initiate_buffer.call(size).unwrap() as *mut BufferBuilder
     }
 
     #[test]
     fn read_and_write() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
-        let _mem = instance.exports.get_memory("memory")?.data_ptr();
-        let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), None) };
+        let mem = instance.exports.get_memory("memory")?;
+        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+
+        let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
         writer.write(&[1u8, 2])?;
-        let mut reader = writer.flip_ownership();
+        let mut reader = writer.shared();
         let r: [u8; 2] = unsafe { reader.read() };
         assert_eq!(r, [1, 2]);
 
-        let mut writer = unsafe { reader.flip_ownership() };
+        let mut writer = unsafe { reader.exclusive() };
         writer.write(&[3u8, 4])?;
-        let mut reader = writer.flip_ownership();
+        let mut reader = writer.shared();
         let r: [u8; 2] = unsafe { reader.read() };
         assert_eq!(r, [3, 4]);
-
         Ok(())
     }
 
     #[test]
     fn read_and_write_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
-        let _mem = instance.exports.get_memory("memory")?.data_ptr();
-        let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), None) };
+        let mem = instance.exports.get_memory("memory")?;
+        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+
+        let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
         writer.write(&[1u8, 2])?;
-        let mut reader = writer.flip_ownership();
+        let mut reader = writer.shared();
         let r = reader.read_bytes(2);
         assert_eq!(r, &[1, 2]);
 
-        let mut writer = unsafe { reader.flip_ownership() };
+        let mut writer = unsafe { reader.exclusive() };
         writer.write(&[3u8, 4])?;
-        let mut reader = writer.flip_ownership();
+        let mut reader = writer.shared();
         let r = reader.read_bytes(2);
         assert_eq!(r, &[3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn update() -> Result<(), Box<dyn std::error::Error>> {
+        let (_store, instance) = build_test_mod()?;
+        let mem = instance.exports.get_memory("memory")?;
+        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+
+        let ptr = {
+            let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
+            writer.write(&[1u8, 2])?;
+            writer.ptr()
+        };
+
+        let writer = unsafe {
+            let builder = &mut *ptr;
+            builder.update_buffer(vec![3, 5, 7]);
+            BufferMut::from_ptr(ptr, linear_mem)
+        };
+        let mut reader = writer.shared();
+        assert_eq!(reader.read_all(), &[3, 5, 7]);
 
         Ok(())
     }

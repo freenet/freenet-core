@@ -21,7 +21,9 @@ impl ContractInterface for Contract {
     ) -> Result<UpdateModification, ContractError> {
         let new_state = state.to_mut();
         new_state.extend(delta.as_ref());
-        Ok(UpdateModification::ValidUpdate(state))
+        Ok(UpdateModification::ValidUpdate(State::from(
+            new_state.to_vec(),
+        )))
     }
 
     fn summarize_state(

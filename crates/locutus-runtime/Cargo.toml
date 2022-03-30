@@ -17,6 +17,7 @@ thiserror = "1"
 wasmer = { version = "^2.0", default-features = false, features = [ 
 	"sys" 
 ]}
+wasmer-compiler-llvm = { version="^2.0", optional = true }
 
 # internal
 locutus-stdlib = { path = "../locutus-stdlib" }
@@ -25,7 +26,9 @@ locutus-stdlib = { path = "../locutus-stdlib" }
 default = [ "wasmer-default" ]
 wasmer-default = [ 
 	"wasmer/llvm",
-	"wasmer/dylib"
+	"wasmer-compiler-llvm",
+	# "wasmer/dylib"
+	"wasmer/universal"
 ]
 wasmser-universal = [
 	"wasmer/default-cranelift",

@@ -1631,6 +1631,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "wasmer",
+ "wasmer-compiler-llvm",
  "wasmer-wasi",
 ]
 

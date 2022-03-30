@@ -94,7 +94,7 @@ impl Runtime {
         unsafe {
             Ok(BufferMut::from_ptr(
                 builder_ptr as *mut BufferBuilder,
-                Some(memory.data_ptr()),
+                (memory.data_ptr() as _, memory.data_size()),
             ))
         }
     }
@@ -134,8 +134,11 @@ impl Runtime {
 
     #[cfg(not(test))]
     fn instance_store() -> Store {
-        use wasmer::Dylib;
-        Store::new(&Dylib::headless().engine())
+        // use wasmer::Dylib;
+        use wasmer::Universal;
+        use wasmer_compiler_llvm::LLVM;
+        // Store::new(&Dylib::headless().engine())
+        Store::new(&Universal::new(LLVM::new()).engine())
     }
 
     #[cfg(test)]
@@ -241,17 +244,20 @@ impl Runtime {
         let mut delta_buf = self.init_buf(&instance, &delta)?;
         delta_buf.write(delta)?;
 
-        let validate_func: NativeFunc<(i64, i64), i32> =
+        let validate_func: NativeFunc<(i64, i64, i64), i32> =
             instance.exports.get_native_function("update_state")?;
-        let update_res = UpdateResult::try_from(
-            validate_func.call(param_buf.ptr() as i64, delta_buf.ptr() as i64)?,
-        )
+        let update_res = UpdateResult::try_from(validate_func.call(
+            param_buf.ptr() as i64,
+            state_buf.ptr() as i64,
+            delta_buf.ptr() as i64,
+        )?)
         .map_err(|_| ContractRuntimeError::from(ExecError::UnexpectedResult))?;
         match update_res {
             UpdateResult::ValidNoChange => Ok(state),
             UpdateResult::ValidUpdate => {
-                let mut state_buf = state_buf.flip_ownership();
-                let new_state = state_buf.read_bytes(state.size());
+                let mut state_buf = state_buf.shared();
+                let new_state = state_buf.read_all();
+                eprintln!("new_state: {new_state:?}");
                 Ok(State::from(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
@@ -284,7 +290,8 @@ impl Runtime {
             .as_ref()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
-        let summary_buf = unsafe { BufferMut::from_ptr(res_ptr, Some(memory.data_ptr())) };
+        let summary_buf =
+            unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
         let summary: StateSummary = summary_buf.read_bytes(summary_buf.size()).into();
         Ok(StateSummary::from(summary.to_vec()))
     }
@@ -320,7 +327,8 @@ impl Runtime {
             .as_ref()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
-        let delta_buf = unsafe { BufferMut::from_ptr(res_ptr, Some(memory.data_ptr())) };
+        let delta_buf =
+            unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
         let delta = delta_buf.read_bytes(delta_buf.size());
         Ok(StateDelta::from(delta.to_owned()))
     }
@@ -354,11 +362,78 @@ impl Runtime {
         match update_res {
             UpdateResult::ValidNoChange => Ok(current_state),
             UpdateResult::ValidUpdate => {
-                let mut state_buf = state_buf.flip_ownership();
+                let mut state_buf = state_buf.shared();
                 let new_state = state_buf.read_bytes(current_state.size());
                 Ok(State::from(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::Contract;
+
+    fn test_dir() -> PathBuf {
+        let test_dir = std::env::temp_dir().join("locutus").join("contracts");
+        if !test_dir.exists() {
+            std::fs::create_dir_all(&test_dir).unwrap();
+        }
+        test_dir
+    }
+
+    fn test_contract(contract_path: &str) -> Contract {
+        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
+        let contracts = PathBuf::from(CONTRACTS_DIR);
+        let mut dirs = contracts.ancestors();
+        let path = dirs.nth(2).unwrap();
+        let contract_path = path
+            .join("contracts")
+            .join("test_contract")
+            .join(contract_path);
+        Contract::try_from(contract_path).expect("contract found")
+    }
+
+    fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
+        let mut store = ContractStore::new(test_dir(), 10_000);
+        let contract = test_contract("test_contract_guest.wasi.wasm");
+        let key = contract.key();
+        store.store_contract(contract)?;
+        Ok((store, key))
+    }
+
+    #[test]
+    fn update_state() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, key) = get_guest_test_contract()?;
+        let mut runtime = Runtime::build(store, false).unwrap();
+        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+        let new_state = runtime.update_state(
+            &key,
+            Parameters::from([].as_ref()),
+            State::from([5, 2, 3].as_ref()),
+            StateDelta::from([4].as_ref()),
+        )?;
+        assert!(new_state.as_ref().len() == 4);
+        assert!(new_state.as_ref()[3] == 4);
+        Ok(())
+    }
+
+    #[test]
+    fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, key) = get_guest_test_contract()?;
+        let mut runtime = Runtime::build(store, false).unwrap();
+        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+        let summary = runtime.summarize_state(
+            &key,
+            Parameters::from([].as_ref()),
+            State::from([5, 2, 3, 4].as_ref()),
+        )?;
+        assert!(summary.as_ref().len() == 1);
+        assert!(summary.as_ref()[0] == 5);
+        Ok(())
     }
 }
