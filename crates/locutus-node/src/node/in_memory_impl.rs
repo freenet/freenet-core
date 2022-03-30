@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use either::Either;
-use locutus_runtime::{Contract, ContractKey, ContractValue};
+use locutus_runtime::{Contract, ContractKey, ContractState};
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -14,7 +14,7 @@ use crate::{
     message::{Message, NodeEvent, TransactionType},
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
-    user_events::UserEventsProxy,
+    client_events::ClientEventsProxy,
     util::IterExt,
     NodeConfig,
 };
@@ -69,7 +69,7 @@ where
 
     pub async fn run_node<UsrEv>(&mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
     where
-        UsrEv: UserEventsProxy + Send + Sync + 'static,
+        UsrEv: ClientEventsProxy + Send + Sync + 'static,
     {
         if !self.is_gateway {
             if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {
@@ -91,7 +91,7 @@ where
 
     pub async fn append_contracts(
         &self,
-        contracts: Vec<(Contract, ContractValue)>,
+        contracts: Vec<(Contract, ContractState)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, value) in contracts {

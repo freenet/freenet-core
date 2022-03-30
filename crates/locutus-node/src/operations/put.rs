@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use locutus_runtime::{Contract, ContractKey, ContractValue};
+use locutus_runtime::{Contract, ContractKey, ContractState};
 
 use crate::{
     config::PEER_TIMEOUT,
@@ -30,7 +30,7 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    pub fn start_op(contract: Contract, value: ContractValue, htl: usize, peer: &PeerKey) -> Self {
+    pub fn start_op(contract: Contract, value: ContractState, htl: usize, peer: &PeerKey) -> Self {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
             contract.key(),
@@ -178,7 +178,7 @@ enum PutState {
     PrepareRequest {
         id: Transaction,
         contract: Contract,
-        value: ContractValue,
+        value: ContractState,
         htl: usize,
     },
     AwaitingResponse {
@@ -631,8 +631,8 @@ where
 async fn put_contract<CErr>(
     op_storage: &OpManager<CErr>,
     key: ContractKey,
-    value: ContractValue,
-) -> Result<ContractValue, OpError<CErr>>
+    value: ContractState,
+) -> Result<ContractState, OpError<CErr>>
 where
     CErr: std::error::Error,
 {
@@ -663,7 +663,7 @@ async fn forward_changes<CErr, CB>(
     op_storage: &OpManager<CErr>,
     conn_manager: &CB,
     contract: &Contract,
-    new_value: ContractValue,
+    new_value: ContractState,
     id: Transaction,
     htl: usize,
     skip_list: &[PeerKey],
@@ -718,7 +718,7 @@ mod messages {
         RequestPut {
             id: Transaction,
             contract: Contract,
-            value: ContractValue,
+            value: ContractState,
             /// max hops to live
             htl: usize,
             target: PeerKeyLocation,
@@ -729,7 +729,7 @@ mod messages {
         PutForward {
             id: Transaction,
             contract: Contract,
-            new_value: ContractValue,
+            new_value: ContractState,
             /// current htl, reduced by one at each hop
             htl: usize,
             skip_list: Vec<PeerKey>,
@@ -737,14 +737,14 @@ mod messages {
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
             id: Transaction,
-            new_value: ContractValue,
+            new_value: ContractState,
         },
         /// Target the node which is closest to the key
         SeekNode {
             id: Transaction,
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
-            value: ContractValue,
+            value: ContractState,
             contract: Contract,
             /// max hops to live
             htl: usize,
@@ -758,14 +758,14 @@ mod messages {
             broadcasted_to: usize,
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
-            new_value: ContractValue,
+            new_value: ContractState,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
             id: Transaction,
             sender: PeerKeyLocation,
             key: ContractKey,
-            new_value: ContractValue,
+            new_value: ContractState,
             sender_subscribers: Vec<PeerKeyLocation>,
         },
     }
@@ -831,9 +831,9 @@ mod test {
     use std::collections::HashMap;
 
     use crate::{
+        client_events::ClientRequest,
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
-        user_events::UserEvent,
     };
 
     use super::*;
@@ -854,7 +854,7 @@ mod test {
 
         let mut requester = PutOp::start_op(
             contract.clone(),
-            ContractValue::new(vec![0, 1, 2, 3]),
+            ContractState::new(vec![0, 1, 2, 3]),
             0,
             &peer,
         )
@@ -871,7 +871,7 @@ mod test {
         let expected = PutMsg::RequestPut {
             id,
             contract: contract.clone(),
-            value: ContractValue::new(vec![0, 1, 2, 3]),
+            value: ContractState::new(vec![0, 1, 2, 3]),
             htl: 0,
             target: target_loc,
         };
@@ -889,12 +889,12 @@ mod test {
                 broadcast_to: vec![],
                 broadcasted_to: 0,
                 key: contract.key(),
-                new_value: ContractValue::new(vec![4, 3, 2, 1]),
+                new_value: ContractState::new(vec![4, 3, 2, 1]),
             })?
             .ok_or_else(|| anyhow::anyhow!("no output"))?;
         let expected = PutMsg::SuccessfulUpdate {
             id,
-            new_value: ContractValue::new(vec![4, 3, 2, 1]),
+            new_value: ContractState::new(vec![4, 3, 2, 1]),
         };
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert_eq!(res_msg, expected);
@@ -914,8 +914,8 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
         let key = contract.key();
-        let contract_val: ContractValue = gen.arbitrary()?;
-        let new_value = ContractValue::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
+        let contract_val: ContractState = gen.arbitrary()?;
+        let new_value = ContractState::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         let mut locations = sim_nodes.get_locations_by_node();
@@ -937,9 +937,9 @@ mod test {
             contract_subscribers: HashMap::from_iter([(contract.key(), vec![node0_loc])]),
         };
 
-        let put_event = UserEvent::Put {
+        let put_event = ClientRequest::Put {
             contract: contract.clone(),
-            value: new_value.clone(),
+            state: new_value.clone(),
         };
 
         let gw_0 = NodeSpecification {

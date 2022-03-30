@@ -499,14 +499,14 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use locutus_runtime::{Contract, ContractValue};
+    use locutus_runtime::{Contract, ContractState};
 
     use super::*;
     use crate::{
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
-        user_events::UserEvent,
+        client_events::ClientRequest,
     };
     use std::collections::HashMap;
 
@@ -605,10 +605,10 @@ mod test {
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: Contract = gen.arbitrary()?;
-        let contract_val: ContractValue = gen.arbitrary()?;
+        let contract_val: ContractState = gen.arbitrary()?;
         let contract_key: ContractKey = contract.key();
 
-        let event = UserEvent::Subscribe { key: contract_key };
+        let event = ClientRequest::Subscribe { key: contract_key };
         let first_node = NodeSpecification {
             owned_contracts: Vec::new(),
             non_owned_contracts: vec![contract_key],

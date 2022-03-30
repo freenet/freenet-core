@@ -1,21 +1,45 @@
-use locutus_runtime::{Contract, ContractKey, ContractValue};
+use locutus_runtime::{Contract, ContractKey, ContractState};
+use locutus_stdlib::prelude::{State, StateDelta};
+use serde::{Deserialize, Serialize};
 
 #[async_trait::async_trait]
-pub trait UserEventsProxy {
+pub trait ClientEventsProxy {
+    type Error: std::fmt::Debug + Into<Box<dyn std::error::Error + Send + Sync>> + Serialize;
+
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    async fn recv(&mut self) -> UserEvent;
+    async fn recv(&mut self) -> Result<ClientRequest, Self::Error>;
+
+    /// Sends a response from the host to the client application.
+    async fn send(
+        &mut self,
+        response: Result<HostResponse, Self::Error>,
+    ) -> Result<HostResponse, Self::Error>;
 }
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub enum UserEvent {
+#[derive(Serialize, Deserialize)]
+pub enum HostResponse {
+    PutResponse,
+    UpdateContract,
+    GetResponse {
+        contract: Option<Contract>,
+        state: Option<State<'static>>,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum ClientRequest {
     /// Update or insert a new value in a contract corresponding with the provided key.
     Put {
         /// Value to upsert in the contract.
-        value: ContractValue,
+        state: ContractState,
         // TODO: this should be Either<ContractKey, Contract>
         contract: Contract,
+    },
+    Update {
+        key: ContractKey,
+        delta: StateDelta<'static>,
     },
     /// Fetch the current value from a contract corresponding to the provided key.
     Get {
@@ -46,8 +70,8 @@ pub(crate) mod test {
         id: PeerKey,
         signal: Receiver<(EventId, PeerKey)>,
         non_owned_contracts: Vec<ContractKey>,
-        owned_contracts: Vec<(Contract, ContractValue)>,
-        events_to_gen: HashMap<EventId, UserEvent>,
+        owned_contracts: Vec<(Contract, ContractState)>,
+        events_to_gen: HashMap<EventId, ClientRequest>,
         random: bool,
     }
 
@@ -71,33 +95,39 @@ pub(crate) mod test {
         /// Contracts that the user updates.
         pub fn has_contract(
             &mut self,
-            contracts: impl IntoIterator<Item = (Contract, ContractValue)>,
+            contracts: impl IntoIterator<Item = (Contract, ContractState)>,
         ) {
             self.owned_contracts.extend(contracts);
         }
 
         /// Events that the user generate.
-        pub fn generate_events(&mut self, events: impl IntoIterator<Item = (EventId, UserEvent)>) {
+        pub fn generate_events(
+            &mut self,
+            events: impl IntoIterator<Item = (EventId, ClientRequest)>,
+        ) {
             self.events_to_gen.extend(events.into_iter())
         }
 
-        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<UserEvent> {
+        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest> {
             self.events_to_gen.remove(id)
         }
 
-        fn generate_rand_event(&mut self) -> UserEvent {
+        fn generate_rand_event(&mut self) -> ClientRequest {
             let mut rng = thread_rng();
             loop {
                 match rng.gen_range(0u8..3) {
                     0 if !self.owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.owned_contracts.len());
                         let (contract, value) = self.owned_contracts[contract_no].clone();
-                        break UserEvent::Put { contract, value };
+                        break ClientRequest::Put {
+                            contract,
+                            state: value,
+                        };
                     }
                     1 if !self.non_owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
                         let key = self.non_owned_contracts[contract_no];
-                        break UserEvent::Get {
+                        break ClientRequest::Get {
                             key,
                             contract: rng.gen_bool(0.5),
                         };
@@ -122,7 +152,7 @@ pub(crate) mod test {
 
                             self.non_owned_contracts[contract_no]
                         };
-                        break UserEvent::Subscribe { key };
+                        break ClientRequest::Subscribe { key };
                     }
                     0 => {}
                     1 => {}
@@ -138,17 +168,19 @@ pub(crate) mod test {
     }
 
     #[async_trait::async_trait]
-    impl UserEventsProxy for MemoryEventsGen {
-        async fn recv(&mut self) -> UserEvent {
+    impl ClientEventsProxy for MemoryEventsGen {
+        type Error = String;
+
+        async fn recv(&mut self) -> Result<ClientRequest, Self::Error> {
             loop {
                 if self.signal.changed().await.is_ok() {
                     let (ev_id, pk) = *self.signal.borrow();
                     if pk == self.id && !self.random {
-                        return self
+                        return Ok(self
                             .generate_deterministic_event(&ev_id)
-                            .expect("event not found");
+                            .expect("event not found"));
                     } else if pk == self.id {
-                        return self.generate_rand_event();
+                        return Ok(self.generate_rand_event());
                     }
                 } else {
                     log::debug!("sender half of user event gen dropped");
@@ -157,6 +189,13 @@ pub(crate) mod test {
                     panic!("finished orphan background thread");
                 }
             }
+        }
+
+        async fn send(
+            &mut self,
+            _response: Result<HostResponse, Self::Error>,
+        ) -> Result<HostResponse, Self::Error> {
+            todo!()
         }
     }
 }

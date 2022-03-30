@@ -20,7 +20,7 @@ use crate::{
     message::{Message, NodeEvent},
     ring::Ring,
     util::IterExt,
-    NodeConfig, UserEventsProxy,
+    NodeConfig, ClientEventsProxy,
 };
 
 use super::OpManager;
@@ -40,7 +40,7 @@ where
 {
     pub(super) async fn run_node<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
     where
-        UsrEv: UserEventsProxy + Send + Sync + 'static,
+        UsrEv: ClientEventsProxy + Send + Sync + 'static,
     {
         // 1. start listening in case this is a listening node (gateway) and join the ring
         if self.is_gateway {

@@ -18,8 +18,14 @@ async fn main() -> Result<(), anyhow::Error> {
 struct UserEvents;
 
 #[async_trait::async_trait]
-impl UserEventsProxy for UserEvents {
-    async fn recv(&mut self) -> UserEvent {
+impl ClientEventsProxy for UserEvents {
+    type Error = String;
+
+    async fn recv(&mut self) -> Result<ClientRequest, Self::Error> {
+        todo!()
+    }
+
+    async fn send(&mut self, _response: HostResponse) -> Result<HostResponse, Self::Error> {
         todo!()
     }
 }

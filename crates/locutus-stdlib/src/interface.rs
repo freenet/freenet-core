@@ -9,6 +9,8 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+use serde::{Deserialize, Serialize};
+
 pub struct Parameters<'a>(&'a [u8]);
 
 impl<'a> Parameters<'a> {
@@ -29,6 +31,7 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct State<'a>(Cow<'a, [u8]>);
 
 impl<'a> State<'a> {
@@ -80,6 +83,7 @@ impl<'a> DerefMut for State<'a> {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StateDelta<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateDelta<'a> {
@@ -216,10 +220,10 @@ pub enum ContractError {
 }
 
 pub trait ContractInterface {
-    /// Verify that the state is valid, given the parameters. 
+    /// Verify that the state is valid, given the parameters.
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
 
-    /// Verify that a delta is valid - at least as much as possible. 
+    /// Verify that a delta is valid - at least as much as possible.
     fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool;
 
     /// Update the state to account for the state_delta, assuming it is valid.
@@ -236,8 +240,8 @@ pub trait ContractInterface {
         state: State<'static>,
     ) -> StateSummary<'static>;
 
-    /// Generate a state delta using a summary from the current state. 
-    /// This along with [`Self::summarize_state`] allows flexible and efficient 
+    /// Generate a state delta using a summary from the current state.
+    /// This along with [`Self::summarize_state`] allows flexible and efficient
     /// state synchronization between peers.
     fn get_state_delta(
         parameters: Parameters<'static>,

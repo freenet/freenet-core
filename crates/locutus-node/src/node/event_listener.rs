@@ -6,7 +6,7 @@ use crate::{
     ring::{Location, PeerKeyLocation},
 };
 
-use locutus_runtime::{ContractKey, ContractValue};
+use locutus_runtime::{ContractKey, ContractState};
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;
 
@@ -144,7 +144,7 @@ enum PutEvent {
     },
     PutSuccess {
         requester: PeerKey,
-        value: ContractValue,
+        value: ContractState,
     },
     BroadcastEmitted {
         /// subscribed peers
@@ -152,7 +152,7 @@ enum PutEvent {
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
-        value: ContractValue,
+        value: ContractState,
     },
     BroadcastReceived {
         /// peer who started the broadcast op
@@ -160,7 +160,7 @@ enum PutEvent {
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
-        value: ContractValue,
+        value: ContractState,
     },
 }
 
@@ -223,7 +223,7 @@ mod test_utils {
             &self,
             peer: &PeerKey,
             for_key: &ContractKey,
-            expected_value: &ContractValue,
+            expected_value: &ContractState,
         ) -> bool {
             let logs = self.logs.read();
             let put_ops = logs.iter().filter_map(|l| match &l.kind {

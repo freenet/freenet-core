@@ -2,7 +2,7 @@ mod contract;
 mod contract_store;
 mod runtime;
 
-pub use contract::{Contract, ContractKey, ContractValue};
+pub use contract::{Contract, ContractKey, ContractState};
 pub use contract_store::ContractStore;
 use locutus_stdlib::prelude::BufferError;
 pub use runtime::{ExecError, Runtime};

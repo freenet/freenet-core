@@ -5,8 +5,10 @@ use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
 };
-use locutus_node::{InitPeerNode, Location, NodeConfig, UserEvent, UserEventsProxy};
-use locutus_runtime::{Contract, ContractValue};
+use locutus_node::{
+    ClientEventsProxy, ClientRequest, HostResponse, InitPeerNode, Location, NodeConfig,
+};
+use locutus_runtime::{Contract, ContractState};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");
@@ -38,13 +40,13 @@ async fn start_new_peer(
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     let contract = Contract::new(vec![7, 3, 9, 5]);
     let key = contract.key();
-    let init_val = ContractValue::new(vec![1, 2, 3, 4]);
+    let init_val = ContractState::new(vec![1, 2, 3, 4]);
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     manager
         .tx_gw_ev
-        .send(UserEvent::Put {
-            value: init_val,
+        .send(ClientRequest::Put {
+            state: init_val,
             contract: contract.clone(),
         })
         .await
@@ -53,7 +55,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
 
     manager
         .tx_gw_ev
-        .send(UserEvent::Get {
+        .send(ClientRequest::Get {
             key,
             contract: false,
         })
@@ -61,11 +63,11 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    let second_val = ContractValue::new(vec![2, 3, 1, 4]);
+    let second_val = ContractState::new(vec![2, 3, 1, 4]);
     manager
         .tx_node_ev
-        .send(UserEvent::Put {
-            value: second_val,
+        .send(ClientRequest::Put {
+            state: second_val,
             contract,
         })
         .await
@@ -124,18 +126,24 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[derive(Clone)]
 struct EventManager {
-    tx_gw_ev: Sender<UserEvent>,
-    tx_node_ev: Sender<UserEvent>,
+    tx_gw_ev: Sender<ClientRequest>,
+    tx_node_ev: Sender<ClientRequest>,
 }
 
 struct UserEvents {
-    rx_ev: Receiver<UserEvent>,
+    rx_ev: Receiver<ClientRequest>,
 }
 
 #[async_trait::async_trait]
-impl UserEventsProxy for UserEvents {
-    async fn recv(&mut self) -> locutus_node::UserEvent {
-        self.rx_ev.recv().await.expect("channel open")
+impl ClientEventsProxy for UserEvents {
+    type Error = String;
+
+    async fn recv(&mut self) -> Result<locutus_node::ClientRequest, Self::Error> {
+        Ok(self.rx_ev.recv().await.expect("channel open"))
+    }
+
+    async fn send(&mut self, _response: HostResponse) -> Result<HostResponse, Self::Error> {
+        todo!()
     }
 }
 

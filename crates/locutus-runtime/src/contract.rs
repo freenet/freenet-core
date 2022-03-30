@@ -126,19 +126,19 @@ where
         .map_err(|_| <D::Error as serde::de::Error>::custom("invalid key length"))
 }
 
-/// The value for a contract.
+/// The state for a contract.
 #[derive(
     Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize, arbitrary::Arbitrary,
 )]
-pub struct ContractValue(Arc<Vec<u8>>);
+pub struct ContractState(Arc<Vec<u8>>);
 
-impl ContractValue {
+impl ContractState {
     pub fn new(bytes: Vec<u8>) -> Self {
-        ContractValue(Arc::new(bytes))
+        ContractState(Arc::new(bytes))
     }
 }
 
-impl Deref for ContractValue {
+impl Deref for ContractState {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {

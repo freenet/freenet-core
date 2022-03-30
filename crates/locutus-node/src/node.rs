@@ -23,6 +23,7 @@ use self::{
     p2p_impl::NodeP2P,
 };
 use crate::{
+    client_events::{ClientEventsProxy, ClientRequest},
     config::{tracing::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{Message, NodeEvent, Transaction, TransactionType, TxType},
@@ -32,7 +33,6 @@ use crate::{
         put, subscribe, OpError, Operation,
     },
     ring::{Location, PeerKeyLocation},
-    user_events::{UserEvent, UserEventsProxy},
     util::{ExponentialBackoff, IterExt},
 };
 
@@ -56,7 +56,7 @@ where
 {
     pub async fn run<UsrEv>(self, user_events: UsrEv) -> Result<(), anyhow::Error>
     where
-        UsrEv: UserEventsProxy + Send + Sync + 'static,
+        UsrEv: ClientEventsProxy + Send + Sync + 'static,
     {
         Logger::init_logger();
         self.0.run_node(user_events).await
@@ -295,12 +295,12 @@ where
 /// Process user events.
 async fn user_event_handling<UsrEv, CErr>(op_storage: Arc<OpManager<CErr>>, mut user_events: UsrEv)
 where
-    UsrEv: UserEventsProxy + Send + Sync + 'static,
+    UsrEv: ClientEventsProxy + Send + Sync + 'static,
     CErr: std::error::Error + Send + Sync + 'static,
 {
     loop {
-        let ev = user_events.recv().await;
-        if let UserEvent::Shutdown = ev {
+        let ev = user_events.recv().await.unwrap(); // fixme: deal with this unwrap
+        if let ClientRequest::Shutdown = ev {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
                 log::error!("{}", err);
             }
@@ -310,7 +310,10 @@ where
         let op_storage_cp = op_storage.clone();
         GlobalExecutor::spawn(async move {
             match ev {
-                UserEvent::Put { value, contract } => {
+                ClientRequest::Put {
+                    state: value,
+                    contract,
+                } => {
                     // Initialize a put op.
                     log::debug!(
                         "Received put from user event @ {}",
@@ -326,7 +329,10 @@ where
                         log::error!("{}", err);
                     }
                 }
-                UserEvent::Get { key, contract } => {
+                ClientRequest::Update { key, delta } => {
+                    todo!()
+                }
+                ClientRequest::Get { key, contract } => {
                     // Initialize a get op.
                     log::debug!(
                         "Received get from user event @ {}",
@@ -337,7 +343,7 @@ where
                         log::error!("{}", err);
                     }
                 }
-                UserEvent::Subscribe { key } => {
+                ClientRequest::Subscribe { key } => {
                     // Initialize a subscribe op.
                     loop {
                         // FIXME: this will block the event loop until the subscribe op succeeds
@@ -362,7 +368,7 @@ where
                         }
                     }
                 }
-                UserEvent::Shutdown => unreachable!(),
+                ClientRequest::Shutdown => unreachable!(),
             }
         });
     }

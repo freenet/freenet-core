@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{Contract, ContractStore, ContractValue, RuntimeResult};
+use locutus_runtime::{Contract, ContractStore, ContractState, RuntimeResult};
 use locutus_stdlib::interface::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -25,7 +25,7 @@ pub(crate) trait ContractHandler:
 
     /// Get current contract value, if present, otherwise get none.
     async fn get_value(&self, contract: &ContractKey)
-        -> Result<Option<ContractValue>, Self::Error>;
+        -> Result<Option<ContractState>, Self::Error>;
 
     /// Updates (or inserts) a value for the given contract. This operation is fallible:
     /// It will return an error when the value is not valid (according to the contract specification)
@@ -34,8 +34,8 @@ pub(crate) trait ContractHandler:
     async fn put_value(
         &mut self,
         contract: &ContractKey,
-        value: ContractValue,
-    ) -> Result<ContractValue, Self::Error>;
+        value: ContractState,
+    ) -> Result<ContractState, Self::Error>;
 }
 
 pub struct EventId(u64);
@@ -153,7 +153,7 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
-    pub value: Option<ContractValue>,
+    pub value: Option<ContractState>,
     pub contract: Option<Contract>,
 }
 
@@ -167,11 +167,11 @@ pub(crate) enum ContractHandlerEvent<Err> {
     /// Try to push/put a new value into the contract.
     PushQuery {
         key: ContractKey,
-        value: ContractValue,
+        value: ContractState,
     },
     /// The response to a push query.
     PushResponse {
-        new_value: Result<ContractValue, Err>,
+        new_value: Result<ContractState, Err>,
     },
     /// Fetch a supposedly existing contract value in this node, and optionally the contract itself.  
     FetchQuery {
@@ -284,7 +284,7 @@ mod sqlite {
         channel: ContractHandlerChannel<SqlDbError, CHListenerHalve>,
         store: ContractStore,
         runtime: R,
-        value_mem_cache: AsyncCache<ContractKey, ContractValue>,
+        value_mem_cache: AsyncCache<ContractKey, ContractState>,
         pub(super) pool: SqlitePool,
     }
 
@@ -361,14 +361,14 @@ mod sqlite {
         async fn get_value(
             &self,
             contract_key: &ContractKey,
-        ) -> Result<Option<ContractValue>, Self::Error> {
+        ) -> Result<Option<ContractState>, Self::Error> {
             let encoded_key = hex::encode(&**contract_key);
             if let Some(value) = self.value_mem_cache.get(contract_key) {
                 return Ok(Some(value.value().clone()));
             }
             match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
                 .bind(encoded_key)
-                .map(|row: SqliteRow| Some(ContractValue::new(row.get("value"))))
+                .map(|row: SqliteRow| Some(ContractState::new(row.get("value"))))
                 .fetch_one(&self.pool)
                 .await
             {
@@ -381,9 +381,9 @@ mod sqlite {
         async fn put_value(
             &mut self,
             contract_key: &ContractKey,
-            value: ContractValue,
-        ) -> Result<ContractValue, Self::Error> {
-            let old_value: ContractValue = match self.get_value(contract_key).await {
+            value: ContractState,
+        ) -> Result<ContractState, Self::Error> {
+            let old_value: ContractState = match self.get_value(contract_key).await {
                 Ok(Some(contract_value)) => contract_value,
                 Ok(None) => value.clone(),
                 Err(_) => value.clone(),
@@ -401,7 +401,7 @@ mod sqlite {
             )
             .bind(encoded_key)
             .bind(value)
-            .map(|row: SqliteRow| ContractValue::new(row.get("value")))
+            .map(|row: SqliteRow| ContractState::new(row.get("value")))
             .fetch_one(&self.pool)
             .await
             {
@@ -443,7 +443,7 @@ mod sqlite {
             let contract: Contract = Contract::new(contract_bytes.clone());
 
             // Get contract parts
-            let contract_value = ContractValue::new(contract_bytes.clone());
+            let contract_value = ContractState::new(contract_bytes.clone());
             let put_result_value = handler
                 .put_value(&contract.key(), contract_value.clone())
                 .await?;
@@ -456,7 +456,7 @@ mod sqlite {
             assert_eq!(contract_value, get_result_value);
 
             // Update the contract value with new one
-            let new_contract_value = ContractValue::new(b"New test contract value".to_vec());
+            let new_contract_value = ContractState::new(b"New test contract value".to_vec());
             let new_put_result_value = handler
                 .put_value(&contract.key(), new_contract_value.clone())
                 .await?;
@@ -541,15 +541,15 @@ pub mod test {
         async fn get_value(
             &self,
             contract: &ContractKey,
-        ) -> Result<Option<ContractValue>, Self::Error> {
+        ) -> Result<Option<ContractState>, Self::Error> {
             Ok(self.kv_store.get(contract).cloned())
         }
 
         async fn put_value(
             &mut self,
             contract: &ContractKey,
-            value: ContractValue,
-        ) -> Result<ContractValue, Self::Error> {
+            value: ContractState,
+        ) -> Result<ContractState, Self::Error> {
             let new_val = value.clone();
             self.kv_store.insert(*contract, value);
             Ok(new_val)

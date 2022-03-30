@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use locutus_runtime::{ContractKey, ContractStore, ContractValue};
+use locutus_runtime::{ContractKey, ContractStore, ContractState};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel, RuntimeInterface};
 use crate::config::CONFIG;
@@ -9,7 +9,7 @@ pub(crate) struct MockRuntime {}
 
 impl RuntimeInterface for MockRuntime {}
 
-pub(crate) type MemKVStore = HashMap<ContractKey, ContractValue>;
+pub(crate) type MemKVStore = HashMap<ContractKey, ContractState>;
 
 pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
     channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
@@ -66,15 +66,15 @@ impl ContractHandler for MemoryContractHandler {
     async fn get_value(
         &self,
         contract: &ContractKey,
-    ) -> Result<Option<ContractValue>, Self::Error> {
+    ) -> Result<Option<ContractState>, Self::Error> {
         Ok(self.kv_store.get(contract).cloned())
     }
 
     async fn put_value(
         &mut self,
         contract: &ContractKey,
-        value: ContractValue,
-    ) -> Result<ContractValue, Self::Error> {
+        value: ContractState,
+    ) -> Result<ContractState, Self::Error> {
         let new_val = value.clone();
         self.kv_store.insert(*contract, value);
         Ok(new_val)
