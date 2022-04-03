@@ -54,12 +54,18 @@ impl<CErr> Node<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub async fn run<UsrEv>(self, user_events: UsrEv) -> Result<(), anyhow::Error>
-    where
-        UsrEv: ClientEventsProxy + Send + Sync + 'static,
-    {
+    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         Logger::init_logger();
-        self.0.run_node(user_events).await
+        #[cfg(feature = "websocket")]
+        {
+            let ws_interface = crate::websocket::WebSocketProxy::start_server(CONFIG.ws).await?;
+            self.0.run_node(ws_interface).await?;
+            Ok(())
+        }
+        #[cfg(all(not(feature = "websocket")))]
+        {
+            panic!("at least one client app interface required")
+        }
     }
 }
 
@@ -292,15 +298,17 @@ where
     Ok(())
 }
 
-/// Process user events.
-async fn user_event_handling<UsrEv, CErr>(op_storage: Arc<OpManager<CErr>>, mut user_events: UsrEv)
-where
-    UsrEv: ClientEventsProxy + Send + Sync + 'static,
+/// Process client events.
+async fn client_event_handling<ClientEv, CErr>(
+    op_storage: Arc<OpManager<CErr>>,
+    mut client_events: ClientEv,
+) where
+    ClientEv: ClientEventsProxy + Send + Sync + 'static,
     CErr: std::error::Error + Send + Sync + 'static,
 {
     loop {
-        let ev = user_events.recv().await.unwrap(); // fixme: deal with this unwrap
-        if let ClientRequest::Shutdown = ev {
+        let (id, ev) = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
+        if let ClientRequest::Disconnect { .. } = ev {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
                 log::error!("{}", err);
             }
@@ -368,7 +376,7 @@ where
                         }
                     }
                 }
-                ClientRequest::Shutdown => unreachable!(),
+                ClientRequest::Disconnect { .. } => unreachable!(),
             }
         });
     }

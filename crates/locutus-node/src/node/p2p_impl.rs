@@ -12,15 +12,16 @@ use libp2p::{
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    conn_manager::p2p_protoc::P2pConnManager, join_ring_request, user_event_handling, PeerKey,
+    conn_manager::p2p_protoc::P2pConnManager, join_ring_request, client_event_handling, PeerKey,
 };
 use crate::{
+    client_events::ClientEventsProxy,
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler},
     message::{Message, NodeEvent},
     ring::Ring,
     util::IterExt,
-    NodeConfig, ClientEventsProxy,
+    NodeConfig,
 };
 
 use super::OpManager;
@@ -38,9 +39,12 @@ impl<CErr> NodeP2P<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub(super) async fn run_node<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    pub(super) async fn run_node<ClientEv>(
+        mut self,
+        client_events: ClientEv,
+    ) -> Result<(), anyhow::Error>
     where
-        UsrEv: ClientEventsProxy + Send + Sync + 'static,
+        ClientEv: ClientEventsProxy + Send + Sync + 'static,
     {
         // 1. start listening in case this is a listening node (gateway) and join the ring
         if self.is_gateway {
@@ -63,7 +67,7 @@ where
         }
 
         // 2. start the user event handler loop
-        GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
+        GlobalExecutor::spawn(client_event_handling(self.op_storage.clone(), client_events));
 
         // 3. start the p2p event loop
         self.conn_manager

@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
     conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, handle_cancelled_op,
-    join_ring_request, op_state::OpManager, process_message, user_event_handling, PeerKey,
+    join_ring_request, op_state::OpManager, process_message, client_event_handling, PeerKey,
 };
 use crate::{
     config::GlobalExecutor,
@@ -85,7 +85,7 @@ where
                 anyhow::bail!("requires at least one gateway");
             }
         }
-        GlobalExecutor::spawn(user_event_handling(self.op_storage.clone(), user_events));
+        GlobalExecutor::spawn(client_event_handling(self.op_storage.clone(), user_events));
         self.run_event_listener().await
     }
 

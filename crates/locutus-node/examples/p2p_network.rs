@@ -5,9 +5,7 @@ use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
 };
-use locutus_node::{
-    ClientEventsProxy, ClientRequest, HostResponse, InitPeerNode, Location, NodeConfig,
-};
+use locutus_node::{ClientRequest, InitPeerNode, Location, NodeConfig};
 use locutus_runtime::{Contract, ContractState};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -18,23 +16,25 @@ async fn start_gateway(
     port: u16,
     location: Location,
     user_events: UserEvents,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    // todo: send user events though ws interface
     let mut config = NodeConfig::default();
     config
         .with_ip(Ipv4Addr::LOCALHOST)
         .with_port(port)
         .with_key(key)
         .with_location(location);
-    config.build()?.run(user_events).await
+    config.build()?.run().await
 }
 
 async fn start_new_peer(
     gateway_config: InitPeerNode,
     user_events: UserEvents,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    // todo: send user events though ws interface
     let mut config = NodeConfig::default();
     config.add_gateway(gateway_config);
-    config.build()?.run(user_events).await
+    config.build()?.run().await
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
@@ -134,18 +134,21 @@ struct UserEvents {
     rx_ev: Receiver<ClientRequest>,
 }
 
-#[async_trait::async_trait]
-impl ClientEventsProxy for UserEvents {
-    type Error = String;
-
-    async fn recv(&mut self) -> Result<locutus_node::ClientRequest, Self::Error> {
-        Ok(self.rx_ev.recv().await.expect("channel open"))
-    }
-
-    async fn send(&mut self, _response: HostResponse) -> Result<HostResponse, Self::Error> {
-        todo!()
-    }
-}
+// #[async_trait::async_trait]
+// impl ClientEventsProxy for UserEvents {
+//     type Error = String;
+//     async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error> {
+//         Ok((ClientId(1), self.rx_ev.recv().await.expect("channel open")))
+//     }
+//     async fn send(
+//         &mut self,
+//         _id: ClientId,
+//         _response: Result<HostResponse, Self::Error>,
+//     ) -> Result<(), Self::Error> {
+//         log::info!("received response");
+//         Ok(())
+//     }
+// }
 
 struct Args {
     is_gw: bool,

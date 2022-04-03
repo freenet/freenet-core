@@ -9,7 +9,7 @@ pub(crate) mod util;
 
 // exports:
 pub use crate::config::Config;
-pub use client_events::{ClientEventsProxy, ClientRequest, HostResponse};
+pub use client_events::{ClientEventsProxy, ClientId, ClientRequest, HostResponse};
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;
 

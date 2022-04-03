@@ -18,7 +18,7 @@ config = { version = "0.11.0", features = [ "toml" ] }
 crossbeam = "0.8.1"
 dashmap = "5"
 directories = "4"
-either = "1"
+either = { version = "1", features = ["serde"] }
 env_logger = "0.9.0"
 futures = "0.3.21"
 hex = "0.4"
@@ -56,4 +56,5 @@ itertools = "0.10"
 pico-args = "0.4"
 
 [features]
+default = ["websocket"]
 websocket = ["warp/websocket"]

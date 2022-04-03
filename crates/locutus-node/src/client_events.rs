@@ -1,45 +1,61 @@
+use either::Either;
 use locutus_runtime::{Contract, ContractKey, ContractState};
 use locutus_stdlib::prelude::{State, StateDelta};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ClientId(pub usize);
+
+// fixme: only use this internally, communication outside of the node should come from
+//        one of the offered client interfaces enabled through features (eg. websockets)
 #[async_trait::async_trait]
 pub trait ClientEventsProxy {
     type Error: std::fmt::Debug + Into<Box<dyn std::error::Error + Send + Sync>> + Serialize;
 
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    async fn recv(&mut self) -> Result<ClientRequest, Self::Error>;
+    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error>;
 
     /// Sends a response from the host to the client application.
     async fn send(
         &mut self,
+        id: ClientId,
         response: Result<HostResponse, Self::Error>,
-    ) -> Result<HostResponse, Self::Error>;
+    ) -> Result<(), Self::Error>;
 }
 
+/// A response to a previous [`ClientRequest`]
 #[derive(Serialize, Deserialize)]
 pub enum HostResponse {
-    PutResponse,
-    UpdateContract,
+    PutResponse(ContractKey),
+    /// Successful update
+    UpdateResponse(ContractKey),
+    /// Message sent when there is an update to a subscribed command.
+    UpdateNotification {
+        key: ContractKey,
+        update: Either<StateDelta<'static>, State<'static>>,
+    },
     GetResponse {
         contract: Option<Contract>,
         state: Option<State<'static>>,
     },
 }
 
+/// A request from a client application to the host.
 #[derive(Clone, Serialize, Deserialize)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum ClientRequest {
-    /// Update or insert a new value in a contract corresponding with the provided key.
+    /// Insert a new value in a contract corresponding with the provided key.
     Put {
+        contract: Contract,
         /// Value to upsert in the contract.
         state: ContractState,
-        // TODO: this should be Either<ContractKey, Contract>
-        contract: Contract,
     },
+    /// Update an existing contract corresponding with the provided key.
     Update {
         key: ContractKey,
-        delta: StateDelta<'static>,
+        delta: Either<StateDelta<'static>, State<'static>>,
     },
     /// Fetch the current value from a contract corresponding to the provided key.
     Get {
@@ -50,9 +66,12 @@ pub enum ClientRequest {
     },
     /// Subscribe to teh changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
-    Subscribe { key: ContractKey },
-    /// Shutdown the node
-    Shutdown,
+    Subscribe {
+        key: ContractKey,
+    },
+    Disconnect {
+        cause: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -171,16 +190,18 @@ pub(crate) mod test {
     impl ClientEventsProxy for MemoryEventsGen {
         type Error = String;
 
-        async fn recv(&mut self) -> Result<ClientRequest, Self::Error> {
+        async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error> {
             loop {
                 if self.signal.changed().await.is_ok() {
                     let (ev_id, pk) = *self.signal.borrow();
                     if pk == self.id && !self.random {
-                        return Ok(self
-                            .generate_deterministic_event(&ev_id)
-                            .expect("event not found"));
+                        return Ok((
+                            ClientId(1),
+                            self.generate_deterministic_event(&ev_id)
+                                .expect("event not found"),
+                        ));
                     } else if pk == self.id {
-                        return Ok(self.generate_rand_event());
+                        return Ok((ClientId(1), self.generate_rand_event()));
                     }
                 } else {
                     log::debug!("sender half of user event gen dropped");
@@ -193,8 +214,9 @@ pub(crate) mod test {
 
         async fn send(
             &mut self,
+            _id: ClientId,
             _response: Result<HostResponse, Self::Error>,
-        ) -> Result<HostResponse, Self::Error> {
+        ) -> Result<(), Self::Error> {
             todo!()
         }
     }

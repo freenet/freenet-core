@@ -9,23 +9,5 @@ async fn main() -> Result<(), anyhow::Error> {
     config.with_key(key);
     let node = config.build()?;
 
-    let user_events = UserEvents;
-    node.run(user_events)
-        .await
-        .map_err(|_| anyhow!("failed to start"))
-}
-
-struct UserEvents;
-
-#[async_trait::async_trait]
-impl ClientEventsProxy for UserEvents {
-    type Error = String;
-
-    async fn recv(&mut self) -> Result<ClientRequest, Self::Error> {
-        todo!()
-    }
-
-    async fn send(&mut self, _response: HostResponse) -> Result<HostResponse, Self::Error> {
-        todo!()
-    }
+    node.run().await.map_err(|_| anyhow!("failed to start"))
 }

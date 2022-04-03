@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     future::Future,
     io::Read,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
     str::FromStr,
@@ -34,6 +34,29 @@ pub struct Config {
     pub local_peer_keypair: Option<identity::Keypair>,
     pub(crate) log_level: log::LevelFilter,
     pub(crate) config_paths: ConfigPaths,
+
+    #[cfg(feature = "websocket")]
+    pub(crate) ws: WebSocketApiConfig,
+}
+
+#[cfg(feature = "websocket")]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct WebSocketApiConfig {
+    ip: IpAddr,
+    port: u16,
+}
+
+impl From<WebSocketApiConfig> for SocketAddr {
+    fn from(val: WebSocketApiConfig) -> Self {
+        (val.ip, val.port).into()
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl WebSocketApiConfig {
+    fn from_config(config: &config::Config) -> Self {
+        todo!()
+    }
 }
 
 #[derive(Debug)]
@@ -108,6 +131,8 @@ impl Config {
             local_peer_keypair,
             log_level,
             config_paths,
+            #[cfg(feature = "websocket")]
+            ws: WebSocketApiConfig::from_config(&settings),
         })
     }
 
