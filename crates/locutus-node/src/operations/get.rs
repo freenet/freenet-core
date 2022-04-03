@@ -1,8 +1,3 @@
-use opentelemetry::global;
-use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::sdk::propagation::TraceContextPropagator;
-use opentelemetry::trace::TraceContextExt;
-use std::collections::HashMap;
 use std::time::Duration;
 
 use locutus_runtime::ContractKey;
@@ -20,9 +15,6 @@ use super::{
     state_machine::{StateMachine, StateMachineImpl},
     OpError, Operation, OperationResult,
 };
-
-use tracing::{info, instrument};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub(crate) use self::messages::GetMsg;
 
@@ -279,7 +271,6 @@ where
     Ok(())
 }
 
-#[instrument(skip(op_storage, conn_manager, get_op))]
 pub(crate) async fn handle_get_request<CB, CErr>(
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
@@ -290,11 +281,6 @@ where
     OpError<CErr>: From<ContractError<CErr>>,
     CErr: std::error::Error,
 {
-    //let carrier = HashMap::new();
-    //let cx = global::get_text_map_propagator(|propagator| propagator.extract(&carrier));
-    //tracing::Span::current().set_parent(cx.clone());
-
-    info!("prueba");
     let sender;
     let tx = *get_op.id();
     let result = match op_storage.pop(get_op.id()) {
@@ -324,7 +310,6 @@ where
     .await
 }
 
-#[instrument(skip(conn_manager, state, other_host_msg, op_storage))]
 async fn update_state<CB, CErr>(
     conn_manager: &mut CB,
     mut state: GetOp,
@@ -338,13 +323,6 @@ where
 {
     let return_msg;
     let new_state;
-
-    //let carrier = HashMap::new();
-    //let cx = global::get_text_map_propagator(|propagator| propagator.extract(&carrier));
-    //tracing::Span::current().set_parent(cx.clone());
-
-    info!("prueba");
-
     match other_host_msg {
         GetMsg::RequestGet {
             key,
@@ -352,8 +330,6 @@ where
             target,
             fetch_contract,
         } => {
-            info!("test span");
-
             // fast tracked from the request_get func
             debug_assert!(matches!(
                 state.sm.state(),
@@ -714,14 +690,10 @@ mod test {
     use crate::{
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
-        node::tracer::init_tracer,
         ring::Location,
         user_events::UserEvent,
     };
-    use opentelemetry::sdk::trace::Tracer;
-    use opentelemetry::trace::{Span, TraceContextExt};
     use std::collections::HashMap;
-    use tracing::{span, Level};
 
     use super::*;
 
@@ -813,12 +785,6 @@ mod test {
             ("node-0".to_string(), node_0),
             ("gateway-0".to_string(), gw_0),
         ]);
-
-        init_tracer("get_test02".to_string())?;
-
-        // Create the application root span.
-        let root_span = span!(Level::TRACE, "successful_get_op_between_nodes");
-        let _enter = root_span.enter();
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);

@@ -5,7 +5,6 @@ use crate::{
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
     ring::{Location, PeerKeyLocation},
 };
-use async_trait::async_trait;
 
 use locutus_runtime::{ContractKey, ContractValue};
 #[cfg(test)]
@@ -321,7 +320,6 @@ mod test_utils {
         }
     }
 
-    #[async_trait]
     impl super::EventListener for TestEventListener {
         fn event_received(&mut self, log: EventLog) {
             let tx = log.tx;

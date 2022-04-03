@@ -143,7 +143,7 @@ mod test {
     use super::super::conn_manager::p2p_protoc::NetEvent;
     use super::*;
     use crate::{
-        config::{tracing::Logger, GlobalExecutor},
+        config::{tracer::Logger, GlobalExecutor},
         contract::{TestContractHandler, TestContractStoreError},
         node::{test::get_free_port, InitPeerNode},
         ring::Location,

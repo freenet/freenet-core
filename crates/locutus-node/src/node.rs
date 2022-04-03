@@ -23,7 +23,7 @@ use self::{
     p2p_impl::NodeP2P,
 };
 use crate::{
-    config::{tracing::Logger, GlobalExecutor, CONFIG},
+    config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
@@ -47,7 +47,6 @@ mod op_state;
 mod p2p_impl;
 #[cfg(test)]
 pub(crate) mod test;
-pub(crate) mod tracer;
 
 pub struct Node<CErr>(NodeP2P<CErr>);
 

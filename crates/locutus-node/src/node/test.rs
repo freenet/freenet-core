@@ -9,9 +9,7 @@ use libp2p::{identity, PeerId};
 use locutus_runtime::{Contract, ContractKey, ContractValue};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
-
-use tracing::info;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 use crate::{
     config::GlobalExecutor,
@@ -167,7 +165,6 @@ impl SimNetwork {
 
     #[instrument(skip(self))]
     fn build_nodes(&mut self, num: usize) {
-        info!("Building {} nodes", num);
         let gateways: Vec<_> = self
             .gateways
             .iter()
@@ -316,7 +313,6 @@ impl SimNetwork {
         peers_connections
     }
 
-    #[instrument(skip(self))]
     pub async fn trigger_event(
         &self,
         label: &str,
@@ -327,13 +323,9 @@ impl SimNetwork {
             .labels
             .get(label)
             .ok_or_else(|| anyhow::anyhow!("node not found"))?;
-
         self.usr_ev_controller
             .send((event_id, *peer))
             .expect("node listeners disconnected");
-
-        info!("Event sent to peer @{}", peer.0);
-
         if let Some(sleep_time) = await_for {
             tokio::time::sleep(sleep_time).await;
         }
