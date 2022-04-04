@@ -24,7 +24,7 @@ use self::{
 };
 use crate::{
     client_events::{ClientEventsProxy, ClientRequest},
-    config::{tracing::Logger, GlobalExecutor, CONFIG},
+    config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
