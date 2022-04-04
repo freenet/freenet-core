@@ -13,7 +13,7 @@ use rand::{prelude::StdRng, thread_rng, Rng, SeedableRng};
 
 use super::{ConnectionBridge, ConnectionError, PeerKey};
 use crate::{
-    config::{tracing::Logger, GlobalExecutor},
+    config::{tracer::Logger, GlobalExecutor},
     message::Message,
 };
 

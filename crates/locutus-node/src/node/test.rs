@@ -9,6 +9,7 @@ use libp2p::{identity, PeerId};
 use locutus_runtime::{Contract, ContractKey, ContractValue};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
+use tracing::{info, instrument};
 
 use crate::{
     config::GlobalExecutor,
@@ -101,7 +102,9 @@ impl SimNetwork {
         net
     }
 
+    #[instrument(skip(self))]
     fn build_gateways(&mut self, num: usize) {
+        info!("Building {} gateways", num);
         let mut configs = Vec::with_capacity(num);
         for node_no in 0..num {
             let label = format!("gateway-{}", node_no);
@@ -160,6 +163,7 @@ impl SimNetwork {
         }
     }
 
+    #[instrument(skip(self))]
     fn build_nodes(&mut self, num: usize) {
         let gateways: Vec<_> = self
             .gateways

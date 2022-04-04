@@ -45,6 +45,13 @@ unsigned-varint = "0.7"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
 sqlx = { version = "0.5", features = [ "sqlite", "runtime-tokio-rustls" ] }
 
+# Tracing deps
+tracing = {version = "0.1.30", optional = true }
+opentelemetry = { version = "0.17.0" , default-features = false, features = ["rt-tokio", "trace"], optional = true }
+opentelemetry-jaeger = { version = "0.16.0", features = ["rt-tokio","collector_client", "isahc"], optional = true }
+tracing-opentelemetry = { version = "0.17.0", optional = true }
+tracing-subscriber = { version = "0.3.8", optional = true }
+
 # internal deps
 locutus-runtime = { path = "../locutus-runtime" }
 locutus-stdlib = { path = "../locutus-stdlib" }
@@ -53,3 +60,6 @@ locutus-stdlib = { path = "../locutus-stdlib" }
 arbitrary = { version = "1", features = ["derive"] }
 itertools = "0.10"
 pico-args = "0.4"
+
+[features]
+trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]
