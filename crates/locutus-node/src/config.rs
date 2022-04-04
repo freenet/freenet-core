@@ -198,10 +198,11 @@ impl libp2p::core::Executor for GlobalExecutor {
 
 pub(super) mod tracer {
     use super::*;
-    use opentelemetry::global;
-    use opentelemetry::sdk::propagation::TraceContextPropagator;
-    use opentelemetry::trace::TraceError;
+    #[cfg(feature = "trace")]
+    use opentelemetry::{global, sdk::propagation::TraceContextPropagator, trace::TraceError};
+    #[cfg(feature = "trace")]
     use tracing_subscriber::layer::SubscriberExt;
+    #[cfg(feature = "trace")]
     use tracing_subscriber::Registry;
 
     #[derive(Clone, Copy)]
@@ -233,7 +234,7 @@ pub(super) mod tracer {
         Logger
     });
 
-    /// Tracer initialization
+    #[cfg(feature = "trace")]
     pub fn init_tracer() -> Result<(), TraceError> {
         let tracer = opentelemetry_jaeger::new_pipeline().install_simple()?;
         let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);

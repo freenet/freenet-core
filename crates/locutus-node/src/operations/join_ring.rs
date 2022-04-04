@@ -10,8 +10,6 @@ use crate::{
     util::ExponentialBackoff,
 };
 
-use tracing::{instrument, span, Level};
-
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 
 const MAX_JOIN_RETRIES: usize = 3;
@@ -988,11 +986,9 @@ mod messages {
 #[cfg(test)]
 mod test {
     use std::time::Duration;
-    use tokio::runtime::Runtime;
 
     use super::*;
     use crate::{
-        config::tracer::init_tracer,
         contract::SimStoreError,
         message::TxType,
         node::test::{check_connectivity, SimNetwork},
@@ -1090,23 +1086,13 @@ mod test {
     }
 
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
-    #[test]
-    fn forward_connection_to_node() -> Result<(), anyhow::Error> {
-        init_tracer()?;
-        // Create the application root span.
-        let root_span = span!(Level::TRACE, "forward_connection_to_node");
-        let _enter = root_span.enter();
-
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
-
-        let rt = Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
-            sim_nodes.build().await;
-            check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await
-        });
-        result
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        sim_nodes.build().await;
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await
     }
 
     /// Given a network of N peers all nodes should have connections.
