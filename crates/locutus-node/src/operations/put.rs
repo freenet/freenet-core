@@ -21,7 +21,7 @@ pub(crate) use self::messages::PutMsg;
 use super::{
     handle_op_result,
     state_machine::{StateMachine, StateMachineImpl},
-    OpError, Operation, OperationResult,
+    OpError, OpEnum, OperationResult,
 };
 
 pub(crate) struct PutOp {
@@ -237,7 +237,7 @@ where
         target,
     })? {
         op_storage
-            .notify_op_change(Message::from(req_put), Operation::Put(put_op))
+            .notify_op_change(Message::from(req_put), OpEnum::Put(put_op))
             .await?;
     } else {
         return Err(OpError::UnexpectedOpState);
@@ -258,7 +258,7 @@ where
     let sender;
     let tx = *put_op.id();
     let result = match op_storage.pop(put_op.id()) {
-        Some(Operation::Put(state)) => {
+        Some(OpEnum::Put(state)) => {
             sender = put_op.sender().cloned();
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, put_op, op_storage).await
@@ -437,7 +437,7 @@ where
                 new_state = None;
             } else {
                 op_storage
-                    .notify_op_change(internal_cb.into(), Operation::Put(state))
+                    .notify_op_change(internal_cb.into(), OpEnum::Put(state))
                     .await?;
                 return Err(OpError::StatePushed);
             }
@@ -496,7 +496,7 @@ where
             } else {
                 log::debug!("Callback to start broadcasting to other nodes");
                 op_storage
-                    .notify_op_change(internal_cb.into(), Operation::Put(state))
+                    .notify_op_change(internal_cb.into(), OpEnum::Put(state))
                     .await?;
                 return Err(OpError::StatePushed);
             }
@@ -630,7 +630,7 @@ where
     }
     Ok(OperationResult {
         return_msg,
-        state: new_state.map(Operation::Put),
+        state: new_state.map(OpEnum::Put),
     })
 }
 

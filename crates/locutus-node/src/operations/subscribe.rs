@@ -14,7 +14,7 @@ use crate::{
 use super::{
     handle_op_result,
     state_machine::{StateMachine, StateMachineImpl},
-    OpError, Operation, OperationResult,
+    OpError, OpEnum, OperationResult,
 };
 
 pub(crate) use self::messages::SubscribeMsg;
@@ -181,7 +181,7 @@ where
         .consume_to_output(SubscribeMsg::FetchRouting { target, id })?
     {
         op_storage
-            .notify_op_change(Message::from(req_sub), Operation::Subscribe(sub_op))
+            .notify_op_change(Message::from(req_sub), OpEnum::Subscribe(sub_op))
             .await?;
     }
     Ok(())
@@ -200,7 +200,7 @@ where
     let sender;
     let tx = *subscribe_op.id();
     let result = match op_storage.pop(subscribe_op.id()) {
-        Some(Operation::Subscribe(state)) => {
+        Some(OpEnum::Subscribe(state)) => {
             sender = subscribe_op.sender().cloned();
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, subscribe_op, op_storage).await
@@ -416,7 +416,7 @@ where
     }
     Ok(OperationResult {
         return_msg,
-        state: new_state.map(Operation::Subscribe),
+        state: new_state.map(OpEnum::Subscribe),
     })
 }
 

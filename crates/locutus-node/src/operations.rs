@@ -1,25 +1,56 @@
 use tokio::sync::mpsc::error::SendError;
 
+use self::{join_ring::JoinOpError, op_trait::Operation};
 use crate::{
     contract::ContractError,
-    message::{Message, Transaction, TransactionType},
+    message::{InnerMessage, Message, Transaction, TransactionType},
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
     ring::RingError,
 };
-
-use self::join_ring::JoinOpError;
 
 pub(crate) mod get;
 pub(crate) mod join_ring;
 pub(crate) mod put;
 mod state_machine;
+mod op_trait;
 pub(crate) mod subscribe;
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
     pub return_msg: Option<Message>,
     /// None if the operation has been completed.
-    pub state: Option<Operation>,
+    pub state: Option<OpEnum>,
+}
+
+pub(crate) struct OpInitialization<Op> {
+    sender: Option<PeerKey>,
+    op: Op,
+}
+
+pub(crate) async fn handle_op_request<Op, CErr, CB>(
+    op_storage: &OpManager<CErr>,
+    conn_manager: &mut CB,
+    msg: Op::Message,
+) -> Result<(), OpError<CErr>>
+where
+    Op: Operation<CErr>,
+    CErr: std::error::Error,
+    CB: ConnectionBridge,
+{
+    let sender;
+    let tx = *msg.id();
+    let result: Result<_, Op::Error> = {
+        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, &msg)?;
+        sender = s;
+        op.process_message(msg).await
+    };
+    handle_op_result(
+        op_storage,
+        conn_manager,
+        result.map_err(|err| (err.into(), tx)),
+        sender,
+    )
+    .await
 }
 
 async fn handle_op_result<CB, CErr>(
@@ -81,16 +112,16 @@ where
     Ok(())
 }
 
-pub(crate) enum Operation {
+pub(crate) enum OpEnum {
     JoinRing(join_ring::JoinRingOp),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
 }
 
-impl Operation {
+impl OpEnum {
     fn id(&self) -> Transaction {
-        use Operation::*;
+        use OpEnum::*;
         match self {
             JoinRing(op) => op.id(),
             Put(op) => op.id(),

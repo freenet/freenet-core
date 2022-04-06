@@ -30,7 +30,7 @@ use crate::{
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
-        put, subscribe, OpError, Operation,
+        put, subscribe, OpError, OpEnum,
     },
     ring::{Location, PeerKeyLocation},
     util::{ExponentialBackoff, IterExt},
@@ -483,7 +483,7 @@ where
             // the attempt to join the network failed, this could be a fatal error since the node
             // is useless without connecting to the network, we will retry with exponential backoff
             match op_storage.pop(&tx) {
-                Some(Operation::JoinRing(JoinRingOp {
+                Some(OpEnum::JoinRing(JoinRingOp {
                     backoff: Some(backoff),
                     gateway,
                     ..
@@ -502,7 +502,7 @@ where
                         .await?;
                     }
                 }
-                None | Some(Operation::JoinRing(_)) => {
+                None | Some(OpEnum::JoinRing(_)) => {
                     let rand_gw = gateways
                         .shuffle()
                         .take(1)

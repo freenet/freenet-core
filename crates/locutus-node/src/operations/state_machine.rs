@@ -5,7 +5,7 @@ use crate::message::Transaction;
 
 use super::OpError;
 
-pub trait StateMachineImpl {
+pub(crate) trait StateMachineImpl {
     /// The input alphabet.
     type Input;
     /// The set of possible states.

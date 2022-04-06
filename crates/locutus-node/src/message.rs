@@ -150,6 +150,10 @@ pub(crate) enum Message {
     Canceled(Transaction),
 }
 
+pub(crate) trait InnerMessage {
+    fn id(&self) -> &Transaction;
+}
+
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NodeEvent {

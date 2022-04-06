@@ -5,7 +5,7 @@ use crate::{
     config::PEER_TIMEOUT,
     message::{Message, Transaction},
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
-    operations::{state_machine::StateMachine, Operation},
+    operations::{state_machine::StateMachine, OpEnum},
     ring::{Location, PeerKeyLocation, Ring},
     util::ExponentialBackoff,
 };
@@ -411,7 +411,7 @@ where
         },
     });
     conn_manager.send(&gateway.peer, join_req).await?;
-    op_storage.push(tx, Operation::JoinRing(join_op))?;
+    op_storage.push(tx, OpEnum::JoinRing(join_op))?;
     Ok(())
 }
 
@@ -432,7 +432,7 @@ where
     let sender;
     let tx = *join_op.id();
     let result: Result<_, OpError<CErr>> = match op_storage.pop(join_op.id()) {
-        Some(Operation::JoinRing(state)) => {
+        Some(OpEnum::JoinRing(state)) => {
             sender = join_op.sender().cloned();
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, join_op, &op_storage.ring).await
@@ -746,7 +746,7 @@ where
     }
     Ok(OperationResult {
         return_msg,
-        state: new_state.map(Operation::JoinRing),
+        state: new_state.map(OpEnum::JoinRing),
     })
 }
 

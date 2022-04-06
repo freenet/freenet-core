@@ -13,7 +13,7 @@ use crate::{
 use super::{
     handle_op_result,
     state_machine::{StateMachine, StateMachineImpl},
-    OpError, Operation, OperationResult,
+    OpEnum, OpError, Operation, OperationResult,
 };
 
 pub(crate) use self::messages::GetMsg;
@@ -265,7 +265,7 @@ where
         .consume_to_output(GetMsg::FetchRouting { target, id })?
     {
         op_storage
-            .notify_op_change(Message::from(req_get), Operation::Get(get_op))
+            .notify_op_change(Message::from(req_get), OpEnum::Get(get_op))
             .await?;
     }
     Ok(())
@@ -284,7 +284,7 @@ where
     let sender;
     let tx = *get_op.id();
     let result = match op_storage.pop(get_op.id()) {
-        Some(Operation::Get(state)) => {
+        Some(OpEnum::Get(state)) => {
             sender = get_op.sender().cloned();
             // was an existing operation, the other peer messaged back
             update_state(conn_manager, state, get_op, op_storage).await
@@ -562,7 +562,7 @@ where
                                 sender,
                                 target,
                             }),
-                            Operation::Get(state),
+                            OpEnum::Get(state),
                         )
                         .await?;
                     return Err(OpError::StatePushed);
@@ -595,14 +595,14 @@ where
     }
     Ok(OperationResult {
         return_msg,
-        state: new_state.map(Operation::Get),
+        state: new_state.map(OpEnum::Get),
     })
 }
 
 mod messages {
     use std::fmt::Display;
 
-    use crate::contract::StoreResponse;
+    use crate::{contract::StoreResponse, message::InnerMessage};
 
     use super::*;
 
@@ -636,6 +636,12 @@ mod messages {
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
         },
+    }
+
+    impl InnerMessage for GetMsg {
+        fn id(&self) -> &Transaction {
+            Self::id(self)
+        }
     }
 
     impl GetMsg {

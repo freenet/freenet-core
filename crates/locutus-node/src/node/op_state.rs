@@ -12,7 +12,7 @@ use crate::{
     contract::{CHSenderHalve, ContractError, ContractHandlerChannel, ContractHandlerEvent},
     message::{Message, NodeEvent, Transaction, TransactionType},
     operations::{
-        get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpError, Operation,
+        get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpError, OpEnum,
     },
     ring::Ring,
 };
@@ -71,7 +71,7 @@ where
     pub async fn notify_op_change(
         &self,
         msg: Message,
-        op: Operation,
+        op: OpEnum,
     ) -> Result<(), SendError<Message>> {
         // push back the state to the stack
         self.push(*msg.id(), op).expect("infallible");
@@ -101,21 +101,21 @@ where
             .await
     }
 
-    pub fn push(&self, id: Transaction, op: Operation) -> Result<(), OpError<CErr>> {
+    pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError<CErr>> {
         match op {
-            Operation::JoinRing(tx) => {
+            OpEnum::JoinRing(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::JoinRing);
                 self.join_ring.insert(id, tx);
             }
-            Operation::Put(tx) => {
+            OpEnum::Put(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::Put);
                 self.put.insert(id, tx);
             }
-            Operation::Get(tx) => {
+            OpEnum::Get(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::Get);
                 self.get.insert(id, tx);
             }
-            Operation::Subscribe(tx) => {
+            OpEnum::Subscribe(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::Subscribe);
                 self.subscribe.insert(id, tx);
             }
@@ -123,20 +123,20 @@ where
         Ok(())
     }
 
-    pub fn pop(&self, id: &Transaction) -> Option<Operation> {
+    pub fn pop(&self, id: &Transaction) -> Option<OpEnum> {
         match id.tx_type() {
             TransactionType::JoinRing => self
                 .join_ring
                 .remove(id)
                 .map(|(_k, v)| v)
-                .map(Operation::JoinRing),
-            TransactionType::Put => self.put.remove(id).map(|(_k, v)| v).map(Operation::Put),
-            TransactionType::Get => self.get.remove(id).map(|(_k, v)| v).map(Operation::Get),
+                .map(OpEnum::JoinRing),
+            TransactionType::Put => self.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
+            TransactionType::Get => self.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
             TransactionType::Subscribe => self
                 .subscribe
                 .remove(id)
                 .map(|(_k, v)| v)
-                .map(Operation::Subscribe),
+                .map(OpEnum::Subscribe),
             TransactionType::Canceled => unreachable!(),
         }
     }
