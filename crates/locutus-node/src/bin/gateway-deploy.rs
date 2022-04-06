@@ -8,6 +8,5 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut config = NodeConfig::default();
     config.with_key(key);
     let node = config.build()?;
-
     node.run().await.map_err(|_| anyhow!("failed to start"))
 }

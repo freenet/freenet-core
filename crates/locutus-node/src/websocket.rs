@@ -49,7 +49,7 @@ impl WebSocketProxy {
 
 async fn serve(
     request_sender: Sender<(ClientId, ClientRequest)>,
-    new_responses: Arc<Sender<(ClientId, NewResponseSender)>>,
+    new_responses: Arc<Sender<ClientHandling>>,
     socket: SocketAddr,
 ) {
     let r_sender = Arc::new(request_sender);
@@ -62,17 +62,25 @@ async fn serve(
     warp::serve(request_receiver).run(socket).await
 }
 
+enum ClientHandling {
+    NewClient(ClientId, NewResponseSender),
+    ClientDisconnected(ClientId),
+}
+
 async fn responses(
-    mut new_clients: Receiver<(ClientId, NewResponseSender)>,
+    mut client_handler: Receiver<ClientHandling>,
     mut response_receiver: Receiver<(ClientId, HostResult)>,
 ) {
     let mut clients = HashMap::new();
     loop {
         tokio::select! {
-            new_client = new_clients.recv() => {
+            new_client = client_handler.recv() => {
                 match new_client {
-                    Some((client_id, responses)) => {
+                    Some(ClientHandling::NewClient(client_id, responses)) => {
                         clients.insert(client_id, responses);
+                    }
+                    Some(ClientHandling::ClientDisconnected(client_id)) => {
+                        clients.remove(&client_id);
                     }
                     None => return,
                 }
@@ -101,12 +109,16 @@ static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 async fn handle_socket(
     socket: warp::ws::WebSocket,
     request_sender: Arc<Sender<(ClientId, ClientRequest)>>,
-    new_responses: Arc<Sender<(ClientId, NewResponseSender)>>,
+    client_handler: Arc<Sender<ClientHandling>>,
 ) {
     let client_id = ClientId(CLIENT_ID.fetch_add(1, Ordering::SeqCst));
     let (mut client_tx, mut client_rx) = socket.split();
     let (rx, mut host_responses) = channel(1);
-    if new_responses.send((client_id, rx)).await.is_err() {
+    if client_handler
+        .send(ClientHandling::NewClient(client_id, rx))
+        .await
+        .is_err()
+    {
         let _ = client_tx.send(warp::ws::Message::binary(vec![])).await;
         return;
     }
@@ -118,9 +130,8 @@ async fn handle_socket(
                 }
             }
             response = host_responses.recv() => {
-                if send_reponse_to_client(&mut client_tx, response.unwrap()).await.is_err() {
-                    // client disconnected
-                    todo!("fixme: deal with dc");
+                let send_err = send_reponse_to_client(&mut client_tx, response.unwrap()).await.is_err();
+                if send_err && client_handler.send(ClientHandling::ClientDisconnected(client_id)).await.is_err() {
                     break;
                 }
             }

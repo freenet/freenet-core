@@ -94,29 +94,31 @@ impl ConfigPaths {
 
 impl Config {
     pub fn load_conf() -> std::io::Result<Config> {
-        let mut settings = config::Config::new();
-        settings
-            .merge(config::Environment::with_prefix("LOCUTUS"))
+        let settings = config::Config::builder()
+            .add_source(config::Environment::with_prefix("LOCUTUS"))
+            .build()
             .unwrap();
-        let local_peer_keypair =
-            if let Ok(path_to_key) = settings.get_str("local_peer_key_file").map(PathBuf::from) {
-                let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
-                    panic!(
-                        "Failed to open key file: {}",
-                        &path_to_key.to_str().unwrap()
-                    )
-                });
-                let mut buf = Vec::new();
-                key_file.read_to_end(&mut buf).unwrap();
-                Some(
-                    identity::Keypair::from_protobuf_encoding(&buf)
-                        .map_err(|_| std::io::ErrorKind::InvalidData)?,
+        let local_peer_keypair = if let Ok(path_to_key) = settings
+            .get_string("local_peer_key_file")
+            .map(PathBuf::from)
+        {
+            let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
+                panic!(
+                    "Failed to open key file: {}",
+                    &path_to_key.to_str().unwrap()
                 )
-            } else {
-                None
-            };
+            });
+            let mut buf = Vec::new();
+            key_file.read_to_end(&mut buf).unwrap();
+            Some(
+                identity::Keypair::from_protobuf_encoding(&buf)
+                    .map_err(|_| std::io::ErrorKind::InvalidData)?,
+            )
+        } else {
+            None
+        };
         let log_level = settings
-            .get_str("log")
+            .get_string("log")
             .map(|lvl| lvl.parse().ok())
             .ok()
             .flatten()
@@ -141,7 +143,7 @@ impl Config {
     ) -> std::io::Result<(IpAddr, u16, Option<PeerId>)> {
         let bootstrap_ip = IpAddr::from_str(
             &settings
-                .get_str("bootstrap_host")
+                .get_string("bootstrap_host")
                 .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
         )
         .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
@@ -154,7 +156,7 @@ impl Config {
             .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
 
         let id_str = if let Some(id_str) = settings
-            .get_str("bootstrap_id")
+            .get_string("bootstrap_id")
             .ok()
             .map(|id| id.parse().map_err(|_err| std::io::ErrorKind::InvalidInput))
         {
