@@ -45,7 +45,7 @@ impl<CErr: std::error::Error> From<GetError> for OpError<CErr> {
     }
 }
 
-struct FakeGet {
+pub struct FakeGet {
     id: Transaction,
 }
 

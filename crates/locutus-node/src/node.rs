@@ -30,7 +30,7 @@ use crate::{
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
-        put, subscribe, OpError, OpEnum,
+        put, subscribe, OpEnum, OpError,
     },
     ring::{Location, PeerKeyLocation},
     util::{ExponentialBackoff, IterExt},
@@ -582,4 +582,30 @@ mod serialization {
             ))
         }
     }
+}
+
+#[tokio::test]
+async fn example() {
+    #[derive(thiserror::Error, Debug)]
+    enum Error {
+        #[error("blah")]
+        Example,
+    }
+
+    fn fake() -> (
+        get::GetMsg,
+        OpManager<Error>,
+        conn_manager::p2p_protoc::P2pBridge,
+    ) {
+        todo!()
+    }
+
+    let (msg, op_manager, mut bridge) = fake();
+    let _get_fake = crate::operations::handle_op_request::<
+        crate::operations::op_trait::FakeGet,
+        _,
+        _,
+    >(&op_manager, &mut bridge, msg)
+    .await
+    .unwrap();
 }

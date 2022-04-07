@@ -10,9 +10,9 @@ use crate::{
 
 pub(crate) mod get;
 pub(crate) mod join_ring;
+pub(crate) mod op_trait;
 pub(crate) mod put;
 mod state_machine;
-mod op_trait;
 pub(crate) mod subscribe;
 
 pub(crate) struct OperationResult {
