@@ -9,6 +9,7 @@ use std::{
 };
 
 use futures::{stream::SplitSink, SinkExt, StreamExt};
+use rmp_serde as rmps;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use warp::Filter;
 
@@ -146,9 +147,8 @@ async fn new_request(
 ) -> Result<(), ()> {
     let msg = match result {
         Some(Ok(msg)) if msg.is_binary() => {
-            let data = msg.into_bytes();
-            // fixme: don't use bincode here; switch to a different serialization format supported out of Rust ecosystem
-            let deserialized: ClientRequest = match bincode::deserialize(&data) {
+            let data = std::io::Cursor::new(msg.into_bytes());
+            let deserialized: ClientRequest = match rmps::from_read(data) {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = request_sender
@@ -188,7 +188,7 @@ async fn send_reponse_to_client(
     response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
     response: Result<HostResponse, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let serialize = bincode::serialize(&response).unwrap();
+    let serialize = rmps::to_vec(&response).unwrap();
     response_stream
         .send(warp::ws::Message::binary(serialize))
         .await?;

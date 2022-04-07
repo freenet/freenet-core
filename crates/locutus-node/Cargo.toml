@@ -43,6 +43,8 @@ thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs"] }
 unsigned-varint = "0.7"
 uuid = { version = "0.8", features = ["serde", "v4", "v1"] }
+rmp = { version = "0.8", optional = true }
+rmp-serde = { version = "1", optional = true } 
 sqlx = { version = "0.5", features = ["sqlite", "runtime-tokio-rustls"] }
 warp = { version = "0.3", default-features = false, optional = true, features = ["multipart", "tls"] }
 
@@ -64,5 +66,5 @@ pico-args = "0.4"
 
 [features]
 default = ["websocket"]
-websocket = ["warp/websocket"]
+websocket = ["warp/websocket", "rmp", "rmp-serde"]
 trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]
