@@ -12,11 +12,11 @@ use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, instrument};
 
 use crate::{
+    client_events::{test::MemoryEventsGen, ClientRequest},
     config::GlobalExecutor,
     contract::{MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
-    client_events::{test::MemoryEventsGen, ClientRequest},
     NodeConfig,
 };
 

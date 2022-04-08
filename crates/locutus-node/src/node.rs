@@ -58,7 +58,8 @@ where
         Logger::init_logger();
         #[cfg(feature = "websocket")]
         {
-            let ws_interface = crate::websocket::WebSocketProxy::start_server(CONFIG.ws).await?;
+            use crate::client_events::websocket::WebSocketProxy;
+            let ws_interface = WebSocketProxy::start_server(CONFIG.ws).await?;
             self.0.run_node(ws_interface).await?;
             Ok(())
         }
@@ -307,6 +308,7 @@ async fn client_event_handling<ClientEv, CErr>(
     CErr: std::error::Error + Send + Sync + 'static,
 {
     loop {
+        // fixme: send back responses to client
         let (id, ev) = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
         if let ClientRequest::Disconnect { .. } = ev {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {

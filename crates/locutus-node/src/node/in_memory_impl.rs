@@ -5,16 +5,17 @@ use locutus_runtime::{Contract, ContractKey, ContractState};
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    conn_manager::in_memory::MemoryConnManager, event_listener::EventListener, handle_cancelled_op,
-    join_ring_request, op_state::OpManager, process_message, client_event_handling, PeerKey,
+    client_event_handling, conn_manager::in_memory::MemoryConnManager,
+    event_listener::EventListener, handle_cancelled_op, join_ring_request, op_state::OpManager,
+    process_message, PeerKey,
 };
 use crate::{
+    client_events::ClientEventsProxy,
     config::GlobalExecutor,
     contract::{self, ContractError, ContractHandler, ContractHandlerEvent, SimStoreError},
     message::{Message, NodeEvent, TransactionType},
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
-    client_events::ClientEventsProxy,
     util::IterExt,
     NodeConfig,
 };

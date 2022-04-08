@@ -1,28 +1,76 @@
+use std::fmt::Debug;
+use std::{error::Error as StdError, fmt::Display};
+
 use either::Either;
 use locutus_runtime::{Contract, ContractKey, ContractState};
 use locutus_stdlib::prelude::{State, StateDelta};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub(crate) mod combinator;
+#[cfg(feature = "websocket")]
+pub(crate) mod websocket;
+
+type HostResult = Result<HostResponse, ClientError>;
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[repr(transparent)]
-pub struct ClientId(pub usize);
+pub struct ClientId(pub(crate) usize);
+
+impl Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientError {
+    kind: ErrorKind,
+}
+
+impl ClientError {
+    fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+}
+
+impl From<ErrorKind> for ClientError {
+    fn from(kind: ErrorKind) -> Self {
+        ClientError { kind }
+    }
+}
+
+#[derive(thiserror::Error, Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub enum ErrorKind {
+    #[error("comm channel between client/host closed")]
+    ChannelClosed,
+    #[error("lost the connection with the protocol hanling connections")]
+    TransportProtocolDisconnect,
+    #[error("unknown client id: {0}")]
+    UnknownClient(ClientId),
+}
+
+impl Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClientError")
+    }
+}
+
+impl StdError for ClientError {}
 
 // fixme: only use this internally, communication outside of the node should come from
 //        one of the offered client interfaces enabled through features (eg. websockets)
 #[async_trait::async_trait]
 pub trait ClientEventsProxy {
-    type Error: std::fmt::Debug + Into<Box<dyn std::error::Error + Send + Sync>> + Serialize;
-
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error>;
+    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError>;
 
     /// Sends a response from the host to the client application.
     async fn send(
         &mut self,
         id: ClientId,
-        response: Result<HostResponse, Self::Error>,
-    ) -> Result<(), Self::Error>;
+        response: Result<HostResponse, ClientError>,
+    ) -> Result<(), ClientError>;
 }
 
 /// A response to a previous [`ClientRequest`]
@@ -188,9 +236,7 @@ pub(crate) mod test {
 
     #[async_trait::async_trait]
     impl ClientEventsProxy for MemoryEventsGen {
-        type Error = String;
-
-        async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error> {
+        async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
             loop {
                 if self.signal.changed().await.is_ok() {
                     let (ev_id, pk) = *self.signal.borrow();
@@ -215,8 +261,8 @@ pub(crate) mod test {
         async fn send(
             &mut self,
             _id: ClientId,
-            _response: Result<HostResponse, Self::Error>,
-        ) -> Result<(), Self::Error> {
+            _response: Result<HostResponse, ClientError>,
+        ) -> Result<(), ClientError> {
             todo!()
         }
     }

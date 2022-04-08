@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use locutus_runtime::{ContractKey, ContractStore, ContractState};
+use locutus_runtime::{ContractKey, ContractState, ContractStore};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel, RuntimeInterface};
 use crate::config::CONFIG;

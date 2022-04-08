@@ -268,7 +268,6 @@ pub(super) mod tracer {
         let subscriber = Registry::default().with(telemetry);
         global::set_text_map_propagator(TraceContextPropagator::new());
         tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
-
         Ok(())
     }
 }

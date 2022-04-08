@@ -12,7 +12,7 @@ use libp2p::{
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    conn_manager::p2p_protoc::P2pConnManager, join_ring_request, client_event_handling, PeerKey,
+    client_event_handling, conn_manager::p2p_protoc::P2pConnManager, join_ring_request, PeerKey,
 };
 use crate::{
     client_events::ClientEventsProxy,
@@ -67,7 +67,10 @@ where
         }
 
         // 2. start the user event handler loop
-        GlobalExecutor::spawn(client_event_handling(self.op_storage.clone(), client_events));
+        GlobalExecutor::spawn(client_event_handling(
+            self.op_storage.clone(),
+            client_events,
+        ));
 
         // 3. start the p2p event loop
         self.conn_manager

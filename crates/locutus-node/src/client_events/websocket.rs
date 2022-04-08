@@ -13,20 +13,17 @@ use rmp_serde as rmps;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use warp::Filter;
 
-use crate::{
-    client_events::{ClientEventsProxy, ClientId},
-    ClientRequest, HostResponse,
-};
+use super::{ClientError, ClientEventsProxy, ClientId, ErrorKind, HostResult};
+use crate::{ClientRequest, HostResponse};
 
-const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal stuff
+const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 pub(crate) struct WebSocketProxy {
     server_request: Receiver<(ClientId, ClientRequest)>,
     server_response: Sender<(ClientId, HostResult)>,
 }
 
-type NewResponseSender = Sender<Result<HostResponse, String>>;
-type HostResult = Result<HostResponse, String>;
+type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
 
 impl WebSocketProxy {
     pub async fn start_server<T: Into<SocketAddr>>(
@@ -45,6 +42,30 @@ impl WebSocketProxy {
             server_request,
             server_response,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl ClientEventsProxy for WebSocketProxy {
+    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
+        let (id, msg) = self
+            .server_request
+            .recv()
+            .await
+            .ok_or(ErrorKind::ChannelClosed)?;
+        Ok((id, msg))
+    }
+
+    async fn send(
+        &mut self,
+        client: ClientId,
+        response: Result<HostResponse, ClientError>,
+    ) -> Result<(), ClientError> {
+        self.server_response
+            .send((client, response))
+            .await
+            .map_err(|_| ErrorKind::ChannelClosed)?;
+        Ok(())
     }
 }
 
@@ -186,37 +207,11 @@ async fn new_request(
 
 async fn send_reponse_to_client(
     response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
-    response: Result<HostResponse, String>,
+    response: Result<HostResponse, ClientError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serialize = rmps::to_vec(&response).unwrap();
     response_stream
         .send(warp::ws::Message::binary(serialize))
         .await?;
     Ok(())
-}
-
-#[async_trait::async_trait]
-impl ClientEventsProxy for WebSocketProxy {
-    type Error = String;
-
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error> {
-        let (id, msg) = self
-            .server_request
-            .recv()
-            .await
-            .ok_or_else(|| "Channel closed".to_owned())?;
-        Ok((id, msg))
-    }
-
-    async fn send(
-        &mut self,
-        client: ClientId,
-        response: Result<HostResponse, Self::Error>,
-    ) -> Result<(), Self::Error> {
-        self.server_response
-            .send((client, response))
-            .await
-            .map_err(|_| "Channel closed".to_string())?;
-        Ok(())
-    }
 }

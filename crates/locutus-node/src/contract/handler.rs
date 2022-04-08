@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{Contract, ContractStore, ContractState, RuntimeResult};
+use locutus_runtime::{Contract, ContractState, ContractStore, RuntimeResult};
 use locutus_stdlib::interface::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

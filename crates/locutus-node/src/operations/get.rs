@@ -688,10 +688,10 @@ mod test {
     use locutus_runtime::{Contract, ContractState};
 
     use crate::{
+        client_events::ClientRequest,
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
-        client_events::ClientRequest,
     };
     use std::collections::HashMap;
 

@@ -1,6 +1,7 @@
-mod client_events;
+pub(crate) mod client_events;
 mod config;
 mod contract;
+// pub(crate) mod client_interfaces;
 mod message;
 mod node;
 mod operations;
@@ -12,6 +13,3 @@ pub use crate::config::Config;
 pub use client_events::{ClientEventsProxy, ClientId, ClientRequest, HostResponse};
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;
-
-#[cfg(feature = "websocket")]
-mod websocket;
