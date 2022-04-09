@@ -32,7 +32,7 @@ where
     fn process_message(
         self,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>>>>;
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult<CErr>, Self::Error>>>>;
 }
 
 // EXAMPLE:
@@ -72,7 +72,7 @@ impl<CErr: std::error::Error> Operation<CErr> for FakeGet {
     fn process_message(
         self,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult<CErr>, Self::Error>>>> {
         // todo: add all internal logic here
         Box::pin(async move {
             match input {

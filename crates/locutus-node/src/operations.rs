@@ -15,11 +15,14 @@ pub(crate) mod put;
 mod state_machine;
 pub(crate) mod subscribe;
 
-pub(crate) struct OperationResult {
+pub(crate) struct OperationResult<CErr>
+where
+    CErr: std::error::Error,
+{
     /// Inhabited if there is a message to return to the other peer.
     pub return_msg: Option<Message>,
     /// None if the operation has been completed.
-    pub state: Option<OpEnum>,
+    pub state: Option<OpEnum<CErr>>,
 }
 
 pub(crate) struct OpInitialization<Op> {
@@ -42,7 +45,7 @@ where
     let result: Result<_, Op::Error> = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, &msg)?;
         sender = s;
-        op.process_message(msg).await
+        op.process_message(op_storage, msg).await
     };
     handle_op_result(
         op_storage,
@@ -56,7 +59,7 @@ where
 async fn handle_op_result<CB, CErr>(
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
-    result: Result<OperationResult, (OpError<CErr>, Transaction)>,
+    result: Result<OperationResult<CErr>, (OpError<CErr>, Transaction)>,
     sender: Option<PeerKey>,
 ) -> Result<(), OpError<CErr>>
 where
@@ -112,18 +115,21 @@ where
     Ok(())
 }
 
-pub(crate) enum OpEnum {
+pub(crate) enum OpEnum<CErr> {
     JoinRing(join_ring::JoinRingOp),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
 }
 
-impl OpEnum {
+impl<CErr: std::error::Error> OpEnum<CErr>
+where
+    CErr: std::error::Error,
+{
     fn id(&self) -> Transaction {
         use OpEnum::*;
         match self {
-            JoinRing(op) => op.id(),
+            JoinRing(op) => *op.id().clone(),
             Put(op) => op.id(),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),

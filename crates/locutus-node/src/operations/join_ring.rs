@@ -1,6 +1,10 @@
+use futures::Future;
+use std::pin::Pin;
 use std::{collections::HashSet, time::Duration};
 
 use super::{handle_op_result, state_machine::StateMachineImpl, OpError, OperationResult};
+use crate::operations::op_trait::Operation;
+use crate::operations::OpInitialization;
 use crate::{
     config::PEER_TIMEOUT,
     message::{Message, Transaction},
@@ -23,36 +27,133 @@ pub(crate) struct JoinRingOp {
     _ttl: Duration,
 }
 
-impl JoinRingOp {
-    pub fn initial_request(
-        this_peer: PeerKey,
-        gateway: PeerKeyLocation,
-        max_hops_to_live: usize,
-        id: Transaction,
-    ) -> Self {
-        log::debug!("Connecting to gw {} from {}", gateway.peer, this_peer);
-        let sm = StateMachine::from_state(
-            JRState::Connecting(ConnectionInfo {
-                gateway,
-                this_peer,
-                max_hops_to_live,
-            }),
-            id,
-        );
-        JoinRingOp {
-            sm,
-            gateway: Box::new(gateway),
-            backoff: Some(ExponentialBackoff::new(
-                Duration::from_secs(1),
-                Duration::from_secs(120),
-                MAX_JOIN_RETRIES,
-            )),
-            _ttl: PEER_TIMEOUT,
+impl<CErr: std::error::Error> Operation<CErr> for JoinRingOp {
+    type Message = JoinRingMsg;
+
+    type Error = OpError<CErr>;
+
+    fn load_or_init(
+        op_storage: &OpManager<CErr>,
+        msg: &Self::Message,
+    ) -> Result<OpInitialization<Self>, OpError<CErr>> {
+        let sender;
+        let tx = *msg.id();
+        match op_storage.pop(msg.id()) {
+            Some(OpEnum::JoinRing(join_op)) => {
+                sender = msg.sender().cloned();
+                // was an existing operation, the other peer messaged back
+                Ok(OpInitialization { op: join_op, sender })
+            }
+            Some(_) => return Err(OpError::OpNotPresent(tx)),
+            None => {
+                sender = msg.sender().cloned();
+                // new request to join this node, initialize the machine
+                Ok(OpInitialization {
+                    op: Self {
+                        sm: StateMachine::from_state(JRState::Initializing, tx),
+                        backoff: None,
+                        gateway: Box::new(op_storage.ring.own_location()),
+                        _ttl: PEER_TIMEOUT,
+                    },
+                    sender: None,
+                })
+            }
         }
     }
 
-    pub fn id(&self) -> Transaction {
-        self.sm.id
+    fn id(&self) -> &Transaction {
+        &self.sm.id
+    }
+
+    fn process_message(
+        self,
+        input: Self::Message,
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult<CErr>, Self::Error>>>> {
+        let return_msg;
+        let state;
+        // todo: add all internal logic here
+        Box::pin(async move {
+            match input {
+                JoinRingMsg::Request {
+                    id,
+                    msg:
+                        JoinRequest::StartReq {
+                            target: this_node_loc,
+                            req_peer,
+                            hops_to_live,
+                            ..
+                        },
+                } => {
+                    // likely a gateway which accepts connections
+                    log::debug!(
+                        "Initial join request received from {} with HTL {} @ {}",
+                        req_peer,
+                        hops_to_live,
+                        this_node_loc.peer
+                    );
+                    return_msg = None;
+                    state = None;
+                }
+                JoinRingMsg::Request {
+                    id,
+                    msg:
+                        JoinRequest::Proxy {
+                            sender,
+                            joiner,
+                            hops_to_live,
+                        },
+                } => {
+                    log::debug!(
+                        "Proxy join request received from {} to join new peer {} with HTL {}",
+                        sender.peer,
+                        joiner.peer,
+                        hops_to_live
+                    );
+                    return_msg = None;
+                    state = None;
+                }
+                JoinRingMsg::Response {
+                    id,
+                    sender,
+                    msg:
+                        JoinResponse::AcceptedBy {
+                            peers: accepted_by,
+                            your_location,
+                            your_peer_id,
+                        },
+                    target,
+                } => {
+                    log::debug!("Join response received from {}", sender.peer);
+                    return_msg = None;
+                    state = None;
+                }
+                JoinRingMsg::Response {
+                    id,
+                    sender,
+                    target,
+                    msg: JoinResponse::Proxy { accepted_by },
+                } => {
+                    log::debug!("Received proxy join @ {}", target.peer);
+                    return_msg = None;
+                    state = None;
+                }
+                JoinRingMsg::Response {
+                    id,
+                    sender,
+                    msg: JoinResponse::ReceivedOC { by_peer },
+                    target,
+                } => {
+                    return_msg = None;
+                    state = None;
+                }
+                JoinRingMsg::Connected { target, sender, id } => {
+                    return_msg = None;
+                    state = None;
+                }
+                _ => return Err(OpError::UnexpectedOpState),
+            }
+            Ok(OperationResult { return_msg, state })
+        })
     }
 }
 
@@ -376,6 +477,33 @@ pub(crate) enum JoinOpError {
     NoCapacityLeft,
 }
 
+pub(crate) fn initial_request(
+    this_peer: PeerKey,
+    gateway: PeerKeyLocation,
+    max_hops_to_live: usize,
+    id: Transaction,
+) -> JoinRingOp {
+    log::debug!("Connecting to gw {} from {}", gateway.peer, this_peer);
+    let sm = StateMachine::from_state(
+        JRState::Connecting(ConnectionInfo {
+            gateway,
+            this_peer,
+            max_hops_to_live,
+        }),
+        id,
+    );
+    JoinRingOp {
+        sm,
+        gateway: Box::new(gateway),
+        backoff: Some(ExponentialBackoff::new(
+            Duration::from_secs(1),
+            Duration::from_secs(120),
+            MAX_JOIN_RETRIES,
+        )),
+        _ttl: PEER_TIMEOUT,
+    }
+}
+
 /// Join ring routine, called upon performing a join operation for this node.
 pub(crate) async fn join_ring_request<CB, CErr>(
     tx: Transaction,
@@ -465,7 +593,7 @@ async fn update_state<CB, CErr>(
     mut state: JoinRingOp,
     other_host_msg: JoinRingMsg,
     ring: &Ring,
-) -> Result<OperationResult, OpError<CErr>>
+) -> Result<OperationResult<CErr>, OpError<CErr>>
 where
     CB: ConnectionBridge,
     CErr: std::error::Error,
@@ -842,6 +970,7 @@ mod messages {
     use super::*;
     use crate::ring::{Location, PeerKeyLocation};
 
+    use crate::message::InnerMessage;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -861,6 +990,12 @@ mod messages {
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
         },
+    }
+
+    impl InnerMessage for JoinRingMsg {
+        fn id(&self) -> &Transaction {
+            Self::id(self)
+        }
     }
 
     impl JoinRingMsg {
@@ -1008,7 +1143,7 @@ mod test {
             location: Some(Location::random()),
         };
 
-        let mut join_gw_1 = JoinRingOp::initial_request(new_peer.peer, gateway, 0, id).sm;
+        let mut join_gw_1 = initial_request(new_peer.peer, gateway, 0, id).sm;
         let mut join_new_peer_2 = StateMachine::<JROpSm>::from_state(JRState::Initializing, id);
 
         let req = JoinRingMsg::Request {

@@ -36,6 +36,7 @@ use crate::{
     util::{ExponentialBackoff, IterExt},
 };
 
+use crate::operations::handle_op_request;
 pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use op_state::OpManager;
 
@@ -286,12 +287,8 @@ where
     CM: ConnectionBridge + Send + Sync,
 {
     let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
-    let mut op = join_ring::JoinRingOp::initial_request(
-        peer_key,
-        *gateway,
-        op_storage.ring.max_hops_to_live,
-        tx_id,
-    );
+    let mut op =
+        join_ring::initial_request(peer_key, *gateway, op_storage.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         log::warn!(
@@ -433,8 +430,12 @@ async fn process_message<CErr, CB>(
             match msg {
                 Message::JoinRing(op) => {
                     log_handling_msg!("join", op.id(), op_storage);
-                    let op_result =
-                        join_ring::handle_join_ring(&op_storage, &mut conn_manager, op).await;
+                    let op_result = handle_op_request::<join_ring::JoinRingOp, _, _>(
+                        &op_storage,
+                        &mut conn_manager,
+                        op,
+                    )
+                    .await;
                     report_result(op_result);
                 }
                 Message::Put(op) => {

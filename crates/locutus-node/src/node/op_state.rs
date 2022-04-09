@@ -12,7 +12,7 @@ use crate::{
     contract::{CHSenderHalve, ContractError, ContractHandlerChannel, ContractHandlerEvent},
     message::{Message, NodeEvent, Transaction, TransactionType},
     operations::{
-        get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpError, OpEnum,
+        get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpEnum, OpError,
     },
     ring::Ring,
 };

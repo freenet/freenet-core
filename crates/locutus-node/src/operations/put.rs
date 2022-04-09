@@ -21,7 +21,7 @@ pub(crate) use self::messages::PutMsg;
 use super::{
     handle_op_result,
     state_machine::{StateMachine, StateMachineImpl},
-    OpError, OpEnum, OperationResult,
+    OpEnum, OpError, OperationResult,
 };
 
 pub(crate) struct PutOp {
@@ -710,6 +710,7 @@ mod messages {
 
     use super::*;
 
+    use crate::message::InnerMessage;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -774,6 +775,12 @@ mod messages {
             new_value: WrappedState,
             sender_subscribers: Vec<PeerKeyLocation>,
         },
+    }
+
+    impl InnerMessage for PutMsg {
+        fn id(&self) -> &Transaction {
+            Self::id(self)
+        }
     }
 
     impl PutMsg {
