@@ -1916,7 +1916,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "sqlx",
- "stretto",
+ "stretto 0.4.1",
  "thiserror",
  "tokio",
  "tracing",
@@ -1941,7 +1941,7 @@ dependencies = [
  "once_cell",
  "rand 0.8.5",
  "serde",
- "stretto",
+ "stretto 0.3.3",
  "thiserror",
  "tracing",
  "wasmer",
@@ -3602,6 +3602,20 @@ dependencies = [
  "atomic",
  "crossbeam-channel",
  "parking_lot 0.11.2",
+ "rand 0.8.5",
+ "twox-hash",
+ "wg",
+]
+
+[[package]]
+name = "stretto"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17d673f0ca59f821ffaa1f3e408937050b3d34e7afa2ef38e3d349188a409de9"
+dependencies = [
+ "atomic",
+ "crossbeam-channel",
+ "parking_lot 0.12.0",
  "rand 0.8.5",
  "tokio",
  "twox-hash",

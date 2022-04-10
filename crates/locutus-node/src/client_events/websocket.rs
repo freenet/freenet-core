@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     error::Error,
+    future::Future,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -11,7 +12,7 @@ use std::{
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 use rmp_serde as rmps;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use warp::Filter;
+use warp::{filters::BoxedFilter, Filter, Reply};
 
 use super::{ClientError, ClientEventsProxy, ClientId, ErrorKind, HostResult};
 use crate::{ClientRequest, HostResponse};
@@ -26,8 +27,25 @@ pub struct WebSocketProxy {
 type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
 
 impl WebSocketProxy {
-    pub async fn start_server<T: Into<SocketAddr>>(
+    /// Starts this as an upgrade to an existing HTTP connection at the `/ws-api` URL
+    pub fn as_upgrade<T: Into<SocketAddr>>(
         socket: T,
+        server_config: BoxedFilter<(impl Reply + 'static,)>,
+    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>> {
+        Self::start_server_internal(socket, server_config)
+    }
+
+    /// Starts the websocket connection at the default `/ws-api` URL
+    pub fn start_server<T: Into<SocketAddr>>(
+        socket: T,
+    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>> {
+        let filter = warp::filters::path::end().map(warp::reply::reply).boxed();
+        Self::start_server_internal(socket, filter)
+    }
+
+    async fn start_server_internal<T: Into<SocketAddr>>(
+        socket: T,
+        filter: BoxedFilter<(impl Reply + 'static,)>,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
         let (request_sender, server_request) = channel(PARALLELISM);
         let (server_response, response_receiver) = channel(PARALLELISM);
@@ -36,6 +54,7 @@ impl WebSocketProxy {
             request_sender,
             Arc::new(new_client_up),
             socket.into(),
+            filter,
         ));
         tokio::spawn(responses(new_clients, response_receiver));
         Ok(Self {
@@ -77,15 +96,17 @@ async fn serve(
     request_sender: Sender<(ClientId, ClientRequest)>,
     new_responses: Arc<Sender<ClientHandling>>,
     socket: SocketAddr,
+    server_config: BoxedFilter<(impl Reply + 'static,)>,
 ) {
     let r_sender = Arc::new(request_sender);
     let req_channel = warp::any().map(move || (r_sender.clone(), new_responses.clone()));
-    let request_receiver = warp::path("receiver").and(warp::ws()).and(req_channel).map(
-        |ws: warp::ws::Ws, (request_sender, new_responses)| {
+    let request_receiver = server_config.or(warp::path("ws-api")
+        .and(warp::ws())
+        .and(req_channel)
+        .map(|ws: warp::ws::Ws, (request_sender, new_responses)| {
             ws.on_upgrade(move |socket| handle_socket(socket, request_sender, new_responses))
-        },
-    );
-    warp::serve(request_receiver).run(socket).await
+        }));
+    warp::serve(request_receiver).run(socket).await;
 }
 
 enum ClientHandling {
