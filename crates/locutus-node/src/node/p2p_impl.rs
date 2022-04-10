@@ -15,7 +15,7 @@ use super::{
     client_event_handling, conn_manager::p2p_protoc::P2pConnManager, join_ring_request, PeerKey,
 };
 use crate::{
-    client_events::{combinator::ClientEventsCombinator, ClientEventsProxy},
+    client_events::combinator::ClientEventsCombinator,
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler},
     message::{Message, NodeEvent},
@@ -39,13 +39,7 @@ impl<CErr> NodeP2P<CErr>
 where
     CErr: std::error::Error + Send + Sync + 'static,
 {
-    pub(super) async fn run_node<ClientEv>(
-        mut self,
-        client_events: ClientEv,
-    ) -> Result<(), anyhow::Error>
-    where
-        ClientEv: ClientEventsProxy + Send + Sync + 'static,
-    {
+    pub(super) async fn run_node(mut self) -> Result<(), anyhow::Error> {
         // start listening in case this is a listening node (gateway) and join the ring
         if self.is_gateway {
             self.conn_manager.listen_on()?;
@@ -148,6 +142,7 @@ mod test {
     use super::super::conn_manager::p2p_protoc::NetEvent;
     use super::*;
     use crate::{
+        client_events::test::MemoryEventsGen,
         config::{tracer::Logger, GlobalExecutor},
         contract::{TestContractHandler, TestContractStoreError},
         node::{test::get_free_port, InitPeerNode},
@@ -196,7 +191,7 @@ mod test {
 
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
-            let mut config = NodeConfig::default();
+            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
@@ -204,6 +199,7 @@ mod test {
             let mut peer1 = Box::new(NodeP2P::<TestContractStoreError>::build::<
                 TestContractHandler,
                 TestContractStoreError,
+                1,
             >(config)?);
             peer1.conn_manager.listen_on()?;
             ping_ev_loop(&mut peer1).await.unwrap();
@@ -212,11 +208,12 @@ mod test {
 
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
-            let mut config = NodeConfig::default();
+            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
             config.add_gateway(peer1_config.clone());
             let mut peer2 = NodeP2P::<TestContractStoreError>::build::<
                 TestContractHandler,
                 TestContractStoreError,
+                1,
             >(config)
             .unwrap();
             // wait a bit to make sure the first peer is up and listening

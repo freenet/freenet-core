@@ -10,6 +10,8 @@ pub(crate) mod util;
 
 // exports:
 pub use crate::config::Config;
+#[cfg(feature = "websocket")]
+pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
     BoxedClient, ClientError, ClientEventsProxy, ClientId, ClientRequest, HostResponse,
 };

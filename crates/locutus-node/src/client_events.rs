@@ -17,6 +17,12 @@ type HostResult = Result<HostResponse, ClientError>;
 #[repr(transparent)]
 pub struct ClientId(pub(crate) usize);
 
+impl ClientId {
+    pub fn new(id: usize) -> Self {
+        Self(id)
+    }
+}
+
 impl Display for ClientId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -146,6 +152,10 @@ pub(crate) mod test {
     }
 
     impl MemoryEventsGen {
+        pub fn new_tmp() -> Self {
+            todo!()
+        }
+
         pub fn new(signal: Receiver<(EventId, PeerKey)>, id: PeerKey) -> Self {
             Self {
                 signal,

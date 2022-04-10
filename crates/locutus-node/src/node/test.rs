@@ -113,7 +113,7 @@ impl SimNetwork {
             let port = get_free_port().unwrap();
             let location = Location::random();
 
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
@@ -177,7 +177,7 @@ impl SimNetwork {
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().to_peer_id();
 
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
             for GatewayConfig {
                 port, id, location, ..
             } in &gateways

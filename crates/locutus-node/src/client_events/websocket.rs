@@ -18,7 +18,7 @@ use crate::{ClientRequest, HostResponse};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
-pub(crate) struct WebSocketProxy {
+pub struct WebSocketProxy {
     server_request: Receiver<(ClientId, ClientRequest)>,
     server_response: Sender<(ClientId, HostResult)>,
 }

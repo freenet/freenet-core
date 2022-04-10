@@ -484,6 +484,7 @@ pub(crate) enum RingError {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::client_events::test::MemoryEventsGen;
 
     #[test]
     fn location_dist() {
@@ -498,7 +499,7 @@ mod test {
 
     #[test]
     fn find_closest() {
-        let config = NodeConfig::new();
+        let config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
         let ring = Ring::new(&config, &[]).unwrap();
 
         fn build_pk(loc: Location) -> PeerKeyLocation {
