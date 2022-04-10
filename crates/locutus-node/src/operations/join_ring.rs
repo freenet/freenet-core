@@ -42,7 +42,10 @@ impl<CErr: std::error::Error> Operation<CErr> for JoinRingOp {
             Some(OpEnum::JoinRing(join_op)) => {
                 sender = msg.sender().cloned();
                 // was an existing operation, the other peer messaged back
-                Ok(OpInitialization { op: join_op, sender })
+                Ok(OpInitialization {
+                    op: join_op,
+                    sender,
+                })
             }
             Some(_) => return Err(OpError::OpNotPresent(tx)),
             None => {
@@ -67,8 +70,9 @@ impl<CErr: std::error::Error> Operation<CErr> for JoinRingOp {
 
     fn process_message(
         self,
+        op_storage: &OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult<CErr>, Self::Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>>>> {
         let return_msg;
         let state;
         // todo: add all internal logic here
@@ -593,7 +597,7 @@ async fn update_state<CB, CErr>(
     mut state: JoinRingOp,
     other_host_msg: JoinRingMsg,
     ring: &Ring,
-) -> Result<OperationResult<CErr>, OpError<CErr>>
+) -> Result<OperationResult, OpError<CErr>>
 where
     CB: ConnectionBridge,
     CErr: std::error::Error,

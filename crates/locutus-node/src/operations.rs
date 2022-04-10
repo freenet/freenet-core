@@ -5,6 +5,7 @@ use crate::{
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
+    operations::join_ring::JoinRingOp,
     ring::RingError,
 };
 
@@ -15,14 +16,11 @@ pub(crate) mod put;
 mod state_machine;
 pub(crate) mod subscribe;
 
-pub(crate) struct OperationResult<CErr>
-where
-    CErr: std::error::Error,
-{
+pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
     pub return_msg: Option<Message>,
     /// None if the operation has been completed.
-    pub state: Option<OpEnum<CErr>>,
+    pub state: Option<OpEnum>,
 }
 
 pub(crate) struct OpInitialization<Op> {
@@ -59,7 +57,7 @@ where
 async fn handle_op_result<CB, CErr>(
     op_storage: &OpManager<CErr>,
     conn_manager: &mut CB,
-    result: Result<OperationResult<CErr>, (OpError<CErr>, Transaction)>,
+    result: Result<OperationResult, (OpError<CErr>, Transaction)>,
     sender: Option<PeerKey>,
 ) -> Result<(), OpError<CErr>>
 where
@@ -94,7 +92,8 @@ where
             state: Some(updated_state),
         }) => {
             // interim state
-            op_storage.push(updated_state.id(), updated_state)?;
+            let id = OpEnum::id::<CErr>(&updated_state);
+            op_storage.push(id, updated_state)?;
         }
         Ok(OperationResult {
             return_msg: Some(msg),
@@ -115,21 +114,18 @@ where
     Ok(())
 }
 
-pub(crate) enum OpEnum<CErr> {
+pub(crate) enum OpEnum {
     JoinRing(join_ring::JoinRingOp),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
 }
 
-impl<CErr: std::error::Error> OpEnum<CErr>
-where
-    CErr: std::error::Error,
-{
-    fn id(&self) -> Transaction {
+impl OpEnum {
+    fn id<CErr: std::error::Error>(&self) -> Transaction {
         use OpEnum::*;
         match self {
-            JoinRing(op) => *op.id().clone(),
+            JoinRing(op) => *<JoinRingOp as Operation<CErr>>::id(op),
             Put(op) => op.id(),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
