@@ -34,7 +34,7 @@ pub(crate) async fn handle_op_request<Op, CErr, CB>(
     msg: Op::Message,
 ) -> Result<(), OpError<CErr>>
 where
-    Op: Operation<CErr>,
+    Op: Operation<CErr, CB>,
     CErr: std::error::Error,
     CB: ConnectionBridge,
 {
@@ -43,7 +43,7 @@ where
     let result: Result<_, Op::Error> = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, &msg)?;
         sender = s;
-        op.process_message(op_storage, msg).await
+        op.process_message(conn_manager, op_storage, msg).await
     };
     handle_op_result(
         op_storage,
@@ -91,8 +91,9 @@ where
             return_msg: None,
             state: Some(updated_state),
         }) => {
+            // TODO revisar como se pasa explicitamente el parámetro genérico sin estar en el struct
             // interim state
-            let id = OpEnum::id::<CErr>(&updated_state);
+            let id = OpEnum::id::<CErr, CB>(&updated_state);
             op_storage.push(id, updated_state)?;
         }
         Ok(OperationResult {
@@ -122,10 +123,11 @@ pub(crate) enum OpEnum {
 }
 
 impl OpEnum {
-    fn id<CErr: std::error::Error>(&self) -> Transaction {
+    // TODO revisar como se pasa explicitamente el cerr
+    fn id<CErr: std::error::Error, CB: ConnectionBridge>(&self) -> Transaction {
         use OpEnum::*;
         match self {
-            JoinRing(op) => *<JoinRingOp as Operation<CErr>>::id(op),
+            JoinRing(op) => *<JoinRingOp as Operation<CErr,CB>>::id(op),
             Put(op) => op.id(),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),

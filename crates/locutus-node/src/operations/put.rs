@@ -10,7 +10,7 @@ use locutus_runtime::prelude::ContractKey;
 use crate::{
     config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent},
-    message::{Message, Transaction, TxType},
+    message::{Message, Transaction, TxType, InnerMessage},
     node::{ConnectionBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
     WrappedContract, WrappedState,
@@ -779,12 +779,6 @@ mod messages {
 
     impl InnerMessage for PutMsg {
         fn id(&self) -> &Transaction {
-            Self::id(self)
-        }
-    }
-
-    impl PutMsg {
-        pub fn id(&self) -> &Transaction {
             match self {
                 Self::SeekNode { id, .. } => id,
                 Self::RouteValue { id, .. } => id,
@@ -796,7 +790,9 @@ mod messages {
                 Self::BroadcastTo { id, .. } => id,
             }
         }
+    }
 
+    impl PutMsg {
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::SeekNode { sender, .. } => Some(sender),

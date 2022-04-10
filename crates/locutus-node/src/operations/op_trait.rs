@@ -9,8 +9,9 @@ use crate::{
     node::OpManager,
     operations::{OpError, OpInitialization, OperationResult},
 };
+use crate::node::ConnectionBridge;
 
-pub(crate) trait Operation<CErr>
+pub(crate) trait Operation<CErr, CB>
 where
     Self: Sized,
     CErr: std::error::Error,
@@ -31,6 +32,7 @@ where
     #[allow(clippy::type_complexity)]
     fn process_message(
         self,
+        conn_manager: &mut CB,
         op_storage: &OpManager<CErr>,
         input: Self::Message,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>>;
@@ -50,7 +52,7 @@ pub struct FakeGet {
     id: Transaction,
 }
 
-impl<CErr: std::error::Error> Operation<CErr> for FakeGet {
+impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for FakeGet {
     type Message = super::get::GetMsg;
 
     type Error = GetError;
@@ -72,6 +74,7 @@ impl<CErr: std::error::Error> Operation<CErr> for FakeGet {
 
     fn process_message(
         self,
+        _conn_manager: &mut CB,
         _op_storage: &OpManager<CErr>,
         input: Self::Message,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>> {

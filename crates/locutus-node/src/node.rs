@@ -26,7 +26,7 @@ use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientRequest},
     config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
-    message::{Message, NodeEvent, Transaction, TransactionType, TxType},
+    message::{Message, NodeEvent, Transaction, TransactionType, TxType, InnerMessage},
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
@@ -439,7 +439,7 @@ async fn process_message<CErr, CB>(
                     report_result(op_result);
                 }
                 Message::Put(op) => {
-                    log_handling_msg!("put", op.id(), op_storage);
+                    log_handling_msg!("put", *op.id(), op_storage);
                     let op_result =
                         put::handle_put_request(&op_storage, &mut conn_manager, op).await;
                     report_result(op_result);
