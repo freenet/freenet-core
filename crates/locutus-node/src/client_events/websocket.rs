@@ -67,6 +67,10 @@ impl ClientEventsProxy for WebSocketProxy {
             .map_err(|_| ErrorKind::ChannelClosed)?;
         Ok(())
     }
+
+    fn cloned(&self) -> super::BoxedClient {
+        todo!()
+    }
 }
 
 async fn serve(

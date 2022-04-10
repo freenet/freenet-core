@@ -1321,6 +1321,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-gw"
+version = "0.0.0"
+
+[[package]]
 name = "httparse"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

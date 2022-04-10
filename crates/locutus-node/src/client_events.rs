@@ -10,6 +10,7 @@ pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
 
+pub type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
 type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -71,6 +72,8 @@ pub trait ClientEventsProxy {
         id: ClientId,
         response: Result<HostResponse, ClientError>,
     ) -> Result<(), ClientError>;
+
+    fn cloned(&self) -> BoxedClient;
 }
 
 /// A response to a previous [`ClientRequest`]
@@ -263,6 +266,10 @@ pub(crate) mod test {
             _id: ClientId,
             _response: Result<HostResponse, ClientError>,
         ) -> Result<(), ClientError> {
+            todo!()
+        }
+
+        fn cloned(&self) -> BoxedClient {
             todo!()
         }
     }

@@ -104,7 +104,10 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new(config: &NodeConfig, gateways: &[PeerKeyLocation]) -> Result<Self, anyhow::Error> {
+    pub fn new<const CLIENTS: usize>(
+        config: &NodeConfig<CLIENTS>,
+        gateways: &[PeerKeyLocation],
+    ) -> Result<Self, anyhow::Error> {
         let peer_key = PeerKey::from(config.local_key.public());
 
         // for location here consider -1 == None

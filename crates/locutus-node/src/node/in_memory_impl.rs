@@ -36,7 +36,7 @@ where
 {
     /// Buils an in-memory node. Does nothing upon construction,
     pub fn build<CH>(
-        config: NodeConfig,
+        config: NodeConfig<1>,
         event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     ) -> Result<NodeInMemory<<CH as ContractHandler>::Error>, anyhow::Error>
     where

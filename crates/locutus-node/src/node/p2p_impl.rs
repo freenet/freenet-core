@@ -15,7 +15,7 @@ use super::{
     client_event_handling, conn_manager::p2p_protoc::P2pConnManager, join_ring_request, PeerKey,
 };
 use crate::{
-    client_events::ClientEventsProxy,
+    client_events::{combinator::ClientEventsCombinator, ClientEventsProxy},
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler},
     message::{Message, NodeEvent},
@@ -46,7 +46,7 @@ where
     where
         ClientEv: ClientEventsProxy + Send + Sync + 'static,
     {
-        // 1. start listening in case this is a listening node (gateway) and join the ring
+        // start listening in case this is a listening node (gateway) and join the ring
         if self.is_gateway {
             self.conn_manager.listen_on()?;
         }
@@ -66,19 +66,15 @@ where
             }
         }
 
-        // 2. start the user event handler loop
-        GlobalExecutor::spawn(client_event_handling(
-            self.op_storage.clone(),
-            client_events,
-        ));
-
-        // 3. start the p2p event loop
+        // start the p2p event loop
         self.conn_manager
             .run_event_listener(self.op_storage.clone(), self.notification_channel)
             .await
     }
 
-    pub fn build<CH, Err>(config: NodeConfig) -> Result<NodeP2P<Err>, anyhow::Error>
+    pub(crate) fn build<CH, Err, const CLIENTS: usize>(
+        config: NodeConfig<CLIENTS>,
+    ) -> Result<NodeP2P<Err>, anyhow::Error>
     where
         CH: ContractHandler<Error = Err> + Send + Sync + 'static,
         Err: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
@@ -98,6 +94,8 @@ where
         let contract_handler = CH::from(ch_channel);
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
+        let clients = ClientEventsCombinator::new(config.clients);
+        GlobalExecutor::spawn(client_event_handling(op_storage.clone(), clients));
 
         Ok(NodeP2P {
             peer_key,

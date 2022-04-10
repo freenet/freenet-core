@@ -7,12 +7,10 @@ use std::{collections::HashMap, task::Poll};
 use futures::FutureExt;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
+use super::{BoxedClient, ClientError, HostResult};
 use crate::client_events::ErrorKind;
 use crate::{ClientEventsProxy, ClientId, ClientRequest, HostResponse};
 
-use super::{ClientError, HostResult};
-
-type BoxedClient = Box<dyn ClientEventsProxy + Send>;
 type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
 static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
@@ -25,7 +23,8 @@ pub(crate) struct ClientEventsCombinator<const N: usize> {
     hosts_rx: Box<[Receiver<HostIncomingMsg>; N]>,
     /// pending client futures from the client applications, if any
     #[allow(clippy::type_complexity)]
-    pending_client_futs: [Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Send>>>; N],
+    pending_client_futs:
+        [Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Send + Sync>>>; N],
     /// a map of the individual protocols, external, sending client events ids to an internal list of ids
     external_clients: [HashMap<ClientId, ClientId>; N],
     /// a map of the external id to which protocol it belongs (represented by the index in the array)
@@ -60,7 +59,7 @@ impl<const N: usize> ClientEventsCombinator<N> {
         };
         for (i, rx) in h.iter_mut().enumerate() {
             let a = pending_client_futs.get_mut(i).unwrap();
-            let f = Box::pin(rx.recv()) as Pin<Box<dyn Future<Output = _> + Send>>;
+            let f = Box::pin(rx.recv()) as Pin<Box<dyn Future<Output = _> + Send + Sync>>;
             *a = Some(f);
         }
 
@@ -128,6 +127,10 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
             .await
             .map_err(|_| ErrorKind::TransportProtocolDisconnect)?;
         Ok(())
+    }
+
+    fn cloned(&self) -> BoxedClient {
+        todo!()
     }
 }
 

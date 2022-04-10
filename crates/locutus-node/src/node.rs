@@ -23,7 +23,7 @@ use self::{
     p2p_impl::NodeP2P,
 };
 use crate::{
-    client_events::{ClientEventsProxy, ClientRequest},
+    client_events::{BoxedClient, ClientEventsProxy, ClientRequest},
     config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{Message, NodeEvent, Transaction, TransactionType, TxType},
@@ -56,17 +56,18 @@ where
 {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         Logger::init_logger();
-        #[cfg(feature = "websocket")]
-        {
-            use crate::client_events::websocket::WebSocketProxy;
-            let ws_interface = WebSocketProxy::start_server(CONFIG.ws).await?;
-            self.0.run_node(ws_interface).await?;
-            Ok(())
-        }
-        #[cfg(all(not(feature = "websocket")))]
-        {
-            panic!("at least one client app interface required")
-        }
+        // #[cfg(feature = "websocket")]
+        // {
+        //     use crate::client_events::websocket::WebSocketProxy;
+        //     let ws_interface = WebSocketProxy::start_server(CONFIG.ws).await?;
+        //     self.0.run_node(ws_interface).await?;
+        //     Ok(())
+        // }
+        // #[cfg(all(not(feature = "websocket")))]
+        // {
+        //     panic!("at least one client app interface required")
+        // }
+        Ok(())
     }
 }
 
@@ -80,8 +81,7 @@ where
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_provider()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-#[derive(Clone)]
-pub struct NodeConfig {
+pub struct NodeConfig<const CLIENTS: usize> {
     /// local peer private key in
     pub(crate) local_key: identity::Keypair,
     // optional local info, in case this is an initial bootstrap node
@@ -98,10 +98,11 @@ pub struct NodeConfig {
     pub(crate) rnd_if_htl_above: Option<usize>,
     pub(crate) max_number_conn: Option<usize>,
     pub(crate) min_number_conn: Option<usize>,
+    pub(crate) clients: [BoxedClient; CLIENTS],
 }
 
-impl NodeConfig {
-    pub fn new() -> NodeConfig {
+impl<const CLIENTS: usize> NodeConfig<CLIENTS> {
+    pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeConfig<CLIENTS> {
         let local_key = if let Some(key) = &CONFIG.local_peer_keypair {
             key.clone()
         } else {
@@ -117,6 +118,7 @@ impl NodeConfig {
             rnd_if_htl_above: None,
             max_number_conn: None,
             min_number_conn: None,
+            clients,
         }
     }
 
@@ -170,8 +172,11 @@ impl NodeConfig {
 
     /// Builds a node using the default backend connection manager.
     pub fn build(self) -> Result<Node<SqlDbError>, anyhow::Error> {
-        let node =
-            NodeP2P::<SqlDbError>::build::<SQLiteContractHandler<MockRuntime>, SqlDbError>(self)?;
+        let node = NodeP2P::<SqlDbError>::build::<
+            SQLiteContractHandler<MockRuntime>,
+            SqlDbError,
+            CLIENTS,
+        >(self)?;
         Ok(Node(node))
     }
 
@@ -201,12 +206,6 @@ impl NodeConfig {
         } else {
             Ok(gateways)
         }
-    }
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
