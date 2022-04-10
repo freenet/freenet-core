@@ -33,12 +33,12 @@ where
         self,
         op_storage: &OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>>>>;
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>>;
 }
 
 // EXAMPLE:
 
-enum GetError {}
+pub(crate) enum GetError {}
 
 impl<CErr: std::error::Error> From<GetError> for OpError<CErr> {
     fn from(_val: GetError) -> Self {
@@ -72,9 +72,9 @@ impl<CErr: std::error::Error> Operation<CErr> for FakeGet {
 
     fn process_message(
         self,
-        op_storage: &OpManager<CErr>,
+        _op_storage: &OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>> {
         // todo: add all internal logic here
         Box::pin(async move {
             match input {

@@ -72,11 +72,10 @@ impl<CErr: std::error::Error> Operation<CErr> for JoinRingOp {
         self,
         op_storage: &OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>>>> {
-        let return_msg;
-        let state;
-        // todo: add all internal logic here
-        Box::pin(async move {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>> {
+        let fut = async move {
+            let mut return_msg;
+            let mut state;
             match input {
                 JoinRingMsg::Request {
                     id,
@@ -157,7 +156,8 @@ impl<CErr: std::error::Error> Operation<CErr> for JoinRingOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
             Ok(OperationResult { return_msg, state })
-        })
+        };
+        Box::pin(fut)
     }
 }
 
