@@ -6,7 +6,7 @@ use crate::{
     ring::{Location, PeerKeyLocation},
 };
 
-use locutus_runtime::{ContractKey, ContractState};
+use locutus_runtime::prelude::{ContractKey, ContractState};
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;
 

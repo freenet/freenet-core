@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use locutus_runtime::{Contract, ContractKey, ContractState};
+use locutus_runtime::prelude::{ContractKey, ContractState};
 
 use crate::{
     config::PEER_TIMEOUT,
@@ -13,6 +13,7 @@ use crate::{
     message::{Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
+    Contract,
 };
 
 pub(crate) use self::messages::PutMsg;

@@ -1,4 +1,4 @@
-use locutus_runtime::{ContractKey, ContractRuntimeError};
+use locutus_runtime::ContractRuntimeError;
 
 mod handler;
 mod test;
@@ -9,6 +9,7 @@ pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, SQLiteContractHandler, SqlDbError, StoreResponse,
 };
+use locutus_stdlib::prelude::ContractKey;
 pub(crate) use test::MockRuntime;
 #[cfg(test)]
 pub(crate) use test::{MemoryContractHandler, SimStoreError};

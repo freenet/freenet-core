@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
-use locutus_stdlib::prelude::*;
+use locutus_stdlib::prelude::{
+    BufferBuilder, BufferMut, ContractKey, Parameters, State, StateDelta, StateSummary,
+    UpdateResult,
+};
 use wasmer::{
     imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
 };
 
-use crate::{ContractKey, ContractRuntimeError, ContractStore, RuntimeResult};
+use crate::{contract_store::ContractStore, ContractRuntimeError, RuntimeResult};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ExecError {
@@ -375,8 +378,9 @@ impl Runtime {
 mod test {
     use std::path::PathBuf;
 
+    use crate::contract::Contract;
+
     use super::*;
-    use crate::Contract;
 
     fn test_dir() -> PathBuf {
         let test_dir = std::env::temp_dir().join("locutus").join("contracts");

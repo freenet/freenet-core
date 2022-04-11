@@ -2,9 +2,11 @@ use std::fmt::Debug;
 use std::{error::Error as StdError, fmt::Display};
 
 use either::Either;
-use locutus_runtime::{Contract, ContractKey, ContractState};
+use locutus_runtime::prelude::*;
 use locutus_stdlib::prelude::{State, StateDelta};
 use serde::{Deserialize, Serialize};
+
+use crate::Contract;
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]

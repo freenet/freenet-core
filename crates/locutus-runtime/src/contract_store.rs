@@ -2,7 +2,7 @@ use std::{fs::File, io::Write, path::PathBuf};
 
 use stretto::Cache;
 
-use crate::{Contract, RuntimeResult};
+use crate::{contract::Contract, RuntimeResult};
 
 use super::ContractKey;
 

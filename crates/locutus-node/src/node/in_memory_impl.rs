@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use either::Either;
-use locutus_runtime::{Contract, ContractKey, ContractState};
+use locutus_runtime::prelude::{ContractKey, ContractState};
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -17,7 +17,7 @@ use crate::{
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
     util::IterExt,
-    NodeConfig,
+    Contract, NodeConfig,
 };
 
 pub(super) struct NodeInMemory<CErr = SimStoreError> {

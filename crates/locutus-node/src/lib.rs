@@ -8,6 +8,8 @@ mod operations;
 mod ring;
 pub(crate) mod util;
 
+pub(crate) type Contract = locutus_runtime::prelude::WrappedContract;
+
 // exports:
 pub use crate::config::Config;
 #[cfg(feature = "websocket")]

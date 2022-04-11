@@ -51,7 +51,7 @@ impl WebSocketProxy {
         let (server_response, response_receiver) = channel(PARALLELISM);
         let (new_client_up, new_clients) = channel(PARALLELISM);
         tokio::spawn(serve(
-            request_sender,
+            Arc::new(request_sender),
             Arc::new(new_client_up),
             socket.into(),
             filter,
@@ -93,13 +93,12 @@ impl ClientEventsProxy for WebSocketProxy {
 }
 
 async fn serve(
-    request_sender: Sender<(ClientId, ClientRequest)>,
+    request_sender: Arc<Sender<(ClientId, ClientRequest)>>,
     new_responses: Arc<Sender<ClientHandling>>,
     socket: SocketAddr,
     server_config: BoxedFilter<(impl Reply + 'static,)>,
 ) {
-    let r_sender = Arc::new(request_sender);
-    let req_channel = warp::any().map(move || (r_sender.clone(), new_responses.clone()));
+    let req_channel = warp::any().map(move || (request_sender.clone(), new_responses.clone()));
     let request_receiver = server_config.or(warp::path("ws-api")
         .and(warp::ws())
         .and(req_channel)

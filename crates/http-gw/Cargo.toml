@@ -3,7 +3,13 @@ name = "http-gw"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.58.0"
-resolver = "2"
 
 [dependencies]
+async-trait = "0.1"
+log = "0.4"
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+warp = { version = "0.3", default-features = false, features = ["multipart", "tls"] }
 
+# internal:
+locutus-node = { path = "../locutus-node" }
