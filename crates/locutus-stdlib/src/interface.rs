@@ -34,7 +34,7 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct State<'a>(Cow<'a, [u8]>);
 
 impl<'a> State<'a> {
@@ -86,7 +86,7 @@ impl<'a> DerefMut for State<'a> {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StateDelta<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateDelta<'a> {
@@ -324,6 +324,12 @@ pub struct ContractKey(
 impl ContractKey {
     pub fn bytes(&self) -> &[u8] {
         self.0.as_ref()
+    }
+
+    pub fn decode(encoded: impl Into<String>) -> Result<Self, hex::FromHexError> {
+        let mut arr = [0; 64];
+        hex::decode_to_slice(encoded.into(), &mut arr)?;
+        Ok(Self(arr))
     }
 }
 

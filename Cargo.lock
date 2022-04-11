@@ -1327,6 +1327,7 @@ dependencies = [
  "async-trait",
  "hex",
  "locutus-node",
+ "locutus-stdlib",
  "log",
  "tokio",
  "warp",

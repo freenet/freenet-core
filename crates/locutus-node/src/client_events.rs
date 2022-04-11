@@ -37,7 +37,7 @@ pub struct ClientError {
 }
 
 impl ClientError {
-    fn kind(&self) -> ErrorKind {
+    pub fn kind(&self) -> ErrorKind {
         self.kind
     }
 }
@@ -56,6 +56,12 @@ pub enum ErrorKind {
     TransportProtocolDisconnect,
     #[error("unknown client id: {0}")]
     UnknownClient(ClientId),
+}
+
+impl From<ErrorKind> for warp::Rejection {
+    fn from(_: ErrorKind) -> Self {
+        todo!()
+    }
 }
 
 impl Display for ClientError {
@@ -85,7 +91,7 @@ pub trait ClientEventsProxy {
 }
 
 /// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum HostResponse {
     PutResponse(ContractKey),
     /// Successful update
@@ -123,8 +129,10 @@ pub enum ClientRequest {
         /// If this flag is set then fetch also the contract itself.
         contract: bool,
     },
-    /// Subscribe to teh changes in a given contract. Implicitly starts a get operation
+    /// Subscribe to the changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
+    /// After this action the client will start receiving all changes though the open
+    /// connection.
     Subscribe {
         key: ContractKey,
     },

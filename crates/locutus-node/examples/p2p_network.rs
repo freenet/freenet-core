@@ -6,7 +6,7 @@ use libp2p::{
     PeerId,
 };
 use locutus_node::*;
-use locutus_runtime::{Contract, ContractState};
+use locutus_runtime::prelude::{ContractState, WrappedContract};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");
@@ -38,7 +38,7 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    let contract = Contract::new(vec![7, 3, 9, 5]);
+    let contract = WrappedContract::new(vec![7, 3, 9, 5]);
     let key = contract.key();
     let init_val = ContractState::new(vec![1, 2, 3, 4]);
 

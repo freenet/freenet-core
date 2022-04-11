@@ -1,7 +1,14 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use locutus_node::*;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use locutus_stdlib::prelude::ContractKey;
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    oneshot,
+};
 use warp::{
     hyper::StatusCode,
     reject::{self, Reject},
@@ -9,104 +16,76 @@ use warp::{
 };
 
 type HostResult = Result<HostResponse, ClientError>;
-type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 pub struct HttpGateway {
-    server_request: Receiver<(ClientId, ClientRequest)>,
-    server_response: Sender<(ClientId, HostResult)>,
+    server_request: Receiver<(ClientRequest, oneshot::Sender<HostResult>)>,
+    pending_responses: HashMap<ClientId, oneshot::Sender<HostResult>>,
 }
 
 impl HttpGateway {
-    pub fn as_filter(socket: impl Into<SocketAddr>) -> (Self, impl warp::Filter) {
+    /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
+    pub fn as_filter() -> (Self, impl warp::Filter) {
         let (request_sender, server_request) = channel(PARALLELISM);
-        let (server_response, response_receiver) = channel(PARALLELISM);
-        let (new_client_up, new_clients) = channel(PARALLELISM);
-        let filter = warp::path::end()
-            .map(move || (request_sender.clone(), new_client_up.clone()))
+        let filter = warp::path::path("contract")
+            .map(move || request_sender.clone())
             .and(warp::path::param())
-            .and_then(|(rs, nw), key: String| async move { handle_contract(key).await })
-            .recover(handle_error);
-        tokio::spawn(responses(new_clients, response_receiver));
+            .and(warp::path::end())
+            .and_then(|rs, key: String| async move { handle_contract(key, rs).await })
+            .or(warp::path::end().and_then(handle_home))
+            .recover(errors::handle_error);
         (
             Self {
                 server_request,
-                server_response,
+                pending_responses: HashMap::new(),
             },
             filter,
         )
     }
 }
 
-#[derive(Debug)]
-struct InvalidParam(String);
+/// Each request is unique so we don't keep track of a client session of any sort.
+static ID: AtomicUsize = AtomicUsize::new(0);
 
-impl Reject for InvalidParam {}
-
-async fn handle_contract(key: String) -> Result<impl Reply, Rejection> {
+async fn handle_contract(
+    key: String,
+    request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
+) -> Result<impl Reply, Rejection> {
     let key = key.to_lowercase();
-    let key_as_bytes =
-        hex::decode(&key).map_err(|err| reject::custom(InvalidParam(format!("{err}"))))?;
+    let key = ContractKey::decode(key)
+        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+    let (tx, response) = oneshot::channel();
+    request_sender
+        .send((ClientRequest::Subscribe { key }, tx))
+        .await
+        .map_err(|_| reject::custom(errors::NodeError))?;
+    let response = response
+        .await
+        .map_err(|_| reject::custom(errors::NodeError))?;
+    match response {
+        Ok(_r) => {
+            // TODO: here we should pass the batton to the websocket interface
+            Ok(reply::reply())
+        }
+        Err(err) => Err(err.kind().into()),
+    }
+}
+
+async fn handle_home() -> Result<impl Reply, Rejection> {
     Ok(reply::reply())
-}
-
-async fn handle_error(err: Rejection) -> Result<impl Reply, std::convert::Infallible> {
-    if let Some(e) = err.find::<InvalidParam>() {
-        return Ok(reply::with_status(e.0.to_owned(), StatusCode::BAD_REQUEST));
-    }
-    Ok(reply::with_status(
-        "INTERNAL SERVER ERROR".to_owned(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-    ))
-}
-
-enum ClientHandling {
-    NewClient(ClientId, NewResponseSender),
-    ClientDisconnected(ClientId),
-}
-
-async fn responses(
-    mut client_handler: Receiver<ClientHandling>,
-    mut response_receiver: Receiver<(ClientId, HostResult)>,
-) {
-    let mut clients = HashMap::new();
-    loop {
-        tokio::select! {
-        new_client = client_handler.recv() => {
-            match new_client {
-            Some(ClientHandling::NewClient(client_id, responses)) => {
-                clients.insert(client_id, responses);
-            }
-            Some(ClientHandling::ClientDisconnected(client_id)) => {
-                clients.remove(&client_id);
-            }
-            None => return,
-            }
-        }
-        host_result = response_receiver.recv() => {
-            match host_result {
-            Some((client_id, response)) => {
-                if let Some(ch) = clients.get_mut(&client_id) {
-                if Sender::send(ch, response).await.is_err() {
-                    log::error!("Tried to send an a response to an unregistered client");
-                    return;
-                }
-                } else {
-                   return;
-                }
-            }
-            None => return,
-            }
-        }
-        }
-    }
 }
 
 #[async_trait::async_trait]
 impl ClientEventsProxy for HttpGateway {
     async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
-        todo!()
+        if let Some((req, response_ch)) = self.server_request.recv().await {
+            let cli_id = ClientId::new(ID.fetch_add(1, Ordering::SeqCst));
+            self.pending_responses.insert(cli_id, response_ch);
+            Ok((cli_id, req))
+        } else {
+            todo!()
+        }
     }
 
     async fn send(
@@ -114,10 +93,43 @@ impl ClientEventsProxy for HttpGateway {
         client: ClientId,
         response: Result<HostResponse, ClientError>,
     ) -> Result<(), ClientError> {
+        // fixme: deal with unwraps()
+        let ch = self.pending_responses.remove(&client).unwrap();
+        ch.send(response).unwrap();
         Ok(())
     }
 
     fn cloned(&self) -> BoxedClient {
         todo!()
     }
+}
+
+mod errors {
+    use super::*;
+
+    pub(super) async fn handle_error(
+        err: Rejection,
+    ) -> Result<impl Reply, std::convert::Infallible> {
+        if let Some(e) = err.find::<errors::InvalidParam>() {
+            return Ok(reply::with_status(e.0.to_owned(), StatusCode::BAD_REQUEST));
+        }
+        if err.find::<errors::NodeError>().is_some() {
+            return Ok(reply::with_status(
+                "Node unavailable".to_owned(),
+                StatusCode::BAD_GATEWAY,
+            ));
+        }
+        Ok(reply::with_status(
+            "INTERNAL SERVER ERROR".to_owned(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+    }
+
+    #[derive(Debug)]
+    pub(super) struct InvalidParam(pub String);
+    impl Reject for InvalidParam {}
+
+    #[derive(Debug)]
+    pub(super) struct NodeError;
+    impl Reject for NodeError {}
 }
