@@ -54,7 +54,7 @@ Locutus is the development name for this software; it will probably change befor
 
 ### 6. Chat with us
 
-We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord.
+We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join.
 
 ### 7. Stay up to date
 
