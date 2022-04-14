@@ -1330,6 +1330,8 @@ dependencies = [
  "locutus-stdlib",
  "log",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "warp",
 ]
 

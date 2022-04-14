@@ -1,6 +1,6 @@
 use locutus_stdlib::prelude::{Contract as StdContract, ContractKey};
 use serde::Serialize;
-use std::{fs::File, io::Read, ops::Deref, path::PathBuf, sync::Arc};
+use std::{fmt::Display, fs::File, io::Read, ops::Deref, path::PathBuf, sync::Arc};
 
 use crate::ContractRuntimeError;
 
@@ -8,6 +8,12 @@ use crate::ContractRuntimeError;
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct Contract(Arc<StdContract>);
+
+impl Display for Contract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.as_ref().fmt(f)
+    }
+}
 
 impl Contract {
     pub fn new(bytes: Vec<u8>) -> Contract {
@@ -64,5 +70,21 @@ impl Deref for ContractState {
 
     fn deref(&self) -> &Self::Target {
         &*self.0
+    }
+}
+
+impl std::fmt::Display for ContractState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data: String = if self.0.len() > 8 {
+            (&self.0[..4])
+                .iter()
+                .map(|b| char::from(*b))
+                .chain("...".chars())
+                .chain((&self.0[4..]).iter().map(|b| char::from(*b)))
+                .collect()
+        } else {
+            self.0.iter().copied().map(char::from).collect()
+        };
+        write!(f, "ContractState(data: [{}])", data)
     }
 }

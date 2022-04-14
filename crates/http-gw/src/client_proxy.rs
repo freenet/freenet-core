@@ -10,6 +10,7 @@ use tokio::sync::{
     oneshot,
 };
 use warp::{
+    filters::BoxedFilter,
     hyper::StatusCode,
     reject::{self, Reject},
     reply, Filter, Rejection, Reply,
@@ -26,21 +27,22 @@ pub struct HttpGateway {
 
 impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
-    pub fn as_filter() -> (Self, impl warp::Filter) {
+    pub fn as_filter() -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
         let (request_sender, server_request) = channel(PARALLELISM);
         let filter = warp::path::path("contract")
             .map(move || request_sender.clone())
             .and(warp::path::param())
             .and(warp::path::end())
             .and_then(|rs, key: String| async move { handle_contract(key, rs).await })
-            .or(warp::path::end().and_then(handle_home))
-            .recover(errors::handle_error);
+            .or(warp::path::end().and_then(home))
+            .recover(errors::handle_error)
+            .with(warp::trace::request());
         (
             Self {
                 server_request,
                 pending_responses: HashMap::new(),
             },
-            filter,
+            filter.boxed(),
         )
     }
 }
@@ -53,7 +55,7 @@ async fn handle_contract(
     request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
 ) -> Result<impl Reply, Rejection> {
     let key = key.to_lowercase();
-    let key = ContractKey::decode(key)
+    let key = ContractKey::hex_decode(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let (tx, response) = oneshot::channel();
     request_sender
@@ -72,7 +74,7 @@ async fn handle_contract(
     }
 }
 
-async fn handle_home() -> Result<impl Reply, Rejection> {
+async fn home() -> Result<impl Reply, Rejection> {
     Ok(reply::reply())
 }
 
@@ -80,6 +82,7 @@ async fn handle_home() -> Result<impl Reply, Rejection> {
 impl ClientEventsProxy for HttpGateway {
     async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
         if let Some((req, response_ch)) = self.server_request.recv().await {
+            tracing::debug!("received request: {req}");
             let cli_id = ClientId::new(ID.fetch_add(1, Ordering::SeqCst));
             self.pending_responses.insert(cli_id, response_ch);
             Ok((cli_id, req))

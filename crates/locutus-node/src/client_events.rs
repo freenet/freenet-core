@@ -91,7 +91,7 @@ pub trait ClientEventsProxy {
 }
 
 /// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum HostResponse {
     PutResponse(ContractKey),
     /// Successful update
@@ -108,7 +108,7 @@ pub enum HostResponse {
 }
 
 /// A request from a client application to the host.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum ClientRequest {
     /// Insert a new value in a contract corresponding with the provided key.
@@ -139,6 +139,22 @@ pub enum ClientRequest {
     Disconnect {
         cause: Option<String>,
     },
+}
+
+impl Display for ClientRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientRequest::Put { contract, state } => {
+                write!(f, "put request for contract {contract} with state {state}")
+            }
+            ClientRequest::Update { key, .. } => write!(f, "Update request for {key}"),
+            ClientRequest::Get { key, contract } => {
+                write!(f, "get request for {key} (fetch full contract: {contract})")
+            }
+            ClientRequest::Subscribe { key } => write!(f, "subscribe request for {key}"),
+            ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
+        }
+    }
 }
 
 #[cfg(test)]

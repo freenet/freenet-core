@@ -16,7 +16,7 @@ type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
 
 /// This type allows combining different sources of events into one and interoperation between them.
-pub(crate) struct ClientEventsCombinator<const N: usize> {
+pub struct ClientEventsCombinator<const N: usize> {
     /// receiving end of the different client applications from the node
     clients: [Sender<(ClientId, HostResult)>; N],
     /// receiving end of the host node from the different client applications
@@ -53,11 +53,11 @@ impl<const N: usize> ClientEventsCombinator<N> {
         let mut hosts_rx = Box::new(hosts_rx.map(|c| c.unwrap()));
         let mut pending_client_futs = [(); N].map(|_| None);
         // Safety: create a longer living reference, is safe since the futures should always be as long living as the refs
-        let h = unsafe {
+        let hosts_rx_ref = unsafe {
             &mut *(&mut hosts_rx as *mut _)
                 as &mut [Receiver<Result<(ClientId, ClientRequest), ClientError>>; N]
         };
-        for (i, rx) in h.iter_mut().enumerate() {
+        for (i, rx) in hosts_rx_ref.iter_mut().enumerate() {
             let a = pending_client_futs.get_mut(i).unwrap();
             let f = Box::pin(rx.recv()) as Pin<Box<dyn Future<Output = _> + Send + Sync>>;
             *a = Some(f);
@@ -95,6 +95,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
         if let Some(res) = res {
             match res {
                 Ok((external, r)) => {
+                    log::debug!("received request; internal_id={external}; req={r:?}");
                     let id = (&mut self.external_clients[idx])
                         .entry(external)
                         .or_insert_with(|| {
@@ -153,8 +154,9 @@ async fn client_fn(
             }
             client_msg = client.recv() => {
                 match client_msg {
-                    Ok(msg) => {
-                        if tx_host.send(Ok(msg)).await.is_err() {
+                    Ok((id, msg)) => {
+                        log::debug!("received msg @ combinator from external id {id}, msg: {msg}");
+                        if tx_host.send(Ok((id, msg))).await.is_err() {
                             break;
                         }
                     }
@@ -184,6 +186,7 @@ impl<Fut: Future + Unpin, const N: usize> Future for SelectAll<Fut, N> {
     type Output = (Fut::Output, usize, [Option<Fut>; N]);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        log::info!("entered fut");
         let item = self
             .inner
             .iter_mut()

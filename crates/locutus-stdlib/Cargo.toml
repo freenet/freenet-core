@@ -5,23 +5,23 @@ edition = "2021"
 rust-version = "1.58.0"
 
 [dependencies]
-arbitrary = { version = "1", optional = true }
+arbitrary = { version = "1", optional = true, features = ["derive"] }
 arrayvec = { version = "0.7", features = ["serde"] }
 blake2 = { version =  "0.10", features = [ "std" ] }
 hex = "0.4"
 once_cell = "1"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 
 # internal
 locutus-macros = { path = "../locutus-macros" }
 
 [dev-dependencies]
-arbitrary = "1"
+arbitrary = { version = "1", features = ["derive"] }
 bincode = "1"
 wasmer = { version = "^2.0", features = [ "sys-default", "wat"] }
 wasmer-wasi = "*"
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
 testing = ["arbitrary"]
