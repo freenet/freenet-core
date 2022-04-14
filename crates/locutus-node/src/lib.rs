@@ -15,7 +15,8 @@ pub use crate::config::Config;
 #[cfg(feature = "websocket")]
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
-    BoxedClient, ClientError, ClientEventsProxy, ClientId, ClientRequest, HostResponse,
+    combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
+    ClientRequest, HostResponse,
 };
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;

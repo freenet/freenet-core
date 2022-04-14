@@ -326,10 +326,14 @@ impl ContractKey {
         self.0.as_ref()
     }
 
-    pub fn decode(encoded: impl Into<String>) -> Result<Self, hex::FromHexError> {
+    pub fn hex_decode(encoded: impl Into<String>) -> Result<Self, hex::FromHexError> {
         let mut arr = [0; 64];
         hex::decode_to_slice(encoded.into(), &mut arr)?;
         Ok(Self(arr))
+    }
+
+    pub fn hex_encode(&self) -> String {
+        hex::encode(self.0)
     }
 }
 
@@ -370,7 +374,7 @@ where
 mod test {
     use super::*;
     use once_cell::sync::Lazy;
-    use rand::{prelude::SmallRng, Rng, SeedableRng};
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
 
     static RND_BYTES: Lazy<[u8; 1024]> = Lazy::new(|| {
         let mut bytes = [0; 1024];
@@ -383,9 +387,13 @@ mod test {
     fn key_ser() -> Result<(), Box<dyn std::error::Error>> {
         let mut gen = arbitrary::Unstructured::new(&*RND_BYTES);
         let expected: ContractKey = gen.arbitrary()?;
+        let encoded = hex::encode(expected.bytes());
+        // eprintln!("encoded key: {encoded}");
 
         let serialized = bincode::serialize(&expected)?;
         let deserialized: ContractKey = bincode::deserialize(&serialized)?;
+        let decoded = hex::encode(deserialized.bytes());
+        assert_eq!(encoded, decoded);
         assert_eq!(deserialized, expected);
         Ok(())
     }

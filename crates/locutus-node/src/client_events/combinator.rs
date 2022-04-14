@@ -16,7 +16,7 @@ type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
 
 /// This type allows combining different sources of events into one and interoperation between them.
-pub(crate) struct ClientEventsCombinator<const N: usize> {
+pub struct ClientEventsCombinator<const N: usize> {
     /// receiving end of the different client applications from the node
     clients: [Sender<(ClientId, HostResult)>; N],
     /// receiving end of the host node from the different client applications

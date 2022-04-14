@@ -91,7 +91,7 @@ pub trait ClientEventsProxy {
 }
 
 /// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum HostResponse {
     PutResponse(ContractKey),
     /// Successful update
@@ -108,7 +108,7 @@ pub enum HostResponse {
 }
 
 /// A request from a client application to the host.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum ClientRequest {
     /// Insert a new value in a contract corresponding with the provided key.

@@ -104,7 +104,8 @@ async fn serve(
         .and(req_channel)
         .map(|ws: warp::ws::Ws, (request_sender, new_responses)| {
             ws.on_upgrade(move |socket| handle_socket(socket, request_sender, new_responses))
-        }));
+        })
+        .with(warp::trace::request()));
     warp::serve(request_receiver).run(socket).await;
 }
 
