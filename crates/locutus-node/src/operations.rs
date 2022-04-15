@@ -1,6 +1,7 @@
 use tokio::sync::mpsc::error::SendError;
 
 use self::{join_ring::JoinOpError, op_trait::Operation};
+use crate::operations::put::PutOp;
 use crate::{
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
@@ -91,7 +92,6 @@ where
             return_msg: None,
             state: Some(updated_state),
         }) => {
-            // TODO revisar como se pasa explicitamente el parámetro genérico sin estar en el struct
             // interim state
             let id = OpEnum::id::<CErr, CB>(&updated_state);
             op_storage.push(id, updated_state)?;
@@ -123,12 +123,11 @@ pub(crate) enum OpEnum {
 }
 
 impl OpEnum {
-    // TODO revisar como se pasa explicitamente el cerr
     fn id<CErr: std::error::Error, CB: ConnectionBridge>(&self) -> Transaction {
         use OpEnum::*;
         match self {
-            JoinRing(op) => *<JoinRingOp as Operation<CErr,CB>>::id(op),
-            Put(op) => op.id(),
+            JoinRing(op) => *<JoinRingOp as Operation<CErr, CB>>::id(op),
+            Put(op) => *<PutOp as Operation<CErr, CB>>::id(op),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
         }

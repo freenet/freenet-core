@@ -26,7 +26,7 @@ use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientRequest},
     config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
-    message::{Message, NodeEvent, Transaction, TransactionType, TxType, InnerMessage},
+    message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
@@ -338,7 +338,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         "Received put from user event @ {}",
                         &op_storage_cp.ring.peer_key
                     );
-                    let op = put::PutOp::start_op(
+                    let op = put::start_op(
                         contract,
                         value,
                         op_storage_cp.ring.max_hops_to_live,
@@ -441,7 +441,8 @@ async fn process_message<CErr, CB>(
                 Message::Put(op) => {
                     log_handling_msg!("put", *op.id(), op_storage);
                     let op_result =
-                        put::handle_put_request(&op_storage, &mut conn_manager, op).await;
+                        handle_op_request::<put::PutOp, _, _>(&op_storage, &mut conn_manager, op)
+                            .await;
                     report_result(op_result);
                 }
                 Message::Get(op) => {

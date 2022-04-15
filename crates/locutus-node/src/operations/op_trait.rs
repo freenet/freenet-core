@@ -4,12 +4,12 @@ use std::pin::Pin;
 
 use futures::Future;
 
+use crate::node::ConnectionBridge;
 use crate::{
     message::{InnerMessage, Transaction},
     node::OpManager,
     operations::{OpError, OpInitialization, OperationResult},
 };
-use crate::node::ConnectionBridge;
 
 pub(crate) trait Operation<CErr, CB>
 where
