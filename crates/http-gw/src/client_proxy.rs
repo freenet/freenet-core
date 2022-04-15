@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -78,28 +80,36 @@ async fn home() -> Result<impl Reply, Rejection> {
     Ok(reply::reply())
 }
 
-#[async_trait::async_trait]
+#[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for HttpGateway {
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
-        if let Some((req, response_ch)) = self.server_request.recv().await {
-            tracing::debug!("received request: {req}");
-            let cli_id = ClientId::new(ID.fetch_add(1, Ordering::SeqCst));
-            self.pending_responses.insert(cli_id, response_ch);
-            Ok((cli_id, req))
-        } else {
-            todo!()
-        }
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
+    > {
+        Box::pin(async move {
+            if let Some((req, response_ch)) = self.server_request.recv().await {
+                tracing::debug!("received request: {req}");
+                let cli_id = ClientId::new(ID.fetch_add(1, Ordering::SeqCst));
+                self.pending_responses.insert(cli_id, response_ch);
+                Ok((cli_id, req))
+            } else {
+                todo!()
+            }
+        })
     }
 
-    async fn send(
-        &mut self,
+    fn send<'a>(
+        &'a mut self,
         client: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Result<(), ClientError> {
-        // fixme: deal with unwraps()
-        let ch = self.pending_responses.remove(&client).unwrap();
-        ch.send(response).unwrap();
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+        Box::pin(async move {
+            // fixme: deal with unwraps()
+            let ch = self.pending_responses.remove(&client).unwrap();
+            ch.send(response).unwrap();
+            Ok(())
+        })
     }
 
     fn cloned(&self) -> BoxedClient {

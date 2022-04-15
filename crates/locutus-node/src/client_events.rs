@@ -1,4 +1,6 @@
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
 
 use either::Either;
@@ -72,20 +74,20 @@ impl Display for ClientError {
 
 impl StdError for ClientError {}
 
-// fixme: only use this internally, communication outside of the node should come from
-//        one of the offered client interfaces enabled through features (eg. websockets)
-#[async_trait::async_trait]
+type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
+
+#[allow(clippy::needless_lifetimes)]
 pub trait ClientEventsProxy {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError>;
+    fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>>;
 
     /// Sends a response from the host to the client application.
-    async fn send(
-        &mut self,
+    fn send<'a>(
+        &'a mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Result<(), ClientError>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>>;
 
     fn cloned(&self) -> BoxedClient;
 }
@@ -273,35 +275,46 @@ pub(crate) mod test {
         }
     }
 
-    #[async_trait::async_trait]
+    #[allow(clippy::needless_lifetimes)]
     impl ClientEventsProxy for MemoryEventsGen {
-        async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
-            loop {
-                if self.signal.changed().await.is_ok() {
-                    let (ev_id, pk) = *self.signal.borrow();
-                    if pk == self.id && !self.random {
-                        return Ok((
-                            ClientId(1),
-                            self.generate_deterministic_event(&ev_id)
-                                .expect("event not found"),
-                        ));
-                    } else if pk == self.id {
-                        return Ok((ClientId(1), self.generate_rand_event()));
+        fn recv<'a>(
+            &'a mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>>
+                    + Send
+                    + Sync
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                loop {
+                    if self.signal.changed().await.is_ok() {
+                        let (ev_id, pk) = *self.signal.borrow();
+                        if pk == self.id && !self.random {
+                            return Ok((
+                                ClientId(1),
+                                self.generate_deterministic_event(&ev_id)
+                                    .expect("event not found"),
+                            ));
+                        } else if pk == self.id {
+                            return Ok((ClientId(1), self.generate_rand_event()));
+                        }
+                    } else {
+                        log::debug!("sender half of user event gen dropped");
+                        // probably the process finished, wait for a bit and then kill the thread
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        panic!("finished orphan background thread");
                     }
-                } else {
-                    log::debug!("sender half of user event gen dropped");
-                    // probably the process finished, wait for a bit and then kill the thread
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    panic!("finished orphan background thread");
                 }
-            }
+            })
         }
 
-        async fn send(
+        fn send(
             &mut self,
             _id: ClientId,
             _response: Result<HostResponse, ClientError>,
-        ) -> Result<(), ClientError> {
+        ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
             todo!()
         }
 

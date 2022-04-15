@@ -1,6 +1,7 @@
-use std::{net::Ipv4Addr, time::Duration};
+use std::{net::Ipv4Addr, pin::Pin, time::Duration};
 
 use anyhow::{anyhow, bail};
+use futures::Future;
 use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
@@ -134,25 +135,32 @@ struct UserEvents {
     rx_ev: Receiver<ClientRequest>,
 }
 
-#[async_trait::async_trait]
 impl ClientEventsProxy for UserEvents {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
-        Ok((
-            ClientId::new(1),
-            self.rx_ev.recv().await.expect("channel open"),
-        ))
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
+    > {
+        Box::pin(async move {
+            Ok((
+                ClientId::new(1),
+                self.rx_ev.recv().await.expect("channel open"),
+            ))
+        })
     }
 
     /// Sends a response from the host to the client application.
-    async fn send(
-        &mut self,
+    fn send<'a>(
+        &'a mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Result<(), ClientError> {
-        log::info!("received response");
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+        Box::pin(async move {
+            log::info!("received response");
+            Ok(())
+        })
     }
 
     fn cloned(&self) -> BoxedClient {

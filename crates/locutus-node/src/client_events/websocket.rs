@@ -3,6 +3,7 @@ use std::{
     error::Error,
     future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -64,27 +65,35 @@ impl WebSocketProxy {
     }
 }
 
-#[async_trait::async_trait]
+#[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for WebSocketProxy {
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
-        let (id, msg) = self
-            .server_request
-            .recv()
-            .await
-            .ok_or(ErrorKind::ChannelClosed)?;
-        Ok((id, msg))
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
+    > {
+        Box::pin(async move {
+            let (id, msg) = self
+                .server_request
+                .recv()
+                .await
+                .ok_or(ErrorKind::ChannelClosed)?;
+            Ok((id, msg))
+        })
     }
 
-    async fn send(
+    fn send<'a>(
         &mut self,
         client: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Result<(), ClientError> {
-        self.server_response
-            .send((client, response))
-            .await
-            .map_err(|_| ErrorKind::ChannelClosed)?;
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+        Box::pin(async move {
+            self.server_response
+                .send((client, response))
+                .await
+                .map_err(|_| ErrorKind::ChannelClosed)?;
+            Ok(())
+        })
     }
 
     fn cloned(&self) -> super::BoxedClient {

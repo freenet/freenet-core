@@ -20,11 +20,11 @@ pub struct ClientEventsCombinator<const N: usize> {
     /// receiving end of the different client applications from the node
     clients: [Sender<(ClientId, HostResult)>; N],
     /// receiving end of the host node from the different client applications
-    hosts_rx: Box<[Receiver<HostIncomingMsg>; N]>,
+    hosts_rx: Pin<Box<[Receiver<HostIncomingMsg>; N]>>,
     /// pending client futures from the client applications, if any
     #[allow(clippy::type_complexity)]
     pending_client_futs:
-        [Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Send + Sync>>>; N],
+        [Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Send + Sync + 'static>>>; N],
     /// a map of the individual protocols, external, sending client events ids to an internal list of ids
     external_clients: [HashMap<ClientId, ClientId>; N],
     /// a map of the external id to which protocol it belongs (represented by the index in the array)
@@ -53,10 +53,8 @@ impl<const N: usize> ClientEventsCombinator<N> {
         let mut hosts_rx = Box::new(hosts_rx.map(|c| c.unwrap()));
         let mut pending_client_futs = [(); N].map(|_| None);
         // Safety: create a longer living reference, is safe since the futures should always be as long living as the refs
-        let hosts_rx_ref = unsafe {
-            &mut *(&mut hosts_rx as *mut _)
-                as &mut [Receiver<Result<(ClientId, ClientRequest), ClientError>>; N]
-        };
+        let hosts_rx_ref =
+            unsafe { &mut *(&mut hosts_rx as *mut _) as &mut [Receiver<HostIncomingMsg>; N] };
         for (i, rx) in hosts_rx_ref.iter_mut().enumerate() {
             let a = pending_client_futs.get_mut(i).unwrap();
             let f = Box::pin(rx.recv()) as Pin<Box<dyn Future<Output = _> + Send + Sync>>;
@@ -66,7 +64,7 @@ impl<const N: usize> ClientEventsCombinator<N> {
         let external_clients = [(); N].map(|_| HashMap::new());
         Self {
             clients: clients.map(|c| c.unwrap()),
-            hosts_rx,
+            hosts_rx: Pin::new(hosts_rx),
             pending_client_futs,
             external_clients,
             internal_clients: HashMap::new(),
@@ -81,53 +79,69 @@ impl<const N: usize> Drop for ClientEventsCombinator<N> {
     }
 }
 
-#[async_trait::async_trait]
+#[allow(clippy::needless_lifetimes)]
 impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), ClientError> {
-        let mut futs_opt = [(); N].map(|_| None);
-        for (i, o) in self.pending_client_futs.iter_mut().enumerate() {
-            let f = futs_opt.get_mut(i).unwrap();
-            *f = o.take();
-        }
-        let (res, idx, mut others) = select_all(futs_opt.map(|f| f.unwrap())).await;
-        let idle_ch = &mut self.hosts_rx[idx];
-        others[idx] = Some(Box::pin(idle_ch.recv()));
-        if let Some(res) = res {
-            match res {
-                Ok((external, r)) => {
-                    log::debug!("received request; internal_id={external}; req={r:?}");
-                    let id = (&mut self.external_clients[idx])
-                        .entry(external)
-                        .or_insert_with(|| {
-                            // add a new mapped external client id
-                            let internal =
-                                ClientId(COMBINATOR_INDEXES.fetch_add(1, Ordering::SeqCst));
-                            self.internal_clients.insert(internal, (idx, external));
-                            internal
-                        });
-                    Ok((*id, r))
-                }
-                err @ Err(_) => err,
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
+    > {
+        Box::pin(async move {
+            let mut futs_opt = [(); N].map(|_| None);
+            for (i, o) in self.pending_client_futs.iter_mut().enumerate() {
+                let f = futs_opt.get_mut(i).unwrap();
+                *f = o.take();
             }
-        } else {
-            Err(ErrorKind::TransportProtocolDisconnect.into())
-        }
+            let (res, idx, mut others) = select_all(futs_opt.map(|f| f.unwrap())).await;
+            {
+                let self_l: &'static mut Self = unsafe { &mut *(self as *mut _) };
+                let new_fut = self_l.hosts_rx[idx].recv();
+                others[idx] = Some(Box::pin(new_fut));
+            }
+            if let Some(res) = res {
+                match res {
+                    Ok((external, r)) => {
+                        log::debug!("received request; internal_id={external}; req={r:?}");
+                        let id = *(&mut self.external_clients[idx])
+                            .entry(external)
+                            .or_insert_with(|| {
+                                // add a new mapped external client id
+                                let internal =
+                                    ClientId(COMBINATOR_INDEXES.fetch_add(1, Ordering::SeqCst));
+                                self.internal_clients.insert(internal, (idx, external));
+                                internal
+                            });
+
+                        // place back futs
+                        for (i, fut) in others.iter_mut().enumerate() {
+                            std::mem::swap(fut, &mut self.pending_client_futs[i]);
+                        }
+                        Ok((id, r))
+                    }
+                    err @ Err(_) => err,
+                }
+            } else {
+                Err(ErrorKind::TransportProtocolDisconnect.into())
+            }
+        })
     }
 
-    async fn send(
-        &mut self,
+    fn send<'a>(
+        &'a mut self,
         internal: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Result<(), ClientError> {
-        let (idx, external) = self
-            .internal_clients
-            .get(&internal)
-            .ok_or(ErrorKind::UnknownClient(internal))?;
-        (&self.clients[*idx])
-            .send((*external, response))
-            .await
-            .map_err(|_| ErrorKind::TransportProtocolDisconnect)?;
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+        Box::pin(async move {
+            let (idx, external) = self
+                .internal_clients
+                .get(&internal)
+                .ok_or(ErrorKind::UnknownClient(internal))?;
+            (&self.clients[*idx])
+                .send((*external, response))
+                .await
+                .map_err(|_| ErrorKind::TransportProtocolDisconnect)?;
+            Ok(())
+        })
     }
 
     fn cloned(&self) -> BoxedClient {
