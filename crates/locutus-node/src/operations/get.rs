@@ -423,7 +423,7 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetO
                     new_state = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
-            };
+            }
 
             let output_state = Some(Self {
                 id: self.id,
@@ -441,7 +441,7 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetO
     }
 }
 
-pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> Self {
+pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> GetOp {
     log::debug!(
         "Requesting get contract {} @ loc({})",
         key,
@@ -533,8 +533,8 @@ where
             });
 
             let op = GetOp {
-                state: new_state,
                 id,
+                state: new_state,
                 _ttl: get_op._ttl,
             };
 

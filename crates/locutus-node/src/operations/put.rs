@@ -444,7 +444,7 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                     new_state = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
-            };
+            }
 
             let output_state = Some(Self {
                 id: self.id,
@@ -481,6 +481,7 @@ pub fn start_op(
         value,
         htl,
     });
+
     PutOp {
         id,
         state,
@@ -572,6 +573,7 @@ where
         }
         _ => return Err(OpError::InvalidStateTransition(put_op.id)),
     };
+
     Ok(())
 }
 

@@ -514,7 +514,7 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for Join
                     };
                 }
                 _ => return Err(OpError::UnexpectedOpState),
-            };
+            }
 
             let output_state = Some(Self {
                 id: self.id,
