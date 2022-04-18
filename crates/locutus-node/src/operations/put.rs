@@ -482,8 +482,8 @@ pub fn start_op(
         htl,
     });
     PutOp {
-        state,
         id,
+        state,
         _ttl: PEER_TIMEOUT,
     }
 }
@@ -552,7 +552,7 @@ where
             let new_state = Some(PutState::AwaitingResponse {
                 contract: contract.key(),
             });
-            let return_msg = Some(PutMsg::RequestPut {
+            let msg = Some(PutMsg::RequestPut {
                 id,
                 contract,
                 value,
@@ -567,7 +567,7 @@ where
             };
 
             op_storage
-                .notify_op_change(return_msg.map(Message::from).unwrap(), OpEnum::Put(op))
+                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Put(op))
                 .await?;
         }
         _ => return Err(OpError::InvalidStateTransition(put_op.id)),

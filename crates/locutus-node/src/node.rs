@@ -357,7 +357,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         "Received get from user event @ {}",
                         &op_storage_cp.ring.peer_key
                     );
-                    let op = get::GetOp::start_op(key, contract, &op_storage_cp.ring.peer_key);
+                    let op = get::start_op(key, contract, &op_storage_cp.ring.peer_key);
                     if let Err(err) = get::request_get(&op_storage_cp, op).await {
                         log::error!("{}", err);
                     }
@@ -372,8 +372,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
                             Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
                                 log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
-                                let get_op =
-                                    get::GetOp::start_op(key, true, &op_storage_cp.ring.peer_key);
+                                let get_op = get::start_op(key, true, &op_storage_cp.ring.peer_key);
                                 if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
                                     log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
                                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -448,7 +447,8 @@ async fn process_message<CErr, CB>(
                 Message::Get(op) => {
                     log_handling_msg!("get", op.id(), op_storage);
                     let op_result =
-                        get::handle_get_request(&op_storage, &mut conn_manager, op).await;
+                        handle_op_request::<get::GetOp, _, _>(&op_storage, &mut conn_manager, op)
+                            .await;
                     report_result(op_result);
                 }
                 Message::Subscribe(op) => {
