@@ -1,6 +1,6 @@
 # Locutus 
 
-[![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/2kZuKNxYXv)
+![Matrix](https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix) [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=chat&logo=discord)](https://discord.gg/2kZuKNxYXv)
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
