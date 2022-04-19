@@ -453,9 +453,12 @@ async fn process_message<CErr, CB>(
                 }
                 Message::Subscribe(op) => {
                     log_handling_msg!("subscribe", op.id(), op_storage);
-                    let op_result =
-                        subscribe::handle_subscribe_response(&op_storage, &mut conn_manager, op)
-                            .await;
+                    let op_result = handle_op_request::<subscribe::SubscribeOp, _, _>(
+                        &op_storage,
+                        &mut conn_manager,
+                        op,
+                    )
+                    .await;
                     report_result(op_result);
                 }
                 _ => {}

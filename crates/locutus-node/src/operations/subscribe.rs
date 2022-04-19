@@ -15,11 +15,7 @@ use crate::{
     ring::{PeerKeyLocation, RingError},
 };
 
-use super::{
-    handle_op_result,
-    state_machine::{StateMachine, StateMachineImpl},
-    OpEnum, OpError, OperationResult,
-};
+use super::{OpEnum, OpError, OperationResult};
 
 pub(crate) use self::messages::SubscribeMsg;
 
