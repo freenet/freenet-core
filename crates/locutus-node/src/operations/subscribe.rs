@@ -27,7 +27,10 @@ pub(crate) struct SubscribeOp {
     _ttl: Duration,
 }
 
-impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for SubscribeOp {
+impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for SubscribeOp
+where
+    CErr: std::error::Error + Send,
+{
     type Message = SubscribeMsg;
     type Error = OpError<CErr>;
 
@@ -69,13 +72,13 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for Subs
         &self.id
     }
 
-    fn process_message(
+    fn process_message<'a>(
         self,
-        conn_manager: &mut CB,
-        op_storage: &OpManager<CErr>,
+        conn_manager: &'a mut CB,
+        op_storage: &'a OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>> {
-        let fut = async move {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
             let mut return_msg = None;
             let mut new_state = None;
 
@@ -213,11 +216,6 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for Subs
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.push(sender.peer);
-                                new_state = Some(SubscribeState::AwaitingResponse {
-                                    skip_list,
-                                    retries: retries + 1,
-                                });
-
                                 if let Some(target) = op_storage
                                     .ring
                                     .closest_caching(&key, 1, skip_list.as_slice())
@@ -236,6 +234,10 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for Subs
                                 } else {
                                     return Err(RingError::NoCachingPeers(key).into());
                                 }
+                                new_state = Some(SubscribeState::AwaitingResponse {
+                                    skip_list,
+                                    retries: retries + 1,
+                                });
                             } else {
                                 new_state = None;
                                 return Err(OpError::MaxRetriesExceeded(id, "sub".to_owned()));
@@ -280,13 +282,11 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for Subs
                 return_msg: return_msg.map(Message::from),
                 state: output_state.map(OpEnum::Subscribe),
             })
-        };
-
-        Box::pin(fut)
+        })
     }
 }
 
-pub fn start_op(key: ContractKey, peer: &PeerKey) -> SubscribeOp {
+pub(crate) fn start_op(key: ContractKey, peer: &PeerKey) -> SubscribeOp {
     let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), peer);
     let state = Some(SubscribeState::PrepareRequest { id, key });
     SubscribeOp {
@@ -316,7 +316,7 @@ enum SubscribeState {
 /// Request to subscribe to value changes from a contract.
 pub(crate) async fn request_subscribe<CErr>(
     op_storage: &OpManager<CErr>,
-    mut sub_op: SubscribeOp,
+    sub_op: SubscribeOp,
 ) -> Result<(), OpError<CErr>>
 where
     CErr: std::error::Error,

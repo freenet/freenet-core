@@ -16,11 +16,7 @@ use crate::{
     Location,
 };
 
-use super::{
-    handle_op_result,
-    state_machine::{StateMachine, StateMachineImpl},
-    OpEnum, OpError, OperationResult,
-};
+use super::{handle_op_result, OpEnum, OpError, OperationResult};
 
 pub(crate) use self::messages::GetMsg;
 
@@ -37,7 +33,10 @@ pub(crate) struct GetOp {
     _ttl: Duration,
 }
 
-impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetOp {
+impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for GetOp
+where
+    CErr: std::error::Error + Send,
+{
     type Message = GetMsg;
     type Error = OpError<CErr>;
 
@@ -76,13 +75,13 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetO
         &self.id
     }
 
-    fn process_message(
+    fn process_message<'a>(
         self,
-        conn_manager: &mut CB,
-        op_storage: &OpManager<CErr>,
+        conn_manager: &'a mut CB,
+        op_storage: &'a OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>> {
-        let fut = async move {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
             let mut return_msg = None;
             let mut new_state = None;
 
@@ -154,20 +153,22 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetO
                             new_target.peer
                         );
 
-                        conn_manager
-                            .send(
-                                &new_target.peer,
-                                (GetMsg::SeekNode {
-                                    id,
-                                    key,
-                                    fetch_contract,
-                                    sender,
-                                    target: new_target,
-                                    htl: new_htl,
-                                })
-                                .into(),
-                            )
-                            .await?;
+                        {
+                            conn_manager
+                                .send(
+                                    &new_target.peer,
+                                    (GetMsg::SeekNode {
+                                        id,
+                                        key,
+                                        fetch_contract,
+                                        sender,
+                                        target: new_target,
+                                        htl: new_htl,
+                                    })
+                                    .into(),
+                                )
+                                .await?;
+                        }
 
                         return_msg = None;
                         new_state = None;
@@ -267,12 +268,6 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetO
                             if retries < MAX_RETRIES {
                                 // no respose received from this peer, so skip it in the next iteration
                                 skip_list.push(target.peer);
-                                new_state = Some(GetState::AwaitingResponse {
-                                    skip_list,
-                                    retries: retries + 1,
-                                    fetch_contract,
-                                });
-
                                 if let Some(target) = op_storage
                                     .ring
                                     .closest_caching(&key, 1, skip_list.as_slice())
@@ -284,12 +279,17 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetO
                                         key,
                                         target,
                                         sender: this_loc,
-                                        fetch_contract: fetch_contract,
+                                        fetch_contract,
                                         htl: MAX_GET_RETRY_HOPS,
                                     });
                                 } else {
                                     return Err(RingError::NoCachingPeers(key).into());
                                 }
+                                new_state = Some(GetState::AwaitingResponse {
+                                    skip_list,
+                                    retries: retries + 1,
+                                    fetch_contract,
+                                });
                             } else {
                                 log::error!(
                                     "Failed getting a value for contract {}, reached max retries",
@@ -435,13 +435,11 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for GetO
                 return_msg: return_msg.map(Message::from),
                 state: output_state.map(OpEnum::Get),
             })
-        };
-
-        Box::pin(fut)
+        })
     }
 }
 
-pub fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> GetOp {
+pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> GetOp {
     log::debug!(
         "Requesting get contract {} @ loc({})",
         key,
@@ -484,7 +482,7 @@ enum GetState {
 /// Request to get the current value from a contract.
 pub(crate) async fn request_get<CErr>(
     op_storage: &OpManager<CErr>,
-    mut get_op: GetOp,
+    get_op: GetOp,
 ) -> Result<(), OpError<CErr>>
 where
     CErr: std::error::Error,
