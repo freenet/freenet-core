@@ -6,18 +6,18 @@ use std::{
 
 use itertools::Itertools;
 use libp2p::{identity, PeerId};
-use locutus_runtime::{Contract, ContractKey, ContractState};
+use locutus_runtime::prelude::{ContractKey, ContractState};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, instrument};
 
 use crate::{
+    client_events::{test::MemoryEventsGen, ClientRequest},
     config::GlobalExecutor,
     contract::{MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
-    client_events::{test::MemoryEventsGen, ClientRequest},
-    NodeConfig,
+    Contract, NodeConfig,
 };
 
 use super::PeerKey;
@@ -113,7 +113,7 @@ impl SimNetwork {
             let port = get_free_port().unwrap();
             let location = Location::random();
 
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
@@ -177,7 +177,7 @@ impl SimNetwork {
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().to_peer_id();
 
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
             for GatewayConfig {
                 port, id, location, ..
             } in &gateways

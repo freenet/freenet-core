@@ -172,9 +172,9 @@ pub(in crate::node) struct P2pConnManager {
 }
 
 impl P2pConnManager {
-    pub fn build(
+    pub fn build<const CLIENTS: usize>(
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
-        config: &NodeConfig,
+        config: &NodeConfig<CLIENTS>,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.

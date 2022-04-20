@@ -7,9 +7,19 @@
 use std::{
     borrow::Cow,
     ops::{Deref, DerefMut},
+    path::PathBuf,
 };
 
-use serde::{Deserialize, Serialize};
+use arrayvec::ArrayVec;
+use blake2::{Blake2b512, Digest};
+use serde::{Deserialize, Deserializer, Serialize};
+
+const CONTRACT_KEY_SIZE: usize = 64;
+
+#[derive(Debug)]
+pub enum ContractError {
+    InvalidUpdate,
+}
 
 pub struct Parameters<'a>(&'a [u8]);
 
@@ -31,7 +41,8 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct State<'a>(Cow<'a, [u8]>);
 
 impl<'a> State<'a> {
@@ -83,7 +94,7 @@ impl<'a> DerefMut for State<'a> {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StateDelta<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateDelta<'a> {
@@ -214,11 +225,6 @@ pub enum UpdateModification {
     NoChange,
 }
 
-#[derive(Debug)]
-pub enum ContractError {
-    InvalidUpdate,
-}
-
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
@@ -255,4 +261,179 @@ pub trait ContractInterface {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<UpdateModification, ContractError>;
+}
+
+/// Main abstraction for representing a contract in binary form.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Contract {
+    data: Vec<u8>,
+    #[serde(serialize_with = "<[_]>::serialize")]
+    #[serde(deserialize_with = "contract_key_deser")]
+    key: [u8; CONTRACT_KEY_SIZE],
+}
+
+impl Contract {
+    pub fn new(data: Vec<u8>) -> Self {
+        let mut hasher = Blake2b512::new();
+        hasher.update(&data);
+        let key_arr = hasher.finalize();
+        debug_assert_eq!((&key_arr[..]).len(), CONTRACT_KEY_SIZE);
+        let mut key = [0; CONTRACT_KEY_SIZE];
+        key.copy_from_slice(&key_arr);
+
+        Self { data, key }
+    }
+
+    pub fn key(&self) -> ContractKey {
+        ContractKey(self.key)
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &*self.data
+    }
+
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+}
+
+impl PartialEq for Contract {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Contract {}
+
+#[cfg(any(test, feature = "testing"))]
+impl<'a> arbitrary::Arbitrary<'a> for Contract {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let data: Vec<u8> = u.arbitrary()?;
+        Ok(Contract::new(data))
+    }
+}
+
+impl std::fmt::Display for Contract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Contract( key: ")?;
+        internal_fmt_key(&self.key, f)?;
+        let data: String = if self.data.len() > 8 {
+            (&self.data[..4])
+                .iter()
+                .map(|b| char::from(*b))
+                .chain("...".chars())
+                .chain((&self.data[4..]).iter().map(|b| char::from(*b)))
+                .collect()
+        } else {
+            self.data.iter().copied().map(char::from).collect()
+        };
+        write!(f, ", data: [{}])", data)
+    }
+}
+
+/// The key representing a contract.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+#[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
+pub struct ContractKey(
+    #[serde(deserialize_with = "contract_key_deser")]
+    #[serde(serialize_with = "<[_]>::serialize")]
+    [u8; CONTRACT_KEY_SIZE],
+);
+
+impl ContractKey {
+    pub fn bytes(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+
+    pub fn hex_decode(encoded: impl Into<String>) -> Result<Self, hex::FromHexError> {
+        let mut arr = [0; 64];
+        hex::decode_to_slice(encoded.into(), &mut arr)?;
+        Ok(Self(arr))
+    }
+
+    pub fn hex_encode(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl From<ContractKey> for PathBuf {
+    fn from(val: ContractKey) -> Self {
+        let r = hex::encode(val.0);
+        PathBuf::from(r)
+    }
+}
+
+impl Deref for ContractKey {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ContractKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ContractKey(")?;
+        internal_fmt_key(&self.0, f)?;
+        write!(f, ")")
+    }
+}
+
+fn internal_fmt_key(
+    key: &[u8; CONTRACT_KEY_SIZE],
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    let r = hex::encode(key);
+    write!(f, "{}", &r[..8])
+}
+
+// A bit wasteful but cannot deserialize directly into [u8; 64]
+// with current version of serde
+fn contract_key_deser<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let data: ArrayVec<u8, 64> = Deserialize::deserialize(deserializer)?;
+    data.into_inner()
+        .map_err(|_| <D::Error as serde::de::Error>::custom("invalid key length"))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
+
+    static RND_BYTES: Lazy<[u8; 1024]> = Lazy::new(|| {
+        let mut bytes = [0; 1024];
+        let mut rng = SmallRng::from_entropy();
+        rng.fill(&mut bytes);
+        bytes
+    });
+
+    #[test]
+    fn key_ser() -> Result<(), Box<dyn std::error::Error>> {
+        let mut gen = arbitrary::Unstructured::new(&*RND_BYTES);
+        let expected: ContractKey = gen.arbitrary()?;
+        let encoded = hex::encode(expected.bytes());
+        // eprintln!("encoded key: {encoded}");
+
+        let serialized = bincode::serialize(&expected)?;
+        let deserialized: ContractKey = bincode::deserialize(&serialized)?;
+        let decoded = hex::encode(deserialized.bytes());
+        assert_eq!(encoded, decoded);
+        assert_eq!(deserialized, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn contract_ser() -> Result<(), Box<dyn std::error::Error>> {
+        let mut gen = arbitrary::Unstructured::new(&*RND_BYTES);
+        let expected: Contract = gen.arbitrary()?;
+
+        let serialized = bincode::serialize(&expected)?;
+        let deserialized: Contract = bincode::deserialize(&serialized)?;
+        assert_eq!(deserialized, expected);
+        Ok(())
+    }
 }

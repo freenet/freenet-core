@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use locutus_runtime::*;
+use locutus_runtime::prelude::*;
 use locutus_stdlib::prelude::*;
 
 fn test_dir() -> PathBuf {
@@ -11,7 +11,7 @@ fn test_dir() -> PathBuf {
     test_dir
 }
 
-fn test_contract(contract_path: &str) -> Contract {
+fn test_contract(contract_path: &str) -> WrappedContract {
     const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
     let contracts = PathBuf::from(CONTRACTS_DIR);
     let mut dirs = contracts.ancestors();
@@ -20,7 +20,7 @@ fn test_contract(contract_path: &str) -> Contract {
         .join("contracts")
         .join("test_contract")
         .join(contract_path);
-    Contract::try_from(contract_path).expect("contract found")
+    WrappedContract::try_from(contract_path).expect("contract found")
 }
 
 fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {

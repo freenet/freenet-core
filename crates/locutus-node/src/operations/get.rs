@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use locutus_runtime::ContractKey;
+use locutus_stdlib::prelude::ContractKey;
 
 use crate::{
     config::PEER_TIMEOUT,
@@ -685,13 +685,14 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use locutus_runtime::{Contract, ContractState};
+    use locutus_runtime::prelude::*;
 
     use crate::{
+        client_events::ClientRequest,
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
-        client_events::ClientRequest,
+        Contract,
     };
     use std::collections::HashMap;
 
@@ -705,7 +706,7 @@ mod test {
         let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), &requester);
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
             location: Some(Location::random()),
             peer: PeerKey::random(),

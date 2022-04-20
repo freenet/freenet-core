@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     error::Error,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -11,34 +13,49 @@ use std::{
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 use rmp_serde as rmps;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use warp::Filter;
+use warp::{filters::BoxedFilter, Filter, Reply};
 
-use crate::{
-    client_events::{ClientEventsProxy, ClientId},
-    ClientRequest, HostResponse,
-};
+use super::{ClientError, ClientEventsProxy, ClientId, ErrorKind, HostResult};
+use crate::{ClientRequest, HostResponse};
 
-const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal stuff
+const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
-pub(crate) struct WebSocketProxy {
+pub struct WebSocketProxy {
     server_request: Receiver<(ClientId, ClientRequest)>,
     server_response: Sender<(ClientId, HostResult)>,
 }
 
-type NewResponseSender = Sender<Result<HostResponse, String>>;
-type HostResult = Result<HostResponse, String>;
+type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
 
 impl WebSocketProxy {
-    pub async fn start_server<T: Into<SocketAddr>>(
+    /// Starts this as an upgrade to an existing HTTP connection at the `/ws-api` URL
+    pub fn as_upgrade<T: Into<SocketAddr>>(
         socket: T,
+        server_config: BoxedFilter<(impl Reply + 'static,)>,
+    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>> {
+        Self::start_server_internal(socket, server_config)
+    }
+
+    /// Starts the websocket connection at the default `/ws-api` URL
+    pub fn start_server<T: Into<SocketAddr>>(
+        socket: T,
+    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>> {
+        let filter = warp::filters::path::end().map(warp::reply::reply).boxed();
+        Self::start_server_internal(socket, filter)
+    }
+
+    async fn start_server_internal<T: Into<SocketAddr>>(
+        socket: T,
+        filter: BoxedFilter<(impl Reply + 'static,)>,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
         let (request_sender, server_request) = channel(PARALLELISM);
         let (server_response, response_receiver) = channel(PARALLELISM);
         let (new_client_up, new_clients) = channel(PARALLELISM);
         tokio::spawn(serve(
-            request_sender,
+            Arc::new(request_sender),
             Arc::new(new_client_up),
             socket.into(),
+            filter,
         ));
         tokio::spawn(responses(new_clients, response_receiver));
         Ok(Self {
@@ -48,19 +65,57 @@ impl WebSocketProxy {
     }
 }
 
+#[allow(clippy::needless_lifetimes)]
+impl ClientEventsProxy for WebSocketProxy {
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
+    > {
+        Box::pin(async move {
+            let (id, msg) = self
+                .server_request
+                .recv()
+                .await
+                .ok_or(ErrorKind::ChannelClosed)?;
+            Ok((id, msg))
+        })
+    }
+
+    fn send<'a>(
+        &mut self,
+        client: ClientId,
+        response: Result<HostResponse, ClientError>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+        Box::pin(async move {
+            self.server_response
+                .send((client, response))
+                .await
+                .map_err(|_| ErrorKind::ChannelClosed)?;
+            Ok(())
+        })
+    }
+
+    fn cloned(&self) -> super::BoxedClient {
+        todo!()
+    }
+}
+
 async fn serve(
-    request_sender: Sender<(ClientId, ClientRequest)>,
+    request_sender: Arc<Sender<(ClientId, ClientRequest)>>,
     new_responses: Arc<Sender<ClientHandling>>,
     socket: SocketAddr,
+    server_config: BoxedFilter<(impl Reply + 'static,)>,
 ) {
-    let r_sender = Arc::new(request_sender);
-    let req_channel = warp::any().map(move || (r_sender.clone(), new_responses.clone()));
-    let request_receiver = warp::path("receiver").and(warp::ws()).and(req_channel).map(
-        |ws: warp::ws::Ws, (request_sender, new_responses)| {
+    let req_channel = warp::any().map(move || (request_sender.clone(), new_responses.clone()));
+    let request_receiver = server_config.or(warp::path("ws-api")
+        .and(warp::ws())
+        .and(req_channel)
+        .map(|ws: warp::ws::Ws, (request_sender, new_responses)| {
             ws.on_upgrade(move |socket| handle_socket(socket, request_sender, new_responses))
-        },
-    );
-    warp::serve(request_receiver).run(socket).await
+        })
+        .with(warp::trace::request()));
+    warp::serve(request_receiver).run(socket).await;
 }
 
 enum ClientHandling {
@@ -186,37 +241,11 @@ async fn new_request(
 
 async fn send_reponse_to_client(
     response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
-    response: Result<HostResponse, String>,
+    response: Result<HostResponse, ClientError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serialize = rmps::to_vec(&response).unwrap();
     response_stream
         .send(warp::ws::Message::binary(serialize))
         .await?;
     Ok(())
-}
-
-#[async_trait::async_trait]
-impl ClientEventsProxy for WebSocketProxy {
-    type Error = String;
-
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error> {
-        let (id, msg) = self
-            .server_request
-            .recv()
-            .await
-            .ok_or_else(|| "Channel closed".to_owned())?;
-        Ok((id, msg))
-    }
-
-    async fn send(
-        &mut self,
-        client: ClientId,
-        response: Result<HostResponse, Self::Error>,
-    ) -> Result<(), Self::Error> {
-        self.server_response
-            .send((client, response))
-            .await
-            .map_err(|_| "Channel closed".to_string())?;
-        Ok(())
-    }
 }

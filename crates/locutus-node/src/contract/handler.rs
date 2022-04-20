@@ -3,12 +3,13 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{Contract, ContractStore, ContractState, RuntimeResult};
-use locutus_stdlib::interface::*;
+use locutus_runtime::prelude::*;
+use locutus_stdlib::prelude::{Parameters, State, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
+use crate::Contract;
 pub(crate) use sqlite::{SQLiteContractHandler, SqlDbError};
 
 const MAX_MEM_CACHE: i64 = 10_000_000;

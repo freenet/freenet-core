@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use locutus_runtime::ContractKey;
+use locutus_runtime::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -499,14 +499,15 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use locutus_runtime::{Contract, ContractState};
+    use locutus_runtime::prelude::ContractState;
 
     use super::*;
     use crate::{
+        client_events::ClientRequest,
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
-        client_events::ClientRequest,
+        Contract,
     };
     use std::collections::HashMap;
 

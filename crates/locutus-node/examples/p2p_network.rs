@@ -1,12 +1,13 @@
-use std::{net::Ipv4Addr, time::Duration};
+use std::{net::Ipv4Addr, pin::Pin, time::Duration};
 
 use anyhow::{anyhow, bail};
+use futures::Future;
 use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
 };
-use locutus_node::{ClientRequest, InitPeerNode, Location, NodeConfig};
-use locutus_runtime::{Contract, ContractState};
+use locutus_node::*;
+use locutus_runtime::prelude::{ContractState, WrappedContract};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");
@@ -18,7 +19,7 @@ async fn start_gateway(
     user_events: UserEvents,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // todo: send user events though ws interface
-    let mut config = NodeConfig::default();
+    let mut config = NodeConfig::new([Box::new(user_events)]);
     config
         .with_ip(Ipv4Addr::LOCALHOST)
         .with_port(port)
@@ -32,13 +33,13 @@ async fn start_new_peer(
     user_events: UserEvents,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // todo: send user events though ws interface
-    let mut config = NodeConfig::default();
+    let mut config = NodeConfig::new([Box::new(user_events)]);
     config.add_gateway(gateway_config);
     config.build()?.run().await
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    let contract = Contract::new(vec![7, 3, 9, 5]);
+    let contract = WrappedContract::new(vec![7, 3, 9, 5]);
     let key = contract.key();
     let init_val = ContractState::new(vec![1, 2, 3, 4]);
 
@@ -134,21 +135,38 @@ struct UserEvents {
     rx_ev: Receiver<ClientRequest>,
 }
 
-// #[async_trait::async_trait]
-// impl ClientEventsProxy for UserEvents {
-//     type Error = String;
-//     async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error> {
-//         Ok((ClientId(1), self.rx_ev.recv().await.expect("channel open")))
-//     }
-//     async fn send(
-//         &mut self,
-//         _id: ClientId,
-//         _response: Result<HostResponse, Self::Error>,
-//     ) -> Result<(), Self::Error> {
-//         log::info!("received response");
-//         Ok(())
-//     }
-// }
+impl ClientEventsProxy for UserEvents {
+    /// # Cancellation Safety
+    /// This future must be safe to cancel.
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
+    > {
+        Box::pin(async move {
+            Ok((
+                ClientId::new(1),
+                self.rx_ev.recv().await.expect("channel open"),
+            ))
+        })
+    }
+
+    /// Sends a response from the host to the client application.
+    fn send<'a>(
+        &'a mut self,
+        id: ClientId,
+        response: Result<HostResponse, ClientError>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+        Box::pin(async move {
+            log::info!("received response");
+            Ok(())
+        })
+    }
+
+    fn cloned(&self) -> BoxedClient {
+        todo!()
+    }
+}
 
 struct Args {
     is_gw: bool,

@@ -2,10 +2,15 @@ mod contract;
 mod contract_store;
 mod runtime;
 
-pub use contract::{Contract, ContractKey, ContractState};
-pub use contract_store::ContractStore;
-use locutus_stdlib::prelude::BufferError;
-pub use runtime::{ExecError, Runtime};
+pub mod prelude {
+    pub use super::contract::{Contract as WrappedContract, ContractState};
+    pub use super::contract_store::ContractStore;
+    pub use super::runtime::{ExecError, Runtime};
+    pub use super::RuntimeResult;
+    pub use locutus_stdlib::prelude::ContractKey;
+}
+
+use locutus_stdlib::prelude::{BufferError, ContractKey};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractRuntimeError>;
 
@@ -18,7 +23,7 @@ pub enum ContractRuntimeError {
     ContractNotFound(ContractKey),
 
     #[error(transparent)]
-    ExecError(#[from] ExecError),
+    ExecError(#[from] runtime::ExecError),
 
     #[error(transparent)]
     IOError(#[from] std::io::Error),

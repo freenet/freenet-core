@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use locutus_runtime::{ContractKey, ContractStore, ContractState};
+use locutus_runtime::prelude::{ContractKey, ContractState, ContractStore};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel, RuntimeInterface};
 use crate::config::CONFIG;
@@ -100,7 +100,7 @@ impl From<std::io::Error> for SimStoreError {
 
 #[cfg(test)]
 mod tests {
-    use locutus_runtime::Contract;
+    use crate::Contract;
 
     #[test]
     fn serialization() -> Result<(), anyhow::Error> {

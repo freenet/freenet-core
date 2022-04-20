@@ -24,7 +24,7 @@ use std::{
 
 use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
-use locutus_runtime::ContractKey;
+use locutus_runtime::prelude::ContractKey;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -104,7 +104,10 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new(config: &NodeConfig, gateways: &[PeerKeyLocation]) -> Result<Self, anyhow::Error> {
+    pub fn new<const CLIENTS: usize>(
+        config: &NodeConfig<CLIENTS>,
+        gateways: &[PeerKeyLocation],
+    ) -> Result<Self, anyhow::Error> {
         let peer_key = PeerKey::from(config.local_key.public());
 
         // for location here consider -1 == None
@@ -481,6 +484,7 @@ pub(crate) enum RingError {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::client_events::test::MemoryEventsGen;
 
     #[test]
     fn location_dist() {
@@ -495,7 +499,7 @@ mod test {
 
     #[test]
     fn find_closest() {
-        let config = NodeConfig::new();
+        let config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
         let ring = Ring::new(&config, &[]).unwrap();
 
         fn build_pk(loc: Location) -> PeerKeyLocation {

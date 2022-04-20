@@ -1,32 +1,99 @@
+use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
+use std::{error::Error as StdError, fmt::Display};
+
 use either::Either;
-use locutus_runtime::{Contract, ContractKey, ContractState};
+use locutus_runtime::prelude::*;
 use locutus_stdlib::prelude::{State, StateDelta};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+use crate::Contract;
+
+pub(crate) mod combinator;
+#[cfg(feature = "websocket")]
+pub(crate) mod websocket;
+
+pub type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
+type HostResult = Result<HostResponse, ClientError>;
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[repr(transparent)]
-pub struct ClientId(pub usize);
+pub struct ClientId(pub(crate) usize);
 
-// fixme: only use this internally, communication outside of the node should come from
-//        one of the offered client interfaces enabled through features (eg. websockets)
-#[async_trait::async_trait]
+impl ClientId {
+    pub fn new(id: usize) -> Self {
+        Self(id)
+    }
+}
+
+impl Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientError {
+    kind: ErrorKind,
+}
+
+impl ClientError {
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+}
+
+impl From<ErrorKind> for ClientError {
+    fn from(kind: ErrorKind) -> Self {
+        ClientError { kind }
+    }
+}
+
+#[derive(thiserror::Error, Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub enum ErrorKind {
+    #[error("comm channel between client/host closed")]
+    ChannelClosed,
+    #[error("lost the connection with the protocol hanling connections")]
+    TransportProtocolDisconnect,
+    #[error("unknown client id: {0}")]
+    UnknownClient(ClientId),
+}
+
+impl From<ErrorKind> for warp::Rejection {
+    fn from(_: ErrorKind) -> Self {
+        todo!()
+    }
+}
+
+impl Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClientError")
+    }
+}
+
+impl StdError for ClientError {}
+
+type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
+
+#[allow(clippy::needless_lifetimes)]
 pub trait ClientEventsProxy {
-    type Error: std::fmt::Debug + Into<Box<dyn std::error::Error + Send + Sync>> + Serialize;
-
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error>;
+    fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>>;
 
     /// Sends a response from the host to the client application.
-    async fn send(
-        &mut self,
+    fn send<'a>(
+        &'a mut self,
         id: ClientId,
-        response: Result<HostResponse, Self::Error>,
-    ) -> Result<(), Self::Error>;
+        response: Result<HostResponse, ClientError>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>>;
+
+    fn cloned(&self) -> BoxedClient;
 }
 
 /// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum HostResponse {
     PutResponse(ContractKey),
     /// Successful update
@@ -43,7 +110,7 @@ pub enum HostResponse {
 }
 
 /// A request from a client application to the host.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum ClientRequest {
     /// Insert a new value in a contract corresponding with the provided key.
@@ -64,14 +131,32 @@ pub enum ClientRequest {
         /// If this flag is set then fetch also the contract itself.
         contract: bool,
     },
-    /// Subscribe to teh changes in a given contract. Implicitly starts a get operation
+    /// Subscribe to the changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
+    /// After this action the client will start receiving all changes though the open
+    /// connection.
     Subscribe {
         key: ContractKey,
     },
     Disconnect {
         cause: Option<String>,
     },
+}
+
+impl Display for ClientRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientRequest::Put { contract, state } => {
+                write!(f, "put request for contract {contract} with state {state}")
+            }
+            ClientRequest::Update { key, .. } => write!(f, "Update request for {key}"),
+            ClientRequest::Get { key, contract } => {
+                write!(f, "get request for {key} (fetch full contract: {contract})")
+            }
+            ClientRequest::Subscribe { key } => write!(f, "subscribe request for {key}"),
+            ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +180,10 @@ pub(crate) mod test {
     }
 
     impl MemoryEventsGen {
+        pub fn new_tmp() -> Self {
+            todo!()
+        }
+
         pub fn new(signal: Receiver<(EventId, PeerKey)>, id: PeerKey) -> Self {
             Self {
                 signal,
@@ -186,37 +275,50 @@ pub(crate) mod test {
         }
     }
 
-    #[async_trait::async_trait]
+    #[allow(clippy::needless_lifetimes)]
     impl ClientEventsProxy for MemoryEventsGen {
-        type Error = String;
-
-        async fn recv(&mut self) -> Result<(ClientId, ClientRequest), Self::Error> {
-            loop {
-                if self.signal.changed().await.is_ok() {
-                    let (ev_id, pk) = *self.signal.borrow();
-                    if pk == self.id && !self.random {
-                        return Ok((
-                            ClientId(1),
-                            self.generate_deterministic_event(&ev_id)
-                                .expect("event not found"),
-                        ));
-                    } else if pk == self.id {
-                        return Ok((ClientId(1), self.generate_rand_event()));
+        fn recv<'a>(
+            &'a mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>>
+                    + Send
+                    + Sync
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                loop {
+                    if self.signal.changed().await.is_ok() {
+                        let (ev_id, pk) = *self.signal.borrow();
+                        if pk == self.id && !self.random {
+                            return Ok((
+                                ClientId(1),
+                                self.generate_deterministic_event(&ev_id)
+                                    .expect("event not found"),
+                            ));
+                        } else if pk == self.id {
+                            return Ok((ClientId(1), self.generate_rand_event()));
+                        }
+                    } else {
+                        log::debug!("sender half of user event gen dropped");
+                        // probably the process finished, wait for a bit and then kill the thread
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        panic!("finished orphan background thread");
                     }
-                } else {
-                    log::debug!("sender half of user event gen dropped");
-                    // probably the process finished, wait for a bit and then kill the thread
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    panic!("finished orphan background thread");
                 }
-            }
+            })
         }
 
-        async fn send(
+        fn send(
             &mut self,
             _id: ClientId,
-            _response: Result<HostResponse, Self::Error>,
-        ) -> Result<(), Self::Error> {
+            _response: Result<HostResponse, ClientError>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+            todo!()
+        }
+
+        fn cloned(&self) -> BoxedClient {
             todo!()
         }
     }

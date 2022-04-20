@@ -3,15 +3,12 @@ name = "locutus-node"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.58.0"
-resolver = "2"
-
-[lib]
-path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+arbitrary = { version = "1", features = ["derive"], optional = true}
 asynchronous-codec = "0.6"
-async-trait = "0.1.52"
+async-trait = "0.1"
 bincode = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 config = { version = "0.13.0", features = [ "toml" ] } 
@@ -38,7 +35,7 @@ once_cell = "1"
 parking_lot = "0.12.0"
 rand = "0.8"
 serde = { version = "1", features = ["rc", "derive"] }
-stretto = { version = "0.3.3", features = ["async"] }
+stretto = { version = "0.4", features = ["async"] }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs"] }
 unsigned-varint = "0.7"
@@ -49,7 +46,7 @@ sqlx = { version = "0.5", features = ["sqlite", "runtime-tokio-rustls"] }
 warp = { version = "0.3", default-features = false, optional = true, features = ["multipart", "tls"] }
 
 # Tracing deps
-tracing = {version = "0.1.30", optional = true }
+tracing = { version = "0.1", optional = true }
 opentelemetry = { version = "0.17.0" , default-features = false, features = ["rt-tokio", "trace"], optional = true }
 opentelemetry-jaeger = { version = "0.16.0", features = ["rt-tokio","collector_client", "isahc"], optional = true }
 tracing-opentelemetry = { version = "0.17.0", optional = true }
@@ -60,11 +57,15 @@ locutus-runtime = { path = "../locutus-runtime" }
 locutus-stdlib = { path = "../locutus-stdlib" }
 
 [dev-dependencies]
+tracing = "0.1"
 arbitrary = { version = "1", features = ["derive"] }
 itertools = "0.10"
 pico-args = "0.4"
+locutus-runtime = { path = "../locutus-runtime", features = ["testing"] }
+locutus-stdlib = { path = "../locutus-stdlib", features = ["testing"] }
 
 [features]
+testing = ["arbitrary"]
 default = ["websocket"]
 websocket = ["warp/websocket", "rmp", "rmp-serde"]
 trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]
