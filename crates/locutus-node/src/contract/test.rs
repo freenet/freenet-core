@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
-use locutus_runtime::prelude::{ContractKey, ContractState, ContractStore};
+use locutus_runtime::prelude::{ContractKey, ContractStore};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel, RuntimeInterface};
-use crate::config::CONFIG;
+use crate::{config::CONFIG, WrappedState};
 
 pub(crate) struct MockRuntime {}
 
 impl RuntimeInterface for MockRuntime {}
 
-pub(crate) type MemKVStore = HashMap<ContractKey, ContractState>;
+pub(crate) type MemKVStore = HashMap<ContractKey, WrappedState>;
 
 pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
     channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
@@ -63,18 +63,15 @@ impl ContractHandler for MemoryContractHandler {
     }
 
     /// Get current contract value, if present, otherwise get none.
-    async fn get_value(
-        &self,
-        contract: &ContractKey,
-    ) -> Result<Option<ContractState>, Self::Error> {
+    async fn get_value(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         Ok(self.kv_store.get(contract).cloned())
     }
 
     async fn put_value(
         &mut self,
         contract: &ContractKey,
-        value: ContractState,
-    ) -> Result<ContractState, Self::Error> {
+        value: WrappedState,
+    ) -> Result<WrappedState, Self::Error> {
         let new_val = value.clone();
         self.kv_store.insert(*contract, value);
         Ok(new_val)
@@ -100,16 +97,16 @@ impl From<std::io::Error> for SimStoreError {
 
 #[cfg(test)]
 mod tests {
-    use crate::Contract;
+    use crate::WrappedContract;
 
     #[test]
     fn serialization() -> Result<(), anyhow::Error> {
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
 
         let serialized = bincode::serialize(&contract)?;
-        let deser: Contract = bincode::deserialize(&serialized)?;
+        let deser: WrappedContract = bincode::deserialize(&serialized)?;
         assert_eq!(deser.data(), contract.data());
         assert_eq!(deser.key(), contract.key());
         Ok(())

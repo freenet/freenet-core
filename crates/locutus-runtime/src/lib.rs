@@ -2,12 +2,14 @@ mod contract;
 mod contract_store;
 mod runtime;
 
+pub use prelude::*;
+
 pub mod prelude {
-    pub use super::contract::{Contract as WrappedContract, ContractState};
+    pub use super::contract::{Contract as WrappedContract, State as WrappedState};
     pub use super::contract_store::ContractStore;
     pub use super::runtime::{ExecError, Runtime};
     pub use super::RuntimeResult;
-    pub use locutus_stdlib::prelude::ContractKey;
+    pub use locutus_stdlib::prelude::{ContractKey, State, StateDelta};
 }
 
 use locutus_stdlib::prelude::{BufferError, ContractKey};

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use either::Either;
-use locutus_runtime::prelude::{ContractKey, ContractState};
+use locutus_runtime::prelude::ContractKey;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -17,7 +17,7 @@ use crate::{
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
     util::IterExt,
-    Contract, NodeConfig,
+    NodeConfig, WrappedContract, WrappedState,
 };
 
 pub(super) struct NodeInMemory<CErr = SimStoreError> {
@@ -92,7 +92,7 @@ where
 
     pub async fn append_contracts(
         &self,
-        contracts: Vec<(Contract, ContractState)>,
+        contracts: Vec<(WrappedContract, WrappedState)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, value) in contracts {

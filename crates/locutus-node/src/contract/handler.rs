@@ -3,13 +3,13 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::prelude::*;
+use locutus_runtime::{ContractStore, RuntimeResult};
 use locutus_stdlib::prelude::{Parameters, State, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
-use crate::Contract;
+use crate::{WrappedContract, WrappedState};
 pub(crate) use sqlite::{SQLiteContractHandler, SqlDbError};
 
 const MAX_MEM_CACHE: i64 = 10_000_000;
@@ -25,8 +25,7 @@ pub(crate) trait ContractHandler:
     fn contract_store(&mut self) -> &mut ContractStore;
 
     /// Get current contract value, if present, otherwise get none.
-    async fn get_value(&self, contract: &ContractKey)
-        -> Result<Option<ContractState>, Self::Error>;
+    async fn get_value(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
 
     /// Updates (or inserts) a value for the given contract. This operation is fallible:
     /// It will return an error when the value is not valid (according to the contract specification)
@@ -35,8 +34,8 @@ pub(crate) trait ContractHandler:
     async fn put_value(
         &mut self,
         contract: &ContractKey,
-        value: ContractState,
-    ) -> Result<ContractState, Self::Error>;
+        value: WrappedState,
+    ) -> Result<WrappedState, Self::Error>;
 }
 
 pub struct EventId(u64);
@@ -154,8 +153,8 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
-    pub value: Option<ContractState>,
-    pub contract: Option<Contract>,
+    pub value: Option<WrappedState>,
+    pub contract: Option<WrappedContract>,
 }
 
 struct InternalCHEvent<CErr> {
@@ -168,11 +167,11 @@ pub(crate) enum ContractHandlerEvent<Err> {
     /// Try to push/put a new value into the contract.
     PushQuery {
         key: ContractKey,
-        value: ContractState,
+        value: WrappedState,
     },
     /// The response to a push query.
     PushResponse {
-        new_value: Result<ContractState, Err>,
+        new_value: Result<WrappedState, Err>,
     },
     /// Fetch a supposedly existing contract value in this node, and optionally the contract itself.  
     FetchQuery {
@@ -185,7 +184,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
         response: Result<StoreResponse, Err>,
     },
     /// Store a contract in the local store.
-    Cache(Contract),
+    Cache(WrappedContract),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError<Err>>),
 }
@@ -240,7 +239,7 @@ pub(crate) trait RuntimeInterface {
 mod sqlite {
     use std::str::FromStr;
 
-    use locutus_runtime::ContractRuntimeError;
+    use locutus_runtime::{ContractRuntimeError, ContractStore};
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},
@@ -285,7 +284,7 @@ mod sqlite {
         channel: ContractHandlerChannel<SqlDbError, CHListenerHalve>,
         store: ContractStore,
         runtime: R,
-        value_mem_cache: AsyncCache<ContractKey, ContractState>,
+        value_mem_cache: AsyncCache<ContractKey, WrappedState>,
         pub(super) pool: SqlitePool,
     }
 
@@ -362,14 +361,14 @@ mod sqlite {
         async fn get_value(
             &self,
             contract_key: &ContractKey,
-        ) -> Result<Option<ContractState>, Self::Error> {
+        ) -> Result<Option<WrappedState>, Self::Error> {
             let encoded_key = hex::encode(&**contract_key);
             if let Some(value) = self.value_mem_cache.get(contract_key) {
                 return Ok(Some(value.value().clone()));
             }
             match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
                 .bind(encoded_key)
-                .map(|row: SqliteRow| Some(ContractState::new(row.get("value"))))
+                .map(|row: SqliteRow| Some(WrappedState::new(row.get("value"))))
                 .fetch_one(&self.pool)
                 .await
             {
@@ -382,9 +381,9 @@ mod sqlite {
         async fn put_value(
             &mut self,
             contract_key: &ContractKey,
-            value: ContractState,
-        ) -> Result<ContractState, Self::Error> {
-            let old_value: ContractState = match self.get_value(contract_key).await {
+            value: WrappedState,
+        ) -> Result<WrappedState, Self::Error> {
+            let old_value = match self.get_value(contract_key).await {
                 Ok(Some(contract_value)) => contract_value,
                 Ok(None) => value.clone(),
                 Err(_) => value.clone(),
@@ -402,7 +401,7 @@ mod sqlite {
             )
             .bind(encoded_key)
             .bind(value)
-            .map(|row: SqliteRow| ContractState::new(row.get("value")))
+            .map(|row: SqliteRow| WrappedState::new(row.get("value")))
             .fetch_one(&self.pool)
             .await
             {
@@ -441,10 +440,10 @@ mod sqlite {
 
             // Generate a contract
             let contract_bytes = b"Test contract value".to_vec();
-            let contract: Contract = Contract::new(contract_bytes.clone());
+            let contract: WrappedContract = WrappedContract::new(contract_bytes.clone());
 
             // Get contract parts
-            let contract_value = ContractState::new(contract_bytes.clone());
+            let contract_value = WrappedState::new(contract_bytes.clone());
             let put_result_value = handler
                 .put_value(&contract.key(), contract_value.clone())
                 .await?;
@@ -457,7 +456,7 @@ mod sqlite {
             assert_eq!(contract_value, get_result_value);
 
             // Update the contract value with new one
-            let new_contract_value = ContractState::new(b"New test contract value".to_vec());
+            let new_contract_value = WrappedState::new(b"New test contract value".to_vec());
             let new_put_result_value = handler
                 .put_value(&contract.key(), new_contract_value.clone())
                 .await?;
@@ -476,6 +475,8 @@ mod sqlite {
 
 #[cfg(test)]
 pub mod test {
+    use locutus_runtime::ContractStore;
+
     use super::*;
     use crate::{
         config::{GlobalExecutor, CONFIG},
@@ -542,15 +543,15 @@ pub mod test {
         async fn get_value(
             &self,
             contract: &ContractKey,
-        ) -> Result<Option<ContractState>, Self::Error> {
+        ) -> Result<Option<WrappedState>, Self::Error> {
             Ok(self.kv_store.get(contract).cloned())
         }
 
         async fn put_value(
             &mut self,
             contract: &ContractKey,
-            value: ContractState,
-        ) -> Result<ContractState, Self::Error> {
+            value: WrappedState,
+        ) -> Result<WrappedState, Self::Error> {
             let new_val = value.clone();
             self.kv_store.insert(*contract, value);
             Ok(new_val)
@@ -563,7 +564,9 @@ pub mod test {
 
         let h = GlobalExecutor::spawn(async move {
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(Contract::new(vec![0, 1, 2, 3])))
+                .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(vec![
+                    0, 1, 2, 3,
+                ])))
                 .await
         });
 
@@ -576,7 +579,8 @@ pub mod test {
             assert_eq!(data, vec![0, 1, 2, 3]);
             tokio::time::timeout(
                 Duration::from_millis(100),
-                rcv_halve.send_to_listener(id, ContractHandlerEvent::Cache(Contract::new(data))),
+                rcv_halve
+                    .send_to_listener(id, ContractHandlerEvent::Cache(WrappedContract::new(data))),
             )
             .await??;
         } else {

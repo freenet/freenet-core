@@ -1,0 +1,32 @@
+[package]
+name = "locutus-dev"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.58.0"
+publish = false
+
+[dependencies]
+clap = { version = "3", features = ["derive"] }
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "signal"] }
+pico-args = "0.4"
+# log = "0.4"
+# env_logger = "0.9"
+
+# deserialization features
+serde = { version = "*", optional = true }
+
+# (mp) message pack feature
+rmp = { version = "0.8", optional = true }
+rmp-serde = { version = "1", optional = true } 
+
+# json feature
+serde_json = { version = "1", optional = true }
+
+# internal
+locutus-node = { path = "../locutus-node" }
+locutus-runtime = { path = "../locutus-runtime" }
+
+[features]
+json = ["serde", "serde_json"]
+messagepack = ["serde", "rmp", "rmp-serde"]

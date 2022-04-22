@@ -4,9 +4,10 @@ use crate::{
     message::{Message, Transaction},
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
     ring::{Location, PeerKeyLocation},
+    WrappedState,
 };
 
-use locutus_runtime::prelude::{ContractKey, ContractState};
+use locutus_runtime::prelude::ContractKey;
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;
 
@@ -144,7 +145,7 @@ enum PutEvent {
     },
     PutSuccess {
         requester: PeerKey,
-        value: ContractState,
+        value: WrappedState,
     },
     BroadcastEmitted {
         /// subscribed peers
@@ -152,7 +153,7 @@ enum PutEvent {
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
-        value: ContractState,
+        value: WrappedState,
     },
     BroadcastReceived {
         /// peer who started the broadcast op
@@ -160,7 +161,7 @@ enum PutEvent {
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
-        value: ContractState,
+        value: WrappedState,
     },
 }
 
@@ -175,6 +176,7 @@ mod test_utils {
     };
 
     use dashmap::DashMap;
+    use locutus_runtime::WrappedState;
     use parking_lot::RwLock;
 
     use super::*;
@@ -223,7 +225,7 @@ mod test_utils {
             &self,
             peer: &PeerKey,
             for_key: &ContractKey,
-            expected_value: &ContractState,
+            expected_value: &WrappedState,
         ) -> bool {
             let logs = self.logs.read();
             let put_ops = logs.iter().filter_map(|l| match &l.kind {

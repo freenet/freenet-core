@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use locutus_runtime::prelude::{ContractKey, ContractState};
+use locutus_runtime::prelude::ContractKey;
 
 use crate::{
     config::PEER_TIMEOUT,
@@ -13,7 +13,7 @@ use crate::{
     message::{Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
-    Contract,
+    WrappedContract, WrappedState,
 };
 
 pub(crate) use self::messages::PutMsg;
@@ -31,7 +31,12 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    pub fn start_op(contract: Contract, value: ContractState, htl: usize, peer: &PeerKey) -> Self {
+    pub fn start_op(
+        contract: WrappedContract,
+        value: WrappedState,
+        htl: usize,
+        peer: &PeerKey,
+    ) -> Self {
         log::debug!(
             "Requesting put to contract {} @ loc({})",
             contract.key(),
@@ -178,8 +183,8 @@ enum PutState {
     ReceivedRequest,
     PrepareRequest {
         id: Transaction,
-        contract: Contract,
-        value: ContractState,
+        contract: WrappedContract,
+        value: WrappedState,
         htl: usize,
     },
     AwaitingResponse {
@@ -632,8 +637,8 @@ where
 async fn put_contract<CErr>(
     op_storage: &OpManager<CErr>,
     key: ContractKey,
-    value: ContractState,
-) -> Result<ContractState, OpError<CErr>>
+    value: WrappedState,
+) -> Result<WrappedState, OpError<CErr>>
 where
     CErr: std::error::Error,
 {
@@ -663,8 +668,8 @@ where
 async fn forward_changes<CErr, CB>(
     op_storage: &OpManager<CErr>,
     conn_manager: &CB,
-    contract: &Contract,
-    new_value: ContractState,
+    contract: &WrappedContract,
+    new_value: WrappedState,
     id: Transaction,
     htl: usize,
     skip_list: &[PeerKey],
@@ -718,8 +723,8 @@ mod messages {
         /// Internal node instruction to find a route to the target node.
         RequestPut {
             id: Transaction,
-            contract: Contract,
-            value: ContractState,
+            contract: WrappedContract,
+            value: WrappedState,
             /// max hops to live
             htl: usize,
             target: PeerKeyLocation,
@@ -729,8 +734,8 @@ mod messages {
         /// Forward a contract and it's latest value to an other node
         PutForward {
             id: Transaction,
-            contract: Contract,
-            new_value: ContractState,
+            contract: WrappedContract,
+            new_value: WrappedState,
             /// current htl, reduced by one at each hop
             htl: usize,
             skip_list: Vec<PeerKey>,
@@ -738,15 +743,15 @@ mod messages {
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
             id: Transaction,
-            new_value: ContractState,
+            new_value: WrappedState,
         },
         /// Target the node which is closest to the key
         SeekNode {
             id: Transaction,
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
-            value: ContractState,
-            contract: Contract,
+            value: WrappedState,
+            contract: WrappedContract,
             /// max hops to live
             htl: usize,
             // FIXME: remove skip list once we deduplicate at top msg handling level
@@ -759,14 +764,14 @@ mod messages {
             broadcasted_to: usize,
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
-            new_value: ContractState,
+            new_value: WrappedState,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
             id: Transaction,
             sender: PeerKeyLocation,
             key: ContractKey,
-            new_value: ContractState,
+            new_value: WrappedState,
             sender_subscribers: Vec<PeerKeyLocation>,
         },
     }
@@ -847,7 +852,7 @@ mod test {
         let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), &peer);
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
         let target_loc = PeerKeyLocation {
             location: Some(Location::random()),
             peer: PeerKey::random(),
@@ -855,7 +860,7 @@ mod test {
 
         let mut requester = PutOp::start_op(
             contract.clone(),
-            ContractState::new(vec![0, 1, 2, 3]),
+            WrappedState::new(vec![0, 1, 2, 3]),
             0,
             &peer,
         )
@@ -872,7 +877,7 @@ mod test {
         let expected = PutMsg::RequestPut {
             id,
             contract: contract.clone(),
-            value: ContractState::new(vec![0, 1, 2, 3]),
+            value: WrappedState::new(vec![0, 1, 2, 3]),
             htl: 0,
             target: target_loc,
         };
@@ -890,12 +895,12 @@ mod test {
                 broadcast_to: vec![],
                 broadcasted_to: 0,
                 key: contract.key(),
-                new_value: ContractState::new(vec![4, 3, 2, 1]),
+                new_value: WrappedState::new(vec![4, 3, 2, 1]),
             })?
             .ok_or_else(|| anyhow::anyhow!("no output"))?;
         let expected = PutMsg::SuccessfulUpdate {
             id,
-            new_value: ContractState::new(vec![4, 3, 2, 1]),
+            new_value: WrappedState::new(vec![4, 3, 2, 1]),
         };
         assert_eq!(target.state(), &PutState::BroadcastComplete);
         assert_eq!(res_msg, expected);
@@ -913,10 +918,10 @@ mod test {
 
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
         let key = contract.key();
-        let contract_val: ContractState = gen.arbitrary()?;
-        let new_value = ContractState::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
+        let contract_val: WrappedState = gen.arbitrary()?;
+        let new_value = WrappedState::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
         let mut locations = sim_nodes.get_locations_by_node();

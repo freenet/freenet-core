@@ -499,7 +499,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use locutus_runtime::prelude::ContractState;
+    use std::collections::HashMap;
 
     use super::*;
     use crate::{
@@ -507,9 +507,8 @@ mod test {
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
-        Contract,
+        WrappedContract, WrappedState,
     };
-    use std::collections::HashMap;
 
     #[test]
     fn successful_subscribe_op_seq() -> Result<(), anyhow::Error> {
@@ -517,7 +516,7 @@ mod test {
         let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), &peer);
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
 
         let key = contract.key();
 
@@ -605,8 +604,8 @@ mod test {
 
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
-        let contract_val: ContractState = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
+        let contract_val: WrappedState = gen.arbitrary()?;
         let contract_key: ContractKey = contract.key();
 
         let event = ClientRequest::Subscribe { key: contract_key };

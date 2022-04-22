@@ -7,7 +7,7 @@ use libp2p::{
     PeerId,
 };
 use locutus_node::*;
-use locutus_runtime::prelude::{ContractState, WrappedContract};
+use locutus_runtime::prelude::{WrappedContract, WrappedState};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");
@@ -41,7 +41,7 @@ async fn start_new_peer(
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     let contract = WrappedContract::new(vec![7, 3, 9, 5]);
     let key = contract.key();
-    let init_val = ContractState::new(vec![1, 2, 3, 4]);
+    let init_val = WrappedState::new(vec![1, 2, 3, 4]);
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     manager
@@ -64,7 +64,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    let second_val = ContractState::new(vec![2, 3, 1, 4]);
+    let second_val = WrappedState::new(vec![2, 3, 1, 4]);
     manager
         .tx_node_ev
         .send(ClientRequest::Put {

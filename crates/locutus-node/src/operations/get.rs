@@ -685,18 +685,16 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use locutus_runtime::prelude::*;
+    use std::collections::HashMap;
 
+    use super::*;
     use crate::{
         client_events::ClientRequest,
         contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         ring::Location,
-        Contract,
+        WrappedContract, WrappedState,
     };
-    use std::collections::HashMap;
-
-    use super::*;
 
     type Err = OpError<SimStoreError>;
 
@@ -738,7 +736,7 @@ mod test {
                 id,
                 value: StoreResponse {
                     contract: Some(contract),
-                    value: Some(ContractState::new(b"abc".to_vec())),
+                    value: Some(WrappedState::new(b"abc".to_vec())),
                 },
                 sender: target_loc,
                 target: sender_loc,
@@ -760,8 +758,8 @@ mod test {
 
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
-        let contract_val: ContractState = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
+        let contract_val: WrappedState = gen.arbitrary()?;
         let key = contract.key();
 
         let get_event = ClientRequest::Get {
@@ -808,7 +806,7 @@ mod test {
 
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
         let key = contract.key();
 
         let get_event = ClientRequest::Get {
@@ -844,8 +842,8 @@ mod test {
 
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: Contract = gen.arbitrary()?;
-        let contract_val: ContractState = gen.arbitrary()?;
+        let contract: WrappedContract = gen.arbitrary()?;
+        let contract_val: WrappedState = gen.arbitrary()?;
         let key = contract.key();
 
         let get_event = ClientRequest::Get {

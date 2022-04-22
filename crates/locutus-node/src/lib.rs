@@ -8,7 +8,8 @@ mod operations;
 mod ring;
 pub(crate) mod util;
 
-pub(crate) type Contract = locutus_runtime::prelude::WrappedContract;
+pub(crate) type WrappedContract = locutus_runtime::prelude::WrappedContract;
+pub(crate) type WrappedState = locutus_runtime::prelude::WrappedState;
 
 // exports:
 pub use crate::config::Config;
@@ -16,7 +17,7 @@ pub use crate::config::Config;
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
-    ClientRequest, HostResponse,
+    ClientRequest, ErrorKind, HostResponse,
 };
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;

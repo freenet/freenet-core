@@ -4,11 +4,11 @@ use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
 
 use either::Either;
-use locutus_runtime::prelude::*;
+use locutus_runtime::prelude::ContractKey;
 use locutus_stdlib::prelude::{State, StateDelta};
 use serde::{Deserialize, Serialize};
 
-use crate::Contract;
+use crate::{WrappedContract, WrappedState};
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -104,7 +104,7 @@ pub enum HostResponse {
         update: Either<StateDelta<'static>, State<'static>>,
     },
     GetResponse {
-        contract: Option<Contract>,
+        contract: Option<WrappedContract>,
         state: Option<State<'static>>,
     },
 }
@@ -115,9 +115,9 @@ pub enum HostResponse {
 pub enum ClientRequest {
     /// Insert a new value in a contract corresponding with the provided key.
     Put {
-        contract: Contract,
+        contract: WrappedContract,
         /// Value to upsert in the contract.
-        state: ContractState,
+        state: WrappedState,
     },
     /// Update an existing contract corresponding with the provided key.
     Update {
@@ -174,7 +174,7 @@ pub(crate) mod test {
         id: PeerKey,
         signal: Receiver<(EventId, PeerKey)>,
         non_owned_contracts: Vec<ContractKey>,
-        owned_contracts: Vec<(Contract, ContractState)>,
+        owned_contracts: Vec<(WrappedContract, WrappedState)>,
         events_to_gen: HashMap<EventId, ClientRequest>,
         random: bool,
     }
@@ -203,7 +203,7 @@ pub(crate) mod test {
         /// Contracts that the user updates.
         pub fn has_contract(
             &mut self,
-            contracts: impl IntoIterator<Item = (Contract, ContractState)>,
+            contracts: impl IntoIterator<Item = (WrappedContract, WrappedState)>,
         ) {
             self.owned_contracts.extend(contracts);
         }

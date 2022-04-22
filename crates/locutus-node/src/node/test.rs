@@ -6,7 +6,7 @@ use std::{
 
 use itertools::Itertools;
 use libp2p::{identity, PeerId};
-use locutus_runtime::prelude::{ContractKey, ContractState};
+use locutus_runtime::prelude::ContractKey;
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, instrument};
@@ -17,7 +17,7 @@ use crate::{
     contract::{MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
-    Contract, NodeConfig,
+    NodeConfig, WrappedContract, WrappedState,
 };
 
 use super::PeerKey;
@@ -60,7 +60,7 @@ pub(crate) type EventId = usize;
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
     /// Pair of contract and the initial value
-    pub owned_contracts: Vec<(Contract, ContractState)>,
+    pub owned_contracts: Vec<(WrappedContract, WrappedState)>,
     pub non_owned_contracts: Vec<ContractKey>,
     pub events_to_generate: HashMap<EventId, ClientRequest>,
     pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
@@ -271,7 +271,7 @@ impl SimNetwork {
         }
     }
 
-    pub fn has_put_contract(&self, peer: &str, key: &ContractKey, value: &ContractState) -> bool {
+    pub fn has_put_contract(&self, peer: &str, key: &ContractKey, value: &WrappedState) -> bool {
         if let Some(pk) = self.labels.get(peer) {
             self.event_listener.has_put_contract(pk, key, value)
         } else {

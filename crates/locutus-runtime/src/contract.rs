@@ -57,15 +57,15 @@ impl TryInto<Vec<u8>> for Contract {
 /// The state for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct ContractState(Arc<Vec<u8>>);
+pub struct State(Arc<Vec<u8>>);
 
-impl ContractState {
+impl State {
     pub fn new(bytes: Vec<u8>) -> Self {
-        ContractState(Arc::new(bytes))
+        State(Arc::new(bytes))
     }
 }
 
-impl Deref for ContractState {
+impl Deref for State {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -73,7 +73,7 @@ impl Deref for ContractState {
     }
 }
 
-impl std::fmt::Display for ContractState {
+impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let data: String = if self.0.len() > 8 {
             (&self.0[..4])

@@ -55,7 +55,9 @@ impl Transaction {
         // are created at the same exact time and the first 6 bytes of the key coincide;
         // in practice the chance of this happening is astronomically low
 
-        let id = Uuid::new_v1(ts, &initial_peer.to_bytes()[0..6]).unwrap();
+        let b = &mut [0; 6];
+        b.copy_from_slice(&initial_peer.to_bytes()[0..6]);
+        let id = Uuid::new_v1(ts, b);
         // 2 word size for 64-bits platforms most likely since msg type
         // probably will be aligned to 64 bytes
         Self { id, ty }
