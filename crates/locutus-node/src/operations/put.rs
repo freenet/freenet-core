@@ -7,25 +7,18 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use locutus_runtime::prelude::ContractKey;
+pub(crate) use self::messages::PutMsg;
+use locutus_runtime::prelude::{ContractKey, ContractState};
 
-use crate::operations::op_trait::Operation;
-use crate::operations::OpInitialization;
+use super::{handle_op_result, OpEnum, OpError, OperationResult};
 use crate::{
     config::PEER_TIMEOUT,
-    contract::{ContractError, ContractHandlerEvent},
+    contract::ContractHandlerEvent,
     message::{InnerMessage, Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
+    operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
     WrappedContract, WrappedState,
-};
-
-pub(crate) use self::messages::PutMsg;
-
-use super::{
-    handle_op_result,
-    state_machine::{StateMachine, StateMachineImpl},
-    OpEnum, OpError, OperationResult,
 };
 
 pub(crate) struct PutOp {
@@ -35,7 +28,10 @@ pub(crate) struct PutOp {
     _ttl: Duration,
 }
 
-impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutOp {
+impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for PutOp
+where
+    CErr: std::error::Error + Send,
+{
     type Message = PutMsg;
     type Error = OpError<CErr>;
 
@@ -44,15 +40,15 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
         msg: &Self::Message,
     ) -> Result<OpInitialization<Self>, OpError<CErr>> {
         let mut sender: Option<PeerKey> = None;
-        if let Some(peerKeyLoc) = msg.sender().cloned() {
-            sender = Some(peerKeyLoc.peer);
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer);
         };
 
         let tx = *msg.id();
         let result = match op_storage.pop(msg.id()) {
-            Some(OpEnum::Put(putOp)) => {
+            Some(OpEnum::Put(put_op)) => {
                 // was an existing operation, the other peer messaged back
-                Ok(OpInitialization { op: putOp, sender })
+                Ok(OpInitialization { op: put_op, sender })
             }
             Some(_) => return Err(OpError::OpNotPresent(tx)),
             None => {
@@ -74,15 +70,15 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
         &self.id
     }
 
-    fn process_message(
+    fn process_message<'a>(
         self,
-        conn_manager: &mut CB,
-        op_storage: &OpManager<CErr>,
+        conn_manager: &'a mut CB,
+        op_storage: &'a OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>> {
-        let fut = async move {
-            let mut return_msg = None;
-            let mut new_state = None;
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let return_msg;
+            let new_state;
 
             match input {
                 PutMsg::RequestPut {
@@ -124,7 +120,7 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                     mut skip_list,
                 } => {
                     let key = contract.key();
-                    let cached_contract = op_storage.ring.is_contract_cached(&key);
+                    let is_cached_contract = op_storage.ring.is_contract_cached(&key);
 
                     log::debug!(
                         "Performing a SeekNode at {}, trying put the contract {}",
@@ -132,26 +128,17 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                         key
                     );
 
-                    if !cached_contract
+                    if !is_cached_contract
                         && op_storage
                             .ring
                             .within_caching_distance(&Location::from(&key))
                     {
                         log::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
-                        // this node does not have the contract, so instead store the contract and execute the put op.
-                        let res = op_storage
-                            .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
-                            .await?;
-                        if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
-                            op_storage.ring.contract_cached(key);
-                            log::debug!("Contract successfully cached");
-                        } else {
-                            log::error!(
-                                "Contract handler returned wrong event when trying to cache contract, this should not happen!"
-                            );
-                            return Err(OpError::UnexpectedOpState);
+                        match try_to_cache_contract(op_storage, &contract, key).await {
+                            Ok(_) => {}
+                            Err(err) => return Err(err),
                         }
-                    } else if !cached_contract {
+                    } else if !is_cached_contract {
                         // in this case forward to a closer node to the target location and just wait for a response
                         // to give back to requesting peer
                         // FIXME
@@ -203,43 +190,22 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                         target.location
                     );
 
-                    match self.state {
-                        Some(PutState::ReceivedRequest | PutState::BroadcastOngoing { .. }) => {
-                            if broadcast_to.is_empty() {
-                                // broadcast complete
-                                new_state = Some(PutState::BroadcastComplete);
-                                return_msg = Some(PutMsg::SuccessfulUpdate { id, new_value });
-                            } else {
-                                new_state = Some(PutState::BroadcastOngoing);
-                                return_msg = Some(PutMsg::Broadcasting {
-                                    id,
-                                    new_value,
-                                    broadcasted_to: 0,
-                                    broadcast_to,
-                                    key,
-                                });
-                            }
+                    match try_to_broadcast(
+                        id,
+                        op_storage,
+                        self.state,
+                        broadcast_to,
+                        key,
+                        new_value,
+                        self._ttl,
+                    )
+                    .await
+                    {
+                        Ok((state, msg)) => {
+                            new_state = state;
+                            return_msg = msg;
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
-                    };
-
-                    if let Some(PutMsg::SuccessfulUpdate { .. }) = return_msg.clone() {
-                        log::debug!(
-                            "Empty broadcast list while updating value for contract {}",
-                            key
-                        );
-                        // means the whole tx finished so can return early
-                        new_state = None;
-                    } else {
-                        let op = Self {
-                            id: self.id,
-                            state: self.state,
-                            _ttl: self._ttl,
-                        };
-                        op_storage
-                            .notify_op_change(Message::from(return_msg.unwrap()), OpEnum::Put(op))
-                            .await?;
-                        return Err(OpError::StatePushed);
+                        Err(err) => return Err(err),
                     }
                 }
                 PutMsg::BroadcastTo {
@@ -274,44 +240,22 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                         target.location
                     );
 
-                    match self.state {
-                        Some(PutState::ReceivedRequest | PutState::BroadcastOngoing { .. }) => {
-                            if broadcast_to.is_empty() {
-                                // broadcast complete
-                                new_state = Some(PutState::BroadcastComplete);
-                                return_msg = Some(PutMsg::SuccessfulUpdate { id, new_value });
-                            } else {
-                                new_state = Some(PutState::BroadcastOngoing);
-                                return_msg = Some(PutMsg::Broadcasting {
-                                    id,
-                                    new_value,
-                                    broadcasted_to: 0,
-                                    broadcast_to,
-                                    key,
-                                });
-                            }
+                    match try_to_broadcast(
+                        id,
+                        op_storage,
+                        self.state,
+                        broadcast_to,
+                        key,
+                        new_value,
+                        self._ttl,
+                    )
+                    .await
+                    {
+                        Ok((state, msg)) => {
+                            new_state = state;
+                            return_msg = msg;
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
-                    }
-
-                    if let Some(PutMsg::SuccessfulUpdate { .. }) = return_msg {
-                        log::debug!(
-                            "Empty broadcast list while updating value for contract {}",
-                            key
-                        );
-                        // means the whole tx finished so can return early
-                        new_state = None;
-                    } else {
-                        log::debug!("Callback to start broadcasting to other nodes");
-                        let op = Self {
-                            id: self.id,
-                            state: self.state,
-                            _ttl: self._ttl,
-                        };
-                        op_storage
-                            .notify_op_change(Message::from(return_msg.unwrap()), OpEnum::Put(op))
-                            .await?;
-                        return Err(OpError::StatePushed);
+                        Err(err) => return Err(err),
                     }
                 }
                 PutMsg::Broadcasting {
@@ -372,11 +316,11 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                     return_msg = None;
                     new_state = None;
                 }
-                PutMsg::SuccessfulUpdate { id, new_value } => {
+                PutMsg::SuccessfulUpdate { .. } => {
                     match self.state {
                         Some(PutState::AwaitingResponse { contract, .. }) => {
                             log::debug!("Successfully updated value for {}", contract,);
-                            new_state = Some(PutState::Done);
+                            new_state = None;
                             return_msg = None;
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
@@ -385,7 +329,6 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                         "Peer {} completed contract value put",
                         op_storage.ring.peer_key
                     );
-                    new_state = None;
                 }
                 PutMsg::PutForward {
                     id,
@@ -395,23 +338,22 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                     mut skip_list,
                 } => {
                     let key = contract.key();
+                    let peer_loc = op_storage.ring.own_location();
+
+                    log::debug!(
+                        "Forwarding changes at {}, trying put the contract {}",
+                        peer_loc.peer,
+                        key
+                    );
+
                     let cached_contract = op_storage.ring.is_contract_cached(&key);
                     let within_caching_dist = op_storage
                         .ring
                         .within_caching_distance(&Location::from(&key));
                     if !cached_contract && within_caching_dist {
-                        // this node does not have the contract, so instead store the contract and execute the put op.
-                        let res = op_storage
-                            .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
-                            .await?;
-                        if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
-                            op_storage.ring.contract_cached(key);
-                            log::debug!("Contract successfully cached");
-                        } else {
-                            log::error!(
-                            "Contract handler returned wrong event when trying to cache contract, this should not happen!"
-                        );
-                            return Err(OpError::UnexpectedOpState);
+                        match try_to_cache_contract(op_storage, &contract, key).await {
+                            Ok(_) => {}
+                            Err(err) => return Err(err),
                         }
                     } else if !within_caching_dist {
                         // not a contract this node cares about; do nothing
@@ -424,10 +366,9 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                     let new_value = put_contract(op_storage, key, new_value).await?;
 
                     //update skip list
-                    let peer_loc = op_storage.ring.own_location();
                     skip_list.push(peer_loc.peer);
 
-                    // if sucessful, forward to the next closest peers (if any)
+                    // if successful, forward to the next closest peers (if any)
                     if let Some(new_htl) = htl.checked_sub(1) {
                         forward_changes(
                             op_storage,
@@ -446,23 +387,101 @@ impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for PutO
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            let output_state = Some(Self {
-                id: self.id,
-                state: new_state,
-                _ttl: self._ttl,
-            });
-
-            Ok(OperationResult {
-                return_msg: return_msg.map(Message::from),
-                state: output_state.map(OpEnum::Put),
-            })
-        };
-
-        Box::pin(fut)
+            build_op_result(self.id, new_state, return_msg, self._ttl)
+        })
     }
 }
 
-pub fn start_op(
+fn build_op_result<CErr: std::error::Error>(
+    id: Transaction,
+    state: Option<PutState>,
+    msg: Option<PutMsg>,
+    ttl: Duration,
+) -> Result<OperationResult, OpError<CErr>> {
+    let output_op = Some(PutOp {
+        id,
+        state,
+        _ttl: ttl,
+    });
+    Ok(OperationResult {
+        return_msg: msg.map(Message::from),
+        state: output_op.map(OpEnum::Put),
+    })
+}
+
+async fn try_to_cache_contract<CErr: std::error::Error>(
+    op_storage: &OpManager<CErr>,
+    contract: &WrappedContract,
+    key: ContractKey,
+) -> Result<(), OpError<CErr>> {
+    // this node does not have the contract, so instead store the contract and execute the put op.
+    let res = op_storage
+        .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
+        .await?;
+    if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
+        op_storage.ring.contract_cached(key);
+        log::debug!("Contract successfully cached");
+        Ok(())
+    } else {
+        log::error!(
+            "Contract handler returned wrong event when trying to cache contract, this should not happen!"
+        );
+        return Err(OpError::UnexpectedOpState);
+    }
+}
+
+async fn try_to_broadcast<CErr: std::error::Error>(
+    id: Transaction,
+    op_storage: &OpManager<CErr>,
+    state: Option<PutState>,
+    broadcast_to: Vec<PeerKeyLocation>,
+    key: ContractKey,
+    new_value: WrappedState,
+    ttl: Duration,
+) -> Result<(Option<PutState>, Option<PutMsg>), OpError<CErr>> {
+    let new_state;
+    let return_msg;
+
+    match state {
+        Some(PutState::ReceivedRequest | PutState::BroadcastOngoing { .. }) => {
+            if broadcast_to.is_empty() {
+                // broadcast complete
+                log::debug!(
+                    "Empty broadcast list while updating value for contract {}",
+                    key
+                );
+                // means the whole tx finished so can return early
+                new_state = None;
+                return_msg = Some(PutMsg::SuccessfulUpdate { id, new_value });
+            } else {
+                log::debug!("Callback to start broadcasting to other nodes");
+                new_state = Some(PutState::BroadcastOngoing);
+                return_msg = Some(PutMsg::Broadcasting {
+                    id,
+                    new_value,
+                    broadcasted_to: 0,
+                    broadcast_to,
+                    key,
+                });
+
+                let op = PutOp {
+                    id,
+                    state: new_state,
+                    _ttl: ttl,
+                };
+                op_storage
+                    .notify_op_change(Message::from(return_msg.unwrap()), OpEnum::Put(op))
+                    .await?;
+                return Err(OpError::StatePushed);
+            }
+        }
+        _ => return Err(OpError::InvalidStateTransition(id)),
+    };
+
+    Ok((new_state, return_msg))
+}
+
+pub(crate) fn start_op(
     contract: WrappedContract,
     value: WrappedState,
     htl: usize,
@@ -501,24 +520,13 @@ enum PutState {
     AwaitingResponse {
         contract: ContractKey,
     },
-    Done,
     BroadcastOngoing,
-    BroadcastComplete,
-}
-
-impl PutState {
-    fn id(&self) -> &Transaction {
-        match self {
-            Self::PrepareRequest { id, .. } => id,
-            _ => unreachable!(),
-        }
-    }
 }
 
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put<CErr>(
     op_storage: &OpManager<CErr>,
-    mut put_op: PutOp,
+    put_op: PutOp,
 ) -> Result<(), OpError<CErr>>
 where
     CErr: std::error::Error,
@@ -539,7 +547,7 @@ where
         .closest_caching(&key, 1, &[sender.peer])
         .into_iter()
         .next()
-        .ok_or_else(|| OpError::from(RingError::EmptyRing))?;
+        .ok_or(RingError::EmptyRing)?;
 
     let id = put_op.id.clone();
 
@@ -737,7 +745,6 @@ mod messages {
 
     impl PutMsg {
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
-            use PutMsg::*;
             match self {
                 Self::SeekNode { sender, .. } => Some(sender),
                 Self::BroadcastTo { sender, .. } => Some(sender),
@@ -746,7 +753,6 @@ mod messages {
         }
 
         pub fn target(&self) -> Option<&PeerKeyLocation> {
-            use PutMsg::*;
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestPut { target, .. } => Some(target),

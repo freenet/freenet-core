@@ -54,7 +54,7 @@ impl From<WebSocketApiConfig> for SocketAddr {
 
 #[cfg(feature = "websocket")]
 impl WebSocketApiConfig {
-    fn from_config(config: &config::Config) -> Self {
+    fn from_config(_config: &config::Config) -> Self {
         todo!()
     }
 }

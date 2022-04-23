@@ -39,8 +39,8 @@ where
         msg: &Self::Message,
     ) -> Result<OpInitialization<Self>, OpError<CErr>> {
         let mut sender: Option<PeerKey> = None;
-        if let Some(peerKeyLoc) = msg.sender().cloned() {
-            sender = Some(peerKeyLoc.peer);
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer);
         };
         let id = *msg.id();
 
@@ -79,8 +79,8 @@ where
         input: Self::Message,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
         Box::pin(async move {
-            let mut return_msg = None;
-            let mut new_state = None;
+            let return_msg;
+            let new_state;
 
             match input {
                 SubscribeMsg::RequestSub { id, key, target } => {
@@ -152,54 +152,38 @@ where
                                 .into(),
                             )
                             .await?;
-                        match self.state {
-                            Some(SubscribeState::ReceivedRequest) => {
-                                log::info!(
-                                    "Peer {} successfully subscribed to contract {}",
-                                    subscriber.peer,
-                                    key
-                                );
-                                new_state = Some(SubscribeState::Completed);
-                                return_msg = Some(SubscribeMsg::ReturnSub {
-                                    sender: new_target,
-                                    target: subscriber,
-                                    id,
-                                    key,
-                                    subscribed: true,
-                                });
-                            }
-                            _ => return Err(OpError::InvalidStateTransition(self.id)),
-                        }
                     } else {
                         if op_storage.ring.add_subscriber(key, subscriber).is_err() {
                             // max number of subscribers for this contract reached
                             return Ok(return_err());
                         }
-                        match self.state {
-                            Some(SubscribeState::ReceivedRequest) => {
-                                log::info!(
-                                    "Peer {} successfully subscribed to contract {}",
-                                    subscriber.peer,
-                                    key
-                                );
-                                new_state = None;
-                                return_msg = Some(SubscribeMsg::ReturnSub {
-                                    sender: target,
-                                    target: subscriber,
-                                    id,
-                                    key,
-                                    subscribed: true,
-                                });
-                            }
-                            _ => return Err(OpError::InvalidStateTransition(self.id)),
+                    }
+
+                    match self.state {
+                        Some(SubscribeState::ReceivedRequest) => {
+                            log::info!(
+                                "Peer {} successfully subscribed to contract {}",
+                                subscriber.peer,
+                                key
+                            );
+                            new_state = Some(SubscribeState::Completed);
+                            // TODO review behaviour, if the contract is not cached should return subscribed false?
+                            return_msg = Some(SubscribeMsg::ReturnSub {
+                                sender: target,
+                                target: subscriber,
+                                id,
+                                key,
+                                subscribed: true,
+                            });
                         }
+                        _ => return Err(OpError::InvalidStateTransition(self.id)),
                     }
                 }
                 SubscribeMsg::ReturnSub {
                     subscribed: false,
                     key,
                     sender,
-                    target,
+                    target: _,
                     id,
                 } => {
                     log::warn!(
@@ -239,7 +223,6 @@ where
                                     retries: retries + 1,
                                 });
                             } else {
-                                new_state = None;
                                 return Err(OpError::MaxRetriesExceeded(id, "sub".to_owned()));
                             }
                         }
@@ -250,8 +233,8 @@ where
                     subscribed: true,
                     key,
                     sender,
-                    target,
-                    id,
+                    target: _,
+                    id: _,
                 } => {
                     log::warn!(
                         "Subscribed to `{}` not found at potential subscription provider {}",
@@ -262,12 +245,11 @@ where
 
                     match self.state {
                         Some(SubscribeState::AwaitingResponse { .. }) => {
-                            new_state = Some(SubscribeState::Completed);
+                            new_state = None;
                             return_msg = None;
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     }
-                    new_state = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
             }
@@ -321,7 +303,7 @@ pub(crate) async fn request_subscribe<CErr>(
 where
     CErr: std::error::Error,
 {
-    let (target, id) =
+    let (target, _id) =
         if let Some(SubscribeState::PrepareRequest { id, key }) = sub_op.state.clone() {
             if !op_storage.ring.is_contract_cached(&key) {
                 return Err(OpError::ContractError(ContractError::ContractNotFound(key)));
@@ -332,7 +314,7 @@ where
                     .closest_caching(&key, 1, &[])
                     .into_iter()
                     .next()
-                    .ok_or_else(|| OpError::from(RingError::EmptyRing))?,
+                    .ok_or(RingError::EmptyRing)?,
                 id,
             )
         } else {

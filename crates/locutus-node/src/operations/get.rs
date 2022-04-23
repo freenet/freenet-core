@@ -45,13 +45,13 @@ where
         msg: &Self::Message,
     ) -> Result<OpInitialization<Self>, OpError<CErr>> {
         let mut sender: Option<PeerKey> = None;
-        if let Some(peerKeyLoc) = msg.sender().cloned() {
-            sender = Some(peerKeyLoc.peer);
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer);
         };
         let tx = *msg.id();
         let result = match op_storage.pop(msg.id()) {
-            Some(OpEnum::Get(getOp)) => {
-                Ok(OpInitialization { op: getOp, sender })
+            Some(OpEnum::Get(get_op)) => {
+                Ok(OpInitialization { op: get_op, sender })
                 // was an existing operation, the other peer messaged back
             }
             Some(_) => return Err(OpError::OpNotPresent(tx)),
@@ -82,8 +82,8 @@ where
         input: Self::Message,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
         Box::pin(async move {
-            let mut return_msg = None;
-            let mut new_state = None;
+            let return_msg;
+            let new_state;
 
             match input {
                 GetMsg::RequestGet {
@@ -97,8 +97,8 @@ where
                         self.state,
                         Some(GetState::AwaitingResponse { .. })
                     ));
-                    new_state = self.state;
                     log::debug!("Seek contract {} @ {} (tx: {})", key, target.peer, id);
+                    new_state = self.state;
                     return_msg = Some(GetMsg::SeekNode {
                         key,
                         id,
@@ -116,7 +116,8 @@ where
                     target,
                     htl,
                 } => {
-                    if !op_storage.ring.is_contract_cached(&key) {
+                    let is_cached_contract = op_storage.ring.is_contract_cached(&key);
+                    if !is_cached_contract {
                         log::warn!(
                             "Contract `{}` not found while processing a get request at node @ {}",
                             key,
@@ -129,8 +130,11 @@ where
                                  back to the node @ {}",
                                 sender.peer
                             );
-                            return Ok(OperationResult {
-                                return_msg: Some(Message::from(GetMsg::ReturnGet {
+
+                            return build_op_result(
+                                self.id,
+                                None,
+                                Some(GetMsg::ReturnGet {
                                     key,
                                     id,
                                     value: StoreResponse {
@@ -139,36 +143,29 @@ where
                                     },
                                     sender: op_storage.ring.own_location(),
                                     target: sender, // return to requester
-                                })),
-                                state: None,
-                            });
+                                }),
+                                self._ttl,
+                            );
                         }
 
                         let new_htl = htl - 1;
                         let new_target =
                             op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
 
-                        log::info!(
-                            "Retrying to get the contract from node @ {}",
-                            new_target.peer
-                        );
-
-                        {
-                            conn_manager
-                                .send(
-                                    &new_target.peer,
-                                    (GetMsg::SeekNode {
-                                        id,
-                                        key,
-                                        fetch_contract,
-                                        sender,
-                                        target: new_target,
-                                        htl: new_htl,
-                                    })
-                                    .into(),
-                                )
-                                .await?;
-                        }
+                        continue_seeking(
+                            conn_manager,
+                            &new_target,
+                            (GetMsg::SeekNode {
+                                id,
+                                key,
+                                fetch_contract,
+                                sender,
+                                target: new_target,
+                                htl: new_htl,
+                            })
+                            .into(),
+                        )
+                        .await?;
 
                         return_msg = None;
                         new_state = None;
@@ -182,47 +179,26 @@ where
                         })
                         .await?
                     {
-                        if returned_key != key {
-                            // shouldn't be a reachable path
-                            log::error!(
-                                "contract retrieved ({}) and asked ({}) are not the same",
-                                returned_key,
-                                key
-                            );
-                            return Err(OpError::InvalidStateTransition(id));
-                        }
-
-                        match &value {
-                            Ok(StoreResponse {
-                                value: None,
-                                contract: None,
-                            }) => return Err(ContractError::ContractNotFound(key).into()),
-                            Ok(StoreResponse {
-                                value: Some(_),
-                                contract: None,
-                            }) if fetch_contract => {
-                                return Err(ContractError::ContractNotFound(key).into())
-                            }
-                            _ => {}
+                        match check_contract_found(key, id, fetch_contract, &value, returned_key) {
+                            Ok(_) => {}
+                            Err(err) => return Err(err),
                         }
 
                         log::debug!("Contract {} found @ peer {}", returned_key, target.peer);
 
                         match self.state {
-                            Some(GetState::AwaitingResponse {
-                                mut skip_list,
-                                retries,
-                                fetch_contract,
-                                ..
-                            }) => {
-                                log::debug!("Get response received for contract {}", key);
+                            Some(GetState::AwaitingResponse { .. }) => {
+                                log::debug!(
+                                    "Completed operation, Get response received for contract {}",
+                                    key
+                                );
                                 // Completed op
-                                new_state = Some(GetState::Completed);
+                                new_state = None;
                                 return_msg = None;
                             }
                             Some(GetState::ReceivedRequest) => {
                                 log::debug!("Returning contract {} to {}", key, sender.peer);
-                                new_state = Some(GetState::Completed);
+                                new_state = None;
                                 return_msg = Some(GetMsg::ReturnGet {
                                     id,
                                     key,
@@ -233,7 +209,6 @@ where
                             }
                             _ => return Err(OpError::InvalidStateTransition(self.id)),
                         };
-                        new_state = None;
                     } else {
                         return Err(OpError::InvalidStateTransition(id));
                     }
@@ -266,7 +241,7 @@ where
                             ..
                         }) => {
                             if retries < MAX_RETRIES {
-                                // no respose received from this peer, so skip it in the next iteration
+                                // no response received from this peer, so skip it in the next iteration
                                 skip_list.push(target.peer);
                                 if let Some(target) = op_storage
                                     .ring
@@ -295,13 +270,12 @@ where
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
-                                new_state = None;
                                 return Err(OpError::MaxRetriesExceeded(id, "get".to_owned()));
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
                             log::debug!("Returning contract {} to {}", key, sender.peer);
-                            new_state = Some(GetState::Completed);
+                            new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
                                 key,
@@ -385,12 +359,7 @@ where
                         .await?;
 
                     match self.state {
-                        Some(GetState::AwaitingResponse {
-                            mut skip_list,
-                            retries,
-                            fetch_contract,
-                            ..
-                        }) => {
+                        Some(GetState::AwaitingResponse { fetch_contract, .. }) => {
                             if fetch_contract && contract.is_none() {
                                 log::error!(
                                     "Get response received for contract {}, but the contract wasn't returned",
@@ -400,13 +369,13 @@ where
                                 return_msg = None;
                             } else {
                                 log::debug!("Get response received for contract {}", key);
-                                new_state = Some(GetState::Completed);
+                                new_state = None;
                                 return_msg = None;
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
                             log::debug!("Returning contract {} to {}", key, sender.peer);
-                            new_state = Some(GetState::Completed);
+                            new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
                                 key,
@@ -420,22 +389,76 @@ where
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     };
-                    new_state = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            let output_state = Some(Self {
-                id: self.id,
-                state: new_state,
-                _ttl: self._ttl,
-            });
-
-            Ok(OperationResult {
-                return_msg: return_msg.map(Message::from),
-                state: output_state.map(OpEnum::Get),
-            })
+            build_op_result(self.id, new_state, return_msg, self._ttl)
         })
+    }
+}
+
+fn build_op_result<CErr: std::error::Error>(
+    id: Transaction,
+    state: Option<GetState>,
+    msg: Option<GetMsg>,
+    ttl: Duration,
+) -> Result<OperationResult, OpError<CErr>> {
+    let output_op = Some(GetOp {
+        id,
+        state,
+        _ttl: ttl,
+    });
+    Ok(OperationResult {
+        return_msg: msg.map(Message::from),
+        state: output_op.map(OpEnum::Get),
+    })
+}
+
+async fn continue_seeking<CErr: std::error::Error, CB: ConnectionBridge>(
+    conn_manager: &mut CB,
+    new_target: &PeerKeyLocation,
+    retry_msg: Message,
+) -> Result<(), OpError<CErr>> {
+    log::info!(
+        "Retrying to get the contract from node @ {}",
+        new_target.peer
+    );
+
+    conn_manager.send(&new_target.peer, retry_msg).await?;
+
+    Ok(())
+}
+
+fn check_contract_found<CErr: std::error::Error>(
+    key: ContractKey,
+    id: Transaction,
+    fetch_contract: bool,
+    value: &Result<StoreResponse, CErr>,
+    returned_key: ContractKey,
+) -> Result<(), OpError<CErr>> {
+    if returned_key != key {
+        // shouldn't be a reachable path
+        log::error!(
+            "contract retrieved ({}) and asked ({}) are not the same",
+            returned_key,
+            key
+        );
+        return Err(OpError::InvalidStateTransition(id));
+    }
+
+    match &value {
+        Ok(StoreResponse {
+            value: None,
+            contract: None,
+        }) => return Err(OpError::ContractError(ContractError::ContractNotFound(key))),
+        Ok(StoreResponse {
+            value: Some(_),
+            contract: None,
+        }) if fetch_contract => {
+            return Err(OpError::ContractError(ContractError::ContractNotFound(key)))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -475,8 +498,6 @@ enum GetState {
         retries: usize,
         fetch_contract: bool,
     },
-    /// Transaction complete.
-    Completed,
 }
 
 /// Request to get the current value from a contract.
@@ -498,7 +519,7 @@ where
                 .closest_caching(&key, 1, &[])
                 .into_iter()
                 .next()
-                .ok_or_else(|| OpError::from(RingError::EmptyRing))?,
+                .ok_or(RingError::EmptyRing)?,
             id,
         )
     } else {

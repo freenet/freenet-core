@@ -1,7 +1,9 @@
 use tokio::sync::mpsc::error::SendError;
 
-use self::{join_ring::JoinOpError, op_trait::Operation};
+use self::op_trait::Operation;
+use crate::operations::get::GetOp;
 use crate::operations::put::PutOp;
+use crate::operations::subscribe::SubscribeOp;
 use crate::{
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
@@ -14,7 +16,6 @@ pub(crate) mod get;
 pub(crate) mod join_ring;
 pub(crate) mod op_trait;
 pub(crate) mod put;
-mod state_machine;
 pub(crate) mod subscribe;
 
 pub(crate) struct OperationResult {
@@ -36,7 +37,7 @@ pub(crate) async fn handle_op_request<Op, CErr, CB>(
 ) -> Result<(), OpError<CErr>>
 where
     Op: Operation<CErr, CB>,
-    CErr: std::error::Error,
+    CErr: std::error::Error + Send + Sync,
     CB: ConnectionBridge,
 {
     let sender;
@@ -63,7 +64,7 @@ async fn handle_op_result<CB, CErr>(
 ) -> Result<(), OpError<CErr>>
 where
     CB: ConnectionBridge,
-    CErr: std::error::Error,
+    CErr: std::error::Error + Send + Sync,
 {
     // FIXME: register changes in the future op commit log
     match result {
@@ -123,13 +124,16 @@ pub(crate) enum OpEnum {
 }
 
 impl OpEnum {
-    fn id<CErr: std::error::Error, CB: ConnectionBridge>(&self) -> Transaction {
+    fn id<CErr, CB: ConnectionBridge>(&self) -> Transaction
+    where
+        CErr: std::error::Error + Send + Sync,
+    {
         use OpEnum::*;
         match self {
             JoinRing(op) => *<JoinRingOp as Operation<CErr, CB>>::id(op),
             Put(op) => *<PutOp as Operation<CErr, CB>>::id(op),
-            Get(op) => op.id(),
-            Subscribe(op) => op.id(),
+            Get(op) => *<GetOp as Operation<CErr, CB>>::id(op),
+            Subscribe(op) => *<SubscribeOp as Operation<CErr, CB>>::id(op),
         }
     }
 }
@@ -142,8 +146,6 @@ pub(crate) enum OpError<S: std::error::Error> {
     RingError(#[from] RingError),
     #[error(transparent)]
     ContractError(#[from] ContractError<S>),
-    #[error(transparent)]
-    JoinOp(#[from] JoinOpError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
