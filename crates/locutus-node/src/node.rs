@@ -366,8 +366,7 @@ async fn client_event_handling<ClientEv, CErr>(
                     loop {
                         // FIXME: this will block the event loop until the subscribe op succeeds
                         //        instead the op should be deferred for later execution
-                        let op =
-                            subscribe::SubscribeOp::start_op(key, &op_storage_cp.ring.peer_key);
+                        let op = subscribe::start_op(key, &op_storage_cp.ring.peer_key);
                         match subscribe::request_subscribe(&op_storage_cp, op).await {
                             Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
                                 log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);

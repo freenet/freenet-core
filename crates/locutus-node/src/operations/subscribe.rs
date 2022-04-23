@@ -254,18 +254,26 @@ where
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            let output_state = Some(Self {
-                id: self.id,
-                state: new_state,
-                _ttl: self._ttl,
-            });
-
-            Ok(OperationResult {
-                return_msg: return_msg.map(Message::from),
-                state: output_state.map(OpEnum::Subscribe),
-            })
+            build_op_result(self.id, new_state, return_msg, self._ttl)
         })
     }
+}
+
+fn build_op_result<CErr: std::error::Error>(
+    id: Transaction,
+    state: Option<SubscribeState>,
+    msg: Option<SubscribeMsg>,
+    ttl: Duration,
+) -> Result<OperationResult, OpError<CErr>> {
+    let output_op = Some(SubscribeOp {
+        id,
+        state,
+        _ttl: ttl,
+    });
+    Ok(OperationResult {
+        return_msg: msg.map(Message::from),
+        state: output_op.map(OpEnum::Subscribe),
+    })
 }
 
 pub(crate) fn start_op(key: ContractKey, peer: &PeerKey) -> SubscribeOp {

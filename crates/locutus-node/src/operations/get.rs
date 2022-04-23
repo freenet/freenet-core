@@ -16,7 +16,7 @@ use crate::{
     Location,
 };
 
-use super::{handle_op_result, OpEnum, OpError, OperationResult};
+use super::{OpEnum, OpError, OperationResult};
 
 pub(crate) use self::messages::GetMsg;
 
@@ -36,6 +36,7 @@ pub(crate) struct GetOp {
 impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for GetOp
 where
     CErr: std::error::Error + Send,
+    CB: std::marker::Send,
 {
     type Message = GetMsg;
     type Error = OpError<CErr>;

@@ -4,7 +4,6 @@ use std::pin::Pin;
 
 use futures::Future;
 
-use crate::node::ConnectionBridge;
 use crate::{
     message::{InnerMessage, Transaction},
     node::OpManager,
@@ -30,66 +29,10 @@ where
     fn id(&self) -> &Transaction;
 
     #[allow(clippy::type_complexity)]
-    fn process_message(
+    fn process_message<'a>(
         self,
-        conn_manager: &mut CB,
-        op_storage: &OpManager<CErr>,
+        conn_manager: &'a mut CB,
+        op_storage: &'a OpManager<CErr>,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>>;
-}
-
-// EXAMPLE:
-
-pub(crate) enum GetError {}
-
-impl<CErr: std::error::Error> From<GetError> for OpError<CErr> {
-    fn from(_val: GetError) -> Self {
-        todo!()
-    }
-}
-
-pub struct FakeGet {
-    id: Transaction,
-}
-
-impl<CErr: std::error::Error, CB: ConnectionBridge> Operation<CErr, CB> for FakeGet {
-    type Message = super::get::GetMsg;
-
-    type Error = GetError;
-
-    fn load_or_init(
-        _op_storage: &OpManager<CErr>,
-        msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError<CErr>> {
-        // todo: basically move the load/initialization logic from the handle_<op>_request inside here
-        Ok(OpInitialization {
-            op: Self { id: *msg.id() },
-            sender: None,
-        })
-    }
-
-    fn id(&self) -> &Transaction {
-        &self.id
-    }
-
-    fn process_message(
-        self,
-        _conn_manager: &mut CB,
-        _op_storage: &OpManager<CErr>,
-        input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'static>> {
-        // todo: add all internal logic here
-        Box::pin(async move {
-            match input {
-                super::get::GetMsg::RequestGet { .. } => {
-                    println!("do something");
-                }
-                _ => println!("do something else"),
-            }
-            Ok(OperationResult {
-                return_msg: None,
-                state: None,
-            })
-        })
-    }
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>>;
 }

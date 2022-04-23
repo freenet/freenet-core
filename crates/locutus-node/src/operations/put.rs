@@ -8,9 +8,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 pub(crate) use self::messages::PutMsg;
-use locutus_runtime::prelude::{ContractKey, ContractState};
+use locutus_runtime::prelude::ContractKey;
 
-use super::{handle_op_result, OpEnum, OpError, OperationResult};
+use super::{OpEnum, OpError, OperationResult};
 use crate::{
     config::PEER_TIMEOUT,
     contract::ContractHandlerEvent,

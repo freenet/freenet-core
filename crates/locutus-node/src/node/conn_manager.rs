@@ -17,7 +17,7 @@ pub(crate) mod p2p_protoc;
 pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
 #[async_trait::async_trait]
-pub(crate) trait ConnectionBridge {
+pub(crate) trait ConnectionBridge: Send + Sync {
     async fn add_connection(&mut self, peer: PeerKey) -> ConnResult<()>;
 
     async fn drop_connection(&mut self, peer: &PeerKey) -> ConnResult<()>;
