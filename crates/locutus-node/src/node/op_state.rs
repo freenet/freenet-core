@@ -105,7 +105,7 @@ where
         match op {
             OpEnum::JoinRing(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::JoinRing);
-                self.join_ring.insert(id, tx);
+                self.join_ring.insert(id, *tx);
             }
             OpEnum::Put(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::Put);
@@ -129,7 +129,7 @@ where
                 .join_ring
                 .remove(id)
                 .map(|(_k, v)| v)
-                .map(OpEnum::JoinRing),
+                .map(|op| OpEnum::JoinRing(Box::new(op))),
             TransactionType::Put => self.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
             TransactionType::Get => self.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
             TransactionType::Subscribe => self

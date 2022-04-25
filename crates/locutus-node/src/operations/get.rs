@@ -452,13 +452,11 @@ fn check_contract_found<CErr: std::error::Error>(
         Ok(StoreResponse {
             value: None,
             contract: None,
-        }) => return Err(OpError::ContractError(ContractError::ContractNotFound(key))),
+        }) => Err(OpError::ContractError(ContractError::ContractNotFound(key))),
         Ok(StoreResponse {
             value: Some(_),
             contract: None,
-        }) if fetch_contract => {
-            return Err(OpError::ContractError(ContractError::ContractNotFound(key)))
-        }
+        }) if fetch_contract => Err(OpError::ContractError(ContractError::ContractNotFound(key))),
         _ => Ok(()),
     }
 }
@@ -660,13 +658,9 @@ mod test {
     use super::*;
     use crate::{
         client_events::ClientRequest,
-        contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
-        ring::Location,
         WrappedContract, WrappedState,
     };
-
-    type Err = OpError<SimStoreError>;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {

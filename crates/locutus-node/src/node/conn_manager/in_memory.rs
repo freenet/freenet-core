@@ -189,7 +189,7 @@ impl InMemoryTransport {
         }
     }
 
-    fn shuffle<T>(iter: &mut Vec<T>) {
+    fn shuffle<T>(iter: &mut [T]) {
         let mut rng = thread_rng();
         for i in (1..(iter.len() - 1)).rev() {
             let idx = rng.gen_range(0..=i);

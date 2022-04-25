@@ -132,10 +132,9 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
         id: EventId,
         ev: ContractHandlerEvent<CErr>,
     ) -> Result<(), ContractError<CErr>> {
-        Ok(self
-            .tx
+        self.tx
             .send(InternalCHEvent { ev, id: id.0 })
-            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?)
+            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))
     }
 
     pub async fn recv_from_listener(

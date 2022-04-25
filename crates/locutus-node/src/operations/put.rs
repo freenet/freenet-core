@@ -426,7 +426,7 @@ async fn try_to_cache_contract<CErr: std::error::Error>(
         log::error!(
             "Contract handler returned wrong event when trying to cache contract, this should not happen!"
         );
-        return Err(OpError::UnexpectedOpState);
+        Err(OpError::UnexpectedOpState)
     }
 }
 
@@ -549,7 +549,7 @@ where
         .next()
         .ok_or(RingError::EmptyRing)?;
 
-    let id = put_op.id.clone();
+    let id = put_op.id;
 
     match put_op.state.clone() {
         Some(PutState::PrepareRequest {
@@ -792,13 +792,10 @@ mod test {
 
     use crate::{
         client_events::ClientRequest,
-        contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
     };
 
     use super::*;
-
-    type Err = OpError<SimStoreError>;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {

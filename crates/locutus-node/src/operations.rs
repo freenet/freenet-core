@@ -117,7 +117,7 @@ where
 }
 
 pub(crate) enum OpEnum {
-    JoinRing(join_ring::JoinRingOp),
+    JoinRing(Box<join_ring::JoinRingOp>),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),

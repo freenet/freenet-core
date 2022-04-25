@@ -152,11 +152,9 @@ where
                                 .into(),
                             )
                             .await?;
-                    } else {
-                        if op_storage.ring.add_subscriber(key, subscriber).is_err() {
-                            // max number of subscribers for this contract reached
-                            return Ok(return_err());
-                        }
+                    } else if op_storage.ring.add_subscriber(key, subscriber).is_err() {
+                        // max number of subscribers for this contract reached
+                        return Ok(return_err());
                     }
 
                     match self.state {
@@ -447,9 +445,7 @@ mod test {
     use super::*;
     use crate::{
         client_events::ClientRequest,
-        contract::SimStoreError,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
-        ring::Location,
         WrappedContract, WrappedState,
     };
 

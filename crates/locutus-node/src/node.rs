@@ -487,23 +487,26 @@ where
             // the attempt to join the network failed, this could be a fatal error since the node
             // is useless without connecting to the network, we will retry with exponential backoff
             match op_storage.pop(&tx) {
-                Some(OpEnum::JoinRing(JoinRingOp {
-                    backoff: Some(backoff),
-                    gateway,
-                    ..
-                })) => {
-                    if cfg!(test) {
-                        join_ring_request(None, peer_key, &gateway, op_storage, conn_manager)
+                Some(OpEnum::JoinRing(op)) if op.has_backoff() => {
+                    if let JoinRingOp {
+                        backoff: Some(backoff),
+                        gateway,
+                        ..
+                    } = *op
+                    {
+                        if cfg!(test) {
+                            join_ring_request(None, peer_key, &gateway, op_storage, conn_manager)
+                                .await?;
+                        } else {
+                            join_ring_request(
+                                Some(backoff),
+                                peer_key,
+                                &gateway,
+                                op_storage,
+                                conn_manager,
+                            )
                             .await?;
-                    } else {
-                        join_ring_request(
-                            Some(backoff),
-                            peer_key,
-                            &gateway,
-                            op_storage,
-                            conn_manager,
-                        )
-                        .await?;
+                        }
                     }
                 }
                 None | Some(OpEnum::JoinRing(_)) => {

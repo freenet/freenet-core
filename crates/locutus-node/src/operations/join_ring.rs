@@ -28,6 +28,12 @@ pub(crate) struct JoinRingOp {
     _ttl: Duration,
 }
 
+impl JoinRingOp {
+    pub fn has_backoff(&self) -> bool {
+        self.backoff.is_some()
+    }
+}
+
 impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for JoinRingOp
 where
     CErr: std::error::Error + Send,
@@ -47,7 +53,7 @@ where
                 sender = msg.sender().cloned();
                 // was an existing operation, the other peer messaged back
                 Ok(OpInitialization {
-                    op: join_op,
+                    op: *join_op,
                     sender,
                 })
             }
@@ -526,7 +532,7 @@ fn build_op_result<CErr: std::error::Error>(
     });
     Ok(OperationResult {
         return_msg: msg.map(Message::from),
-        state: output_op.map(OpEnum::JoinRing),
+        state: output_op.map(|op| OpEnum::JoinRing(Box::new(op))),
     })
 }
 
@@ -536,28 +542,24 @@ fn try_proxy_connection(
     own_loc: &PeerKeyLocation,
     accepted_by: HashSet<PeerKeyLocation>,
 ) -> (Option<JRState>, Option<JoinRingMsg>) {
-    let new_state: Option<JRState>;
-    let return_msg: Option<JoinRingMsg>;
-
-    if accepted_by.contains(&own_loc) {
+    let new_state = if accepted_by.contains(own_loc) {
         log::debug!(
             "Return to {}, connected at proxy {} (tx: {})",
             sender.peer,
             own_loc.peer,
             id
         );
-        new_state = Some(JRState::Connected);
+        Some(JRState::Connected)
     } else {
         log::debug!("Failed to connect at proxy {}", sender.peer);
-        new_state = None;
-    }
-    return_msg = Some(JoinRingMsg::Response {
+        None
+    };
+    let return_msg = Some(JoinRingMsg::Response {
         msg: JoinResponse::Proxy { accepted_by },
         sender: *own_loc,
         id: *id,
         target: *sender,
     });
-
     (new_state, return_msg)
 }
 
@@ -601,7 +603,9 @@ mod states {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::Initializing => write!(f, "Initializing"),
-                Self::Connecting { 0: _ConnectionInfo } => write!(f, "Connecting(info: {})", 0),
+                Self::Connecting(connection_info) => {
+                    write!(f, "Connecting(info: {connection_info:?})")
+                }
                 Self::AwaitingProxyResponse { .. } => write!(f, "AwaitingProxyResponse"),
                 Self::OCReceived => write!(f, "OCReceived"),
                 Self::Connected => write!(f, "Connected"),
@@ -729,7 +733,7 @@ where
         },
     });
     conn_manager.send(&gateway.peer, join_req).await?;
-    op_storage.push(tx, OpEnum::JoinRing(join_op))?;
+    op_storage.push(tx, OpEnum::JoinRing(Box::new(join_op)))?;
     Ok(())
 }
 
@@ -972,12 +976,7 @@ mod messages {
 mod test {
     use std::time::Duration;
 
-    use super::*;
-    use crate::{
-        contract::SimStoreError,
-        message::TxType,
-        node::test::{check_connectivity, SimNetwork},
-    };
+    use crate::node::test::{check_connectivity, SimNetwork};
 
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
