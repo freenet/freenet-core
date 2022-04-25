@@ -30,7 +30,7 @@ pub(crate) struct PutOp {
 
 impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for PutOp
 where
-    CErr: std::error::Error + Send,
+    CErr: std::error::Error + Send + Sync,
 {
     type Message = PutMsg;
     type Error = OpError<CErr>;

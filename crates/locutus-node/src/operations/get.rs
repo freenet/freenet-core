@@ -35,7 +35,7 @@ pub(crate) struct GetOp {
 
 impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for GetOp
 where
-    CErr: std::error::Error + Send,
+    CErr: std::error::Error + Send + Sync,
     CB: std::marker::Send,
 {
     type Message = GetMsg;

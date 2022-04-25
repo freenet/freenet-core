@@ -383,26 +383,6 @@ async fn client_event_handling<ClientEv, CErr>(
                             Ok(()) => break,
                         }
                     }
-                    loop {
-                        // FIXME: this will block the event loop until the subscribe op succeeds
-                        //        instead the op should be deferred for later execution
-                        let op = subscribe::start_op(key, &op_storage_cp.ring.peer_key);
-                        match subscribe::request_subscribe(&op_storage_cp, op).await {
-                            Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
-                                log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
-                                let get_op = get::start_op(key, true, &op_storage_cp.ring.peer_key);
-                                if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
-                                    log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
-                                }
-                            }
-                            Err(err) => {
-                                log::error!("{}", err);
-                                break;
-                            }
-                            Ok(()) => break,
-                        }
-                    }
                     todo!()
                 }
                 ClientRequest::Disconnect { .. } => unreachable!(),
@@ -606,30 +586,4 @@ mod serialization {
             ))
         }
     }
-}
-
-#[tokio::test]
-async fn example() {
-    #[derive(thiserror::Error, Debug)]
-    enum Error {
-        #[error("blah")]
-        Example,
-    }
-
-    fn fake() -> (
-        get::GetMsg,
-        OpManager<Error>,
-        conn_manager::p2p_protoc::P2pBridge,
-    ) {
-        todo!()
-    }
-
-    let (msg, op_manager, mut bridge) = fake();
-    let _get_fake = crate::operations::handle_op_request::<
-        crate::operations::op_trait::FakeGet,
-        _,
-        _,
-    >(&op_manager, &mut bridge, msg)
-    .await
-    .unwrap();
 }
