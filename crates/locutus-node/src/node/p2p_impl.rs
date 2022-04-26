@@ -151,6 +151,7 @@ mod test {
 
     use futures::StreamExt;
     use libp2p::swarm::SwarmEvent;
+    use tokio::sync::watch::channel;
 
     /// Ping test event loop
     async fn ping_ev_loop<CErr>(peer: &mut NodeP2P<CErr>) -> Result<(), ()>
@@ -189,9 +190,16 @@ mod test {
             .listening_ip(Ipv4Addr::LOCALHOST)
             .listening_port(peer1_port);
 
+        let peer2_key = Keypair::generate_ed25519();
+        let peer2_id: PeerId = peer2_key.public().into();
+
+        let (_, receiver1) = channel((0, PeerKey::from(peer1_id)));
+        let (_, receiver2) = channel((0, PeerKey::from(peer2_id)));
+
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
-            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
+            let user_events = MemoryEventsGen::new(receiver1, PeerKey::from(peer1_id));
+            let mut config = NodeConfig::new([Box::new(user_events)]);
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
@@ -208,7 +216,8 @@ mod test {
 
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
-            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
+            let user_events = MemoryEventsGen::new(receiver2, PeerKey::from(peer2_id));
+            let mut config = NodeConfig::new([Box::new(user_events)]);
             config.add_gateway(peer1_config.clone());
             let mut peer2 = NodeP2P::<TestContractStoreError>::build::<
                 TestContractHandler,

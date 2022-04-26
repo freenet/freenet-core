@@ -485,6 +485,7 @@ pub(crate) enum RingError {
 mod test {
     use super::*;
     use crate::client_events::test::MemoryEventsGen;
+    use tokio::sync::watch::channel;
 
     #[test]
     fn location_dist() {
@@ -499,7 +500,11 @@ mod test {
 
     #[test]
     fn find_closest() {
-        let config = NodeConfig::new([Box::new(MemoryEventsGen::new_tmp())]);
+        let peer_key: PeerKey = PeerKey::random();
+
+        let (_, receiver) = channel((0, peer_key));
+        let user_events = MemoryEventsGen::new(receiver.clone(), peer_key);
+        let config = NodeConfig::new([Box::new(user_events)]);
         let ring = Ring::new(&config, &[]).unwrap();
 
         fn build_pk(loc: Location) -> PeerKeyLocation {
