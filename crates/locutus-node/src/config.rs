@@ -13,6 +13,7 @@ use std::{
 use directories::ProjectDirs;
 use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
+use serde::Deserializer;
 use tokio::runtime::Runtime;
 
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
@@ -55,7 +56,21 @@ impl From<WebSocketApiConfig> for SocketAddr {
 #[cfg(feature = "websocket")]
 impl WebSocketApiConfig {
     fn from_config(_config: &config::Config) -> Self {
-        todo!()
+        WebSocketApiConfig {
+            ip: IpAddr::from_str(
+                &_config
+                    .get_string("bootstrap_host")
+                    .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
+            )
+            .map_err(|_err| std::io::ErrorKind::InvalidInput)
+            .unwrap(),
+            port: _config
+                .get_int("bootstrap_port")
+                .map(u16::try_from)
+                .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
+                .map_err(|_err| std::io::ErrorKind::InvalidInput)
+                .unwrap(),
+        }
     }
 }
 
