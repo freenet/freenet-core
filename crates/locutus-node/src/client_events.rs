@@ -163,6 +163,7 @@ impl Display for ClientRequest {
 pub(crate) mod test {
     use std::{collections::HashMap, time::Duration};
 
+    use futures::FutureExt;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
@@ -170,6 +171,7 @@ pub(crate) mod test {
 
     use super::*;
 
+    #[derive(Clone)]
     pub(crate) struct MemoryEventsGen {
         id: PeerKey,
         signal: Receiver<(EventId, PeerKey)>,
@@ -180,10 +182,6 @@ pub(crate) mod test {
     }
 
     impl MemoryEventsGen {
-        pub fn new_tmp() -> Self {
-            todo!()
-        }
-
         pub fn new(signal: Receiver<(EventId, PeerKey)>, id: PeerKey) -> Self {
             Self {
                 signal,
@@ -315,11 +313,11 @@ pub(crate) mod test {
             _id: ClientId,
             _response: Result<HostResponse, ClientError>,
         ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
-            todo!()
+            Box::pin(async { Ok(()) })
         }
 
         fn cloned(&self) -> BoxedClient {
-            todo!()
+            Box::new(self.clone())
         }
     }
 }

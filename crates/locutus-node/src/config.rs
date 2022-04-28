@@ -17,6 +17,8 @@ use serde::Deserializer;
 use tokio::runtime::Runtime;
 
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
+const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
+
 pub(crate) static CONFIG: Lazy<Config> =
     Lazy::new(|| Config::load_conf().expect("Failed to load configuration"));
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -55,19 +57,19 @@ impl From<WebSocketApiConfig> for SocketAddr {
 
 #[cfg(feature = "websocket")]
 impl WebSocketApiConfig {
-    fn from_config(_config: &config::Config) -> Self {
+    fn from_config(config: &config::Config) -> Self {
         WebSocketApiConfig {
             ip: IpAddr::from_str(
-                &_config
-                    .get_string("bootstrap_host")
+                &config
+                    .get_string("websocket_api_ip")
                     .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
             )
             .map_err(|_err| std::io::ErrorKind::InvalidInput)
             .unwrap(),
-            port: _config
-                .get_int("bootstrap_port")
+            port: config
+                .get_int("websocket_api_port")
                 .map(u16::try_from)
-                .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
+                .unwrap_or(Ok(DEFAULT_WEBSOCKET_API_PORT))
                 .map_err(|_err| std::io::ErrorKind::InvalidInput)
                 .unwrap(),
         }
