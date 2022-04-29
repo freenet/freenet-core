@@ -5,3 +5,10 @@ exclude = ["contracts/test_contract"]
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.release.package."*"]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
