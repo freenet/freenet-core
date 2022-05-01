@@ -9,6 +9,8 @@ mod user_events;
 type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest>;
 type CommandSender = tokio::sync::mpsc::Sender<ClientRequest>;
 
+const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
+
 #[derive(clap::ArgEnum, Clone, Copy, Debug)]
 enum DeserializationFmt {
     #[cfg(feature = "json")]
@@ -46,6 +48,9 @@ struct Cli {
     /// Terminal output
     #[clap(long, requires = "fmt")]
     terminal_output: bool,
+    /// Max contract size
+    #[clap(long, env = "LOCUTUS_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
+    max_contract_size: i64,
 }
 
 #[tokio::main]
@@ -56,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     }
 
     let (sender, receiver) = tokio::sync::mpsc::channel(100);
-    let runtime = tokio::task::spawn(executor::wasm_runtime(receiver));
+    let runtime = tokio::task::spawn(executor::wasm_runtime(cli.clone(), receiver));
     let user_fn = user_events::user_fn_handler(sender, cli);
     tokio::select! {
         res = runtime => { res?? }

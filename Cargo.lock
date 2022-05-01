@@ -1936,7 +1936,7 @@ dependencies = [
  "locutus-runtime",
  "pico-args",
  "rmp",
- "rmp-serde",
+ "rmpv",
  "serde",
  "serde_json",
  "tokio",
@@ -3100,6 +3100,16 @@ dependencies = [
  "byteorder",
  "rmp",
  "serde",
+]
+
+[[package]]
+name = "rmpv"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de8813b3a2f95c5138fe5925bfb8784175d88d6bff059ba8ce090aa891319754"
+dependencies = [
+ "num-traits",
+ "rmp",
 ]
 
 [[package]]
