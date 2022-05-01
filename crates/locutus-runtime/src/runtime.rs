@@ -260,7 +260,6 @@ impl Runtime {
             UpdateResult::ValidUpdate => {
                 let mut state_buf = state_buf.shared();
                 let new_state = state_buf.read_all();
-                eprintln!("new_state: {new_state:?}");
                 Ok(State::from(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
@@ -366,7 +365,7 @@ impl Runtime {
             UpdateResult::ValidNoChange => Ok(current_state),
             UpdateResult::ValidUpdate => {
                 let mut state_buf = state_buf.shared();
-                let new_state = state_buf.read_bytes(current_state.size());
+                let new_state = state_buf.read_all();
                 Ok(State::from(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
