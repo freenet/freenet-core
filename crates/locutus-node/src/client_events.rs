@@ -83,8 +83,8 @@ pub trait ClientEventsProxy {
     fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>>;
 
     /// Sends a response from the host to the client application.
-    fn send<'a>(
-        &'a mut self,
+    fn send(
+        &mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>>;
@@ -163,7 +163,6 @@ impl Display for ClientRequest {
 pub(crate) mod test {
     use std::{collections::HashMap, time::Duration};
 
-    use futures::FutureExt;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 

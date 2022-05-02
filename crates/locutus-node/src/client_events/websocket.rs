@@ -67,8 +67,8 @@ impl WebSocketProxy {
 
 #[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for WebSocketProxy {
-    fn recv<'a>(
-        &'a mut self,
+    fn recv(
+        &mut self,
     ) -> Pin<
         Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
     > {
@@ -82,7 +82,7 @@ impl ClientEventsProxy for WebSocketProxy {
         })
     }
 
-    fn send<'a>(
+    fn send(
         &mut self,
         client: ClientId,
         response: Result<HostResponse, ClientError>,

@@ -503,7 +503,7 @@ mod test {
         let peer_key: PeerKey = PeerKey::random();
 
         let (_, receiver) = channel((0, peer_key));
-        let user_events = MemoryEventsGen::new(receiver.clone(), peer_key);
+        let user_events = MemoryEventsGen::new(receiver, peer_key);
         let config = NodeConfig::new([Box::new(user_events)]);
         let ring = Ring::new(&config, &[]).unwrap();
 

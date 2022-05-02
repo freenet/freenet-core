@@ -13,7 +13,6 @@ use std::{
 use directories::ProjectDirs;
 use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
-use serde::Deserializer;
 use tokio::runtime::Runtime;
 
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;

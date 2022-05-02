@@ -7,7 +7,52 @@ use crate::{config::CONFIG, WrappedState};
 
 pub(crate) struct MockRuntime {}
 
-impl RuntimeInterface for MockRuntime {}
+impl RuntimeInterface for MockRuntime {
+    fn validate_state<'a>(
+        &mut self,
+        _key: &ContractKey,
+        _parameters: locutus_stdlib::prelude::Parameters<'a>,
+        _state: locutus_runtime::State<'a>,
+    ) -> locutus_runtime::RuntimeResult<bool> {
+        todo!()
+    }
+
+    fn validate_delta<'a>(
+        &mut self,
+        _key: &ContractKey,
+        _parameters: locutus_stdlib::prelude::Parameters<'a>,
+        _delta: locutus_runtime::StateDelta<'a>,
+    ) -> locutus_runtime::RuntimeResult<bool> {
+        todo!()
+    }
+
+    fn update_state<'a>(
+        &mut self,
+        _key: &ContractKey,
+        _parameters: locutus_stdlib::prelude::Parameters<'a>,
+        _state: locutus_runtime::State<'a>,
+        _delta: locutus_runtime::StateDelta<'a>,
+    ) -> locutus_runtime::RuntimeResult<locutus_runtime::State<'a>> {
+        todo!()
+    }
+
+    fn summarize_state<'a>(
+        &mut self,
+        _parameters: locutus_stdlib::prelude::Parameters<'a>,
+        _state: locutus_runtime::State<'a>,
+    ) -> locutus_stdlib::prelude::StateSummary<'a> {
+        todo!()
+    }
+
+    fn get_state_delta<'a>(
+        &mut self,
+        _parameters: locutus_stdlib::prelude::Parameters<'a>,
+        _state: locutus_runtime::State<'a>,
+        _delta_to: locutus_stdlib::prelude::StateSummary<'a>,
+    ) -> locutus_runtime::StateDelta<'a> {
+        todo!()
+    }
+}
 
 pub(crate) type MemKVStore = HashMap<ContractKey, WrappedState>;
 

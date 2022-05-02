@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Context;
 use std::{collections::HashMap, task::Poll};
 
@@ -14,17 +14,14 @@ use crate::{ClientEventsProxy, ClientId, ClientRequest, HostResponse};
 type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
 static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// This type allows combining different sources of events into one and interoperation between them.
 pub struct ClientEventsCombinator<const N: usize> {
     /// receiving end of the different client applications from the node
     clients: [Sender<(ClientId, HostResult)>; N],
     /// receiving end of the host node from the different client applications
-    hosts_rx: Pin<Box<[Receiver<HostIncomingMsg>; N]>>,
-    /// pending client futures from the client applications, if any
-    #[allow(clippy::type_complexity)]
-    pending_client_futs:
-        [Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Send + Sync + 'static>>>; N],
+    hosts_rx: [Receiver<HostIncomingMsg>; N],
     /// a map of the individual protocols, external, sending client events ids to an internal list of ids
     external_clients: [HashMap<ClientId, ClientId>; N],
     /// a map of the external id to which protocol it belongs (represented by the index in the array)
@@ -34,7 +31,9 @@ pub struct ClientEventsCombinator<const N: usize> {
 
 impl<const N: usize> ClientEventsCombinator<N> {
     pub fn new(clients: [BoxedClient; N]) -> Self {
-        // TODO: here share connection between clients reusing the local HTTP server when it applies
+        if INITIALIZED.load(Ordering::SeqCst) {
+            panic!("only one instance of a combinator allowed per execution");
+        }
         let channels = clients.map(|client| {
             let (tx, rx) = channel(1);
             let (tx_host, rx_host) = channel(1);
@@ -47,57 +46,52 @@ impl<const N: usize> ClientEventsCombinator<N> {
             clients[i] = Some(tx);
             hosts_rx[i] = Some(rx_host);
         }
-
-        // initialize receiving channels for first time
-        // give an stable address on the heap to hosts_rx
-        let mut hosts_rx = Box::new(hosts_rx.map(|c| c.unwrap()));
-        let mut pending_client_futs = [(); N].map(|_| None);
-        // Safety: create a longer living reference, is safe since the futures should always be as long living as the refs
-        let hosts_rx_ref =
-            unsafe { &mut *(&mut hosts_rx as *mut _) as &mut [Receiver<HostIncomingMsg>; N] };
-        for (i, rx) in hosts_rx_ref.iter_mut().enumerate() {
-            let a = pending_client_futs.get_mut(i).unwrap();
-            let f = Box::pin(rx.recv()) as Pin<Box<dyn Future<Output = _> + Send + Sync>>;
-            *a = Some(f);
-        }
-
+        let hosts_rx = hosts_rx.map(|h| h.unwrap());
         let external_clients = [(); N].map(|_| HashMap::new());
         Self {
             clients: clients.map(|c| c.unwrap()),
-            hosts_rx: Pin::new(hosts_rx),
-            pending_client_futs,
+            hosts_rx,
             external_clients,
             internal_clients: HashMap::new(),
         }
     }
 }
 
-impl<const N: usize> Drop for ClientEventsCombinator<N> {
-    fn drop(&mut self) {
-        // make sure that the pending futures are not left outstanding with danglign references to self
-        let _ = std::mem::replace(&mut self.pending_client_futs, [(); N].map(|_| None));
-    }
-}
+#[allow(clippy::type_complexity)]
+static mut PEND_FUTS: &mut [Option<
+    Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Sync + Send + 'static>>,
+>] = &mut [];
 
 #[allow(clippy::needless_lifetimes)]
 impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
-    fn recv<'a>(
-        &'a mut self,
+    fn recv(
+        &mut self,
     ) -> Pin<
         Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
     > {
-        Box::pin(async move {
+        Box::pin(async {
+            let mut pend_futs = unsafe { &mut *PEND_FUTS };
+            if !INITIALIZED.swap(true, Ordering::SeqCst) {
+                let init = Box::leak(Box::new([(); N].map(|_| None)));
+                pend_futs = init.as_mut();
+            }
             let mut futs_opt = [(); N].map(|_| None);
-            for (i, o) in self.pending_client_futs.iter_mut().enumerate() {
-                let f = futs_opt.get_mut(i).unwrap();
-                *f = o.take();
+            for (i, pend) in pend_futs.iter_mut().enumerate() {
+                let f = &mut futs_opt[i];
+                if let Some(pend_fut) = pend.take() {
+                    *f = Some(pend_fut);
+                } else {
+                    // this receiver ain't awaiting, queue a new one
+                    // SAFETY: is safe here to extend the lifetime since clients are required to be 'static
+                    //         and we take ownership, so they will be alive for the duration of the program
+                    let new_pend = unsafe {
+                        std::mem::transmute(Box::pin(self.hosts_rx[i].recv())
+                            as Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>)
+                    };
+                    *f = Some(new_pend);
+                }
             }
             let (res, idx, mut others) = select_all(futs_opt.map(|f| f.unwrap())).await;
-            {
-                let self_l: &'static mut Self = unsafe { &mut *(self as *mut _) };
-                let new_fut = self_l.hosts_rx[idx].recv();
-                others[idx] = Some(Box::pin(new_fut));
-            }
             if let Some(res) = res {
                 match res {
                     Ok((external, r)) => {
@@ -114,7 +108,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
 
                         // place back futs
                         for (i, fut) in others.iter_mut().enumerate() {
-                            std::mem::swap(fut, &mut self.pending_client_futs[i]);
+                            std::mem::swap(fut, &mut pend_futs[i]);
                         }
                         Ok((id, r))
                     }

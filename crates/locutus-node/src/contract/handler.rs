@@ -194,18 +194,14 @@ pub(crate) trait RuntimeInterface {
         key: &ContractKey,
         parameters: Parameters<'a>,
         state: State<'a>,
-    ) -> RuntimeResult<bool> {
-        todo!()
-    }
+    ) -> RuntimeResult<bool>;
 
     fn validate_delta<'a>(
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
         delta: StateDelta<'a>,
-    ) -> RuntimeResult<bool> {
-        todo!()
-    }
+    ) -> RuntimeResult<bool>;
 
     fn update_state<'a>(
         &mut self,
@@ -213,26 +209,20 @@ pub(crate) trait RuntimeInterface {
         parameters: Parameters<'a>,
         state: State<'a>,
         delta: StateDelta<'a>,
-    ) -> RuntimeResult<State<'a>> {
-        todo!()
-    }
+    ) -> RuntimeResult<State<'a>>;
 
     fn summarize_state<'a>(
         &mut self,
         parameters: Parameters<'a>,
         state: State<'a>,
-    ) -> StateSummary<'a> {
-        todo!()
-    }
+    ) -> StateSummary<'a>;
 
     fn get_state_delta<'a>(
         &mut self,
         parameters: Parameters<'a>,
         state: State<'a>,
         delta_to: StateSummary<'a>,
-    ) -> StateDelta<'a> {
-        todo!()
-    }
+    ) -> StateDelta<'a>;
 }
 
 mod sqlite {
