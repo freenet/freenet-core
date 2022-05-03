@@ -6,7 +6,6 @@ use std::{collections::HashMap, task::Poll};
 
 use futures::task::AtomicWaker;
 use futures::FutureExt;
-use once_cell::sync::Lazy;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, HostResult};
@@ -98,7 +97,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                     *f = Some(new_pend);
                 }
             }
-            assert_eq!(pend_futs.len(), N);
+            debug_assert_eq!(pend_futs.len(), N);
             let (res, idx, others) =
                 futures::future::select_all(futs_opt.map(|f| f.unwrap())).await;
             if let Some(res) = res {
@@ -116,8 +115,8 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                             });
 
                         // place back futs
-                        assert!(pend_futs.iter().all(|f| f.is_none()));
-                        assert_eq!(others.len(), pend_futs.len() - 1);
+                        debug_assert!(pend_futs.iter().all(|f| f.is_none()));
+                        debug_assert_eq!(others.len(), pend_futs.len() - 1);
                         for (i, fut) in others.into_iter().enumerate() {
                             let p = &mut pend_futs.get_mut(i);
                             let _ = p.insert(&mut Some(fut));
