@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         .finish();
     sub.init();
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
@@ -29,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
         loop {
             let (id, req) = all_clients.recv().await?;
-            tracing::info!("client {id}, req -> {req:?}");
+            tracing::info!("client {id}, req -> {req}");
         }
     })
 }

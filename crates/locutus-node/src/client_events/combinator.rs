@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Context;
 use std::{collections::HashMap, task::Poll};
 
+use futures::task::AtomicWaker;
 use futures::FutureExt;
+use once_cell::sync::Lazy;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, HostResult};
@@ -58,9 +60,9 @@ impl<const N: usize> ClientEventsCombinator<N> {
 }
 
 #[allow(clippy::type_complexity)]
-static mut PEND_FUTS: &mut [Option<
-    Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Sync + Send + 'static>>,
->] = &mut [];
+static mut PEND_FUTS: Option<
+    Box<[Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Sync + Send + 'static>>>]>,
+> = None;
 
 #[allow(clippy::needless_lifetimes)]
 impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
@@ -70,12 +72,17 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
         Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
     > {
         Box::pin(async {
-            let mut pend_futs = unsafe { &mut *PEND_FUTS };
+            let pend_futs = unsafe { &mut PEND_FUTS };
             if !INITIALIZED.swap(true, Ordering::SeqCst) {
-                let init = Box::leak(Box::new([(); N].map(|_| None)));
-                pend_futs = init.as_mut();
+                let init = [(); N]
+                    .map(|_| None)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                std::mem::swap(pend_futs, &mut Some(init));
             }
             let mut futs_opt = [(); N].map(|_| None);
+            let pend_futs = pend_futs.as_mut().unwrap();
             for (i, pend) in pend_futs.iter_mut().enumerate() {
                 let f = &mut futs_opt[i];
                 if let Some(pend_fut) = pend.take() {
@@ -91,11 +98,13 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                     *f = Some(new_pend);
                 }
             }
-            let (res, idx, mut others) = select_all(futs_opt.map(|f| f.unwrap())).await;
+            assert_eq!(pend_futs.len(), N);
+            let (res, idx, others) =
+                futures::future::select_all(futs_opt.map(|f| f.unwrap())).await;
             if let Some(res) = res {
                 match res {
                     Ok((external, r)) => {
-                        log::debug!("received request; internal_id={external}; req={r:?}");
+                        log::debug!("received request; internal_id={external}; req={r}");
                         let id = *(&mut self.external_clients[idx])
                             .entry(external)
                             .or_insert_with(|| {
@@ -107,8 +116,11 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                             });
 
                         // place back futs
-                        for (i, fut) in others.iter_mut().enumerate() {
-                            std::mem::swap(fut, &mut pend_futs[i]);
+                        assert!(pend_futs.iter().all(|f| f.is_none()));
+                        assert_eq!(others.len(), pend_futs.len() - 1);
+                        for (i, fut) in others.into_iter().enumerate() {
+                            let p = &mut pend_futs.get_mut(i);
+                            let _ = p.insert(&mut Some(fut));
                         }
                         Ok((id, r))
                     }
@@ -180,11 +192,13 @@ async fn client_fn(
             }
         }
     }
+    log::error!("client shut down");
 }
 
 /// An optimized for the use case version of `futures::select_all` which keeps ordering.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 struct SelectAll<Fut, const N: usize> {
+    waker: AtomicWaker,
     inner: [Option<Fut>; N],
 }
 
@@ -194,34 +208,44 @@ impl<Fut: Future + Unpin, const N: usize> Future for SelectAll<Fut, N> {
     type Output = (Fut::Output, usize, [Option<Fut>; N]);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        log::info!("entered fut");
-        let item = self
-            .inner
-            .iter_mut()
-            .enumerate()
-            .find_map(|(i, f)| {
-                f.as_mut().map(|f| match f.poll_unpin(cx) {
-                    Poll::Pending => None,
-                    Poll::Ready(e) => Some((i, e)),
-                })
-            })
-            .flatten();
-        match item {
-            Some((idx, res)) => {
-                self.inner[idx] = None;
-                let rest = std::mem::replace(&mut self.inner, [(); N].map(|_| None));
-                Poll::Ready((res, idx, rest))
-            }
-            None => Poll::Pending,
+        macro_rules! recv {
+            () => {
+                let item = self
+                    .inner
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(i, f)| {
+                        f.as_mut().map(|f| match f.poll_unpin(cx) {
+                            Poll::Pending => None,
+                            Poll::Ready(e) => Some((i, e)),
+                        })
+                    })
+                    .flatten();
+                match item {
+                    Some((idx, res)) => {
+                        self.inner[idx] = None;
+                        let rest = std::mem::replace(&mut self.inner, [(); N].map(|_| None));
+                        return Poll::Ready((res, idx, rest));
+                    }
+                    None => {}
+                }
+            };
         }
+
+        recv!();
+        self.waker.register(cx.waker());
+        recv!();
+        Poll::Pending
     }
 }
 
-fn select_all<F, const N: usize>(iter: [F; N]) -> SelectAll<F, N>
+// FIXME
+fn _select_all<F, const N: usize>(iter: [F; N]) -> SelectAll<F, N>
 where
     F: Future + Unpin,
 {
     SelectAll {
+        waker: AtomicWaker::new(),
         inner: iter.map(|f| Some(f)),
     }
 }
