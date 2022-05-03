@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Context;
 use std::{collections::HashMap, task::Poll};
 
@@ -15,7 +15,6 @@ use crate::{ClientEventsProxy, ClientId, ClientRequest, HostResponse};
 type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
 static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// This type allows combining different sources of events into one and interoperation between them.
 pub struct ClientEventsCombinator<const N: usize> {
@@ -28,13 +27,13 @@ pub struct ClientEventsCombinator<const N: usize> {
     /// a map of the external id to which protocol it belongs (represented by the index in the array)
     /// and the original id (reverse of indexes)
     internal_clients: HashMap<ClientId, (usize, ClientId)>,
+    #[allow(clippy::type_complexity)]
+    pend_futs:
+        [Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Sync + Send + 'static>>>; N],
 }
 
 impl<const N: usize> ClientEventsCombinator<N> {
     pub fn new(clients: [BoxedClient; N]) -> Self {
-        if INITIALIZED.load(Ordering::SeqCst) {
-            panic!("only one instance of a combinator allowed per execution");
-        }
         let channels = clients.map(|client| {
             let (tx, rx) = channel(1);
             let (tx_host, rx_host) = channel(1);
@@ -54,14 +53,10 @@ impl<const N: usize> ClientEventsCombinator<N> {
             hosts_rx,
             external_clients,
             internal_clients: HashMap::new(),
+            pend_futs: [(); N].map(|_| None),
         }
     }
 }
-
-#[allow(clippy::type_complexity)]
-static mut PEND_FUTS: Option<
-    Box<[Option<Pin<Box<dyn Future<Output = Option<HostIncomingMsg>> + Sync + Send + 'static>>>]>,
-> = None;
 
 #[allow(clippy::needless_lifetimes)]
 impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
@@ -71,17 +66,8 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
         Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
     > {
         Box::pin(async {
-            let pend_futs = unsafe { &mut PEND_FUTS };
-            if !INITIALIZED.swap(true, Ordering::SeqCst) {
-                let init = [(); N]
-                    .map(|_| None)
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                std::mem::swap(pend_futs, &mut Some(init));
-            }
             let mut futs_opt = [(); N].map(|_| None);
-            let pend_futs = pend_futs.as_mut().unwrap();
+            let pend_futs = &mut self.pend_futs.as_mut();
             for (i, pend) in pend_futs.iter_mut().enumerate() {
                 let f = &mut futs_opt[i];
                 if let Some(pend_fut) = pend.take() {
