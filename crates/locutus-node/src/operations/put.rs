@@ -832,6 +832,7 @@ mod test {
         let put_event = ClientRequest::Put {
             contract: contract.clone(),
             state: new_value.clone(),
+            parameters: [].as_ref().into(),
         };
 
         let gw_0 = NodeSpecification {

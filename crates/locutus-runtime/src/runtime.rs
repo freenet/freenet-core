@@ -71,12 +71,12 @@ impl Runtime {
         Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
     }
 
-    fn get_module(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+    fn get_module(&mut self, key: &ContractKey, parameters: &Parameters) -> RuntimeResult<()> {
         let contract = self
             .contracts
-            .fetch_contract(key)?
+            .fetch_contract(key, parameters)
             .ok_or(ContractRuntimeError::ContractNotFound(*key))?;
-        let module = Module::new(&self.store, contract.data())?;
+        let module = Module::new(&self.store, contract.data().data())?;
         self.modules.insert(*key, module);
         Ok(())
     }
@@ -150,11 +150,16 @@ impl Runtime {
         Store::new(&Universal::new(Cranelift::new()).engine())
     }
 
-    fn prepare_call(&mut self, key: &ContractKey, req_bytes: usize) -> RuntimeResult<Instance> {
+    fn prepare_call(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+        req_bytes: usize,
+    ) -> RuntimeResult<Instance> {
         let module = if let Some(module) = self.modules.get(key) {
             module
         } else {
-            self.get_module(key)?;
+            self.get_module(key, parameters)?;
             self.modules.get(key).unwrap()
         };
         let instance = self.prepare_instance(module)?;
@@ -186,7 +191,7 @@ impl Runtime {
         state: State<'a>,
     ) -> RuntimeResult<bool> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -209,7 +214,7 @@ impl Runtime {
     ) -> RuntimeResult<bool> {
         // todo: if we keep this hot in memory on next calls overwrite the buffer with new delta
         let req_bytes = parameters.size() + delta.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut delta_buf = self.init_buf(&instance, &delta)?;
@@ -239,7 +244,7 @@ impl Runtime {
         //       - over subsequent requests state size may change
         //       - the delta may not be necessarily the same size
         let req_bytes = parameters.size() + state.size() + delta.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -277,7 +282,7 @@ impl Runtime {
         state: State<'a>,
     ) -> RuntimeResult<StateSummary<'a>> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -309,7 +314,7 @@ impl Runtime {
         summary: StateSummary<'a>,
     ) -> RuntimeResult<StateDelta<'a>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -344,7 +349,7 @@ impl Runtime {
         current_summary: StateSummary<'a>,
     ) -> RuntimeResult<State<'a>> {
         let req_bytes = parameters.size() + current_state.size() + current_summary.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &current_state)?;

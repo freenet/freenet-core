@@ -655,6 +655,8 @@ mod messages {
 mod test {
     use std::collections::HashMap;
 
+    use locutus_stdlib::prelude::Parameters;
+
     use super::*;
     use crate::{
         client_events::ClientRequest,

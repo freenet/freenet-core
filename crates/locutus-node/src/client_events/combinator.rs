@@ -67,7 +67,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
     > {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
-            let pend_futs = &mut self.pend_futs.as_mut();
+            let pend_futs = &mut self.pend_futs;
             for (i, pend) in pend_futs.iter_mut().enumerate() {
                 let f = &mut futs_opt[i];
                 if let Some(pend_fut) = pend.take() {
@@ -83,7 +83,6 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                     *f = Some(new_pend);
                 }
             }
-            debug_assert_eq!(pend_futs.len(), N);
             let (res, idx, others) =
                 futures::future::select_all(futs_opt.map(|f| f.unwrap())).await;
             if let Some(res) = res {

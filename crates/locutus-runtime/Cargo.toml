@@ -9,6 +9,7 @@ publish = false
 arbitrary = { version = "1", features = ["derive"], optional = true }
 arrayvec = { version = "0.7", features = ["serde"] }
 blake2 = { version =  "0.10", features = [ "std" ] }
+bs58 = "0.4"
 futures = "0.3"
 hex = "0.4"
 serde = { version = "1", features = ["rc", "derive"] }

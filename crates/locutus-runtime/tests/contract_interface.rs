@@ -20,7 +20,7 @@ fn test_contract(contract_path: &str) -> WrappedContract {
         .join("contracts")
         .join("test_contract")
         .join(contract_path);
-    WrappedContract::try_from(contract_path).expect("contract found")
+    WrappedContract::try_from(&*contract_path).expect("contract found")
 }
 
 fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
