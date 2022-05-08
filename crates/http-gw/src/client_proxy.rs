@@ -61,7 +61,7 @@ async fn handle_contract(
     request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
 ) -> Result<impl Reply, Rejection> {
     let key = key.to_lowercase();
-    let key = ContractKey::hex_decode(key)
+    let key = ContractKey::hex_decode(key, vec![].into())
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let (tx, response) = oneshot::channel();
     request_sender
@@ -93,7 +93,8 @@ async fn handle_contract(
 fn get_web(state: Option<State>) -> Result<String, anyhow::Error> {
     if let Some(state) = state.clone() {
         // Decompose the state and extract the compressed web interface
-        let state_bytes = state.to_vec().as_slice();
+        let state = state.to_vec();
+        let state_bytes = state.as_slice();
         let (metadata_size, reminder) = state_bytes.split_at(4);
         let (_, reminder) =
             reminder.split_at(u32::from_be_bytes(metadata_size.try_into().unwrap()) as usize);

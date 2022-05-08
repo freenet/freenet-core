@@ -403,13 +403,13 @@ mod test {
             .join("contracts")
             .join("test_contract")
             .join(contract_path);
-        Contract::try_from(contract_path).expect("contract found")
+        Contract::try_from((&*contract_path, Parameters::from(vec![]))).expect("contract found")
     }
 
     fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
         let mut store = ContractStore::new(test_dir(), 10_000);
         let contract = test_contract("test_contract_guest.wasi.wasm");
-        let key = contract.key();
+        let key = *contract.key();
         store.store_contract(contract)?;
         Ok((store, key))
     }

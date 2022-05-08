@@ -23,6 +23,35 @@ pub enum ContractError {
     InvalidUpdate,
 }
 
+#[doc(hidden)]
+#[repr(i32)]
+pub enum UpdateResult {
+    ValidUpdate = 0i32,
+    ValidNoChange = 1i32,
+    Invalid = 2i32,
+}
+
+impl From<ContractError> for UpdateResult {
+    fn from(err: ContractError) -> Self {
+        match err {
+            ContractError::InvalidUpdate => UpdateResult::Invalid,
+        }
+    }
+}
+
+impl TryFrom<i32> for UpdateResult {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ValidUpdate),
+            1 => Ok(Self::ValidNoChange),
+            2 => Ok(Self::Invalid),
+            _ => Err(()),
+        }
+    }
+}
+
 pub enum UpdateModification {
     ValidUpdate(State<'static>),
     NoChange,
@@ -70,13 +99,13 @@ pub trait ContractInterface {
 /// and a `contract` section.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContractSpecification<'a> {
-    parameters: Parameters<'a>,
-    contract: ContractData<'a>,
+    pub parameters: Parameters<'a>,
+    pub contract: ContractData<'a>,
     key: ContractKey,
 }
 
-impl ContractSpecification<'_> {
-    pub fn new<'a>(
+impl<'a> ContractSpecification<'a> {
+    pub fn new(
         contract: ContractData<'a>,
         parameters: Parameters<'a>,
     ) -> ContractSpecification<'a> {
@@ -95,6 +124,11 @@ impl ContractSpecification<'_> {
     /// Data portion of the specification.
     pub fn data(&self) -> &ContractData {
         &self.contract
+    }
+
+    /// Data portion of the specification.
+    pub fn into_data(self) -> ContractData<'a> {
+        self.contract
     }
 
     /// Parameters portion of the parameters.
@@ -180,6 +214,10 @@ impl<'a> Parameters<'a> {
     pub fn size(&self) -> usize {
         self.0.len()
     }
+
+    pub fn into_owned(self) -> Vec<u8> {
+        self.0.into_owned()
+    }
 }
 
 impl<'a> From<Vec<u8>> for Parameters<'a> {
@@ -199,35 +237,6 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
         match &self.0 {
             Cow::Borrowed(arr) => arr,
             Cow::Owned(arr) => arr.as_ref(),
-        }
-    }
-}
-
-#[doc(hidden)]
-#[repr(i32)]
-pub enum UpdateResult {
-    ValidUpdate = 0i32,
-    ValidNoChange = 1i32,
-    Invalid = 2i32,
-}
-
-impl From<ContractError> for UpdateResult {
-    fn from(err: ContractError) -> Self {
-        match err {
-            ContractError::InvalidUpdate => UpdateResult::Invalid,
-        }
-    }
-}
-
-impl TryFrom<i32> for UpdateResult {
-    type Error = ();
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::ValidUpdate),
-            1 => Ok(Self::ValidNoChange),
-            2 => Ok(Self::Invalid),
-            _ => Err(()),
         }
     }
 }

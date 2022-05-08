@@ -411,6 +411,8 @@ mod sqlite {
 
     #[cfg(test)]
     mod test {
+        use locutus_stdlib::prelude::ContractData;
+
         use super::sqlite::SQLiteContractHandler;
         use super::*;
 
@@ -429,15 +431,18 @@ mod sqlite {
 
             // Generate a contract
             let contract_bytes = b"Test contract value".to_vec();
-            let contract: WrappedContract = WrappedContract::new(contract_bytes.clone());
+            let contract: WrappedContract = WrappedContract::new(
+                ContractData::from(contract_bytes.clone()),
+                Parameters::from(vec![]),
+            );
 
             // Get contract parts
             let contract_value = WrappedState::new(contract_bytes.clone());
             let put_result_value = handler
-                .put_value(&contract.key(), contract_value.clone())
+                .put_value(contract.key(), contract_value.clone())
                 .await?;
             let get_result_value = handler
-                .get_value(&contract.key())
+                .get_value(contract.key())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("No value found"))?;
 
@@ -447,10 +452,10 @@ mod sqlite {
             // Update the contract value with new one
             let new_contract_value = WrappedState::new(b"New test contract value".to_vec());
             let new_put_result_value = handler
-                .put_value(&contract.key(), new_contract_value.clone())
+                .put_value(contract.key(), new_contract_value.clone())
                 .await?;
             let new_get_result_value = handler
-                .get_value(&contract.key())
+                .get_value(contract.key())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("No value found"))?;
 
@@ -465,6 +470,7 @@ mod sqlite {
 #[cfg(test)]
 pub mod test {
     use locutus_runtime::ContractStore;
+    use locutus_stdlib::prelude::ContractData;
 
     use super::*;
     use crate::{
@@ -553,9 +559,10 @@ pub mod test {
 
         let h = GlobalExecutor::spawn(async move {
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(vec![
-                    0, 1, 2, 3,
-                ])))
+                .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(
+                    ContractData::from(vec![0, 1, 2, 3]),
+                    Parameters::from(vec![]),
+                )))
                 .await
         });
 
@@ -568,8 +575,13 @@ pub mod test {
             assert_eq!(data, vec![0, 1, 2, 3]);
             tokio::time::timeout(
                 Duration::from_millis(100),
-                rcv_halve
-                    .send_to_listener(id, ContractHandlerEvent::Cache(WrappedContract::new(data))),
+                rcv_halve.send_to_listener(
+                    id,
+                    ContractHandlerEvent::Cache(WrappedContract::new(
+                        ContractData::from(data),
+                        Parameters::from(vec![]),
+                    )),
+                ),
             )
             .await??;
         } else {

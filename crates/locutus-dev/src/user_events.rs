@@ -1,17 +1,19 @@
-use std::{future::Future, io::Read, pin::Pin, time::Duration};
+use std::{fs::File, future::Future, io::Read, pin::Pin, time::Duration};
 
 use locutus_node::{
     BoxedClient, ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse,
 };
 use locutus_runtime::prelude::*;
+use locutus_stdlib::prelude::{ContractSpecification, Parameters};
 
-use crate::{Cli, CommandSender};
+use crate::{state::AppState, Cli, CommandSender};
 
 type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
 pub(crate) async fn user_fn_handler(
-    command_sender: CommandSender,
     config: Cli,
+    command_sender: CommandSender,
+    app_state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let mut input = StdInput::new(config)?;
     println!("running... send a command or write \"help\" for help");
@@ -32,23 +34,38 @@ pub(crate) async fn user_fn_handler(
 struct StdInput {
     config: Cli,
     contract_key: ContractKey,
+    input: File,
     buf: Vec<u8>,
 }
 
 impl StdInput {
     fn new(config: Cli) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        let contract = WrappedContract::try_from(config.contract.clone())?;
-        let contract_key = contract.key();
+        let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
+        let contract_key = *contract.key();
         Ok(StdInput {
+            input: File::open(&config.input_file)?,
             config,
             contract_key,
             buf: vec![],
         })
     }
+
+    fn read_input(&mut self) -> Vec<u8> {
+        let mut buf = vec![];
+        self.input.read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    fn read_state(&mut self) -> (Parameters<'static>, WrappedState) {
+        let data = self.read_input();
+        let contract_spec = ContractSpecification::try_from(data).unwrap();
+        todo!()
+    }
 }
 
 #[derive(Debug)]
 enum Command {
+    InitialPut,
     Get,
     Update { delta: StateDelta<'static> },
     Help,
@@ -85,6 +102,7 @@ impl TryFrom<&[u8]> for Command {
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         let cmd = std::str::from_utf8(value).map_err(|e| format!("{e}"))?;
         match cmd {
+            "initial_put" => Ok(Command::InitialPut),
             "get" => Ok(Command::Get),
             "update" => todo!(),
             "help" => Ok(Command::Help),
@@ -111,6 +129,10 @@ impl ClientEventsProxy for StdInput {
                 match Command::try_from(&self.buf[..]) {
                     Ok(cmd) if matches!(cmd, Command::Help) => {
                         println!("{HELP}");
+                    }
+                    Ok(cmd) if matches!(cmd, Command::InitialPut) => {
+                        let (parameters, state) = self.read_state();
+                        todo!()
                     }
                     Ok(cmd) => {
                         self.buf.clear();
@@ -150,6 +172,7 @@ impl Clone for StdInput {
             config: self.config.clone(),
             contract_key: self.contract_key,
             buf: Vec::new(),
+            input: File::open(&self.config.input_file).unwrap(),
         }
     }
 }

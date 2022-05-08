@@ -458,7 +458,7 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
-        let contract_key: ContractKey = contract.key();
+        let contract_key: ContractKey = *contract.key();
 
         let event = ClientRequest::Subscribe { key: contract_key };
         let first_node = NodeSpecification {

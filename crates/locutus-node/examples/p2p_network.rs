@@ -8,6 +8,7 @@ use libp2p::{
 };
 use locutus_node::*;
 use locutus_runtime::prelude::{WrappedContract, WrappedState};
+use locutus_stdlib::prelude::{ContractData, Parameters};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");
@@ -39,8 +40,11 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    let contract = WrappedContract::new(vec![7, 3, 9, 5]);
-    let key = contract.key();
+    let contract = WrappedContract::new(
+        ContractData::from(vec![7, 3, 9, 5]),
+        Parameters::from(vec![]),
+    );
+    let key = *contract.key();
     let init_val = WrappedState::new(vec![1, 2, 3, 4]);
 
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -49,6 +53,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: init_val,
             contract: contract.clone(),
+            parameters: vec![].into(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;
@@ -70,6 +75,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: second_val,
             contract,
+            parameters: vec![].into(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;
@@ -138,8 +144,8 @@ struct UserEvents {
 impl ClientEventsProxy for UserEvents {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    fn recv<'a>(
-        &'a mut self,
+    fn recv(
+        &mut self,
     ) -> Pin<
         Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
     > {
@@ -152,10 +158,10 @@ impl ClientEventsProxy for UserEvents {
     }
 
     /// Sends a response from the host to the client application.
-    fn send<'a>(
-        &'a mut self,
-        id: ClientId,
-        response: Result<HostResponse, ClientError>,
+    fn send(
+        &mut self,
+        _id: ClientId,
+        _response: Result<HostResponse, ClientError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
             log::info!("received response");

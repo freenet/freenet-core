@@ -9,7 +9,7 @@ pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, SQLiteContractHandler, SqlDbError, StoreResponse,
 };
-use locutus_stdlib::prelude::ContractKey;
+use locutus_stdlib::prelude::{ContractKey, Parameters};
 pub(crate) use test::MockRuntime;
 #[cfg(test)]
 pub(crate) use test::{MemoryContractHandler, SimStoreError};
@@ -32,10 +32,10 @@ where
                 },
             ) => {
                 let contract = if fetch_contract {
+                    let params = Parameters::from(vec![]); // FIXME
                     contract_handler
                         .contract_store()
-                        .fetch_contract(&key)
-                        .map_err(|err| ContractError::ContractRuntimeError(err))?
+                        .fetch_contract(&key, &params)
                 } else {
                     None
                 };

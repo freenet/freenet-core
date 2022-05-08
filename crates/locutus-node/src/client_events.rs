@@ -5,7 +5,7 @@ use std::{error::Error as StdError, fmt::Display};
 
 use either::Either;
 use locutus_runtime::prelude::ContractKey;
-use locutus_stdlib::prelude::{State, StateDelta};
+use locutus_stdlib::prelude::{Parameters, State, StateDelta};
 use serde::{Deserialize, Serialize};
 
 use crate::{WrappedContract, WrappedState};
@@ -118,6 +118,7 @@ pub enum ClientRequest {
         contract: WrappedContract,
         /// Value to upsert in the contract.
         state: WrappedState,
+        parameters: Parameters<'static>,
     },
     /// Update an existing contract corresponding with the provided key.
     Update {
@@ -146,11 +147,15 @@ pub enum ClientRequest {
 impl Display for ClientRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientRequest::Put { contract, state } => {
+            ClientRequest::Put {
+                contract,
+                state,
+                parameters,
+            } => {
                 write!(f, "put request for contract {contract} with state {state}")
             }
             ClientRequest::Update { key, .. } => write!(f, "Update request for {key}"),
-            ClientRequest::Get { key, contract } => {
+            ClientRequest::Get { key, contract, .. } => {
                 write!(f, "get request for {key} (fetch full contract: {contract})")
             }
             ClientRequest::Subscribe { key } => write!(f, "subscribe request for {key}"),
@@ -223,10 +228,11 @@ pub(crate) mod test {
                 match rng.gen_range(0u8..3) {
                     0 if !self.owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                        let (contract, value) = self.owned_contracts[contract_no].clone();
+                        let (contract, state) = self.owned_contracts[contract_no].clone();
                         break ClientRequest::Put {
                             contract,
-                            state: value,
+                            state,
+                            parameters: [].as_ref().into(),
                         };
                     }
                     1 if !self.non_owned_contracts.is_empty() => {
@@ -251,11 +257,11 @@ pub(crate) mod test {
                         };
                         let key = if get_owned {
                             let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                            self.owned_contracts[contract_no].0.key()
+                            *self.owned_contracts[contract_no].0.key()
                         } else {
-                            let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
-
-                            self.non_owned_contracts[contract_no]
+                            // let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
+                            // self.non_owned_contracts[contract_no]
+                            todo!() // fixme
                         };
                         break ClientRequest::Subscribe { key };
                     }

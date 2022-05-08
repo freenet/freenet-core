@@ -33,7 +33,7 @@ impl ContractStore {
         &self,
         key: &ContractKey,
         params: &Parameters<'a>,
-    ) -> Option<ContractSpecification<'a>> {
+    ) -> Option<Contract> {
         let contract_hash = key.contract_part();
         let whole_spec_key = key.bytes();
         if let Some(contract) = self.contract_cache.get(contract_hash) {
@@ -44,7 +44,8 @@ impl ContractStore {
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
-            let contract = Contract::try_from(&*key_path)
+            let owned_params = Parameters::from(params.as_ref().to_owned());
+            let contract = Contract::try_from((&*key_path, owned_params))
                 .map_err(|err| {
                     tracing::debug!("contract not found: {err}");
                     err
@@ -52,22 +53,15 @@ impl ContractStore {
                 .ok()?;
 
             // add back the contract part to the mem store
-            let size = contract.data().len() as i64;
-            self.contract_cache.insert(
-                *contract_hash,
-                Contract::new(contract.data().to_vec()),
-                size,
-            );
-
-            Some(ContractSpecification::new(
-                ContractData::from(contract.data().to_vec()),
-                params.clone(),
-            ))
+            let size = contract.data().data().len() as i64;
+            self.contract_cache
+                .insert(*contract_hash, contract.clone(), size);
+            Some(contract)
         }
     }
 
     /// Store a copy of the contract in the local store.
-    pub fn store_contract(&mut self, contract: ContractSpecification) -> RuntimeResult<()> {
+    pub fn store_contract(&mut self, contract: Contract) -> RuntimeResult<()> {
         //fixme
         // {
         //     // store the contract portion of the spec

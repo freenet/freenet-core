@@ -655,8 +655,6 @@ mod messages {
 mod test {
     use std::collections::HashMap;
 
-    use locutus_stdlib::prelude::Parameters;
-
     use super::*;
     use crate::{
         client_events::ClientRequest,
@@ -673,7 +671,7 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
-        let key = contract.key();
+        let key = *contract.key();
 
         let get_event = ClientRequest::Get {
             key,
@@ -720,7 +718,7 @@ mod test {
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
-        let key = contract.key();
+        let key = *contract.key();
 
         let get_event = ClientRequest::Get {
             key,
@@ -757,7 +755,7 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
-        let key = contract.key();
+        let key = *contract.key();
 
         let get_event = ClientRequest::Get {
             key,

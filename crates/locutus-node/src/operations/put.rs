@@ -120,7 +120,7 @@ where
                     mut skip_list,
                 } => {
                     let key = contract.key();
-                    let is_cached_contract = op_storage.ring.is_contract_cached(&key);
+                    let is_cached_contract = op_storage.ring.is_contract_cached(key);
 
                     log::debug!(
                         "Performing a SeekNode at {}, trying put the contract {}",
@@ -131,10 +131,10 @@ where
                     if !is_cached_contract
                         && op_storage
                             .ring
-                            .within_caching_distance(&Location::from(&key))
+                            .within_caching_distance(&Location::from(key))
                     {
                         log::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
-                        match try_to_cache_contract(op_storage, &contract, key).await {
+                        match try_to_cache_contract(op_storage, &contract, *key).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -150,7 +150,7 @@ where
 
                     // after the contract has been cached, push the update query
                     log::debug!("Attempting contract value update");
-                    let new_value = put_contract(op_storage, key, value).await?;
+                    let new_value = put_contract(op_storage, *key, value).await?;
                     log::debug!("Contract successfully updated");
                     // if the change was successful, communicate this back to the requestor and broadcast the change
                     conn_manager
@@ -181,7 +181,7 @@ where
 
                     let broadcast_to = op_storage
                         .ring
-                        .subscribers_of(&key)
+                        .subscribers_of(key)
                         .map(|i| i.value().to_vec())
                         .unwrap_or_default();
                     log::debug!(
@@ -195,7 +195,7 @@ where
                         op_storage,
                         self.state,
                         broadcast_to,
-                        key,
+                        *key,
                         new_value,
                         self._ttl,
                     )
@@ -346,12 +346,12 @@ where
                         key
                     );
 
-                    let cached_contract = op_storage.ring.is_contract_cached(&key);
+                    let cached_contract = op_storage.ring.is_contract_cached(key);
                     let within_caching_dist = op_storage
                         .ring
-                        .within_caching_distance(&Location::from(&key));
+                        .within_caching_distance(&Location::from(key));
                     if !cached_contract && within_caching_dist {
-                        match try_to_cache_contract(op_storage, &contract, key).await {
+                        match try_to_cache_contract(op_storage, &contract, *key).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -363,7 +363,7 @@ where
                         });
                     }
                     // after the contract has been cached, push the update query
-                    let new_value = put_contract(op_storage, key, new_value).await?;
+                    let new_value = put_contract(op_storage, *key, new_value).await?;
 
                     //update skip list
                     skip_list.push(peer_loc.peer);
@@ -490,7 +490,7 @@ pub(crate) fn start_op(
     log::debug!(
         "Requesting put to contract {} @ loc({})",
         contract.key(),
-        Location::from(&contract.key())
+        Location::from(contract.key())
     );
 
     let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), peer);
@@ -532,7 +532,7 @@ where
     CErr: std::error::Error,
 {
     let key = if let Some(PutState::PrepareRequest { contract, .. }) = put_op.state.clone() {
-        contract.key()
+        *contract.key()
     } else {
         return Err(OpError::UnexpectedOpState);
     };
@@ -559,7 +559,7 @@ where
             ..
         }) => {
             let new_state = Some(PutState::AwaitingResponse {
-                contract: contract.key(),
+                contract: *contract.key(),
             });
             let msg = Some(PutMsg::RequestPut {
                 id,
@@ -629,8 +629,8 @@ async fn forward_changes<CErr, CB>(
     CB: ConnectionBridge,
 {
     let key = contract.key();
-    let contract_loc = Location::from(&key);
-    let forward_to = op_storage.ring.closest_caching(&key, 1, skip_list);
+    let contract_loc = Location::from(key);
+    let forward_to = op_storage.ring.closest_caching(key, 1, skip_list);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     for peer in forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
@@ -805,7 +805,7 @@ mod test {
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
-        let key = contract.key();
+        let key = *contract.key();
         let contract_val: WrappedState = gen.arbitrary()?;
         let new_value = WrappedState::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
@@ -819,14 +819,14 @@ mod test {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node1_loc])]),
+            contract_subscribers: HashMap::from_iter([(*contract.key(), vec![node1_loc])]),
         };
 
         let node_1 = NodeSpecification {
             owned_contracts: vec![(contract.clone(), contract_val.clone())],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(contract.key(), vec![node0_loc])]),
+            contract_subscribers: HashMap::from_iter([(*contract.key(), vec![node0_loc])]),
         };
 
         let put_event = ClientRequest::Put {

@@ -20,13 +20,13 @@ fn test_contract(contract_path: &str) -> WrappedContract {
         .join("contracts")
         .join("test_contract")
         .join(contract_path);
-    WrappedContract::try_from(&*contract_path).expect("contract found")
+    WrappedContract::try_from((&*contract_path, Parameters::from(vec![]))).expect("contract found")
 }
 
 fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
     let mut store = ContractStore::new(test_dir(), 10_000);
     let contract = test_contract("test_contract_guest.wasm");
-    let key = contract.key();
+    let key = *contract.key();
     store.store_contract(contract)?;
     Ok((store, key))
 }
@@ -56,7 +56,7 @@ fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> 
 fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = ContractStore::new(test_dir(), 10_000);
     let contract = test_contract("test_contract_host.wasm");
-    let key = contract.key();
+    let key = *contract.key();
     store.store_contract(contract)?;
 
     let mut runtime = Runtime::build(store, true).unwrap();
@@ -80,7 +80,7 @@ fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
 fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = ContractStore::new(test_dir(), 10_000);
     let contract = test_contract("test_contract_host.wasm");
-    let key = contract.key();
+    let key = *contract.key();
     store.store_contract(contract)?;
 
     let mut runtime = Runtime::build(store, true).unwrap();
