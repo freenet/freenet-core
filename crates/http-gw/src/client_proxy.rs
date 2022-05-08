@@ -1,12 +1,14 @@
+use anyhow::Error;
 use std::{
     collections::HashMap,
     future::Future,
+    io::Read,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use locutus_node::*;
-use locutus_stdlib::prelude::ContractKey;
+use locutus_stdlib::prelude::{ContractKey, State};
 use tokio::sync::{
     mpsc::{channel, Receiver, Sender},
     oneshot,
@@ -17,6 +19,8 @@ use warp::{
     reject::{self, Reject},
     reply, Filter, Rejection, Reply,
 };
+
+use flate2::read::GzDecoder;
 
 type HostResult = Result<HostResponse, ClientError>;
 
@@ -67,12 +71,42 @@ async fn handle_contract(
     let response = response
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
+
     match response {
-        Ok(_r) => {
-            // TODO: here we should pass the batton to the websocket interface
-            Ok(reply::reply())
+        Ok(r) => {
+            match r {
+                HostResponse::GetResponse { contract, state } => {
+                    // TODO: here we should pass the batton to the websocket interface
+                    let _web_body = get_web(state);
+                    Ok(reply::reply())
+                }
+                _ => {
+                    // TODO: here we should pass the batton to the websocket interface
+                    Ok(reply::reply())
+                }
+            }
         }
         Err(err) => Err(err.kind().into()),
+    }
+}
+
+fn get_web(state: Option<State>) -> Result<String, anyhow::Error> {
+    if let Some(state) = state.clone() {
+        // Decompose the state and extract the compressed web interface
+        let state_bytes = state.to_vec();
+        let state_bytes = state_bytes.as_slice();
+        let (metadata_size, reminder) = state_bytes.split_at(4);
+        let (_, reminder) =
+            reminder.split_at(u32::from_be_bytes(metadata_size.try_into().unwrap()) as usize);
+        let (web_size, reminder) = reminder.split_at(4);
+        let (web, _) = reminder.split_at(u32::from_be_bytes(web_size.try_into().unwrap()) as usize);
+
+        let mut gz = GzDecoder::new(web);
+        let mut body = String::new();
+        gz.read_to_string(&mut body)?;
+        Ok(body)
+    } else {
+        Ok("".to_string())
     }
 }
 
@@ -145,4 +179,38 @@ mod errors {
     #[derive(Debug)]
     pub(super) struct NodeError;
     impl Reject for NodeError {}
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    use super::*;
+    use flate2::read::GzEncoder;
+    use flate2::Compression;
+
+    #[test]
+    fn test_get_ui_from_contract() -> Result<(), anyhow::Error> {
+        // Prepare contract state
+        let expected_web_content = "<html><head><title>Title</title></head><body></body></html>";
+        let mut web = vec![];
+        let mut gz = GzEncoder::new(expected_web_content.as_bytes(), Compression::default());
+        let web_size = (gz.read_to_end(&mut web).unwrap() as u32)
+            .to_be_bytes()
+            .to_vec();
+
+        let metadata: Vec<u8> = "metadata".as_bytes().to_vec();
+        let metadata_size: Vec<u8> = u32::try_from(metadata.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        let reminder: Vec<u8> = "reminder".as_bytes().to_vec();
+        let state_vec: Vec<u8> = [metadata_size, metadata, web_size, web, reminder].concat();
+        let state = State::from(state_vec);
+
+        // Get web contet from state
+        let body = get_web(Some(state)).unwrap();
+
+        assert_eq!(expected_web_content, body);
+
+        Ok(())
+    }
 }
