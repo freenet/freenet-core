@@ -93,8 +93,7 @@ async fn handle_contract(
 fn get_web(state: Option<State>) -> Result<String, anyhow::Error> {
     if let Some(state) = state.clone() {
         // Decompose the state and extract the compressed web interface
-        let state_bytes = state.to_vec();
-        let state_bytes = state_bytes.as_slice();
+        let state_bytes = state.to_vec().as_slice();
         let (metadata_size, reminder) = state_bytes.split_at(4);
         let (_, reminder) =
             reminder.split_at(u32::from_be_bytes(metadata_size.try_into().unwrap()) as usize);
@@ -206,7 +205,7 @@ pub(crate) mod test {
         let state_vec: Vec<u8> = [metadata_size, metadata, web_size, web, reminder].concat();
         let state = State::from(state_vec);
 
-        // Get web contet from state
+        // Get web content from state
         let body = get_web(Some(state)).unwrap();
 
         assert_eq!(expected_web_content, body);

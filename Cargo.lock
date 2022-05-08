@@ -1366,7 +1366,9 @@ dependencies = [
 name = "http-gw"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "flate2",
  "hex",
  "locutus-node",
  "locutus-stdlib",
