@@ -3,11 +3,15 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Parser};
 use locutus_node::ClientRequest;
 
+use crate::state::AppState;
+
 mod executor;
+mod state;
 mod user_events;
 
 type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest>;
 type CommandSender = tokio::sync::mpsc::Sender<ClientRequest>;
+type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
@@ -54,15 +58,20 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+async fn main() -> Result<(), DynError> {
     let cli = Cli::parse();
     if cli.disable_tui_mode {
         return Err("CLI mode not yet implemented".into());
     }
+    let app_state = AppState::new(&cli)?;
 
     let (sender, receiver) = tokio::sync::mpsc::channel(100);
-    let runtime = tokio::task::spawn(executor::wasm_runtime(cli.clone(), receiver));
-    let user_fn = user_events::user_fn_handler(sender, cli);
+    let runtime = tokio::task::spawn(executor::wasm_runtime(
+        cli.clone(),
+        receiver,
+        app_state.clone(),
+    ));
+    let user_fn = user_events::user_fn_handler(cli, sender, app_state);
     tokio::select! {
         res = runtime => { res?? }
         res = user_fn => { res? }

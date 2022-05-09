@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use locutus_stdlib::prelude::{ContractData, ContractSpecification, Parameters};
+use locutus_stdlib::prelude::Parameters;
 use stretto::Cache;
 
 use crate::{contract::Contract, RuntimeResult};

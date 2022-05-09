@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, pin::Pin, time::Duration};
+use std::{net::Ipv4Addr, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail};
 use futures::Future;
@@ -41,7 +41,7 @@ async fn start_new_peer(
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     let contract = WrappedContract::new(
-        ContractData::from(vec![7, 3, 9, 5]),
+        Arc::new(ContractData::from(vec![7, 3, 9, 5])),
         Parameters::from(vec![]),
     );
     let key = *contract.key();

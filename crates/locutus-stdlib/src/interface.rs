@@ -15,6 +15,7 @@ use arrayvec::ArrayVec;
 use blake2::{Blake2b512, Blake2s256, Digest};
 use byteorder::LittleEndian;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 64;
 
@@ -208,6 +209,7 @@ impl<'a> arbitrary::Arbitrary<'a> for ContractSpecification<'static> {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct Parameters<'a>(Cow<'a, [u8]>);
 
 impl<'a> Parameters<'a> {
@@ -481,15 +483,14 @@ impl std::fmt::Display for ContractData<'_> {
     }
 }
 
+#[serde_as]
 /// The key representing a contract.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 pub struct ContractKey {
-    #[serde(deserialize_with = "contract_key_deser")]
-    #[serde(serialize_with = "<[_]>::serialize")]
+    #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     spec: [u8; CONTRACT_KEY_SIZE],
-    #[serde(deserialize_with = "contract_key_deser")]
-    #[serde(serialize_with = "<[_]>::serialize")]
+    #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     contract: [u8; CONTRACT_KEY_SIZE],
 }
 
@@ -574,6 +575,7 @@ impl std::fmt::Display for ContractKey {
     }
 }
 
+#[inline]
 fn internal_fmt_key(
     key: &[u8; CONTRACT_KEY_SIZE],
     f: &mut std::fmt::Formatter<'_>,

@@ -411,6 +411,8 @@ mod sqlite {
 
     #[cfg(test)]
     mod test {
+        use std::sync::Arc;
+
         use locutus_stdlib::prelude::ContractData;
 
         use super::sqlite::SQLiteContractHandler;
@@ -432,7 +434,7 @@ mod sqlite {
             // Generate a contract
             let contract_bytes = b"Test contract value".to_vec();
             let contract: WrappedContract = WrappedContract::new(
-                ContractData::from(contract_bytes.clone()),
+                Arc::new(ContractData::from(contract_bytes.clone())),
                 Parameters::from(vec![]),
             );
 
@@ -469,6 +471,8 @@ mod sqlite {
 
 #[cfg(test)]
 pub mod test {
+    use std::sync::Arc;
+
     use locutus_runtime::ContractStore;
     use locutus_stdlib::prelude::ContractData;
 
@@ -560,7 +564,7 @@ pub mod test {
         let h = GlobalExecutor::spawn(async move {
             send_halve
                 .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(
-                    ContractData::from(vec![0, 1, 2, 3]),
+                    Arc::new(ContractData::from(vec![0, 1, 2, 3])),
                     Parameters::from(vec![]),
                 )))
                 .await
@@ -578,7 +582,7 @@ pub mod test {
                 rcv_halve.send_to_listener(
                     id,
                     ContractHandlerEvent::Cache(WrappedContract::new(
-                        ContractData::from(data),
+                        Arc::new(ContractData::from(data)),
                         Parameters::from(vec![]),
                     )),
                 ),

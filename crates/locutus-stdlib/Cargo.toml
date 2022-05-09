@@ -13,6 +13,7 @@ bs58 = "0.4"
 hex = "0.4"
 once_cell = "1"
 serde = { version = "1", features = ["derive"] }
+serde_with = "1"
 thiserror = "1"
 
 # internal
