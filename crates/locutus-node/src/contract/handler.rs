@@ -351,7 +351,9 @@ mod sqlite {
             &self,
             contract_key: &ContractKey,
         ) -> Result<Option<WrappedState>, Self::Error> {
-            let encoded_key = hex::encode(&**contract_key);
+            let encoded_key = bs58::encode(&**contract_key)
+                .with_alphabet(bs58::Alphabet::BITCOIN)
+                .into_string();
             if let Some(value) = self.value_mem_cache.get(contract_key) {
                 return Ok(Some(value.value().clone()));
             }
@@ -383,7 +385,9 @@ mod sqlite {
             // let value: Vec<u8> = self
             //     .runtime
             //     .update_value(contract_key, &*old_value, &*value)?;
-            let encoded_key = hex::encode(contract_key.as_ref());
+            let encoded_key = bs58::encode(contract_key.as_ref())
+                .with_alphabet(bs58::Alphabet::BITCOIN)
+                .into_string();
             match sqlx::query(
                 "INSERT OR REPLACE INTO contracts (key, value) VALUES ($1, $2) \
                      RETURNING value",

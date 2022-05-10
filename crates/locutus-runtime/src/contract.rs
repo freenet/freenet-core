@@ -35,12 +35,10 @@ impl<'a> Contract<'a> {
     pub fn data(&self) -> &Arc<ContractData> {
         &self.data
     }
-}
 
-impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for Contract<'static> {
-    type Error = ContractRuntimeError;
-    fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        let (path, params) = data;
+    pub(crate) fn get_data_from_fs(
+        path: &Path,
+    ) -> Result<ContractData<'static>, ContractRuntimeError> {
         let mut contract_file = File::open(path)?;
         let mut contract_data = if let Ok(md) = contract_file.metadata() {
             Vec::with_capacity(md.len() as usize)
@@ -48,7 +46,15 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for Contract<'static> {
             Vec::new()
         };
         contract_file.read_to_end(&mut contract_data)?;
-        let data = Arc::new(ContractData::from(contract_data));
+        Ok(ContractData::from(contract_data))
+    }
+}
+
+impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for Contract<'static> {
+    type Error = ContractRuntimeError;
+    fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
+        let (path, params) = data;
+        let data = Arc::new(Self::get_data_from_fs(path)?);
         Ok(Contract::new(data, params))
     }
 }

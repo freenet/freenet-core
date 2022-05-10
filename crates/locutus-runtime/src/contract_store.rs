@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 
 use locutus_stdlib::prelude::{ContractData, Parameters};
 use stretto::Cache;
@@ -14,7 +14,6 @@ type KeyContractPart = [u8; 64];
 pub struct ContractStore {
     contracts_dir: PathBuf,
     contract_cache: Cache<KeyContractPart, Arc<ContractData<'static>>>,
-    // cached_params: Cache<ContractKey, Contract>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
@@ -25,9 +24,9 @@ impl ContractStore {
         Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
-            // cached_params: Cache::new(10_000, max_size).expect(ERR),
         }
     }
+
     /// Returns a copy of the contract bytes if available, none otherwise.
     pub fn fetch_contract<'a>(
         &self,
@@ -58,26 +57,29 @@ impl ContractStore {
         }
     }
 
-    /// Store a copy of the contract in the local store.
+    /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
     pub fn store_contract(&mut self, contract: Contract) -> RuntimeResult<()> {
-        //fixme
-        // {
-        //     // store the contract portion of the spec
-        //     let key = contract.data().key();
+        let contract_hash = contract.key().contract_part();
+        if self.contract_cache.get(contract_hash).is_some() {
+            return Ok(());
+        }
 
-        //     // insert in the memory cache
-        //     let size = contract.data().data().len() as i64;
-        //     self.contract_cache.insert(*key, contract.data(), size);
+        let key_path = bs58::encode(contract_hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+        let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
+        if Contract::get_data_from_fs(&key_path).is_ok() {
+            return Ok(());
+        }
 
-        //     // write to disc
-        //     let key_path: PathBuf = key.into();
-        //     let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
-        //     if key_path.exists() {
-        //         return Ok(());
-        //     }
-        //     let mut file = File::create(key_path)?;
-        //     file.write_all(contract.data())?;
-        // }
+        // insert in the memory cache
+        let size = contract.data().data().len() as i64;
+        let data = contract.data().data().to_vec();
+        self.contract_cache
+            .insert(*contract_hash, Arc::new(ContractData::from(data)), size);
+
+        let mut file = File::create(key_path)?;
+        file.write_all(contract.data().data())?;
 
         Ok(())
     }

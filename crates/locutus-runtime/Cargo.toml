@@ -11,7 +11,6 @@ arrayvec = { version = "0.7", features = ["serde"] }
 blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
 futures = "0.3"
-hex = "0.4"
 serde = { version = "1", features = ["rc", "derive"] }
 stretto = { version = "0.3.3", features = ["sync"], default-features = false }
 tracing = "0.1"
