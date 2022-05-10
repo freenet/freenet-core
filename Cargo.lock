@@ -2034,7 +2034,6 @@ dependencies = [
  "blake2 0.10.4",
  "bs58",
  "byteorder",
- "hex",
  "locutus-macros",
  "once_cell",
  "rand 0.8.5",

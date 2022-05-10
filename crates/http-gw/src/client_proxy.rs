@@ -61,7 +61,7 @@ async fn handle_contract(
     request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
 ) -> Result<impl Reply, Rejection> {
     let key = key.to_lowercase();
-    let key = ContractKey::hex_decode(key, vec![].into())
+    let key = ContractKey::decode(key, vec![].into())
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let (tx, response) = oneshot::channel();
     request_sender

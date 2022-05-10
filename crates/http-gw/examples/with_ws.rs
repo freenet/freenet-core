@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     rt.block_on(async move {
         let sample = Contract::new(vec![1, 2, 3, 4].into(), vec![].into());
-        tracing::info!("available contract: {}", sample.key().hex_encode());
+        tracing::info!("available contract: {}", sample.key().encode());
         // a482fdc4e226d57674e9a9086fc79e97deb5a648922c478e6347b32815d810b1df289553cf6f501c4c230a0b0fc88b58079e7d6798ca3278ecb2ce3db67cb1ab
 
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();

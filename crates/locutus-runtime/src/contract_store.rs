@@ -7,7 +7,7 @@ use crate::{contract::Contract, RuntimeResult};
 
 use super::ContractKey;
 
-type KeyContractPart = [u8; 64];
+type KeyContractPart = [u8; 32];
 
 /// Handle contract blob storage on the file system.
 #[derive(Clone)]

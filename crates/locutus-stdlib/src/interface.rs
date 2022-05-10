@@ -8,16 +8,14 @@ use std::{
     borrow::{Borrow, Cow},
     io::{Cursor, Read},
     ops::{Deref, DerefMut},
-    path::PathBuf,
 };
 
-use arrayvec::ArrayVec;
-use blake2::{Blake2b512, Blake2s256, Digest};
+use blake2::{Blake2s256, Digest};
 use byteorder::LittleEndian;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-const CONTRACT_KEY_SIZE: usize = 64;
+const CONTRACT_KEY_SIZE: usize = 32;
 
 #[derive(Debug)]
 pub enum ContractError {
@@ -384,11 +382,11 @@ impl<'a> DerefMut for StateSummary<'a> {
 ///
 /// It is the part of the executable belonging to the full specification
 /// and does not include any other metadata (like the parameters).
+#[serde_as]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContractData<'a> {
     data: Cow<'a, [u8]>,
-    #[serde(serialize_with = "<[_]>::serialize")]
-    #[serde(deserialize_with = "contract_key_deser")]
+    #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     key: [u8; CONTRACT_KEY_SIZE],
 }
 
@@ -491,7 +489,7 @@ where
 
         let contract_hash = contract.key();
 
-        let mut hasher = Blake2b512::new();
+        let mut hasher = Blake2s256::new();
         hasher.update(contract_hash);
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
@@ -517,14 +515,16 @@ impl ContractKey {
         &self.contract
     }
 
-    pub fn hex_decode(
-        encoded_contract: impl Into<String>,
+    pub fn decode(
+        contract_key: impl Into<String>,
         parameters: Parameters,
-    ) -> Result<Self, hex::FromHexError> {
-        let mut contract = [0; 64];
-        hex::decode_to_slice(encoded_contract.into(), &mut contract)?;
+    ) -> Result<Self, bs58::decode::Error> {
+        let mut contract = [0; CONTRACT_KEY_SIZE];
+        bs58::decode(contract_key.into())
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into(&mut contract)?;
 
-        let mut hasher = Blake2b512::new();
+        let mut hasher = Blake2s256::new();
         hasher.update(&contract);
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
@@ -534,15 +534,10 @@ impl ContractKey {
         Ok(Self { spec, contract })
     }
 
-    pub fn hex_encode(&self) -> String {
-        hex::encode(self.spec)
-    }
-}
-
-impl From<ContractKey> for PathBuf {
-    fn from(val: ContractKey) -> Self {
-        let r = hex::encode(val.spec);
-        PathBuf::from(r)
+    pub fn encode(&self) -> String {
+        bs58::encode(self.spec)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
     }
 }
 
@@ -567,19 +562,10 @@ fn internal_fmt_key(
     key: &[u8; CONTRACT_KEY_SIZE],
     f: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
-    let r = hex::encode(key);
+    let r = bs58::encode(key)
+        .with_alphabet(bs58::Alphabet::BITCOIN)
+        .into_string();
     write!(f, "{}", &r[..8])
-}
-
-// A bit wasteful but cannot deserialize directly into [u8; 64]
-// with current version of serde
-fn contract_key_deser<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let data: ArrayVec<u8, 64> = Deserialize::deserialize(deserializer)?;
-    data.into_inner()
-        .map_err(|_| <D::Error as serde::de::Error>::custom("invalid key length"))
 }
 
 #[cfg(test)]
@@ -599,12 +585,12 @@ mod test {
     fn key_ser() -> Result<(), Box<dyn std::error::Error>> {
         let mut gen = arbitrary::Unstructured::new(&*RND_BYTES);
         let expected: ContractKey = gen.arbitrary()?;
-        let encoded = hex::encode(expected.bytes());
-        // eprintln!("encoded key: {encoded}");
+        let encoded = bs58::encode(expected.bytes()).into_string();
+        // println!("encoded key: {encoded}");
 
         let serialized = bincode::serialize(&expected)?;
         let deserialized: ContractKey = bincode::deserialize(&serialized)?;
-        let decoded = hex::encode(deserialized.bytes());
+        let decoded = bs58::encode(deserialized.bytes()).into_string();
         assert_eq!(encoded, decoded);
         assert_eq!(deserialized, expected);
         Ok(())
