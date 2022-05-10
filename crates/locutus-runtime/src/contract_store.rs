@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
-use locutus_stdlib::prelude::Parameters;
+use locutus_stdlib::prelude::{ContractData, Parameters};
 use stretto::Cache;
 
 use crate::{contract::Contract, RuntimeResult};
@@ -13,8 +13,8 @@ type KeyContractPart = [u8; 64];
 #[derive(Clone)]
 pub struct ContractStore {
     contracts_dir: PathBuf,
-    contract_cache: Cache<KeyContractPart, Contract>,
-    cached_params: Cache<ContractKey, Contract>,
+    contract_cache: Cache<KeyContractPart, Arc<ContractData<'static>>>,
+    // cached_params: Cache<ContractKey, Contract>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
@@ -25,7 +25,7 @@ impl ContractStore {
         Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
-            cached_params: Cache::new(10_000, max_size).expect(ERR),
+            // cached_params: Cache::new(10_000, max_size).expect(ERR),
         }
     }
     /// Returns a copy of the contract bytes if available, none otherwise.
@@ -33,19 +33,17 @@ impl ContractStore {
         &self,
         key: &ContractKey,
         params: &Parameters<'a>,
-    ) -> Option<Contract> {
+    ) -> Option<Contract<'a>> {
         let contract_hash = key.contract_part();
-        let whole_spec_key = key.bytes();
-        if let Some(contract) = self.contract_cache.get(contract_hash) {
-            // Ok(Some(contract.as_ref().clone()))
-            todo!()
+        if let Some(data) = self.contract_cache.get(contract_hash) {
+            Some(Contract::new(data.value().clone(), params.clone()))
         } else {
             let path = bs58::encode(contract_hash)
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
             let owned_params = Parameters::from(params.as_ref().to_owned());
-            let contract = Contract::try_from((&*key_path, owned_params))
+            let Contract { data, params, .. } = Contract::try_from((&*key_path, owned_params))
                 .map_err(|err| {
                     tracing::debug!("contract not found: {err}");
                     err
@@ -53,10 +51,10 @@ impl ContractStore {
                 .ok()?;
 
             // add back the contract part to the mem store
-            let size = contract.data().data().len() as i64;
+            let size = data.data().len() as i64;
             self.contract_cache
-                .insert(*contract_hash, contract.clone(), size);
-            Some(contract)
+                .insert(*contract_hash, data.clone(), size);
+            Some(Contract::new(data, params))
         }
     }
 

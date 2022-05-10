@@ -153,7 +153,7 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
     pub value: Option<WrappedState>,
-    pub contract: Option<WrappedContract>,
+    pub contract: Option<WrappedContract<'static>>,
 }
 
 struct InternalCHEvent<CErr> {
@@ -183,7 +183,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
         response: Result<StoreResponse, Err>,
     },
     /// Store a contract in the local store.
-    Cache(WrappedContract),
+    Cache(WrappedContract<'static>),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError<Err>>),
 }

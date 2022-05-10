@@ -14,7 +14,7 @@ pub(crate) use test::MockRuntime;
 #[cfg(test)]
 pub(crate) use test::{MemoryContractHandler, SimStoreError};
 
-pub(crate) async fn contract_handling<CH, Err>(
+pub(crate) async fn contract_handling<'a, CH, Err>(
     mut contract_handler: CH,
 ) -> Result<(), ContractError<Err>>
 where

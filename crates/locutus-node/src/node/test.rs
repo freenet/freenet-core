@@ -60,7 +60,7 @@ pub(crate) type EventId = usize;
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
     /// Pair of contract and the initial value
-    pub owned_contracts: Vec<(WrappedContract, WrappedState)>,
+    pub owned_contracts: Vec<(WrappedContract<'static>, WrappedState)>,
     pub non_owned_contracts: Vec<ContractKey>,
     pub events_to_generate: HashMap<EventId, ClientRequest>,
     pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,

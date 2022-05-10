@@ -8,7 +8,7 @@ mod operations;
 mod ring;
 pub(crate) mod util;
 
-pub(crate) type WrappedContract = locutus_runtime::prelude::WrappedContract;
+pub(crate) type WrappedContract<'a> = locutus_runtime::prelude::WrappedContract<'a>;
 pub(crate) type WrappedState = locutus_runtime::prelude::WrappedState;
 
 // exports:

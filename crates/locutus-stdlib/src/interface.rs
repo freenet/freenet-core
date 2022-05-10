@@ -99,21 +99,18 @@ pub trait ContractInterface {
 /// A complete contract specification requires a `parameters` section
 /// and a `contract` section.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ContractSpecification<'a> {
+pub struct Contract<'a> {
     pub parameters: Parameters<'a>,
-    pub contract: ContractData<'a>,
+    pub data: ContractData<'a>,
     key: ContractKey,
 }
 
-impl<'a> ContractSpecification<'a> {
-    pub fn new(
-        contract: ContractData<'a>,
-        parameters: Parameters<'a>,
-    ) -> ContractSpecification<'a> {
+impl<'a> Contract<'a> {
+    pub fn new(contract: ContractData<'a>, parameters: Parameters<'a>) -> Contract<'a> {
         let key = ContractKey::from((&parameters, &contract));
-        ContractSpecification {
+        Contract {
             parameters,
-            contract,
+            data: contract,
             key,
         }
     }
@@ -123,22 +120,12 @@ impl<'a> ContractSpecification<'a> {
     }
 
     /// Data portion of the specification.
-    pub fn data(&self) -> &ContractData {
-        &self.contract
-    }
-
-    /// Data portion of the specification.
     pub fn into_data(self) -> ContractData<'a> {
-        self.contract
-    }
-
-    /// Parameters portion of the parameters.
-    pub fn parameters(&self) -> &Parameters {
-        &self.parameters
+        self.data
     }
 }
 
-impl TryFrom<Vec<u8>> for ContractSpecification<'static> {
+impl TryFrom<Vec<u8>> for Contract<'static> {
     type Error = std::io::Error;
 
     fn try_from(data: Vec<u8>) -> Result<Self, Self::Error> {
@@ -157,42 +144,42 @@ impl TryFrom<Vec<u8>> for ContractSpecification<'static> {
 
         let key = ContractKey::from((&parameters, &contract));
 
-        Ok(ContractSpecification {
+        Ok(Contract {
             parameters,
-            contract,
+            data: contract,
             key,
         })
     }
 }
 
-impl PartialEq for ContractSpecification<'_> {
+impl PartialEq for Contract<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
 
-impl Eq for ContractSpecification<'_> {}
+impl Eq for Contract<'_> {}
 
-impl std::fmt::Display for ContractSpecification<'_> {
+impl std::fmt::Display for Contract<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ContractSpec( key: ")?;
         internal_fmt_key(&self.key.spec, f)?;
-        let data: String = if self.contract.data.len() > 8 {
-            (&self.contract.data[..4])
+        let data: String = if self.data.data.len() > 8 {
+            (&self.data.data[..4])
                 .iter()
                 .map(|b| char::from(*b))
                 .chain("...".chars())
-                .chain((&self.contract.data[4..]).iter().map(|b| char::from(*b)))
+                .chain((&self.data.data[4..]).iter().map(|b| char::from(*b)))
                 .collect()
         } else {
-            self.contract.data.iter().copied().map(char::from).collect()
+            self.data.data.iter().copied().map(char::from).collect()
         };
         write!(f, ", data: [{}])", data)
     }
 }
 
 #[cfg(any(test, feature = "testing"))]
-impl<'a> arbitrary::Arbitrary<'a> for ContractSpecification<'static> {
+impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let contract: ContractData = u.arbitrary()?;
         let parameters: Vec<u8> = u.arbitrary()?;
@@ -200,8 +187,8 @@ impl<'a> arbitrary::Arbitrary<'a> for ContractSpecification<'static> {
 
         let key = ContractKey::from((&parameters, &contract));
 
-        Ok(ContractSpecification {
-            contract,
+        Ok(Contract {
+            data: contract,
             parameters,
             key,
         })
@@ -626,10 +613,10 @@ mod test {
     #[test]
     fn contract_ser() -> Result<(), Box<dyn std::error::Error>> {
         let mut gen = arbitrary::Unstructured::new(&*RND_BYTES);
-        let expected: ContractSpecification = gen.arbitrary()?;
+        let expected: Contract = gen.arbitrary()?;
 
         let serialized = bincode::serialize(&expected)?;
-        let deserialized: ContractSpecification = bincode::deserialize(&serialized)?;
+        let deserialized: Contract = bincode::deserialize(&serialized)?;
         assert_eq!(deserialized, expected);
         Ok(())
     }

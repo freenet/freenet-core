@@ -6,22 +6,22 @@ use crate::ContractRuntimeError;
 
 /// Just as `locutus_stdlib::Contract` but with some convenience impl.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
-pub struct Contract {
-    data: Arc<ContractData<'static>>,
-    params: Parameters<'static>,
-    key: ContractKey,
+pub struct Contract<'a> {
+    pub(crate) data: Arc<ContractData<'a>>,
+    pub(crate) params: Parameters<'a>,
+    pub(crate) key: ContractKey,
 }
 
-impl PartialEq for Contract {
+impl PartialEq for Contract<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
 
-impl Eq for Contract {}
+impl Eq for Contract<'_> {}
 
-impl Contract {
-    pub fn new(data: Arc<ContractData<'static>>, params: Parameters<'static>) -> Contract {
+impl<'a> Contract<'a> {
+    pub fn new(data: Arc<ContractData<'a>>, params: Parameters<'a>) -> Contract<'a> {
         let key = ContractKey::from((&params, &*data));
         Contract { data, params, key }
     }
@@ -37,7 +37,7 @@ impl Contract {
     }
 }
 
-impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for Contract {
+impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for Contract<'static> {
     type Error = ContractRuntimeError;
     fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
         let (path, params) = data;
@@ -53,7 +53,7 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for Contract {
     }
 }
 
-impl TryInto<Vec<u8>> for Contract {
+impl TryInto<Vec<u8>> for Contract<'static> {
     type Error = ContractRuntimeError;
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
         Arc::try_unwrap(self.data)
@@ -62,7 +62,7 @@ impl TryInto<Vec<u8>> for Contract {
     }
 }
 
-impl Display for Contract {
+impl Display for Contract<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Contract(")?;
         self.key.fmt(f)?;
@@ -71,7 +71,7 @@ impl Display for Contract {
 }
 
 #[cfg(feature = "testing")]
-impl<'a> arbitrary::Arbitrary<'a> for Contract {
+impl<'a> arbitrary::Arbitrary<'a> for Contract<'_> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         use arbitrary::Arbitrary;
         let data: ContractData = Arbitrary::arbitrary(u)?;

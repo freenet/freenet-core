@@ -74,20 +74,22 @@ impl Display for ClientError {
 
 impl StdError for ClientError {}
 
-type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
+type HostIncomingMsg<'a> = Result<(ClientId, ClientRequest), ClientError>;
 
 #[allow(clippy::needless_lifetimes)]
 pub trait ClientEventsProxy {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>>;
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = HostIncomingMsg<'a>> + Send + Sync + 'a>>;
 
     /// Sends a response from the host to the client application.
-    fn send(
-        &mut self,
+    fn send<'a>(
+        &'a mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>>;
 
     fn cloned(&self) -> BoxedClient;
 }
@@ -104,7 +106,7 @@ pub enum HostResponse {
         update: Either<StateDelta<'static>, State<'static>>,
     },
     GetResponse {
-        contract: Option<WrappedContract>,
+        contract: Option<WrappedContract<'static>>,
         state: Option<State<'static>>,
     },
 }
@@ -115,7 +117,7 @@ pub enum HostResponse {
 pub enum ClientRequest {
     /// Insert a new value in a contract corresponding with the provided key.
     Put {
-        contract: WrappedContract,
+        contract: WrappedContract<'static>,
         /// Value to upsert in the contract.
         state: WrappedState,
         parameters: Parameters<'static>,
@@ -180,7 +182,7 @@ pub(crate) mod test {
         id: PeerKey,
         signal: Receiver<(EventId, PeerKey)>,
         non_owned_contracts: Vec<ContractKey>,
-        owned_contracts: Vec<(WrappedContract, WrappedState)>,
+        owned_contracts: Vec<(WrappedContract<'static>, WrappedState)>,
         events_to_gen: HashMap<EventId, ClientRequest>,
         random: bool,
     }
@@ -205,7 +207,7 @@ pub(crate) mod test {
         /// Contracts that the user updates.
         pub fn has_contract(
             &mut self,
-            contracts: impl IntoIterator<Item = (WrappedContract, WrappedState)>,
+            contracts: impl IntoIterator<Item = (WrappedContract<'static>, WrappedState)>,
         ) {
             self.owned_contracts.extend(contracts);
         }

@@ -34,7 +34,7 @@ pub(crate) async fn user_fn_handler(
 
 struct StdInput {
     config: Cli,
-    contract: WrappedContract,
+    contract: WrappedContract<'static>,
     input: File,
     buf: Vec<u8>,
     app_state: AppState,
@@ -105,7 +105,7 @@ enum Command {
 
 struct CommandInfo {
     cmd: Command,
-    contract: WrappedContract,
+    contract: WrappedContract<'static>,
     input: Option<CommandInput>,
 }
 
