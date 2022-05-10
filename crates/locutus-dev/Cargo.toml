@@ -6,6 +6,7 @@ rust-version = "1.58.0"
 publish = false
 
 [dependencies]
+byteorder = "1"
 clap = { version = "3", features = ["derive", "env"] }
 either = "1"
 tracing = "0.1"

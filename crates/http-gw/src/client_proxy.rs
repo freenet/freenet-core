@@ -1,8 +1,9 @@
 use anyhow::Error;
+use byteorder::{BigEndian, ReadBytesExt};
 use std::{
     collections::HashMap,
     future::Future,
-    io::Read,
+    io::{Cursor, Read},
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -91,20 +92,25 @@ async fn handle_contract(
 }
 
 fn get_web(state: Option<State>) -> Result<String, anyhow::Error> {
-    if let Some(state) = state.clone() {
+    if let Some(state) = state {
+        let mut state = Cursor::new(state.as_ref());
         // Decompose the state and extract the compressed web interface
-        let state = state.to_vec();
-        let state_bytes = state.as_slice();
-        let (metadata_size, reminder) = state_bytes.split_at(4);
-        let (_, reminder) =
-            reminder.split_at(u32::from_be_bytes(metadata_size.try_into().unwrap()) as usize);
-        let (web_size, reminder) = reminder.split_at(4);
-        let (web, _) = reminder.split_at(u32::from_be_bytes(web_size.try_into().unwrap()) as usize);
 
-        let mut gz = GzDecoder::new(web);
-        let mut body = String::new();
-        gz.read_to_string(&mut body)?;
-        Ok(body)
+        let metadata_size = state.read_u64::<BigEndian>()?;
+        let mut metadata = vec![0; metadata_size as usize];
+        state.read_exact(&mut metadata)?;
+        let web_size = state.read_u64::<BigEndian>()?;
+        let mut web = vec![0; web_size as usize];
+        state.read_exact(&mut web)?;
+
+        todo!("web should be a `tar.xz` file; that is a compressed tar, using xz compression, archive")
+        // TODO: inside this tar there is a random number of files, one of which is guaranteed to be an index.html
+        //       the server must then serve this files under the current URL, going from the index.html
+
+        // let mut gz = GzDecoder::new(Cursor::new(&web));
+        // let mut body = String::new();
+        // gz.read_to_string(&mut body)?;
+        // Ok(body)
     } else {
         Ok("".to_string())
     }

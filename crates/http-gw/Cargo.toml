@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+byteorder = "1"
 log = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
