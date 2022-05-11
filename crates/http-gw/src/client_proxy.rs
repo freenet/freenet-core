@@ -1,5 +1,5 @@
-use anyhow::Error;
 use byteorder::{BigEndian, ReadBytesExt};
+use locutus_runtime::WrappedState;
 use std::{
     collections::HashMap,
     future::Future,
@@ -9,7 +9,7 @@ use std::{
 };
 
 use locutus_node::*;
-use locutus_stdlib::prelude::{ContractKey, State};
+use locutus_stdlib::prelude::ContractKey;
 use tokio::sync::{
     mpsc::{channel, Receiver, Sender},
     oneshot,
@@ -91,7 +91,7 @@ async fn handle_contract(
     }
 }
 
-fn get_web(state: Option<State>) -> Result<String, anyhow::Error> {
+fn get_web(state: Option<WrappedState>) -> Result<String, anyhow::Error> {
     if let Some(state) = state {
         let mut state = Cursor::new(state.as_ref());
         // Decompose the state and extract the compressed web interface
@@ -210,7 +210,7 @@ pub(crate) mod test {
             .to_vec();
         let reminder: Vec<u8> = "reminder".as_bytes().to_vec();
         let state_vec: Vec<u8> = [metadata_size, metadata, web_size, web, reminder].concat();
-        let state = State::from(state_vec);
+        let state = WrappedState::new(state_vec);
 
         // Get web content from state
         let body = get_web(Some(state)).unwrap();

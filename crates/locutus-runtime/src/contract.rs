@@ -101,6 +101,22 @@ impl State {
     pub fn new(bytes: Vec<u8>) -> Self {
         State(Arc::new(bytes))
     }
+
+    pub fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl From<Vec<u8>> for State {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl AsRef<[u8]> for State {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
 }
 
 impl Deref for State {

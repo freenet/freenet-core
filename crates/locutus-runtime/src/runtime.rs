@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 
 use locutus_stdlib::prelude::{
-    BufferBuilder, BufferMut, ContractKey, Parameters, State, StateDelta, StateSummary,
-    UpdateResult,
+    BufferBuilder, BufferMut, ContractKey, Parameters, StateDelta, StateSummary, UpdateResult,
 };
 use wasmer::{
     imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
 };
 
-use crate::{contract_store::ContractStore, ContractRuntimeError, RuntimeResult};
+use crate::{contract::State, contract_store::ContractStore, ContractRuntimeError, RuntimeResult};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ExecError {
@@ -188,7 +187,7 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: State,
     ) -> RuntimeResult<bool> {
         let req_bytes = parameters.size() + state.size();
         let instance = self.prepare_call(key, &parameters, req_bytes)?;
@@ -237,9 +236,9 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: State,
         delta: StateDelta<'a>,
-    ) -> RuntimeResult<State<'a>> {
+    ) -> RuntimeResult<State> {
         // todo: if we keep this hot in memory some things to take into account:
         //       - over subsequent requests state size may change
         //       - the delta may not be necessarily the same size
@@ -265,21 +264,20 @@ impl Runtime {
             UpdateResult::ValidUpdate => {
                 let mut state_buf = state_buf.shared();
                 let new_state = state_buf.read_all();
-                Ok(State::from(new_state.to_vec()))
+                Ok(State::new(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
         }
     }
 
-    /// Generate a concise summary of a state that can be used to create deltas
-    /// relative to this state.
+    /// Generate a concise summary of a state that can be used to create deltas relative to this state.
     ///
     /// This allows flexible and efficient state synchronization between peers.
     pub fn summarize_state<'a>(
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: State,
     ) -> RuntimeResult<StateSummary<'a>> {
         let req_bytes = parameters.size() + state.size();
         let instance = self.prepare_call(key, &parameters, req_bytes)?;
@@ -310,7 +308,7 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: State,
         summary: StateSummary<'a>,
     ) -> RuntimeResult<StateDelta<'a>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
@@ -345,9 +343,9 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        current_state: State<'a>,
+        current_state: State,
         current_summary: StateSummary<'a>,
-    ) -> RuntimeResult<State<'a>> {
+    ) -> RuntimeResult<State> {
         let req_bytes = parameters.size() + current_state.size() + current_summary.size();
         let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
@@ -371,7 +369,7 @@ impl Runtime {
             UpdateResult::ValidUpdate => {
                 let mut state_buf = state_buf.shared();
                 let new_state = state_buf.read_all();
-                Ok(State::from(new_state.to_vec()))
+                Ok(State::new(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
         }
@@ -422,7 +420,7 @@ mod test {
         let new_state = runtime.update_state(
             &key,
             Parameters::from([].as_ref()),
-            State::from([5, 2, 3].as_ref()),
+            State::new(vec![5, 2, 3]),
             StateDelta::from([4].as_ref()),
         )?;
         assert!(new_state.as_ref().len() == 4);
@@ -438,7 +436,7 @@ mod test {
         let summary = runtime.summarize_state(
             &key,
             Parameters::from([].as_ref()),
-            State::from([5, 2, 3, 4].as_ref()),
+            State::new(vec![5, 2, 3, 4]),
         )?;
         assert!(summary.as_ref().len() == 1);
         assert!(summary.as_ref()[0] == 5);

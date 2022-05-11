@@ -41,19 +41,23 @@ fn execute_command(
             contract,
             state,
             parameters,
-        } => match runtime.validate_state(contract.key(), parameters, State::from(&*state)) {
+        } => match runtime.validate_state(contract.key(), parameters, state) {
             Ok(valid) => app.printout_deser(format!("valid put: {valid}").as_bytes())?,
             Err(err) => {
                 println!("error: {err}");
             }
         },
         ClientRequest::Update { key, delta } => {
-            let state = app.load_state()?;
-            match runtime.update_state(&key, vec![].into(), state.clone(), delta.left().unwrap()) {
+            let state = app.load_state()?.to_vec();
+            match runtime.update_state(
+                &key,
+                vec![].into(),
+                WrappedState::new(state),
+                delta.left().unwrap(),
+            ) {
                 Ok(new_state) => {
-                    app.printout_deser(&*state)?;
-                    let state = WrappedState::new(new_state.into_owned());
-                    app.put(state);
+                    app.printout_deser(&new_state)?;
+                    app.put(new_state);
                 }
                 Err(err) => {
                     println!("error: {err}");
@@ -61,7 +65,7 @@ fn execute_command(
             }
         }
         ClientRequest::Get { key, .. } => {
-            let state = app.load_state()?;
+            let state = WrappedState::new(app.load_state()?.to_vec());
             let parameters: Parameters = vec![].into();
             let summary = runtime.summarize_state(&key, parameters.clone(), state.clone())?;
             match runtime.get_state_delta(&key, parameters, state, summary) {

@@ -1372,6 +1372,7 @@ dependencies = [
  "byteorder",
  "flate2",
  "locutus-node",
+ "locutus-runtime",
  "locutus-stdlib",
  "log",
  "tokio",

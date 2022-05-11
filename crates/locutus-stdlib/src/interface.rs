@@ -515,6 +515,12 @@ impl ContractKey {
         &self.contract
     }
 
+    pub fn contract_part_as_str(&self) -> String {
+        bs58::encode(self.contract)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
+    }
+
     pub fn decode(
         contract_key: impl Into<String>,
         parameters: Parameters,

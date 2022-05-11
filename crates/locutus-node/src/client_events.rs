@@ -103,11 +103,11 @@ pub enum HostResponse {
     /// Message sent when there is an update to a subscribed command.
     UpdateNotification {
         key: ContractKey,
-        update: Either<StateDelta<'static>, State<'static>>,
+        update: Either<StateDelta<'static>, WrappedState>,
     },
     GetResponse {
         contract: Option<WrappedContract<'static>>,
-        state: Option<State<'static>>,
+        state: Option<WrappedState>,
     },
 }
 
@@ -125,7 +125,7 @@ pub enum ClientRequest {
     /// Update an existing contract corresponding with the provided key.
     Update {
         key: ContractKey,
-        delta: Either<StateDelta<'static>, State<'static>>,
+        delta: Either<StateDelta<'static>, WrappedState>,
     },
     /// Fetch the current value from a contract corresponding to the provided key.
     Get {

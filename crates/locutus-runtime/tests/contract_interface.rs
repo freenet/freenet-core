@@ -40,13 +40,13 @@ fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> 
     let is_valid = runtime.validate_state(
         &key,
         Parameters::from([].as_ref()),
-        State::from([1, 2, 3, 4].as_ref()),
+        WrappedState::new(vec![1, 2, 3, 4]),
     )?;
     assert!(is_valid);
     let not_valid = !runtime.validate_state(
         &key,
         Parameters::from([].as_ref()),
-        State::from([1, 0, 0, 1].as_ref()),
+        WrappedState::new(vec![1, 0, 0, 1]),
     )?;
     assert!(not_valid);
     Ok(())
@@ -64,13 +64,13 @@ fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
     let is_valid = runtime.validate_state(
         &key,
         Parameters::from([].as_ref()),
-        State::from([1, 2, 3, 4].as_ref()),
+        WrappedState::new(vec![1, 2, 3, 4]),
     )?;
     assert!(is_valid);
     let not_valid = !runtime.validate_state(
         &key,
         Parameters::from([].as_ref()),
-        State::from([1, 0, 0, 1].as_ref()),
+        WrappedState::new(vec![1, 0, 0, 1]),
     )?;
     assert!(not_valid);
     Ok(())
@@ -108,7 +108,7 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     let new_state = runtime.update_state(
         &key,
         Parameters::from([].as_ref()),
-        State::from([5, 2, 3].as_ref()),
+        WrappedState::new(vec![5, 2, 3]),
         StateDelta::from([4].as_ref()),
     )?;
     assert!(new_state.as_ref().len() == 4);
@@ -124,7 +124,7 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
     let summary = runtime.summarize_state(
         &key,
         Parameters::from([].as_ref()),
-        State::from([5, 2, 3, 4].as_ref()),
+        WrappedState::new(vec![5, 2, 3, 4]),
     )?;
     assert!(summary.as_ref().len() == 1);
     assert!(summary.as_ref()[0] == 5);
@@ -139,7 +139,7 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     let delta = runtime.get_state_delta(
         &key,
         Parameters::from([].as_ref()),
-        State::from([5, 2, 3, 4].as_ref()),
+        WrappedState::new(vec![5, 2, 3, 4]),
         StateSummary::from([2, 3].as_ref()),
     )?;
     assert!(delta.as_ref().len() == 1);
@@ -155,7 +155,7 @@ fn update_state_from_summary() -> Result<(), Box<dyn std::error::Error>> {
     let new_state = runtime.update_state_from_summary(
         &key,
         Parameters::from([].as_ref()),
-        State::from([5, 2, 3].as_ref()),
+        WrappedState::new(vec![5, 2, 3]),
         StateSummary::from([4].as_ref()),
     )?;
     assert!(new_state.as_ref().len() == 4);

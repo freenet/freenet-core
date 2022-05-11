@@ -19,5 +19,6 @@ pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
     ClientRequest, ErrorKind, HostResponse,
 };
+pub use either;
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;
