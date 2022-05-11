@@ -3,7 +3,7 @@ use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 use locutus_stdlib::prelude::{ContractData, Parameters};
 use stretto::Cache;
 
-use crate::{contract::Contract, RuntimeResult};
+use crate::{contract::WrappedContract, RuntimeResult};
 
 use super::ContractKey;
 
@@ -32,33 +32,34 @@ impl ContractStore {
         &self,
         key: &ContractKey,
         params: &Parameters<'a>,
-    ) -> Option<Contract<'a>> {
+    ) -> Option<WrappedContract<'a>> {
         let contract_hash = key.contract_part();
         if let Some(data) = self.contract_cache.get(contract_hash) {
-            Some(Contract::new(data.value().clone(), params.clone()))
+            Some(WrappedContract::new(data.value().clone(), params.clone()))
         } else {
             let path = bs58::encode(contract_hash)
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
             let owned_params = Parameters::from(params.as_ref().to_owned());
-            let Contract { data, params, .. } = Contract::try_from((&*key_path, owned_params))
-                .map_err(|err| {
-                    tracing::debug!("contract not found: {err}");
-                    err
-                })
-                .ok()?;
+            let WrappedContract { data, params, .. } =
+                WrappedContract::try_from((&*key_path, owned_params))
+                    .map_err(|err| {
+                        tracing::debug!("contract not found: {err}");
+                        err
+                    })
+                    .ok()?;
 
             // add back the contract part to the mem store
             let size = data.data().len() as i64;
             self.contract_cache
                 .insert(*contract_hash, data.clone(), size);
-            Some(Contract::new(data, params))
+            Some(WrappedContract::new(data, params))
         }
     }
 
     /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
-    pub fn store_contract(&mut self, contract: Contract) -> RuntimeResult<()> {
+    pub fn store_contract(&mut self, contract: WrappedContract) -> RuntimeResult<()> {
         let contract_hash = contract.key().contract_part();
         if self.contract_cache.get(contract_hash).is_some() {
             return Ok(());
@@ -68,7 +69,7 @@ impl ContractStore {
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
-        if Contract::get_data_from_fs(&key_path).is_ok() {
+        if WrappedContract::get_data_from_fs(&key_path).is_ok() {
             return Ok(());
         }
 

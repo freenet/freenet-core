@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ReadBytesExt};
-use locutus_runtime::WrappedState;
+use locutus_node::WrappedState;
 use std::{
     collections::HashMap,
     future::Future,

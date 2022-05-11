@@ -9,7 +9,7 @@ mod ring;
 pub(crate) mod util;
 
 pub(crate) type WrappedContract<'a> = locutus_runtime::prelude::WrappedContract<'a>;
-pub(crate) type WrappedState = locutus_runtime::prelude::WrappedState;
+pub type WrappedState = locutus_runtime::prelude::WrappedState;
 
 // exports:
 pub use crate::config::Config;
