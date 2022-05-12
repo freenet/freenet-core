@@ -17,7 +17,7 @@ pub use crate::config::Config;
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
-    ClientRequest, ErrorKind, HostResponse,
+    ClientRequest, ErrorKind, HostResponse, RequestError,
 };
 pub use either;
 pub use node::{InitPeerNode, NodeConfig};

@@ -19,7 +19,7 @@ flate2 = "1.0.23"
 # internal:
 locutus-node = { path = "../locutus-node", features = ["websocket"] }
 locutus-stdlib = { path = "../locutus-stdlib"}
-locutus-runtime = { path = "../locutus-runtime", optional = true }
+locutus-dev = { path = "../locutus-dev", optional = true }
 
 [features]
-local = ["locutus-runtime"]
+local = ["locutus-dev"]

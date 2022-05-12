@@ -19,6 +19,8 @@ pub struct ContractStore {
 //       to keep the total speed used under a configured threshold
 
 impl ContractStore {
+    /// # Arguments
+    /// - max_size: max size in bytes of the contracts being cached
     pub fn new(contracts_dir: PathBuf, max_size: i64) -> Self {
         const ERR: &str = "failed to build mem cache";
         Self {

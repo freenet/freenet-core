@@ -21,8 +21,6 @@ use warp::{
     reply, Filter, Rejection, Reply,
 };
 
-use flate2::read::GzDecoder;
-
 type HostResult = Result<HostResponse, ClientError>;
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
@@ -91,29 +89,25 @@ async fn handle_contract(
     }
 }
 
-fn get_web(state: Option<WrappedState>) -> Result<String, anyhow::Error> {
-    if let Some(state) = state {
-        let mut state = Cursor::new(state.as_ref());
-        // Decompose the state and extract the compressed web interface
+fn get_web(state: WrappedState) -> Result<String, anyhow::Error> {
+    let mut state = Cursor::new(state.as_ref());
+    // Decompose the state and extract the compressed web interface
 
-        let metadata_size = state.read_u64::<BigEndian>()?;
-        let mut metadata = vec![0; metadata_size as usize];
-        state.read_exact(&mut metadata)?;
-        let web_size = state.read_u64::<BigEndian>()?;
-        let mut web = vec![0; web_size as usize];
-        state.read_exact(&mut web)?;
+    let metadata_size = state.read_u64::<BigEndian>()?;
+    let mut metadata = vec![0; metadata_size as usize];
+    state.read_exact(&mut metadata)?;
+    let web_size = state.read_u64::<BigEndian>()?;
+    let mut web = vec![0; web_size as usize];
+    state.read_exact(&mut web)?;
 
-        todo!("web should be a `tar.xz` file; that is a compressed tar, using xz compression, archive")
-        // TODO: inside this tar there is a random number of files, one of which is guaranteed to be an index.html
-        //       the server must then serve this files under the current URL, going from the index.html
+    todo!("web should be a `tar.xz/gz` file; that is a compressed tar, using xz/gz compression, archive")
+    // TODO: inside this tar there is a random number of files, one of which is guaranteed to be an index.html
+    //       the server must then serve this files under the current URL, going from the index.html
 
-        // let mut gz = GzDecoder::new(Cursor::new(&web));
-        // let mut body = String::new();
-        // gz.read_to_string(&mut body)?;
-        // Ok(body)
-    } else {
-        Ok("".to_string())
-    }
+    // let mut gz = GzDecoder::new(Cursor::new(&web));
+    // let mut body = String::new();
+    // gz.read_to_string(&mut body)?;
+    // Ok(body)
 }
 
 async fn home() -> Result<impl Reply, Rejection> {
@@ -213,7 +207,7 @@ pub(crate) mod test {
         let state = WrappedState::new(state_vec);
 
         // Get web content from state
-        let body = get_web(Some(state)).unwrap();
+        let body = get_web(state).unwrap();
 
         assert_eq!(expected_web_content, body);
 

@@ -32,7 +32,7 @@ impl<'a> WrappedContract<'a> {
     }
 
     #[inline]
-    pub fn data(&self) -> &Arc<ContractData> {
+    pub fn data(&self) -> &Arc<ContractData<'a>> {
         &self.data
     }
 

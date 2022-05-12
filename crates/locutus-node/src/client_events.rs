@@ -5,7 +5,7 @@ use std::{error::Error as StdError, fmt::Display};
 
 use either::Either;
 use locutus_runtime::prelude::ContractKey;
-use locutus_stdlib::prelude::{Parameters, State, StateDelta};
+use locutus_stdlib::prelude::{Parameters, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::{WrappedContract, WrappedState};
@@ -99,16 +99,29 @@ pub trait ClientEventsProxy {
 pub enum HostResponse {
     PutResponse(ContractKey),
     /// Successful update
-    UpdateResponse(ContractKey),
-    /// Message sent when there is an update to a subscribed command.
+    UpdateResponse {
+        key: ContractKey,
+        summary: StateSummary<'static>,
+    },
+    /// Message sent when there is an update to a subscribed contract.
     UpdateNotification {
         key: ContractKey,
         update: Either<StateDelta<'static>, WrappedState>,
     },
     GetResponse {
         contract: Option<WrappedContract<'static>>,
-        state: Option<WrappedState>,
+        state: WrappedState,
     },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    #[error("put error for contract {0}")]
+    PutError(ContractKey),
+    #[error("update error for contrract {key}, reason: {cause}")]
+    UpdateError { key: ContractKey, cause: String },
+    #[error("failed to get contract {key}, reason: {cause}")]
+    GetError { key: ContractKey, cause: String },
 }
 
 /// A request from a client application to the host.
@@ -150,9 +163,7 @@ impl Display for ClientRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientRequest::Put {
-                contract,
-                state,
-                parameters,
+                contract, state, ..
             } => {
                 write!(f, "put request for contract {contract} with state {state}")
             }

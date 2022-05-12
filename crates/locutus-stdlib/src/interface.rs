@@ -329,6 +329,7 @@ impl<'a> DerefMut for StateDelta<'a> {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StateSummary<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateSummary<'a> {

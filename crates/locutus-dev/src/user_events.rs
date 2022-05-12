@@ -7,12 +7,12 @@ use locutus_node::{
 use locutus_runtime::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{state::AppState, Cli, CommandSender, DynError};
+use crate::{config::Config, state::AppState, CommandSender, DynError};
 
 type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
-pub(crate) async fn user_fn_handler(
-    config: Cli,
+pub async fn user_fn_handler(
+    config: Config,
     command_sender: CommandSender,
     app_state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -33,7 +33,7 @@ pub(crate) async fn user_fn_handler(
 }
 
 struct StdInput {
-    config: Cli,
+    config: Config,
     contract: WrappedContract<'static>,
     input: File,
     buf: Vec<u8>,
@@ -41,7 +41,7 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: Cli, app_state: AppState) -> Result<Self, DynError> {
+    fn new(config: Config, app_state: AppState) -> Result<Self, DynError> {
         let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
         Ok(StdInput {
             input: File::open(&config.input_file)?,

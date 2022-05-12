@@ -288,9 +288,9 @@ impl Runtime {
         let mut state_buf = self.init_buf(&instance, &state)?;
         state_buf.write(state)?;
 
-        let validate_func: NativeFunc<(i64, i64), i64> =
+        let summary_func: NativeFunc<(i64, i64), i64> =
             instance.exports.get_native_function("summarize_state")?;
-        let res_ptr = validate_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?
+        let res_ptr = summary_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?
             as *mut BufferBuilder;
         let memory = self
             .host_memory

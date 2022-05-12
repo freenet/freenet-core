@@ -2,10 +2,10 @@ use locutus_node::ClientRequest;
 use locutus_runtime::prelude::*;
 use locutus_stdlib::prelude::Parameters;
 
-use crate::{state::AppState, Cli, CommandReceiver, DynError};
+use crate::{config::Config, state::AppState, CommandReceiver, DynError};
 
-pub(crate) async fn wasm_runtime(
-    config: Cli,
+pub async fn wasm_runtime(
+    config: Config,
     mut command_receiver: CommandReceiver,
     mut app: AppState,
 ) -> Result<(), DynError> {
@@ -48,7 +48,7 @@ fn execute_command(
             }
         },
         ClientRequest::Update { key, delta } => {
-            let state = app.load_state()?.to_vec();
+            let state = app.load_state(&key)?.to_vec();
             match runtime.update_state(
                 &key,
                 vec![].into(),
@@ -57,7 +57,7 @@ fn execute_command(
             ) {
                 Ok(new_state) => {
                     app.printout_deser(&new_state)?;
-                    app.put(new_state);
+                    app.put(key, new_state);
                 }
                 Err(err) => {
                     println!("error: {err}");
@@ -65,7 +65,7 @@ fn execute_command(
             }
         }
         ClientRequest::Get { key, .. } => {
-            let state = WrappedState::new(app.load_state()?.to_vec());
+            let state = WrappedState::new(app.load_state(&key)?.to_vec());
             let parameters: Parameters = vec![].into();
             let summary = runtime.summarize_state(&key, parameters.clone(), state.clone())?;
             match runtime.get_state_delta(&key, parameters, state, summary) {
