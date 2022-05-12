@@ -1,18 +1,11 @@
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Parser};
-use locutus_node::ClientRequest;
-
-mod executor;
-mod user_events;
-
-type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest>;
-type CommandSender = tokio::sync::mpsc::Sender<ClientRequest>;
+use clap::ArgGroup;
 
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
 #[derive(clap::ArgEnum, Clone, Copy, Debug)]
-enum DeserializationFmt {
+pub enum DeserializationFmt {
     #[cfg(feature = "json")]
     Json,
     #[cfg(feature = "messagepack")]
@@ -20,6 +13,7 @@ enum DeserializationFmt {
 }
 
 /// A CLI utility for testing out contracts against a Locutus local node.
+///
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Locutus Contract Development Environment")]
 #[clap(author = "The Freenet Project Inc.")]
@@ -29,44 +23,26 @@ enum DeserializationFmt {
         .required(true)
         .args(&["output-file", "terminal-output"])
 ))]
-struct Cli {
+pub struct Config {
     /// Path to the contract to be loaded
     #[clap(parse(from_os_str))]
-    contract: PathBuf,
+    pub contract: PathBuf,
     /// Path to the input file to read from on command
     #[clap(short, long, parse(from_os_str), value_name = "INPUT_FILE")]
-    input_file: PathBuf,
+    pub input_file: PathBuf,
     /// Deserialization format, requires feature flags enabled.
     #[clap(short, long, arg_enum, group = "fmt", value_name = "FORMAT")]
-    deser_format: Option<DeserializationFmt>,
+    pub deser_format: Option<DeserializationFmt>,
     /// Disable TUI mode (run only though CLI commands)
     #[clap(long)]
-    disable_tui_mode: bool,
+    pub disable_tui_mode: bool,
     /// Path to output file
     #[clap(short, long, parse(from_os_str), value_name = "OUTPUT_FILE")]
-    output_file: Option<PathBuf>,
+    pub output_file: Option<PathBuf>,
     /// Terminal output
     #[clap(long, requires = "fmt")]
-    terminal_output: bool,
+    pub terminal_output: bool,
     /// Max contract size
     #[clap(long, env = "LOCUTUS_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
-    max_contract_size: i64,
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let cli = Cli::parse();
-    if cli.disable_tui_mode {
-        return Err("CLI mode not yet implemented".into());
-    }
-
-    let (sender, receiver) = tokio::sync::mpsc::channel(100);
-    let runtime = tokio::task::spawn(executor::wasm_runtime(cli.clone(), receiver));
-    let user_fn = user_events::user_fn_handler(sender, cli);
-    tokio::select! {
-        res = runtime => { res?? }
-        res = user_fn => { res? }
-    };
-    println!("Shutdown...");
-    Ok(())
+    pub max_contract_size: i64,
 }

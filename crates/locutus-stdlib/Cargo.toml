@@ -7,10 +7,12 @@ rust-version = "1.58.0"
 [dependencies]
 arbitrary = { version = "1", optional = true, features = ["derive"] }
 arrayvec = { version = "0.7", features = ["serde"] }
+byteorder = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
-hex = "0.4"
+bs58 = "0.4"
 once_cell = "1"
 serde = { version = "1", features = ["derive"] }
+serde_with = "1"
 thiserror = "1"
 
 # internal

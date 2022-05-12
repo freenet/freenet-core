@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
 use locutus_stdlib::prelude::{
-    BufferBuilder, BufferMut, ContractKey, Parameters, State, StateDelta, StateSummary,
-    UpdateResult,
+    BufferBuilder, BufferMut, ContractKey, Parameters, StateDelta, StateSummary, UpdateResult,
 };
 use wasmer::{
     imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,
 };
 
-use crate::{contract_store::ContractStore, ContractRuntimeError, RuntimeResult};
+use crate::{
+    contract::WrappedState, contract_store::ContractStore, ContractRuntimeError, RuntimeResult,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ExecError {
@@ -71,12 +72,12 @@ impl Runtime {
         Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
     }
 
-    fn get_module(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+    fn get_module(&mut self, key: &ContractKey, parameters: &Parameters) -> RuntimeResult<()> {
         let contract = self
             .contracts
-            .fetch_contract(key)?
+            .fetch_contract(key, parameters)
             .ok_or(ContractRuntimeError::ContractNotFound(*key))?;
-        let module = Module::new(&self.store, contract.data())?;
+        let module = Module::new(&self.store, contract.data().data())?;
         self.modules.insert(*key, module);
         Ok(())
     }
@@ -150,11 +151,16 @@ impl Runtime {
         Store::new(&Universal::new(Cranelift::new()).engine())
     }
 
-    fn prepare_call(&mut self, key: &ContractKey, req_bytes: usize) -> RuntimeResult<Instance> {
+    fn prepare_call(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+        req_bytes: usize,
+    ) -> RuntimeResult<Instance> {
         let module = if let Some(module) = self.modules.get(key) {
             module
         } else {
-            self.get_module(key)?;
+            self.get_module(key, parameters)?;
             self.modules.get(key).unwrap()
         };
         let instance = self.prepare_instance(module)?;
@@ -183,10 +189,10 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: WrappedState,
     ) -> RuntimeResult<bool> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -209,7 +215,7 @@ impl Runtime {
     ) -> RuntimeResult<bool> {
         // todo: if we keep this hot in memory on next calls overwrite the buffer with new delta
         let req_bytes = parameters.size() + delta.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut delta_buf = self.init_buf(&instance, &delta)?;
@@ -232,14 +238,14 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: WrappedState,
         delta: StateDelta<'a>,
-    ) -> RuntimeResult<State<'a>> {
+    ) -> RuntimeResult<WrappedState> {
         // todo: if we keep this hot in memory some things to take into account:
         //       - over subsequent requests state size may change
         //       - the delta may not be necessarily the same size
         let req_bytes = parameters.size() + state.size() + delta.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -260,32 +266,31 @@ impl Runtime {
             UpdateResult::ValidUpdate => {
                 let mut state_buf = state_buf.shared();
                 let new_state = state_buf.read_all();
-                Ok(State::from(new_state.to_vec()))
+                Ok(WrappedState::new(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
         }
     }
 
-    /// Generate a concise summary of a state that can be used to create deltas
-    /// relative to this state.
+    /// Generate a concise summary of a state that can be used to create deltas relative to this state.
     ///
     /// This allows flexible and efficient state synchronization between peers.
     pub fn summarize_state<'a>(
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: WrappedState,
     ) -> RuntimeResult<StateSummary<'a>> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
         state_buf.write(state)?;
 
-        let validate_func: NativeFunc<(i64, i64), i64> =
+        let summary_func: NativeFunc<(i64, i64), i64> =
             instance.exports.get_native_function("summarize_state")?;
-        let res_ptr = validate_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?
+        let res_ptr = summary_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?
             as *mut BufferBuilder;
         let memory = self
             .host_memory
@@ -305,11 +310,11 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        state: State<'a>,
+        state: WrappedState,
         summary: StateSummary<'a>,
     ) -> RuntimeResult<StateDelta<'a>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -340,11 +345,11 @@ impl Runtime {
         &mut self,
         key: &ContractKey,
         parameters: Parameters<'a>,
-        current_state: State<'a>,
+        current_state: WrappedState,
         current_summary: StateSummary<'a>,
-    ) -> RuntimeResult<State<'a>> {
+    ) -> RuntimeResult<WrappedState> {
         let req_bytes = parameters.size() + current_state.size() + current_summary.size();
-        let instance = self.prepare_call(key, req_bytes)?;
+        let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &current_state)?;
@@ -366,7 +371,7 @@ impl Runtime {
             UpdateResult::ValidUpdate => {
                 let mut state_buf = state_buf.shared();
                 let new_state = state_buf.read_all();
-                Ok(State::from(new_state.to_vec()))
+                Ok(WrappedState::new(new_state.to_vec()))
             }
             UpdateResult::Invalid => Err(ExecError::InvalidPutValue.into()),
         }
@@ -377,7 +382,7 @@ impl Runtime {
 mod test {
     use std::path::PathBuf;
 
-    use crate::contract::Contract;
+    use crate::contract::WrappedContract;
 
     use super::*;
 
@@ -389,7 +394,7 @@ mod test {
         test_dir
     }
 
-    fn test_contract(contract_path: &str) -> Contract {
+    fn test_contract(contract_path: &str) -> WrappedContract {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let contracts = PathBuf::from(CONTRACTS_DIR);
         let mut dirs = contracts.ancestors();
@@ -398,13 +403,14 @@ mod test {
             .join("contracts")
             .join("test_contract")
             .join(contract_path);
-        Contract::try_from(contract_path).expect("contract found")
+        WrappedContract::try_from((&*contract_path, Parameters::from(vec![])))
+            .expect("contract found")
     }
 
     fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
         let mut store = ContractStore::new(test_dir(), 10_000);
         let contract = test_contract("test_contract_guest.wasi.wasm");
-        let key = contract.key();
+        let key = *contract.key();
         store.store_contract(contract)?;
         Ok((store, key))
     }
@@ -417,7 +423,7 @@ mod test {
         let new_state = runtime.update_state(
             &key,
             Parameters::from([].as_ref()),
-            State::from([5, 2, 3].as_ref()),
+            WrappedState::new(vec![5, 2, 3]),
             StateDelta::from([4].as_ref()),
         )?;
         assert!(new_state.as_ref().len() == 4);
@@ -433,7 +439,7 @@ mod test {
         let summary = runtime.summarize_state(
             &key,
             Parameters::from([].as_ref()),
-            State::from([5, 2, 3, 4].as_ref()),
+            WrappedState::new(vec![5, 2, 3, 4]),
         )?;
         assert!(summary.as_ref().len() == 1);
         assert!(summary.as_ref()[0] == 5);

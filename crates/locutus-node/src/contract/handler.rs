@@ -153,7 +153,7 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
     pub value: Option<WrappedState>,
-    pub contract: Option<WrappedContract>,
+    pub contract: Option<WrappedContract<'static>>,
 }
 
 struct InternalCHEvent<CErr> {
@@ -183,7 +183,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
         response: Result<StoreResponse, Err>,
     },
     /// Store a contract in the local store.
-    Cache(WrappedContract),
+    Cache(WrappedContract<'static>),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError<Err>>),
 }
@@ -351,7 +351,9 @@ mod sqlite {
             &self,
             contract_key: &ContractKey,
         ) -> Result<Option<WrappedState>, Self::Error> {
-            let encoded_key = hex::encode(&**contract_key);
+            let encoded_key = bs58::encode(&**contract_key)
+                .with_alphabet(bs58::Alphabet::BITCOIN)
+                .into_string();
             if let Some(value) = self.value_mem_cache.get(contract_key) {
                 return Ok(Some(value.value().clone()));
             }
@@ -383,7 +385,9 @@ mod sqlite {
             // let value: Vec<u8> = self
             //     .runtime
             //     .update_value(contract_key, &*old_value, &*value)?;
-            let encoded_key = hex::encode(contract_key.as_ref());
+            let encoded_key = bs58::encode(contract_key.as_ref())
+                .with_alphabet(bs58::Alphabet::BITCOIN)
+                .into_string();
             match sqlx::query(
                 "INSERT OR REPLACE INTO contracts (key, value) VALUES ($1, $2) \
                      RETURNING value",
@@ -411,6 +415,10 @@ mod sqlite {
 
     #[cfg(test)]
     mod test {
+        use std::sync::Arc;
+
+        use locutus_stdlib::prelude::ContractData;
+
         use super::sqlite::SQLiteContractHandler;
         use super::*;
 
@@ -429,15 +437,18 @@ mod sqlite {
 
             // Generate a contract
             let contract_bytes = b"Test contract value".to_vec();
-            let contract: WrappedContract = WrappedContract::new(contract_bytes.clone());
+            let contract: WrappedContract = WrappedContract::new(
+                Arc::new(ContractData::from(contract_bytes.clone())),
+                Parameters::from(vec![]),
+            );
 
             // Get contract parts
             let contract_value = WrappedState::new(contract_bytes.clone());
             let put_result_value = handler
-                .put_value(&contract.key(), contract_value.clone())
+                .put_value(contract.key(), contract_value.clone())
                 .await?;
             let get_result_value = handler
-                .get_value(&contract.key())
+                .get_value(contract.key())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("No value found"))?;
 
@@ -447,10 +458,10 @@ mod sqlite {
             // Update the contract value with new one
             let new_contract_value = WrappedState::new(b"New test contract value".to_vec());
             let new_put_result_value = handler
-                .put_value(&contract.key(), new_contract_value.clone())
+                .put_value(contract.key(), new_contract_value.clone())
                 .await?;
             let new_get_result_value = handler
-                .get_value(&contract.key())
+                .get_value(contract.key())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("No value found"))?;
 
@@ -464,7 +475,10 @@ mod sqlite {
 
 #[cfg(test)]
 pub mod test {
+    use std::sync::Arc;
+
     use locutus_runtime::ContractStore;
+    use locutus_stdlib::prelude::ContractData;
 
     use super::*;
     use crate::{
@@ -553,9 +567,10 @@ pub mod test {
 
         let h = GlobalExecutor::spawn(async move {
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(vec![
-                    0, 1, 2, 3,
-                ])))
+                .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(
+                    Arc::new(ContractData::from(vec![0, 1, 2, 3])),
+                    Parameters::from(vec![]),
+                )))
                 .await
         });
 
@@ -568,8 +583,13 @@ pub mod test {
             assert_eq!(data, vec![0, 1, 2, 3]);
             tokio::time::timeout(
                 Duration::from_millis(100),
-                rcv_halve
-                    .send_to_listener(id, ContractHandlerEvent::Cache(WrappedContract::new(data))),
+                rcv_halve.send_to_listener(
+                    id,
+                    ContractHandlerEvent::Cache(WrappedContract::new(
+                        Arc::new(ContractData::from(data)),
+                        Parameters::from(vec![]),
+                    )),
+                ),
             )
             .await??;
         } else {

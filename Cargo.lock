@@ -740,6 +740,7 @@ dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
+ "strsim",
  "syn",
 ]
 
@@ -1366,8 +1367,11 @@ dependencies = [
 name = "http-gw"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
- "hex",
+ "byteorder",
+ "flate2",
+ "locutus-dev",
  "locutus-node",
  "locutus-stdlib",
  "log",
@@ -1931,9 +1935,15 @@ dependencies = [
 name = "locutus-dev"
 version = "0.0.0"
 dependencies = [
+ "bincode",
+ "byteorder",
  "clap",
+ "either",
  "locutus-node",
  "locutus-runtime",
+ "locutus-stdlib",
+ "log",
+ "parking_lot 0.11.2",
  "pico-args",
  "rmp",
  "rmpv",
@@ -1962,6 +1972,7 @@ dependencies = [
  "asynchronous-codec",
  "bincode",
  "blake2 0.10.4",
+ "bs58",
  "config",
  "crossbeam",
  "dashmap",
@@ -1969,7 +1980,6 @@ dependencies = [
  "either",
  "env_logger",
  "futures",
- "hex",
  "itertools",
  "libp2p",
  "locutus-runtime",
@@ -2004,8 +2014,8 @@ dependencies = [
  "arrayvec",
  "bincode",
  "blake2 0.10.4",
+ "bs58",
  "futures",
- "hex",
  "locutus-stdlib",
  "once_cell",
  "rand 0.8.5",
@@ -2026,11 +2036,13 @@ dependencies = [
  "arrayvec",
  "bincode",
  "blake2 0.10.4",
- "hex",
+ "bs58",
+ "byteorder",
  "locutus-macros",
  "once_cell",
  "rand 0.8.5",
  "serde",
+ "serde_with",
  "thiserror",
  "wasmer",
  "wasmer-wasi",
@@ -3341,6 +3353,29 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_with"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b827f2113224f3f19a665136f006709194bdfdcb1fdc1e4b2b5cbac8e0cced54"
+dependencies = [
+ "rustversion",
+ "serde",
+ "serde_with_macros",
+]
+
+[[package]]
+name = "serde_with_macros"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e182d6ec6f05393cc0e5ed1bf81ad6db3a8feedf8ee515ecdd369809bcce8082"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

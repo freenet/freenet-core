@@ -6,15 +6,17 @@ rust-version = "1.58.0"
 publish = false
 
 [dependencies]
+byteorder = "1"
 clap = { version = "3", features = ["derive", "env"] }
+either = "1"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "signal"] }
+parking_lot = "*"
 pico-args = "0.4"
-# log = "0.4"
-# env_logger = "0.9"
+log = "0.4"
 
-# deserialization features
-serde = { version = "*", optional = true }
+serde = "1"
+bincode = "1"
 
 # (mp) message pack feature
 rmp = { version = "0.8", optional = true }
@@ -26,7 +28,8 @@ serde_json = { version = "1", optional = true }
 # internal
 locutus-node = { path = "../locutus-node" }
 locutus-runtime = { path = "../locutus-runtime" }
+locutus-stdlib = { path = "../locutus-stdlib" }
 
 [features]
-json = ["serde", "serde_json"]
-messagepack = ["serde", "rmp", "rmpv"]
+json = ["serde_json"]
+messagepack = ["rmp", "rmpv"]

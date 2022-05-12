@@ -331,6 +331,7 @@ async fn client_event_handling<ClientEv, CErr>(
                 ClientRequest::Put {
                     state: value,
                     contract,
+                    parameters,
                 } => {
                     // Initialize a put op.
                     log::debug!(

@@ -110,8 +110,8 @@ mod sealed_msg_type {
         JoinRing,
         Put,
         Get,
-        Canceled,
         Subscribe,
+        Canceled,
     }
 
     macro_rules! transaction_type_enumeration {

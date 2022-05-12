@@ -90,13 +90,13 @@ where
         self.run_event_listener().await
     }
 
-    pub async fn append_contracts(
+    pub async fn append_contracts<'a>(
         &self,
-        contracts: Vec<(WrappedContract, WrappedState)>,
+        contracts: Vec<(WrappedContract<'static>, WrappedState)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, value) in contracts {
-            let key = contract.key();
+            let key = *contract.key();
             self.op_storage
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract))
                 .await?;

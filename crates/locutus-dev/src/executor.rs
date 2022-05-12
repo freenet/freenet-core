@@ -1,21 +1,25 @@
-use std::{fs::File, io::Write};
-
 use locutus_node::ClientRequest;
 use locutus_runtime::prelude::*;
+use locutus_stdlib::prelude::Parameters;
 
-use crate::{Cli, CommandReceiver, DeserializationFmt};
+use crate::{config::Config, state::AppState, CommandReceiver, DynError};
 
-pub(crate) async fn wasm_runtime(
-    config: Cli,
+pub async fn wasm_runtime(
+    config: Config,
     mut command_receiver: CommandReceiver,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    mut app: AppState,
+) -> Result<(), DynError> {
     let tmp_path = std::env::temp_dir().join("locutus");
-    let contract_store = ContractStore::new(tmp_path.join("contracts"), config.max_contract_size);
+    let mut contract_store =
+        ContractStore::new(tmp_path.join("contracts"), config.max_contract_size);
+
+    let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
+    contract_store.store_contract(contract)?;
     let mut runtime = Runtime::build(contract_store, false)?;
     loop {
         tokio::select! {
             req = command_receiver.recv() => {
-                execute_command(&mut runtime, req.ok_or("channel closed")?, &config)?;
+                execute_command(&mut runtime, req.ok_or("channel closed")?, &mut app)?;
             }
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt?;
@@ -30,62 +34,51 @@ pub(crate) async fn wasm_runtime(
 fn execute_command(
     runtime: &mut Runtime,
     req: ClientRequest,
-    config: &Cli,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    app: &mut AppState,
+) -> Result<(), DynError> {
     match req {
-        ClientRequest::Put { contract, state } => {
-            let parameters = todo!();
-            let delta = todo!();
-            match runtime.update_state(&contract.key(), parameters, (&*state).into(), delta) {
-                Ok(new_state) => printout_deser(config, &*state)?,
+        ClientRequest::Put {
+            contract,
+            state,
+            parameters,
+        } => match runtime.validate_state(contract.key(), parameters, state) {
+            Ok(valid) => app.printout_deser(format!("valid put: {valid}").as_bytes())?,
+            Err(err) => {
+                println!("error: {err}");
+            }
+        },
+        ClientRequest::Update { key, delta } => {
+            let state = app.load_state(&key)?.to_vec();
+            match runtime.update_state(
+                &key,
+                vec![].into(),
+                WrappedState::new(state),
+                delta.left().unwrap(),
+            ) {
+                Ok(new_state) => {
+                    app.printout_deser(&new_state)?;
+                    app.put(key, new_state);
+                }
                 Err(err) => {
                     println!("error: {err}");
                 }
             }
         }
         ClientRequest::Get { key, .. } => {
-            let parameters = todo!();
-            let state = todo!();
-            let summary = todo!();
+            let state = WrappedState::new(app.load_state(&key)?.to_vec());
+            let parameters: Parameters = vec![].into();
+            let summary = runtime.summarize_state(&key, parameters.clone(), state.clone())?;
             match runtime.get_state_delta(&key, parameters, state, summary) {
-                Ok(delta_output) => printout_deser(config, &*delta_output)?,
+                Ok(delta_output) => {
+                    app.printout_deser(&*delta_output)?;
+                    println!("finished writing delta result from get");
+                }
                 Err(err) => {
                     println!("error: {err}");
                 }
             }
         }
         _ => unreachable!(),
-    }
-    Ok(())
-}
-
-fn printout_deser<R: AsRef<[u8]> + ?Sized>(config: &Cli, data: &R) -> Result<(), std::io::Error> {
-    fn write_res(config: &Cli, pprinted: &str) -> Result<(), std::io::Error> {
-        if let Some(p) = &config.output_file {
-            let mut f = File::create(p)?;
-            f.write_all(pprinted.as_bytes())?;
-        } else if config.terminal_output {
-            println!("{pprinted}");
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "json")]
-    {
-        if let Some(DeserializationFmt::Json) = config.deser_format {
-            let deser: serde_json::Value = serde_json::from_slice(data.as_ref())?;
-            let pp = serde_json::to_string_pretty(&deser)?;
-            write_res(config, &*pp)?;
-        }
-    }
-    #[cfg(feature = "messagepack")]
-    {
-        if let Some(DeserializationFmt::MessagePack) = &config.deser_format {
-            let deser = rmpv::decode::read_value(&mut data.as_ref())
-                .map_err(|_err| std::io::ErrorKind::InvalidData)?;
-            let pp = format!("{deser}");
-            write_res(config, &*pp)?;
-        }
     }
     Ok(())
 }

@@ -5,7 +5,7 @@ use std::{error::Error as StdError, fmt::Display};
 
 use either::Either;
 use locutus_runtime::prelude::ContractKey;
-use locutus_stdlib::prelude::{State, StateDelta};
+use locutus_stdlib::prelude::{Parameters, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::{WrappedContract, WrappedState};
@@ -74,20 +74,22 @@ impl Display for ClientError {
 
 impl StdError for ClientError {}
 
-type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
+type HostIncomingMsg<'a> = Result<(ClientId, ClientRequest), ClientError>;
 
 #[allow(clippy::needless_lifetimes)]
 pub trait ClientEventsProxy {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>>;
+    fn recv<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = HostIncomingMsg<'a>> + Send + Sync + 'a>>;
 
     /// Sends a response from the host to the client application.
-    fn send(
-        &mut self,
+    fn send<'a>(
+        &'a mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>>;
 
     fn cloned(&self) -> BoxedClient;
 }
@@ -97,16 +99,29 @@ pub trait ClientEventsProxy {
 pub enum HostResponse {
     PutResponse(ContractKey),
     /// Successful update
-    UpdateResponse(ContractKey),
-    /// Message sent when there is an update to a subscribed command.
+    UpdateResponse {
+        key: ContractKey,
+        summary: StateSummary<'static>,
+    },
+    /// Message sent when there is an update to a subscribed contract.
     UpdateNotification {
         key: ContractKey,
-        update: Either<StateDelta<'static>, State<'static>>,
+        update: Either<StateDelta<'static>, WrappedState>,
     },
     GetResponse {
-        contract: Option<WrappedContract>,
-        state: Option<State<'static>>,
+        contract: Option<WrappedContract<'static>>,
+        state: WrappedState,
     },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    #[error("put error for contract {0}")]
+    PutError(ContractKey),
+    #[error("update error for contrract {key}, reason: {cause}")]
+    UpdateError { key: ContractKey, cause: String },
+    #[error("failed to get contract {key}, reason: {cause}")]
+    GetError { key: ContractKey, cause: String },
 }
 
 /// A request from a client application to the host.
@@ -115,14 +130,15 @@ pub enum HostResponse {
 pub enum ClientRequest {
     /// Insert a new value in a contract corresponding with the provided key.
     Put {
-        contract: WrappedContract,
+        contract: WrappedContract<'static>,
         /// Value to upsert in the contract.
         state: WrappedState,
+        parameters: Parameters<'static>,
     },
     /// Update an existing contract corresponding with the provided key.
     Update {
         key: ContractKey,
-        delta: Either<StateDelta<'static>, State<'static>>,
+        delta: Either<StateDelta<'static>, WrappedState>,
     },
     /// Fetch the current value from a contract corresponding to the provided key.
     Get {
@@ -146,11 +162,13 @@ pub enum ClientRequest {
 impl Display for ClientRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientRequest::Put { contract, state } => {
+            ClientRequest::Put {
+                contract, state, ..
+            } => {
                 write!(f, "put request for contract {contract} with state {state}")
             }
             ClientRequest::Update { key, .. } => write!(f, "Update request for {key}"),
-            ClientRequest::Get { key, contract } => {
+            ClientRequest::Get { key, contract, .. } => {
                 write!(f, "get request for {key} (fetch full contract: {contract})")
             }
             ClientRequest::Subscribe { key } => write!(f, "subscribe request for {key}"),
@@ -175,7 +193,7 @@ pub(crate) mod test {
         id: PeerKey,
         signal: Receiver<(EventId, PeerKey)>,
         non_owned_contracts: Vec<ContractKey>,
-        owned_contracts: Vec<(WrappedContract, WrappedState)>,
+        owned_contracts: Vec<(WrappedContract<'static>, WrappedState)>,
         events_to_gen: HashMap<EventId, ClientRequest>,
         random: bool,
     }
@@ -200,7 +218,7 @@ pub(crate) mod test {
         /// Contracts that the user updates.
         pub fn has_contract(
             &mut self,
-            contracts: impl IntoIterator<Item = (WrappedContract, WrappedState)>,
+            contracts: impl IntoIterator<Item = (WrappedContract<'static>, WrappedState)>,
         ) {
             self.owned_contracts.extend(contracts);
         }
@@ -223,10 +241,11 @@ pub(crate) mod test {
                 match rng.gen_range(0u8..3) {
                     0 if !self.owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                        let (contract, value) = self.owned_contracts[contract_no].clone();
+                        let (contract, state) = self.owned_contracts[contract_no].clone();
                         break ClientRequest::Put {
                             contract,
-                            state: value,
+                            state,
+                            parameters: [].as_ref().into(),
                         };
                     }
                     1 if !self.non_owned_contracts.is_empty() => {
@@ -251,11 +270,11 @@ pub(crate) mod test {
                         };
                         let key = if get_owned {
                             let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                            self.owned_contracts[contract_no].0.key()
+                            *self.owned_contracts[contract_no].0.key()
                         } else {
-                            let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
-
-                            self.non_owned_contracts[contract_no]
+                            // let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
+                            // self.non_owned_contracts[contract_no]
+                            todo!() // fixme
                         };
                         break ClientRequest::Subscribe { key };
                     }

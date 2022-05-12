@@ -51,7 +51,7 @@ impl<'a> EventLog<'a> {
             }) => EventKind::Put(
                 PutEvent::Request {
                     performer: target.peer,
-                    key: contract.key(),
+                    key: *contract.key(),
                 },
                 *msg.id(),
             ),
