@@ -1,7 +1,6 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use locutus_runtime::{prelude::ContractKey, WrappedState};
-use locutus_stdlib::interface::State;
+use locutus_runtime::{ContractStore, WrappedContract};
 use parking_lot::RwLock;
 
 use crate::{
@@ -11,29 +10,24 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
-    local_node: Arc<RwLock<LocalNode>>,
+    pub(crate) local_node: Arc<RwLock<LocalNode>>,
     config: Config,
 }
 
 impl AppState {
     pub fn new(config: &Config) -> Result<Self, DynError> {
+        let tmp_path = std::env::temp_dir().join("locutus").join("contracts");
+        std::fs::create_dir_all(&tmp_path)?;
+
+        let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
+        let mut contract_store =
+            ContractStore::new(tmp_path.join("contracts"), config.max_contract_size);
+        contract_store.store_contract(contract)?;
+
         Ok(AppState {
-            local_node: Arc::new(RwLock::new(LocalNode::new())),
+            local_node: Arc::new(RwLock::new(LocalNode::new(contract_store))),
             config: config.clone(),
         })
-    }
-
-    pub fn put(&mut self, key: ContractKey, state: WrappedState) {
-        let node = &mut *self.local_node.write();
-        node.contract_state.insert(key, state);
-    }
-
-    pub fn load_state(&self, key: &ContractKey) -> Result<State, DynError> {
-        let node = &*self.local_node.read();
-        node.contract_state
-            .get(key)
-            .ok_or_else(|| format!("initial state not uploaded for {key}").into())
-            .map(|s| State::from((&*s).to_vec()))
     }
 
     pub fn printout_deser<R: AsRef<[u8]> + ?Sized>(&self, data: &R) -> Result<(), std::io::Error> {

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use locutus_node::{either::Either, ClientRequest, HostResponse, RequestError};
 use locutus_runtime::{prelude::*, ContractRuntimeError};
@@ -14,8 +14,7 @@ pub struct LocalNode {
 }
 
 impl LocalNode {
-    pub fn new() -> Self {
-        let store = ContractStore::new(test_dir(), 10_000_000);
+    pub fn new(store: ContractStore) -> Self {
         Self {
             contract_params: HashMap::default(),
             contract_data: HashMap::default(),
@@ -47,7 +46,7 @@ impl LocalNode {
                 // todo: should simulate sending "update notifications"
                 is_valid
                     .then(|| HostResponse::PutResponse(*key))
-                    .ok_or(Either::Left(RequestError::PutError(*key)))
+                    .ok_or(Either::Left(RequestError::Put(*key)))
             }
             ClientRequest::Update { key, delta } => {
                 let parameters = self.contract_params.get(&key).unwrap();
@@ -59,7 +58,7 @@ impl LocalNode {
                             .update_state(&key, parameters.clone(), state, delta)
                             .map_err(|err| match err {
                                 ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
-                                    Either::Left(RequestError::PutError(key))
+                                    Either::Left(RequestError::Put(key))
                                 }
                                 other => Either::Right(other.into()),
                             })?;
@@ -101,7 +100,7 @@ impl LocalNode {
                     .cloned()
                     .map(|state| HostResponse::GetResponse { contract, state })
                     .ok_or_else(|| {
-                        Either::Left(RequestError::GetError {
+                        Either::Left(RequestError::Get {
                             key,
                             cause: "missing contract state".into(),
                         })
@@ -116,18 +115,4 @@ impl LocalNode {
             _ => unimplemented!(),
         }
     }
-}
-
-impl Default for LocalNode {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn test_dir() -> PathBuf {
-    let test_dir = std::env::temp_dir().join("locutus").join("contracts");
-    if !test_dir.exists() {
-        std::fs::create_dir_all(&test_dir).unwrap();
-    }
-    test_dir
 }

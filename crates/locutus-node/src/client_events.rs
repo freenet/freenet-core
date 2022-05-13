@@ -117,11 +117,11 @@ pub enum HostResponse {
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
     #[error("put error for contract {0}")]
-    PutError(ContractKey),
-    #[error("update error for contrract {key}, reason: {cause}")]
-    UpdateError { key: ContractKey, cause: String },
+    Put(ContractKey),
+    #[error("update error for contract {key}, reason: {cause}")]
+    Update { key: ContractKey, cause: String },
     #[error("failed to get contract {key}, reason: {cause}")]
-    GetError { key: ContractKey, cause: String },
+    Get { key: ContractKey, cause: String },
 }
 
 /// A request from a client application to the host.

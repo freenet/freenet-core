@@ -1,6 +1,5 @@
-use locutus_node::ClientRequest;
+use locutus_node::{ClientRequest, HostResponse};
 use locutus_runtime::prelude::*;
-use locutus_stdlib::prelude::Parameters;
 
 use crate::{config::Config, state::AppState, CommandReceiver, DynError};
 
@@ -15,11 +14,10 @@ pub async fn wasm_runtime(
 
     let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
     contract_store.store_contract(contract)?;
-    let mut runtime = Runtime::build(contract_store, false)?;
     loop {
         tokio::select! {
             req = command_receiver.recv() => {
-                execute_command(&mut runtime, req.ok_or("channel closed")?, &mut app)?;
+                execute_command(req.ok_or("channel closed")?, &mut app)?;
             }
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt?;
@@ -31,51 +29,38 @@ pub async fn wasm_runtime(
 }
 
 #[allow(unused, clippy::diverging_sub_expression)]
-fn execute_command(
-    runtime: &mut Runtime,
-    req: ClientRequest,
-    app: &mut AppState,
-) -> Result<(), DynError> {
+fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynError> {
+    let node = &mut *app.local_node.write();
     match req {
-        ClientRequest::Put {
-            contract,
-            state,
-            parameters,
-        } => match runtime.validate_state(contract.key(), parameters, state) {
-            Ok(valid) => app.printout_deser(format!("valid put: {valid}").as_bytes())?,
+        req @ ClientRequest::Put { .. } => match node.handle_request(req) {
+            Ok(HostResponse::PutResponse(key)) => {
+                println!("valid put for {key}");
+            }
             Err(err) => {
                 println!("error: {err}");
             }
+            _ => unimplemented!(),
         },
-        ClientRequest::Update { key, delta } => {
-            let state = app.load_state(&key)?.to_vec();
-            match runtime.update_state(
-                &key,
-                vec![].into(),
-                WrappedState::new(state),
-                delta.left().unwrap(),
-            ) {
-                Ok(new_state) => {
-                    app.printout_deser(&new_state)?;
-                    app.put(key, new_state);
-                }
-                Err(err) => {
-                    println!("error: {err}");
-                }
+        req @ ClientRequest::Update { .. } => match node.handle_request(req) {
+            Ok(HostResponse::UpdateResponse { key, summary }) => {
+                println!("valid update for {key}, state summary:");
+                app.printout_deser(summary.as_ref())?;
             }
-        }
-        ClientRequest::Get { key, .. } => {
-            let state = WrappedState::new(app.load_state(&key)?.to_vec());
-            let parameters: Parameters = vec![].into();
-            let summary = runtime.summarize_state(&key, parameters.clone(), state.clone())?;
-            match runtime.get_state_delta(&key, parameters, state, summary) {
-                Ok(delta_output) => {
-                    app.printout_deser(&*delta_output)?;
-                    println!("finished writing delta result from get");
+            Err(err) => {
+                println!("error: {err}");
+            }
+            _ => unimplemented!(),
+        },
+        ClientRequest::Get { key, contract } => {
+            match node.handle_request(ClientRequest::Get { key, contract }) {
+                Ok(HostResponse::GetResponse { contract, state }) => {
+                    println!("valid update for {key}, state:");
+                    app.printout_deser(state.as_ref())?;
                 }
                 Err(err) => {
                     println!("error: {err}");
                 }
+                _ => unimplemented!(),
             }
         }
         _ => unreachable!(),
