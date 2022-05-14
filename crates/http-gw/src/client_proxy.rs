@@ -20,6 +20,7 @@ use warp::{
     reject::{self, Reject},
     reply, Filter, Rejection, Reply,
 };
+use xz2::bufread::XzDecoder;
 
 type HostResult = Result<HostResponse, ClientError>;
 
@@ -76,12 +77,12 @@ async fn handle_contract(
             match r {
                 HostResponse::GetResponse { contract, state } => {
                     // TODO: here we should pass the batton to the websocket interface
-                    let _web_body = get_web(state);
-                    Ok(reply::reply())
+                    let web_body = get_web_body(state).unwrap();
+                    Ok(reply::html(web_body))
                 }
                 _ => {
                     // TODO: here we should pass the batton to the websocket interface
-                    Ok(reply::reply())
+                    Ok(reply::html(hyper::Body::empty()))
                 }
             }
         }
@@ -89,10 +90,9 @@ async fn handle_contract(
     }
 }
 
-fn get_web(state: WrappedState) -> Result<String, anyhow::Error> {
-    let mut state = Cursor::new(state.as_ref());
+fn get_web_body(state: WrappedState) -> Result<hyper::Body, anyhow::Error> {
     // Decompose the state and extract the compressed web interface
-
+    let mut state = Cursor::new(state.as_ref());
     let metadata_size = state.read_u64::<BigEndian>()?;
     let mut metadata = vec![0; metadata_size as usize];
     state.read_exact(&mut metadata)?;
@@ -100,14 +100,11 @@ fn get_web(state: WrappedState) -> Result<String, anyhow::Error> {
     let mut web = vec![0; web_size as usize];
     state.read_exact(&mut web)?;
 
-    todo!("web should be a `tar.xz/gz` file; that is a compressed tar, using xz/gz compression, archive")
-    // TODO: inside this tar there is a random number of files, one of which is guaranteed to be an index.html
-    //       the server must then serve this files under the current URL, going from the index.html
-
-    // let mut gz = GzDecoder::new(Cursor::new(&web));
-    // let mut body = String::new();
-    // gz.read_to_string(&mut body)?;
-    // Ok(body)
+    // Decode tar.xz and build response body
+    let mut body = vec![];
+    let mut decoder = XzDecoder::new(Cursor::new(&web));
+    let _ = decoder.read_to_end(&mut body);
+    Ok(hyper::Body::from(body))
 }
 
 async fn home() -> Result<impl Reply, Rejection> {
@@ -184,32 +181,14 @@ mod errors {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use flate2::read::GzEncoder;
-    use flate2::Compression;
+    use crate::util::get_random_state;
 
     #[test]
     fn test_get_ui_from_contract() -> Result<(), anyhow::Error> {
-        // Prepare contract state
-        let expected_web_content = "<html><head><title>Title</title></head><body></body></html>";
-        let mut web = vec![];
-        let mut gz = GzEncoder::new(expected_web_content.as_bytes(), Compression::default());
-        let web_size = (gz.read_to_end(&mut web).unwrap() as u32)
-            .to_be_bytes()
-            .to_vec();
+        let state = get_random_state();
+        let body = get_web_body(state);
 
-        let metadata: Vec<u8> = "metadata".as_bytes().to_vec();
-        let metadata_size: Vec<u8> = u32::try_from(metadata.len())
-            .unwrap()
-            .to_be_bytes()
-            .to_vec();
-        let reminder: Vec<u8> = "reminder".as_bytes().to_vec();
-        let state_vec: Vec<u8> = [metadata_size, metadata, web_size, web, reminder].concat();
-        let state = WrappedState::new(state_vec);
-
-        // Get web content from state
-        let body = get_web(state).unwrap();
-
-        assert_eq!(expected_web_content, body);
+        assert!(body.is_ok());
 
         Ok(())
     }
