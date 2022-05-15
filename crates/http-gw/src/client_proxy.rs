@@ -71,7 +71,7 @@ async fn handle_contract(
     let response = response
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-
+    // http://localhost/contract/<?key>
     match response {
         Ok(r) => {
             match r {
@@ -192,4 +192,15 @@ pub(crate) mod test {
 
         Ok(())
     }
+}
+
+#[cfg(feature = "local")]
+mod local {
+    use locutus_dev::LocalNode;
+
+    // fn set_local_node() -> LocalNode {
+    //     let contract = ;
+    //     LocalNode::new();
+    //     todo!()
+    // }
 }

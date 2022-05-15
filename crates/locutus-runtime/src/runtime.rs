@@ -401,7 +401,7 @@ mod test {
         let path = dirs.nth(2).unwrap();
         let contract_path = path
             .join("contracts")
-            .join("test_contract")
+            .join("test-contract")
             .join(contract_path);
         WrappedContract::try_from((&*contract_path, Parameters::from(vec![])))
             .expect("contract found")

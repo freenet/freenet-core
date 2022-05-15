@@ -1,0 +1,11 @@
+{
+	"version": "0.0.1",
+	"messages": [
+		{
+			"author": "IDG",
+			"date": "2022-05-10",
+			"title": "Lore ipsum",
+			"content": "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+		}
+	]
+}

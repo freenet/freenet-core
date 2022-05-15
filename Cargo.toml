@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["contracts/test_contract"]
+exclude = ["contracts/test-contract", "contracts/test-web-contract"]
 
 [profile.dev.package."*"]
 opt-level = 3
