@@ -40,7 +40,7 @@ pub struct ClientError {
 
 impl ClientError {
     pub fn kind(&self) -> ErrorKind {
-        self.kind
+        self.kind.clone()
     }
 }
 
@@ -50,7 +50,7 @@ impl From<ErrorKind> for ClientError {
     }
 }
 
-#[derive(thiserror::Error, Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[derive(thiserror::Error, Debug, Serialize, Deserialize, Clone)]
 pub enum ErrorKind {
     #[error("comm channel between client/host closed")]
     ChannelClosed,
@@ -58,6 +58,10 @@ pub enum ErrorKind {
     TransportProtocolDisconnect,
     #[error("unknown client id: {0}")]
     UnknownClient(ClientId),
+    #[error(transparent)]
+    RequestError(#[from] RequestError),
+    #[error("unhandled error: {0}")]
+    Unhandled(String),
 }
 
 impl From<ErrorKind> for warp::Rejection {
@@ -114,7 +118,7 @@ pub enum HostResponse {
     },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum RequestError {
     #[error("put error for contract {0}")]
     Put(ContractKey),

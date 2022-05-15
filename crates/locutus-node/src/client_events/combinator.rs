@@ -164,7 +164,7 @@ async fn client_fn(
                             break;
                         }
                     }
-                    Err(err) if err.kind() == ErrorKind::ChannelClosed =>{
+                    Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) =>{
                         log::debug!("disconnected client");
                         let _ = tx_host.send(Err(err)).await;
                         break;

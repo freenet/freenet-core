@@ -9,6 +9,7 @@ mod user_events;
 pub use config::Config;
 pub use executor::wasm_runtime;
 pub use local_node::LocalNode;
+pub use locutus_runtime::ContractStore;
 pub use state::AppState;
 pub use user_events::user_fn_handler;
 

@@ -193,14 +193,3 @@ pub(crate) mod test {
         Ok(())
     }
 }
-
-#[cfg(feature = "local")]
-mod local {
-    use locutus_dev::LocalNode;
-
-    // fn set_local_node() -> LocalNode {
-    //     let contract = ;
-    //     LocalNode::new();
-    //     todo!()
-    // }
-}

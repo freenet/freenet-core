@@ -112,7 +112,9 @@ impl LocalNode {
                 }
                 Err(Either::Right("disconnected".into()))
             }
-            _ => unimplemented!(),
+            ClientRequest::Subscribe { key } => {
+                todo!()
+            }
         }
     }
 }
