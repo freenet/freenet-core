@@ -6,7 +6,6 @@ rust-version = "1.58.0"
 publish = false
 
 [dependencies]
-anyhow = "1"
 async-trait = "0.1"
 byteorder = "1"
 log = "0.4"

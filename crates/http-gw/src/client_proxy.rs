@@ -22,6 +22,8 @@ use warp::{
 };
 use xz2::bufread::XzDecoder;
 
+use crate::DynError;
+
 type HostResult = Result<HostResponse, ClientError>;
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
@@ -90,7 +92,7 @@ async fn handle_contract(
     }
 }
 
-fn get_web_body(state: WrappedState) -> Result<hyper::Body, anyhow::Error> {
+fn get_web_body(state: WrappedState) -> Result<hyper::Body, DynError> {
     // Decompose the state and extract the compressed web interface
     let mut state = Cursor::new(state.as_ref());
     let metadata_size = state.read_u64::<BigEndian>()?;
@@ -180,16 +182,25 @@ mod errors {
 
 #[cfg(test)]
 pub(crate) mod test {
+    use std::{fs::File, path::PathBuf};
+
+    use crate::DynError;
+
     use super::*;
-    use crate::util::get_random_state;
+
+    pub fn test_state() -> Result<WrappedState, std::io::Error> {
+        const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
+        let path = PathBuf::from(CRATE_DIR).join("tests/encoded_state");
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+        Ok(WrappedState::new(bytes))
+    }
 
     #[test]
-    fn test_get_ui_from_contract() -> Result<(), anyhow::Error> {
-        let state = get_random_state();
+    fn test_get_ui_from_contract() -> Result<(), DynError> {
+        let state = test_state()?;
         let body = get_web_body(state);
-
         assert!(body.is_ok());
-
         Ok(())
     }
 }

@@ -1,19 +1,12 @@
 use locutus_node::{ClientRequest, HostResponse};
-use locutus_runtime::prelude::*;
 
 use crate::{config::Config, state::AppState, CommandReceiver, DynError};
 
 pub async fn wasm_runtime(
-    config: Config,
+    _config: Config,
     mut command_receiver: CommandReceiver,
     mut app: AppState,
 ) -> Result<(), DynError> {
-    let tmp_path = std::env::temp_dir().join("locutus");
-    let mut contract_store =
-        ContractStore::new(tmp_path.join("contracts"), config.max_contract_size);
-
-    let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
-    contract_store.store_contract(contract)?;
     loop {
         tokio::select! {
             req = command_receiver.recv() => {
@@ -39,7 +32,7 @@ fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynErro
             Err(err) => {
                 println!("error: {err}");
             }
-            _ => unimplemented!(),
+            _ => unreachable!(),
         },
         req @ ClientRequest::Update { .. } => match node.handle_request(req) {
             Ok(HostResponse::UpdateResponse { key, summary }) => {
@@ -49,18 +42,18 @@ fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynErro
             Err(err) => {
                 println!("error: {err}");
             }
-            _ => unimplemented!(),
+            _ => unreachable!(),
         },
         ClientRequest::Get { key, contract } => {
             match node.handle_request(ClientRequest::Get { key, contract }) {
                 Ok(HostResponse::GetResponse { contract, state }) => {
-                    println!("valid update for {key}, state:");
+                    println!("current state for {key}:");
                     app.printout_deser(state.as_ref())?;
                 }
                 Err(err) => {
                     println!("error: {err}");
                 }
-                _ => unimplemented!(),
+                _ => unreachable!(),
             }
         }
         _ => unreachable!(),

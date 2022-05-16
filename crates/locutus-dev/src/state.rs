@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use locutus_runtime::{ContractStore, WrappedContract};
+use locutus_runtime::ContractStore;
 use parking_lot::RwLock;
 
 use crate::{
@@ -18,12 +18,8 @@ impl AppState {
     pub fn new(config: &Config) -> Result<Self, DynError> {
         let tmp_path = std::env::temp_dir().join("locutus").join("contracts");
         std::fs::create_dir_all(&tmp_path)?;
-
-        let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
-        let mut contract_store =
+        let contract_store =
             ContractStore::new(tmp_path.join("contracts"), config.max_contract_size);
-        contract_store.store_contract(contract)?;
-
         Ok(AppState {
             local_node: Arc::new(RwLock::new(LocalNode::new(contract_store))),
             config: config.clone(),
@@ -40,23 +36,21 @@ impl AppState {
             }
             Ok(())
         }
-
-        #[cfg(feature = "json")]
-        {
-            if let Some(DeserializationFmt::Json) = self.config.deser_format {
+        match self.config.deser_format {
+            #[cfg(feature = "json")]
+            Some(DeserializationFmt::Json) => {
                 let deser: serde_json::Value = serde_json::from_slice(data.as_ref())?;
                 let pp = serde_json::to_string_pretty(&deser)?;
                 write_res(&self.config, &*pp)?;
             }
-        }
-        #[cfg(feature = "messagepack")]
-        {
-            if let Some(DeserializationFmt::MessagePack) = self.config.deser_format {
+            #[cfg(feature = "messagepack")]
+            Some(DeserializationFmt::MessagePack) => {
                 let deser = rmpv::decode::read_value(&mut data.as_ref())
                     .map_err(|_err| std::io::ErrorKind::InvalidData)?;
                 let pp = format!("{deser}");
                 write_res(&self.config, &*pp)?;
             }
+            _ => {}
         }
         Ok(())
     }

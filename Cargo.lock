@@ -1367,7 +1367,6 @@ dependencies = [
 name = "http-gw"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "byteorder",
  "hyper",
@@ -1940,6 +1939,7 @@ dependencies = [
  "bincode",
  "byteorder",
  "clap",
+ "crossbeam",
  "either",
  "locutus-node",
  "locutus-runtime",
