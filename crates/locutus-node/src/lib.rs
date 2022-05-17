@@ -20,5 +20,6 @@ pub use client_events::{
     ClientRequest, ErrorKind, HostResponse, RequestError,
 };
 pub use either;
+pub use node::PeerKey;
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;

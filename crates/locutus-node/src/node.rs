@@ -328,11 +328,7 @@ async fn client_event_handling<ClientEv, CErr>(
         let op_storage_cp = op_storage.clone();
         GlobalExecutor::spawn(async move {
             match ev {
-                ClientRequest::Put {
-                    state: value,
-                    contract,
-                    parameters,
-                } => {
+                ClientRequest::Put { state, contract } => {
                     // Initialize a put op.
                     log::debug!(
                         "Received put from user event @ {}",
@@ -340,7 +336,7 @@ async fn client_event_handling<ClientEv, CErr>(
                     );
                     let op = put::start_op(
                         contract,
-                        value,
+                        state,
                         op_storage_cp.ring.max_hops_to_live,
                         &op_storage_cp.ring.peer_key,
                     );

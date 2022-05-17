@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crossbeam::channel::Sender;
-use locutus_node::{either::Either, ClientRequest, HostResponse, RequestError};
+use locutus_node::{either::Either, ClientRequest, HostResponse, PeerKey, RequestError};
 use locutus_runtime::{prelude::*, ContractRuntimeError};
 use locutus_stdlib::prelude::*;
 
@@ -17,10 +17,11 @@ type Response = Result<HostResponse, Either<RequestError, DynError>>;
 /// of changes or can alternatively use the notification channel.
 pub struct LocalNode {
     contract_params: HashMap<ContractKey, Parameters<'static>>,
-    contract_data: HashMap<String, Arc<ContractData<'static>>>,
+    contract_data: HashMap<String, Arc<ContractCode<'static>>>,
     pub(crate) contract_state: HashMap<ContractKey, WrappedState>,
     runtime: Runtime,
-    update_notifications: HashMap<ContractKey, Vec<Sender<HostResponse>>>,
+    update_notifications: HashMap<ContractKey, Vec<(PeerKey, Sender<HostResponse>)>>,
+    subscriber_summaries: HashMap<ContractKey, HashMap<PeerKey, StateSummary<'static>>>,
 }
 
 impl LocalNode {
@@ -31,84 +32,85 @@ impl LocalNode {
             contract_state: HashMap::default(),
             runtime: Runtime::build(store, false).unwrap(),
             update_notifications: HashMap::default(),
+            subscriber_summaries: HashMap::default(),
         }
     }
 
     pub fn register_contract_notifier(
         &mut self,
         key: ContractKey,
+        peer_key: PeerKey,
         notification_ch: Sender<HostResponse>,
-    ) {
-        self.update_notifications
+        summary: StateSummary<'static>,
+    ) -> Result<(), DynError> {
+        let channels = self.update_notifications.entry(key).or_default();
+        if let Ok(i) = channels.binary_search_by_key(&&peer_key, |(p, _)| p) {
+            let (_, existing_ch) = &channels[i];
+            if !existing_ch.same_channel(&notification_ch) {
+                return Err(format!("peer {peer_key} has multiple notification channels").into());
+            }
+        } else {
+            channels.push((peer_key, notification_ch));
+        }
+
+        if self
+            .subscriber_summaries
             .entry(key)
             .or_default()
-            .push(notification_ch);
+            .insert(peer_key, summary)
+            .is_some()
+        {
+            log::warn!(
+                "contract {key} already was registered for peer {peer_key}; replaced summary"
+            );
+        }
+        Ok(())
     }
 
     pub fn handle_request(&mut self, req: ClientRequest) -> Response {
         match req {
-            ClientRequest::Put {
-                contract,
-                state,
-                parameters,
-            } => {
+            ClientRequest::Put { contract, state } => {
+                // FIXME: in net node, we don't allow puts for existing contract states
+                //        if it hits a node which already has it it will get rejected
+                //        while we wait for confirmation for the state,
+                //        we don't respond with the interim state
+                //
+                //        if there is a conflict, resolve the conflict to see which
+                //        is the outdated state:
+                //          1. through the arbitraur mechanism
+                //          2. a new func which compared two summaries and gives the most fresh
+                //        you can request to several nodes and determine which node has a fresher ver
                 let key = contract.key();
                 let is_valid = self
                     .runtime
-                    .validate_state(key, parameters.clone(), state.clone())
+                    .validate_state(key, contract.params(), state.clone())
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.contract_state.insert(*key, state.clone());
-                self.contract_params.insert(*key, parameters);
+                self.contract_params.insert(*key, contract.params().clone());
                 self.contract_data
-                    .insert(key.contract_part_as_str(), contract.data().clone());
+                    .insert(key.contract_part_as_str(), contract.code().clone());
                 let res = is_valid
                     .then(|| HostResponse::PutResponse(*key))
                     .ok_or(Either::Left(RequestError::Put(*key)));
-                if let Some(notifiers) = self.update_notifications.get(key) {
-                    // todo: keep track of summaries from consumers and return deltas
-                    for notifier in notifiers {
-                        notifier
-                            .send(HostResponse::UpdateNotification {
-                                key: *key,
-                                update: Either::Right(state.clone()),
-                            })
-                            .map_err(|_| Either::Right("disconnected".into()))?;
-                    }
-                }
+                self.send_update_notification(key, contract.params(), &state)?;
                 res
             }
             ClientRequest::Update { key, delta } => {
-                let parameters = self.contract_params.get(&key).unwrap();
-                let new_state = match delta {
-                    Either::Left(delta) => {
-                        let state = self.contract_state.get(&key).unwrap().clone();
-                        let new_state = self
-                            .runtime
-                            .update_state(&key, parameters.clone(), state, delta)
-                            .map_err(|err| match err {
-                                ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
-                                    Either::Left(RequestError::Put(key))
-                                }
-                                other => Either::Right(other.into()),
-                            })?;
-                        self.contract_state.insert(key, new_state.clone());
-                        new_state
-                    }
-                    Either::Right(state) => {
-                        if self
-                            .runtime
-                            .validate_state(&key, parameters.clone(), state.clone())
-                            .map_err(Into::into)
-                            .map_err(Either::Right)?
-                        {
-                            self.contract_state.insert(key, state.clone());
-                            state
-                        } else {
-                            log::error!("Invalid state for `{key}`: {state}");
-                            todo!()
-                        }
-                    }
+                let parameters = self.contract_params.get(&key).unwrap().clone();
+                let new_state = {
+                    let state = self.contract_state.get(&key).unwrap().clone();
+                    let new_state = self
+                        .runtime
+                        .update_state(&key, parameters.clone(), state, delta)
+                        .map_err(|err| match err {
+                            ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
+                                Either::Left(RequestError::Put(key))
+                            }
+                            other => Either::Right(other.into()),
+                        })?;
+                    self.contract_state.insert(key, new_state.clone());
+                    new_state
                 };
                 // in the network impl this would be sent over the network
                 let summary = self
@@ -116,17 +118,8 @@ impl LocalNode {
                     .summarize_state(&key, parameters.clone(), new_state.clone())
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                if let Some(notifiers) = self.update_notifications.get(&key) {
-                    // todo: keep track of summaries from consumers and return deltas
-                    for notifier in notifiers {
-                        notifier
-                            .send(HostResponse::UpdateNotification {
-                                key,
-                                update: Either::Right(new_state.clone()),
-                            })
-                            .map_err(|_| Either::Right("disconnected".into()))?;
-                    }
-                }
+                self.send_update_notification(&key, &parameters, &new_state)?;
+                // TODO: after the node sending the update gets the response what should it do
                 Ok(HostResponse::UpdateResponse { key, summary })
             }
             ClientRequest::Get { key, contract } => {
@@ -140,6 +133,33 @@ impl LocalNode {
                 Err(Either::Right("disconnected".into()))
             }
         }
+    }
+
+    fn send_update_notification<'a>(
+        &'a mut self,
+        key: &ContractKey,
+        params: &Parameters<'a>,
+        new_state: &WrappedState,
+    ) -> Result<(), Either<RequestError, DynError>> {
+        if let Some(notifiers) = self.update_notifications.get(key) {
+            let summaries = self.subscriber_summaries.get_mut(key).unwrap();
+            for (peer_key, notifier) in notifiers {
+                let peer_summary = summaries.get_mut(peer_key).unwrap();
+                let update = self
+                    .runtime
+                    .get_state_delta(key, params, new_state, &*peer_summary)
+                    .map_err(|err| match err {
+                        ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
+                            Either::Left(RequestError::Put(*key))
+                        }
+                        other => Either::Right(other.into()),
+                    })?;
+                notifier
+                    .send(HostResponse::UpdateNotification { key: *key, update })
+                    .map_err(|_| Either::Right("disconnected".into()))?;
+            }
+        }
+        Ok(())
     }
 
     fn perform_get(

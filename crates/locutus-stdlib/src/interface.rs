@@ -92,6 +92,9 @@ pub trait ContractInterface {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<UpdateModification, ContractError>;
+    
+    // todo: implement in contract
+    // fn(state_summary_1, state_summary_2) -> up_to_data(1 | 2);
 }
 
 /// A complete contract specification requires a `parameters` section
@@ -99,12 +102,12 @@ pub trait ContractInterface {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Contract<'a> {
     pub parameters: Parameters<'a>,
-    pub data: ContractData<'a>,
+    pub data: ContractCode<'a>,
     key: ContractKey,
 }
 
 impl<'a> Contract<'a> {
-    pub fn new(contract: ContractData<'a>, parameters: Parameters<'a>) -> Contract<'a> {
+    pub fn new(contract: ContractCode<'a>, parameters: Parameters<'a>) -> Contract<'a> {
         let key = ContractKey::from((&parameters, &contract));
         Contract {
             parameters,
@@ -118,7 +121,7 @@ impl<'a> Contract<'a> {
     }
 
     /// Data portion of the specification.
-    pub fn into_data(self) -> ContractData<'a> {
+    pub fn into_data(self) -> ContractCode<'a> {
         self.data
     }
 }
@@ -138,7 +141,7 @@ impl TryFrom<Vec<u8>> for Contract<'static> {
         let contract_len = reader.read_u64::<LittleEndian>()?;
         let mut contract_buf = vec![0; contract_len as usize];
         reader.read_exact(&mut contract_buf)?;
-        let contract = ContractData::from(contract_buf);
+        let contract = ContractCode::from(contract_buf);
 
         let key = ContractKey::from((&parameters, &contract));
 
@@ -179,7 +182,7 @@ impl std::fmt::Display for Contract<'_> {
 #[cfg(any(test, feature = "testing"))]
 impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let contract: ContractData = u.arbitrary()?;
+        let contract: ContractCode = u.arbitrary()?;
         let parameters: Vec<u8> = u.arbitrary()?;
         let parameters = Parameters::from(parameters);
 
@@ -385,13 +388,13 @@ impl<'a> DerefMut for StateSummary<'a> {
 /// and does not include any other metadata (like the parameters).
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ContractData<'a> {
+pub struct ContractCode<'a> {
     data: Cow<'a, [u8]>,
     #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     key: [u8; CONTRACT_KEY_SIZE],
 }
 
-impl ContractData<'_> {
+impl ContractCode<'_> {
     pub fn key(&self) -> &[u8; CONTRACT_KEY_SIZE] {
         &self.key
     }
@@ -415,43 +418,43 @@ impl ContractData<'_> {
     }
 }
 
-impl From<Vec<u8>> for ContractData<'static> {
+impl From<Vec<u8>> for ContractCode<'static> {
     fn from(data: Vec<u8>) -> Self {
-        let key = ContractData::gen_key(&data);
-        ContractData {
+        let key = ContractCode::gen_key(&data);
+        ContractCode {
             data: Cow::from(data),
             key,
         }
     }
 }
 
-impl<'a> From<&'a [u8]> for ContractData<'a> {
-    fn from(data: &'a [u8]) -> ContractData {
-        let key = ContractData::gen_key(data);
-        ContractData {
+impl<'a> From<&'a [u8]> for ContractCode<'a> {
+    fn from(data: &'a [u8]) -> ContractCode {
+        let key = ContractCode::gen_key(data);
+        ContractCode {
             data: Cow::from(data),
             key,
         }
     }
 }
 
-impl PartialEq for ContractData<'_> {
+impl PartialEq for ContractCode<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
 
-impl Eq for ContractData<'_> {}
+impl Eq for ContractCode<'_> {}
 
 #[cfg(any(test, feature = "testing"))]
-impl<'a> arbitrary::Arbitrary<'a> for ContractData<'static> {
+impl<'a> arbitrary::Arbitrary<'a> for ContractCode<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
-        Ok(ContractData::from(data))
+        Ok(ContractCode::from(data))
     }
 }
 
-impl std::fmt::Display for ContractData<'_> {
+impl std::fmt::Display for ContractCode<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Contract( key: ")?;
         internal_fmt_key(&self.key, f)?;
@@ -483,7 +486,7 @@ pub struct ContractKey {
 impl<'a, T, U> From<(T, U)> for ContractKey
 where
     T: Borrow<Parameters<'a>>,
-    U: Borrow<ContractData<'a>>,
+    U: Borrow<ContractCode<'a>>,
 {
     fn from(spec: (T, U)) -> Self {
         let (parameters, contract) = (spec.0.borrow(), spec.1.borrow());

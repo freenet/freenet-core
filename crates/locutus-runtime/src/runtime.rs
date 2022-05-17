@@ -77,7 +77,7 @@ impl Runtime {
             .contracts
             .fetch_contract(key, parameters)
             .ok_or(ContractRuntimeError::ContractNotFound(*key))?;
-        let module = Module::new(&self.store, contract.data().data())?;
+        let module = Module::new(&self.store, contract.code().data())?;
         self.modules.insert(*key, module);
         Ok(())
     }
@@ -188,12 +188,12 @@ impl Runtime {
     pub fn validate_state<'a>(
         &mut self,
         key: &ContractKey,
-        parameters: Parameters<'a>,
+        parameters: &Parameters<'a>,
         state: WrappedState,
     ) -> RuntimeResult<bool> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_call(key, &parameters, req_bytes)?;
-        let mut param_buf = self.init_buf(&instance, &parameters)?;
+        let instance = self.prepare_call(key, parameters, req_bytes)?;
+        let mut param_buf = self.init_buf(&instance, parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
         state_buf.write(state)?;
@@ -280,7 +280,7 @@ impl Runtime {
         key: &ContractKey,
         parameters: Parameters<'a>,
         state: WrappedState,
-    ) -> RuntimeResult<StateSummary<'a>> {
+    ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
         let instance = self.prepare_call(key, &parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
@@ -309,12 +309,12 @@ impl Runtime {
     pub fn get_state_delta<'a>(
         &mut self,
         key: &ContractKey,
-        parameters: Parameters<'a>,
-        state: WrappedState,
-        summary: StateSummary<'a>,
-    ) -> RuntimeResult<StateDelta<'a>> {
+        parameters: &Parameters<'a>,
+        state: &WrappedState,
+        summary: &StateSummary<'a>,
+    ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
-        let instance = self.prepare_call(key, &parameters, req_bytes)?;
+        let instance = self.prepare_call(key, parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;

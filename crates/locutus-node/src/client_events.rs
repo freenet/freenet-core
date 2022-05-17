@@ -3,9 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
 
-use either::Either;
 use locutus_runtime::prelude::ContractKey;
-use locutus_stdlib::prelude::{Parameters, StateDelta, StateSummary};
+use locutus_stdlib::prelude::{StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::{WrappedContract, WrappedState};
@@ -107,14 +106,14 @@ pub enum HostResponse {
         key: ContractKey,
         summary: StateSummary<'static>,
     },
-    /// Message sent when there is an update to a subscribed contract.
-    UpdateNotification {
-        key: ContractKey,
-        update: Either<StateDelta<'static>, WrappedState>,
-    },
     GetResponse {
         contract: Option<WrappedContract<'static>>,
         state: WrappedState,
+    },
+    /// Message sent when there is an update to a subscribed contract.
+    UpdateNotification {
+        key: ContractKey,
+        update: StateDelta<'static>,
     },
 }
 
@@ -137,12 +136,11 @@ pub enum ClientRequest {
         contract: WrappedContract<'static>,
         /// Value to upsert in the contract.
         state: WrappedState,
-        parameters: Parameters<'static>,
     },
     /// Update an existing contract corresponding with the provided key.
     Update {
         key: ContractKey,
-        delta: Either<StateDelta<'static>, WrappedState>,
+        delta: StateDelta<'static>,
     },
     /// Fetch the current value from a contract corresponding to the provided key.
     Get {
@@ -246,11 +244,7 @@ pub(crate) mod test {
                     0 if !self.owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.owned_contracts.len());
                         let (contract, state) = self.owned_contracts[contract_no].clone();
-                        break ClientRequest::Put {
-                            contract,
-                            state,
-                            parameters: [].as_ref().into(),
-                        };
+                        break ClientRequest::Put { contract, state };
                     }
                     1 if !self.non_owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.non_owned_contracts.len());

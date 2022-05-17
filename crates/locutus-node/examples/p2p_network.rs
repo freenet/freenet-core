@@ -8,7 +8,7 @@ use libp2p::{
 };
 use locutus_node::*;
 use locutus_runtime::prelude::{WrappedContract, WrappedState};
-use locutus_stdlib::prelude::{ContractData, Parameters};
+use locutus_stdlib::prelude::{ContractCode, Parameters};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");
@@ -41,7 +41,7 @@ async fn start_new_peer(
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     let contract = WrappedContract::new(
-        Arc::new(ContractData::from(vec![7, 3, 9, 5])),
+        Arc::new(ContractCode::from(vec![7, 3, 9, 5])),
         Parameters::from(vec![]),
     );
     let key = *contract.key();
@@ -53,7 +53,6 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: init_val,
             contract: contract.clone(),
-            parameters: vec![].into(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;
@@ -75,7 +74,6 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: second_val,
             contract,
-            parameters: vec![].into(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;

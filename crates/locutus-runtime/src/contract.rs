@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::{ContractData, ContractKey, Parameters};
+use locutus_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use serde::Serialize;
 use std::{fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 
@@ -7,7 +7,7 @@ use crate::ContractRuntimeError;
 /// Just as `locutus_stdlib::Contract` but with some convenience impl.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct WrappedContract<'a> {
-    pub(crate) data: Arc<ContractData<'a>>,
+    pub(crate) data: Arc<ContractCode<'a>>,
     pub(crate) params: Parameters<'a>,
     pub(crate) key: ContractKey,
 }
@@ -21,7 +21,7 @@ impl PartialEq for WrappedContract<'_> {
 impl Eq for WrappedContract<'_> {}
 
 impl<'a> WrappedContract<'a> {
-    pub fn new(data: Arc<ContractData<'a>>, params: Parameters<'a>) -> WrappedContract<'a> {
+    pub fn new(data: Arc<ContractCode<'a>>, params: Parameters<'a>) -> WrappedContract<'a> {
         let key = ContractKey::from((&params, &*data));
         WrappedContract { data, params, key }
     }
@@ -32,13 +32,18 @@ impl<'a> WrappedContract<'a> {
     }
 
     #[inline]
-    pub fn data(&self) -> &Arc<ContractData<'a>> {
+    pub fn code(&self) -> &Arc<ContractCode<'a>> {
         &self.data
+    }
+
+    #[inline]
+    pub fn params(&self) -> &Parameters<'a> {
+        &self.params
     }
 
     pub(crate) fn get_data_from_fs(
         path: &Path,
-    ) -> Result<ContractData<'static>, ContractRuntimeError> {
+    ) -> Result<ContractCode<'static>, ContractRuntimeError> {
         let mut contract_file = File::open(path)?;
         let mut contract_data = if let Ok(md) = contract_file.metadata() {
             Vec::with_capacity(md.len() as usize)
@@ -46,7 +51,7 @@ impl<'a> WrappedContract<'a> {
             Vec::new()
         };
         contract_file.read_to_end(&mut contract_data)?;
-        Ok(ContractData::from(contract_data))
+        Ok(ContractCode::from(contract_data))
     }
 }
 
@@ -80,7 +85,7 @@ impl Display for WrappedContract<'_> {
 impl<'a> arbitrary::Arbitrary<'a> for WrappedContract<'_> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         use arbitrary::Arbitrary;
-        let data: ContractData = Arbitrary::arbitrary(u)?;
+        let data: ContractCode = Arbitrary::arbitrary(u)?;
         let param_bytes: Vec<u8> = Arbitrary::arbitrary(u)?;
         let params = Parameters::from(param_bytes);
         let key = ContractKey::from((&params, &data));

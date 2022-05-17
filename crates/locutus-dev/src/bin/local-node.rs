@@ -19,3 +19,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     println!("Shutdown...");
     Ok(())
 }
+
+// /tmp/locutus/contracts/7843vnjfd <- contract A
+// /tmp/locutus/db/sqlite.db <- (key, value) where key is contrac A + parameter B <- value: state

@@ -121,14 +121,13 @@ impl From<CommandInfo> for (ClientId, ClientRequest) {
                 ClientRequest::Put {
                     contract: cmd.contract,
                     state: WrappedState::new(state.into_owned()),
-                    parameters: vec![].into(),
                 }
             }
             Command::Update => {
                 let delta = cmd.input.unwrap().unwrap_delta();
                 ClientRequest::Update {
                     key: *cmd.contract.key(),
-                    delta: Either::Left(delta),
+                    delta,
                 }
             }
             _ => unreachable!(),

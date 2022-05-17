@@ -152,7 +152,7 @@ mod tests {
 
         let serialized = bincode::serialize(&contract)?;
         let deser: WrappedContract = bincode::deserialize(&serialized)?;
-        assert_eq!(deser.data(), contract.data());
+        assert_eq!(deser.code(), contract.code());
         assert_eq!(deser.key(), contract.key());
         Ok(())
     }

@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 
-use locutus_stdlib::prelude::{ContractData, Parameters};
+use locutus_stdlib::prelude::{ContractCode, Parameters};
 use stretto::Cache;
 
 use crate::{contract::WrappedContract, RuntimeResult};
@@ -13,7 +13,7 @@ type KeyContractPart = [u8; 32];
 #[derive(Clone)]
 pub struct ContractStore {
     contracts_dir: PathBuf,
-    contract_cache: Cache<KeyContractPart, Arc<ContractData<'static>>>,
+    contract_cache: Cache<KeyContractPart, Arc<ContractCode<'static>>>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
@@ -76,13 +76,13 @@ impl ContractStore {
         }
 
         // insert in the memory cache
-        let size = contract.data().data().len() as i64;
-        let data = contract.data().data().to_vec();
+        let size = contract.code().data().len() as i64;
+        let data = contract.code().data().to_vec();
         self.contract_cache
-            .insert(*contract_hash, Arc::new(ContractData::from(data)), size);
+            .insert(*contract_hash, Arc::new(ContractCode::from(data)), size);
 
         let mut file = File::create(key_path)?;
-        file.write_all(contract.data().data())?;
+        file.write_all(contract.code().data())?;
 
         Ok(())
     }

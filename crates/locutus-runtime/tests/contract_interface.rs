@@ -39,13 +39,13 @@ fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> 
     // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires buding for wasi
     let is_valid = runtime.validate_state(
         &key,
-        Parameters::from([].as_ref()),
+        &Parameters::from([].as_ref()),
         WrappedState::new(vec![1, 2, 3, 4]),
     )?;
     assert!(is_valid);
     let not_valid = !runtime.validate_state(
         &key,
-        Parameters::from([].as_ref()),
+        &Parameters::from([].as_ref()),
         WrappedState::new(vec![1, 0, 0, 1]),
     )?;
     assert!(not_valid);
@@ -63,13 +63,13 @@ fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
     // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
     let is_valid = runtime.validate_state(
         &key,
-        Parameters::from([].as_ref()),
+        &Parameters::from([].as_ref()),
         WrappedState::new(vec![1, 2, 3, 4]),
     )?;
     assert!(is_valid);
     let not_valid = !runtime.validate_state(
         &key,
-        Parameters::from([].as_ref()),
+        &Parameters::from([].as_ref()),
         WrappedState::new(vec![1, 0, 0, 1]),
     )?;
     assert!(not_valid);
@@ -138,9 +138,9 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
     let delta = runtime.get_state_delta(
         &key,
-        Parameters::from([].as_ref()),
-        WrappedState::new(vec![5, 2, 3, 4]),
-        StateSummary::from([2, 3].as_ref()),
+        &Parameters::from([].as_ref()),
+        &WrappedState::new(vec![5, 2, 3, 4]),
+        &StateSummary::from([2, 3].as_ref()),
     )?;
     assert!(delta.as_ref().len() == 1);
     assert!(delta.as_ref()[0] == 4);
