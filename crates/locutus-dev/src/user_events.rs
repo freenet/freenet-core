@@ -114,7 +114,7 @@ impl From<CommandInfo> for (ClientId, ClientRequest) {
         let req = match cmd.cmd {
             Command::Get => ClientRequest::Get {
                 key: *cmd.contract.key(),
-                contract: false,
+                fetch_contract: false,
             },
             Command::Put => {
                 let state = cmd.input.unwrap().unwrap_put();

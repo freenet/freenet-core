@@ -1,69 +1,100 @@
 use std::collections::HashMap;
 
-use locutus_runtime::prelude::{ContractKey, ContractStore};
+use locutus_runtime::{ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore};
 
-use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel, RuntimeInterface};
+use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 use crate::{config::CONFIG, WrappedState};
 
 pub(crate) struct MockRuntime {}
 
+#[allow(unused_variables)]
 impl RuntimeInterface for MockRuntime {
     fn validate_state<'a>(
         &mut self,
-        _key: &ContractKey,
-        _parameters: locutus_stdlib::prelude::Parameters<'a>,
-        _state: locutus_runtime::State<'a>,
+        key: &ContractKey,
+        parameters: &locutus_runtime::Parameters<'a>,
+        state: &locutus_runtime::WrappedState,
     ) -> locutus_runtime::RuntimeResult<bool> {
         todo!()
     }
 
     fn validate_delta<'a>(
         &mut self,
-        _key: &ContractKey,
-        _parameters: locutus_stdlib::prelude::Parameters<'a>,
-        _delta: locutus_runtime::StateDelta<'a>,
+        key: &ContractKey,
+        parameters: &locutus_runtime::Parameters<'a>,
+        delta: &locutus_runtime::StateDelta<'a>,
     ) -> locutus_runtime::RuntimeResult<bool> {
         todo!()
     }
 
     fn update_state<'a>(
         &mut self,
-        _key: &ContractKey,
-        _parameters: locutus_stdlib::prelude::Parameters<'a>,
-        _state: locutus_runtime::State<'a>,
-        _delta: locutus_runtime::StateDelta<'a>,
-    ) -> locutus_runtime::RuntimeResult<locutus_runtime::State<'a>> {
+        key: &ContractKey,
+        parameters: &locutus_runtime::Parameters<'a>,
+        state: &locutus_runtime::WrappedState,
+        delta: &locutus_runtime::StateDelta<'a>,
+    ) -> locutus_runtime::RuntimeResult<locutus_runtime::WrappedState> {
         todo!()
     }
 
     fn summarize_state<'a>(
         &mut self,
-        _parameters: locutus_stdlib::prelude::Parameters<'a>,
-        _state: locutus_runtime::State<'a>,
-    ) -> locutus_stdlib::prelude::StateSummary<'a> {
+        key: &ContractKey,
+        parameters: &locutus_runtime::Parameters<'a>,
+        state: &locutus_runtime::WrappedState,
+    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateSummary<'a>> {
         todo!()
     }
 
     fn get_state_delta<'a>(
         &mut self,
-        _parameters: locutus_stdlib::prelude::Parameters<'a>,
-        _state: locutus_runtime::State<'a>,
-        _delta_to: locutus_stdlib::prelude::StateSummary<'a>,
-    ) -> locutus_runtime::StateDelta<'a> {
+        key: &ContractKey,
+        parameters: &locutus_runtime::Parameters<'a>,
+        state: &locutus_runtime::WrappedState,
+        delta_to: &locutus_runtime::StateSummary<'a>,
+    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateDelta<'a>> {
         todo!()
     }
 }
 
-pub(crate) type MemKVStore = HashMap<ContractKey, WrappedState>;
+#[derive(Default)]
+pub(crate) struct MemKVStore(HashMap<ContractKey, WrappedState>);
+
+#[async_trait::async_trait]
+impl StateStorage for MemKVStore {
+    type Error = String;
+
+    async fn store(
+        &mut self,
+        key: ContractKey,
+        state: locutus_runtime::WrappedState,
+    ) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    async fn get(&self, key: &ContractKey) -> Result<locutus_runtime::WrappedState, Self::Error> {
+        todo!()
+    }
+}
+
+impl MemKVStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
     channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
-    kv_store: KVStore,
+    kv_store: StateStore<KVStore>,
     contract_store: ContractStore,
     _runtime: MockRuntime,
 }
 
-impl<KVStore> MemoryContractHandler<KVStore> {
+impl<KVStore> MemoryContractHandler<KVStore>
+where
+    KVStore: StateStorage,
+    <KVStore as StateStorage>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     const MAX_MEM_CACHE: i64 = 10_000_000;
 
     pub fn new(
@@ -72,7 +103,7 @@ impl<KVStore> MemoryContractHandler<KVStore> {
     ) -> Self {
         MemoryContractHandler {
             channel,
-            kv_store,
+            kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
             contract_store: ContractStore::new(
                 CONFIG.config_paths.contracts_dir.clone(),
                 Self::MAX_MEM_CACHE,
@@ -96,6 +127,7 @@ impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHal
 #[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
     type Error = SimStoreError;
+    type Store = MemKVStore;
 
     #[inline(always)]
     fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
@@ -107,19 +139,28 @@ impl ContractHandler for MemoryContractHandler {
         &mut self.contract_store
     }
 
-    /// Get current contract value, if present, otherwise get none.
-    async fn get_value(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
-        Ok(self.kv_store.get(contract).cloned())
+    async fn handle_request(
+        &mut self,
+        req: crate::ClientRequest,
+    ) -> Result<crate::HostResponse, Self::Error> {
+        // async fn get_state(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
+        //     Ok(self.kv_store.get(contract).cloned())
+        // }
+
+        // async fn update_state(
+        //     &mut self,
+        //     contract: &ContractKey,
+        //     value: WrappedState,
+        // ) -> Result<WrappedState, Self::Error> {
+        //     let new_val = value.clone();
+        //     self.kv_store.insert(*contract, value);
+        //     Ok(new_val)
+        // }
+        todo!()
     }
 
-    async fn put_value(
-        &mut self,
-        contract: &ContractKey,
-        value: WrappedState,
-    ) -> Result<WrappedState, Self::Error> {
-        let new_val = value.clone();
-        self.kv_store.insert(*contract, value);
-        Ok(new_val)
+    fn state_store(&mut self) -> &mut locutus_runtime::StateStore<Self::Store> {
+        &mut self.kv_store
     }
 }
 

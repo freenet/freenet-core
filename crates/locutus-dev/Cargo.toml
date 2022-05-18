@@ -29,7 +29,6 @@ serde_json = { version = "1", optional = true }
 # internal
 locutus-node = { path = "../locutus-node" }
 locutus-runtime = { path = "../locutus-runtime" }
-locutus-stdlib = { path = "../locutus-stdlib" }
 
 [features]
 json = ["serde_json"]

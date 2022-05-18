@@ -588,14 +588,14 @@ where
 async fn put_contract<CErr>(
     op_storage: &OpManager<CErr>,
     key: ContractKey,
-    value: WrappedState,
+    state: WrappedState,
 ) -> Result<WrappedState, OpError<CErr>>
 where
     CErr: std::error::Error,
 {
     // after the contract has been cached, push the update query
     match op_storage
-        .notify_contract_handler(ContractHandlerEvent::PushQuery { key, value })
+        .notify_contract_handler(ContractHandlerEvent::PushQuery { key, state })
         .await
     {
         Ok(ContractHandlerEvent::PushResponse {

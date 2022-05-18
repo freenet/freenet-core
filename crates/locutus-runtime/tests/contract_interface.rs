@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use locutus_runtime::prelude::*;
-use locutus_stdlib::prelude::*;
 
 fn test_dir() -> PathBuf {
     let test_dir = std::env::temp_dir().join("locutus").join("contracts");
@@ -40,13 +39,13 @@ fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> 
     let is_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
-        WrappedState::new(vec![1, 2, 3, 4]),
+        &WrappedState::new(vec![1, 2, 3, 4]),
     )?;
     assert!(is_valid);
     let not_valid = !runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
-        WrappedState::new(vec![1, 0, 0, 1]),
+        &WrappedState::new(vec![1, 0, 0, 1]),
     )?;
     assert!(not_valid);
     Ok(())
@@ -64,13 +63,13 @@ fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
     let is_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
-        WrappedState::new(vec![1, 2, 3, 4]),
+        &WrappedState::new(vec![1, 2, 3, 4]),
     )?;
     assert!(is_valid);
     let not_valid = !runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
-        WrappedState::new(vec![1, 0, 0, 1]),
+        &WrappedState::new(vec![1, 0, 0, 1]),
     )?;
     assert!(not_valid);
     Ok(())
@@ -87,14 +86,14 @@ fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
     // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
     let is_valid = runtime.validate_delta(
         &key,
-        Parameters::from([].as_ref()),
-        StateDelta::from([1, 2, 3, 4].as_ref()),
+        &Parameters::from([].as_ref()),
+        &StateDelta::from([1, 2, 3, 4].as_ref()),
     )?;
     assert!(is_valid);
     let not_valid = !runtime.validate_delta(
         &key,
-        Parameters::from([].as_ref()),
-        StateDelta::from([1, 0, 0, 1].as_ref()),
+        &Parameters::from([].as_ref()),
+        &StateDelta::from([1, 0, 0, 1].as_ref()),
     )?;
     assert!(not_valid);
     Ok(())
@@ -107,9 +106,9 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
     let new_state = runtime.update_state(
         &key,
-        Parameters::from([].as_ref()),
-        WrappedState::new(vec![5, 2, 3]),
-        StateDelta::from([4].as_ref()),
+        &Parameters::from([].as_ref()),
+        &WrappedState::new(vec![5, 2, 3]),
+        &StateDelta::from([4].as_ref()),
     )?;
     assert!(new_state.as_ref().len() == 4);
     assert!(new_state.as_ref()[3] == 4);
@@ -123,8 +122,8 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
     // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
     let summary = runtime.summarize_state(
         &key,
-        Parameters::from([].as_ref()),
-        WrappedState::new(vec![5, 2, 3, 4]),
+        &Parameters::from([].as_ref()),
+        &WrappedState::new(vec![5, 2, 3, 4]),
     )?;
     assert!(summary.as_ref().len() == 1);
     assert!(summary.as_ref()[0] == 5);

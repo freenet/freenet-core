@@ -347,7 +347,10 @@ async fn client_event_handling<ClientEv, CErr>(
                 ClientRequest::Update { key, delta } => {
                     todo!()
                 }
-                ClientRequest::Get { key, contract } => {
+                ClientRequest::Get {
+                    key,
+                    fetch_contract: contract,
+                } => {
                     // Initialize a get op.
                     log::debug!(
                         "Received get from user event @ {}",

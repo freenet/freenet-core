@@ -95,13 +95,13 @@ where
         contracts: Vec<(WrappedContract<'static>, WrappedState)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
-        for (contract, value) in contracts {
+        for (contract, state) in contracts {
             let key = *contract.key();
             self.op_storage
-                .notify_contract_handler(ContractHandlerEvent::Cache(contract))
+                .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                 .await?;
             self.op_storage
-                .notify_contract_handler(ContractHandlerEvent::PushQuery { key, value })
+                .notify_contract_handler(ContractHandlerEvent::PushQuery { key, state })
                 .await?;
             log::debug!(
                 "Appended contract {} to peer {}",

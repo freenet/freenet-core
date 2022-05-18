@@ -62,7 +62,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .tx_gw_ev
         .send(ClientRequest::Get {
             key,
-            contract: false,
+            fetch_contract: false,
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;

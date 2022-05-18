@@ -3,8 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
 
-use locutus_runtime::prelude::ContractKey;
-use locutus_stdlib::prelude::{StateDelta, StateSummary};
+use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::{WrappedContract, WrappedState};
@@ -117,6 +116,24 @@ pub enum HostResponse {
     },
 }
 
+impl HostResponse {
+    pub fn unwrap_put(self) -> ContractKey {
+        if let Self::PutResponse(key) = self {
+            key
+        } else {
+            panic!("called `HostResponse::unwrap_put()` on other than `PutResponse` value")
+        }
+    }
+
+    pub fn unwrap_get(self) -> (WrappedState, Option<WrappedContract<'static>>) {
+        if let Self::GetResponse { contract, state } = self {
+            (state, contract)
+        } else {
+            panic!("called `HostResponse::unwrap_put()` on other than `PutResponse` value")
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum RequestError {
     #[error("put error for contract {0}")]
@@ -142,12 +159,12 @@ pub enum ClientRequest {
         key: ContractKey,
         delta: StateDelta<'static>,
     },
-    /// Fetch the current value from a contract corresponding to the provided key.
+    /// Fetch the current state from a contract corresponding to the provided key.
     Get {
         /// Key of the contract.
         key: ContractKey,
         /// If this flag is set then fetch also the contract itself.
-        contract: bool,
+        fetch_contract: bool,
     },
     /// Subscribe to the changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
@@ -170,7 +187,11 @@ impl Display for ClientRequest {
                 write!(f, "put request for contract {contract} with state {state}")
             }
             ClientRequest::Update { key, .. } => write!(f, "Update request for {key}"),
-            ClientRequest::Get { key, contract, .. } => {
+            ClientRequest::Get {
+                key,
+                fetch_contract: contract,
+                ..
+            } => {
                 write!(f, "get request for {key} (fetch full contract: {contract})")
             }
             ClientRequest::Subscribe { key } => write!(f, "subscribe request for {key}"),
@@ -251,7 +272,7 @@ pub(crate) mod test {
                         let key = self.non_owned_contracts[contract_no];
                         break ClientRequest::Get {
                             key,
-                            contract: rng.gen_bool(0.5),
+                            fetch_contract: rng.gen_bool(0.5),
                         };
                     }
                     2 if !self.non_owned_contracts.is_empty()

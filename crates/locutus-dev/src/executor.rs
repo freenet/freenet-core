@@ -44,8 +44,14 @@ fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynErro
             }
             _ => unreachable!(),
         },
-        ClientRequest::Get { key, contract } => {
-            match node.handle_request(ClientRequest::Get { key, contract }) {
+        ClientRequest::Get {
+            key,
+            fetch_contract: contract,
+        } => {
+            match node.handle_request(ClientRequest::Get {
+                key,
+                fetch_contract: contract,
+            }) {
                 Ok(HostResponse::GetResponse { contract, state }) => {
                     println!("current state for {key}:");
                     app.printout_deser(state.as_ref())?;

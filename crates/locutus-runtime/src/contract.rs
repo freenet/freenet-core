@@ -41,9 +41,7 @@ impl<'a> WrappedContract<'a> {
         &self.params
     }
 
-    pub(crate) fn get_data_from_fs(
-        path: &Path,
-    ) -> Result<ContractCode<'static>, ContractRuntimeError> {
+    pub(crate) fn get_data_from_fs(path: &Path) -> Result<ContractCode<'static>, std::io::Error> {
         let mut contract_file = File::open(path)?;
         let mut contract_data = if let Ok(md) = contract_file.metadata() {
             Vec::with_capacity(md.len() as usize)
@@ -56,7 +54,7 @@ impl<'a> WrappedContract<'a> {
 }
 
 impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for WrappedContract<'static> {
-    type Error = ContractRuntimeError;
+    type Error = std::io::Error;
     fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
         let (path, params) = data;
         let data = Arc::new(Self::get_data_from_fs(path)?);

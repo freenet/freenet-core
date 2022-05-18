@@ -1,7 +1,6 @@
 pub(crate) mod client_events;
 mod config;
 mod contract;
-// pub(crate) mod client_interfaces;
 mod message;
 mod node;
 mod operations;
@@ -19,6 +18,7 @@ pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
     ClientRequest, ErrorKind, HostResponse, RequestError,
 };
+pub use contract::{SQLiteContractHandler, SqlitePool};
 pub use either;
 pub use node::PeerKey;
 pub use node::{InitPeerNode, NodeConfig};

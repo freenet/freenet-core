@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use locutus_stdlib::prelude::ContractKey;
+use locutus_runtime::ContractKey;
 
 use crate::message::InnerMessage;
 use crate::operations::op_trait::Operation;
@@ -139,7 +139,7 @@ where
                                     key,
                                     id,
                                     value: StoreResponse {
-                                        value: None,
+                                        state: None,
                                         contract: None,
                                     },
                                     sender: op_storage.ring.own_location(),
@@ -219,7 +219,7 @@ where
                     key,
                     value:
                         StoreResponse {
-                            value: None,
+                            state: None,
                             contract: None,
                         },
                     sender,
@@ -281,7 +281,7 @@ where
                                 id,
                                 key,
                                 value: StoreResponse {
-                                    value: None,
+                                    state: None,
                                     contract: None,
                                 },
                                 sender,
@@ -295,7 +295,7 @@ where
                     key,
                     value:
                         StoreResponse {
-                            value: Some(value),
+                            state: Some(value),
                             contract,
                         },
                     id,
@@ -339,7 +339,7 @@ where
                                         id,
                                         key,
                                         value: StoreResponse {
-                                            value: None,
+                                            state: None,
                                             contract: None,
                                         },
                                         sender,
@@ -355,7 +355,7 @@ where
                     op_storage
                         .notify_contract_handler(ContractHandlerEvent::PushQuery {
                             key,
-                            value: value.clone(),
+                            state: value.clone(),
                         })
                         .await?;
 
@@ -381,7 +381,7 @@ where
                                 id,
                                 key,
                                 value: StoreResponse {
-                                    value: None,
+                                    state: None,
                                     contract: None,
                                 },
                                 sender,
@@ -450,11 +450,11 @@ fn check_contract_found<CErr: std::error::Error>(
 
     match &value {
         Ok(StoreResponse {
-            value: None,
+            state: None,
             contract: None,
         }) => Err(OpError::ContractError(ContractError::ContractNotFound(key))),
         Ok(StoreResponse {
-            value: Some(_),
+            state: Some(_),
             contract: None,
         }) if fetch_contract => Err(OpError::ContractError(ContractError::ContractNotFound(key))),
         _ => Ok(()),
@@ -675,7 +675,7 @@ mod test {
 
         let get_event = ClientRequest::Get {
             key,
-            contract: true,
+            fetch_contract: true,
         };
         let node_0 = NodeSpecification {
             owned_contracts: vec![],
@@ -722,7 +722,7 @@ mod test {
 
         let get_event = ClientRequest::Get {
             key,
-            contract: false,
+            fetch_contract: false,
         };
         let node_1 = NodeSpecification {
             owned_contracts: vec![],
@@ -759,7 +759,7 @@ mod test {
 
         let get_event = ClientRequest::Get {
             key,
-            contract: false,
+            fetch_contract: false,
         };
 
         let node_0 = NodeSpecification {

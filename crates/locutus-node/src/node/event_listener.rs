@@ -90,7 +90,7 @@ impl<'a> EventLog<'a> {
             ),
             Message::Get(GetMsg::ReturnGet {
                 key,
-                value: StoreResponse { value: Some(_), .. },
+                value: StoreResponse { state: Some(_), .. },
                 ..
             }) => EventKind::Get { key: *key },
             _ => EventKind::Unknown,

@@ -3,13 +3,14 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{ContractStore, RuntimeResult};
-use locutus_stdlib::prelude::{Parameters, State, StateDelta, StateSummary};
+use locutus_runtime::{
+    ContractStore, Parameters, RuntimeResult, State, StateDelta, StateStore, StateSummary,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
-use crate::{WrappedContract, WrappedState};
+use crate::{ClientRequest, HostResponse, WrappedContract, WrappedState};
 pub(crate) use sqlite::{SQLiteContractHandler, SqlDbError};
 
 const MAX_MEM_CACHE: i64 = 10_000_000;
@@ -19,23 +20,15 @@ pub(crate) trait ContractHandler:
     From<ContractHandlerChannel<Self::Error, CHListenerHalve>>
 {
     type Error: std::error::Error;
+    type Store;
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve>;
 
     fn contract_store(&mut self) -> &mut ContractStore;
 
-    /// Get current contract value, if present, otherwise get none.
-    async fn get_value(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
+    fn state_store(&mut self) -> &mut StateStore<Self::Store>;
 
-    /// Updates (or inserts) a value for the given contract. This operation is fallible:
-    /// It will return an error when the value is not valid (according to the contract specification)
-    /// or any other condition happened (for example the contract not being present currently,
-    /// in which case it has to be stored by calling `contract_store` first).
-    async fn put_value(
-        &mut self,
-        contract: &ContractKey,
-        value: WrappedState,
-    ) -> Result<WrappedState, Self::Error>;
+    async fn handle_request(&mut self, req: ClientRequest) -> Result<HostResponse, Self::Error>;
 }
 
 pub struct EventId(u64);
@@ -152,7 +145,7 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
-    pub value: Option<WrappedState>,
+    pub state: Option<WrappedState>,
     pub contract: Option<WrappedContract<'static>>,
 }
 
@@ -166,7 +159,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
     /// Try to push/put a new value into the contract.
     PushQuery {
         key: ContractKey,
-        value: WrappedState,
+        state: WrappedState,
     },
     /// The response to a push query.
     PushResponse {
@@ -188,56 +181,48 @@ pub(crate) enum ContractHandlerEvent<Err> {
     CacheResult(Result<(), ContractError<Err>>),
 }
 
-pub(crate) trait RuntimeInterface {
-    fn validate_state<'a>(
-        &mut self,
-        key: &ContractKey,
-        parameters: Parameters<'a>,
-        state: State<'a>,
-    ) -> RuntimeResult<bool>;
-
-    fn validate_delta<'a>(
-        &mut self,
-        key: &ContractKey,
-        parameters: Parameters<'a>,
-        delta: StateDelta<'a>,
-    ) -> RuntimeResult<bool>;
-
-    fn update_state<'a>(
-        &mut self,
-        key: &ContractKey,
-        parameters: Parameters<'a>,
-        state: State<'a>,
-        delta: StateDelta<'a>,
-    ) -> RuntimeResult<State<'a>>;
-
-    fn summarize_state<'a>(
-        &mut self,
-        parameters: Parameters<'a>,
-        state: State<'a>,
-    ) -> StateSummary<'a>;
-
-    fn get_state_delta<'a>(
-        &mut self,
-        parameters: Parameters<'a>,
-        state: State<'a>,
-        delta_to: StateSummary<'a>,
-    ) -> StateDelta<'a>;
-}
-
-mod sqlite {
+pub(in crate::contract) mod sqlite {
     use std::str::FromStr;
 
-    use locutus_runtime::{ContractRuntimeError, ContractStore};
+    use locutus_runtime::{
+        ContractRuntimeError, ContractStore, RuntimeInterface, StateStorage, StateStoreError,
+    };
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},
         ConnectOptions, Row, SqlitePool,
     };
-    use stretto::AsyncCache;
 
     use super::*;
     use crate::{config::CONFIG, contract::test::MockRuntime};
+
+    pub struct Pool(SqlitePool);
+
+    impl Default for Pool {
+        fn default() -> Self {
+            Self(POOL.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateStorage for Pool {
+        type Error = sqlx::Error;
+
+        async fn store(
+            &mut self,
+            key: ContractKey,
+            state: locutus_runtime::WrappedState,
+        ) -> Result<(), Self::Error> {
+            todo!()
+        }
+
+        async fn get(
+            &self,
+            key: &ContractKey,
+        ) -> Result<locutus_runtime::WrappedState, Self::Error> {
+            todo!()
+        }
+    }
 
     // Is fine to clone this as it wraps by an Arc.
     static POOL: Lazy<SqlitePool> = Lazy::new(|| {
@@ -267,13 +252,15 @@ mod sqlite {
         RuntimeError(#[from] ContractRuntimeError),
         #[error(transparent)]
         IOError(#[from] std::io::Error),
+        #[error(transparent)]
+        StateStore(#[from] StateStoreError),
     }
 
-    pub(crate) struct SQLiteContractHandler<R> {
+    pub struct SQLiteContractHandler<R> {
         channel: ContractHandlerChannel<SqlDbError, CHListenerHalve>,
         store: ContractStore,
         runtime: R,
-        value_mem_cache: AsyncCache<ContractKey, WrappedState>,
+        state_store: StateStore<Pool>,
         pub(super) pool: SqlitePool,
     }
 
@@ -284,7 +271,7 @@ mod sqlite {
         /// max number of values stored in memory
         const MEM_CACHE_ITEMS: usize = 10_000;
         /// number of max bytes allowed to be stored in the cache
-        const MEM_SIZE: i64 = 10_000_000;
+        const MEM_SIZE: u32 = 10_000_000;
 
         async fn new(
             channel: ContractHandlerChannel<SqlDbError, CHListenerHalve>,
@@ -296,10 +283,9 @@ mod sqlite {
             Ok(SQLiteContractHandler {
                 channel,
                 store,
-                pool,
                 runtime,
-                value_mem_cache: AsyncCache::new(Self::MEM_CACHE_ITEMS, Self::MEM_SIZE)
-                    .expect("failed to build mem cache"),
+                state_store: StateStore::new(Pool(POOL.clone()), Self::MEM_SIZE)?,
+                pool,
             })
         }
 
@@ -336,6 +322,7 @@ mod sqlite {
     #[async_trait::async_trait]
     impl ContractHandler for SQLiteContractHandler<MockRuntime> {
         type Error = SqlDbError;
+        type Store = Pool;
 
         #[inline(always)]
         fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
@@ -347,69 +334,78 @@ mod sqlite {
             &mut self.store
         }
 
-        async fn get_value(
-            &self,
-            contract_key: &ContractKey,
-        ) -> Result<Option<WrappedState>, Self::Error> {
-            let encoded_key = bs58::encode(&**contract_key)
-                .with_alphabet(bs58::Alphabet::BITCOIN)
-                .into_string();
-            if let Some(value) = self.value_mem_cache.get(contract_key) {
-                return Ok(Some(value.value().clone()));
-            }
-            match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
-                .bind(encoded_key)
-                .map(|row: SqliteRow| Some(WrappedState::new(row.get("value"))))
-                .fetch_one(&self.pool)
-                .await
-            {
-                Ok(result) => Ok(result),
-                Err(sqlx::Error::RowNotFound) => Ok(None),
-                Err(_) => Err(SqlDbError::ContractNotFound),
-            }
+        async fn handle_request(
+            &mut self,
+            req: ClientRequest,
+        ) -> Result<HostResponse, Self::Error> {
+            // async fn update_state(
+            //     &mut self,
+            //     contract_key: &ContractKey,
+            //     value: WrappedState,
+            // ) -> Result<WrappedState, Self::Error> {
+            //     let old_value = match self.get_state(contract_key).await {
+            //         Ok(Some(contract_value)) => contract_value,
+            //         Ok(None) => value.clone(),
+            //         Err(_) => value.clone(),
+            //     };
+
+            //     let value = vec![];
+            //     let value: Vec<u8> = self
+            //         .runtime
+            //         .update_value(contract_key, &*old_value, &*value)?;
+            //     let encoded_key = bs58::encode(contract_key.as_ref())
+            //         .with_alphabet(bs58::Alphabet::BITCOIN)
+            //         .into_string();
+            //     match sqlx::query(
+            //         "INSERT OR REPLACE INTO contracts (key, value) VALUES ($1, $2) \
+            //              RETURNING value",
+            //     )
+            //     .bind(encoded_key)
+            //     .bind(value)
+            //     .map(|row: SqliteRow| WrappedState::new(row.get("value")))
+            //     .fetch_one(&self.pool)
+            //     .await
+            //     {
+            //         Ok(contract_value) => {
+            //             let size = contract_value.len() as i64;
+            //             self.value_mem_cache
+            //                 .insert(*contract_key, contract_value.clone(), size)
+            //                 .await;
+            //             Ok(contract_value)
+            //         }
+            //         Err(err) => {
+            //             log::error!("{}", err);
+            //             Err(SqlDbError::SqliteError(err))
+            //         }
+            //     }
+            // }
+
+            // async fn get_state(
+            //     &self,
+            //     contract_key: &ContractKey,
+            // ) -> Result<Option<WrappedState>, Self::Error> {
+            //     let encoded_key = bs58::encode(&**contract_key)
+            //         .with_alphabet(bs58::Alphabet::BITCOIN)
+            //         .into_string();
+            //     if let Some(value) = self.value_mem_cache.get(contract_key) {
+            //         return Ok(Some(value.value().clone()));
+            //     }
+            //     match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
+            //         .bind(encoded_key)
+            //         .map(|row: SqliteRow| Some(WrappedState::new(row.get("value"))))
+            //         .fetch_one(&self.pool)
+            //         .await
+            //     {
+            //         Ok(result) => Ok(result),
+            //         Err(sqlx::Error::RowNotFound) => Ok(None),
+            //         Err(_) => Err(SqlDbError::ContractNotFound),
+            //     }
+            // }
+            todo!()
         }
 
-        async fn put_value(
-            &mut self,
-            contract_key: &ContractKey,
-            value: WrappedState,
-        ) -> Result<WrappedState, Self::Error> {
-            let old_value = match self.get_value(contract_key).await {
-                Ok(Some(contract_value)) => contract_value,
-                Ok(None) => value.clone(),
-                Err(_) => value.clone(),
-            };
-
-            // FIXME: use the new interface
-            let value = vec![];
-            // let value: Vec<u8> = self
-            //     .runtime
-            //     .update_value(contract_key, &*old_value, &*value)?;
-            let encoded_key = bs58::encode(contract_key.as_ref())
-                .with_alphabet(bs58::Alphabet::BITCOIN)
-                .into_string();
-            match sqlx::query(
-                "INSERT OR REPLACE INTO contracts (key, value) VALUES ($1, $2) \
-                     RETURNING value",
-            )
-            .bind(encoded_key)
-            .bind(value)
-            .map(|row: SqliteRow| WrappedState::new(row.get("value")))
-            .fetch_one(&self.pool)
-            .await
-            {
-                Ok(contract_value) => {
-                    let size = contract_value.len() as i64;
-                    self.value_mem_cache
-                        .insert(*contract_key, contract_value.clone(), size)
-                        .await;
-                    Ok(contract_value)
-                }
-                Err(err) => {
-                    log::error!("{}", err);
-                    Err(SqlDbError::SqliteError(err))
-                }
-            }
+        fn state_store(&mut self) -> &mut StateStore<Self::Store> {
+            &mut self.state_store
         }
     }
 
@@ -443,32 +439,40 @@ mod sqlite {
             );
 
             // Get contract parts
-            let contract_value = WrappedState::new(contract_bytes.clone());
-            let put_result_value = handler
-                .put_value(contract.key(), contract_value.clone())
-                .await?;
-            let get_result_value = handler
-                .get_value(contract.key())
+            let state = WrappedState::new(contract_bytes.clone());
+            handler
+                .handle_request(ClientRequest::Put {
+                    contract: contract.clone(),
+                    state: state.clone(),
+                })
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("No value found"))?;
-
-            assert_eq!(contract_value, put_result_value);
-            assert_eq!(contract_value, get_result_value);
-
-            // Update the contract value with new one
-            let new_contract_value = WrappedState::new(b"New test contract value".to_vec());
-            let new_put_result_value = handler
-                .put_value(contract.key(), new_contract_value.clone())
-                .await?;
-            let new_get_result_value = handler
-                .get_value(contract.key())
+                .unwrap_put();
+            let (get_result_value, _) = handler
+                .handle_request(ClientRequest::Get {
+                    key: *contract.key(),
+                    fetch_contract: false,
+                })
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("No value found"))?;
+                .unwrap_get();
+            assert_eq!(state, get_result_value);
 
-            assert_eq!(new_contract_value, new_put_result_value);
-            assert_eq!(new_contract_value, new_get_result_value);
-
-            Ok(())
+            // Update the contract state with a new delta
+            let delta = StateDelta::from(b"New test contract value".to_vec());
+            handler
+                .handle_request(ClientRequest::Update {
+                    key: *contract.key(),
+                    delta,
+                })
+                .await?;
+            // let (new_get_result_value, _) = handler
+            //     .handle_request(ClientRequest::Get {
+            //         key: *contract.key(),
+            //         contract: false,
+            //     })
+            //     .await?
+            //     .unwrap_summary();
+            // assert_eq!(delta, new_get_result_value);
+            todo!("get summary and compare with delta");
         }
     }
 }
@@ -531,6 +535,7 @@ pub mod test {
     #[async_trait::async_trait]
     impl ContractHandler for TestContractHandler {
         type Error = TestContractStoreError;
+        type Store = MemKVStore;
 
         #[inline(always)]
         fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
@@ -542,22 +547,31 @@ pub mod test {
             &mut self.contract_store
         }
 
-        /// Get current contract value, if present, otherwise get none.
-        async fn get_value(
-            &self,
-            contract: &ContractKey,
-        ) -> Result<Option<WrappedState>, Self::Error> {
-            Ok(self.kv_store.get(contract).cloned())
+        async fn handle_request(
+            &mut self,
+            req: ClientRequest,
+        ) -> Result<HostResponse, Self::Error> {
+            // async fn get_state(
+            //     &self,
+            //     contract: &ContractKey,
+            // ) -> Result<Option<WrappedState>, Self::Error> {
+            //     Ok(self.kv_store.get(contract).cloned())
+            // }
+
+            // async fn update_state(
+            //     &mut self,
+            //     contract: &ContractKey,
+            //     value: WrappedState,
+            // ) -> Result<WrappedState, Self::Error> {
+            //     let new_val = value.clone();
+            //     self.kv_store.insert(*contract, value);
+            //     Ok(new_val)
+            // }
+            todo!()
         }
 
-        async fn put_value(
-            &mut self,
-            contract: &ContractKey,
-            value: WrappedState,
-        ) -> Result<WrappedState, Self::Error> {
-            let new_val = value.clone();
-            self.kv_store.insert(*contract, value);
-            Ok(new_val)
+        fn state_store(&mut self) -> &mut StateStore<Self::Store> {
+            todo!()
         }
     }
 

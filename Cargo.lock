@@ -1943,7 +1943,6 @@ dependencies = [
  "either",
  "locutus-node",
  "locutus-runtime",
- "locutus-stdlib",
  "log",
  "parking_lot 0.12.0",
  "pico-args",
@@ -2014,6 +2013,7 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "arrayvec",
+ "async-trait",
  "bincode",
  "blake2 0.10.4",
  "bs58",
@@ -3740,9 +3740,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96dd9c98d1bffad3101efa95f7ac469cace9ec10fdc102da6ca60077a64f47d3"
 dependencies = [
  "atomic",
- "crossbeam-channel",
  "parking_lot 0.11.2",
  "rand 0.8.5",
+ "tokio",
  "twox-hash",
  "wg",
 ]
@@ -3757,7 +3757,6 @@ dependencies = [
  "crossbeam-channel",
  "parking_lot 0.12.0",
  "rand 0.8.5",
- "tokio",
  "twox-hash",
  "wg",
 ]

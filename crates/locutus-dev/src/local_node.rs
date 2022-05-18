@@ -1,9 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crossbeam::channel::Sender;
-use locutus_node::{either::Either, ClientRequest, HostResponse, PeerKey, RequestError};
+use locutus_node::{
+    either::Either, ClientRequest, HostResponse, PeerKey, RequestError, SqlitePool,
+};
 use locutus_runtime::{prelude::*, ContractRuntimeError};
-use locutus_stdlib::prelude::*;
 
 use crate::DynError;
 
@@ -22,6 +23,7 @@ pub struct LocalNode {
     runtime: Runtime,
     update_notifications: HashMap<ContractKey, Vec<(PeerKey, Sender<HostResponse>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<PeerKey, StateSummary<'static>>>,
+    state_store: StateStore<SqlitePool>,
 }
 
 impl LocalNode {
@@ -33,6 +35,7 @@ impl LocalNode {
             runtime: Runtime::build(store, false).unwrap(),
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
+            state_store: StateStore::new(SqlitePool::default(), 10_000_000).unwrap(),
         }
     }
 
@@ -83,7 +86,7 @@ impl LocalNode {
                 let key = contract.key();
                 let is_valid = self
                     .runtime
-                    .validate_state(key, contract.params(), state.clone())
+                    .validate_state(key, contract.params(), &state)
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.contract_state.insert(*key, state.clone());
@@ -102,7 +105,7 @@ impl LocalNode {
                     let state = self.contract_state.get(&key).unwrap().clone();
                     let new_state = self
                         .runtime
-                        .update_state(&key, parameters.clone(), state, delta)
+                        .update_state(&key, &parameters, &state, &delta)
                         .map_err(|err| match err {
                             ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
                                 Either::Left(RequestError::Put(key))
@@ -115,17 +118,21 @@ impl LocalNode {
                 // in the network impl this would be sent over the network
                 let summary = self
                     .runtime
-                    .summarize_state(&key, parameters.clone(), new_state.clone())
+                    .summarize_state(&key, &parameters, &new_state)
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.send_update_notification(&key, &parameters, &new_state)?;
                 // TODO: after the node sending the update gets the response what should it do
                 Ok(HostResponse::UpdateResponse { key, summary })
             }
-            ClientRequest::Get { key, contract } => {
-                self.perform_get(contract, key).map_err(Either::Left)
+            ClientRequest::Get {
+                key,
+                fetch_contract: contract,
+            } => self.perform_get(contract, key).map_err(Either::Left),
+            ClientRequest::Subscribe { key } => {
+                // by default a subscribe op has an implicit get
+                self.perform_get(true, key).map_err(Either::Left)
             }
-            ClientRequest::Subscribe { key } => self.perform_get(true, key).map_err(Either::Left),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     log::info!("disconnecting cause: {cause}");

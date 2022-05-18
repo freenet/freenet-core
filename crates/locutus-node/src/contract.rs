@@ -1,15 +1,16 @@
-use locutus_runtime::ContractRuntimeError;
+use locutus_runtime::{prelude::ContractKey, ContractRuntimeError, Parameters};
 
 mod handler;
 mod test;
 
+use crate::ClientRequest;
+pub use handler::sqlite::{Pool as SqlitePool, SQLiteContractHandler};
 #[cfg(test)]
 pub(crate) use handler::test::{TestContractHandler, TestContractStoreError};
 pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, SQLiteContractHandler, SqlDbError, StoreResponse,
+    ContractHandlerEvent, SqlDbError, StoreResponse,
 };
-use locutus_stdlib::prelude::{ContractKey, Parameters};
 pub(crate) use test::MockRuntime;
 #[cfg(test)]
 pub(crate) use test::{MemoryContractHandler, SimStoreError};
@@ -40,10 +41,17 @@ where
                     None
                 };
 
-                let response = contract_handler
-                    .get_value(&key)
-                    .await
-                    .map(|value| StoreResponse { value, contract });
+                let response = {
+                    let contract = if fetch_contract {
+                        let parameters = todo!();
+                        contract_handler
+                            .contract_store()
+                            .fetch_contract(&key, parameters)
+                    } else {
+                        None
+                    };
+                    todo!("get state from state store");
+                };
 
                 contract_handler
                     .channel()
@@ -67,8 +75,17 @@ where
                     }
                 }
             }
-            (id, ContractHandlerEvent::PushQuery { key, value }) => {
-                let put_result = contract_handler.put_value(&key, value).await;
+            (id, ContractHandlerEvent::PushQuery { key, state }) => {
+                let put_result = contract_handler
+                    .handle_request(ClientRequest::Put {
+                        contract: todo!(),
+                        state,
+                    })
+                    .await
+                    .map(|r| {
+                        let r = r.unwrap_put();
+                        todo!()
+                    });
                 contract_handler
                     .channel()
                     .send_to_listener(
