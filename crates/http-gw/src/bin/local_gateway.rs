@@ -1,5 +1,3 @@
-#![cfg(feature = "local")]
-
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -17,5 +15,13 @@ fn main() -> Result<(), DynError> {
         .build()
         .unwrap();
 
-    rt.block_on(http_gw::local_node::set_local_node())
+    #[cfg(feature = "local")]
+    {
+        rt.block_on(http_gw::local_node::set_local_node())?;
+    }
+    #[cfg(not(feature = "local"))]
+    {
+        panic!("only allowed if local feature is enabled");
+    }
+    Ok(())
 }
