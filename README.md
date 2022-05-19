@@ -59,6 +59,7 @@ We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freene
 ### 7. Stay up to date
 
 Keep up to date by following us on Twitter: 
+
 ![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)
 
 ### 8. License
