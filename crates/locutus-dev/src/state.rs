@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, sync::Arc};
 
 use locutus_runtime::ContractStore;
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 
 use crate::{
     config::{Config, DeserializationFmt},
@@ -15,13 +15,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: &Config) -> Result<Self, DynError> {
+    pub async fn new(config: &Config) -> Result<Self, DynError> {
         let tmp_path = std::env::temp_dir().join("locutus").join("contracts");
         std::fs::create_dir_all(&tmp_path)?;
         let contract_store =
             ContractStore::new(tmp_path.join("contracts"), config.max_contract_size);
         Ok(AppState {
-            local_node: Arc::new(RwLock::new(LocalNode::new(contract_store))),
+            local_node: Arc::new(RwLock::new(LocalNode::new(contract_store).await?)),
             config: config.clone(),
         })
     }

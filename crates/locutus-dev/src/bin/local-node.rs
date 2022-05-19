@@ -8,7 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     if cli.disable_tui_mode {
         return Err("CLI mode not yet implemented".into());
     }
-    let app_state = AppState::new(&cli)?;
+    let app_state = AppState::new(&cli).await?;
     let (sender, receiver) = tokio::sync::mpsc::channel(100);
     let runtime = tokio::task::spawn(wasm_runtime(cli.clone(), receiver, app_state.clone()));
     let user_fn = user_fn_handler(cli, sender, app_state);
@@ -19,6 +19,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     println!("Shutdown...");
     Ok(())
 }
-
-// /tmp/locutus/contracts/7843vnjfd <- contract A
-// /tmp/locutus/db/sqlite.db <- (key, value) where key is contrac A + parameter B <- value: state

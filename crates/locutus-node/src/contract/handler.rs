@@ -3,17 +3,15 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{
-    ContractStore, Parameters, RuntimeResult, State, StateDelta, StateStore, StateSummary,
-};
+use locutus_runtime::{ContractStore, Parameters, StateStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
 use crate::{ClientRequest, HostResponse, WrappedContract, WrappedState};
-pub(crate) use sqlite::{SQLiteContractHandler, SqlDbError};
+pub(crate) use sqlite::SqlDbError;
 
-const MAX_MEM_CACHE: i64 = 10_000_000;
+const MAX_MEM_CACHE: i64 = 10 ^ 7;
 
 #[async_trait::async_trait]
 pub(crate) trait ContractHandler:
@@ -182,10 +180,11 @@ pub(crate) enum ContractHandlerEvent<Err> {
 }
 
 pub(in crate::contract) mod sqlite {
-    use std::str::FromStr;
+    use std::{collections::HashMap, str::FromStr};
 
     use locutus_runtime::{
-        ContractRuntimeError, ContractStore, RuntimeInterface, StateStorage, StateStoreError,
+        ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, StateStorage,
+        StateStoreError,
     };
     use once_cell::sync::Lazy;
     use sqlx::{
@@ -195,34 +194,6 @@ pub(in crate::contract) mod sqlite {
 
     use super::*;
     use crate::{config::CONFIG, contract::test::MockRuntime};
-
-    pub struct Pool(SqlitePool);
-
-    impl Default for Pool {
-        fn default() -> Self {
-            Self(POOL.clone())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl StateStorage for Pool {
-        type Error = sqlx::Error;
-
-        async fn store(
-            &mut self,
-            key: ContractKey,
-            state: locutus_runtime::WrappedState,
-        ) -> Result<(), Self::Error> {
-            todo!()
-        }
-
-        async fn get(
-            &self,
-            key: &ContractKey,
-        ) -> Result<locutus_runtime::WrappedState, Self::Error> {
-            todo!()
-        }
-    }
 
     // Is fine to clone this as it wraps by an Arc.
     static POOL: Lazy<SqlitePool> = Lazy::new(|| {
@@ -241,6 +212,61 @@ pub(in crate::contract) mod sqlite {
         })
         .unwrap()
     });
+
+    async fn create_contracts_table() -> Result<(), SqlDbError> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS states (
+                    contract        BLOB PRIMARY KEY,
+                    state           BLOB
+                )",
+        )
+        .execute(&*POOL)
+        .await?;
+        Ok(())
+    }
+
+    pub struct Pool(SqlitePool);
+
+    impl Pool {
+        pub async fn new() -> Result<Self, SqlDbError> {
+            create_contracts_table().await?;
+            Ok(Self(POOL.clone()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateStorage for Pool {
+        type Error = SqlDbError;
+
+        async fn store(
+            &mut self,
+            key: ContractKey,
+            state: locutus_runtime::WrappedState,
+        ) -> Result<(), Self::Error> {
+            sqlx::query("INSERT OR REPLACE INTO states (contract, state) VALUES ($1, $2)")
+                .bind(key.bytes())
+                .bind(state.as_ref())
+                .execute(&self.0)
+                .await?;
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            key: &ContractKey,
+        ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
+            match sqlx::query("SELECT state FROM states WHERE contract = ?")
+                .bind(key.bytes())
+                .map(|row: SqliteRow| Some(WrappedState::new(row.get("state"))))
+                .fetch_one(&self.0)
+                .await
+            {
+                Ok(result) => Ok(result),
+                Err(sqlx::Error::RowNotFound) => Ok(None),
+                Err(_) => Err(SqlDbError::ContractNotFound),
+            }
+        }
+    }
 
     #[derive(Debug, thiserror::Error)]
     pub enum SqlDbError {
@@ -261,15 +287,13 @@ pub(in crate::contract) mod sqlite {
         store: ContractStore,
         runtime: R,
         state_store: StateStore<Pool>,
-        pub(super) pool: SqlitePool,
+        params: HashMap<ContractKey, Parameters<'static>>,
     }
 
     impl<R> SQLiteContractHandler<R>
     where
         R: RuntimeInterface + 'static,
     {
-        /// max number of values stored in memory
-        const MEM_CACHE_ITEMS: usize = 10_000;
         /// number of max bytes allowed to be stored in the cache
         const MEM_SIZE: u32 = 10_000_000;
 
@@ -278,31 +302,35 @@ pub(in crate::contract) mod sqlite {
             store: ContractStore,
             runtime: R,
         ) -> Result<Self, SqlDbError> {
-            let pool = POOL.clone();
-            Self::create_contracts_table().await?;
+            // create_contracts_table().await?;
             Ok(SQLiteContractHandler {
                 channel,
                 store,
                 runtime,
-                state_store: StateStore::new(Pool(POOL.clone()), Self::MEM_SIZE)?,
-                pool,
+                state_store: StateStore::new(Pool::new().await?, Self::MEM_SIZE)?,
+                params: HashMap::default(),
             })
         }
 
-        async fn create_contracts_table() -> Result<(), SqlDbError> {
-            sqlx::query(
-                "CREATE TABLE IF NOT EXISTS contracts (
-                        key             STRING PRIMARY KEY,
-                        value           BLOB
-                    )",
-            )
-            .execute(&*POOL)
-            .await?;
-            Ok(())
+        async fn get_contract(
+            &self,
+            key: &ContractKey,
+            fetch_contract: bool,
+        ) -> Result<(WrappedState, Option<WrappedContract<'static>>), SqlDbError> {
+            let state = self.state_store.get(key).await?;
+            let contract = fetch_contract
+                .then(|| {
+                    let params = self.params.get(key).ok_or(SqlDbError::ContractNotFound)?;
+                    self.store
+                        .fetch_contract(key, params)
+                        .ok_or(SqlDbError::ContractNotFound)
+                })
+                .transpose()?;
+            Ok((state, contract))
         }
     }
 
-    impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>>
+    impl From<ContractHandlerChannel<SqlDbError, CHListenerHalve>>
         for SQLiteContractHandler<MockRuntime>
     {
         fn from(
@@ -320,7 +348,11 @@ pub(in crate::contract) mod sqlite {
     }
 
     #[async_trait::async_trait]
-    impl ContractHandler for SQLiteContractHandler<MockRuntime> {
+    impl<R> ContractHandler for SQLiteContractHandler<R>
+    where
+        R: RuntimeInterface + Send + Sync + 'static,
+        Self: From<ContractHandlerChannel<SqlDbError, CHListenerHalve>>,
+    {
         type Error = SqlDbError;
         type Store = Pool;
 
@@ -338,70 +370,37 @@ pub(in crate::contract) mod sqlite {
             &mut self,
             req: ClientRequest,
         ) -> Result<HostResponse, Self::Error> {
-            // async fn update_state(
-            //     &mut self,
-            //     contract_key: &ContractKey,
-            //     value: WrappedState,
-            // ) -> Result<WrappedState, Self::Error> {
-            //     let old_value = match self.get_state(contract_key).await {
-            //         Ok(Some(contract_value)) => contract_value,
-            //         Ok(None) => value.clone(),
-            //         Err(_) => value.clone(),
-            //     };
+            match req {
+                ClientRequest::Get {
+                    key,
+                    fetch_contract,
+                } => {
+                    let (state, contract) = self.get_contract(&key, fetch_contract).await?;
+                    Ok(HostResponse::GetResponse { contract, state })
+                }
+                ClientRequest::Put { contract, state } => {
+                    match self.get_contract(contract.key(), false).await {
+                        Ok((_old_state, _)) => {
+                            return Err(ContractRuntimeError::from(ExecError::DoublePut(
+                                *contract.key(),
+                            ))
+                            .into())
+                        }
+                        Err(SqlDbError::ContractNotFound) => {}
+                        Err(other) => return Err(other),
+                    }
 
-            //     let value = vec![];
-            //     let value: Vec<u8> = self
-            //         .runtime
-            //         .update_value(contract_key, &*old_value, &*value)?;
-            //     let encoded_key = bs58::encode(contract_key.as_ref())
-            //         .with_alphabet(bs58::Alphabet::BITCOIN)
-            //         .into_string();
-            //     match sqlx::query(
-            //         "INSERT OR REPLACE INTO contracts (key, value) VALUES ($1, $2) \
-            //              RETURNING value",
-            //     )
-            //     .bind(encoded_key)
-            //     .bind(value)
-            //     .map(|row: SqliteRow| WrappedState::new(row.get("value")))
-            //     .fetch_one(&self.pool)
-            //     .await
-            //     {
-            //         Ok(contract_value) => {
-            //             let size = contract_value.len() as i64;
-            //             self.value_mem_cache
-            //                 .insert(*contract_key, contract_value.clone(), size)
-            //                 .await;
-            //             Ok(contract_value)
-            //         }
-            //         Err(err) => {
-            //             log::error!("{}", err);
-            //             Err(SqlDbError::SqliteError(err))
-            //         }
-            //     }
-            // }
-
-            // async fn get_state(
-            //     &self,
-            //     contract_key: &ContractKey,
-            // ) -> Result<Option<WrappedState>, Self::Error> {
-            //     let encoded_key = bs58::encode(&**contract_key)
-            //         .with_alphabet(bs58::Alphabet::BITCOIN)
-            //         .into_string();
-            //     if let Some(value) = self.value_mem_cache.get(contract_key) {
-            //         return Ok(Some(value.value().clone()));
-            //     }
-            //     match sqlx::query("SELECT key, value FROM contracts WHERE key = ?")
-            //         .bind(encoded_key)
-            //         .map(|row: SqliteRow| Some(WrappedState::new(row.get("value"))))
-            //         .fetch_one(&self.pool)
-            //         .await
-            //     {
-            //         Ok(result) => Ok(result),
-            //         Err(sqlx::Error::RowNotFound) => Ok(None),
-            //         Err(_) => Err(SqlDbError::ContractNotFound),
-            //     }
-            // }
-            todo!()
+                    let is_valid =
+                        self.runtime
+                            .validate_state(contract.key(), contract.params(), &state)?;
+                    if !is_valid {
+                        todo!("return error");
+                    }
+                    self.state_store.store(*contract.key(), state).await?;
+                    todo!()
+                }
+                _ => unimplemented!(),
+            }
         }
 
         fn state_store(&mut self) -> &mut StateStore<Self::Store> {
@@ -413,6 +412,7 @@ pub(in crate::contract) mod sqlite {
     mod test {
         use std::sync::Arc;
 
+        use locutus_runtime::StateDelta;
         use locutus_stdlib::prelude::ContractCode;
 
         use super::sqlite::SQLiteContractHandler;

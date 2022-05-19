@@ -1,6 +1,5 @@
 use std::{fmt::Display, fs::File, future::Future, io::Read, pin::Pin, time::Duration};
 
-use either::Either;
 use locutus_node::{
     BoxedClient, ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse,
 };

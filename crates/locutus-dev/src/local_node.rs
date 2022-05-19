@@ -19,24 +19,23 @@ type Response = Result<HostResponse, Either<RequestError, DynError>>;
 pub struct LocalNode {
     contract_params: HashMap<ContractKey, Parameters<'static>>,
     contract_data: HashMap<String, Arc<ContractCode<'static>>>,
-    pub(crate) contract_state: HashMap<ContractKey, WrappedState>,
     runtime: Runtime,
     update_notifications: HashMap<ContractKey, Vec<(PeerKey, Sender<HostResponse>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<PeerKey, StateSummary<'static>>>,
-    state_store: StateStore<SqlitePool>,
+    contract_state: StateStore<SqlitePool>,
 }
 
 impl LocalNode {
-    pub fn new(store: ContractStore) -> Self {
-        Self {
+    const MAX_MEM_CACHE: u32 = 10 ^ 7;
+    pub async fn new(store: ContractStore) -> Result<Self, DynError> {
+        Ok(Self {
             contract_params: HashMap::default(),
             contract_data: HashMap::default(),
-            contract_state: HashMap::default(),
+            contract_state: StateStore::new(SqlitePool::new().await?, Self::MAX_MEM_CACHE).unwrap(),
             runtime: Runtime::build(store, false).unwrap(),
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
-            state_store: StateStore::new(SqlitePool::default(), 10_000_000).unwrap(),
-        }
+        })
     }
 
     pub fn register_contract_notifier(
@@ -70,7 +69,7 @@ impl LocalNode {
         Ok(())
     }
 
-    pub fn handle_request(&mut self, req: ClientRequest) -> Response {
+    pub async fn handle_request(&mut self, req: ClientRequest) -> Response {
         match req {
             ClientRequest::Put { contract, state } => {
                 // FIXME: in net node, we don't allow puts for existing contract states
@@ -89,7 +88,7 @@ impl LocalNode {
                     .validate_state(key, contract.params(), &state)
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                self.contract_state.insert(*key, state.clone());
+                self.contract_state.store(*key, state.clone());
                 self.contract_params.insert(*key, contract.params().clone());
                 self.contract_data
                     .insert(key.contract_part_as_str(), contract.code().clone());
@@ -102,7 +101,7 @@ impl LocalNode {
             ClientRequest::Update { key, delta } => {
                 let parameters = self.contract_params.get(&key).unwrap().clone();
                 let new_state = {
-                    let state = self.contract_state.get(&key).unwrap().clone();
+                    let state = self.contract_state.get(&key).await.unwrap().clone();
                     let new_state = self
                         .runtime
                         .update_state(&key, &parameters, &state, &delta)
@@ -112,7 +111,7 @@ impl LocalNode {
                             }
                             other => Either::Right(other.into()),
                         })?;
-                    self.contract_state.insert(key, new_state.clone());
+                    self.contract_state.store(key, new_state.clone()).await;
                     new_state
                 };
                 // in the network impl this would be sent over the network
@@ -122,16 +121,19 @@ impl LocalNode {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.send_update_notification(&key, &parameters, &new_state)?;
-                // TODO: after the node sending the update gets the response what should it do
+                // TODO: in network mode, wait at least for one confirmation
+                //       when a node receives a delta from updates, run the update themselves
+                //       and send back confirmation
                 Ok(HostResponse::UpdateResponse { key, summary })
             }
             ClientRequest::Get {
                 key,
                 fetch_contract: contract,
-            } => self.perform_get(contract, key).map_err(Either::Left),
+            } => self.perform_get(contract, key).await.map_err(Either::Left),
             ClientRequest::Subscribe { key } => {
                 // by default a subscribe op has an implicit get
-                self.perform_get(true, key).map_err(Either::Left)
+                self.perform_get(true, key).await.map_err(Either::Left)
+                // todo: in network mode, also send a subscribe to keep up to date
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
@@ -169,7 +171,7 @@ impl LocalNode {
         Ok(())
     }
 
-    fn perform_get(
+    async fn perform_get(
         &mut self,
         contract: bool,
         key: ContractKey,
@@ -179,13 +181,13 @@ impl LocalNode {
             let data = self.contract_data.get(&key.contract_part_as_str()).unwrap();
             WrappedContract::new(data.clone(), parameters.clone())
         });
-        self.contract_state
-            .get(&key)
-            .cloned()
-            .map(|state| HostResponse::GetResponse { contract, state })
-            .ok_or_else(|| RequestError::Get {
+        match self.contract_state.get(&key).await {
+            Ok(state) => Ok(HostResponse::GetResponse { contract, state }),
+            Err(StateStoreError::MissingContract) => Err(RequestError::Get {
                 key,
                 cause: "missing contract state".into(),
-            })
+            }),
+            Err(err) => todo!(),
+        }
     }
 }

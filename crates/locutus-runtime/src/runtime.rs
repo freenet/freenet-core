@@ -63,6 +63,11 @@ pub enum ExecError {
 
     #[error("unexpected result from contract interface")]
     UnexpectedResult,
+
+    #[error(
+        "Attempted to perform a put for an already put contract ({0}), use update instead"
+    )]
+    DoublePut(ContractKey),
 }
 
 pub struct Runtime {

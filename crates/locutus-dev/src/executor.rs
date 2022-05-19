@@ -10,7 +10,7 @@ pub async fn wasm_runtime(
     loop {
         tokio::select! {
             req = command_receiver.recv() => {
-                execute_command(req.ok_or("channel closed")?, &mut app)?;
+                execute_command(req.ok_or("channel closed")?, &mut app).await?;
             }
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt?;
@@ -22,10 +22,10 @@ pub async fn wasm_runtime(
 }
 
 #[allow(unused, clippy::diverging_sub_expression)]
-fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynError> {
-    let node = &mut *app.local_node.write();
+async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynError> {
+    let node = &mut *app.local_node.write().await;
     match req {
-        req @ ClientRequest::Put { .. } => match node.handle_request(req) {
+        req @ ClientRequest::Put { .. } => match node.handle_request(req).await {
             Ok(HostResponse::PutResponse(key)) => {
                 println!("valid put for {key}");
             }
@@ -34,7 +34,7 @@ fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynErro
             }
             _ => unreachable!(),
         },
-        req @ ClientRequest::Update { .. } => match node.handle_request(req) {
+        req @ ClientRequest::Update { .. } => match node.handle_request(req).await {
             Ok(HostResponse::UpdateResponse { key, summary }) => {
                 println!("valid update for {key}, state summary:");
                 app.printout_deser(summary.as_ref())?;
@@ -48,10 +48,13 @@ fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynErro
             key,
             fetch_contract: contract,
         } => {
-            match node.handle_request(ClientRequest::Get {
-                key,
-                fetch_contract: contract,
-            }) {
+            match node
+                .handle_request(ClientRequest::Get {
+                    key,
+                    fetch_contract: contract,
+                })
+                .await
+            {
                 Ok(HostResponse::GetResponse { contract, state }) => {
                     println!("current state for {key}:");
                     app.printout_deser(state.as_ref())?;

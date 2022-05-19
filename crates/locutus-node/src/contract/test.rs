@@ -72,7 +72,10 @@ impl StateStorage for MemKVStore {
         todo!()
     }
 
-    async fn get(&self, key: &ContractKey) -> Result<locutus_runtime::WrappedState, Self::Error> {
+    async fn get(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
         todo!()
     }
 }

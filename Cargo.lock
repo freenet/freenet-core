@@ -1944,7 +1944,6 @@ dependencies = [
  "locutus-node",
  "locutus-runtime",
  "log",
- "parking_lot 0.12.0",
  "pico-args",
  "rmp",
  "rmpv",
@@ -1996,7 +1995,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "sqlx",
- "stretto 0.4.3",
+ "stretto",
  "thiserror",
  "tokio",
  "tracing",
@@ -2022,7 +2021,7 @@ dependencies = [
  "once_cell",
  "rand 0.8.5",
  "serde",
- "stretto 0.3.3",
+ "stretto",
  "thiserror",
  "tracing",
  "wasmer",
@@ -3735,20 +3734,6 @@ checksum = "213701ba3370744dcd1a12960caa4843b3d68b4d1c0a5d575e0d65b2ee9d16c0"
 
 [[package]]
 name = "stretto"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96dd9c98d1bffad3101efa95f7ac469cace9ec10fdc102da6ca60077a64f47d3"
-dependencies = [
- "atomic",
- "parking_lot 0.11.2",
- "rand 0.8.5",
- "tokio",
- "twox-hash",
- "wg",
-]
-
-[[package]]
-name = "stretto"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f07295bf95b359d1046fb0ca5beca2bdd45eb0948cc67fdbc432d9549dd9c11"
@@ -3757,6 +3742,7 @@ dependencies = [
  "crossbeam-channel",
  "parking_lot 0.12.0",
  "rand 0.8.5",
+ "tokio",
  "twox-hash",
  "wg",
 ]

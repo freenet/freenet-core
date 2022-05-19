@@ -7,13 +7,15 @@ use crate::{DynError, WrappedState};
 pub enum StateStoreError {
     #[error(transparent)]
     Any(#[from] DynError),
+    #[error("missing contract")]
+    MissingContract,
 }
 
 #[async_trait::async_trait]
 pub trait StateStorage {
     type Error;
     async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error>;
-    async fn get(&self, key: &ContractKey) -> Result<WrappedState, Self::Error>;
+    async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
 }
 
 pub struct StateStore<S> {
@@ -44,10 +46,23 @@ where
         key: ContractKey,
         state: WrappedState,
     ) -> Result<(), StateStoreError> {
-        todo!()
+        self.store
+            .store(key, state.clone())
+            .await
+            .map_err(Into::into)?;
+        let cost = state.size() as i64;
+        self.mem_cache.insert(key, state, cost).await;
+        Ok(())
     }
 
-    pub fn get(&self, key: &ContractKey) -> Result<WrappedState, StateStoreError> {
-        todo!()
+    pub async fn get(&self, key: &ContractKey) -> Result<WrappedState, StateStoreError> {
+        if let Some(v) = self.mem_cache.get(key) {
+            return Ok(v.value().clone());
+        }
+        self.store
+            .get(key)
+            .await
+            .map_err(Into::into)?
+            .ok_or(StateStoreError::MissingContract)
     }
 }
