@@ -46,19 +46,22 @@ Locutus is implemented in Rust and will be available across all major operating 
 
 ### 4. Status
 
-We're working hard and expect an early prototype in May 2022. If you're a Rust developer and would like to help please talk to us in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord. You can also support Freenet through a [donation](https://freenetproject.org/pages/donate.html).
+We're working hard and expect an early prototype in June 2022. 
 
-### 5. Name
+You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
+
+
+### 5. Stay up to date
+
+[![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
+
+### 6. Name
 
 Locutus is the development name for this software; it will probably change before launch.
 
-### 6. Chat with us
+### 7. Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join. If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
-
-### 7. Stay up to date
-
-[![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
 
 ### 8. License
 
