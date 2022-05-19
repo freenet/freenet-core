@@ -1372,7 +1372,7 @@ dependencies = [
  "hyper",
  "locutus-dev",
  "locutus-node",
- "locutus-stdlib",
+ "locutus-runtime",
  "log",
  "rand 0.8.5",
  "tokio",

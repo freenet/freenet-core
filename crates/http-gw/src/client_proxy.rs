@@ -1,5 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use locutus_node::WrappedState;
+use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
     future::Future,
@@ -9,7 +10,6 @@ use std::{
 };
 
 use locutus_node::*;
-use locutus_stdlib::prelude::ContractKey;
 use tokio::sync::{
     mpsc::{channel, Receiver, Sender},
     oneshot,
@@ -73,7 +73,6 @@ async fn handle_contract(
     let response = response
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-    // http://localhost/contract/<?key>
     match response {
         Ok(r) => {
             match r {

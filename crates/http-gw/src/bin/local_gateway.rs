@@ -9,6 +9,7 @@ fn main() -> Result<(), DynError> {
         .with_level(true)
         .finish();
     sub.init();
+    #[allow(unused_variables)]
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -17,7 +18,10 @@ fn main() -> Result<(), DynError> {
 
     #[cfg(feature = "local")]
     {
-        rt.block_on(http_gw::local_node::set_local_node())?;
+        rt.block_on(async move {
+            let local_node = http_gw::local_node::config_node().await?;
+            http_gw::local_node::set_local_node(local_node).await
+        })?;
     }
     #[cfg(not(feature = "local"))]
     {

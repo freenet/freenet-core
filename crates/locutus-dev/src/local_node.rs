@@ -26,7 +26,7 @@ pub struct LocalNode {
 }
 
 impl LocalNode {
-    const MAX_MEM_CACHE: u32 = 10 ^ 7;
+    const MAX_MEM_CACHE: u32 = 10_000_000;
     pub async fn new(store: ContractStore) -> Result<Self, DynError> {
         Ok(Self {
             contract_params: HashMap::default(),
@@ -88,7 +88,10 @@ impl LocalNode {
                     .validate_state(key, contract.params(), &state)
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                self.contract_state.store(*key, state.clone());
+                self.contract_state
+                    .store(*key, state.clone())
+                    .await
+                    .map_err(|e| Either::Right(e.into()))?;
                 self.contract_params.insert(*key, contract.params().clone());
                 self.contract_data
                     .insert(key.contract_part_as_str(), contract.code().clone());
@@ -111,7 +114,10 @@ impl LocalNode {
                             }
                             other => Either::Right(other.into()),
                         })?;
-                    self.contract_state.store(key, new_state.clone()).await;
+                    self.contract_state
+                        .store(key, new_state.clone())
+                        .await
+                        .unwrap();
                     new_state
                 };
                 // in the network impl this would be sent over the network
@@ -187,7 +193,10 @@ impl LocalNode {
                 key,
                 cause: "missing contract state".into(),
             }),
-            Err(err) => todo!(),
+            Err(err) => Err(RequestError::Get {
+                key,
+                cause: format!("{err}"),
+            }),
         }
     }
 }

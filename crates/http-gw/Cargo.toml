@@ -19,7 +19,7 @@ rand = { version = "0.8" }
 
 # internal:
 locutus-node = { path = "../locutus-node", features = ["websocket"] }
-locutus-stdlib = { path = "../locutus-stdlib"}
+locutus-runtime = { path = "../locutus-runtime"}
 locutus-dev = { path = "../locutus-dev", optional = true }
 
 [features]

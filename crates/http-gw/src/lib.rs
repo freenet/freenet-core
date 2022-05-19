@@ -17,14 +17,13 @@ pub mod local_node {
 
     const MAX_SIZE: i64 = 10 * 1024 * 1024;
 
-    async fn config_node() -> Result<LocalNode, DynError> {
+    pub async fn config_node() -> Result<LocalNode, DynError> {
         let tmp_path = std::env::temp_dir().join("locutus");
         let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
         LocalNode::new(contract_store).await
     }
 
-    pub async fn set_local_node() -> Result<(), DynError> {
-        let mut local_node = config_node().await?;
+    pub async fn set_local_node(mut local_node: LocalNode) -> Result<(), DynError> {
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
         let (http_handle, filter) = HttpGateway::as_filter();
         let ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;

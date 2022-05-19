@@ -11,7 +11,7 @@ use crate::contract::{ContractError, ContractKey};
 use crate::{ClientRequest, HostResponse, WrappedContract, WrappedState};
 pub(crate) use sqlite::SqlDbError;
 
-const MAX_MEM_CACHE: i64 = 10 ^ 7;
+const MAX_MEM_CACHE: i64 = 10_000_000;
 
 #[async_trait::async_trait]
 pub(crate) trait ContractHandler:
