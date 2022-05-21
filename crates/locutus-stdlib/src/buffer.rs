@@ -196,11 +196,11 @@ fn from_raw_builder<'a>(
         let buffer_ptr = compute_ptr(buf_builder.start as *mut u8, start_ptr, end_ptr);
         let buffer =
             &mut *std::ptr::slice_from_raw_parts_mut(buffer_ptr, buf_builder.size as usize);
-        eprintln!(
-            "checking new ptr: {:p} -> {}; mem: {start_ptr:p} - {end_ptr:p};
-            buf ptr: {buffer_ptr:p}; buf size {}",
-            buf_builder.start as *mut u8, buf_builder.start, buf_builder.size
-        );
+        // eprintln!(
+        //     "checking new ptr: {:p} -> {}; mem: {start_ptr:p} - {end_ptr:p};
+        //     buf ptr: {buffer_ptr:p}; buf size {}",
+        //     buf_builder.start as *mut u8, buf_builder.start, buf_builder.size
+        // );
         BuilderInfo {
             buffer,
             read_ptr,

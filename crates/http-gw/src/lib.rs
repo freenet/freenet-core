@@ -17,14 +17,11 @@ pub mod local_node {
 
     use crate::{DynError, HttpGateway};
 
-    pub async fn config_node(
+    pub async fn set_local_node(
+        mut local_node: LocalNode,
         contract_store: ContractStore,
         state_store: StateStore<SqlitePool>,
-    ) -> Result<LocalNode, DynError> {
-        LocalNode::new(contract_store, state_store).await
-    }
-
-    pub async fn set_local_node(mut local_node: LocalNode, contract_store: ContractStore, state_store: StateStore<SqlitePool>) -> Result<(), DynError> {
+    ) -> Result<(), DynError> {
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
         let (http_handle, filter) = HttpGateway::as_filter();
         let ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;

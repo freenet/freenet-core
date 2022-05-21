@@ -88,12 +88,18 @@ impl LocalNode {
                 //          1. through the arbitraur mechanism
                 //          2. a new func which compared two summaries and gives the most fresh
                 //        you can request to several nodes and determine which node has a fresher ver
+                self.runtime
+                    .contracts
+                    .store_contract(contract.clone())
+                    .map_err(|err| Either::Right(err.into()))?;
+
                 let key = contract.key();
                 let is_valid = self
                     .runtime
                     .validate_state(key, contract.params(), &state)
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
+
                 self.contract_state
                     .store(*key, state.clone())
                     .await

@@ -64,17 +64,15 @@ pub enum ExecError {
     #[error("unexpected result from contract interface")]
     UnexpectedResult,
 
-    #[error(
-        "Attempted to perform a put for an already put contract ({0}), use update instead"
-    )]
+    #[error("Attempted to perform a put for an already put contract ({0}), use update instead")]
     DoublePut(ContractKey),
 }
 
 pub struct Runtime {
     /// working memory store used by the inner engine
     store: Store,
-    /// local contract disc store
-    contracts: ContractStore,
+    /// Local contract storage.
+    pub contracts: ContractStore,
     /// loaded modules
     modules: HashMap<ContractKey, Module>,
     // /// includes all the necessary imports to interact with the native runtime environment

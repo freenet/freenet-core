@@ -34,11 +34,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let contract = test_contract()?;
     log::info!("loaded contract {} in local node", contract.key().encode());
     let tmp_path = std::env::temp_dir().join("locutus");
-    let mut contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
-    contract_store.store_contract(contract.clone())?;
+    let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node =
-        http_gw::local_node::config_node(contract_store.clone(), state_store.clone()).await?;
+        locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
     if let Err(err) = local_node
         .handle_request(locutus_node::ClientRequest::Put { contract, state })
         .await
@@ -51,8 +50,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     http_gw::local_node::set_local_node(local_node, contract_store, state_store).await
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     // env_logger::Builder::from_default_env()
     //     .format_module_path(true)

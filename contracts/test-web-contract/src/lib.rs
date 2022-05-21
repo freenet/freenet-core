@@ -7,13 +7,11 @@ struct Contract;
 #[contract]
 impl ContractInterface for Contract {
     fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
-        // let state_bytes = state.as_ref();
-        // eprintln!("state: {state_bytes:?}");
-        state[0] == 1 && state[3] == 4
+        true
     }
 
     fn validate_delta(_parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool {
-        delta[0] == 1 && delta[3] == 4
+        true
     }
 
     fn update_state(
