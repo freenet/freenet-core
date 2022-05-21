@@ -10,20 +10,21 @@ pub mod local_node {
 
     use locutus_dev::{ContractStore, LocalNode};
     use locutus_node::{
-        either, ClientError, ClientEventsCombinator, ClientEventsProxy, ErrorKind, WebSocketProxy,
+        either, ClientError, ClientEventsCombinator, ClientEventsProxy, ErrorKind, SqlitePool,
+        WebSocketProxy,
     };
+    use locutus_runtime::StateStore;
 
     use crate::{DynError, HttpGateway};
 
-    const MAX_SIZE: i64 = 10 * 1024 * 1024;
-
-    pub async fn config_node() -> Result<LocalNode, DynError> {
-        let tmp_path = std::env::temp_dir().join("locutus");
-        let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
-        LocalNode::new(contract_store).await
+    pub async fn config_node(
+        contract_store: ContractStore,
+        state_store: StateStore<SqlitePool>,
+    ) -> Result<LocalNode, DynError> {
+        LocalNode::new(contract_store, state_store).await
     }
 
-    pub async fn set_local_node(mut local_node: LocalNode) -> Result<(), DynError> {
+    pub async fn set_local_node(mut local_node: LocalNode, contract_store: ContractStore, state_store: StateStore<SqlitePool>) -> Result<(), DynError> {
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
         let (http_handle, filter) = HttpGateway::as_filter();
         let ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;

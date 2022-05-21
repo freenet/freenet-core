@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use dashmap::DashMap;
 use locutus_runtime::{ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
@@ -57,8 +56,8 @@ impl RuntimeInterface for MockRuntime {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct MemKVStore(HashMap<ContractKey, WrappedState>);
+#[derive(Default, Clone)]
+pub(crate) struct MemKVStore(DashMap<ContractKey, WrappedState>);
 
 #[async_trait::async_trait]
 impl StateStorage for MemKVStore {
@@ -86,7 +85,10 @@ impl MemKVStore {
     }
 }
 
-pub(crate) struct MemoryContractHandler<KVStore = MemKVStore> {
+pub(crate) struct MemoryContractHandler<KVStore = MemKVStore>
+where
+    KVStore: StateStorage,
+{
     channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
     kv_store: StateStore<KVStore>,
     contract_store: ContractStore,

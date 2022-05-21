@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use locutus_runtime::{ContractStore, Parameters, StateStore};
+use locutus_runtime::{ContractStore, Parameters, StateStorage, StateStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -18,7 +18,7 @@ pub(crate) trait ContractHandler:
     From<ContractHandlerChannel<Self::Error, CHListenerHalve>>
 {
     type Error: std::error::Error;
-    type Store;
+    type Store: StateStorage;
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve>;
 
@@ -225,6 +225,7 @@ pub(in crate::contract) mod sqlite {
         Ok(())
     }
 
+    #[derive(Clone)]
     pub struct Pool(SqlitePool);
 
     impl Pool {

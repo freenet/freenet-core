@@ -26,12 +26,14 @@ pub struct LocalNode {
 }
 
 impl LocalNode {
-    const MAX_MEM_CACHE: u32 = 10_000_000;
-    pub async fn new(store: ContractStore) -> Result<Self, DynError> {
+    pub async fn new(
+        store: ContractStore,
+        contract_state: StateStore<SqlitePool>,
+    ) -> Result<Self, DynError> {
         Ok(Self {
             contract_params: HashMap::default(),
             contract_data: HashMap::default(),
-            contract_state: StateStore::new(SqlitePool::new().await?, Self::MAX_MEM_CACHE).unwrap(),
+            contract_state,
             runtime: Runtime::build(store, false).unwrap(),
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
@@ -67,6 +69,10 @@ impl LocalNode {
             );
         }
         Ok(())
+    }
+
+    pub async fn preload(&mut self, contract: WrappedContract<'static>, state: WrappedState) {
+        todo!()
     }
 
     pub async fn handle_request(&mut self, req: ClientRequest) -> Response {

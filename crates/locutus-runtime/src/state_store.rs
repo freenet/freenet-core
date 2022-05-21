@@ -12,13 +12,14 @@ pub enum StateStoreError {
 }
 
 #[async_trait::async_trait]
-pub trait StateStorage {
+pub trait StateStorage: Clone {
     type Error;
     async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error>;
     async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
 }
 
-pub struct StateStore<S> {
+#[derive(Clone)]
+pub struct StateStore<S: StateStorage> {
     mem_cache: AsyncCache<ContractKey, WrappedState>,
     store: S,
 }
