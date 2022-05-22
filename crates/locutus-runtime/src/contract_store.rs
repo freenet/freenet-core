@@ -78,7 +78,10 @@ impl ContractStore {
             .into_string()
             .to_lowercase();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
-        if WrappedContract::get_data_from_fs(&key_path).is_ok() {
+        if let Ok(code) = WrappedContract::get_data_from_fs(&key_path) {
+            let size = code.data().len() as i64;
+            self.contract_cache
+                .insert(*contract_hash, Arc::new(code), size);
             return Ok(());
         }
 
