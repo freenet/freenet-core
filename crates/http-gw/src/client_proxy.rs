@@ -44,20 +44,31 @@ impl HttpGateway {
         contract_store: ContractStore,
     ) -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
         let (request_sender, server_request) = channel(PARALLELISM);
-        let filter = warp::path::path("contract")
+        let get_contract_web = warp::path::path("contract")
             .map(move || (request_sender.clone(), contract_store.clone()))
             .and(warp::path::param())
             .and(warp::path::end())
-            .and_then(|(rs, cs), key: String| async move { handle_contract(key, rs, cs).await })
-            .or(warp::path::end().and_then(home))
+            .and_then(|(rs, cs), key: String| async move { handle_contract(key, rs, cs).await });
+
+        let get_contract_state = warp::path::path("contract")
+            .and(warp::path::param())
+            .and(warp::path::path("state"))
+            .and_then(|key: String| get_state(key));
+
+        let get_home = warp::path::end().and_then(home);
+
+        let filters = get_contract_web
+            .or(get_contract_state)
+            .or(get_home)
             .recover(errors::handle_error)
             .with(warp::trace::request());
+
         (
             Self {
                 server_request,
                 pending_responses: HashMap::new(),
             },
-            filter.boxed(),
+            filters.boxed(),
         )
     }
 }
@@ -165,6 +176,10 @@ fn get_web_body(state: WrappedState, path: PathBuf) -> Result<hyper::Body, DynEr
     key_file.read_to_end(&mut index).unwrap();
 
     Ok(hyper::Body::from(index))
+}
+
+async fn get_state(contract_key: String) -> Result<impl Reply, Rejection> {
+    Ok(reply::html(contract_key))
 }
 
 async fn home() -> Result<impl Reply, Rejection> {
