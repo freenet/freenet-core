@@ -1,7 +1,9 @@
+use std::path::Path;
 use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 
 use locutus_stdlib::prelude::{ContractCode, Parameters};
 use stretto::Cache;
+use walkdir::{DirEntry, WalkDir};
 
 use crate::{contract::WrappedContract, RuntimeResult};
 
@@ -27,6 +29,17 @@ impl ContractStore {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
         }
+    }
+
+    pub fn try_load_existing_contracts(&mut self) {
+        println!("{}", self.contracts_dir.as_path().display());
+        let walker = WalkDir::new(self.contracts_dir.as_path()).into_iter();
+        walker.for_each(|e| {
+            let entry = e.unwrap();
+            let contract_code = WrappedContract::get_data_from_fs(entry.path()).unwrap();
+            let contract = WrappedContract::new(Arc::new(contract_code), [].as_ref().into());
+            let _ = self.store_contract(contract);
+        });
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
@@ -85,5 +98,16 @@ impl ContractStore {
         file.write_all(contract.code().data())?;
 
         Ok(())
+    }
+
+    pub fn get_contract_path(&mut self, contract: WrappedContract) -> PathBuf {
+        let contract_hash = contract.key().contract_part();
+        let key_path = bs58::encode(contract_hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+
+        let key_path = self.contracts_dir.join(key_path);
+
+        key_path
     }
 }
