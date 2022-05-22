@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use locutus_node::WrappedState;
-use locutus_runtime::{ContractKey, ContractStore, WrappedContract};
+use locutus_runtime::{ContractKey, ContractStore};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -53,7 +53,7 @@ impl HttpGateway {
         let get_contract_state = warp::path::path("contract")
             .and(warp::path::param())
             .and(warp::path::path("state"))
-            .and_then(|key: String| get_state(key));
+            .and_then(get_state);
 
         let get_home = warp::path::end().and_then(home);
 
@@ -115,12 +115,13 @@ async fn handle_contract(
             match r {
                 HostResponse::GetResponse { contract, state } => {
                     // TODO: here we should pass the batton to the websocket interface
-                    if let Some(c) = contract {
-                        let contract_path = contract_store.get_contract_path(c);
-                        let web_body = get_web_body(state, contract_path).unwrap();
-                        Ok(reply::html(web_body))
-                    } else {
-                        Ok(reply::html(hyper::Body::empty()))
+                    match contract {
+                        Some(c) => {
+                            let contract_path = contract_store.get_contract_path(c.key());
+                            let web_body = get_web_body(state, contract_path).unwrap();
+                            Ok(reply::html(web_body))
+                        }
+                        None => Ok(reply::html(hyper::Body::empty())),
                     }
                 }
                 _ => {
@@ -144,7 +145,7 @@ fn get_web_path(state: WrappedState, path: PathBuf) -> Result<PathBuf, DynError>
     state.read_exact(&mut web)?;
 
     // Decode tar.xz and build response body
-    let mut decoder = XzDecoder::new(Cursor::new(&web));
+    let decoder = XzDecoder::new(Cursor::new(&web));
     let mut files = Archive::new(decoder);
     let _ = files.unpack(path.clone());
 
@@ -165,9 +166,9 @@ fn get_web_body(state: WrappedState, path: PathBuf) -> Result<hyper::Body, DynEr
 
     // Decode tar.xz and unpack contract web
     let mut index = vec![];
-    let mut decoder = XzDecoder::new(Cursor::new(&web));
+    let decoder = XzDecoder::new(Cursor::new(&web));
     let mut files = Archive::new(decoder);
-    let _ = files.unpack(path.clone());
+    files.unpack(path.clone())?;
 
     // Get and return web
     let web_path = path.join("web/index.html");
@@ -257,11 +258,9 @@ mod errors {
 pub(crate) mod test {
     use std::{fs::File, path::PathBuf};
 
-    use crate::DynError;
-
     use super::*;
 
-    pub fn test_state() -> Result<WrappedState, std::io::Error> {
+    fn _test_state() -> Result<WrappedState, std::io::Error> {
         const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let path = PathBuf::from(CRATE_DIR).join("tests/encoded_state");
         let mut bytes = Vec::new();

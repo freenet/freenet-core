@@ -1,4 +1,3 @@
-use locutus_dev::ContractStore;
 use locutus_node::SqlitePool;
 use locutus_runtime::StateStore;
 use tracing::metadata::LevelFilter;
@@ -11,6 +10,7 @@ const MAX_MEM_CACHE: u32 = 10_000_000;
 
 #[cfg(feature = "local")]
 async fn run() -> Result<(), DynError> {
+    use locutus_dev::ContractStore;
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();

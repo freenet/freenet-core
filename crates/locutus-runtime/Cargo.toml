@@ -13,7 +13,7 @@ blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
 futures = "0.3"
 serde = { version = "1", features = ["rc", "derive"] }
-stretto = { version = "0.4", features = ["async"], default-features = false }
+stretto = { version = "0.4", features = ["async", "sync"], default-features = false }
 tracing = "0.1"
 thiserror = "1"
 walkdir = "2.3.2"
