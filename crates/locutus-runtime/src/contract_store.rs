@@ -16,7 +16,7 @@ pub struct ContractStore {
     contracts_dir: PathBuf,
     contract_cache: Cache<ContractKeyCodePart, Arc<ContractCode<'static>>>,
     // todo: persist this somewhere
-    key_to_code_part: DashMap<ContractKey, ContractKeyCodePart>,
+    key_to_code_part: Arc<DashMap<ContractKey, ContractKeyCodePart>>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
@@ -34,7 +34,7 @@ impl ContractStore {
         Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
-            key_to_code_part: DashMap::new(),
+            key_to_code_part: Arc::new(DashMap::new()),
         }
     }
 
@@ -117,17 +117,10 @@ impl ContractStore {
     pub fn get_contract_path(&mut self, key: &ContractKey) -> RuntimeResult<PathBuf> {
         let contract_hash = match key.contract_part() {
             Some(k) => *k,
-            None => {
-                // part not specified, then try it from the fullkey to code map
-                *self
-                    .key_to_code_part
-                    .get(key)
-                    .ok_or_else(|| {
-                        tracing::warn!("trying to store partially unspecified contract `{key}`");
-                        ContractRuntimeError::UnwrapContract
-                    })?
-                    .value()
-            }
+            None => self.code_hash_from_key(key).ok_or_else(|| {
+                tracing::warn!("trying to store partially unspecified contract `{key}`");
+                ContractRuntimeError::UnwrapContract
+            })?,
         };
 
         let key_path = bs58::encode(contract_hash)
@@ -135,6 +128,10 @@ impl ContractStore {
             .into_string()
             .to_lowercase();
         Ok(self.contracts_dir.join(key_path).with_extension("wasm"))
+    }
+
+    pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<ContractKeyCodePart> {
+        self.key_to_code_part.get(key).map(|r| *r.value())
     }
 }
 

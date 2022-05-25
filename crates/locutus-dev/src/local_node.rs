@@ -104,7 +104,6 @@ impl LocalNode {
                     .store(*key, state.clone())
                     .await
                     .map_err(|e| Either::Right(e.into()))?;
-                log::info!("insert {key}");
                 self.contract_params.insert(*key, contract.params().clone());
                 self.contract_data
                     .insert(key.contract_part_as_str().unwrap(), contract.code().clone());
@@ -197,12 +196,16 @@ impl LocalNode {
         key: ContractKey,
     ) -> Result<HostResponse, RequestError> {
         let contract = contract.then(|| {
-            log::info!("get {key}");
             let parameters = self.contract_params.get(&key).unwrap();
-            let data = self
-                .contract_data
-                .get(&key.contract_part_as_str().unwrap())
+            let data_key = key
+                .contract_part_as_str()
+                .or_else(|| {
+                    Some(ContractCode::encode_key(
+                        &self.runtime.contracts.code_hash_from_key(&key).unwrap(),
+                    ))
+                })
                 .unwrap();
+            let data = self.contract_data.get(&data_key).unwrap();
             WrappedContract::new(data.clone(), parameters.clone())
         });
         match self.contract_state.get(&key).await {

@@ -6,6 +6,7 @@
 
 use std::{
     borrow::{Borrow, Cow},
+    hash::Hasher,
     io::{Cursor, Read},
     ops::{Deref, DerefMut},
 };
@@ -408,7 +409,11 @@ impl ContractCode<'_> {
     }
 
     pub fn hash(&self) -> String {
-        bs58::encode(self.key)
+        Self::encode_key(&self.key)
+    }
+
+    pub fn encode_key(key: &[u8; CONTRACT_KEY_SIZE]) -> String {
+        bs58::encode(key)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
     }
@@ -480,13 +485,25 @@ impl std::fmt::Display for ContractCode<'_> {
 
 #[serde_as]
 /// The key representing a contract.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+#[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 pub struct ContractKey {
     #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     spec: [u8; CONTRACT_KEY_SIZE],
     #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
     contract: Option<[u8; CONTRACT_KEY_SIZE]>,
+}
+
+impl PartialEq for ContractKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec
+    }
+}
+
+impl std::hash::Hash for ContractKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.spec.hash(state);
+    }
 }
 
 impl<'a, T, U> From<(T, U)> for ContractKey
