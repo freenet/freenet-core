@@ -104,9 +104,10 @@ impl LocalNode {
                     .store(*key, state.clone())
                     .await
                     .map_err(|e| Either::Right(e.into()))?;
+                log::info!("insert {key}");
                 self.contract_params.insert(*key, contract.params().clone());
                 self.contract_data
-                    .insert(key.contract_part_as_str(), contract.code().clone());
+                    .insert(key.contract_part_as_str().unwrap(), contract.code().clone());
                 let res = is_valid
                     .then(|| HostResponse::PutResponse(*key))
                     .ok_or(Either::Left(RequestError::Put(*key)));
@@ -149,6 +150,7 @@ impl LocalNode {
                 fetch_contract: contract,
             } => self.perform_get(contract, key).await.map_err(Either::Left),
             ClientRequest::Subscribe { key } => {
+                log::info!("getting contract: {}", key.encode());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)
                 // todo: in network mode, also send a subscribe to keep up to date
@@ -195,8 +197,12 @@ impl LocalNode {
         key: ContractKey,
     ) -> Result<HostResponse, RequestError> {
         let contract = contract.then(|| {
+            log::info!("get {key}");
             let parameters = self.contract_params.get(&key).unwrap();
-            let data = self.contract_data.get(&key.contract_part_as_str()).unwrap();
+            let data = self
+                .contract_data
+                .get(&key.contract_part_as_str().unwrap())
+                .unwrap();
             WrappedContract::new(data.clone(), parameters.clone())
         });
         match self.contract_state.get(&key).await {

@@ -62,11 +62,7 @@ pub enum ErrorKind {
     Unhandled(String),
 }
 
-impl From<ErrorKind> for warp::Rejection {
-    fn from(_: ErrorKind) -> Self {
-        todo!()
-    }
-}
+impl warp::reject::Reject for ErrorKind {}
 
 impl Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

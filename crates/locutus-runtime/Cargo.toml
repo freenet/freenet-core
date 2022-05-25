@@ -11,6 +11,7 @@ arrayvec = { version = "0.7", features = ["serde"] }
 async-trait = "0.1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
+dashmap = "5"
 futures = "0.3"
 serde = { version = "1", features = ["rc", "derive"] }
 stretto = { version = "0.4", features = ["async", "sync"], default-features = false }

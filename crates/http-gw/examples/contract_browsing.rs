@@ -33,6 +33,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = test_state()?;
     let contract = test_contract()?;
     log::info!("loaded contract {} in local node", contract.key().encode());
+    log::info!("decoded: {:x?}", contract.key().bytes());
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();

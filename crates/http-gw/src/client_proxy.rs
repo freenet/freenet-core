@@ -99,8 +99,7 @@ async fn handle_contract(
     request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
     mut contract_store: ContractStore,
 ) -> Result<impl Reply, Rejection> {
-    let key = key.to_lowercase();
-    let key = ContractKey::decode(key, vec![].into())
+    let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let (tx, response) = oneshot::channel();
     request_sender
@@ -117,7 +116,13 @@ async fn handle_contract(
                     // TODO: here we should pass the batton to the websocket interface
                     match contract {
                         Some(c) => {
-                            let contract_path = contract_store.get_contract_path(c.key());
+                            let contract_path =
+                                contract_store.get_contract_path(c.key()).map_err(|_| {
+                                    ErrorKind::RequestError(RequestError::Get {
+                                        key,
+                                        cause: "contract code hash key not specified".to_owned(),
+                                    })
+                                })?;
                             let web_body = get_web_body(state, contract_path).unwrap();
                             Ok(reply::html(web_body))
                         }

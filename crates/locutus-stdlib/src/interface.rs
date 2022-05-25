@@ -92,7 +92,7 @@ pub trait ContractInterface {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<UpdateModification, ContractError>;
-    
+
     // todo: implement in contract
     // fn(state_summary_1, state_summary_2) -> up_to_data(1 | 2);
 }
@@ -407,6 +407,12 @@ impl ContractCode<'_> {
         self.data.to_owned().to_vec()
     }
 
+    pub fn hash(&self) -> String {
+        bs58::encode(self.key)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
+    }
+
     fn gen_key(data: &[u8]) -> [u8; CONTRACT_KEY_SIZE] {
         let mut hasher = Blake2s256::new();
         hasher.update(&data);
@@ -479,8 +485,8 @@ impl std::fmt::Display for ContractCode<'_> {
 pub struct ContractKey {
     #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     spec: [u8; CONTRACT_KEY_SIZE],
-    #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
-    contract: [u8; CONTRACT_KEY_SIZE],
+    #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
+    contract: Option<[u8; CONTRACT_KEY_SIZE]>,
 }
 
 impl<'a, T, U> From<(T, U)> for ContractKey
@@ -489,9 +495,9 @@ where
     U: Borrow<ContractCode<'a>>,
 {
     fn from(spec: (T, U)) -> Self {
-        let (parameters, contract) = (spec.0.borrow(), spec.1.borrow());
+        let (parameters, code_data) = (spec.0.borrow(), spec.1.borrow());
 
-        let contract_hash = contract.key();
+        let contract_hash = code_data.key();
 
         let mut hasher = Blake2s256::new();
         hasher.update(contract_hash);
@@ -503,26 +509,40 @@ where
         spec.copy_from_slice(&full_key_arr);
         Self {
             spec,
-            contract: *contract_hash,
+            contract: Some(*contract_hash),
         }
     }
 }
 
 impl ContractKey {
+    /// Builds a partial `ContractKey`, the contract code part is unspecified.
+    pub fn from_spec(spec_key: impl Into<String>) -> Result<Self, bs58::decode::Error> {
+        let mut spec = [0; CONTRACT_KEY_SIZE];
+        bs58::decode(spec_key.into())
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into(&mut spec)?;
+        Ok(Self {
+            spec,
+            contract: None,
+        })
+    }
+
     /// Gets the whole spec key hash.
     pub fn bytes(&self) -> &[u8] {
         self.spec.as_ref()
     }
 
     /// Returns the hash of the contract data only.
-    pub fn contract_part(&self) -> &[u8; CONTRACT_KEY_SIZE] {
-        &self.contract
+    pub fn contract_part(&self) -> Option<&[u8; CONTRACT_KEY_SIZE]> {
+        self.contract.as_ref()
     }
 
-    pub fn contract_part_as_str(&self) -> String {
-        bs58::encode(self.contract)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into_string()
+    pub fn contract_part_as_str(&self) -> Option<String> {
+        self.contract.as_ref().map(|c| {
+            bs58::encode(c)
+                .with_alphabet(bs58::Alphabet::BITCOIN)
+                .into_string()
+        })
     }
 
     pub fn decode(
@@ -541,7 +561,10 @@ impl ContractKey {
 
         let mut spec = [0; CONTRACT_KEY_SIZE];
         spec.copy_from_slice(&full_key_arr);
-        Ok(Self { spec, contract })
+        Ok(Self {
+            spec,
+            contract: Some(contract),
+        })
     }
 
     pub fn encode(&self) -> String {
@@ -590,6 +613,21 @@ mod test {
         rng.fill(&mut bytes);
         bytes
     });
+
+    #[test]
+    fn key_encoding() -> Result<(), Box<dyn std::error::Error>> {
+        let code = ContractCode::from(vec![1, 2, 3]);
+        let expected = ContractKey::from((Parameters::from(vec![]), &code));
+        // let encoded_key = expected.encode();
+        // println!("encoded key: {encoded_key}");
+        // let encoded_code = expected.contract_part_as_str();
+        // println!("encoded key: {encoded_code}");
+
+        let decoded = ContractKey::decode(code.hash(), [].as_ref().into())?;
+        assert_eq!(expected, decoded);
+        assert_eq!(expected.contract_part(), decoded.contract_part());
+        Ok(())
+    }
 
     #[test]
     fn key_ser() -> Result<(), Box<dyn std::error::Error>> {

@@ -2030,6 +2030,7 @@ dependencies = [
  "bincode",
  "blake2 0.10.4",
  "bs58",
+ "dashmap",
  "futures",
  "locutus-stdlib",
  "once_cell",

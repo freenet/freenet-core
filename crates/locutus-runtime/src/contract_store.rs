@@ -1,19 +1,22 @@
 use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 
+use dashmap::DashMap;
 use locutus_stdlib::prelude::{ContractCode, Parameters};
 use stretto::Cache;
 
-use crate::{contract::WrappedContract, RuntimeResult};
+use crate::{contract::WrappedContract, ContractRuntimeError, RuntimeResult};
 
 use super::ContractKey;
 
-type KeyContractPart = [u8; 32];
+type ContractKeyCodePart = [u8; 32];
 
 /// Handle contract blob storage on the file system.
 #[derive(Clone)]
 pub struct ContractStore {
     contracts_dir: PathBuf,
-    contract_cache: Cache<KeyContractPart, Arc<ContractCode<'static>>>,
+    contract_cache: Cache<ContractKeyCodePart, Arc<ContractCode<'static>>>,
+    // todo: persist this somewhere
+    key_to_code_part: DashMap<ContractKey, ContractKeyCodePart>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
@@ -31,6 +34,7 @@ impl ContractStore {
         Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
+            key_to_code_part: DashMap::new(),
         }
     }
 
@@ -40,7 +44,12 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'a>,
     ) -> Option<WrappedContract<'a>> {
-        let contract_hash = key.contract_part();
+        let contract_hash = if let Some(s) = key.contract_part() {
+            s
+        } else {
+            tracing::warn!("requested partially unspecified contract `{key}`");
+            return None;
+        };
         if let Some(data) = self.contract_cache.get(contract_hash) {
             Some(WrappedContract::new(data.value().clone(), params.clone()))
         } else {
@@ -68,10 +77,18 @@ impl ContractStore {
 
     /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
     pub fn store_contract(&mut self, contract: WrappedContract) -> RuntimeResult<()> {
-        let contract_hash = contract.key().contract_part();
+        let contract_hash = contract.key().contract_part().ok_or_else(|| {
+            tracing::warn!(
+                "trying to store partially unspecified contract `{}`",
+                contract.key()
+            );
+            ContractRuntimeError::UnwrapContract
+        })?;
         if self.contract_cache.get(contract_hash).is_some() {
             return Ok(());
         }
+        self.key_to_code_part
+            .insert(*contract.key(), *contract_hash);
 
         let key_path = bs58::encode(contract_hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -97,13 +114,27 @@ impl ContractStore {
         Ok(())
     }
 
-    pub fn get_contract_path(&mut self, key: &ContractKey) -> PathBuf {
-        let contract_hash = key.contract_part();
+    pub fn get_contract_path(&mut self, key: &ContractKey) -> RuntimeResult<PathBuf> {
+        let contract_hash = match key.contract_part() {
+            Some(k) => *k,
+            None => {
+                // part not specified, then try it from the fullkey to code map
+                *self
+                    .key_to_code_part
+                    .get(key)
+                    .ok_or_else(|| {
+                        tracing::warn!("trying to store partially unspecified contract `{key}`");
+                        ContractRuntimeError::UnwrapContract
+                    })?
+                    .value()
+            }
+        };
+
         let key_path = bs58::encode(contract_hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
             .to_lowercase();
-        self.contracts_dir.join(key_path).with_extension("wasm")
+        Ok(self.contracts_dir.join(key_path).with_extension("wasm"))
     }
 }
 
