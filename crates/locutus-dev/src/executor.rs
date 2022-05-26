@@ -8,21 +8,17 @@ pub async fn wasm_runtime(
     mut app: AppState,
 ) -> Result<(), DynError> {
     loop {
-        tokio::select! {
-            req = command_receiver.recv() => {
-                execute_command(req.ok_or("channel closed")?, &mut app).await?;
-            }
-            interrupt = tokio::signal::ctrl_c() => {
-                interrupt?;
-                break;
-            }
+        let req = command_receiver.recv().await;
+        let dc = execute_command(req.ok_or("channel closed")?, &mut app).await?;
+        if dc {
+            break;
         }
     }
     Ok(())
 }
 
 #[allow(unused, clippy::diverging_sub_expression)]
-async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), DynError> {
+async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool, DynError> {
     let node = &mut *app.local_node.write().await;
     match req {
         req @ ClientRequest::Put { .. } => match node.handle_request(req).await {
@@ -65,7 +61,8 @@ async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<(), D
                 _ => unreachable!(),
             }
         }
+        ClientRequest::Disconnect { .. } => return Ok(true),
         _ => unreachable!(),
     }
-    Ok(())
+    Ok(false)
 }

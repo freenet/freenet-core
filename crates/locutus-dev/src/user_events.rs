@@ -1,12 +1,18 @@
-use std::{fmt::Display, fs::File, future::Future, io::Read, pin::Pin, time::Duration};
+use std::{fmt::Display, fs::File, future::Future, io::Read, pin::Pin, sync::Arc, time::Duration};
 
+use either::Either;
 use locutus_node::{
     BoxedClient, ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse,
 };
 use locutus_runtime::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::{signal::unix::SignalKind, sync::Mutex};
 
-use crate::{config::Config, state::AppState, CommandSender, DynError};
+use crate::{
+    config::{Config, DeserializationFmt},
+    state::AppState,
+    util, CommandSender, DynError,
+};
 
 type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
@@ -18,14 +24,12 @@ pub async fn user_fn_handler(
     let mut input = StdInput::new(config, app_state)?;
     println!("running... send a command or write \"help\" for help");
     loop {
-        tokio::select! {
-            command = input.recv() => {
-                command_sender.send(command?.1).await?;
-            }
-            interrupt = tokio::signal::ctrl_c() => {
-                interrupt?;
-                break;
-            }
+        let command = input.recv().await;
+        let command = command?;
+        let dc = command.1.is_disconnect();
+        command_sender.send(command.1).await?;
+        if dc {
+            break;
         }
     }
     Ok(())
@@ -37,24 +41,81 @@ struct StdInput {
     input: File,
     buf: Vec<u8>,
     app_state: AppState,
+    #[cfg(target_family = "unix")]
+    signal: Arc<Mutex<tokio::signal::unix::Signal>>,
 }
 
 impl StdInput {
     fn new(config: Config, app_state: AppState) -> Result<Self, DynError> {
-        let contract = WrappedContract::try_from((&*config.contract, vec![].into()))?;
+        #[cfg(target_family = "unix")]
+        let signal = Arc::new(Mutex::new(tokio::signal::unix::signal(
+            SignalKind::interrupt(),
+        )?));
+
+        let params = config
+            .params
+            .as_ref()
+            .map(|p| {
+                let mut f = File::open(p)?;
+                let mut buf = vec![];
+                f.read_to_end(&mut buf)?;
+                Ok::<_, DynError>(buf)
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let contract = WrappedContract::try_from((&*config.contract, params.into()))?;
         Ok(StdInput {
             input: File::open(&config.input_file)?,
             config,
             contract,
             buf: vec![],
             app_state,
+            #[cfg(target_family = "unix")]
+            signal,
         })
     }
 
-    fn read_input(&mut self) -> Result<CommandInput, DynError> {
+    fn read_input<T>(&mut self) -> Result<T, DynError>
+    where
+        T: DeserializeOwned,
+    {
         let mut buf = vec![];
         self.input.read_to_end(&mut buf).unwrap();
-        bincode::deserialize(&buf).map_err(Into::into)
+        util::deserialize(self.config.ser_format, &buf)
+    }
+
+    fn get_command_input<T>(&mut self) -> Result<T, ClientError>
+    where
+        T: From<Vec<u8>>,
+    {
+        match self.config.ser_format {
+            #[cfg(feature = "json")]
+            Some(DeserializationFmt::Json) => {
+                let state: serde_json::Value = self
+                    .read_input()
+                    .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
+                let json_str = serde_json::to_string_pretty(&state)
+                    .map_err(|e| ErrorKind::Unhandled(format!("{e}")))?;
+                println!("Putting value:\n{json_str}");
+                Ok(json_str.into_bytes().into())
+            }
+            #[cfg(feature = "messagepack")]
+            Some(DeserializationFmt::MessagePack) => {
+                let mut buf = vec![];
+                self.input.read_to_end(&mut buf).unwrap();
+                let state = rmpv::decode::read_value_ref(&mut buf.as_ref())
+                    .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
+                println!("Putting value:\n{state}");
+                Ok(buf.into())
+            }
+            _ => {
+                let state: Vec<u8> = self
+                    .read_input()
+                    .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
+                Ok(state.into())
+            }
+        }
     }
 }
 
@@ -100,6 +161,7 @@ enum Command {
     Get,
     Update,
     Help,
+    Exit,
 }
 
 struct CommandInfo {
@@ -129,6 +191,9 @@ impl From<CommandInfo> for (ClientId, ClientRequest) {
                     delta,
                 }
             }
+            Command::Exit => ClientRequest::Disconnect {
+                cause: Some("shutdown".to_owned()),
+            },
             _ => unreachable!(),
         };
         (ClientId::new(0), req)
@@ -140,7 +205,9 @@ const HELP: &str = "Locutus Contract Development Environment
 SUBCOMMANDS:
     help        Print this message
     get         Gets the current value of the contract. It will be piped into the set output pipe (file, terminal, etc.)
-    update      Attempts to update the contract and prints out the result of the operation";
+    update      Attempts to update the contract and prints out the result of the operation
+    put         Puts the state for the contract for the first time
+    exit        Exit from the TUI";
 
 impl TryFrom<&[u8]> for Command {
     type Error = String;
@@ -152,6 +219,7 @@ impl TryFrom<&[u8]> for Command {
             "get" => Ok(Command::Get),
             "update" => Ok(Command::Update),
             "help" => Ok(Command::Help),
+            "exit" => Ok(Command::Exit),
             v => Err(format!("command {v} unknown")),
         }
     }
@@ -162,68 +230,111 @@ impl ClientEventsProxy for StdInput {
     fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>> {
         Box::pin(async {
             loop {
-                let stdin = std::io::stdin();
-                for b in stdin.bytes() {
-                    let b =
-                        b.map_err(|_| ClientError::from(ErrorKind::TransportProtocolDisconnect))?;
-                    if b == b'\n' {
-                        break;
+                let signal = self.signal.clone();
+                let f = async {
+                    let stdin = std::io::stdin();
+                    for b in stdin.bytes() {
+                        let b = b.map_err(|_| {
+                            ClientError::from(ErrorKind::TransportProtocolDisconnect)
+                        })?;
+                        if b == b'\n' {
+                            break;
+                        }
+                        self.buf.push(b);
                     }
-                    self.buf.push(b);
-                }
-                // try parse command
-                match Command::try_from(&self.buf[..]) {
-                    Ok(cmd) if matches!(cmd, Command::Help) => {
-                        println!("{HELP}");
+                    if String::from_utf8_lossy(&self.buf[..]).trim().is_empty() {
+                        return Ok(Either::Right(()));
                     }
-                    Ok(cmd) if matches!(cmd, Command::Put) => match self.read_input() {
-                        Ok(CommandInput::Put { state }) => {
-                            return Ok(CommandInfo {
-                                cmd,
-                                contract: self.contract.clone(),
-                                input: Some(CommandInput::Put { state }),
-                            }
-                            .into());
+                    // try parse command
+                    match Command::try_from(&self.buf[..]) {
+                        Ok(cmd) if matches!(cmd, Command::Help) => {
+                            println!("{HELP}");
+                        }
+                        Ok(cmd) if matches!(cmd, Command::Put) => {
+                            let state: State = match self.get_command_input() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    println!("Error: {e}");
+                                    return Ok(Either::Right(()));
+                                }
+                            };
+                            self.buf.clear();
+                            return Ok(Either::Left(
+                                CommandInfo {
+                                    cmd,
+                                    contract: self.contract.clone(),
+                                    input: Some(CommandInput::Put { state }),
+                                }
+                                .into(),
+                            ));
+                        }
+                        Ok(cmd) if matches!(cmd, Command::Update) => {
+                            let delta: StateDelta = match self.get_command_input() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    println!("Error: {e}");
+                                    return Ok(Either::Right(()));
+                                }
+                            };
+                            self.buf.clear();
+                            return Ok(Either::Left(
+                                CommandInfo {
+                                    cmd,
+                                    contract: self.contract.clone(),
+                                    input: Some(CommandInput::Update { delta }),
+                                }
+                                .into(),
+                            ));
                         }
                         Ok(cmd) => {
-                            println!("Unexpected command: {cmd}");
+                            self.buf.clear();
+                            return Ok(Either::Left(
+                                CommandInfo {
+                                    cmd,
+                                    contract: self.contract.clone(),
+                                    input: None,
+                                }
+                                .into(),
+                            ));
                         }
                         Err(err) => {
-                            println!("Initial put error: {err}");
+                            println!("error: {err}");
+                            return Err(ClientError::from(ErrorKind::TransportProtocolDisconnect));
                         }
-                    },
-                    Ok(cmd) if matches!(cmd, Command::Update) => match self.read_input() {
-                        Ok(CommandInput::Update { delta }) => {
-                            return Ok(CommandInfo {
-                                cmd,
-                                contract: self.contract.clone(),
-                                input: Some(CommandInput::Update { delta }),
-                            }
-                            .into());
-                        }
-                        Ok(cmd) => {
-                            println!("Unexpected command: {cmd}");
-                        }
-                        Err(err) => {
-                            println!("Initial put error: {err}");
-                        }
-                    },
-                    Ok(cmd) => {
-                        self.buf.clear();
-                        return Ok(CommandInfo {
-                            cmd,
-                            contract: self.contract.clone(),
-                            input: None,
-                        }
-                        .into());
                     }
-                    Err(err) => {
-                        println!("error: {err}");
-                        return Err(ClientError::from(ErrorKind::TransportProtocolDisconnect));
+                    self.buf.clear();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(Either::<(ClientId, ClientRequest), _>::Right(()))
+                };
+                #[cfg(not(target_family = "unix"))]
+                {
+                    match f.await {
+                        Ok(Either::Right(_)) => continue,
+                        Ok(Either::Left(r)) => return Ok(r),
+                        Err(err) => return Err(err),
                     }
                 }
-                self.buf.clear();
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                #[cfg(target_family = "unix")]
+                {
+                    let mut l = signal.lock().await;
+                    tokio::select! {
+                        res = f => {
+                            match res {
+                                Ok(Either::Right(_)) => continue,
+                                Ok(Either::Left(r)) => return Ok(r),
+                                Err(err) => return Err(err),
+                            }
+                        }
+                        _ = l.recv() => {
+                            let cmd: (ClientId, ClientRequest) = CommandInfo {
+                                cmd: Command::Exit,
+                                contract: self.contract.clone(),
+                                input: None,
+                            }.into();
+                            break Ok(cmd);
+                        }
+                    }
+                }
             }
         })
     }
@@ -233,7 +344,7 @@ impl ClientEventsProxy for StdInput {
         _id: ClientId,
         _response: Result<HostResponse, ClientError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
-        todo!()
+        unimplemented!()
     }
 
     fn cloned(&self) -> BoxedClient {
@@ -249,6 +360,8 @@ impl Clone for StdInput {
             buf: Vec::new(),
             input: File::open(&self.config.input_file).unwrap(),
             app_state: self.app_state.clone(),
+            #[cfg(target_family = "unix")]
+            signal: self.signal.clone(),
         }
     }
 }

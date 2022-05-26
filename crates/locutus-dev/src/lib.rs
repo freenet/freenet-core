@@ -5,6 +5,7 @@ mod executor;
 mod local_node;
 mod state;
 mod user_events;
+pub(crate) mod util;
 
 pub use config::Config;
 pub use executor::wasm_runtime;

@@ -24,15 +24,24 @@ pub enum DeserializationFmt {
         .args(&["output-file", "terminal-output"])
 ))]
 pub struct Config {
-    /// Path to the contract to be loaded
+    /// Path to the contract to be loaded.
     #[clap(parse(from_os_str))]
     pub contract: PathBuf,
-    /// Path to the input file to read from on command
+    /// Path to the file containing the parameters for this contract. If not set the default parameters will be empty.
+    #[clap(long = "parameters", parse(from_os_str))]
+    pub params: Option<PathBuf>,
+    /// Path to the input file to read from on command.
     #[clap(short, long, parse(from_os_str), value_name = "INPUT_FILE")]
     pub input_file: PathBuf,
     /// Deserialization format, requires feature flags enabled.
-    #[clap(short, long, arg_enum, group = "fmt", value_name = "FORMAT")]
-    pub deser_format: Option<DeserializationFmt>,
+    #[clap(
+        short,
+        long = "deserialization-format",
+        arg_enum,
+        group = "fmt",
+        value_name = "FORMAT"
+    )]
+    pub ser_format: Option<DeserializationFmt>,
     /// Disable TUI mode (run only though CLI commands)
     #[clap(long)]
     pub disable_tui_mode: bool,

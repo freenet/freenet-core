@@ -174,6 +174,12 @@ pub enum ClientRequest {
     },
 }
 
+impl ClientRequest {
+    pub fn is_disconnect(&self) -> bool {
+        matches!(self, Self::Disconnect { .. })
+    }
+}
+
 impl Display for ClientRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

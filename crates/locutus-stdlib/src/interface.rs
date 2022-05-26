@@ -549,12 +549,13 @@ impl ContractKey {
         self.spec.as_ref()
     }
 
-    /// Returns the hash of the contract data only.
+    /// Returns the hash of the contract code only, if the key is fully specified.
     pub fn contract_part(&self) -> Option<&[u8; CONTRACT_KEY_SIZE]> {
         self.contract.as_ref()
     }
 
-    pub fn contract_part_as_str(&self) -> Option<String> {
+    /// Returns the encoded key of the contract code only, if the key is fully specified.
+    pub fn contract_part_encoded(&self) -> Option<String> {
         self.contract.as_ref().map(|c| {
             bs58::encode(c)
                 .with_alphabet(bs58::Alphabet::BITCOIN)

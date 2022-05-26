@@ -105,8 +105,10 @@ impl LocalNode {
                     .await
                     .map_err(|e| Either::Right(e.into()))?;
                 self.contract_params.insert(*key, contract.params().clone());
-                self.contract_data
-                    .insert(key.contract_part_as_str().unwrap(), contract.code().clone());
+                self.contract_data.insert(
+                    key.contract_part_encoded().unwrap(),
+                    contract.code().clone(),
+                );
                 let res = is_valid
                     .then(|| HostResponse::PutResponse(*key))
                     .ok_or(Either::Left(RequestError::Put(*key)));
@@ -198,7 +200,7 @@ impl LocalNode {
         let contract = contract.then(|| {
             let parameters = self.contract_params.get(&key).unwrap();
             let data_key = key
-                .contract_part_as_str()
+                .contract_part_encoded()
                 .or_else(|| {
                     Some(ContractCode::encode_key(
                         &self.runtime.contracts.code_hash_from_key(&key).unwrap(),

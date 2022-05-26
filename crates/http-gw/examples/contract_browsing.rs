@@ -33,7 +33,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = test_state()?;
     let contract = test_contract()?;
     log::info!("loaded contract {} in local node", contract.key().encode());
-    log::info!("decoded: {:x?}", contract.key().bytes());
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
@@ -52,16 +51,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(feature = "local"))]
+    {
+        panic!("only allowed if local feature is enabled");
+    }
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     // env_logger::Builder::from_default_env()
     //     .format_module_path(true)
     //     .filter_level(log::LevelFilter::Info)
     //     .init();
-
-    #[cfg(not(feature = "local"))]
-    {
-        panic!("only allowed if local feature is enabled");
-    }
 
     #[allow(unused_variables)]
     let rt = tokio::runtime::Builder::new_multi_thread()
