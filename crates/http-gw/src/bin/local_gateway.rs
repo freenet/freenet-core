@@ -1,4 +1,4 @@
-use locutus_node::SqlitePool;
+use locutus_node::{PeerKey, SqlitePool};
 use locutus_runtime::StateStore;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -16,7 +16,8 @@ async fn run() -> Result<(), DynError> {
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
-    http_gw::local_node::set_local_node(local_node, contract_store, state_store).await
+    let peer_key = PeerKey::random();
+    http_gw::local_node::set_local_node(local_node, peer_key, contract_store, state_store).await
 }
 
 fn main() -> Result<(), DynError> {

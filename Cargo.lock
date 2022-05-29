@@ -1382,6 +1382,7 @@ dependencies = [
  "async-trait",
  "byteorder",
  "env_logger",
+ "futures",
  "hyper",
  "locutus-dev",
  "locutus-node",

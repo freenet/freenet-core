@@ -68,6 +68,7 @@ pub enum ExecError {
     DoublePut(ContractKey),
 }
 
+#[derive(Clone)]
 pub struct Runtime {
     /// working memory store used by the inner engine
     store: Store,

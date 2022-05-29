@@ -1,9 +1,11 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use locutus_node::WrappedState;
-use locutus_runtime::{ContractKey, ContractStore};
+use locutus_runtime::{ContractKey, ContractStore, StateStore, StateSummary};
 use std::fs::File;
 use std::path::PathBuf;
 
+use locutus_dev::LocalNode;
+use locutus_node::*;
 use std::{
     collections::HashMap,
     future::Future,
@@ -12,13 +14,11 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tar::Archive;
-
-use locutus_node::*;
 use tokio::sync::{
+    mpsc,
     mpsc::{channel, Receiver, Sender},
     oneshot,
 };
-
 use warp::{
     filters::BoxedFilter,
     hyper::StatusCode,
@@ -42,8 +42,11 @@ impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
     pub fn as_filter(
         contract_store: ContractStore,
+        local_node: LocalNode,
+        peer_key: PeerKey,
     ) -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
         let (request_sender, server_request) = channel(PARALLELISM);
+
         let get_contract_web = warp::path::path("contract")
             .map(move || (request_sender.clone(), contract_store.clone()))
             .and(warp::path::param())
@@ -51,9 +54,10 @@ impl HttpGateway {
             .and_then(|(rs, cs), key: String| async move { handle_contract(key, rs, cs).await });
 
         let get_contract_state = warp::path::path("contract")
+            .map(move || (peer_key, local_node.clone()))
             .and(warp::path::param())
             .and(warp::path::path("state"))
-            .and_then(get_state);
+            .and_then(|(pk, ln), key: String| async move { handle_get_state(key, pk, ln).await });
 
         let get_home = warp::path::end().and_then(home);
 
@@ -92,6 +96,29 @@ impl From<std::path::StripPrefixError> for ExtractError {
     fn from(error: std::path::StripPrefixError) -> Self {
         ExtractError::StripPrefixError(error)
     }
+}
+
+async fn handle_get_state(
+    key: String,
+    peer_key: PeerKey,
+    mut local_node: LocalNode,
+) -> Result<impl Reply, Rejection> {
+    let (sender, mut receiver) = mpsc::unbounded_channel::<HostResponse>();
+    let key = ContractKey::from_spec(key).unwrap();
+    let state_summary = StateSummary::from(vec![]);
+    local_node
+        .register_contract_notifier(key, peer_key, sender, state_summary)
+        .unwrap();
+    Ok(reply::html(tokio::select! {
+        msg = receiver.recv() => {
+            match msg {
+                Some(HostResponse::UpdateResponse { key, summary }) => {
+                    summary.to_vec()
+                }
+                _ => vec![]
+            }
+        }
+    }))
 }
 
 async fn handle_contract(
@@ -184,8 +211,16 @@ fn get_web_body(state: WrappedState, path: PathBuf) -> Result<hyper::Body, DynEr
     Ok(hyper::Body::from(index))
 }
 
-async fn get_state(contract_key: String) -> Result<impl Reply, Rejection> {
-    Ok(reply::html(contract_key))
+async fn get_state(
+    contract_key: String,
+    state_store: StateStore<SqlitePool>,
+    ws: warp::ws::Ws,
+) -> Result<impl Reply, Rejection> {
+    let key = ContractKey::from_spec(contract_key)
+        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+    let state = state_store.get(&key).await.unwrap().to_vec();
+
+    Ok(reply::html(hyper::Body::from(state)))
 }
 
 async fn home() -> Result<impl Reply, Rejection> {
@@ -252,10 +287,12 @@ mod errors {
 
     #[derive(Debug)]
     pub(super) struct InvalidParam(pub String);
+
     impl Reject for InvalidParam {}
 
     #[derive(Debug)]
     pub(super) struct NodeError;
+
     impl Reject for NodeError {}
 }
 

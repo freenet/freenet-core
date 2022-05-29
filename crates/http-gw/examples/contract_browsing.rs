@@ -3,7 +3,7 @@
 use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 
 use locutus_dev::ContractStore;
-use locutus_node::{either::Either, SqlitePool, WrappedState};
+use locutus_node::{either::Either, PeerKey, SqlitePool, WrappedState};
 use locutus_runtime::{ContractCode, StateStore, WrappedContract};
 
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
@@ -38,6 +38,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
+    let peer_key = PeerKey::random();
     if let Err(err) = local_node
         .handle_request(locutus_node::ClientRequest::Put { contract, state })
         .await
@@ -47,7 +48,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Either::Right(err) => log::error!("other error: {err}"),
         }
     }
-    http_gw::local_node::set_local_node(local_node, contract_store, state_store).await
+    http_gw::local_node::set_local_node(local_node, peer_key, contract_store, state_store).await
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

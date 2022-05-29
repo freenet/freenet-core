@@ -1,10 +1,11 @@
+use futures::TryFutureExt;
 use std::{collections::HashMap, sync::Arc};
 
-use crossbeam::channel::Sender;
 use locutus_node::{
     either::Either, ClientRequest, HostResponse, PeerKey, RequestError, SqlitePool,
 };
 use locutus_runtime::{prelude::*, ContractRuntimeError};
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 
 use crate::DynError;
 
@@ -16,11 +17,12 @@ type Response = Result<HostResponse, Either<RequestError, DynError>>;
 /// This node will monitor the store directories and databases to detect state changes.
 /// Consumers of the node are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
+#[derive(Clone)]
 pub struct LocalNode {
     contract_params: HashMap<ContractKey, Parameters<'static>>,
     contract_data: HashMap<String, Arc<ContractCode<'static>>>,
     runtime: Runtime,
-    update_notifications: HashMap<ContractKey, Vec<(PeerKey, Sender<HostResponse>)>>,
+    update_notifications: HashMap<ContractKey, Vec<(PeerKey, UnboundedSender<HostResponse>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<PeerKey, StateSummary<'static>>>,
     contract_state: StateStore<SqlitePool>,
 }
@@ -44,7 +46,7 @@ impl LocalNode {
         &mut self,
         key: ContractKey,
         peer_key: PeerKey,
-        notification_ch: Sender<HostResponse>,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResponse>,
         summary: StateSummary<'static>,
     ) -> Result<(), DynError> {
         let channels = self.update_notifications.entry(key).or_default();
@@ -112,7 +114,9 @@ impl LocalNode {
                 let res = is_valid
                     .then(|| HostResponse::PutResponse(*key))
                     .ok_or(Either::Left(RequestError::Put(*key)));
-                self.send_update_notification(key, contract.params(), &state)?;
+                self.send_update_notification(key, contract.params(), &state)
+                    .await
+                    .unwrap();
                 res
             }
             ClientRequest::Update { key, delta } => {
@@ -140,7 +144,8 @@ impl LocalNode {
                     .summarize_state(&key, &parameters, &new_state)
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                self.send_update_notification(&key, &parameters, &new_state)?;
+                self.send_update_notification(&key, &parameters, &new_state)
+                    .await;
                 // TODO: in network mode, wait at least for one confirmation
                 //       when a node receives a delta from updates, run the update themselves
                 //       and send back confirmation
@@ -165,7 +170,7 @@ impl LocalNode {
         }
     }
 
-    fn send_update_notification<'a>(
+    async fn send_update_notification<'a>(
         &'a mut self,
         key: &ContractKey,
         params: &Parameters<'a>,
@@ -186,7 +191,7 @@ impl LocalNode {
                     })?;
                 notifier
                     .send(HostResponse::UpdateNotification { key: *key, update })
-                    .map_err(|_| Either::Right("disconnected".into()))?;
+                    .unwrap();
             }
         }
         Ok(())
