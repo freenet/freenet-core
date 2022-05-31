@@ -25,8 +25,12 @@ pub mod local_node {
         state_store: StateStore<SqlitePool>,
     ) -> Result<(), DynError> {
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
-        let (mut http_handle, filter) =
-            HttpGateway::as_filter(contract_store.clone(), local_node.clone(), peer_key.clone());
+        let (mut http_handle, filter) = HttpGateway::as_filter(
+            contract_store.clone(),
+            state_store.clone(),
+            local_node.clone(),
+            peer_key.clone(),
+        );
         let ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;
         //let mut all_clients =
         //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);

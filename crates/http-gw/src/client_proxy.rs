@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use locutus_node::WrappedState;
-use locutus_runtime::{ContractKey, ContractStore, StateStore, StateSummary};
+use locutus_runtime::{ContractKey, ContractStore, Parameters, StateStore, StateSummary};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -42,13 +42,20 @@ impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
     pub fn as_filter(
         contract_store: ContractStore,
+        state_store: StateStore<SqlitePool>,
         local_node: LocalNode,
         peer_key: PeerKey,
     ) -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
         let (request_sender, server_request) = channel(PARALLELISM);
 
+        let cs = contract_store.clone();
+        let cs2 = contract_store.clone();
+        let ss = state_store.clone();
+        let rs = request_sender.clone();
+        let rs2 = request_sender.clone();
+
         let get_contract_web = warp::path::path("contract")
-            .map(move || (request_sender.clone(), contract_store.clone()))
+            .map(move || (rs.clone(), cs.clone()))
             .and(warp::path::param())
             .and(warp::path::end())
             .and_then(|(rs, cs), key: String| async move { handle_contract(key, rs, cs).await });
@@ -59,10 +66,19 @@ impl HttpGateway {
             .and(warp::path::path("state"))
             .and_then(|(pk, ln), key: String| async move { handle_get_state(key, pk, ln).await });
 
+        let put_contract_state = warp::path::path("contract")
+            .map(move || (rs2.clone(), cs2.clone(), ss.clone()))
+            .and(warp::path::param())
+            .and(warp::path::path("state_put"))
+            .and_then(|(rs, cs, ss), key: String| async move {
+                handle_put_state(key, rs, cs, ss).await
+            });
+
         let get_home = warp::path::end().and_then(home);
 
         let filters = get_contract_web
             .or(get_contract_state)
+            .or(put_contract_state)
             .or(get_home)
             .recover(errors::handle_error)
             .with(warp::trace::request());
@@ -119,6 +135,26 @@ async fn handle_get_state(
             }
         }
     }))
+}
+
+async fn handle_put_state(
+    key: String,
+    request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
+    contract_store: ContractStore,
+    state_store: StateStore<SqlitePool>,
+) -> Result<impl Reply, Rejection> {
+    let key = ContractKey::from_spec(key)
+        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+    let params = Parameters::from(vec![]);
+    let contract = contract_store.fetch_contract(&key, &params).unwrap();
+    let state = state_store.get(&key).await.unwrap();
+    let (tx, response) = oneshot::channel();
+    request_sender
+        .send((ClientRequest::Put { contract, state }, tx))
+        .await
+        .map_err(|_| reject::custom(errors::NodeError))?;
+
+    Ok(reply::html("Ok"))
 }
 
 async fn handle_contract(
