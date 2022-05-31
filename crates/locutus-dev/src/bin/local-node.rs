@@ -4,6 +4,7 @@ use locutus_dev::{user_fn_handler, wasm_runtime, AppState, Config};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("error"));
     let cli = Config::parse();
     if cli.disable_tui_mode {
         return Err("CLI mode not yet implemented".into());

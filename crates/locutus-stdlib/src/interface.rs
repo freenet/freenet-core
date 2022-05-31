@@ -18,9 +18,16 @@ use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 32;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ContractError {
+    #[error("invalid contract update")]
     InvalidUpdate,
+    #[error("trying to read an invalid state")]
+    InvalidState,
+    #[error("trying to read an invalid delta")]
+    InvalidDelta,
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 #[doc(hidden)]
@@ -32,10 +39,8 @@ pub enum UpdateResult {
 }
 
 impl From<ContractError> for UpdateResult {
-    fn from(err: ContractError) -> Self {
-        match err {
-            ContractError::InvalidUpdate => UpdateResult::Invalid,
-        }
+    fn from(_err: ContractError) -> Self {
+        UpdateResult::Invalid
     }
 }
 
@@ -71,6 +76,7 @@ pub trait ContractInterface {
         delta: StateDelta<'static>,
     ) -> Result<UpdateModification, ContractError>;
 
+    // FIXME: should return a result type, instead
     /// Generate a concise summary of a state that can be used to create deltas
     /// relative to this state.
     fn summarize_state(
@@ -78,6 +84,7 @@ pub trait ContractInterface {
         state: State<'static>,
     ) -> StateSummary<'static>;
 
+    // FIXME: should return a result type, instead
     /// Generate a state delta using a summary from the current state.
     /// This along with [`Self::summarize_state`] allows flexible and efficient
     /// state synchronization between peers.

@@ -132,8 +132,8 @@ impl HostResponse {
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum RequestError {
-    #[error("put error for contract {0}")]
-    Put(ContractKey),
+    #[error("put error for contract {key}, reason: {cause}")]
+    Put { key: ContractKey, cause: String },
     #[error("update error for contract {key}, reason: {cause}")]
     Update { key: ContractKey, cause: String },
     #[error("failed to get contract {key}, reason: {cause}")]
