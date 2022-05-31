@@ -41,17 +41,10 @@ struct StdInput {
     input: File,
     buf: Vec<u8>,
     app_state: AppState,
-    #[cfg(target_family = "unix")]
-    signal: Arc<Mutex<tokio::signal::unix::Signal>>,
 }
 
 impl StdInput {
     fn new(config: Config, app_state: AppState) -> Result<Self, DynError> {
-        #[cfg(target_family = "unix")]
-        let signal = Arc::new(Mutex::new(tokio::signal::unix::signal(
-            SignalKind::interrupt(),
-        )?));
-
         let params = config
             .params
             .as_ref()
@@ -71,8 +64,6 @@ impl StdInput {
             contract,
             buf: vec![],
             app_state,
-            #[cfg(target_family = "unix")]
-            signal,
         })
     }
 
@@ -85,7 +76,7 @@ impl StdInput {
         util::deserialize(self.config.ser_format, &buf)
     }
 
-    fn get_command_input<T>(&mut self) -> Result<T, ClientError>
+    fn get_command_input<T>(&mut self, cmd: Command) -> Result<T, ClientError>
     where
         T: From<Vec<u8>>,
     {
@@ -97,7 +88,7 @@ impl StdInput {
                     .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
                 let json_str = serde_json::to_string_pretty(&state)
                     .map_err(|e| ErrorKind::Unhandled(format!("{e}")))?;
-                println!("Putting value:\n{json_str}");
+                println!("{cmd:?} value:\n{json_str}");
                 Ok(json_str.into_bytes().into())
             }
             #[cfg(feature = "messagepack")]
@@ -106,7 +97,7 @@ impl StdInput {
                 self.input.read_to_end(&mut buf).unwrap();
                 let state = rmpv::decode::read_value_ref(&mut buf.as_ref())
                     .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
-                println!("Putting value:\n{state}");
+                println!("{cmd:?} value:\n{state}");
                 Ok(buf.into())
             }
             _ => {
@@ -230,7 +221,6 @@ impl ClientEventsProxy for StdInput {
     fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>> {
         Box::pin(async {
             loop {
-                let signal = self.signal.clone();
                 let f = async {
                     let stdin = std::io::stdin();
                     for b in stdin.bytes() {
@@ -251,7 +241,7 @@ impl ClientEventsProxy for StdInput {
                             println!("{HELP}");
                         }
                         Ok(cmd) if matches!(cmd, Command::Put) => {
-                            let state: State = match self.get_command_input() {
+                            let state: State = match self.get_command_input(Command::Put) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     println!("Error: {e}");
@@ -269,7 +259,7 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(cmd) if matches!(cmd, Command::Update) => {
-                            let delta: StateDelta = match self.get_command_input() {
+                            let delta: StateDelta = match self.get_command_input(Command::Update) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     println!("Error: {e}");
@@ -306,34 +296,10 @@ impl ClientEventsProxy for StdInput {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     Ok(Either::<(ClientId, ClientRequest), _>::Right(()))
                 };
-                #[cfg(not(target_family = "unix"))]
-                {
-                    match f.await {
-                        Ok(Either::Right(_)) => continue,
-                        Ok(Either::Left(r)) => return Ok(r),
-                        Err(err) => return Err(err),
-                    }
-                }
-                #[cfg(target_family = "unix")]
-                {
-                    let mut l = signal.lock().await;
-                    tokio::select! {
-                        res = f => {
-                            match res {
-                                Ok(Either::Right(_)) => continue,
-                                Ok(Either::Left(r)) => return Ok(r),
-                                Err(err) => return Err(err),
-                            }
-                        }
-                        _ = l.recv() => {
-                            let cmd: (ClientId, ClientRequest) = CommandInfo {
-                                cmd: Command::Exit,
-                                contract: self.contract.clone(),
-                                input: None,
-                            }.into();
-                            break Ok(cmd);
-                        }
-                    }
+                match f.await {
+                    Ok(Either::Right(_)) => continue,
+                    Ok(Either::Left(r)) => return Ok(r),
+                    Err(err) => return Err(err),
                 }
             }
         })
@@ -360,8 +326,6 @@ impl Clone for StdInput {
             buf: Vec::new(),
             input: File::open(&self.config.input_file).unwrap(),
             app_state: self.app_state.clone(),
-            #[cfg(target_family = "unix")]
-            signal: self.signal.clone(),
         }
     }
 }

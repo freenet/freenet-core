@@ -1,3 +1,4 @@
+use either::Either;
 use locutus_node::{ClientRequest, HostResponse};
 
 use crate::{config::Config, state::AppState, CommandReceiver, DynError};

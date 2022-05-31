@@ -91,9 +91,11 @@ impl LocalNode {
                 self.runtime
                     .contracts
                     .store_contract(contract.clone())
-                    .map_err(|err| Either::Right(err.into()))?;
+                    .map_err(Into::into)
+                    .map_err(Either::Right)?;
 
                 let key = contract.key();
+                log::debug!("executing with params: {:?}", contract.params());
                 let is_valid = self
                     .runtime
                     .validate_state(key, contract.params(), &state)
@@ -103,7 +105,8 @@ impl LocalNode {
                 self.contract_state
                     .store(*key, state.clone())
                     .await
-                    .map_err(|e| Either::Right(e.into()))?;
+                    .map_err(Into::into)
+                    .map_err(Either::Right)?;
                 self.contract_params.insert(*key, contract.params().clone());
                 self.contract_data.insert(
                     key.contract_part_encoded().unwrap(),
@@ -111,27 +114,45 @@ impl LocalNode {
                 );
                 let res = is_valid
                     .then(|| HostResponse::PutResponse(*key))
-                    .ok_or(Either::Left(RequestError::Put(*key)));
+                    .ok_or_else(|| {
+                        Either::Left(RequestError::Put {
+                            key: *key,
+                            cause: "not valid".to_owned(),
+                        })
+                    });
                 self.send_update_notification(key, contract.params(), &state)?;
                 res
             }
             ClientRequest::Update { key, delta } => {
-                let parameters = self.contract_params.get(&key).unwrap().clone();
+                let parameters = self
+                    .contract_params
+                    .get(&key)
+                    .ok_or_else(|| Either::Right("contract not found".into()))?
+                    .clone();
                 let new_state = {
-                    let state = self.contract_state.get(&key).await.unwrap().clone();
+                    let state = self
+                        .contract_state
+                        .get(&key)
+                        .await
+                        .map_err(Into::into)
+                        .map_err(Either::Right)?
+                        .clone();
                     let new_state = self
                         .runtime
                         .update_state(&key, &parameters, &state, &delta)
                         .map_err(|err| match err {
                             ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
-                                Either::Left(RequestError::Put(key))
+                                Either::Left(RequestError::Update {
+                                    key,
+                                    cause: "invalid put value".to_owned(),
+                                })
                             }
                             other => Either::Right(other.into()),
                         })?;
                     self.contract_state
                         .store(key, new_state.clone())
                         .await
-                        .unwrap();
+                        .map_err(|err| Either::Right(err.into()))?;
                     new_state
                 };
                 // in the network impl this would be sent over the network
@@ -180,7 +201,10 @@ impl LocalNode {
                     .get_state_delta(key, params, new_state, &*peer_summary)
                     .map_err(|err| match err {
                         ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
-                            Either::Left(RequestError::Put(*key))
+                            Either::Left(RequestError::Put {
+                                key: *key,
+                                cause: "invalid put value".to_owned(),
+                            })
                         }
                         other => Either::Right(other.into()),
                     })?;

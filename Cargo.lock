@@ -1955,6 +1955,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "either",
+ "env_logger",
  "futures",
  "locutus-node",
  "locutus-runtime",
