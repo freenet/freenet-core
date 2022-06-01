@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 byteorder = "1"
 clap = { version = "3", features = ["derive", "env"] }
-crossbeam = "0.8"
 env_logger = "0.9"
 either = "1"
 futures = "0.3"

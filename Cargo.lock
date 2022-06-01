@@ -1954,7 +1954,6 @@ dependencies = [
  "bincode",
  "byteorder",
  "clap",
- "crossbeam",
  "either",
  "env_logger",
  "futures",

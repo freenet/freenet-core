@@ -1,11 +1,10 @@
-use futures::TryFutureExt;
 use std::{collections::HashMap, sync::Arc};
 
 use locutus_node::{
     either::Either, ClientRequest, HostResponse, PeerKey, RequestError, SqlitePool,
 };
 use locutus_runtime::{prelude::*, ContractRuntimeError};
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::DynError;
 
@@ -24,7 +23,7 @@ pub struct LocalNode {
     runtime: Runtime,
     update_notifications: HashMap<ContractKey, Vec<(PeerKey, UnboundedSender<HostResponse>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<PeerKey, StateSummary<'static>>>,
-    contract_state: StateStore<SqlitePool>,
+    pub(crate) contract_state: StateStore<SqlitePool>,
 }
 
 impl LocalNode {
@@ -103,9 +102,17 @@ impl LocalNode {
                     .validate_state(key, contract.params(), &state)
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
+                let res = is_valid
+                    .then(|| HostResponse::PutResponse(*key))
+                    .ok_or_else(|| {
+                        Either::Left(RequestError::Put {
+                            key: *key,
+                            cause: "not valid".to_owned(),
+                        })
+                    })?;
 
                 self.contract_state
-                    .store(*key, state.clone())
+                    .store(*key, state.clone(), Some(contract.params().clone()))
                     .await
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
@@ -114,14 +121,6 @@ impl LocalNode {
                     key.contract_part_encoded().unwrap(),
                     contract.code().clone(),
                 );
-                let res = is_valid
-                    .then(|| HostResponse::PutResponse(*key))
-                    .ok_or_else(|| {
-                        Either::Left(RequestError::Put {
-                            key: *key,
-                            cause: "not valid".to_owned(),
-                        })
-                    });
                 self.send_update_notification(key, contract.params(), &state)
                     .await
                     .map_err(|_| {
@@ -130,14 +129,24 @@ impl LocalNode {
                             cause: "failed while sending notifications".to_owned(),
                         })
                     })?;
-                res
+                Ok(res)
             }
             ClientRequest::Update { key, delta } => {
-                let parameters = self
-                    .contract_params
-                    .get(&key)
-                    .ok_or_else(|| Either::Right("contract not found".into()))?
-                    .clone();
+                let parameters = {
+                    match self
+                        .contract_params
+                        .get(&key)
+                        .ok_or_else(|| Either::Right("contract not found".into()))
+                    {
+                        Ok(state) => state.clone(),
+                        Err(err) => self
+                            .contract_state
+                            .get_params(&key)
+                            .await
+                            .map_err(|_| err)?,
+                    }
+                };
+
                 let new_state = {
                     let state = self
                         .contract_state
@@ -153,13 +162,13 @@ impl LocalNode {
                             ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
                                 Either::Left(RequestError::Update {
                                     key,
-                                    cause: "invalid put value".to_owned(),
+                                    cause: "invalid update value".to_owned(),
                                 })
                             }
                             other => Either::Right(other.into()),
                         })?;
                     self.contract_state
-                        .store(key, new_state.clone())
+                        .store(key, new_state.clone(), None)
                         .await
                         .map_err(|err| Either::Right(err.into()))?;
                     new_state
@@ -171,7 +180,13 @@ impl LocalNode {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.send_update_notification(&key, &parameters, &new_state)
-                    .await;
+                    .await
+                    .map_err(|_| {
+                        Either::Left(RequestError::Put {
+                            key,
+                            cause: "failed while sending notifications".to_owned(),
+                        })
+                    })?;
                 // TODO: in network mode, wait at least for one confirmation
                 //       when a node receives a delta from updates, run the update themselves
                 //       and send back confirmation

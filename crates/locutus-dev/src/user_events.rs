@@ -1,4 +1,4 @@
-use std::{fmt::Display, fs::File, future::Future, io::Read, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt::Display, fs::File, future::Future, io::Read, pin::Pin, time::Duration};
 
 use either::Either;
 use locutus_node::{
@@ -6,13 +6,21 @@ use locutus_node::{
 };
 use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::{signal::unix::SignalKind, sync::Mutex};
 
 use crate::{
     config::{Config, DeserializationFmt},
     state::AppState,
     util, CommandSender, DynError,
 };
+
+const HELP: &str = "Locutus Contract Development Environment
+
+SUBCOMMANDS:
+    help        Print this message
+    get         Gets the current value of the contract. It will be piped into the set output pipe (file, terminal, etc.)
+    update      Attempts to update the contract and prints out the result of the operation
+    put         Puts the state for the contract for the first time
+    exit        Exit from the TUI";
 
 type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
@@ -150,9 +158,27 @@ impl Display for CommandInput {
 enum Command {
     Put,
     Get,
+    GetParams,
     Update,
     Help,
     Exit,
+}
+
+impl TryFrom<&[u8]> for Command {
+    type Error = String;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let cmd = std::str::from_utf8(value).map_err(|e| format!("{e}"))?;
+        match cmd {
+            "put" => Ok(Command::Put),
+            "get" => Ok(Command::Get),
+            "get params" => Ok(Command::GetParams),
+            "update" => Ok(Command::Update),
+            "help" => Ok(Command::Help),
+            "exit" => Ok(Command::Exit),
+            v => Err(format!("unknown command: {v}")),
+        }
+    }
 }
 
 struct CommandInfo {
@@ -191,34 +217,9 @@ impl From<CommandInfo> for (ClientId, ClientRequest) {
     }
 }
 
-const HELP: &str = "Locutus Contract Development Environment
-
-SUBCOMMANDS:
-    help        Print this message
-    get         Gets the current value of the contract. It will be piped into the set output pipe (file, terminal, etc.)
-    update      Attempts to update the contract and prints out the result of the operation
-    put         Puts the state for the contract for the first time
-    exit        Exit from the TUI";
-
-impl TryFrom<&[u8]> for Command {
-    type Error = String;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let cmd = std::str::from_utf8(value).map_err(|e| format!("{e}"))?;
-        match cmd {
-            "put" => Ok(Command::Put),
-            "get" => Ok(Command::Get),
-            "update" => Ok(Command::Update),
-            "help" => Ok(Command::Help),
-            "exit" => Ok(Command::Exit),
-            v => Err(format!("command {v} unknown")),
-        }
-    }
-}
-
 #[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for StdInput {
-    fn recv(&mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + '_>> {
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + 'a>> {
         Box::pin(async {
             loop {
                 let f = async {
@@ -237,10 +238,10 @@ impl ClientEventsProxy for StdInput {
                     }
                     // try parse command
                     match Command::try_from(&self.buf[..]) {
-                        Ok(cmd) if matches!(cmd, Command::Help) => {
+                        Ok(Command::Help) => {
                             println!("{HELP}");
                         }
-                        Ok(cmd) if matches!(cmd, Command::Put) => {
+                        Ok(cmd @ Command::Put) => {
                             let state: State = match self.get_command_input(Command::Put) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -258,7 +259,7 @@ impl ClientEventsProxy for StdInput {
                                 .into(),
                             ));
                         }
-                        Ok(cmd) if matches!(cmd, Command::Update) => {
+                        Ok(cmd @ Command::Update) => {
                             let delta: StateDelta = match self.get_command_input(Command::Update) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -276,6 +277,15 @@ impl ClientEventsProxy for StdInput {
                                 .into(),
                             ));
                         }
+                        Ok(Command::GetParams) => {
+                            let node = &*self.app_state.local_node.read().await;
+                            // let p = node
+                            //     .contract_state
+                            //     .get_params(self.contract.key())
+                            //     .await
+                            //     .unwrap();
+                            // self.app_state.printout_deser(&p);
+                        }
                         Ok(cmd) => {
                             self.buf.clear();
                             return Ok(Either::Left(
@@ -288,8 +298,8 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Err(err) => {
-                            println!("error: {err}");
-                            return Err(ClientError::from(ErrorKind::TransportProtocolDisconnect));
+                            println!("{err}");
+                            self.buf.clear();
                         }
                     }
                     self.buf.clear();

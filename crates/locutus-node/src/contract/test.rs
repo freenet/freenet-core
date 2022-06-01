@@ -77,6 +77,14 @@ impl StateStorage for MemKVStore {
     ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
         todo!()
     }
+
+    async fn store_params(
+        &mut self,
+        key: ContractKey,
+        state: locutus_runtime::Parameters<'static>,
+    ) -> Result<(), Self::Error> {
+        todo!()
+    }
 }
 
 impl MemKVStore {
@@ -97,7 +105,7 @@ where
 
 impl<KVStore> MemoryContractHandler<KVStore>
 where
-    KVStore: StateStorage,
+    KVStore: StateStorage + Send + Sync + 'static,
     <KVStore as StateStorage>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     const MAX_MEM_CACHE: i64 = 10_000_000;

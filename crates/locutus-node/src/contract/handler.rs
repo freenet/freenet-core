@@ -180,8 +180,9 @@ pub(crate) enum ContractHandlerEvent<Err> {
 }
 
 pub(in crate::contract) mod sqlite {
-    use std::{collections::HashMap, str::FromStr};
+    use std::{collections::HashMap, pin::Pin, str::FromStr};
 
+    use futures::Future;
     use locutus_runtime::{
         ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, StateStorage,
         StateStoreError,
@@ -201,6 +202,7 @@ pub(in crate::contract) mod sqlite {
             SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
         } else {
             let conn_str = CONFIG.config_paths.db_dir.join("locutus.db");
+            log::info!("loading contract store from {conn_str:?}");
             SqliteConnectOptions::new()
                 .create_if_missing(true)
                 .filename(conn_str)
@@ -217,7 +219,8 @@ pub(in crate::contract) mod sqlite {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS states (
                     contract        BLOB PRIMARY KEY,
-                    state           BLOB
+                    state           BLOB,
+                    params          BLOB
                 )",
         )
         .execute(&*POOL)
@@ -244,11 +247,16 @@ pub(in crate::contract) mod sqlite {
             key: ContractKey,
             state: locutus_runtime::WrappedState,
         ) -> Result<(), Self::Error> {
-            sqlx::query("INSERT OR REPLACE INTO states (contract, state) VALUES ($1, $2)")
-                .bind(key.bytes())
-                .bind(state.as_ref())
-                .execute(&self.0)
-                .await?;
+            sqlx::query(
+                "INSERT INTO states (contract, state) 
+                     VALUES ($1, $2) 
+                     ON CONFLICT(contract) DO UPDATE SET state = excluded.state
+                     ",
+            )
+            .bind(key.bytes())
+            .bind(state.as_ref())
+            .execute(&self.0)
+            .await?;
             Ok(())
         }
 
@@ -266,6 +274,44 @@ pub(in crate::contract) mod sqlite {
                 Err(sqlx::Error::RowNotFound) => Ok(None),
                 Err(_) => Err(SqlDbError::ContractNotFound),
             }
+        }
+
+        async fn store_params(
+            &mut self,
+            key: ContractKey,
+            params: Parameters<'static>,
+        ) -> Result<(), Self::Error> {
+            sqlx::query(
+                "INSERT OR REPLACE INTO states (contract, params) 
+                     VALUES ($1, $2)
+                     ON CONFLICT(contract) DO UPDATE SET params = excluded.params
+                     ",
+            )
+            .bind(key.bytes())
+            .bind(params.as_ref())
+            .execute(&self.0)
+            .await?;
+            Ok(())
+        }
+
+        fn get_params<'a>(
+            &'a self,
+            key: &'a ContractKey,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                match sqlx::query("SELECT param FROM states WHERE contract = ?")
+                    .bind(key.bytes())
+                    .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("state"))))
+                    .fetch_one(&self.0)
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(sqlx::Error::RowNotFound) => Ok(None),
+                    Err(_) => Err(SqlDbError::ContractNotFound),
+                }
+            })
         }
     }
 
@@ -397,7 +443,8 @@ pub(in crate::contract) mod sqlite {
                     if !is_valid {
                         todo!("return error");
                     }
-                    self.state_store.store(*contract.key(), state).await?;
+                    let params: Parameters<'static> = contract.params().clone().into_owned().into();
+                    self.state_store.store(*contract.key(), state, None).await?;
                     todo!()
                 }
                 _ => unimplemented!(),
