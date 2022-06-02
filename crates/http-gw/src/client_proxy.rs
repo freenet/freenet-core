@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use locutus_dev::LocalNode;
 use locutus_node::*;
+use std::cell::Cell;
 use std::{
     collections::HashMap,
     future::Future,
@@ -14,6 +15,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tar::Archive;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{
     mpsc,
     mpsc::{channel, Receiver, Sender},
@@ -54,6 +56,9 @@ impl HttpGateway {
         let rs = request_sender.clone();
         let rs2 = request_sender.clone();
 
+        let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
+        let sender = sender.clone();
+
         let get_contract_web = warp::path::path("contract")
             .map(move || (rs.clone(), cs.clone()))
             .and(warp::path::param())
@@ -61,10 +66,12 @@ impl HttpGateway {
             .and_then(|(rs, cs), key: String| async move { handle_contract(key, rs, cs).await });
 
         let get_contract_state = warp::path::path("contract")
-            .map(move || (peer_key, local_node.clone()))
+            .map(move || (peer_key, local_node.clone(), sender.clone(), receiver))
             .and(warp::path::param())
             .and(warp::path::path("state"))
-            .and_then(|(pk, ln), key: String| async move { handle_get_state(key, pk, ln).await });
+            .and_then(|(pk, ln, s, r), key: String| async move {
+                handle_get_state(key, pk, ln, s, r).await
+            });
 
         let put_contract_state = warp::path::path("contract")
             .map(move || (rs2.clone(), cs2.clone(), ss.clone()))
@@ -118,20 +125,23 @@ async fn handle_get_state(
     key: String,
     peer_key: PeerKey,
     mut local_node: LocalNode,
+    sender: UnboundedSender<String>,
+    receiver: UnboundedReceiver<String>,
 ) -> Result<impl Reply, Rejection> {
-    let (sender, mut receiver) = mpsc::unbounded_channel::<HostResponse>();
+    //let (sender, mut receiver) = mpsc::unbounded_channel::<HostResponse>();
     let key = ContractKey::from_spec(key).unwrap();
     let state_summary = StateSummary::from(vec![]);
-    local_node
-        .register_contract_notifier(key, peer_key, sender, state_summary)
-        .unwrap();
+    // local_node
+    //     .register_contract_notifier(key, peer_key, sender, state_summary)
+    //     .unwrap();
+    let mut r = receiver.unwrap();
     Ok(reply::html(tokio::select! {
-        msg = receiver.recv() => {
+        msg = r.recv() => {
             match msg {
-                Some(HostResponse::UpdateResponse { key, summary }) => {
-                    summary.to_vec()
+                Some(state) => {
+                    state
                 }
-                _ => vec![]
+                _ => String::from("state")
             }
         }
     }))
@@ -143,6 +153,7 @@ async fn handle_put_state(
     contract_store: ContractStore,
     state_store: StateStore<SqlitePool>,
 ) -> Result<impl Reply, Rejection> {
+    println!("{}", key);
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let params = Parameters::from(vec![]);
