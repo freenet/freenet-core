@@ -14,10 +14,10 @@ async fn run() -> Result<(), DynError> {
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
+    let peer_key = PeerKey::random();
     let local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
-    let peer_key = PeerKey::random();
-    http_gw::local_node::set_local_node(local_node, peer_key, contract_store, state_store).await
+    http_gw::local_node::set_local_node(local_node).await
 }
 
 fn main() -> Result<(), DynError> {

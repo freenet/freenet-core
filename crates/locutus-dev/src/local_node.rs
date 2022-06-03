@@ -20,10 +20,10 @@ type Response = Result<HostResponse, Either<RequestError, DynError>>;
 pub struct LocalNode {
     contract_params: HashMap<ContractKey, Parameters<'static>>,
     contract_data: HashMap<String, Arc<ContractCode<'static>>>,
-    runtime: Runtime,
+    pub runtime: Runtime,
     update_notifications: HashMap<ContractKey, Vec<(PeerKey, UnboundedSender<HostResponse>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<PeerKey, StateSummary<'static>>>,
-    pub(crate) contract_state: StateStore<SqlitePool>,
+    pub contract_state: StateStore<SqlitePool>,
 }
 
 impl LocalNode {

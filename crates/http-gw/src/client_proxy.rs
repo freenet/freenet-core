@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use locutus_dev::LocalNode;
 use locutus_node::*;
-use std::cell::Cell;
 use std::{
     collections::HashMap,
     future::Future,
@@ -15,7 +14,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tar::Archive;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{
     mpsc,
     mpsc::{channel, Receiver, Sender},
@@ -43,43 +41,31 @@ pub struct HttpGateway {
 impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
     pub fn as_filter(
-        contract_store: ContractStore,
-        state_store: StateStore<SqlitePool>,
         local_node: LocalNode,
-        peer_key: PeerKey,
+        // peer_key: PeerKey,
     ) -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
-        let (request_sender, server_request) = channel(PARALLELISM);
+        let (_request_sender, server_request) = channel(PARALLELISM);
 
-        let cs = contract_store.clone();
-        let cs2 = contract_store.clone();
-        let ss = state_store.clone();
-        let rs = request_sender.clone();
-        let rs2 = request_sender.clone();
-
-        let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
-        let sender = sender.clone();
-
+        // FIXME: LocalNode should hold internally references and maintain interior mutability so we can clone it at will
+        let ln = local_node.clone();
         let get_contract_web = warp::path::path("contract")
-            .map(move || (rs.clone(), cs.clone()))
+            .map(move || ln.clone())
             .and(warp::path::param())
             .and(warp::path::end())
-            .and_then(|(rs, cs), key: String| async move { handle_contract(key, rs, cs).await });
+            .and_then(|ln, key: String| async move { handle_contract(key, ln).await });
 
+        let ln = local_node.clone();
         let get_contract_state = warp::path::path("contract")
-            .map(move || (peer_key, local_node.clone(), sender.clone(), receiver))
+            .map(move || ln.clone())
             .and(warp::path::param())
             .and(warp::path::path("state"))
-            .and_then(|(pk, ln, s, r), key: String| async move {
-                handle_get_state(key, pk, ln, s, r).await
-            });
+            .and_then(move |ln, key: String| async move { handle_get_state(key, ln).await });
 
         let put_contract_state = warp::path::path("contract")
-            .map(move || (rs2.clone(), cs2.clone(), ss.clone()))
+            .map(move || local_node.clone())
             .and(warp::path::param())
             .and(warp::path::path("state_put"))
-            .and_then(|(rs, cs, ss), key: String| async move {
-                handle_put_state(key, rs, cs, ss).await
-            });
+            .and_then(|ln, key: String| async move { handle_put_state(key, ln).await });
 
         let get_home = warp::path::end().and_then(home);
 
@@ -121,95 +107,58 @@ impl From<std::path::StripPrefixError> for ExtractError {
     }
 }
 
-async fn handle_get_state(
-    key: String,
-    peer_key: PeerKey,
-    mut local_node: LocalNode,
-    sender: UnboundedSender<String>,
-    receiver: UnboundedReceiver<String>,
-) -> Result<impl Reply, Rejection> {
-    //let (sender, mut receiver) = mpsc::unbounded_channel::<HostResponse>();
+async fn handle_get_state(key: String, local_node: LocalNode) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key).unwrap();
     let state_summary = StateSummary::from(vec![]);
     // local_node
     //     .register_contract_notifier(key, peer_key, sender, state_summary)
     //     .unwrap();
-    let mut r = receiver.unwrap();
-    Ok(reply::html(tokio::select! {
-        msg = r.recv() => {
-            match msg {
-                Some(state) => {
-                    state
-                }
-                _ => String::from("state")
-            }
-        }
-    }))
+    Ok(reply::html("state"))
 }
 
-async fn handle_put_state(
-    key: String,
-    request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
-    contract_store: ContractStore,
-    state_store: StateStore<SqlitePool>,
-) -> Result<impl Reply, Rejection> {
+async fn handle_put_state(key: String, local_node: LocalNode) -> Result<impl Reply, Rejection> {
     println!("{}", key);
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let params = Parameters::from(vec![]);
-    let contract = contract_store.fetch_contract(&key, &params).unwrap();
-    let state = state_store.get(&key).await.unwrap();
-    let (tx, response) = oneshot::channel();
-    request_sender
-        .send((ClientRequest::Put { contract, state }, tx))
-        .await
-        .map_err(|_| reject::custom(errors::NodeError))?;
-
+    let contract = local_node
+        .runtime
+        .contracts
+        .fetch_contract(&key, &params)
+        .ok_or_else(|| reject::custom(errors::NodeError))?;
+    let state = local_node.contract_state.get(&key).await.unwrap();
     Ok(reply::html("Ok"))
 }
 
-async fn handle_contract(
-    key: String,
-    request_sender: Sender<(ClientRequest, oneshot::Sender<HostResult>)>,
-    mut contract_store: ContractStore,
-) -> Result<impl Reply, Rejection> {
+async fn handle_contract(key: String, mut local_node: LocalNode) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let (tx, response) = oneshot::channel();
-    request_sender
-        .send((ClientRequest::Subscribe { key }, tx))
-        .await
-        .map_err(|_| reject::custom(errors::NodeError))?;
-    let response = response
+    let response = local_node
+        .handle_request(ClientRequest::Get {
+            key,
+            fetch_contract: false,
+        })
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     match response {
-        Ok(r) => {
-            match r {
-                HostResponse::GetResponse { contract, state } => {
-                    // TODO: here we should pass the batton to the websocket interface
-                    match contract {
-                        Some(c) => {
-                            let contract_path =
-                                contract_store.get_contract_path(c.key()).map_err(|_| {
-                                    ErrorKind::RequestError(RequestError::Get {
-                                        key,
-                                        cause: "contract code hash key not specified".to_owned(),
-                                    })
-                                })?;
-                            let web_body = get_web_body(state, contract_path).unwrap();
-                            Ok(reply::html(web_body))
-                        }
-                        None => Ok(reply::html(hyper::Body::empty())),
-                    }
-                }
-                _ => {
-                    // TODO: here we should pass the batton to the websocket interface
-                    Ok(reply::html(hyper::Body::empty()))
-                }
+        HostResponse::GetResponse { contract, state } => match contract {
+            Some(c) => {
+                let contract_path = local_node
+                    .runtime
+                    .contracts
+                    .get_contract_path(c.key())
+                    .map_err(|_| {
+                        ErrorKind::RequestError(RequestError::Get {
+                            key,
+                            cause: "contract code hash key not specified".to_owned(),
+                        })
+                    })?;
+                let web_body = get_web_body(state, contract_path).unwrap();
+                Ok(reply::html(web_body))
             }
-        }
-        Err(err) => Err(err.kind().into()),
+            None => Ok(reply::html(hyper::Body::empty())),
+        },
+        _ => Ok(reply::html(hyper::Body::empty())),
     }
 }
 
