@@ -66,7 +66,7 @@ impl warp::reject::Reject for ErrorKind {}
 
 impl Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ClientError")
+        write!(f, "client error: {}", self.kind)
     }
 }
 

@@ -1,4 +1,11 @@
-use std::{fmt::Display, fs::File, future::Future, io::Read, pin::Pin, time::Duration};
+use std::{
+    fmt::Display,
+    fs::File,
+    future::Future,
+    io::{Read, Seek},
+    pin::Pin,
+    time::Duration,
+};
 
 use either::Either;
 use locutus_node::{
@@ -88,6 +95,9 @@ impl StdInput {
     where
         T: From<Vec<u8>>,
     {
+        self.input
+            .rewind()
+            .map_err(|e| ErrorKind::Unhandled(format!("{e}")))?;
         match self.config.ser_format {
             #[cfg(feature = "json")]
             Some(DeserializationFmt::Json) => {
@@ -222,14 +232,15 @@ impl ClientEventsProxy for StdInput {
     fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + 'a>> {
         Box::pin(async {
             loop {
+                self.buf.clear();
                 let f = async {
                     let stdin = std::io::stdin();
-                    for b in stdin.bytes() {
+                    'stdin: for b in stdin.bytes() {
                         let b = b.map_err(|_| {
                             ClientError::from(ErrorKind::TransportProtocolDisconnect)
                         })?;
                         if b == b'\n' {
-                            break;
+                            break 'stdin;
                         }
                         self.buf.push(b);
                     }
@@ -245,11 +256,10 @@ impl ClientEventsProxy for StdInput {
                             let state: State = match self.get_command_input(Command::Put) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    println!("Error: {e}");
+                                    println!("Put event error: {e}");
                                     return Ok(Either::Right(()));
                                 }
                             };
-                            self.buf.clear();
                             return Ok(Either::Left(
                                 CommandInfo {
                                     cmd,
@@ -263,11 +273,10 @@ impl ClientEventsProxy for StdInput {
                             let delta: StateDelta = match self.get_command_input(Command::Update) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    println!("Error: {e}");
+                                    println!("Update event error: {e}");
                                     return Ok(Either::Right(()));
                                 }
                             };
-                            self.buf.clear();
                             return Ok(Either::Left(
                                 CommandInfo {
                                     cmd,
@@ -287,7 +296,6 @@ impl ClientEventsProxy for StdInput {
                             // self.app_state.printout_deser(&p);
                         }
                         Ok(cmd) => {
-                            self.buf.clear();
                             return Ok(Either::Left(
                                 CommandInfo {
                                     cmd,
@@ -299,10 +307,8 @@ impl ClientEventsProxy for StdInput {
                         }
                         Err(err) => {
                             println!("{err}");
-                            self.buf.clear();
                         }
                     }
-                    self.buf.clear();
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     Ok(Either::<(ClientId, ClientRequest), _>::Right(()))
                 };
