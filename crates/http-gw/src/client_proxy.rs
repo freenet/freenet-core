@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use locutus_node::{either::Either, WrappedState};
-use locutus_runtime::{ContractKey, Parameters, StateDelta};
+use locutus_runtime::{ContractKey, StateDelta};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -120,16 +120,21 @@ async fn state_updates_notification(
     request_sender: mpsc::Sender<ClientHandlingMessage>,
 ) -> Result<impl Reply, Rejection> {
     let contract_key = ContractKey::from_spec(key).unwrap();
-    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    let (updates, mut updates_recv) = mpsc::unbounded_channel();
+    let (response_sender, response_recv) = mpsc::unbounded_channel();
     request_sender
         .send((
-            ClientRequest::Subscribe { key: contract_key },
+            ClientRequest::Subscribe {
+                key: contract_key,
+                updates,
+            },
             Either::Left(response_sender),
         ))
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-    while let Some((_id, response)) = response_recv.recv().await {
-        if let Ok(HostResponse::UpdateNotification { key, update }) = response {
+    // todo: await for some sort of confirmation through "response_recv"
+    while let Some(response) = updates_recv.recv().await {
+        if let HostResponse::UpdateNotification { key, update } = response {
             // todo: we assume that this is json, but it could be anything
             //       in reality we must send this back as bytes and let the client handle it
             //       but in order to test things out we send a json
@@ -142,6 +147,13 @@ async fn state_updates_notification(
             break;
         }
     }
+    request_sender
+        .send((
+            ClientRequest::Disconnect { cause: None },
+            Either::Right(ClientId::new(0)),
+        ))
+        .await
+        .map_err(|_| NodeError)?;
     Err::<warp::reply::Json, _>(NodeError.into())
 }
 

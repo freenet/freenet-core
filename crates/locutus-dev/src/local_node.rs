@@ -196,7 +196,14 @@ impl LocalNode {
                 key,
                 fetch_contract: contract,
             } => self.perform_get(contract, key).await.map_err(Either::Left),
-            ClientRequest::Subscribe { key } => {
+            ClientRequest::Subscribe { key, updates } => {
+                self.register_contract_notifier(
+                    key,
+                    PeerKey::random(),
+                    updates,
+                    [].as_ref().into(),
+                )
+                .unwrap();
                 log::info!("getting contract: {}", key.encode());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)

@@ -460,7 +460,11 @@ mod test {
         let contract_val: WrappedState = gen.arbitrary()?;
         let contract_key: ContractKey = *contract.key();
 
-        let event = ClientRequest::Subscribe { key: contract_key };
+        let (updates, _) = tokio::sync::mpsc::unbounded_channel();
+        let event = ClientRequest::Subscribe {
+            key: contract_key,
+            updates,
+        };
         let first_node = NodeSpecification {
             owned_contracts: Vec::new(),
             non_owned_contracts: vec![contract_key],

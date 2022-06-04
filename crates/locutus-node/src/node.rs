@@ -361,7 +361,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         log::error!("{}", err);
                     }
                 }
-                ClientRequest::Subscribe { key } => {
+                ClientRequest::Subscribe { key, .. } => {
                     // Initialize a subscribe op.
                     loop {
                         // FIXME: this will block the event loop until the subscribe op succeeds

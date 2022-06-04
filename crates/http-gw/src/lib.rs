@@ -23,6 +23,7 @@ pub mod local_node {
         loop {
             let (id, req) = http_handle.recv().await?;
             tracing::debug!("client {id}, req -> {req}");
+
             match local_node.handle_request(req).await {
                 Ok(res) => {
                     http_handle.send(id, Ok(res));

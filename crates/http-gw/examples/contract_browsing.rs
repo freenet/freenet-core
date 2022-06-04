@@ -36,7 +36,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
-    let peer_key = PeerKey::random();
     let mut local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
     if let Err(err) = local_node

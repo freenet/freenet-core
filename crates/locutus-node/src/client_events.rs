@@ -6,6 +6,7 @@ use std::{error::Error as StdError, fmt::Display};
 
 use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{WrappedContract, WrappedState};
 
@@ -172,10 +173,12 @@ pub enum ClientRequest {
     },
     /// Subscribe to the changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
-    /// After this action the client will start receiving all changes though the open
-    /// connection.
+    /// After this action the client will start receiving all changes through the open
+    /// connection, and relied through the provided channel.
+    #[serde(skip)]
     Subscribe {
         key: ContractKey,
+        updates: UnboundedSender<HostResponse>,
     },
     Disconnect {
         cause: Option<String>,
@@ -204,7 +207,7 @@ impl Display for ClientRequest {
             } => {
                 write!(f, "get request for {key} (fetch full contract: {contract})")
             }
-            ClientRequest::Subscribe { key } => write!(f, "subscribe request for {key}"),
+            ClientRequest::Subscribe { key, .. } => write!(f, "subscribe request for {key}"),
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
         }
     }
@@ -305,7 +308,8 @@ pub(crate) mod test {
                             // self.non_owned_contracts[contract_no]
                             todo!() // fixme
                         };
-                        break ClientRequest::Subscribe { key };
+                        let (updates, _) = tokio::sync::mpsc::unbounded_channel();
+                        break ClientRequest::Subscribe { key, updates };
                     }
                     0 => {}
                     1 => {}
