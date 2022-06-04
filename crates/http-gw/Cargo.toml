@@ -8,17 +8,18 @@ publish = false
 [dependencies]
 async-trait = "0.1"
 byteorder = "1"
-log = "0.4"
 env_logger = "0.9.0"
+futures = "0.3.21"
+log = "0.4"
+rand = { version = "0.8" }
+serde = "1"
+serde_json = "1"
+tar = "0.4.38"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-warp = { version = "0.3", default-features = false, features = ["multipart", "tls"] }
 xz2 = "0.1"
-tar = "0.4.38"
-hyper = "0.14.4"
-rand = { version = "0.8" }
-futures = "0.3.21"
+warp = { version = "0.3", default-features = false, features = ["multipart", "tls"] }
 
 # internal:
 locutus-node = { path = "../locutus-node", features = ["websocket"] }

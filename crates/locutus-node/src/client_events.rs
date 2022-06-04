@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
 
@@ -103,6 +104,8 @@ pub enum HostResponse {
     },
     GetResponse {
         contract: Option<WrappedContract<'static>>,
+        /// path in the filesystem to where the actual contract file is stored
+        path: Option<PathBuf>,
         state: WrappedState,
     },
     /// Message sent when there is an update to a subscribed contract.
@@ -122,7 +125,12 @@ impl HostResponse {
     }
 
     pub fn unwrap_get(self) -> (WrappedState, Option<WrappedContract<'static>>) {
-        if let Self::GetResponse { contract, state } = self {
+        if let Self::GetResponse {
+            contract,
+            state,
+            path,
+        } = self
+        {
             (state, contract)
         } else {
             panic!("called `HostResponse::unwrap_put()` on other than `PutResponse` value")

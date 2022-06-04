@@ -52,7 +52,9 @@ async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool,
                 })
                 .await
             {
-                Ok(HostResponse::GetResponse { contract, state }) => {
+                Ok(HostResponse::GetResponse {
+                    contract, state, ..
+                }) => {
                     println!("current state for {key}:");
                     app.printout_deser(state.as_ref())?;
                 }

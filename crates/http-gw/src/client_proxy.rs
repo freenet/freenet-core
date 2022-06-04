@@ -1,10 +1,9 @@
 use byteorder::{BigEndian, ReadBytesExt};
-use locutus_node::WrappedState;
-use locutus_runtime::{ContractKey, ContractStore, Parameters, StateStore, StateSummary};
+use locutus_node::{either::Either, WrappedState};
+use locutus_runtime::{ContractKey, Parameters, StateDelta};
 use std::fs::File;
 use std::path::PathBuf;
 
-use locutus_dev::LocalNode;
 use locutus_node::*;
 use std::{
     collections::HashMap,
@@ -14,11 +13,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tar::Archive;
-use tokio::sync::{
-    mpsc,
-    mpsc::{channel, Receiver, Sender},
-    oneshot,
-};
+use tokio::sync::mpsc;
 use warp::{
     filters::BoxedFilter,
     hyper::StatusCode,
@@ -29,60 +24,73 @@ use xz2::bufread::XzDecoder;
 
 use crate::DynError;
 
-type HostResult = Result<HostResponse, ClientError>;
+use self::errors::NodeError;
+
+type HostResult = (ClientId, Result<HostResponse, ClientError>);
+type ClientHandlingMessage = (
+    ClientRequest,
+    Either<mpsc::UnboundedSender<HostResult>, ClientId>,
+);
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 pub struct HttpGateway {
-    server_request: Receiver<(ClientRequest, oneshot::Sender<HostResult>)>,
-    pending_responses: HashMap<ClientId, oneshot::Sender<HostResult>>,
+    server_request: mpsc::Receiver<ClientHandlingMessage>,
+    response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostResult>>,
 }
 
 impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
-    pub fn as_filter(
-        local_node: LocalNode,
-        // peer_key: PeerKey,
-    ) -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
-        let (_request_sender, server_request) = channel(PARALLELISM);
+    pub fn as_filter() -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
+        let (request_sender, server_request) = mpsc::channel(PARALLELISM);
+        let gateway = Self {
+            server_request,
+            response_channels: HashMap::new(),
+        };
 
-        // FIXME: LocalNode should hold internally references and maintain interior mutability so we can clone it at will
-        let ln = local_node.clone();
+        let rs = request_sender.clone();
         let get_contract_web = warp::path::path("contract")
-            .map(move || ln.clone())
+            .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path::end())
-            .and_then(|ln, key: String| async move { handle_contract(key, ln).await });
-
-        let ln = local_node.clone();
-        let get_contract_state = warp::path::path("contract")
-            .map(move || ln.clone())
-            .and(warp::path::param())
-            .and(warp::path::path("state"))
-            .and_then(move |ln, key: String| async move { handle_get_state(key, ln).await });
-
-        let put_contract_state = warp::path::path("contract")
-            .map(move || local_node.clone())
-            .and(warp::path::param())
-            .and(warp::path::path("state_put"))
-            .and_then(|ln, key: String| async move { handle_put_state(key, ln).await });
+            .and_then(|rs, key: String| async move { handle_contract(key, rs).await });
 
         let get_home = warp::path::end().and_then(home);
 
+        let rs = request_sender.clone();
+        let state_update_notifications = warp::path::path("contract")
+            .map(move || rs.clone())
+            .and(warp::path::param())
+            .and(warp::path!("state" / "updates"))
+            .and_then(
+                move |rs, key: String| async move { state_updates_notification(key, rs).await },
+            );
+
+        let rs = request_sender.clone();
+        let update_contract_state = warp::path::path("contract")
+            .map(move || rs.clone())
+            .and(warp::path::param())
+            .and(warp::path!("state" / "update"))
+            .and(warp::body::json())
+            .and_then(|rs, key: String, put_value| async move {
+                handle_update_state(key, put_value, rs).await
+            });
+
+        let get_contract_state = warp::path::path("contract")
+            .map(move || request_sender.clone())
+            .and(warp::path::param())
+            .and(warp::path!("state" / "get"))
+            .and_then(|rs, key: String| async move { handle_get_state(key, rs).await });
+
         let filters = get_contract_web
-            .or(get_contract_state)
-            .or(put_contract_state)
             .or(get_home)
+            .or(state_update_notifications)
+            .or(update_contract_state)
+            .or(get_contract_state)
             .recover(errors::handle_error)
             .with(warp::trace::request());
 
-        (
-            Self {
-                server_request,
-                pending_responses: HashMap::new(),
-            },
-            filters.boxed(),
-        )
+        (gateway, filters.boxed())
     }
 }
 
@@ -107,82 +115,150 @@ impl From<std::path::StripPrefixError> for ExtractError {
     }
 }
 
-async fn handle_get_state(key: String, local_node: LocalNode) -> Result<impl Reply, Rejection> {
-    let key = ContractKey::from_spec(key).unwrap();
-    let state_summary = StateSummary::from(vec![]);
-    // local_node
-    //     .register_contract_notifier(key, peer_key, sender, state_summary)
-    //     .unwrap();
-    Ok(reply::html("state"))
-}
-
-async fn handle_put_state(key: String, local_node: LocalNode) -> Result<impl Reply, Rejection> {
-    println!("{}", key);
-    let key = ContractKey::from_spec(key)
-        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let params = Parameters::from(vec![]);
-    let contract = local_node
-        .runtime
-        .contracts
-        .fetch_contract(&key, &params)
-        .ok_or_else(|| reject::custom(errors::NodeError))?;
-    let state = local_node.contract_state.get(&key).await.unwrap();
-    Ok(reply::html("Ok"))
-}
-
-async fn handle_contract(key: String, mut local_node: LocalNode) -> Result<impl Reply, Rejection> {
-    let key = ContractKey::from_spec(key)
-        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let response = local_node
-        .handle_request(ClientRequest::Get {
-            key,
-            fetch_contract: false,
-        })
+async fn state_updates_notification(
+    key: String,
+    request_sender: mpsc::Sender<ClientHandlingMessage>,
+) -> Result<impl Reply, Rejection> {
+    let contract_key = ContractKey::from_spec(key).unwrap();
+    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    request_sender
+        .send((
+            ClientRequest::Subscribe { key: contract_key },
+            Either::Left(response_sender),
+        ))
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-    match response {
-        HostResponse::GetResponse { contract, state } => match contract {
-            Some(c) => {
-                let contract_path = local_node
-                    .runtime
-                    .contracts
-                    .get_contract_path(c.key())
-                    .map_err(|_| {
-                        ErrorKind::RequestError(RequestError::Get {
-                            key,
-                            cause: "contract code hash key not specified".to_owned(),
-                        })
-                    })?;
-                let web_body = get_web_body(state, contract_path).unwrap();
-                Ok(reply::html(web_body))
-            }
-            None => Ok(reply::html(hyper::Body::empty())),
-        },
-        _ => Ok(reply::html(hyper::Body::empty())),
+    while let Some((_id, response)) = response_recv.recv().await {
+        if let Ok(HostResponse::UpdateNotification { key, update }) = response {
+            // todo: we assume that this is json, but it could be anything
+            //       in reality we must send this back as bytes and let the client handle it
+            //       but in order to test things out we send a json
+            assert_eq!(key, contract_key);
+            let json_str: serde_json::Value = serde_json::from_slice(update.as_ref()).unwrap();
+            todo!(
+                "we should use a ws upgrade here and send notifications back via the the websocket"
+            )
+        } else {
+            break;
+        }
     }
+    Err::<warp::reply::Json, _>(NodeError.into())
 }
 
-fn get_web_path(state: WrappedState, path: PathBuf) -> Result<PathBuf, DynError> {
-    // Decompose the state and extract the compressed web interface
-    let mut state = Cursor::new(state.as_ref());
-    let metadata_size = state.read_u64::<BigEndian>()?;
-    let mut metadata = vec![0; metadata_size as usize];
-    state.read_exact(&mut metadata)?;
-    let web_size = state.read_u64::<BigEndian>()?;
-    let mut web = vec![0; web_size as usize];
-    state.read_exact(&mut web)?;
-
-    // Decode tar.xz and build response body
-    let decoder = XzDecoder::new(Cursor::new(&web));
-    let mut files = Archive::new(decoder);
-    let _ = files.unpack(path.clone());
-
-    let web_path = path.join("web");
-
-    Ok(web_path)
+async fn handle_get_state(
+    key: String,
+    request_sender: mpsc::Sender<ClientHandlingMessage>,
+) -> Result<impl Reply, Rejection> {
+    let key = ContractKey::from_spec(key)
+        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    request_sender
+        .send((
+            ClientRequest::Get {
+                key,
+                fetch_contract: false,
+            },
+            Either::Left(response_sender),
+        ))
+        .await
+        .map_err(|_| reject::custom(errors::NodeError))?;
+    let (id, response) = match response_recv.recv().await {
+        Some((id, Ok(HostResponse::GetResponse { state, .. }))) => {
+            // todo: we assume that this is json, but it could be anything
+            //       in reality we must send this back as bytes and let the client handle it
+            //       but in order to test things out we send a json
+            let json_str: serde_json::Value = serde_json::from_slice(state.as_ref()).unwrap();
+            (id, Ok(reply::json(&json_str)))
+        }
+        None => {
+            return Err(NodeError.into());
+        }
+        _ => unreachable!(),
+    };
+    request_sender
+        .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))
+        .await
+        .map_err(|_| NodeError)?;
+    response
 }
 
-fn get_web_body(state: WrappedState, path: PathBuf) -> Result<hyper::Body, DynError> {
+// todo: assuming json but could be anything really, they have to send as bytes
+async fn handle_update_state(
+    key: String,
+    update_value: serde_json::Value,
+    request_sender: mpsc::Sender<ClientHandlingMessage>,
+) -> Result<impl Reply, Rejection> {
+    let contract_key = ContractKey::from_spec(key)
+        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+    let delta = serde_json::to_vec(&update_value).unwrap();
+    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    request_sender
+        .send((
+            ClientRequest::Update {
+                key: contract_key,
+                delta: StateDelta::from(delta),
+            },
+            Either::Left(response_sender),
+        ))
+        .await
+        .map_err(|_| reject::custom(errors::NodeError))?;
+    let (id, response) = match response_recv.recv().await {
+        Some((id, Ok(HostResponse::UpdateResponse { key, .. }))) => {
+            assert_eq!(key, contract_key);
+            (id, Ok(reply::json(&serde_json::json!({"result": "ok"}))))
+        }
+        None => {
+            return Err(NodeError.into());
+        }
+        _ => unreachable!(),
+    };
+    request_sender
+        .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))
+        .await
+        .map_err(|_| NodeError)?;
+    response
+}
+
+async fn handle_contract(
+    key: String,
+    request_sender: mpsc::Sender<ClientHandlingMessage>,
+) -> Result<impl Reply, Rejection> {
+    let key = ContractKey::from_spec(key)
+        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    request_sender
+        .send((
+            ClientRequest::Get {
+                key,
+                fetch_contract: false,
+            },
+            Either::Left(response_sender),
+        ))
+        .await
+        .map_err(|_| reject::custom(errors::NodeError))?;
+    let (id, response) = match response_recv.recv().await {
+        Some((id, Ok(HostResponse::GetResponse { path, state, .. }))) => match path {
+            Some(path) => {
+                let web_body = get_web_body(state, path).unwrap();
+                (id, Ok(reply::html(web_body)))
+            }
+            None => {
+                todo!("error indicating the contract is not present");
+            }
+        },
+        None => {
+            return Err(NodeError.into());
+        }
+        _ => unreachable!(),
+    };
+    request_sender
+        .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))
+        .await
+        .map_err(|_| NodeError)?;
+    response
+}
+
+fn get_web_body(state: WrappedState, path: PathBuf) -> Result<warp::hyper::Body, DynError> {
     // Decompose the state and extract the compressed web interface
     let mut state = Cursor::new(state.as_ref());
     let metadata_size = state.read_u64::<BigEndian>()?;
@@ -204,19 +280,7 @@ fn get_web_body(state: WrappedState, path: PathBuf) -> Result<hyper::Body, DynEr
         .unwrap_or_else(|_| panic!("Failed to open key file: {}", &web_path.to_str().unwrap()));
     key_file.read_to_end(&mut index).unwrap();
 
-    Ok(hyper::Body::from(index))
-}
-
-async fn get_state(
-    contract_key: String,
-    state_store: StateStore<SqlitePool>,
-    ws: warp::ws::Ws,
-) -> Result<impl Reply, Rejection> {
-    let key = ContractKey::from_spec(contract_key)
-        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let state = state_store.get(&key).await.unwrap().to_vec();
-
-    Ok(reply::html(hyper::Body::from(state)))
+    Ok(warp::hyper::Body::from(index))
 }
 
 async fn home() -> Result<impl Reply, Rejection> {
@@ -231,11 +295,20 @@ impl ClientEventsProxy for HttpGateway {
         Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
     > {
         Box::pin(async move {
-            if let Some((req, response_ch)) = self.server_request.recv().await {
-                tracing::debug!("received request: {req}");
-                let cli_id = ClientId::new(ID.fetch_add(1, Ordering::SeqCst));
-                self.pending_responses.insert(cli_id, response_ch);
-                Ok((cli_id, req))
+            if let Some((req, ch_or_id)) = self.server_request.recv().await {
+                match ch_or_id {
+                    Either::Left(new_client_ch) => {
+                        // is a new client, assign an id and open a channel to communicate responses from the node
+                        tracing::debug!("received request: {req}");
+                        let cli_id = ClientId::new(ID.fetch_add(1, Ordering::SeqCst));
+                        self.response_channels.insert(cli_id, new_client_ch);
+                        Ok((cli_id, req))
+                    }
+                    Either::Right(existing_client) => {
+                        // just forward the request to the node
+                        Ok((existing_client, req))
+                    }
+                }
             } else {
                 todo!()
             }
@@ -248,15 +321,18 @@ impl ClientEventsProxy for HttpGateway {
         response: Result<HostResponse, ClientError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
-            // fixme: deal with unwraps()
-            let ch = self.pending_responses.remove(&client).unwrap();
-            ch.send(response).unwrap();
+            if let Some(ch) = self.response_channels.remove(&client) {
+                if ch.send((client, response)).is_ok() {
+                    // still alive connection, keep it
+                    self.response_channels.insert(client, ch);
+                }
+            }
             Ok(())
         })
     }
 
     fn cloned(&self) -> BoxedClient {
-        todo!()
+        unimplemented!()
     }
 }
 

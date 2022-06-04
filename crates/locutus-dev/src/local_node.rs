@@ -246,7 +246,7 @@ impl LocalNode {
         contract: bool,
         key: ContractKey,
     ) -> Result<HostResponse, RequestError> {
-        let contract = contract.then(|| {
+        let got_contract = contract.then(|| {
             let parameters = self.contract_params.get(&key).unwrap();
             let data_key = key
                 .contract_part_encoded()
@@ -260,7 +260,23 @@ impl LocalNode {
             WrappedContract::new(data.clone(), parameters.clone())
         });
         match self.contract_state.get(&key).await {
-            Ok(state) => Ok(HostResponse::GetResponse { contract, state }),
+            Ok(state) => {
+                let path = contract
+                    .then(|| {
+                        self.runtime.contracts.get_contract_path(&key).map_err(|_| {
+                            RequestError::Get {
+                                key,
+                                cause: "contract code hash key not specified".to_owned(),
+                            }
+                        })
+                    })
+                    .transpose()?;
+                Ok(HostResponse::GetResponse {
+                    contract: got_contract,
+                    state,
+                    path,
+                })
+            }
             Err(StateStoreError::MissingContract) => Err(RequestError::Get {
                 key,
                 cause: "missing contract state".into(),

@@ -85,6 +85,20 @@ impl StateStorage for MemKVStore {
     ) -> Result<(), Self::Error> {
         todo!()
     }
+
+    fn get_params<'a>(
+        &'a self,
+        _key: &'a ContractKey,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Future<
+                    Output = Result<Option<locutus_runtime::Parameters<'static>>, Self::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        todo!()
+    }
 }
 
 impl MemKVStore {

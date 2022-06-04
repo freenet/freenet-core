@@ -15,6 +15,7 @@ pub enum StateStoreError {
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::type_complexity)]
 pub trait StateStorage: Clone {
     type Error;
     async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error>;
@@ -27,10 +28,7 @@ pub trait StateStorage: Clone {
     fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>
-    {
-        todo!()
-    }
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>;
 }
 
 #[derive(Clone)]
