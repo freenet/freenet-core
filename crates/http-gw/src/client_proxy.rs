@@ -4,9 +4,9 @@ use locutus_runtime::{ContractKey, StateDelta};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use futures::future::ready;
 use futures::{SinkExt, StreamExt};
 use locutus_node::*;
-use std::time::Duration;
 use std::{
     collections::HashMap,
     future::Future,
@@ -142,17 +142,18 @@ async fn state_updates_notification(
     let (updates, mut updates_recv) = mpsc::unbounded_channel();
     let (response_sender, response_recv) = mpsc::unbounded_channel();
 
-    let (mut tx, mut rx) = ws.split();
+    let (mut ws_sender, mut _ws_receiver) = {
+        let (tx, rx) = ws.split();
 
-    //TODO only for test propose, remove it
-    while let Some(msg) = rx.next().await {
-        if let Ok(m) = msg {
-            let _ = tx.send(m).await;
-            println!("Message sent to client");
-        } else {
-            println!("No message to send");
-        }
-    }
+        let str_sender = tx.with(|msg: String| {
+            let res: Result<Message, warp::Error> = Ok(Message::text(
+                serde_json::to_string(&msg).expect("Converting message to JSON"),
+            ));
+            ready(res)
+        });
+
+        (str_sender, rx)
+    };
 
     request_sender
         .send((
@@ -173,9 +174,8 @@ async fn state_updates_notification(
             //       but in order to test things out we send a json
             assert_eq!(key, contract_key);
             let json_str: serde_json::Value = serde_json::from_slice(update.as_ref()).unwrap();
-            todo!(
-                "we should use a ws upgrade here and send notifications back via the the websocket"
-            )
+            let msg = serde_json::to_string_pretty(&json_str).unwrap();
+            let _ = ws_sender.send(msg).await;
         } else {
             break;
         }
@@ -188,11 +188,6 @@ async fn state_updates_notification(
         .await
         .map_err(|_| NodeError)
         .unwrap();
-}
-
-async fn handle_ws_update_notifications(ws: WebSocket, state_bytes: Vec<u8>) {
-    let (mut tx, _rx) = ws.split();
-    tx.send(Message::binary(state_bytes)).await;
 }
 
 async fn handle_get_state(
