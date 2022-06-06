@@ -2,9 +2,11 @@ use byteorder::{BigEndian, ReadBytesExt};
 use locutus_node::{either::Either, WrappedState};
 use locutus_runtime::{ContractKey, StateDelta};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use futures::{SinkExt, StreamExt};
 use locutus_node::*;
+use std::time::Duration;
 use std::{
     collections::HashMap,
     future::Future,
@@ -14,6 +16,7 @@ use std::{
 };
 use tar::Archive;
 use tokio::sync::mpsc;
+use warp::ws::{Message, WebSocket, Ws};
 use warp::{
     filters::BoxedFilter,
     hyper::StatusCode,
@@ -57,14 +60,28 @@ impl HttpGateway {
 
         let get_home = warp::path::end().and_then(home);
 
+        let get_test_web = warp::path::path("contract")
+            .and(warp::path::param())
+            .and(warp::path::path("web"))
+            .map(|key: String| {
+                let mut index = vec![];
+                let mut file = File::open(
+                    Path::new("/Users/hectorsantos/workspace/contribute/locutus/crates/http-gw/examples/web.html")).unwrap();
+                file.read_to_end(&mut index).unwrap();
+                reply::html(warp::hyper::Body::from(index))
+            });
+
         let rs = request_sender.clone();
         let state_update_notifications = warp::path::path("contract")
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path!("state" / "updates"))
-            .and_then(
-                move |rs, key: String| async move { state_updates_notification(key, rs).await },
-            );
+            .and(warp::ws())
+            .map(|rs, key: String, ws: warp::ws::Ws| {
+                ws.on_upgrade(move |websocket: WebSocket| {
+                    state_updates_notification(key, rs, websocket)
+                })
+            });
 
         let rs = request_sender.clone();
         let update_contract_state = warp::path::path("contract")
@@ -84,6 +101,7 @@ impl HttpGateway {
 
         let filters = get_contract_web
             .or(get_home)
+            .or(get_test_web)
             .or(state_update_notifications)
             .or(update_contract_state)
             .or(get_contract_state)
@@ -118,10 +136,24 @@ impl From<std::path::StripPrefixError> for ExtractError {
 async fn state_updates_notification(
     key: String,
     request_sender: mpsc::Sender<ClientHandlingMessage>,
-) -> Result<impl Reply, Rejection> {
+    ws: WebSocket,
+) {
     let contract_key = ContractKey::from_spec(key).unwrap();
     let (updates, mut updates_recv) = mpsc::unbounded_channel();
     let (response_sender, response_recv) = mpsc::unbounded_channel();
+
+    let (mut tx, mut rx) = ws.split();
+
+    //TODO only for test propose, remove it
+    while let Some(msg) = rx.next().await {
+        if let Ok(m) = msg {
+            let _ = tx.send(m).await;
+            println!("Message sent to client");
+        } else {
+            println!("No message to send");
+        }
+    }
+
     request_sender
         .send((
             ClientRequest::Subscribe {
@@ -131,7 +163,8 @@ async fn state_updates_notification(
             Either::Left(response_sender),
         ))
         .await
-        .map_err(|_| reject::custom(errors::NodeError))?;
+        .map_err(|_| reject::custom(errors::NodeError))
+        .unwrap();
     // todo: await for some sort of confirmation through "response_recv"
     while let Some(response) = updates_recv.recv().await {
         if let HostResponse::UpdateNotification { key, update } = response {
@@ -153,8 +186,13 @@ async fn state_updates_notification(
             Either::Right(ClientId::new(0)),
         ))
         .await
-        .map_err(|_| NodeError)?;
-    Err::<warp::reply::Json, _>(NodeError.into())
+        .map_err(|_| NodeError)
+        .unwrap();
+}
+
+async fn handle_ws_update_notifications(ws: WebSocket, state_bytes: Vec<u8>) {
+    let (mut tx, _rx) = ws.split();
+    tx.send(Message::binary(state_bytes)).await;
 }
 
 async fn handle_get_state(
