@@ -140,7 +140,7 @@ async fn state_updates_notification(
 ) {
     let contract_key = ContractKey::from_spec(key).unwrap();
     let (updates, mut updates_recv) = mpsc::unbounded_channel();
-    let (response_sender, response_recv) = mpsc::unbounded_channel();
+    let (response_sender, _response_recv) = mpsc::unbounded_channel();
 
     let (mut ws_sender, mut _ws_receiver) = {
         let (tx, rx) = ws.split();
@@ -290,10 +290,14 @@ async fn handle_contract(
                 todo!("error indicating the contract is not present");
             }
         },
+        Some((_id, Err(err))) => {
+            log::error!("error getting contract `{key}`: {err}");
+            return Err(err.kind().into());
+        }
         None => {
             return Err(NodeError.into());
         }
-        _ => unreachable!(),
+        other => unreachable!("received unexpected node response: {other:?}"),
     };
     request_sender
         .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))

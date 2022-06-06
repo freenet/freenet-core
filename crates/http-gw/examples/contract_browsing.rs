@@ -3,7 +3,7 @@
 use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 
 use locutus_dev::ContractStore;
-use locutus_node::{either::Either, PeerKey, SqlitePool, WrappedState};
+use locutus_node::{either::Either, SqlitePool, WrappedState};
 use locutus_runtime::{ContractCode, StateStore, WrappedContract};
 
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
