@@ -145,7 +145,7 @@ async fn state_updates_notification(
     let (mut ws_sender, mut _ws_receiver) = {
         let (tx, rx) = ws.split();
 
-        let str_sender = tx.with(|msg: String| {
+        let str_sender = tx.with(|msg: serde_json::Value| {
             let res: Result<Message, warp::Error> = Ok(Message::text(
                 serde_json::to_string(&msg).expect("Converting message to JSON"),
             ));
@@ -174,8 +174,7 @@ async fn state_updates_notification(
             //       but in order to test things out we send a json
             assert_eq!(key, contract_key);
             let json_str: serde_json::Value = serde_json::from_slice(update.as_ref()).unwrap();
-            let msg = serde_json::to_string_pretty(&json_str).unwrap();
-            let _ = ws_sender.send(msg).await;
+            let _ = ws_sender.send(json_str).await;
         } else {
             break;
         }
