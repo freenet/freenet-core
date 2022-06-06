@@ -25,7 +25,7 @@ use warp::{
 };
 use xz2::bufread::XzDecoder;
 
-use crate::DynError;
+use crate::{DynError, UnpackedState};
 
 use self::errors::NodeError;
 
@@ -307,27 +307,15 @@ async fn handle_contract(
 }
 
 fn get_web_body(state: WrappedState, path: PathBuf) -> Result<warp::hyper::Body, DynError> {
-    // Decompose the state and extract the compressed web interface
-    let mut state = Cursor::new(state.as_ref());
-    let metadata_size = state.read_u64::<BigEndian>()?;
-    let mut metadata = vec![0; metadata_size as usize];
-    state.read_exact(&mut metadata)?;
-    let web_size = state.read_u64::<BigEndian>()?;
-    let mut web = vec![0; web_size as usize];
-    state.read_exact(&mut web)?;
-
-    // Decode tar.xz and unpack contract web
-    let mut index = vec![];
-    let decoder = XzDecoder::new(Cursor::new(&web));
-    let mut files = Archive::new(decoder);
-    files.unpack(path.clone())?;
+    let UnpackedState { mut web, .. } = super::unpack_state(state.as_ref())?;
+    web.unpack(path.clone())?;
 
     // Get and return web
+    let mut index = vec![];
     let web_path = path.join("web/index.html");
     let mut key_file = File::open(&web_path)
         .unwrap_or_else(|_| panic!("Failed to open key file: {}", &web_path.to_str().unwrap()));
     key_file.read_to_end(&mut index).unwrap();
-
     Ok(warp::hyper::Body::from(index))
 }
 
@@ -429,12 +417,4 @@ pub(crate) mod test {
         File::open(path)?.read_to_end(&mut bytes)?;
         Ok(WrappedState::new(bytes))
     }
-
-    // #[test]
-    // fn test_get_ui_from_contract() -> Result<(), DynError> {
-    //     let state = test_state()?;
-    //     let body = get_web_body(state);
-    //     assert!(body.is_ok());
-    //     Ok(())
-    // }
 }

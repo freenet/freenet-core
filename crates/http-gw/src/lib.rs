@@ -1,6 +1,12 @@
 mod client_proxy;
 
+use std::io::{Cursor, Read};
+
+use byteorder::{BigEndian, ReadBytesExt};
 pub use client_proxy::HttpGateway;
+use locutus_runtime::WrappedState;
+use tar::Archive;
+use xz2::bufread::XzDecoder;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -43,4 +49,36 @@ pub mod local_node {
             }
         }
     }
+}
+
+pub struct UnpackedState<T: Read> {
+    pub metadata: Vec<u8>,
+    pub web: Archive<T>,
+    pub state: WrappedState,
+}
+
+pub fn unpack_state(state: &[u8]) -> Result<UnpackedState<impl Read>, DynError> {
+    // Decompose the state and extract the compressed web interface
+    let mut state = Cursor::new(state);
+    let metadata_size = state.read_u64::<BigEndian>()?;
+    let mut metadata = vec![0; metadata_size as usize];
+    state.read_exact(&mut metadata)?;
+    let web_size = state.read_u64::<BigEndian>()?;
+    let mut web = vec![0; web_size as usize];
+    state.read_exact(&mut web)?;
+    let state_size = state.read_u64::<BigEndian>()?;
+    let mut dynamic_state = vec![0; state_size as usize];
+    state.read_exact(&mut dynamic_state)?;
+
+    // Decode tar.xz and unpack contract web
+    let decoder = XzDecoder::new(Cursor::new(web));
+    let web = Archive::new(decoder);
+
+    // Decode the dynamic state
+    let state = WrappedState::from(dynamic_state);
+    Ok(UnpackedState {
+        metadata,
+        web,
+        state,
+    })
 }
