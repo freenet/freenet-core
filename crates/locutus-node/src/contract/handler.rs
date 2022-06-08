@@ -301,7 +301,7 @@ pub(in crate::contract) mod sqlite {
             Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>,
         > {
             Box::pin(async move {
-                match sqlx::query("SELECT param FROM states WHERE contract = ?")
+                match sqlx::query("SELECT params FROM states WHERE contract = ?")
                     .bind(key.bytes())
                     .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("state"))))
                     .fetch_one(&self.0)

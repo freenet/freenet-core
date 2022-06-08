@@ -1,4 +1,4 @@
-use locutus_node::{PeerKey, SqlitePool};
+use locutus_node::SqlitePool;
 use locutus_runtime::StateStore;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::util::SubscriberInitExt;

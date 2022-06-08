@@ -30,11 +30,18 @@ pub fn test_contract() -> Result<WrappedContract<'static>, std::io::Error> {
 
 #[cfg(feature = "local")]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = http_gw::unpack_state(test_state()?.as_ref())?.state;
+    use http_gw::HttpGateway;
+
+    let state = test_state()?;
     let contract = test_contract()?;
+
+    let mut package = http_gw::unpack_state(state.as_ref(), contract.key())?;
+    // fixme: a workaround
+    HttpGateway::store_web(&mut package, contract.key())?;
+    let state = package.state;
     log::info!("loading contract {} in local node", contract.key().encode());
     log::info!(
-        "initializing state with: {}",
+        "initializing state with content:\n{}",
         serde_json::from_slice::<serde_json::Value>(state.as_ref())?
     );
     let tmp_path = std::env::temp_dir().join("locutus");

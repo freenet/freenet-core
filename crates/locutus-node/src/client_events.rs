@@ -62,6 +62,8 @@ pub enum ErrorKind {
     RequestError(#[from] RequestError),
     #[error("unhandled error: {0}")]
     Unhandled(String),
+    #[error("failed while trying to unpack state for {0}")]
+    IncorrectState(ContractKey),
 }
 
 impl warp::reject::Reject for ErrorKind {}
