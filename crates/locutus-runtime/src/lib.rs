@@ -5,6 +5,7 @@ mod state_store;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
+pub use locutus_stdlib;
 pub use prelude::*;
 
 pub mod prelude {

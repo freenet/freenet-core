@@ -30,7 +30,7 @@ fn append_web_content(state: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Err
         let content_path = PathBuf::from("web");
         let mut tar = tar::Builder::new(web_content);
         tar.append_path(content_path.join("index.html"))?;
-        tar.append_path(content_path.join("subpage.html"))?;
+        tar.append_path(content_path.join("state.html"))?;
         tar.into_inner()?
     };
     let mut encoded = vec![];

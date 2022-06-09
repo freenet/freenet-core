@@ -39,8 +39,10 @@ impl HttpGateway {
             response_channels: HashMap::new(),
         };
 
+        let get_home = warp::path::end().and_then(home);
+
         let rs = request_sender.clone();
-        let get_contract_web = warp::path::path("contract")
+        let contract_home = warp::path::path("contract")
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path::end())
@@ -48,7 +50,12 @@ impl HttpGateway {
                 crate::contract_handling::contract_home(key, rs).await
             });
 
-        let get_home = warp::path::end().and_then(home);
+        let contract_subpages = warp::path::path("contract")
+            .and(warp::path::param())
+            .and(warp::filters::path::full())
+            .and_then(|key: String, path| async move {
+                crate::contract_handling::variable_content(key, path).await
+            });
 
         let rs = request_sender.clone();
         let state_update_notifications = warp::path::path("contract")
@@ -78,11 +85,12 @@ impl HttpGateway {
             .and(warp::path!("state" / "get"))
             .and_then(|rs, key: String| async move { get_state(key, rs).await });
 
-        let filters = get_contract_web
-            .or(get_home)
+        let filters = get_home
+            .or(contract_home)
+            .or(get_contract_state)
             .or(state_update_notifications)
             .or(update_contract_state)
-            .or(get_contract_state)
+            .or(contract_subpages)
             .recover(errors::handle_error)
             .with(warp::trace::request());
 
@@ -95,7 +103,8 @@ impl HttpGateway {
     ) -> Result<(), ClientError> {
         let UnpackedState { web, .. } = state;
         let contract_web_path = Self::contract_web_path(key);
-        web.unpack(contract_web_path).map_err(|_| ErrorKind::IncorrectState(*key))?;
+        web.unpack(contract_web_path)
+            .map_err(|_| ErrorKind::IncorrectState(*key))?;
         Ok(())
     }
 

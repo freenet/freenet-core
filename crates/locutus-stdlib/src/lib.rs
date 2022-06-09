@@ -9,3 +9,4 @@ pub mod prelude {
     pub use crate::interface::*;
     pub use locutus_macros::contract;
 }
+
