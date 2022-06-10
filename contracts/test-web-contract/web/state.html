@@ -8,9 +8,14 @@
 
 <body>
     <h1>Contract Test</h1>
-    <input id="input" type="text" />
+    <textarea id="input" rows="4" cols="50">[{"author":"IDG","date":"2022-05-10T00:00:00Z","title":"Lore ipsum",
+        "content":"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt
+        ut labore et dolore magna aliqua."}]</textarea>
+    <br>
     <button id="btn">Send Update</button>
-    <pre id="log"></pre>
+    <h1>Updates:</h1>
+    <pre id="updates"></pre>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
     <script>
         let log = console.log;
 
@@ -28,8 +33,8 @@
 
         conn.onmessage = function (e) {
             log("Received: " + e.data);
-            document.getElementById("log").textContent =
-                document.getElementById("log").textContent + "\n" + e.data;
+            document.getElementById("updates").textContent =
+                document.getElementById("updates").textContent + "\n" + e.data;
         };
 
         conn.onclose = function () {
@@ -37,9 +42,23 @@
             conn = null;
         };
 
+        function processResponse(){
+            log("State update sent");
+        }
+
         function send() {
-            let state = document.getElementById("input").value
-            conn.send(state);
+            let update = document.getElementById("input").value
+            $.ajax({
+                url: '/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state/update/',
+                type: 'post',
+                dataType: 'json',
+                contentType: 'application/json',
+                success: function (data) {
+                    processResponse();
+                },
+                data: JSON.stringify(update)
+            });
+            //conn.send(state);
         }
 
         document.getElementById("btn").addEventListener("click", send);

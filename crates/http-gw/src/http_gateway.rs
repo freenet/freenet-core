@@ -74,6 +74,7 @@ impl HttpGateway {
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path!("state" / "update"))
+            .and(warp::post())
             .and(warp::body::json())
             .and_then(|rs, key: String, put_value| async move {
                 update_state(key, put_value, rs).await
