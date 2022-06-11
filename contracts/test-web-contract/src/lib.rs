@@ -137,7 +137,7 @@ mod test {
                     "author": "IDG",
                     "date": "2022-05-10T00:00:00Z",
                     "title": "Lore ipsum",
-                    "content": "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+                    "content": "..."
                 }
             ]
         }"#;
@@ -153,12 +153,71 @@ mod test {
                     "author": "IDG",
                     "date": "2022-05-10T00:00:00Z",
                     "title": "Lore ipsum",
-                    "content": "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+                    "content": "..."
                 }
             ]
         }"#;
         let valid =
             MessageFeed::validate_state([].as_ref().into(), State::from(json.as_bytes().to_vec()));
         assert!(valid);
+    }
+
+    #[test]
+    fn summarize_state() {
+        let json = r#"{
+            "messages": [
+                {
+                    "author": "IDG",
+                    "date": "2022-05-10T00:00:00Z",
+                    "title": "Lore ipsum",
+                    "content": "..."
+                }
+            ]
+        }"#;
+        let summary =
+            MessageFeed::summarize_state([].as_ref().into(), State::from(json.as_bytes().to_vec()));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(summary.as_ref()).unwrap(),
+            serde_json::json!([{
+                "author": "IDG",
+                "date": "2022-05-10T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+            }])
+        );
+    }
+
+    #[test]
+    fn get_state_delta() {
+        let json = r#"{
+            "messages": [
+                {
+                    "author": "IDG",
+                    "date": "2022-05-11T00:00:00Z",
+                    "title": "Lore ipsum",
+                    "content": "..."
+                }
+            ]
+        }"#;
+        let summary = serde_json::json!([{
+                "author": "IDG",
+                "date": "2022-05-10T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+        }]);
+        let summary = MessageFeed::get_state_delta(
+            [].as_ref().into(),
+            State::from(json.as_bytes().to_vec()),
+            serde_json::to_vec(&summary).unwrap().into(),
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(summary.as_ref()).unwrap(),
+            serde_json::json!([{
+                "author": "IDG",
+                "date": "2022-05-11T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+            }])
+        );
     }
 }
