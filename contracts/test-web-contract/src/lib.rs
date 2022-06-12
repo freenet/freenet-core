@@ -72,9 +72,7 @@ impl ContractInterface for MessageFeed {
             }
         }
         Ok(UpdateModification::ValidUpdate(State::from(
-            serde_json::to_string(&feed)
-                .map_err(|err| ContractError::Other(err.into()))?
-                .into_bytes(),
+            serde_json::to_vec(&feed).map_err(|err| ContractError::Other(err.into()))?,
         )))
     }
 
@@ -83,10 +81,10 @@ impl ContractInterface for MessageFeed {
         state: State<'static>,
     ) -> StateSummary<'static> {
         let feed = MessageFeed::try_from(state).unwrap();
-        let only_messages = serde_json::to_string(&feed.messages)
+        let only_messages = serde_json::to_vec(&feed.messages)
             .map_err(|err| ContractError::Other(err.into()))
             .unwrap();
-        StateSummary::from(only_messages.into_bytes())
+        StateSummary::from(only_messages)
     }
 
     fn get_state_delta(
@@ -106,10 +104,10 @@ impl ContractInterface for MessageFeed {
                 delta.push(m);
             }
         }
-        let serialized = serde_json::to_string(&delta)
+        let serialized = serde_json::to_vec(&delta)
             .map_err(|err| ContractError::Other(err.into()))
             .unwrap();
-        StateDelta::from(serialized.into_bytes())
+        StateDelta::from(serialized)
     }
 
     fn update_state_from_summary(
@@ -123,7 +121,7 @@ impl ContractInterface for MessageFeed {
             .unwrap();
         feed.messages.append(&mut summary);
         Ok(UpdateModification::ValidUpdate(
-            serde_json::to_string(&feed).unwrap().into_bytes().into(),
+            serde_json::to_vec(&feed).unwrap().into(),
         ))
     }
 }

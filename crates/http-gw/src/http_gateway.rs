@@ -177,7 +177,12 @@ impl ClientEventsProxy for HttpGateway {
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
             if let Some(ch) = self.response_channels.remove(&client) {
-                if ch.send((client, response)).is_ok() {
+                let should_rm = response
+                    .as_ref()
+                    .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
+                    .err()
+                    .unwrap_or(false);
+                if ch.send((client, response)).is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(client, ch);
                 }

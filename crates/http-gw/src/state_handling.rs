@@ -74,10 +74,16 @@ pub async fn update_state(
             assert_eq!(key, contract_key);
             (id, Ok(reply::json(&serde_json::json!({"result": "ok"}))))
         }
+        Some((id, Err(err))) => (
+            id,
+            Ok(reply::json(
+                &serde_json::json!({"result": "error", "err": format!("{err}")}),
+            )),
+        ),
         None => {
             return Err(NodeError.into());
         }
-        _ => unreachable!(),
+        err => unreachable!("{err:?}"),
     };
     request_sender
         .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))

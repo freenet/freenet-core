@@ -24,7 +24,7 @@ pub mod local_node {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use locutus_dev::LocalNode;
-    use locutus_node::{either, ClientError, ClientEventsProxy, ErrorKind, WebSocketProxy};
+    use locutus_node::{either, ClientError, ClientEventsProxy, ErrorKind, WebSocketProxy, RequestError};
 
     use crate::{DynError, HttpGateway};
 
@@ -43,6 +43,7 @@ pub mod local_node {
                 Ok(res) => {
                     http_handle.send(id, Ok(res)).await?;
                 }
+                Err(either::Left(RequestError::Disconnect)) => {}
                 Err(either::Left(err)) => {
                     log::error!("{err}");
                     http_handle

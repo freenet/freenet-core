@@ -620,9 +620,7 @@ impl Deref for ContractKey {
 
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ContractKey(")?;
-        internal_fmt_key(&self.spec, f)?;
-        write!(f, ")")
+        internal_fmt_key(&self.spec, f)
     }
 }
 

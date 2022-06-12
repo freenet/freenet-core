@@ -64,6 +64,8 @@ pub enum ErrorKind {
     Unhandled(String),
     #[error("failed while trying to unpack state for {0}")]
     IncorrectState(ContractKey),
+    #[error("client disconnected")]
+    Disconnect,
 }
 
 impl warp::reject::Reject for ErrorKind {}
@@ -149,6 +151,8 @@ pub enum RequestError {
     Update { key: ContractKey, cause: String },
     #[error("failed to get contract {key}, reason: {cause}")]
     Get { key: ContractKey, cause: String },
+    #[error("client disconnect")]
+    Disconnect,
 }
 
 /// A request from a client application to the host.

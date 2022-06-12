@@ -42,7 +42,7 @@
             conn = null;
         };
 
-        function processResponse(){
+        function processResponse() {
             log("State update sent");
         }
 
@@ -54,8 +54,10 @@
                 dataType: 'json',
                 contentType: 'application/json',
                 success: function (data) {
+                    log("Received response: " + data)
                     processResponse();
                 },
+                
                 data: JSON.stringify(update)
             });
             //conn.send(state);
