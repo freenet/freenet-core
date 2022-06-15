@@ -8,9 +8,16 @@
 
 <body>
     <h1>Contract Test</h1>
-    <textarea id="input" rows="4" cols="50">[{"author":"IDG","date":"2022-05-10T00:00:00Z","title":"Lore ipsum",
-        "content":"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt
-        ut labore et dolore magna aliqua."}]</textarea>
+    <textarea id="input" rows="8" cols="50">
+[
+    {
+        "author":"IDG",
+        "date":"2022-05-10T00:00:00Z",
+        "title":"Lore ipsum",
+        "content":"..."
+    }
+]
+    </textarea>
     <br>
     <button id="btn">Send Update</button>
     <h1>Updates:</h1>
@@ -22,7 +29,7 @@
         const wsUri =
             ((window.location.protocol == "https:" && "wss://") || "ws://") +
             window.location.host +
-            "/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state/updates";
+            "/contract/6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2/state/updates";
         log("Connecting...");
 
         conn = new WebSocket(wsUri);
@@ -47,20 +54,21 @@
         }
 
         function send() {
-            let update = document.getElementById("input").value
+            let update = document.getElementById("input").value;
+            let parsed = JSON.parse(update);
+            log("Sending: " + JSON.stringify(parsed));
             $.ajax({
-                url: '/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state/update/',
-                type: 'post',
+                url: '/contract/6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2/state/update/',
+                method: 'POST',
                 dataType: 'json',
                 contentType: 'application/json',
                 success: function (data) {
                     log("Received response: " + data)
                     processResponse();
                 },
-                
-                data: JSON.stringify(update)
+                data: parsed
             });
-            //conn.send(state);
+            // conn.send(state);
         }
 
         document.getElementById("btn").addEventListener("click", send);

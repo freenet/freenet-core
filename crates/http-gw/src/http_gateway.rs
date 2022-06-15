@@ -47,14 +47,14 @@ impl HttpGateway {
             .and(warp::path::param())
             .and(warp::path::end())
             .and_then(|rs, key: String| async move {
-                crate::contract_handling::contract_home(key, rs).await
+                crate::contract_web_handling::contract_home(key, rs).await
             });
 
         let contract_subpages = warp::path::path("contract")
             .and(warp::path::param())
             .and(warp::filters::path::full())
             .and_then(|key: String, path| async move {
-                crate::contract_handling::variable_content(key, path).await
+                crate::contract_web_handling::variable_content(key, path).await
             });
 
         let rs = request_sender.clone();
@@ -74,6 +74,7 @@ impl HttpGateway {
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path!("state" / "update"))
+            .and(warp::path::end())
             .and(warp::post())
             .and(warp::body::json())
             .and_then(|rs, key: String, put_value| async move {

@@ -1,4 +1,4 @@
-pub(crate) mod contract_handling;
+pub(crate) mod contract_web_handling;
 pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod state_handling;
