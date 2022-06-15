@@ -55,8 +55,7 @@
 
         function send() {
             let update = document.getElementById("input").value;
-            let parsed = JSON.parse(update);
-            log("Sending: " + JSON.stringify(parsed));
+            log("Sending: " + JSON.stringify(JSON.parse(update)));
             $.ajax({
                 url: '/contract/6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2/state/update/',
                 method: 'POST',
@@ -66,7 +65,7 @@
                     log("Received response: " + data)
                     processResponse();
                 },
-                data: parsed
+                data: update
             });
             // conn.send(state);
         }
