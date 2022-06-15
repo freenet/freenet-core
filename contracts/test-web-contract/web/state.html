@@ -26,10 +26,15 @@
     <script>
         let log = console.log;
 
+        function getContractKeyFromUrl() {
+            let urlParts = window.location.pathname.split('/');
+            return urlParts[2]
+        }
+
         const wsUri =
             ((window.location.protocol == "https:" && "wss://") || "ws://") +
             window.location.host +
-            "/contract/6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2/state/updates";
+            `/contract/${getContractKeyFromUrl()}/state/updates`;
         log("Connecting...");
 
         conn = new WebSocket(wsUri);
@@ -57,7 +62,7 @@
             let update = document.getElementById("input").value;
             log("Sending: " + JSON.stringify(JSON.parse(update)));
             $.ajax({
-                url: '/contract/6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2/state/update/',
+                url: `/contract/${getContractKeyFromUrl()}/state/update/`,
                 method: 'POST',
                 dataType: 'json',
                 contentType: 'application/json',
