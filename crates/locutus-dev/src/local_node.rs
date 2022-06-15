@@ -155,6 +155,7 @@ impl LocalNode {
                         .map_err(Into::into)
                         .map_err(Either::Right)?
                         .clone();
+
                     let new_state = self
                         .runtime
                         .update_state(&key, &parameters, &state, &delta)
@@ -213,7 +214,7 @@ impl LocalNode {
                 if let Some(cause) = cause {
                     log::info!("disconnecting cause: {cause}");
                 }
-                Err(Either::Right("disconnected".into()))
+                Err(Either::Left(RequestError::Disconnect))
             }
         }
     }

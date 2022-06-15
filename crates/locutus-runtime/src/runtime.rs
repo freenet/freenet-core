@@ -518,7 +518,7 @@ mod test {
             &WrappedState::new(vec![5, 2, 3]),
             &StateDelta::from([4].as_ref()),
         )?;
-        assert!(new_state.as_ref().len() == 4);
+        assert_eq!(new_state.as_ref().len(), 4);
         assert!(new_state.as_ref()[3] == 4);
         Ok(())
     }
