@@ -20,6 +20,7 @@ pub use client_events::{
 };
 pub use contract::{SQLiteContractHandler, SqlitePool};
 pub use either;
+pub use libp2p;
 pub use node::PeerKey;
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;

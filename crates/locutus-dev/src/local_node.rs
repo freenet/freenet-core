@@ -181,13 +181,7 @@ impl LocalNode {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.send_update_notification(&key, &parameters, &new_state)
-                    .await
-                    .map_err(|_| {
-                        Either::Left(RequestError::Put {
-                            key,
-                            cause: "failed while sending notifications".to_owned(),
-                        })
-                    })?;
+                    .await?;
                 // TODO: in network mode, wait at least for one confirmation
                 //       when a node receives a delta from updates, run the update themselves
                 //       and send back confirmation
@@ -197,14 +191,9 @@ impl LocalNode {
                 key,
                 fetch_contract: contract,
             } => self.perform_get(contract, key).await.map_err(Either::Left),
-            ClientRequest::Subscribe { key, updates } => {
-                self.register_contract_notifier(
-                    key,
-                    PeerKey::random(),
-                    updates,
-                    [].as_ref().into(),
-                )
-                .unwrap();
+            ClientRequest::Subscribe { key, updates, peer } => {
+                self.register_contract_notifier(key, peer, updates, [].as_ref().into())
+                    .unwrap();
                 log::info!("getting contract: {}", key.encode());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)

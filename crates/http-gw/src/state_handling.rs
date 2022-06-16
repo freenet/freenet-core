@@ -114,11 +114,13 @@ pub async fn state_updates_notification(
         (str_sender, rx)
     };
 
+    let peer = PeerKey::random(); // FIXME: this must be obtained somehow from the node
     request_sender
         .send((
             ClientRequest::Subscribe {
                 key: contract_key,
                 updates,
+                peer,
             },
             Either::Left(response_sender),
         ))
@@ -132,7 +134,10 @@ pub async fn state_updates_notification(
             //       in reality we must send this back as bytes and let the client handle it
             //       but in order to test things out we send a json
             assert_eq!(key, contract_key);
-            let json_str: serde_json::Value = serde_json::from_slice(update.as_ref()).unwrap();
+            let s = update.as_ref();
+            // fixme: state delta off by one err when reading from buf
+            let json_str: serde_json::Value =
+                serde_json::from_slice(&s[..s.len() - 1]).expect("deserialization err");
             let _ = ws_sender.send(json_str).await;
         } else {
             break;

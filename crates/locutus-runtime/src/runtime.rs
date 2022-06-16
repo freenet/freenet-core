@@ -428,8 +428,8 @@ impl Runtime {
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
         let delta_buf =
             unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
-        let delta = delta_buf.read_bytes(delta_buf.size());
-        Ok(StateDelta::from(delta.to_owned()))
+        let mut delta = delta_buf.shared();
+        Ok(StateDelta::from(delta.read_all().to_vec()))
     }
 
     /// Updates the current state from the provided summary.
