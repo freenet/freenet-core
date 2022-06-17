@@ -52,12 +52,12 @@ pub async fn get_state(
 // todo: assuming json but could be anything really, they have to send as bytes
 pub async fn update_state(
     key: String,
-    update_value: serde_json::Value,
+    update_value: Vec<u8>,
     request_sender: mpsc::Sender<ClientHandlingMessage>,
 ) -> Result<impl Reply, Rejection> {
     let contract_key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let delta = serde_json::to_vec(&update_value).unwrap();
+    let delta = update_value;
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send((
@@ -104,10 +104,8 @@ pub async fn state_updates_notification(
     let (mut ws_sender, mut _ws_receiver) = {
         let (tx, rx) = ws.split();
 
-        let str_sender = tx.with(|msg: serde_json::Value| {
-            let res: Result<Message, warp::Error> = Ok(Message::text(
-                serde_json::to_string(&msg).expect("Converting message to JSON"),
-            ));
+        let str_sender = tx.with(|msg: Vec<u8>| {
+            let res: Result<Message, warp::Error> = Ok(Message::binary(msg));
             ready(res)
         });
 
@@ -136,9 +134,7 @@ pub async fn state_updates_notification(
             assert_eq!(key, contract_key);
             let s = update.as_ref();
             // fixme: state delta off by one err when reading from buf
-            let json_str: serde_json::Value =
-                serde_json::from_slice(&s[..s.len() - 1]).expect("deserialization err");
-            let _ = ws_sender.send(json_str).await;
+            let _ = ws_sender.send(s[..s.len() - 1].to_vec()).await;
         } else {
             break;
         }

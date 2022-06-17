@@ -32,9 +32,12 @@
         }
 
         const wsUri =
-            ((window.location.protocol == "https:" && "wss://") || "ws://") +
+            ((window.location.protocol === "https:" && "wss://") || "ws://") +
             window.location.host +
             `/contract/${getContractKeyFromUrl()}/state/updates`;
+
+        const reader = new FileReader();
+
         log("Connecting...");
 
         conn = new WebSocket(wsUri);
@@ -44,9 +47,12 @@
         };
 
         conn.onmessage = function (e) {
-            log("Received: " + e.data);
-            document.getElementById("updates").textContent =
-                document.getElementById("updates").textContent + "\n" + e.data;
+            reader.onload = () => {
+                console.log("Received: " + reader.result);
+                document.getElementById("updates").textContent =
+                    document.getElementById("updates").textContent + "\n" + JSON.stringify(JSON.parse(reader.result), null, 2);
+            };
+            reader.readAsText(e.data);
         };
 
         conn.onclose = function () {

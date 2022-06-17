@@ -13,6 +13,7 @@ use std::{
 use tokio::sync::mpsc;
 use warp::ws::WebSocket;
 use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
+use warp::hyper::body::Bytes;
 
 use crate::{
     errors,
@@ -76,9 +77,9 @@ impl HttpGateway {
             .and(warp::path!("state" / "update"))
             .and(warp::path::end())
             .and(warp::post())
-            .and(warp::body::json())
-            .and_then(|rs, key: String, put_value| async move {
-                update_state(key, put_value, rs).await
+            .and(warp::body::bytes())
+            .and_then(|rs, key: String, put_value: Bytes| async move {
+                update_state(key, put_value.to_vec(), rs).await
             });
 
         let get_contract_state = warp::path::path("contract")
