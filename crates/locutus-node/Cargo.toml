@@ -42,7 +42,7 @@ unsigned-varint = "0.7"
 uuid = { version = "1", features = ["serde", "v4", "v1"] }
 rmp = { version = "0.8", optional = true }
 rmp-serde = { version = "1", optional = true } 
-sqlx = { version = "0.5", features = ["sqlite", "runtime-tokio-rustls"] }
+sqlx = { version = "0.6", features = ["sqlite", "runtime-tokio-rustls"] }
 warp = { version = "0.3", default-features = false, optional = true, features = ["multipart", "tls"] }
 
 # Tracing deps
