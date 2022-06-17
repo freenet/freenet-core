@@ -8,7 +8,7 @@ use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{WrappedContract, WrappedState, PeerKey};
+use crate::{PeerKey, WrappedContract, WrappedState};
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -316,7 +316,11 @@ pub(crate) mod test {
                             todo!() // fixme
                         };
                         let (updates, _) = tokio::sync::mpsc::unbounded_channel();
-                        break ClientRequest::Subscribe { key, updates, peer: PeerKey::random() };
+                        break ClientRequest::Subscribe {
+                            key,
+                            updates,
+                            peer: PeerKey::random(),
+                        };
                     }
                     0 => {}
                     1 => {}

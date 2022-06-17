@@ -24,7 +24,9 @@ pub mod local_node {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use locutus_dev::LocalNode;
-    use locutus_node::{either, ClientError, ClientEventsProxy, ErrorKind, WebSocketProxy, RequestError};
+    use locutus_node::{
+        either, ClientError, ClientEventsProxy, ErrorKind, RequestError, WebSocketProxy,
+    };
 
     use crate::{DynError, HttpGateway};
 
