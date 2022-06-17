@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
-use locutus_stdlib::prelude::*;
+use locutus_stdlib::{
+    blake2::{Blake2b512, Digest},
+    prelude::*,
+};
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 
 #[derive(Serialize, Deserialize)]
 struct MessageFeed {
@@ -19,28 +23,43 @@ impl<'a> TryFrom<State<'a>> for MessageFeed {
     type Error = ContractError;
 
     fn try_from(value: State<'a>) -> Result<Self, Self::Error> {
-        serde_json::from_slice(&value).map_err(|_| ContractError::InvalidState)
+        serde_json::from_slice(value.as_ref()).map_err(|_| ContractError::InvalidState)
     }
 }
 
-// #[derive(Serialize, Deserialize)]
-// struct FeedSummary {
-//     messages: Vec<MessageSummary>,
-// }
+#[derive(Serialize, Deserialize)]
+struct FeedSummary {
+    summaries: Vec<MessageSummary>,
+}
 
-// #[derive(Serialize, Deserialize)]
-// struct MessageSummary {
-//     author: String,
-//     date: DateTime<Utc>,
-//     title: String,
-// }
+impl<'a> From<&'a mut MessageFeed> for FeedSummary {
+    fn from(feed: &'a mut MessageFeed) -> Self {
+        feed.messages.sort_by_key(|m| m.date);
+        let mut summaries = Vec::with_capacity(feed.messages.len());
+        for msg in &feed.messages {
+            let mut hasher = Blake2b512::new();
+            hasher.update(msg.author.as_bytes());
+            hasher.update(msg.title.as_bytes());
+            hasher.update(msg.content.as_bytes());
+            let hash_val = hasher.finalize();
+            let mut key = [0; 64];
+            key.copy_from_slice(&hash_val[..]);
+            summaries.push(MessageSummary(key));
+        }
+        FeedSummary { summaries }
+    }
+}
 
-// impl<'a> TryFrom<StateSummary<'a>> for MessageSummary {
-//     type Error = ContractError;
-//     fn try_from(value: StateSummary<'a>) -> Result<Self, Self::Error> {
-//         serde_json::from_slice(&value).map_err(|_| ContractError::InvalidState)
-//     }
-// }
+#[serde_as]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct MessageSummary(#[serde_as(as = "[_; 64]")] [u8; 64]);
+
+impl<'a> TryFrom<StateSummary<'a>> for MessageSummary {
+    type Error = ContractError;
+    fn try_from(value: StateSummary<'a>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(&value).map_err(|_| ContractError::InvalidState)
+    }
+}
 
 #[contract]
 impl ContractInterface for MessageFeed {
@@ -49,7 +68,7 @@ impl ContractInterface for MessageFeed {
     }
 
     fn validate_delta(_parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool {
-        serde_json::from_slice::<Message>(&delta).is_ok()
+        serde_json::from_slice::<Vec<Message>>(&delta).is_ok()
     }
 
     fn update_state(
@@ -72,9 +91,7 @@ impl ContractInterface for MessageFeed {
             }
         }
         Ok(UpdateModification::ValidUpdate(State::from(
-            serde_json::to_string(&feed)
-                .map_err(|err| ContractError::Other(err.into()))?
-                .into_bytes(),
+            serde_json::to_vec(&feed).map_err(|err| ContractError::Other(err.into()))?,
         )))
     }
 
@@ -82,11 +99,9 @@ impl ContractInterface for MessageFeed {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> StateSummary<'static> {
-        let feed = MessageFeed::try_from(state).unwrap();
-        let only_messages = serde_json::to_string(&feed.messages)
-            .map_err(|err| ContractError::Other(err.into()))
-            .unwrap();
-        StateSummary::from(only_messages.into_bytes())
+        let mut feed = MessageFeed::try_from(state).unwrap();
+        let only_messages = FeedSummary::from(&mut feed);
+        StateSummary::from(serde_json::to_vec(&only_messages).expect("serialization failed"))
     }
 
     fn get_state_delta(
@@ -94,34 +109,40 @@ impl ContractInterface for MessageFeed {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> StateDelta<'static> {
-        let mut feed = MessageFeed::try_from(state).unwrap();
-        feed.messages.sort_by_key(|m| m.date);
-        let mut current = serde_json::from_slice::<Vec<Message>>(&summary)
-            .map_err(|_| ContractError::InvalidDelta)
-            .unwrap();
-        current.sort_by_key(|m| m.date);
-        let mut delta = vec![];
-        for m in feed.messages {
-            if current.binary_search_by_key(&m.date, |o| o.date).is_err() {
-                delta.push(m);
+        let feed = MessageFeed::try_from(state).unwrap();
+        let mut summary = match serde_json::from_slice::<FeedSummary>(&summary) {
+            Ok(summary) => summary,
+            Err(_) => {
+                // empty summary
+                FeedSummary { summaries: vec![] }
+            }
+        };
+        summary.summaries.sort();
+        let mut final_messages = vec![];
+        for msg in feed.messages {
+            let mut hasher = Blake2b512::new();
+            hasher.update(msg.author.as_bytes());
+            hasher.update(msg.title.as_bytes());
+            hasher.update(msg.content.as_bytes());
+            let hash_val = hasher.finalize();
+            if summary
+                .summaries
+                .binary_search_by(|m| m.0.as_ref().cmp(&hash_val[..]))
+                .is_err()
+            {
+                final_messages.push(msg);
             }
         }
-        let serialized = serde_json::to_string(&delta)
-            .map_err(|err| ContractError::Other(err.into()))
-            .unwrap();
-        StateDelta::from(serialized.into_bytes())
+        StateDelta::from(serde_json::to_vec(&final_messages).unwrap())
     }
 
+    // TODO: check if this is useful in anyway or makes sense at all
     fn update_state_from_summary(
         _parameters: Parameters<'static>,
-        mut state: State<'static>,
-        summary: StateSummary<'static>,
+        _state: State<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<UpdateModification, ContractError> {
-        let new_state = state.to_mut();
-        new_state.extend(summary.as_ref());
-        Ok(UpdateModification::ValidUpdate(State::from(
-            new_state.to_vec(),
-        )))
+        unimplemented!()
     }
 }
 
@@ -137,7 +158,7 @@ mod test {
                     "author": "IDG",
                     "date": "2022-05-10T00:00:00Z",
                     "title": "Lore ipsum",
-                    "content": "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+                    "content": "..."
                 }
             ]
         }"#;
@@ -146,19 +167,180 @@ mod test {
     }
 
     #[test]
-    fn validate() {
+    fn validate_state() {
         let json = r#"{
             "messages": [
                 {
                     "author": "IDG",
                     "date": "2022-05-10T00:00:00Z",
                     "title": "Lore ipsum",
-                    "content": "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+                    "content": "..."
                 }
             ]
         }"#;
         let valid =
             MessageFeed::validate_state([].as_ref().into(), State::from(json.as_bytes().to_vec()));
         assert!(valid);
+    }
+
+    #[test]
+    fn validate_delta() {
+        let json = r#"[
+            {
+                "author": "IDG",
+                "date": "2022-05-10T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+            }
+        ]"#;
+        let valid = MessageFeed::validate_delta(
+            [].as_ref().into(),
+            StateDelta::from(json.as_bytes().to_vec()),
+        );
+        assert!(valid);
+    }
+
+    #[test]
+    fn update_state() {
+        let state = r#"{"messages":[{"author":"IDG","content":"...","date":"2022-05-10T00:00:00Z","title":"Lore ipsum"}]}"#;
+        let delta =
+            r#"[{"author":"IDG","content":"...","date":"2022-06-15T00:00:00Z","title":"New msg"}]"#;
+        let new_state = MessageFeed::update_state(
+            [].as_ref().into(),
+            state.as_bytes().to_vec().into(),
+            delta.as_bytes().to_vec().into(),
+        )
+        .unwrap()
+        .unwrap_valid();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(new_state.as_ref()).unwrap(),
+            serde_json::json!({
+                "messages": [
+                    {
+                        "author": "IDG",
+                        "date": "2022-05-10T00:00:00Z",
+                        "title": "Lore ipsum",
+                        "content": "..."
+                    },
+                    {
+                        "author": "IDG",
+                        "date": "2022-06-15T00:00:00Z",
+                        "title": "New msg",
+                        "content": "..."
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn summarize_state() {
+        let json = r#"{
+            "messages": [
+                {
+                    "author": "IDG",
+                    "date": "2022-05-10T00:00:00Z",
+                    "title": "Lore ipsum",
+                    "content": "..."
+                }
+            ]
+        }"#;
+        let summary =
+            MessageFeed::summarize_state([].as_ref().into(), State::from(json.as_bytes().to_vec()));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(summary.as_ref()).unwrap(),
+            serde_json::json!([{
+                "author": "IDG",
+                "date": "2022-05-10T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+            }])
+        );
+    }
+
+    #[test]
+    fn get_state_delta() {
+        let json = r#"{
+            "messages": [
+                {
+                    "author": "IDG",
+                    "date": "2022-05-11T00:00:00Z",
+                    "title": "Lore ipsum",
+                    "content": "..."
+                },
+                {
+                    "author": "IDG",
+                    "date": "2022-04-10T00:00:00Z",
+                    "title": "Lore ipsum",
+                    "content": "..."
+                }    
+            ]
+        }"#;
+        let summary = serde_json::json!([{
+                "author": "IDG",
+                "date": "2022-04-10T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+        }]);
+        let delta = MessageFeed::get_state_delta(
+            [].as_ref().into(),
+            State::from(json.as_bytes().to_vec()),
+            serde_json::to_vec(&summary).unwrap().into(),
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(delta.as_ref()).unwrap(),
+            serde_json::json!([{
+                "author": "IDG",
+                "date": "2022-05-11T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+            }])
+        );
+    }
+
+    #[test]
+    fn update_state_from_summary() {
+        let state = r#"{
+            "messages": [
+                {
+                    "author": "IDG",
+                    "date": "2022-05-11T00:00:00Z",
+                    "title": "Lore ipsum",
+                    "content": "..."
+                }    
+            ]
+        }"#;
+        let summary = serde_json::json!([{
+                "author": "IDG",
+                "date": "2022-04-10T00:00:00Z",
+                "title": "Lore ipsum",
+                "content": "..."
+        }]);
+        let delta = MessageFeed::update_state_from_summary(
+            [].as_ref().into(),
+            State::from(state.as_bytes().to_vec()),
+            serde_json::to_vec(&summary).unwrap().into(),
+        )
+        .unwrap()
+        .unwrap_valid();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(delta.as_ref()).unwrap(),
+            serde_json::json!({
+                "messages": [
+                    {
+                        "author": "IDG",
+                        "date": "2022-05-11T00:00:00Z",
+                        "title": "Lore ipsum",
+                        "content": "..."
+                    },
+                    {
+                        "author": "IDG",
+                        "date": "2022-04-10T00:00:00Z",
+                        "title": "Lore ipsum",
+                        "content": "..."
+                    }
+                ]
+            })
+        );
     }
 }

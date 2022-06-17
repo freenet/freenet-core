@@ -2,6 +2,7 @@
 pub mod buffer;
 pub mod interface;
 
+pub use blake2;
 pub use locutus_macros::contract;
 
 pub mod prelude {
@@ -9,4 +10,3 @@ pub mod prelude {
     pub use crate::interface::*;
     pub use locutus_macros::contract;
 }
-

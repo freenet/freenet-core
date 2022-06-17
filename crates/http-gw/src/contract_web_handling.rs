@@ -67,7 +67,6 @@ async fn get_web_body(path: PathBuf) -> Result<warp::hyper::Body, Rejection> {
 
 pub async fn variable_content(
     key: String,
-    // referer: warp::http::Uri,
     req_path: warp::path::FullPath,
 ) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key)

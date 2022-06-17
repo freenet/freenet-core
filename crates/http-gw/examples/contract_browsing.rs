@@ -2,7 +2,6 @@
 
 use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 
-use locutus_dev::ContractStore;
 use locutus_node::{either::Either, SqlitePool, WrappedState};
 use locutus_runtime::{ContractCode, StateStore, WrappedContract};
 
@@ -31,6 +30,7 @@ pub fn test_contract() -> Result<WrappedContract<'static>, std::io::Error> {
 #[cfg(feature = "local")]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use http_gw::HttpGateway;
+    use locutus_dev::ContractStore;
 
     let state = test_state()?;
     let contract = test_contract()?;

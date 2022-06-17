@@ -8,7 +8,7 @@ use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{WrappedContract, WrappedState};
+use crate::{WrappedContract, WrappedState, PeerKey};
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -64,6 +64,8 @@ pub enum ErrorKind {
     Unhandled(String),
     #[error("failed while trying to unpack state for {0}")]
     IncorrectState(ContractKey),
+    #[error("client disconnected")]
+    Disconnect,
 }
 
 impl warp::reject::Reject for ErrorKind {}
@@ -149,6 +151,8 @@ pub enum RequestError {
     Update { key: ContractKey, cause: String },
     #[error("failed to get contract {key}, reason: {cause}")]
     Get { key: ContractKey, cause: String },
+    #[error("client disconnect")]
+    Disconnect,
 }
 
 /// A request from a client application to the host.
@@ -179,6 +183,7 @@ pub enum ClientRequest {
     /// connection, and relied through the provided channel.
     #[serde(skip)]
     Subscribe {
+        peer: PeerKey,
         key: ContractKey,
         updates: UnboundedSender<HostResponse>,
     },
@@ -311,7 +316,7 @@ pub(crate) mod test {
                             todo!() // fixme
                         };
                         let (updates, _) = tokio::sync::mpsc::unbounded_channel();
-                        break ClientRequest::Subscribe { key, updates };
+                        break ClientRequest::Subscribe { key, updates, peer: PeerKey::random() };
                     }
                     0 => {}
                     1 => {}

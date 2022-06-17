@@ -464,6 +464,7 @@ mod test {
         let event = ClientRequest::Subscribe {
             key: contract_key,
             updates,
+            peer: PeerKey::random(),
         };
         let first_node = NodeSpecification {
             owned_contracts: Vec::new(),
