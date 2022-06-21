@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use ed25519_dalek::Verifier;
 use locutus_stdlib::{
     blake2::{Blake2b512, Digest},
     prelude::*,
@@ -17,6 +18,26 @@ struct Message {
     date: DateTime<Utc>,
     title: String,
     content: String,
+    #[serde(default = "Message::modded")]
+    mod_msg: bool,
+    signature: Option<ed25519_dalek::Signature>,
+}
+
+impl Message {
+    fn hash(&self) -> [u8; 64] {
+        let mut hasher = Blake2b512::new();
+        hasher.update(self.author.as_bytes());
+        hasher.update(self.title.as_bytes());
+        hasher.update(self.content.as_bytes());
+        let hash_val = hasher.finalize();
+        let mut key = [0; 64];
+        key.copy_from_slice(&hash_val[..]);
+        key
+    }
+
+    fn modded() -> bool {
+        false
+    }
 }
 
 impl<'a> TryFrom<State<'a>> for MessageFeed {
@@ -37,14 +58,7 @@ impl<'a> From<&'a mut MessageFeed> for FeedSummary {
         feed.messages.sort_by_key(|m| m.date);
         let mut summaries = Vec::with_capacity(feed.messages.len());
         for msg in &feed.messages {
-            let mut hasher = Blake2b512::new();
-            hasher.update(msg.author.as_bytes());
-            hasher.update(msg.title.as_bytes());
-            hasher.update(msg.content.as_bytes());
-            let hash_val = hasher.finalize();
-            let mut key = [0; 64];
-            key.copy_from_slice(&hash_val[..]);
-            summaries.push(MessageSummary(key));
+            summaries.push(MessageSummary(msg.hash()));
         }
         FeedSummary { summaries }
     }
@@ -61,6 +75,30 @@ impl<'a> TryFrom<StateSummary<'a>> for MessageSummary {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct Verification {
+    public_key: ed25519_dalek::PublicKey,
+}
+
+impl Verification {
+    fn verify(&self, msg: &Message) -> bool {
+        if let Some(sig) = msg.signature {
+            self.public_key
+                .verify(&serde_json::to_vec(msg).unwrap(), &sig)
+                .is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+impl<'a> TryFrom<Parameters<'a>> for Verification {
+    type Error = ContractError;
+    fn try_from(value: Parameters<'a>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(value.as_ref()).map_err(|_| ContractError::InvalidState)
+    }
+}
+
 #[contract]
 impl ContractInterface for MessageFeed {
     fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
@@ -72,22 +110,32 @@ impl ContractInterface for MessageFeed {
     }
 
     fn update_state(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
         delta: StateDelta<'static>,
     ) -> Result<UpdateModification, ContractError> {
         let mut feed = MessageFeed::try_from(state)?;
-        feed.messages.sort_by_key(|m| m.date);
+        let verifier = Verification::try_from(parameters).ok();
+        feed.messages.sort_by_cached_key(|m| m.hash());
         let mut incoming = serde_json::from_slice::<Vec<Message>>(&delta)
             .map_err(|_| ContractError::InvalidDelta)?;
-        incoming.sort_by_key(|m| m.date);
+        incoming.sort_by_cached_key(|m| m.hash());
         for m in incoming {
             if feed
                 .messages
-                .binary_search_by_key(&m.date, |o| o.date)
+                .binary_search_by_key(&m.hash(), |o| o.hash())
                 .is_err()
             {
-                feed.messages.push(m);
+                if m.mod_msg {
+                    if let Some(verifier) = &verifier {
+                        if !verifier.verify(&m) {
+                            continue;
+                        }
+                        feed.messages.push(m);
+                    }
+                } else {
+                    feed.messages.push(m);
+                }
             }
         }
         Ok(UpdateModification::ValidUpdate(State::from(

@@ -49,21 +49,19 @@ pub async fn get_state(
     response
 }
 
-// todo: assuming json but could be anything really, they have to send as bytes
 pub async fn update_state(
     key: String,
-    update_value: Vec<u8>,
+    delta: StateDelta<'static>,
     request_sender: mpsc::Sender<ClientHandlingMessage>,
 ) -> Result<impl Reply, Rejection> {
     let contract_key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let delta = update_value;
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send((
             ClientRequest::Update {
                 key: contract_key,
-                delta: StateDelta::from(delta),
+                delta,
             },
             Either::Left(response_sender),
         ))
@@ -128,9 +126,6 @@ pub async fn state_updates_notification(
     // todo: await for some sort of confirmation through "response_recv"
     while let Some(response) = updates_recv.recv().await {
         if let HostResponse::UpdateNotification { key, update } = response {
-            // todo: we assume that this is json, but it could be anything
-            //       in reality we must send this back as bytes and let the client handle it
-            //       but in order to test things out we send a json
             assert_eq!(key, contract_key);
             let s = update.as_ref();
             // fixme: state delta off by one err when reading from buf

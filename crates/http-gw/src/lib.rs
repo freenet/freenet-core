@@ -24,12 +24,22 @@ pub mod local_node {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use locutus_dev::LocalNode;
-    use locutus_node::{either, ClientError, ClientEventsProxy, ErrorKind, WebSocketProxy, RequestError};
+    use locutus_node::{
+        either, ClientError, ClientEventsProxy, ErrorKind, RequestError, WebSocketProxy,
+    };
+    use locutus_runtime::StateDelta;
+    use warp::Rejection;
 
     use crate::{DynError, HttpGateway};
 
-    pub async fn set_local_node(mut local_node: LocalNode) -> Result<(), DynError> {
-        let (mut http_handle, filter) = HttpGateway::as_filter();
+    pub async fn set_local_node<F>(
+        mut local_node: LocalNode,
+        update_hook: F,
+    ) -> Result<(), DynError>
+    where
+        F: Fn(Vec<u8>) -> Result<StateDelta<'static>, Rejection> + Copy + Send + Sync + 'static,
+    {
+        let (mut http_handle, filter) = HttpGateway::as_filter(update_hook);
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
         let _ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;
         // FIXME: use combinator

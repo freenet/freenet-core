@@ -1,7 +1,7 @@
 use locutus_node::either::Either;
 
 use locutus_node::*;
-use locutus_runtime::ContractKey;
+use locutus_runtime::{ContractKey, StateDelta};
 use std::{
     collections::HashMap,
     future::Future,
@@ -11,9 +11,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::mpsc;
+use warp::hyper::body::Bytes;
 use warp::ws::WebSocket;
 use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
-use warp::hyper::body::Bytes;
 
 use crate::{
     errors,
@@ -30,7 +30,10 @@ pub struct HttpGateway {
 
 impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
-    pub fn as_filter() -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
+    pub fn as_filter<F>(update_hook: F) -> (Self, BoxedFilter<(impl Reply + 'static,)>)
+    where
+        F: Fn(Vec<u8>) -> Result<StateDelta<'static>, Rejection> + Copy + Send + Sync + 'static,
+    {
         let contract_web_path = std::env::temp_dir().join("locutus").join("webs");
         std::fs::create_dir_all(&contract_web_path).unwrap();
 
@@ -78,8 +81,9 @@ impl HttpGateway {
             .and(warp::path::end())
             .and(warp::post())
             .and(warp::body::bytes())
-            .and_then(|rs, key: String, put_value: Bytes| async move {
-                update_state(key, put_value.to_vec(), rs).await
+            .and_then(move |rs, key: String, update_val: Bytes| async move {
+                let r = update_hook(update_val.to_vec())?;
+                update_state(key, r, rs).await
             });
 
         let get_contract_state = warp::path::path("contract")

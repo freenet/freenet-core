@@ -73,7 +73,15 @@ impl LocalNode {
     }
 
     pub async fn preload(&mut self, contract: WrappedContract<'static>, state: WrappedState) {
-        todo!()
+        if let Err(err) = self
+            .handle_request(locutus_node::ClientRequest::Put { contract, state })
+            .await
+        {
+            match err {
+                Either::Left(err) => log::error!("req error: {err}"),
+                Either::Right(err) => log::error!("other error: {err}"),
+            }
+        }
     }
 
     pub async fn handle_request(&mut self, req: ClientRequest) -> Response {
@@ -243,19 +251,27 @@ impl LocalNode {
         contract: bool,
         key: ContractKey,
     ) -> Result<HostResponse, RequestError> {
-        let got_contract = contract.then(|| {
-            let parameters = self.contract_params.get(&key).unwrap();
-            let data_key = key
-                .contract_part_encoded()
-                .or_else(|| {
-                    Some(ContractCode::encode_key(
-                        &self.runtime.contracts.code_hash_from_key(&key).unwrap(),
-                    ))
-                })
-                .unwrap();
-            let data = self.contract_data.get(&data_key).unwrap();
-            WrappedContract::new(data.clone(), parameters.clone())
-        });
+        let got_contract = contract
+            .then(|| {
+                let parameters =
+                    self.contract_params
+                        .get(&key)
+                        .ok_or_else(|| RequestError::Get {
+                            key,
+                            cause: "missing contract".to_owned(),
+                        })?;
+                let data_key = key
+                    .contract_part_encoded()
+                    .or_else(|| {
+                        Some(ContractCode::encode_key(
+                            &self.runtime.contracts.code_hash_from_key(&key).unwrap(),
+                        ))
+                    })
+                    .unwrap();
+                let data = self.contract_data.get(&data_key).unwrap();
+                Ok(WrappedContract::new(data.clone(), parameters.clone()))
+            })
+            .transpose()?;
         match self.contract_state.get(&key).await {
             Ok(state) => {
                 let path = contract
