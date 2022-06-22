@@ -380,6 +380,7 @@ dependencies = [
  "locutus-stdlib",
  "serde",
  "serde_json",
+ "serde_with",
  "tar",
  "xz2",
 ]

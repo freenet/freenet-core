@@ -72,7 +72,7 @@ pub enum Error {
 pub struct BufferMut<'instance> {
     buffer: &'instance mut [u8],
     /// stores the last read in the buffer
-    read_ptr: &'instance mut u32,
+    read_ptr: &'instance u32,
     /// stores the last write in the buffer
     write_ptr: &'instance mut u32,
     /// A pointer to the underlying builder
@@ -100,10 +100,13 @@ impl<'instance> BufferMut<'instance> {
             copy_to.copy_from_slice(obj);
             last_write += obj.len();
             *self.write_ptr = last_write as u32;
+            Ok(())
         } else {
-            todo!()
+            Err(Error::InsufficientMemory {
+                req: obj.len(),
+                free: free_right,
+            })
         }
-        Ok(())
     }
 
     pub fn read_bytes(&self, len: usize) -> &[u8] {
@@ -118,11 +121,15 @@ impl<'instance> BufferMut<'instance> {
             builder_ptr, mem, ..
         } = self;
         let BuilderInfo {
-            buffer, read_ptr, ..
+            buffer,
+            read_ptr,
+            write_ptr,
+            ..
         } = from_raw_builder(builder_ptr, mem);
         Buffer {
             buffer,
             read_ptr,
+            write_ptr,
             builder_ptr,
             mem,
         }
@@ -215,6 +222,7 @@ pub struct Buffer<'instance> {
     buffer: &'instance mut [u8],
     /// stores the last read in the buffer
     read_ptr: &'instance mut u32,
+    write_ptr: &'instance u32,
     builder_ptr: *mut BufferBuilder,
     mem: (*const u8, u64),
 }
@@ -241,7 +249,7 @@ impl<'instance> Buffer<'instance> {
     pub fn read_all(&mut self) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         *self.read_ptr += self.buffer.len() as u32;
-        &self.buffer[next_offset..]
+        &self.buffer[next_offset..=*self.write_ptr as usize]
     }
 
     /// Give ownership of the buffer back to the guest.

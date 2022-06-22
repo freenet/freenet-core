@@ -8,16 +8,33 @@
 
 <body>
     <h1>Contract Test</h1>
-    <input id="input" type="text" />
+    <textarea id="input" rows="8" cols="50">
+[
+    {
+        "author":"IDG",
+        "date":"2022-06-15T00:00:00Z",
+        "title":"New msg",
+        "content":"..."
+    }
+]
+    </textarea>
+    <br>
     <button id="btn">Send Update</button>
-    <pre id="log"></pre>
+    <h1>Updates:</h1>
+    <pre id="updates"></pre>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
     <script>
         let log = console.log;
+
+        function getContractKeyFromUrl() {
+            let urlParts = window.location.pathname.split('/');
+            return urlParts[2]
+        }
 
         const wsUri =
             ((window.location.protocol == "https:" && "wss://") || "ws://") +
             window.location.host +
-            "/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state/updates";
+            `/contract/${getContractKeyFromUrl()}/state/updates`;
         log("Connecting...");
 
         conn = new WebSocket(wsUri);
@@ -28,8 +45,8 @@
 
         conn.onmessage = function (e) {
             log("Received: " + e.data);
-            document.getElementById("log").textContent =
-                document.getElementById("log").textContent + "\n" + e.data;
+            document.getElementById("updates").textContent =
+                document.getElementById("updates").textContent + "\n" + e.data;
         };
 
         conn.onclose = function () {
@@ -37,9 +54,25 @@
             conn = null;
         };
 
+        function processResponse() {
+            log("State update sent");
+        }
+
         function send() {
-            let state = document.getElementById("input").value
-            conn.send(state);
+            let update = document.getElementById("input").value;
+            log("Sending: " + JSON.stringify(JSON.parse(update)));
+            $.ajax({
+                url: `/contract/${getContractKeyFromUrl()}/state/update/`,
+                method: 'POST',
+                dataType: 'json',
+                contentType: 'application/json',
+                success: function (data) {
+                    log("Received response: " + data)
+                    processResponse();
+                },
+                data: update
+            });
+            // conn.send(state);
         }
 
         document.getElementById("btn").addEventListener("click", send);

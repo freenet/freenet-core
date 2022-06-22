@@ -47,14 +47,14 @@ impl HttpGateway {
             .and(warp::path::param())
             .and(warp::path::end())
             .and_then(|rs, key: String| async move {
-                crate::contract_handling::contract_home(key, rs).await
+                crate::contract_web_handling::contract_home(key, rs).await
             });
 
         let contract_subpages = warp::path::path("contract")
             .and(warp::path::param())
             .and(warp::filters::path::full())
             .and_then(|key: String, path| async move {
-                crate::contract_handling::variable_content(key, path).await
+                crate::contract_web_handling::variable_content(key, path).await
             });
 
         let rs = request_sender.clone();
@@ -74,6 +74,8 @@ impl HttpGateway {
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path!("state" / "update"))
+            .and(warp::path::end())
+            .and(warp::post())
             .and(warp::body::json())
             .and_then(|rs, key: String, put_value| async move {
                 update_state(key, put_value, rs).await
@@ -176,7 +178,12 @@ impl ClientEventsProxy for HttpGateway {
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
             if let Some(ch) = self.response_channels.remove(&client) {
-                if ch.send((client, response)).is_ok() {
+                let should_rm = response
+                    .as_ref()
+                    .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
+                    .err()
+                    .unwrap_or(false);
+                if ch.send((client, response)).is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(client, ch);
                 }

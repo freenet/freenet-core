@@ -62,6 +62,15 @@ pub enum UpdateModification {
     NoChange,
 }
 
+impl UpdateModification {
+    pub fn unwrap_valid(self) -> State<'static> {
+        match self {
+            Self::ValidUpdate(s) => s,
+            _ => panic!("failed unwrapping state in modification"),
+        }
+    }
+}
+
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
@@ -94,6 +103,8 @@ pub trait ContractInterface {
         summary: StateSummary<'static>,
     ) -> StateDelta<'static>;
 
+    // FIXME: should return a delta, adn should be executed on the node performing the update/put;
+    //        using the summaries from each of the subscribers on behave of them
     /// Updates the current state from the provided summary.
     fn update_state_from_summary(
         parameters: Parameters<'static>,
@@ -609,9 +620,7 @@ impl Deref for ContractKey {
 
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ContractKey(")?;
-        internal_fmt_key(&self.spec, f)?;
-        write!(f, ")")
+        internal_fmt_key(&self.spec, f)
     }
 }
 
