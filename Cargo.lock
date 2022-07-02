@@ -1987,8 +1987,10 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "tar",
  "tokio",
  "tracing",
+ "xz2",
 ]
 
 [[package]]
