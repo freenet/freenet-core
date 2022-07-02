@@ -68,10 +68,14 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
             let pend_futs = &mut self.pend_futs;
+            eprintln!(
+                "pending futs: {}",
+                pend_futs.iter().filter(|a| a.is_some()).count()
+            );
             for (i, pend) in pend_futs.iter_mut().enumerate() {
-                let f = &mut futs_opt[i];
+                let fut = &mut futs_opt[i];
                 if let Some(pend_fut) = pend.take() {
-                    *f = Some(pend_fut);
+                    *fut = Some(pend_fut);
                 } else {
                     // this receiver ain't awaiting, queue a new one
                     // SAFETY: is safe here to extend the lifetime since clients are required to be 'static
@@ -80,39 +84,39 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                         std::mem::transmute(Box::pin(self.hosts_rx[i].recv())
                             as Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>)
                     };
-                    *f = Some(new_pend);
+                    *fut = Some(new_pend);
                 }
             }
-            let (res, idx, others) =
-                futures::future::select_all(futs_opt.map(|f| f.unwrap())).await;
-            if let Some(res) = res {
-                match res {
-                    Ok((external, r)) => {
-                        log::debug!("received request; internal_id={external}; req={r}");
-                        let id = *(&mut self.external_clients[idx])
-                            .entry(external)
-                            .or_insert_with(|| {
-                                // add a new mapped external client id
-                                let internal =
-                                    ClientId(COMBINATOR_INDEXES.fetch_add(1, Ordering::SeqCst));
-                                self.internal_clients.insert(internal, (idx, external));
-                                internal
-                            });
+            let (res, idx, mut others) = select_all(futs_opt.map(|f| f.unwrap())).await;
+            let res = res
+                .map(|res| {
+                    match res {
+                        Ok((external, r)) => {
+                            log::debug!("received request; internal_id={external}; req={r}");
+                            let id = *(&mut self.external_clients[idx])
+                                .entry(external)
+                                .or_insert_with(|| {
+                                    // add a new mapped external client id
+                                    let internal =
+                                        ClientId(COMBINATOR_INDEXES.fetch_add(1, Ordering::SeqCst));
+                                    self.internal_clients.insert(internal, (idx, external));
+                                    internal
+                                });
 
-                        // place back futs
-                        debug_assert!(pend_futs.iter().all(|f| f.is_none()));
-                        debug_assert_eq!(others.len(), pend_futs.len() - 1);
-                        for (i, fut) in others.into_iter().enumerate() {
-                            let p = &mut pend_futs.get_mut(i);
-                            let _ = p.insert(&mut Some(fut));
+                            Ok((id, r))
                         }
-                        Ok((id, r))
+                        err @ Err(_) => err,
                     }
-                    err @ Err(_) => err,
-                }
-            } else {
-                Err(ErrorKind::TransportProtocolDisconnect.into())
-            }
+                })
+                .unwrap_or_else(|| Err(ErrorKind::TransportProtocolDisconnect.into()));
+            // place back futs
+            debug_assert!(pend_futs.iter().all(|f| f.is_none()));
+            debug_assert_eq!(
+                others.iter().filter(|a| a.is_some()).count(),
+                pend_futs.len() - 1
+            );
+            std::mem::swap(pend_futs, &mut others);
+            res
         })
     }
 
@@ -207,15 +211,17 @@ impl<Fut: Future + Unpin, const N: usize> Future for SelectAll<Fut, N> {
                     .flatten();
                 match item {
                     Some((idx, res)) => {
+                        eprintln!("polled {idx}");
                         self.inner[idx] = None;
                         let rest = std::mem::replace(&mut self.inner, [(); N].map(|_| None));
                         return Poll::Ready((res, idx, rest));
                     }
-                    None => {}
+                    None => {
+                        eprintln!("not found");
+                    }
                 }
             };
         }
-
         recv!();
         self.waker.register(cx.waker());
         recv!();
@@ -223,13 +229,88 @@ impl<Fut: Future + Unpin, const N: usize> Future for SelectAll<Fut, N> {
     }
 }
 
-// FIXME
-fn _select_all<F, const N: usize>(iter: [F; N]) -> SelectAll<F, N>
+fn select_all<F, const N: usize>(iter: [F; N]) -> SelectAll<F, N>
 where
     F: Future + Unpin,
 {
     SelectAll {
         waker: AtomicWaker::new(),
         inner: iter.map(|f| Some(f)),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    struct SampleProxy {
+        id: usize,
+        rx: Receiver<usize>,
+    }
+
+    impl SampleProxy {
+        fn new(id: usize, rx: Receiver<usize>) -> Self {
+            Self { id, rx }
+        }
+    }
+
+    impl ClientEventsProxy for SampleProxy {
+        fn recv<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = crate::client_events::HostIncomingMsg> + Send + Sync + 'a>>
+        {
+            Box::pin(async {
+                let id = self
+                    .rx
+                    .recv()
+                    .await
+                    .ok_or_else::<ClientError, _>(|| ErrorKind::ChannelClosed.into())?;
+                assert_eq!(id, self.id);
+                eprintln!("#{}, received msg {id}", self.id);
+                Ok((ClientId::new(id), ClientRequest::Disconnect { cause: None }))
+            })
+        }
+
+        fn send<'a>(
+            &'a mut self,
+            id: ClientId,
+            response: Result<HostResponse, ClientError>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>> {
+            todo!()
+        }
+
+        fn cloned(&self) -> BoxedClient {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn combinator_recv() {
+        let mut cnt = 0;
+        let mut senders = vec![];
+        let proxies = [None::<()>; 3].map(|_| {
+            let (tx, rx) = channel(1);
+            senders.push(tx);
+            let r = Box::new(SampleProxy::new(cnt, rx)) as _;
+            cnt += 1;
+            r
+        });
+        let mut combinator = ClientEventsCombinator::new(proxies);
+
+        let _senders = tokio::task::spawn(async move {
+            for (id, tx) in senders.iter_mut().enumerate() {
+                tx.send(id).await.unwrap();
+                eprintln!("sent msg {id}");
+            }
+            senders
+        })
+        .await
+        .unwrap();
+
+        for i in 0..3 {
+            let (id, _) = combinator.recv().await.unwrap();
+            eprintln!("received: {id:?}");
+            assert_eq!(ClientId::new(i), id);
+        }
     }
 }

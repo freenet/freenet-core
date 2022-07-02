@@ -32,9 +32,12 @@
         }
 
         const wsUri =
-            ((window.location.protocol == "https:" && "wss://") || "ws://") +
+            ((window.location.protocol === "https:" && "wss://") || "ws://") +
             window.location.host +
             `/contract/${getContractKeyFromUrl()}/state/updates`;
+
+        const reader = new FileReader();
+
         log("Connecting...");
 
         conn = new WebSocket(wsUri);
@@ -44,19 +47,23 @@
         };
 
         conn.onmessage = function (e) {
-            log("Received: " + e.data);
-            document.getElementById("updates").textContent =
-                document.getElementById("updates").textContent + "\n" + e.data;
+            reader.onload = () => {
+                log("Received update: " + reader.result);
+                let val = JSON.parse(reader.result);
+                val = val.map((e) => {
+                    delete e.signature;
+                    return e;
+                });
+                document.getElementById("updates").textContent =
+                    JSON.stringify(val, null, 2);
+            };
+            reader.readAsText(e.data);
         };
 
         conn.onclose = function () {
             log("Disconnected");
             conn = null;
         };
-
-        function processResponse() {
-            log("State update sent");
-        }
 
         function send() {
             let update = document.getElementById("input").value;
@@ -67,8 +74,7 @@
                 dataType: 'json',
                 contentType: 'application/json',
                 success: function (data) {
-                    log("Received response: " + data)
-                    processResponse();
+                    log("Update response: " + JSON.stringify(data))
                 },
                 data: update
             });

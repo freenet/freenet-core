@@ -12,6 +12,12 @@ pub enum DeserializationFmt {
     MessagePack,
 }
 
+#[derive(clap::ArgEnum, Clone, Copy, Debug)]
+pub enum ContractType {
+    Web,
+    Data,
+}
+
 /// A CLI utility for testing out contracts against a Locutus local node.
 ///
 #[derive(clap::Parser, Clone)]
@@ -54,4 +60,22 @@ pub struct Config {
     /// Max contract size
     #[clap(long, env = "LOCUTUS_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
     pub max_contract_size: i64,
+}
+
+#[derive(clap::Parser, Clone)]
+#[clap(name = "Locutus Contract Development Environment1")]
+#[clap(author = "The Freenet Project Inc.")]
+#[clap(version = "0.0.1")]
+pub struct StateConfig {
+    #[clap(long, parse(from_os_str), value_name = "INPUT_PATH")]
+    pub input_path: PathBuf,
+    #[clap(long, parse(from_os_str), value_name = "OUTPUT_PATH")]
+    pub output_file: PathBuf,
+    #[clap(
+        long = "contract-type",
+        arg_enum,
+        group = "type",
+        value_name = "TYPE"
+    )]
+    pub contract_type: Option<ContractType>,
 }
