@@ -17,6 +17,8 @@ pico-args = "0.4"
 log = "0.4"
 serde = "1"
 bincode = "1"
+tar = "0.4"
+xz2 = "0.1"
 
 # (mp) message pack feature
 rmp = { version = "0.8", optional = true }
