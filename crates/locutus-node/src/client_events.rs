@@ -8,7 +8,7 @@ use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{WrappedContract, WrappedState, PeerKey};
+use crate::{PeerKey, WrappedContract, WrappedState};
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -78,15 +78,13 @@ impl Display for ClientError {
 
 impl StdError for ClientError {}
 
-type HostIncomingMsg<'a> = Result<(ClientId, ClientRequest), ClientError>;
+type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
 
 #[allow(clippy::needless_lifetimes)]
 pub trait ClientEventsProxy {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    fn recv<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = HostIncomingMsg<'a>> + Send + Sync + 'a>>;
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + 'a>>;
 
     /// Sends a response from the host to the client application.
     fn send<'a>(
@@ -316,7 +314,11 @@ pub(crate) mod test {
                             todo!() // fixme
                         };
                         let (updates, _) = tokio::sync::mpsc::unbounded_channel();
-                        break ClientRequest::Subscribe { key, updates, peer: PeerKey::random() };
+                        break ClientRequest::Subscribe {
+                            key,
+                            updates,
+                            peer: PeerKey::random(),
+                        };
                     }
                     0 => {}
                     1 => {}
