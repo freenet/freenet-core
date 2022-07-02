@@ -1,5 +1,4 @@
-//! A memory buffer to interact with the WASM contracts.
-//! This buffer leakes it's own memory and will only be freed by the runtime when a contract instance is dropped.
+//! Memory buffers to interact with the WASM contracts.
 
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -276,7 +275,9 @@ impl<'instance> Buffer<'instance> {
     }
 }
 
-/// Returns the pointer to a new BufferBuilder
+/// Returns the pointer to a new BufferBuilder.
+///
+/// This buffer leaks it's own memory and will only be freed by the runtime when a contract instance is dropped.
 #[doc(hidden)]
 #[no_mangle]
 pub fn initiate_buffer(size: u32) -> i64 {

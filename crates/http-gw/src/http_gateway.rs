@@ -1,11 +1,10 @@
 use locutus_node::either::Either;
 
 use locutus_node::*;
-use locutus_runtime::{ContractKey, StateDelta};
+use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
     future::Future,
-    io::Read,
     path::PathBuf,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
@@ -17,8 +16,8 @@ use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
 
 use crate::{
     errors,
-    state_handling::{get_state, state_updates_notification, update_state},
-    ClientHandlingMessage, HostResult, UnpackedState,
+    state_handling::{state_updates_notification, update_state},
+    ClientHandlingMessage, HostResult,
 };
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
@@ -30,10 +29,7 @@ pub struct HttpGateway {
 
 impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
-    pub fn as_filter<F>(update_hook: F) -> (Self, BoxedFilter<(impl Reply + 'static,)>)
-    where
-        F: Fn(Vec<u8>) -> Result<StateDelta<'static>, Rejection> + Copy + Send + Sync + 'static,
-    {
+    pub fn as_filter() -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
         let contract_web_path = std::env::temp_dir().join("locutus").join("webs");
         std::fs::create_dir_all(&contract_web_path).unwrap();
 
@@ -44,9 +40,10 @@ impl HttpGateway {
         };
 
         let get_home = warp::path::end().and_then(home);
+        let base_web_contract = warp::path!("contract" / "web");
 
         let rs = request_sender.clone();
-        let contract_home = warp::path::path("contract")
+        let web_home = base_web_contract
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path::end())
@@ -54,7 +51,7 @@ impl HttpGateway {
                 crate::contract_web_handling::contract_home(key, rs).await
             });
 
-        let contract_subpages = warp::path::path("contract")
+        let web_subpages = base_web_contract
             .and(warp::path::param())
             .and(warp::filters::path::full())
             .and_then(|key: String, path| async move {
@@ -62,7 +59,7 @@ impl HttpGateway {
             });
 
         let rs = request_sender.clone();
-        let state_update_notifications = warp::path::path("contract")
+        let state_update_notifications = base_web_contract
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path!("state" / "updates"))
@@ -74,7 +71,7 @@ impl HttpGateway {
             });
 
         let rs = request_sender.clone();
-        let update_contract_state = warp::path::path("contract")
+        let update_contract_state = base_web_contract
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path!("state" / "update"))
@@ -82,44 +79,25 @@ impl HttpGateway {
             .and(warp::post())
             .and(warp::body::bytes())
             .and_then(move |rs, key: String, update_val: Bytes| async move {
-                let r = update_hook(update_val.to_vec())?;
-                update_state(key, r, rs).await
+                update_state(key, update_val.to_vec().into(), rs).await
             });
 
-        let get_contract_state = warp::path::path("contract")
-            .map(move || request_sender.clone())
-            .and(warp::path::param())
-            .and(warp::path!("state" / "get"))
-            .and_then(|rs, key: String| async move { get_state(key, rs).await });
+        // let get_contract_state = warp::path::path("contract")
+        //     .map(move || request_sender.clone())
+        //     .and(warp::path::param())
+        //     .and(warp::path!("state" / "get"))
+        //     .and_then(|rs, key: String| async move { get_state(key, rs).await });
 
         let filters = get_home
-            .or(contract_home)
-            .or(get_contract_state)
-            .or(state_update_notifications)
-            .or(update_contract_state)
-            .or(contract_subpages)
+            .or(web_home)
+            .or(web_subpages)
+            // .or(get_contract_state)
+            // .or(state_update_notifications)
+            // .or(update_contract_state)
             .recover(errors::handle_error)
             .with(warp::trace::request());
 
         (gateway, filters.boxed())
-    }
-
-    pub fn store_web(
-        state: &mut UnpackedState<impl Read>,
-        key: &ContractKey,
-    ) -> Result<(), ClientError> {
-        let UnpackedState { web, .. } = state;
-        let contract_web_path = Self::contract_web_path(key);
-        web.unpack(contract_web_path)
-            .map_err(|_| ErrorKind::IncorrectState(*key))?;
-        Ok(())
-    }
-
-    pub fn contract_web_path(key: &ContractKey) -> PathBuf {
-        std::env::temp_dir()
-            .join("locutus")
-            .join("webs")
-            .join(key.encode())
     }
 }
 

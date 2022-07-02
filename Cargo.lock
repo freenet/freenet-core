@@ -405,17 +405,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrono"
-version = "0.4.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "670ad68c9088c2a963aaa298cb369688cf3f9465ce5e2d4ca10e6e0098a1ce73"
-dependencies = [
- "num-integer",
- "num-traits",
- "serde",
-]
-
-[[package]]
 name = "cipher"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -886,7 +875,6 @@ version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e9c280362032ea4203659fc489832d0204ef09f247a0506f170dafcac08c369"
 dependencies = [
- "serde",
  "signature",
 ]
 
@@ -900,7 +888,6 @@ dependencies = [
  "ed25519",
  "rand 0.7.3",
  "serde",
- "serde_bytes",
  "sha2 0.9.9",
  "zeroize",
 ]
@@ -1399,15 +1386,12 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "byteorder",
- "chrono",
- "ed25519-dalek",
  "env_logger",
  "futures",
  "locutus-dev",
  "locutus-node",
  "locutus-runtime",
  "log",
- "rand 0.7.3",
  "serde",
  "serde_json",
  "tar",
@@ -2086,9 +2070,11 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_with",
+ "tar",
  "thiserror",
  "wasmer",
  "wasmer-wasi",
+ "xz2",
 ]
 
 [[package]]
@@ -2348,16 +2334,6 @@ checksum = "a8903e5a29a317527874d0402f867152a3d21c908bb0b933e416c65e301d4c36"
 dependencies = [
  "memchr",
  "minimal-lexical",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "225d3389fb3509a24c93f5c29eb6bde2586b98d9f016636dff58d7c6f7569cd9"
-dependencies = [
- "autocfg",
- "num-traits",
 ]
 
 [[package]]

@@ -16,7 +16,7 @@ async fn run() -> Result<(), DynError> {
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
-    http_gw::local_node::set_local_node(local_node, |raw_delta| Ok(raw_delta.into())).await
+    http_gw::local_node::set_local_node(local_node).await
 }
 
 fn main() -> Result<(), DynError> {

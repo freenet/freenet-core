@@ -2,103 +2,101 @@
 
 use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 
-use locutus_node::{SqlitePool, WrappedState};
-use locutus_runtime::{ContractCode, StateDelta, StateStore, WrappedContract};
-use rand::{prelude::StdRng, SeedableRng};
-use serde::{Deserialize, Serialize};
-use warp::Rejection;
+use locutus_node::{libp2p::identity::ed25519::PublicKey, SqlitePool, WrappedState};
+use locutus_runtime::{ContractCode, StateStore, WrappedContract};
+use serde::Serialize;
 
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
 const MAX_MEM_CACHE: u32 = 10_000_000;
+const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-pub fn test_state() -> Result<WrappedState, std::io::Error> {
-    const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-    let path = PathBuf::from(CRATE_DIR).join("examples/encoded_state");
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    Ok(WrappedState::new(bytes))
+struct WebBundle {
+    data_contract: WrappedContract<'static>,
+    initial_state: WrappedState,
+    web_contract: WrappedContract<'static>,
+    web_content: WrappedState,
 }
 
-pub fn test_contract(
-    public_key: ed25519_dalek::PublicKey,
-) -> Result<WrappedContract<'static>, std::io::Error> {
-    const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-    let path = PathBuf::from(CRATE_DIR).join("examples/test_web_contract.wasm");
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
+fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
+    fn get_data_contract(
+        public_key: PublicKey,
+    ) -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_data.wasm");
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
 
-    #[derive(Serialize)]
-    struct Verification {
-        public_key: ed25519_dalek::PublicKey,
+        #[derive(Serialize)]
+        struct Verification {
+            public_key: Vec<u8>,
+        }
+        let params = serde_json::to_vec(&Verification {
+            public_key: public_key.encode().to_vec(),
+        })
+        .unwrap();
+        let contract = WrappedContract::new(Arc::new(ContractCode::from(bytes)), params.into());
+
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_data");
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+
+        Ok((contract, bytes.into()))
     }
-    let params = serde_json::to_vec(&Verification { public_key }).unwrap();
 
-    Ok(WrappedContract::new(
-        Arc::new(ContractCode::from(bytes)),
-        params.into(),
-    ))
-}
+    fn get_web_contract() -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_wev.wasm");
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
 
-#[derive(Serialize, Deserialize)]
-struct Message {
-    author: String,
-    date: chrono::DateTime<chrono::Utc>,
-    title: String,
-    content: String,
-    #[serde(default = "Message::modded")]
-    mod_msg: bool,
-    signature: Option<ed25519_dalek::Signature>,
-}
+        let contract =
+            WrappedContract::new(Arc::new(ContractCode::from(bytes)), [].as_ref().into());
 
-impl Message {
-    fn modded() -> bool {
-        false
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web");
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+
+        Ok((contract, bytes.into()))
     }
-}
 
-// TODO: we probably need a new function in the contract that
-//       allows specifying this hook actions before sending a message
-fn sign_up(raw_delta: Vec<u8>) -> Result<StateDelta<'static>, Rejection> {
-    use ed25519_dalek::Signer;
-    let messages: Vec<Message> = serde_json::from_slice(&raw_delta).unwrap();
-    let mut rng = StdRng::from_seed([1u8; 32]);
-    let keypair = ed25519_dalek::Keypair::generate(&mut rng);
-    let mut r = Vec::with_capacity(messages.len());
-    for mut m in messages {
-        let signature = keypair.sign(m.content.as_bytes());
-        m.signature = Some(signature);
-        r.push(m);
-    }
-    Ok(serde_json::to_vec(&r).unwrap().into())
+    let (data_contract, initial_state) = get_data_contract(public_key)?;
+    let (web_contract, web_content) = get_web_contract()?;
+
+    Ok(WebBundle {
+        data_contract,
+        initial_state,
+        web_contract,
+        web_content,
+    })
 }
 
 #[cfg(feature = "local")]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use http_gw::HttpGateway;
     use locutus_dev::ContractStore;
+    use locutus_node::libp2p::identity::ed25519::Keypair;
 
-    let mut rng = StdRng::from_seed([1u8; 32]);
-    let keypair = ed25519_dalek::Keypair::generate(&mut rng);
+    let keypair = Keypair::generate();
 
-    let state = test_state()?;
-    let contract = test_contract(keypair.public)?;
-
-    let mut package = http_gw::unpack_state(state.as_ref(), contract.key())?;
-    // fixme: a workaround
-    HttpGateway::store_web(&mut package, contract.key())?;
-    let state = package.state;
-    log::info!("loading contract {} in local node", contract.key().encode());
+    let bundle = test_web(keypair.public())?;
     log::info!(
-        "initializing state with content:\n{}",
-        serde_json::from_slice::<serde_json::Value>(state.as_ref())?
+        "loading web contract {} in local node",
+        bundle.web_contract.key().encode()
     );
+    log::info!(
+        "loading data contract {} in local node",
+        bundle.data_contract.key().encode()
+    );
+
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
-    local_node.preload(contract, state).await;
-    http_gw::local_node::set_local_node(local_node, sign_up).await
+    local_node
+        .preload(bundle.data_contract, bundle.initial_state)
+        .await;
+    local_node
+        .preload(bundle.web_contract, bundle.web_content)
+        .await;
+    http_gw::local_node::set_local_node(local_node).await
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

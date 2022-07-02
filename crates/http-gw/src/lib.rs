@@ -3,14 +3,8 @@ pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod state_handling;
 
-use std::io::{Cursor, Read};
-
-use byteorder::{BigEndian, ReadBytesExt};
 pub use http_gateway::HttpGateway;
-use locutus_node::{either::Either, ClientError, ClientId, ClientRequest, ErrorKind, HostResponse};
-use locutus_runtime::{ContractKey, WrappedState};
-use tar::Archive;
-use xz2::bufread::XzDecoder;
+use locutus_node::{either::Either, ClientError, ClientId, ClientRequest, HostResponse};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type HostResult = (ClientId, Result<HostResponse, ClientError>);
@@ -27,19 +21,11 @@ pub mod local_node {
     use locutus_node::{
         either, ClientError, ClientEventsProxy, ErrorKind, RequestError, WebSocketProxy,
     };
-    use locutus_runtime::StateDelta;
-    use warp::Rejection;
 
     use crate::{DynError, HttpGateway};
 
-    pub async fn set_local_node<F>(
-        mut local_node: LocalNode,
-        update_hook: F,
-    ) -> Result<(), DynError>
-    where
-        F: Fn(Vec<u8>) -> Result<StateDelta<'static>, Rejection> + Copy + Send + Sync + 'static,
-    {
-        let (mut http_handle, filter) = HttpGateway::as_filter(update_hook);
+    pub async fn set_local_node(mut local_node: LocalNode) -> Result<(), DynError> {
+        let (mut http_handle, filter) = HttpGateway::as_filter();
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
         let _ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;
         // FIXME: use combinator
@@ -69,51 +55,4 @@ pub mod local_node {
             }
         }
     }
-}
-
-pub struct UnpackedState<T: Read> {
-    pub metadata: Vec<u8>,
-    pub web: Archive<T>,
-    pub state: WrappedState,
-}
-
-pub fn unpack_state(
-    state: &[u8],
-    key: &ContractKey,
-) -> Result<UnpackedState<impl Read>, ClientError> {
-    // Decompose the state and extract the compressed web interface
-    let mut state = Cursor::new(state);
-    let metadata_size = state
-        .read_u64::<BigEndian>()
-        .map_err(|_| ErrorKind::IncorrectState(*key))?;
-    let mut metadata = vec![0; metadata_size as usize];
-    state
-        .read_exact(&mut metadata)
-        .map_err(|_| ErrorKind::IncorrectState(*key))?;
-    let web_size = state
-        .read_u64::<BigEndian>()
-        .map_err(|_| ErrorKind::IncorrectState(*key))?;
-    let mut web = vec![0; web_size as usize];
-    state
-        .read_exact(&mut web)
-        .map_err(|_| ErrorKind::IncorrectState(*key))?;
-    let state_size = state
-        .read_u64::<BigEndian>()
-        .map_err(|_| ErrorKind::IncorrectState(*key))?;
-    let mut dynamic_state = vec![0; state_size as usize];
-    state
-        .read_exact(&mut dynamic_state)
-        .map_err(|_| ErrorKind::IncorrectState(*key))?;
-
-    // Decode tar.xz and unpack contract web
-    let decoder = XzDecoder::new(Cursor::new(web));
-    let web = Archive::new(decoder);
-
-    // Decode the dynamic state
-    let state = WrappedState::from(dynamic_state);
-    Ok(UnpackedState {
-        metadata,
-        web,
-        state,
-    })
 }

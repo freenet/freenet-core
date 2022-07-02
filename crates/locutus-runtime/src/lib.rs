@@ -22,7 +22,7 @@ pub type RuntimeResult<T> = std::result::Result<T, ContractRuntimeError>;
 #[derive(thiserror::Error, Debug)]
 pub enum ContractRuntimeError {
     #[error(transparent)]
-    BufferError(#[from] BufferError),
+    BufferError(#[from] locutus_stdlib::buf::Error),
 
     #[error("contract {0} not found in store")]
     ContractNotFound(ContractKey),

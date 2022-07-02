@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use locutus_stdlib::prelude::{
-    BufferBuilder, BufferMut, ContractKey, Parameters, StateDelta, StateSummary, UpdateResult,
+use locutus_stdlib::{
+    buf::{BufferBuilder, BufferMut},
+    prelude::*,
 };
 use wasmer::{
     imports, Bytes, ImportObject, Instance, Memory, MemoryType, Module, NativeFunc, Store,

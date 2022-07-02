@@ -303,6 +303,12 @@ impl<'a> DerefMut for State<'a> {
     }
 }
 
+impl<'a> std::io::Read for State<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.as_ref().read(buf)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StateDelta<'a>(Cow<'a, [u8]>);
 

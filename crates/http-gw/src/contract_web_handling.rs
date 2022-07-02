@@ -1,15 +1,21 @@
+use std::path::{Path, PathBuf};
+
 use locutus_node::either::Either;
-use locutus_runtime::ContractKey;
-use std::path::PathBuf;
+use locutus_runtime::{
+    locutus_stdlib::web::{UnpackedWeb, WebContractError},
+    ContractKey, State, WrappedContract,
+};
 
 use locutus_node::*;
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 use warp::{reject, reply, Rejection, Reply};
 
 use crate::{
-    errors::{self, NodeError},
-    ClientHandlingMessage, HttpGateway,
+    errors::{self, InvalidParam, NodeError},
+    ClientHandlingMessage,
 };
+
+const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 pub async fn contract_home(
     key: String,
@@ -29,10 +35,48 @@ pub async fn contract_home(
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let (id, response) = match response_recv.recv().await {
-        Some((id, Ok(HostResponse::GetResponse { contract, .. }))) => match contract {
+        Some((
+            id,
+            Ok(HostResponse::GetResponse {
+                contract, state, ..
+            }),
+        )) => match contract {
             Some(contract) => {
-                let path = HttpGateway::contract_web_path(contract.key());
-                let web_body = get_web_body(path).await?;
+                let path = contract_web_path(contract.key());
+                let web_body = match get_web_body(&path).await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        let err: std::io::ErrorKind = err.kind();
+                        match err {
+                            std::io::ErrorKind::NotFound => {
+                                let state = State::from(state.as_ref());
+                                fn err(
+                                    err: WebContractError,
+                                    contract: &WrappedContract,
+                                ) -> InvalidParam {
+                                    log::error!("{err}");
+                                    InvalidParam(format!(
+                                        "failed unpacking contract: {}",
+                                        contract.key()
+                                    ))
+                                }
+                                let mut web =
+                                    UnpackedWeb::try_from(state).map_err(|e| err(e, &contract))?;
+                                web.store(path).map_err(|e| err(e, &contract))?;
+                                let index =
+                                    web.get_file("index.html").map_err(|e| err(e, &contract))?;
+                                warp::hyper::Body::from(index)
+                            }
+                            other => {
+                                log::error!("{other}");
+                                return Err(errors::HttpError(
+                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                };
                 (id, Ok(reply::html(web_body)))
             }
             None => {
@@ -55,23 +99,13 @@ pub async fn contract_home(
     response
 }
 
-async fn get_web_body(path: PathBuf) -> Result<warp::hyper::Body, Rejection> {
-    let web_path = path.join("web/index.html");
-    let mut key_file = File::open(&web_path)
-        .await
-        .unwrap_or_else(|_| panic!("Failed to open key file: {}", &web_path.to_str().unwrap()));
-    let mut buf = vec![];
-    key_file.read_to_end(&mut buf).await.unwrap();
-    Ok(warp::hyper::Body::from(buf))
-}
-
 pub async fn variable_content(
     key: String,
     req_path: warp::path::FullPath,
 ) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let base_path = HttpGateway::contract_web_path(&key).join("web/");
+    let base_path = contract_web_path(&key).join("web/");
     let req_uri = req_path.as_str().parse().unwrap();
     let file_path = base_path.join(get_file_path(req_uri)?);
     let mut buf = vec![];
@@ -84,7 +118,20 @@ pub async fn variable_content(
     Ok(reply::html(warp::hyper::Body::from(buf)))
 }
 
-const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+async fn get_web_body(path: &Path) -> std::io::Result<warp::hyper::Body> {
+    let web_path = path.join("index.html");
+    let mut key_file = File::open(&web_path).await?;
+    let mut buf = vec![];
+    key_file.read_to_end(&mut buf).await?;
+    Ok(warp::hyper::Body::from(buf))
+}
+
+fn contract_web_path(key: &ContractKey) -> PathBuf {
+    std::env::temp_dir()
+        .join("locutus")
+        .join("webs")
+        .join(key.encode())
+}
 
 #[inline]
 fn get_file_path(uri: warp::http::Uri) -> Result<String, Rejection> {
