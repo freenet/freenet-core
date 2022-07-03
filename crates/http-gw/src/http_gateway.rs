@@ -98,6 +98,10 @@ impl HttpGateway {
 
         (gateway, filters.boxed())
     }
+
+    pub fn next_id() -> ClientId {
+        ClientId::new(ID.fetch_add(1, Ordering::SeqCst))
+    }
 }
 
 async fn home() -> Result<impl Reply, Rejection> {
@@ -178,20 +182,5 @@ impl ClientEventsProxy for HttpGateway {
 
     fn cloned(&self) -> BoxedClient {
         unimplemented!()
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test {
-    use std::{fs::File, io::Read, path::PathBuf};
-
-    use super::*;
-
-    fn _test_state() -> Result<WrappedState, std::io::Error> {
-        const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-        let path = PathBuf::from(CRATE_DIR).join("tests/encoded_state");
-        let mut bytes = Vec::new();
-        File::open(path)?.read_to_end(&mut bytes)?;
-        Ok(WrappedState::new(bytes))
     }
 }

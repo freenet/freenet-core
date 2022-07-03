@@ -109,13 +109,11 @@ pub async fn state_changes_notification(
         (str_sender, rx)
     };
 
-    let peer = PeerKey::random(); // FIXME: this must be obtained somehow from the node
     request_sender
         .send((
             ClientRequest::Subscribe {
                 key: contract_key,
                 updates,
-                peer,
             },
             Either::Left(response_sender),
         ))

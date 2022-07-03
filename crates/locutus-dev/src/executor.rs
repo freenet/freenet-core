@@ -1,4 +1,4 @@
-use locutus_node::{ClientRequest, HostResponse};
+use locutus_node::{ClientId, ClientRequest, HostResponse};
 
 use crate::{config::Config, state::AppState, CommandReceiver, DynError};
 
@@ -21,7 +21,7 @@ pub async fn wasm_runtime(
 async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool, DynError> {
     let node = &mut *app.local_node.write().await;
     match req {
-        req @ ClientRequest::Put { .. } => match node.handle_request(req).await {
+        req @ ClientRequest::Put { .. } => match node.handle_request(ClientId::FIRST, req).await {
             Ok(HostResponse::PutResponse(key)) => {
                 println!("valid put for {key}");
             }
@@ -30,7 +30,8 @@ async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool,
             }
             _ => unreachable!(),
         },
-        req @ ClientRequest::Update { .. } => match node.handle_request(req).await {
+        req @ ClientRequest::Update { .. } => match node.handle_request(ClientId::FIRST, req).await
+        {
             Ok(HostResponse::UpdateResponse { key, summary }) => {
                 println!("valid update for {key}, state summary:");
                 app.printout_deser(summary.as_ref())?;
@@ -45,10 +46,13 @@ async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool,
             fetch_contract: contract,
         } => {
             match node
-                .handle_request(ClientRequest::Get {
-                    key,
-                    fetch_contract: contract,
-                })
+                .handle_request(
+                    ClientId::FIRST,
+                    ClientRequest::Get {
+                        key,
+                        fetch_contract: contract,
+                    },
+                )
                 .await
             {
                 Ok(HostResponse::GetResponse {

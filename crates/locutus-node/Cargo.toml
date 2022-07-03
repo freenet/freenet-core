@@ -59,7 +59,7 @@ locutus-runtime = { path = "../locutus-runtime" }
 tracing = "0.1"
 arbitrary = { version = "1", features = ["derive"] }
 itertools = "0.10"
-pico-args = "0.4"
+pico-args = "0.5"
 locutus-runtime = { path = "../locutus-runtime", features = ["testing"] }
 locutus-stdlib = { path = "../locutus-stdlib", features = ["testing"] }
 

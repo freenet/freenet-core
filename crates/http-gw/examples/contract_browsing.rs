@@ -70,6 +70,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
 
 #[cfg(feature = "local")]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use http_gw::HttpGateway;
     use locutus_dev::ContractStore;
     use locutus_node::libp2p::identity::ed25519::Keypair;
 
@@ -90,11 +91,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
+    let id = HttpGateway::next_id();
     local_node
-        .preload(bundle.data_contract, bundle.initial_state)
+        .preload(id, bundle.data_contract, bundle.initial_state)
         .await;
     local_node
-        .preload(bundle.web_contract, bundle.web_content)
+        .preload(id, bundle.web_contract, bundle.web_content)
         .await;
     http_gw::local_node::set_local_node(local_node).await
 }

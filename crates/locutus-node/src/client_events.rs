@@ -17,11 +17,13 @@ pub(crate) mod websocket;
 pub type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
 type HostResult = Result<HostResponse, ClientError>;
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct ClientId(pub(crate) usize);
 
 impl ClientId {
+    pub const FIRST: Self = ClientId(0);
+
     pub fn new(id: usize) -> Self {
         Self(id)
     }
@@ -129,9 +131,7 @@ impl HostResponse {
 
     pub fn unwrap_get(self) -> (WrappedState, Option<WrappedContract<'static>>) {
         if let Self::GetResponse {
-            contract,
-            state,
-            path,
+            contract, state, ..
         } = self
         {
             (state, contract)
@@ -181,7 +181,6 @@ pub enum ClientRequest {
     /// connection, and relied through the provided channel.
     #[serde(skip)]
     Subscribe {
-        peer: PeerKey,
         key: ContractKey,
         updates: UnboundedSender<HostResponse>,
     },
@@ -314,11 +313,7 @@ pub(crate) mod test {
                             todo!() // fixme
                         };
                         let (updates, _) = tokio::sync::mpsc::unbounded_channel();
-                        break ClientRequest::Subscribe {
-                            key,
-                            updates,
-                            peer: PeerKey::random(),
-                        };
+                        break ClientRequest::Subscribe { key, updates };
                     }
                     0 => {}
                     1 => {}

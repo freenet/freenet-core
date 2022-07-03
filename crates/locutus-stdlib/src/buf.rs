@@ -32,7 +32,7 @@ impl BufferBuilder {
 
         // write the new buffer information
         let new_ptr = data.as_ptr();
-        self.start = new_ptr as i64; // FIXME: this is not assigning what it should ???
+        self.start = new_ptr as i64;
         self.size = data.capacity() as _;
         *read_ptr = 0;
         *write_ptr = data.len().saturating_sub(1) as _;
