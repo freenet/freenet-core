@@ -1,3 +1,5 @@
+//! Handle the `web` part of the bundles.
+
 use std::path::{Path, PathBuf};
 
 use locutus_node::either::Either;

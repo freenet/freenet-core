@@ -43,7 +43,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
     }
 
     fn get_web_contract() -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_wev.wasm");
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web.wasm");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 

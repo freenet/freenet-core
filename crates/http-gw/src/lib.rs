@@ -1,7 +1,7 @@
-pub(crate) mod contract_web_handling;
 pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod state_handling;
+pub(crate) mod web_handling;
 
 pub use http_gateway::HttpGateway;
 use locutus_node::{either::Either, ClientError, ClientId, ClientRequest, HostResponse};
@@ -34,7 +34,6 @@ pub mod local_node {
         loop {
             let (id, req) = http_handle.recv().await?;
             tracing::debug!("client {id}, req -> {req}");
-
             match local_node.handle_request(req).await {
                 Ok(res) => {
                     http_handle.send(id, Ok(res)).await?;

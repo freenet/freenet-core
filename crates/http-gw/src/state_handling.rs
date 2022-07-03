@@ -1,3 +1,4 @@
+//! Handles the `state data` part of the bundles.
 use locutus_node::either::Either;
 use locutus_runtime::{ContractKey, StateDelta};
 
@@ -31,11 +32,9 @@ pub async fn get_state(
         .map_err(|_| reject::custom(errors::NodeError))?;
     let (id, response) = match response_recv.recv().await {
         Some((id, Ok(HostResponse::GetResponse { state, .. }))) => {
-            // todo: we assume that this is json, but it could be anything
-            //       in reality we must send this back as bytes and let the client handle it
-            //       but in order to test things out we send a json
-            let json_str: serde_json::Value = serde_json::from_slice(state.as_ref()).unwrap();
-            (id, Ok(reply::json(&json_str)))
+            let bytes = bytes::Bytes::copy_from_slice(state.as_ref());
+            let response = reply::Response::new(warp::hyper::Body::from(bytes));
+            (id, Ok(response))
         }
         None => {
             return Err(NodeError.into());
@@ -90,7 +89,7 @@ pub async fn update_state(
     response
 }
 
-pub async fn state_updates_notification(
+pub async fn state_changes_notification(
     key: String,
     request_sender: mpsc::Sender<ClientHandlingMessage>,
     ws: WebSocket,

@@ -1,11 +1,9 @@
 use locutus_node::either::Either;
 
 use locutus_node::*;
-use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -16,7 +14,7 @@ use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
 
 use crate::{
     errors,
-    state_handling::{state_updates_notification, update_state},
+    state_handling::{get_state, state_changes_notification, update_state},
     ClientHandlingMessage, HostResult,
 };
 
@@ -41,6 +39,7 @@ impl HttpGateway {
 
         let get_home = warp::path::end().and_then(home);
         let base_web_contract = warp::path!("contract" / "web");
+        let data_contracts = warp::path!("contract" / "dependency");
 
         let rs = request_sender.clone();
         let web_home = base_web_contract
@@ -48,33 +47,39 @@ impl HttpGateway {
             .and(warp::path::param())
             .and(warp::path::end())
             .and_then(|rs, key: String| async move {
-                crate::contract_web_handling::contract_home(key, rs).await
+                crate::web_handling::contract_home(key, rs).await
             });
 
         let web_subpages = base_web_contract
             .and(warp::path::param())
             .and(warp::filters::path::full())
             .and_then(|key: String, path| async move {
-                crate::contract_web_handling::variable_content(key, path).await
+                crate::web_handling::variable_content(key, path).await
             });
 
         let rs = request_sender.clone();
-        let state_update_notifications = base_web_contract
+        let get_state = data_contracts
             .map(move || rs.clone())
             .and(warp::path::param())
-            .and(warp::path!("state" / "updates"))
+            .and(warp::path("get"))
+            .and_then(|rs, key: String| async move { get_state(key, rs).await });
+
+        let rs = request_sender.clone();
+        let state_changes = data_contracts
+            .map(move || rs.clone())
+            .and(warp::path::param())
+            .and(warp::path("changes"))
             .and(warp::ws())
             .map(|rs, key: String, ws: warp::ws::Ws| {
                 ws.on_upgrade(move |websocket: WebSocket| {
-                    state_updates_notification(key, rs, websocket)
+                    state_changes_notification(key, rs, websocket)
                 })
             });
 
-        let rs = request_sender.clone();
-        let update_contract_state = base_web_contract
-            .map(move || rs.clone())
+        let state_update = data_contracts
+            .map(move || request_sender.clone())
             .and(warp::path::param())
-            .and(warp::path!("state" / "update"))
+            .and(warp::path("update"))
             .and(warp::path::end())
             .and(warp::post())
             .and(warp::body::bytes())
@@ -82,18 +87,12 @@ impl HttpGateway {
                 update_state(key, update_val.to_vec().into(), rs).await
             });
 
-        // let get_contract_state = warp::path::path("contract")
-        //     .map(move || request_sender.clone())
-        //     .and(warp::path::param())
-        //     .and(warp::path!("state" / "get"))
-        //     .and_then(|rs, key: String| async move { get_state(key, rs).await });
-
         let filters = get_home
             .or(web_home)
             .or(web_subpages)
-            // .or(get_contract_state)
-            // .or(state_update_notifications)
-            // .or(update_contract_state)
+            .or(get_state)
+            .or(state_changes)
+            .or(state_update)
             .recover(errors::handle_error)
             .with(warp::trace::request());
 
