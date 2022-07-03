@@ -46,7 +46,7 @@ Locutus is implemented in Rust and will be available across all major operating 
 
 ### 4. Status
 
-We're working hard and expect an early prototype in June 2022. 
+We're working hard and expect an early prototype in August 2022. 
 
 You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
 
