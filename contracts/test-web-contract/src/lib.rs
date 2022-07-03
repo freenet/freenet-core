@@ -183,15 +183,6 @@ impl ContractInterface for MessageFeed {
         }
         StateDelta::from(serde_json::to_vec(&final_messages).unwrap())
     }
-
-    // TODO: check if this is useful in anyway or makes sense at all
-    fn update_state_from_summary(
-        _parameters: Parameters<'static>,
-        _state: State<'static>,
-        _summary: StateSummary<'static>,
-    ) -> Result<UpdateModification, ContractError> {
-        unimplemented!()
-    }
 }
 
 #[cfg(test)]

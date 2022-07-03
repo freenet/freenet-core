@@ -44,14 +44,6 @@ impl ContractInterface for Contract {
         assert!(&state[1..=2] == summary);
         StateDelta::from((&state[3..=3]).to_vec())
     }
-
-    fn update_state_from_summary(
-        _parameters: Parameters<'static>,
-        _state: State<'static>,
-        _summary: StateSummary<'static>,
-    ) -> Result<UpdateModification, ContractError> {
-        unimplemented!()
-    }
 }
 
 fn main() {}

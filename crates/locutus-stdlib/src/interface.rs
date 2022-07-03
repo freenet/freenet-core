@@ -102,18 +102,6 @@ pub trait ContractInterface {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> StateDelta<'static>;
-
-    // FIXME: should return a delta, adn should be executed on the node performing the update/put;
-    //        using the summaries from each of the subscribers on behave of them
-    /// Updates the current state from the provided summary.
-    fn update_state_from_summary(
-        parameters: Parameters<'static>,
-        state: State<'static>,
-        summary: StateSummary<'static>,
-    ) -> Result<UpdateModification, ContractError>;
-
-    // todo: implement in contract
-    // fn(state_summary_1, state_summary_2) -> up_to_data(1 | 2);
 }
 
 /// A complete contract specification requires a `parameters` section
