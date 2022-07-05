@@ -37,14 +37,4 @@ impl ContractInterface for Contract {
     ) -> StateDelta<'static> {
         StateDelta::from((&state).to_vec())
     }
-
-    fn update_state_from_summary(
-        _parameters: Parameters<'static>,
-        mut state: State<'static>,
-        summary: StateSummary<'static>,
-    ) -> Result<UpdateModification, ContractError> {
-        Ok(UpdateModification::ValidUpdate(State::from(
-            state.to_vec(),
-        )))
-    }
 }

@@ -249,8 +249,8 @@ mod test {
             state.as_bytes().to_vec().into(),
             delta.as_bytes().to_vec().into(),
         )
-        .unwrap()
-        .unwrap_valid();
+            .unwrap()
+            .unwrap_valid();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(new_state.as_ref()).unwrap(),
             serde_json::json!({
@@ -312,7 +312,7 @@ mod test {
                     "date": "2022-04-10T00:00:00Z",
                     "title": "Lore ipsum",
                     "content": "..."
-                }    
+                }
             ]
         }"#;
         let summary = serde_json::json!([{
@@ -346,7 +346,7 @@ mod test {
                     "date": "2022-05-11T00:00:00Z",
                     "title": "Lore ipsum",
                     "content": "..."
-                }    
+                }
             ]
         }"#;
         let summary = serde_json::json!([{
@@ -360,8 +360,8 @@ mod test {
             State::from(state.as_bytes().to_vec()),
             serde_json::to_vec(&summary).unwrap().into(),
         )
-        .unwrap()
-        .unwrap_valid();
+            .unwrap()
+            .unwrap_valid();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(delta.as_ref()).unwrap(),
             serde_json::json!({
