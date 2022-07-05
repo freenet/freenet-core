@@ -15,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_with = "1"
 tar = "0.4.38"
 thiserror = "1"
-xz2 = "0.1"
+xz2 = { version = "0.1", optional = true }
 
 # internal
 locutus-macros = { path = "../locutus-macros" }
@@ -29,3 +29,4 @@ rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
 testing = ["arbitrary"]
+archive = ["xz2"]

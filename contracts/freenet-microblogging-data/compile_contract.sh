@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 cargo build --release --target wasm32-unknown-unknown && \
-	cp $CARGO_TARGET_DIR/wasm32-unknown-unknown/release/test_web_contract.wasm ./test_web_contract.wasm 
+	cp $CARGO_TARGET_DIR/wasm32-unknown-unknown/release/freenet_microblogging_data.wasm ./freenet_microblogging_data.wasm 
 cargo build --release --target wasm32-wasi && \
-	cp $CARGO_TARGET_DIR/wasm32-wasi/release/test_web_contract.wasm ./test_web_contract.wasi.wasm 
+	cp $CARGO_TARGET_DIR/wasm32-wasi/release/freenet_microblogging_data.wasm ./freenet_microblogging_data.wasi.wasm 
 echo "Compiled using module memory" 
