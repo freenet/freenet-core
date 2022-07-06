@@ -1,9 +1,10 @@
 //! Serves a new contract so is available for browsing.
 
-use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
+use std::{fs::File, io::{Cursor, Read}, path::PathBuf, sync::Arc};
+use byteorder::{BigEndian, ReadBytesExt};
 
-use locutus_node::{libp2p::identity::ed25519::PublicKey, SqlitePool, WrappedState};
-use locutus_runtime::{ContractCode, StateStore, WrappedContract};
+use locutus_node::{ErrorKind, libp2p::identity::ed25519::PublicKey, SqlitePool, WrappedState};
+use locutus_runtime::{ContractCode, ContractKey, StateStore, WrappedContract};
 use serde::Serialize;
 
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
@@ -17,7 +18,40 @@ struct WebBundle {
     web_content: WrappedState,
 }
 
+struct UnpackedState {
+    pub metadata: Vec<u8>,
+    pub state: WrappedState,
+}
+
 fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
+
+    fn unpack_state(state_bytes: &[u8], key: &ContractKey) -> std::io::Result<UnpackedState> {
+        let mut state_cursor = Cursor::new(state_bytes);
+        let metadata_size = state_cursor
+            .read_u64::<BigEndian>()
+            .map_err(|_| ErrorKind::IncorrectState(*key)).unwrap();
+        let mut metadata = vec![0; metadata_size as usize];
+        state_cursor
+            .read_exact(&mut metadata)
+            .map_err(|_| ErrorKind::IncorrectState(*key)).unwrap();
+        let state_size = state_cursor
+            .read_u64::<BigEndian>()
+            .map_err(|_| ErrorKind::IncorrectState(*key)).unwrap();
+        let mut dynamic_state = vec![0; state_size as usize];
+        state_cursor
+            .read_exact(&mut dynamic_state)
+            .map_err(|_| ErrorKind::IncorrectState(*key)).unwrap();
+
+        let state = WrappedState::from(dynamic_state);
+
+        log::info!("unpacked state: {:?}", state);
+
+        Ok(UnpackedState {
+            metadata,
+            state,
+        })
+    }
+
     fn get_data_contract(
         public_key: PublicKey,
     ) -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
@@ -39,7 +73,9 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
-        Ok((contract, bytes.into()))
+        let state = unpack_state(bytes.as_slice(), contract.key())?.state;
+
+        Ok((contract, state))
     }
 
     fn get_web_contract() -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
@@ -54,7 +90,9 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
-        Ok((contract, bytes.into()))
+        let state = unpack_state(bytes.as_slice(), contract.key())?.state;
+
+        Ok((contract, state))
     }
 
     let (data_contract, initial_state) = get_data_contract(public_key)?;
