@@ -9,7 +9,7 @@ use std::{
 
 use either::Either;
 use locutus_node::{
-    BoxedClient, ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse,
+    ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse,
 };
 use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -95,17 +95,20 @@ impl StdInput {
     where
         T: From<Vec<u8>>,
     {
-        self.input
-            .rewind()
-            .map_err(|e| ErrorKind::Unhandled(format!("{e}")))?;
+        self.input.rewind().map_err(|e| ErrorKind::Unhandled {
+            cause: format!("{e}"),
+        })?;
         match self.config.ser_format {
             #[cfg(feature = "json")]
             Some(DeserializationFmt::Json) => {
-                let state: serde_json::Value = self
-                    .read_input()
-                    .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
-                let json_str = serde_json::to_string_pretty(&state)
-                    .map_err(|e| ErrorKind::Unhandled(format!("{e}")))?;
+                let state: serde_json::Value =
+                    self.read_input().map_err(|e| ErrorKind::Unhandled {
+                        cause: format!("deserialization error: {e}"),
+                    })?;
+                let json_str =
+                    serde_json::to_string_pretty(&state).map_err(|e| ErrorKind::Unhandled {
+                        cause: format!("{e}"),
+                    })?;
                 println!("{cmd:?} value:\n{json_str}");
                 Ok(json_str.into_bytes().into())
             }
@@ -113,15 +116,18 @@ impl StdInput {
             Some(DeserializationFmt::MessagePack) => {
                 let mut buf = vec![];
                 self.input.read_to_end(&mut buf).unwrap();
-                let state = rmpv::decode::read_value_ref(&mut buf.as_ref())
-                    .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
+                let state = rmpv::decode::read_value_ref(&mut buf.as_ref()).map_err(|e| {
+                    ErrorKind::Unhandled {
+                        cause: format!("deserialization error: {e}"),
+                    }
+                })?;
                 println!("{cmd:?} value:\n{state}");
                 Ok(buf.into())
             }
             _ => {
-                let state: Vec<u8> = self
-                    .read_input()
-                    .map_err(|e| ErrorKind::Unhandled(format!("deserialization error: {e}")))?;
+                let state: Vec<u8> = self.read_input().map_err(|e| ErrorKind::Unhandled {
+                    cause: format!("deserialization error: {e}"),
+                })?;
                 Ok(state.into())
             }
         }
@@ -327,10 +333,6 @@ impl ClientEventsProxy for StdInput {
         _response: Result<HostResponse, ClientError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
         unimplemented!()
-    }
-
-    fn cloned(&self) -> BoxedClient {
-        Box::new(self.clone())
     }
 }
 

@@ -8,7 +8,7 @@ use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{PeerKey, WrappedContract, WrappedState};
+use crate::{WrappedContract, WrappedState};
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -56,18 +56,22 @@ impl From<ErrorKind> for ClientError {
 pub enum ErrorKind {
     #[error("comm channel between client/host closed")]
     ChannelClosed,
-    #[error("lost the connection with the protocol hanling connections")]
-    TransportProtocolDisconnect,
-    #[error("unknown client id: {0}")]
-    UnknownClient(ClientId),
-    #[error(transparent)]
-    RequestError(#[from] RequestError),
-    #[error("unhandled error: {0}")]
-    Unhandled(String),
     #[error("failed while trying to unpack state for {0}")]
     IncorrectState(ContractKey),
+    #[error("error while deserializing: {cause}")]
+    DeserializationError { cause: String },
     #[error("client disconnected")]
     Disconnect,
+    #[error("node not available")]
+    NodeUnavailable,
+    #[error(transparent)]
+    RequestError(#[from] RequestError),
+    #[error("lost the connection with the protocol hanling connections")]
+    TransportProtocolDisconnect,
+    #[error("unhandled error: {cause}")]
+    Unhandled { cause: String },
+    #[error("unknown client id: {0}")]
+    UnknownClient(ClientId),
 }
 
 impl warp::reject::Reject for ErrorKind {}
@@ -95,7 +99,7 @@ pub trait ClientEventsProxy {
         response: Result<HostResponse, ClientError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>>;
 
-    fn cloned(&self) -> BoxedClient;
+    // fn cloned(&self) -> BoxedClient;
 }
 
 /// A response to a previous [`ClientRequest`]
@@ -371,8 +375,8 @@ pub(crate) mod test {
             Box::pin(async { Ok(()) })
         }
 
-        fn cloned(&self) -> BoxedClient {
-            Box::new(self.clone())
-        }
+        // fn cloned(&self) -> BoxedClient {
+        //     Box::new(self.clone())
+        // }
     }
 }

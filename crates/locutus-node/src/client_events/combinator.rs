@@ -137,10 +137,6 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
             Ok(())
         })
     }
-
-    fn cloned(&self) -> BoxedClient {
-        todo!()
-    }
 }
 
 async fn client_fn(
@@ -277,10 +273,6 @@ mod test {
             response: Result<HostResponse, ClientError>,
         ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>> {
             todo!()
-        }
-
-        fn cloned(&self) -> BoxedClient {
-            unimplemented!()
         }
     }
 

@@ -1,6 +1,8 @@
+use futures::{SinkExt, StreamExt};
 use locutus_node::either::Either;
 
 use locutus_node::*;
+use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
     future::Future,
@@ -8,9 +10,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::mpsc;
-use warp::hyper::body::Bytes;
 use warp::ws::WebSocket;
 use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
+use warp::{hyper::body::Bytes, ws::Message};
 
 use crate::{
     errors,
@@ -19,6 +21,9 @@ use crate::{
 };
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
+
+/// Each request is unique so we don't keep track of a client session of any sort.
+static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct HttpGateway {
     server_request: mpsc::Receiver<ClientHandlingMessage>,
@@ -42,6 +47,20 @@ impl HttpGateway {
         let data_contracts = warp::path!("contract" / "dependency");
 
         let rs = request_sender.clone();
+        let websocket_commands = warp::path!("contract" / "command")
+            .map(move || rs.clone())
+            .and(warp::path::param())
+            .and(warp::path::end())
+            .and(warp::ws())
+            .map(|rs, key: String, ws: warp::ws::Ws| {
+                ws.on_upgrade(|ws: WebSocket| async {
+                    if let Err(e) = websocket_interface(key, rs, ws).await {
+                        log::error!("{e}");
+                    }
+                })
+            });
+
+        let rs = request_sender.clone();
         let web_home = base_web_contract
             .map(move || rs.clone())
             .and(warp::path::param())
@@ -62,17 +81,22 @@ impl HttpGateway {
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path("get"))
-            .and_then(|rs, key: String| async move { get_state(key, rs).await });
+            .and_then(|rs, key: String| async move {
+                let (mut rx, id) = new_client_connection(&rs).await.unwrap();
+                get_state(id, key, &rs, &mut rx).await
+            });
 
         let rs = request_sender.clone();
         let state_changes = data_contracts
             .map(move || rs.clone())
             .and(warp::path::param())
             .and(warp::path("changes"))
+            .and(warp::path::end())
             .and(warp::ws())
             .map(|rs, key: String, ws: warp::ws::Ws| {
-                ws.on_upgrade(move |websocket: WebSocket| {
-                    state_changes_notification(key, rs, websocket)
+                ws.on_upgrade(move |websocket: WebSocket| async move {
+                    let (mut rx, id) = new_client_connection(&rs).await.unwrap();
+                    state_changes_notification(id, key, websocket, &rs, &mut rx).await
                 })
             });
 
@@ -84,10 +108,12 @@ impl HttpGateway {
             .and(warp::post())
             .and(warp::body::bytes())
             .and_then(move |rs, key: String, update_val: Bytes| async move {
-                update_state(key, update_val.to_vec().into(), rs).await
+                let (mut recv, id) = new_client_connection(&rs).await.unwrap();
+                update_state(id, key, update_val.to_vec().into(), &rs, &mut recv).await
             });
 
-        let filters = get_home
+        let filters = websocket_commands
+            .or(get_home)
             .or(web_home)
             .or(web_subpages)
             .or(get_state)
@@ -99,8 +125,23 @@ impl HttpGateway {
         (gateway, filters.boxed())
     }
 
-    pub fn next_id() -> ClientId {
-        ClientId::new(ID.fetch_add(1, Ordering::SeqCst))
+    pub fn next_client_id() -> ClientId {
+        ClientId::new(REQUEST_ID.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+async fn new_client_connection(
+    request_sender: &mpsc::Sender<ClientHandlingMessage>,
+) -> Result<(mpsc::UnboundedReceiver<HostResult>, ClientId), ClientError> {
+    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    request_sender
+        .send(Either::Left(response_sender))
+        .await
+        .map_err(|_| ErrorKind::NodeUnavailable)?;
+    match response_recv.recv().await {
+        Some(HostResult::NewId(client_id)) => Ok((response_recv, client_id)),
+        None => Err(ErrorKind::NodeUnavailable.into()),
+        other => unreachable!("received unexpected message: {other:?}"),
     }
 }
 
@@ -108,26 +149,59 @@ async fn home() -> Result<impl Reply, Rejection> {
     Ok(reply::reply())
 }
 
-#[derive(Debug)]
-enum ExtractError {
-    Io(std::io::Error),
-    StripPrefixError(std::path::StripPrefixError),
-}
-
-impl From<std::io::Error> for ExtractError {
-    fn from(error: std::io::Error) -> Self {
-        ExtractError::Io(error)
+async fn websocket_interface(
+    key: String,
+    request_sender: mpsc::Sender<ClientHandlingMessage>,
+    ws: WebSocket,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut response_recv, client_id) = new_client_connection(&request_sender).await?;
+    let contract_key = ContractKey::from_spec(key).unwrap();
+    // todo: unpack the web state
+    let (mut tx, mut rx) = ws.split();
+    while let Some(msg) = rx.next().await {
+        let msg = match msg {
+            Ok(m) if m.is_binary() || m.is_text() => m.into_bytes(),
+            Ok(m) if m.is_close() => break,
+            Ok(m) if m.is_ping() => {
+                if let Err(err) = tx.send(Message::pong(vec![0, 3, 2])).await {
+                    log::debug!("{err}");
+                }
+                continue;
+            }
+            Ok(_) => continue,
+            Err(_err) => todo!(),
+        };
+        let msg: ClientRequest = {
+            match rmp_serde::from_read(std::io::Cursor::new(msg)) {
+                Ok(r) => r,
+                Err(e) => {
+                    let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+                        ErrorKind::DeserializationError {
+                            cause: format!("{e}"),
+                        }
+                        .into(),
+                    ))?;
+                    tx.send(Message::binary(result_error)).await?;
+                    continue;
+                }
+            }
+        };
+        request_sender.send(Either::Right((client_id, msg))).await?;
+        if let Some(HostResult::Result { id, result }) = response_recv.recv().await {
+            let res = rmp_serde::to_vec(&result)?;
+            tx.send(Message::binary(res)).await?;
+        } else {
+            let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+                ErrorKind::NodeUnavailable.into(),
+            ))?;
+            tx.send(Message::binary(result_error)).await?;
+            tx.send(Message::close()).await?;
+            log::warn!("node shut down while handling responses for {client_id}");
+            break;
+        }
     }
+    Ok(())
 }
-
-impl From<std::path::StripPrefixError> for ExtractError {
-    fn from(error: std::path::StripPrefixError) -> Self {
-        ExtractError::StripPrefixError(error)
-    }
-}
-
-/// Each request is unique so we don't keep track of a client session of any sort.
-static ID: AtomicUsize = AtomicUsize::new(0);
 
 #[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for HttpGateway {
@@ -137,50 +211,49 @@ impl ClientEventsProxy for HttpGateway {
         Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
     > {
         Box::pin(async move {
-            if let Some((req, ch_or_id)) = self.server_request.recv().await {
-                match ch_or_id {
-                    Either::Left(new_client_ch) => {
-                        // is a new client, assign an id and open a channel to communicate responses from the node
-                        tracing::debug!("received request: {req}");
-                        let cli_id = ClientId::new(ID.fetch_add(1, Ordering::SeqCst));
-                        self.response_channels.insert(cli_id, new_client_ch);
-                        Ok((cli_id, req))
+            loop {
+                if let Some(msg) = self.server_request.recv().await {
+                    match msg {
+                        Either::Left(new_client_ch) => {
+                            // is a new client, assign an id and open a channel to communicate responses from the node
+                            let cli_id = Self::next_client_id();
+                            new_client_ch
+                                .send(HostResult::NewId(cli_id))
+                                .map_err(|_e| ErrorKind::NodeUnavailable)?;
+                            self.response_channels.insert(cli_id, new_client_ch);
+                        }
+                        Either::Right((existing_client, req)) => {
+                            // just forward the request to the node
+                            break Ok((existing_client, req));
+                        }
                     }
-                    Either::Right(existing_client) => {
-                        // just forward the request to the node
-                        Ok((existing_client, req))
-                    }
+                } else {
+                    todo!()
                 }
-            } else {
-                todo!()
             }
         })
     }
 
     fn send<'a>(
         &'a mut self,
-        client: ClientId,
-        response: Result<HostResponse, ClientError>,
+        id: ClientId,
+        result: Result<HostResponse, ClientError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
-            if let Some(ch) = self.response_channels.remove(&client) {
-                let should_rm = response
+            if let Some(ch) = self.response_channels.remove(&id) {
+                let should_rm = result
                     .as_ref()
                     .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
                     .err()
                     .unwrap_or(false);
-                if ch.send((client, response)).is_ok() && !should_rm {
+                if ch.send(HostResult::Result { id, result }).is_ok() && !should_rm {
                     // still alive connection, keep it
-                    self.response_channels.insert(client, ch);
+                    self.response_channels.insert(id, ch);
                 }
             } else {
-                log::warn!("client: {client} not found");
+                log::warn!("client: {id} not found");
             }
             Ok(())
         })
-    }
-
-    fn cloned(&self) -> BoxedClient {
-        unimplemented!()
     }
 }

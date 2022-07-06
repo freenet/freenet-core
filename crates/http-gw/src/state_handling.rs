@@ -9,32 +9,36 @@ use tokio::sync::mpsc;
 use warp::ws::{Message, WebSocket};
 use warp::{reject, reply, Rejection, Reply};
 
-use crate::{errors, ClientHandlingMessage};
+use crate::{errors, ClientHandlingMessage, HostResult};
 
 use self::errors::NodeError;
 
-pub async fn get_state(
+pub(crate) async fn get_state(
+    client_id: ClientId,
     key: String,
-    request_sender: mpsc::Sender<ClientHandlingMessage>,
+    request_sender: &mpsc::Sender<ClientHandlingMessage>,
+    response_recv: &mut mpsc::UnboundedReceiver<HostResult>,
 ) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
-        .send((
+        .send(Either::Right((
+            client_id,
             ClientRequest::Get {
                 key,
                 fetch_contract: false,
             },
-            Either::Left(response_sender),
-        ))
+        )))
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-    let (id, response) = match response_recv.recv().await {
-        Some((id, Ok(HostResponse::GetResponse { state, .. }))) => {
+    let response = match response_recv.recv().await {
+        Some(HostResult::Result {
+            result: Ok(HostResponse::GetResponse { state, .. }),
+            ..
+        }) => {
             let bytes = bytes::Bytes::copy_from_slice(state.as_ref());
             let response = reply::Response::new(warp::hyper::Body::from(bytes));
-            (id, Ok(response))
+            Ok(response)
         }
         None => {
             return Err(NodeError.into());
@@ -42,61 +46,71 @@ pub async fn get_state(
         _ => unreachable!(),
     };
     request_sender
-        .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))
+        .send(Either::Right((
+            client_id,
+            ClientRequest::Disconnect { cause: None },
+        )))
         .await
         .map_err(|_| NodeError)?;
     response
 }
 
-pub async fn update_state(
+pub(crate) async fn update_state(
+    client_id: ClientId,
     key: String,
     delta: StateDelta<'static>,
-    request_sender: mpsc::Sender<ClientHandlingMessage>,
+    request_sender: &mpsc::Sender<ClientHandlingMessage>,
+    response_recv: &mut mpsc::UnboundedReceiver<HostResult>,
 ) -> Result<impl Reply, Rejection> {
     let contract_key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
-        .send((
+        .send(Either::Right((
+            client_id,
             ClientRequest::Update {
                 key: contract_key,
                 delta,
             },
-            Either::Left(response_sender),
-        ))
+        )))
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-    let (id, response) = match response_recv.recv().await {
-        Some((id, Ok(HostResponse::UpdateResponse { key, .. }))) => {
+    let response = match response_recv.recv().await {
+        Some(HostResult::Result {
+            result: Ok(HostResponse::UpdateResponse { key, .. }),
+            ..
+        }) => {
             assert_eq!(key, contract_key);
-            (id, Ok(reply::json(&serde_json::json!({"result": "ok"}))))
+            Ok(reply::json(&serde_json::json!({"result": "ok"})))
         }
-        Some((id, Err(err))) => (
-            id,
-            Ok(reply::json(
-                &serde_json::json!({"result": "error", "err": format!("{err}")}),
-            )),
-        ),
+        Some(HostResult::Result {
+            result: Err(err), ..
+        }) => Ok(reply::json(
+            &serde_json::json!({"result": "error", "err": format!("{err}")}),
+        )),
         None => {
             return Err(NodeError.into());
         }
         err => unreachable!("{err:?}"),
     };
     request_sender
-        .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))
+        .send(Either::Right((
+            client_id,
+            ClientRequest::Disconnect { cause: None },
+        )))
         .await
         .map_err(|_| NodeError)?;
     response
 }
 
-pub async fn state_changes_notification(
+pub(crate) async fn state_changes_notification(
+    client_id: ClientId,
     key: String,
-    request_sender: mpsc::Sender<ClientHandlingMessage>,
     ws: WebSocket,
+    request_sender: &mpsc::Sender<ClientHandlingMessage>,
+    response_recv: &mut mpsc::UnboundedReceiver<HostResult>,
 ) {
     let contract_key = ContractKey::from_spec(key).unwrap();
     let (updates, mut updates_recv) = mpsc::unbounded_channel();
-    let (response_sender, _response_recv) = mpsc::unbounded_channel();
 
     let (mut ws_sender, mut _ws_receiver) = {
         let (tx, rx) = ws.split();
@@ -110,16 +124,19 @@ pub async fn state_changes_notification(
     };
 
     request_sender
-        .send((
+        .send(Either::Right((
+            client_id,
             ClientRequest::Subscribe {
                 key: contract_key,
                 updates,
             },
-            Either::Left(response_sender),
-        ))
+        )))
         .await
         .map_err(|_| reject::custom(errors::NodeError))
         .unwrap();
+
+    // FIXME: at this point must give back control back to the main websocket stream (probably through a `select`)
+    //        in here, otherwise will block communication until an update is received
     // todo: await for some sort of confirmation through "response_recv"
     while let Some(response) = updates_recv.recv().await {
         if let HostResponse::UpdateNotification { key, update } = response {
@@ -132,10 +149,10 @@ pub async fn state_changes_notification(
         }
     }
     request_sender
-        .send((
+        .send(Either::Right((
+            client_id,
             ClientRequest::Disconnect { cause: None },
-            Either::Right(ClientId::new(0)),
-        ))
+        )))
         .await
         .map_err(|_| NodeError)
         .unwrap();

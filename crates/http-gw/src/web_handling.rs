@@ -14,12 +14,12 @@ use warp::{reject, reply, Rejection, Reply};
 
 use crate::{
     errors::{self, InvalidParam, NodeError},
-    ClientHandlingMessage,
+    ClientHandlingMessage, HostResult,
 };
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-pub async fn contract_home(
+pub(crate) async fn contract_home(
     key: String,
     request_sender: mpsc::Sender<ClientHandlingMessage>,
 ) -> Result<impl Reply, Rejection> {
@@ -27,22 +27,32 @@ pub async fn contract_home(
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
-        .send((
+        .send(Either::Left(response_sender))
+        .await
+        .map_err(|_| reject::custom(errors::NodeError))?;
+    let client_id = if let Some(HostResult::NewId(id)) = response_recv.recv().await {
+        id
+    } else {
+        todo!("this is an error");
+    };
+    request_sender
+        .send(Either::Right((
+            client_id,
             ClientRequest::Get {
                 key,
                 fetch_contract: true,
             },
-            Either::Left(response_sender),
-        ))
+        )))
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-    let (id, response) = match response_recv.recv().await {
-        Some((
-            id,
-            Ok(HostResponse::GetResponse {
-                contract, state, ..
-            }),
-        )) => match contract {
+    let response = match response_recv.recv().await {
+        Some(HostResult::Result {
+            result:
+                Ok(HostResponse::GetResponse {
+                    contract, state, ..
+                }),
+            ..
+        }) => match contract {
             Some(contract) => {
                 let path = contract_web_path(contract.key());
                 let web_body = match get_web_body(&path).await {
@@ -79,13 +89,15 @@ pub async fn contract_home(
                         }
                     }
                 };
-                (id, Ok(reply::html(web_body)))
+                Ok(reply::html(web_body))
             }
             None => {
                 todo!("error indicating the contract is not present");
             }
         },
-        Some((_id, Err(err))) => {
+        Some(HostResult::Result {
+            result: Err(err), ..
+        }) => {
             log::error!("error getting contract `{key}`: {err}");
             return Err(err.kind().into());
         }
@@ -95,7 +107,10 @@ pub async fn contract_home(
         other => unreachable!("received unexpected node response: {other:?}"),
     };
     request_sender
-        .send((ClientRequest::Disconnect { cause: None }, Either::Right(id)))
+        .send(Either::Right((
+            client_id,
+            ClientRequest::Disconnect { cause: None },
+        )))
         .await
         .map_err(|_| NodeError)?;
     response

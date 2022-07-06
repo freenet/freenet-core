@@ -167,10 +167,6 @@ impl ClientEventsProxy for UserEvents {
             Ok(())
         })
     }
-
-    fn cloned(&self) -> BoxedClient {
-        todo!()
-    }
 }
 
 struct Args {
