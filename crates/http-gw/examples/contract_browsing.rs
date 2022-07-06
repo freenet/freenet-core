@@ -91,7 +91,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
-    let id = HttpGateway::next_id();
+    let id = HttpGateway::next_client_id();
     local_node
         .preload(id, bundle.data_contract, bundle.initial_state)
         .await;

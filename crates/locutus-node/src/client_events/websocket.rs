@@ -94,10 +94,6 @@ impl ClientEventsProxy for WebSocketProxy {
             Ok(())
         })
     }
-
-    fn cloned(&self) -> super::BoxedClient {
-        todo!()
-    }
 }
 
 async fn serve(

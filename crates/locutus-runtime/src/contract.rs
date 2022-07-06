@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::{ContractCode, ContractKey, Parameters, State};
+use locutus_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use serde::Serialize;
 use std::{fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 

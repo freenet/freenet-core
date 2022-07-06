@@ -7,11 +7,17 @@ pub use http_gateway::HttpGateway;
 use locutus_node::{either::Either, ClientError, ClientId, ClientRequest, HostResponse};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
-type HostResult = (ClientId, Result<HostResponse, ClientError>);
-type ClientHandlingMessage = (
-    ClientRequest,
-    Either<tokio::sync::mpsc::UnboundedSender<HostResult>, ClientId>,
-);
+type ClientHandlingMessage =
+    Either<tokio::sync::mpsc::UnboundedSender<HostResult>, (ClientId, ClientRequest)>;
+
+#[derive(Debug)]
+enum HostResult {
+    NewId(ClientId),
+    Result {
+        id: ClientId,
+        result: Result<HostResponse, ClientError>,
+    },
+}
 
 #[cfg(feature = "local")]
 pub mod local_node {
@@ -48,7 +54,13 @@ pub mod local_node {
                 Err(either::Right(err)) => {
                     log::error!("{err}");
                     http_handle
-                        .send(id, Err(ErrorKind::Unhandled(format!("{err}")).into()))
+                        .send(
+                            id,
+                            Err(ErrorKind::Unhandled {
+                                cause: format!("{err}"),
+                            }
+                            .into()),
+                        )
                         .await?;
                 }
             }
