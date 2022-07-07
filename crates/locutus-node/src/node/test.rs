@@ -140,30 +140,31 @@ impl SimNetwork {
             ));
         }
 
-        for (mut this_node, this_config) in configs.clone() {
-            for GatewayConfig {
-                port, id, location, ..
-            } in configs.iter().filter_map(|(_, config)| {
-                if this_config.label != config.label {
-                    Some(config)
-                } else {
-                    None
-                }
-            }) {
-                this_node.add_gateway(
-                    InitPeerNode::new(*id, *location)
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(*port),
-                );
-            }
+        // FIXME:
+        // for (mut this_node, this_config) in configs {
+        //     for GatewayConfig {
+        //         port, id, location, ..
+        //     } in configs.iter().filter_map(|(_, config)| {
+        //         if this_config.label != config.label {
+        //             Some(config)
+        //         } else {
+        //             None
+        //         }
+        //     }) {
+        //         this_node.add_gateway(
+        //             InitPeerNode::new(*id, *location)
+        //                 .listening_ip(Ipv6Addr::LOCALHOST)
+        //                 .listening_port(*port),
+        //         );
+        //     }
 
-            let gateway = NodeInMemory::<SimStoreError>::build::<MemoryContractHandler>(
-                this_node,
-                Some(Box::new(self.event_listener.clone())),
-            )
-            .unwrap();
-            self.gateways.push((gateway, this_config));
-        }
+        //     let gateway = NodeInMemory::<SimStoreError>::build::<MemoryContractHandler>(
+        //         this_node,
+        //         Some(Box::new(self.event_listener.clone())),
+        //     )
+        //     .unwrap();
+        //     self.gateways.push((gateway, this_config));
+        // }
     }
 
     #[instrument(skip(self))]

@@ -215,6 +215,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "freenet-microblogging-data"
+version = "0.0.0"
+dependencies = [
+ "byteorder",
+ "chrono",
+ "ed25519-dalek",
+ "locutus-stdlib",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tar",
+ "xz2",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -263,6 +278,7 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_with",
+ "tar",
  "thiserror",
 ]
 
@@ -485,21 +501,6 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
-]
-
-[[package]]
-name = "test-web-contract"
-version = "0.0.0"
-dependencies = [
- "byteorder",
- "chrono",
- "ed25519-dalek",
- "locutus-stdlib",
- "serde",
- "serde_json",
- "serde_with",
- "tar",
- "xz2",
 ]
 
 [[package]]

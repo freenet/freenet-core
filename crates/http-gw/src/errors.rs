@@ -27,3 +27,8 @@ impl Reject for InvalidParam {}
 pub(super) struct NodeError;
 
 impl Reject for NodeError {}
+
+#[derive(Debug)]
+pub(super) struct HttpError(pub warp::http::StatusCode);
+
+impl Reject for HttpError {}

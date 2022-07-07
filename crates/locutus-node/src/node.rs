@@ -92,28 +92,6 @@ pub struct NodeConfig<const CLIENTS: usize> {
     pub(crate) clients: [BoxedClient; CLIENTS],
 }
 
-impl<const CLIENTS: usize> Clone for NodeConfig<CLIENTS> {
-    fn clone(&self) -> Self {
-        let mut clients_cp = [(); CLIENTS].map(|_| None);
-        for (i, e) in clients_cp.iter_mut().enumerate().take(CLIENTS) {
-            *e = Some(self.clients[i].cloned());
-        }
-
-        Self {
-            local_key: self.local_key.clone(),
-            local_ip: self.local_ip,
-            local_port: self.local_port,
-            remote_nodes: self.remote_nodes.clone(),
-            location: self.location,
-            max_hops_to_live: self.max_hops_to_live,
-            rnd_if_htl_above: self.rnd_if_htl_above,
-            max_number_conn: self.max_number_conn,
-            min_number_conn: self.min_number_conn,
-            clients: clients_cp.map(|e| e.unwrap()),
-        }
-    }
-}
-
 impl<const CLIENTS: usize> NodeConfig<CLIENTS> {
     pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeConfig<CLIENTS> {
         let local_key = if let Some(key) = &CONFIG.local_peer_keypair {

@@ -71,11 +71,6 @@ pub struct StateConfig {
     pub input_path: PathBuf,
     #[clap(long, parse(from_os_str), value_name = "OUTPUT_PATH")]
     pub output_file: PathBuf,
-    #[clap(
-        long = "contract-type",
-        arg_enum,
-        group = "type",
-        value_name = "TYPE"
-    )]
-    pub contract_type: Option<ContractType>,
+    #[clap(long = "contract-type", arg_enum, group = "type", value_name = "TYPE")]
+    pub contract_type: ContractType,
 }

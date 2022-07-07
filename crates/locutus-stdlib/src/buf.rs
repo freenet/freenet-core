@@ -1,5 +1,4 @@
-//! A memory buffer to interact with the WASM contracts.
-//! This buffer leakes it's own memory and will only be freed by the runtime when a contract instance is dropped.
+//! Memory buffers to interact with the WASM contracts.
 
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -33,7 +32,7 @@ impl BufferBuilder {
 
         // write the new buffer information
         let new_ptr = data.as_ptr();
-        self.start = new_ptr as i64; // FIXME: this is not assigning what it should ???
+        self.start = new_ptr as i64;
         self.size = data.capacity() as _;
         *read_ptr = 0;
         *write_ptr = data.len().saturating_sub(1) as _;
@@ -276,7 +275,9 @@ impl<'instance> Buffer<'instance> {
     }
 }
 
-/// Returns the pointer to a new BufferBuilder
+/// Returns the pointer to a new BufferBuilder.
+///
+/// This buffer leaks it's own memory and will only be freed by the runtime when a contract instance is dropped.
 #[doc(hidden)]
 #[no_mangle]
 pub fn initiate_buffer(size: u32) -> i64 {
