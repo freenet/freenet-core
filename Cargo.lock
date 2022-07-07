@@ -129,6 +129,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-io"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e18f61464ae81cde0a23e713ae8fd299580c54d697a35820cfd0625b8b0e07"
+dependencies = [
+ "concurrent-queue",
+ "futures-lite",
+ "libc",
+ "log",
+ "once_cell",
+ "parking",
+ "polling",
+ "slab",
+ "socket2 0.4.4",
+ "waker-fn",
+ "winapi",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3760,15 +3779,18 @@ checksum = "213701ba3370744dcd1a12960caa4843b3d68b4d1c0a5d575e0d65b2ee9d16c0"
 
 [[package]]
 name = "stretto"
-version = "0.4.6"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53d29c8dde1b9fafaf180a6e3e0c42c7bdbcba55c36edcfff611ed4454fdda9a"
+checksum = "3f7537062c5906795813a413b4acc0508406b7d12f48bd1f7ed81bd9500569ba"
 dependencies = [
+ "async-channel",
+ "async-io",
  "atomic",
  "crossbeam-channel",
+ "futures",
  "parking_lot 0.12.1",
  "rand 0.8.5",
- "tokio",
+ "thiserror",
  "twox-hash",
  "wg",
 ]
