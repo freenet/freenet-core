@@ -9,10 +9,10 @@ use futures::FutureExt;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, HostResult};
-use crate::client_events::ErrorKind;
+use crate::client_events::{ErrorKind, OpenRequest};
 use crate::{ClientEventsProxy, ClientId, ClientRequest, HostResponse};
 
-type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
+type HostIncomingMsg = Result<OpenRequest, ClientError>;
 
 static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
 
@@ -62,9 +62,7 @@ impl<const N: usize> ClientEventsCombinator<N> {
 impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
     fn recv(
         &mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
             let pend_futs = &mut self.pend_futs;
@@ -91,8 +89,12 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
             let res = res
                 .map(|res| {
                     match res {
-                        Ok((external, r)) => {
-                            log::debug!("received request; internal_id={external}; req={r}");
+                        Ok(OpenRequest {
+                            id: external,
+                            request,
+                            notification_channel,
+                        }) => {
+                            log::debug!("received request; internal_id={external}; req={request}");
                             let id = *(&mut self.external_clients[idx])
                                 .entry(external)
                                 .or_insert_with(|| {
@@ -103,7 +105,11 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                                     internal
                                 });
 
-                            Ok((id, r))
+                            Ok(OpenRequest {
+                                id,
+                                request,
+                                notification_channel,
+                            })
                         }
                         err @ Err(_) => err,
                     }
@@ -142,7 +148,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
 async fn client_fn(
     mut client: BoxedClient,
     mut rx: Receiver<(ClientId, HostResult)>,
-    tx_host: Sender<Result<(ClientId, ClientRequest), ClientError>>,
+    tx_host: Sender<Result<OpenRequest, ClientError>>,
 ) {
     loop {
         tokio::select! {
@@ -158,9 +164,9 @@ async fn client_fn(
             }
             client_msg = client.recv() => {
                 match client_msg {
-                    Ok((id, msg)) => {
-                        log::debug!("received msg @ combinator from external id {id}, msg: {msg}");
-                        if tx_host.send(Ok((id, msg))).await.is_err() {
+                    Ok(OpenRequest {id,  request, notification_channel}) => {
+                        log::debug!("received msg @ combinator from external id {id}, msg: {request}");
+                        if tx_host.send(Ok(OpenRequest { id,  request, notification_channel })).await.is_err() {
                             break;
                         }
                     }
@@ -263,7 +269,11 @@ mod test {
                     .ok_or_else::<ClientError, _>(|| ErrorKind::ChannelClosed.into())?;
                 assert_eq!(id, self.id);
                 eprintln!("#{}, received msg {id}", self.id);
-                Ok((ClientId::new(id), ClientRequest::Disconnect { cause: None }))
+                Ok(OpenRequest {
+                    id: ClientId::new(id),
+                    request: ClientRequest::Disconnect { cause: None },
+                    notification_channel: None,
+                })
             })
         }
 
@@ -300,7 +310,7 @@ mod test {
         .unwrap();
 
         for i in 0..3 {
-            let (id, _) = combinator.recv().await.unwrap();
+            let OpenRequest { id, .. } = combinator.recv().await.unwrap();
             eprintln!("received: {id:?}");
             assert_eq!(ClientId::new(i), id);
         }

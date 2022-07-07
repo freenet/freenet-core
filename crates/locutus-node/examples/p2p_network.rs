@@ -145,11 +145,9 @@ impl ClientEventsProxy for UserEvents {
     /// This future must be safe to cancel.
     fn recv(
         &mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
-            Ok((
+            Ok(OpenRequest::new(
                 ClientId::new(1),
                 self.rx_ev.recv().await.expect("channel open"),
             ))

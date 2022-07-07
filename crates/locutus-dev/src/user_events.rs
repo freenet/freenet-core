@@ -9,7 +9,7 @@ use std::{
 
 use either::Either;
 use locutus_node::{
-    ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse,
+    ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse, OpenRequest,
 };
 use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -29,7 +29,7 @@ SUBCOMMANDS:
     put         Puts the state for the contract for the first time
     exit        Exit from the TUI";
 
-type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
+type HostIncomingMsg = Result<OpenRequest, ClientError>;
 
 pub async fn user_fn_handler(
     config: Config,
@@ -41,8 +41,8 @@ pub async fn user_fn_handler(
     loop {
         let command = input.recv().await;
         let command = command?;
-        let dc = command.1.is_disconnect();
-        command_sender.send(command.1).await?;
+        let dc = command.request.is_disconnect();
+        command_sender.send(command.request).await?;
         if dc {
             break;
         }
@@ -203,7 +203,7 @@ struct CommandInfo {
     input: Option<CommandInput>,
 }
 
-impl From<CommandInfo> for (ClientId, ClientRequest) {
+impl From<CommandInfo> for OpenRequest {
     fn from(cmd: CommandInfo) -> Self {
         let req = match cmd.cmd {
             Command::Get => ClientRequest::Get {
@@ -229,7 +229,7 @@ impl From<CommandInfo> for (ClientId, ClientRequest) {
             },
             _ => unreachable!(),
         };
-        (ClientId::new(0), req)
+        OpenRequest::new(ClientId::new(0), req)
     }
 }
 
@@ -316,7 +316,7 @@ impl ClientEventsProxy for StdInput {
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
-                    Ok(Either::<(ClientId, ClientRequest), _>::Right(()))
+                    Ok(Either::<OpenRequest, _>::Right(()))
                 };
                 match f.await {
                     Ok(Either::Right(_)) => continue,

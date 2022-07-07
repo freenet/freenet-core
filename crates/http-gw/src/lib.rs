@@ -25,7 +25,8 @@ pub mod local_node {
 
     use locutus_dev::LocalNode;
     use locutus_node::{
-        either, ClientError, ClientEventsProxy, ErrorKind, RequestError, WebSocketProxy,
+        either, ClientError, ClientEventsProxy, ErrorKind, OpenRequest, RequestError,
+        WebSocketProxy,
     };
 
     use crate::{DynError, HttpGateway};
@@ -38,9 +39,17 @@ pub mod local_node {
         // let mut all_clients =
         //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
         loop {
-            let (id, req) = http_handle.recv().await?;
-            tracing::debug!("client {id}, req -> {req}");
-            match local_node.handle_request(id, req).await {
+            let OpenRequest {
+                id,
+                request,
+                notification_channel,
+                ..
+            } = http_handle.recv().await?;
+            tracing::debug!("client {id}, req -> {request}");
+            match local_node
+                .handle_request(id, request, notification_channel)
+                .await
+            {
                 Ok(res) => {
                     http_handle.send(id, Ok(res)).await?;
                 }

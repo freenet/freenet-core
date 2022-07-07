@@ -49,12 +49,11 @@ impl HttpGateway {
         let rs = request_sender.clone();
         let websocket_commands = warp::path!("contract" / "command")
             .map(move || rs.clone())
-            .and(warp::path::param())
             .and(warp::path::end())
             .and(warp::ws())
-            .map(|rs, key: String, ws: warp::ws::Ws| {
+            .map(|rs, ws: warp::ws::Ws| {
                 ws.on_upgrade(|ws: WebSocket| async {
-                    if let Err(e) = websocket_interface(key, rs, ws).await {
+                    if let Err(e) = websocket_interface(rs, ws).await {
                         log::error!("{e}");
                     }
                 })
@@ -150,13 +149,10 @@ async fn home() -> Result<impl Reply, Rejection> {
 }
 
 async fn websocket_interface(
-    key: String,
     request_sender: mpsc::Sender<ClientHandlingMessage>,
     ws: WebSocket,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut response_recv, client_id) = new_client_connection(&request_sender).await?;
-    let contract_key = ContractKey::from_spec(key).unwrap();
-    // todo: unpack the web state
     let (mut tx, mut rx) = ws.split();
     while let Some(msg) = rx.next().await {
         let msg = match msg {
@@ -188,6 +184,7 @@ async fn websocket_interface(
         };
         request_sender.send(Either::Right((client_id, msg))).await?;
         if let Some(HostResult::Result { id, result }) = response_recv.recv().await {
+            debug_assert_eq!(id, client_id);
             let res = rmp_serde::to_vec(&result)?;
             tx.send(Message::binary(res)).await?;
         } else {
@@ -207,9 +204,7 @@ async fn websocket_interface(
 impl ClientEventsProxy for HttpGateway {
     fn recv<'a>(
         &'a mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + '_>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
             loop {
                 if let Some(msg) = self.server_request.recv().await {
@@ -224,7 +219,7 @@ impl ClientEventsProxy for HttpGateway {
                         }
                         Either::Right((existing_client, req)) => {
                             // just forward the request to the node
-                            break Ok((existing_client, req));
+                            break Ok(OpenRequest::new(existing_client, req));
                         }
                     }
                 } else {

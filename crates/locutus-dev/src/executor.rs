@@ -21,26 +21,29 @@ pub async fn wasm_runtime(
 async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool, DynError> {
     let node = &mut *app.local_node.write().await;
     match req {
-        req @ ClientRequest::Put { .. } => match node.handle_request(ClientId::FIRST, req).await {
-            Ok(HostResponse::PutResponse(key)) => {
-                println!("valid put for {key}");
+        req @ ClientRequest::Put { .. } => {
+            match node.handle_request(ClientId::FIRST, req, None).await {
+                Ok(HostResponse::PutResponse(key)) => {
+                    println!("valid put for {key}");
+                }
+                Err(err) => {
+                    println!("error: {err}");
+                }
+                _ => unreachable!(),
             }
-            Err(err) => {
-                println!("error: {err}");
+        }
+        req @ ClientRequest::Update { .. } => {
+            match node.handle_request(ClientId::FIRST, req, None).await {
+                Ok(HostResponse::UpdateResponse { key, summary }) => {
+                    println!("valid update for {key}, state summary:");
+                    app.printout_deser(summary.as_ref())?;
+                }
+                Err(err) => {
+                    println!("error: {err}");
+                }
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
-        },
-        req @ ClientRequest::Update { .. } => match node.handle_request(ClientId::FIRST, req).await
-        {
-            Ok(HostResponse::UpdateResponse { key, summary }) => {
-                println!("valid update for {key}, state summary:");
-                app.printout_deser(summary.as_ref())?;
-            }
-            Err(err) => {
-                println!("error: {err}");
-            }
-            _ => unreachable!(),
-        },
+        }
         ClientRequest::Get {
             key,
             fetch_contract: contract,
@@ -52,6 +55,7 @@ async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool,
                         key,
                         fetch_contract: contract,
                     },
+                    None,
                 )
                 .await
             {
