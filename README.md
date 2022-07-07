@@ -8,9 +8,11 @@ Locutus is a software platform that makes it easy to create decentralized altern
 
 Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
 
-Watch an [introductory talk](https://www.youtube.com/watch?v=d31jmv5Tx5k) by Ian.
+### 1. News
 
-### 1. Applications
+**7th July, 2022:** Ian gave an introductory talk on Locutus which you can watch [on YouTube](https://www.youtube.com/watch?v=d31jmv5Tx5k).
+
+### 2. Applications
 
 Examples of what can be built on Locutus include:
 
@@ -24,21 +26,21 @@ Examples of what can be built on Locutus include:
 
 All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
 
-### 2. Components
+### 3. Components
 
 Decentralized services that can be used by other decentralized services:
 
-#### 2.1 Reputation system
+#### 3.1 Reputation system
 
 Allows users to build up reputation over time based on feedback from those they interact with. Think of the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
 
 This is conceptually similar to Freenet's [Web of Trust](http://www.draketo.de/english/freenet/friendly-communication-with-anonymity) plugin.
 
-#### 2.2 Arbiters
+#### 3.2 Arbiters
 
 Arbiters are trusted services that can perform tasks and authenticate the results, such as verifying that a contract had a particular state at a given time, or that external blockchains (Bitcoin, Ethereum, Solana etc) contain specific transactions. Trust is achieved through the reputation system.
 
-### 3. How does it work?
+### 4. How does it work?
 
 Locutus is a decentralized key-value database. It uses the same [small world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as the original Freenet design, but each key is a cryptographic contract implemented in [Web Assembly](https://webassembly.org/), and the value associated with each contract is called its *state*. The role of the cryptographic contract is to specify what state is allowed for this contract, and how the state is modified.
 
@@ -46,26 +48,26 @@ A very simple contract might require that the state is a list of messages, each 
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
-### 4. Status
+### 5. Status
 
 We're working hard and expect an early prototype in August 2022. 
 
 You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
 
 
-### 5. Stay up to date
+### 6. Stay up to date
 
 [![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
 
-### 6. Name
+### 7. Name
 
 Locutus is the development name for this software; it will probably change before launch.
 
-### 7. Chat with us
+### 8. Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join. If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
 
-### 8. License
+### 9. License
 
 This project is licensed under either of:
 
