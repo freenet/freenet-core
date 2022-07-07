@@ -8,6 +8,8 @@ Locutus is a software platform that makes it easy to create decentralized altern
 
 Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
 
+Watch an [introductory talk](https://www.youtube.com/watch?v=d31jmv5Tx5k) by Ian.
+
 ### 1. Applications
 
 Examples of what can be built on Locutus include:
