@@ -38,8 +38,10 @@ impl HttpGateway {
         };
 
         let get_home = warp::path::end().and_then(home);
-        let base_web_contract = warp::path!("contract" / "web");
-        let data_contracts = warp::path!("contract" / "dependency");
+        let base_web_contract = warp::path::path("contract").
+            and(warp::path::path("web"));
+        let data_contracts = warp::path::path("contract").
+            and(warp::path::path("dependency"));
 
         let rs = request_sender.clone();
         let web_home = base_web_contract
@@ -89,7 +91,7 @@ impl HttpGateway {
 
         let filters = get_home
             .or(web_home)
-            .or(web_subpages)
+            // .or(web_subpages)
             .or(get_state)
             .or(state_changes)
             .or(state_update)
@@ -106,6 +108,10 @@ impl HttpGateway {
 
 async fn home() -> Result<impl Reply, Rejection> {
     Ok(reply::reply())
+}
+
+async fn test() -> Result<impl Reply, Rejection> {
+    Ok(reply::html("<html><headers><title>test</title></headers><body>Hola</body></html>"))
 }
 
 #[derive(Debug)]
