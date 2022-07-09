@@ -63,17 +63,10 @@ fn append_web_content(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let web_tar = {
         let web_content = Vec::new();
+        let content_path = PathBuf::from(source_path);
         let mut tar = tar::Builder::new(web_content);
-        assert!(source_path.is_dir());
-        for path in &[
-            source_path.join("index.html"),
-            source_path.join("state.html"),
-        ] {
-            let data = File::open(path)?;
-            let mut header = Header::new_gnu();
-            header.set_metadata(&data.metadata()?);
-            tar.append(&header, data)?;
-        }
+        tar.append_path(content_path.join("index.html"))?;
+        tar.append_path(content_path.join("state.html"))?;
         tar.into_inner()?
     };
     assert!(!web_tar.is_empty());

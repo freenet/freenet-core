@@ -60,6 +60,8 @@ impl<'a> TryFrom<State<'a>> for UnpackedWeb {
 
     fn try_from(mut state: State) -> Result<Self, Self::Error> {
         // Decompose the state and extract the compressed web interface
+        let mut state = Cursor::new(state);
+
         let metadata_size = state
             .read_u64::<BigEndian>()
             .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
