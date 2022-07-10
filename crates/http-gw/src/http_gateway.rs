@@ -91,7 +91,7 @@ impl HttpGateway {
 
         let filters = get_home
             .or(web_home)
-            // .or(web_subpages)
+            .or(web_subpages)
             .or(get_state)
             .or(state_changes)
             .or(state_update)
