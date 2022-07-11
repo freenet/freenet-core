@@ -43,8 +43,8 @@ impl HttpGateway {
         };
 
         let get_home = warp::path::end().and_then(home);
-        let base_web_contract = warp::path!("contract" / "web");
-        let data_contracts = warp::path!("contract" / "dependency");
+        let base_web_contract = warp::path::path("contract").and(warp::path::path("web"));
+        let data_contracts = warp::path::path("contract").and(warp::path::path("dependency"));
 
         let rs = request_sender.clone();
         let websocket_commands = warp::path!("contract" / "command")

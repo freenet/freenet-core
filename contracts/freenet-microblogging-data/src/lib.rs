@@ -1,4 +1,6 @@
 use chrono::{DateTime, Utc};
+use std::{fs::File, io::{Cursor, Read}, path::PathBuf, sync::Arc};
+use byteorder::{BigEndian, ReadBytesExt};
 use ed25519_dalek::Verifier;
 use locutus_stdlib::{
     blake2::{Blake2b512, Digest},
@@ -99,10 +101,34 @@ impl<'a> TryFrom<Parameters<'a>> for Verification {
     }
 }
 
+fn unpack_state(state_bytes: &[u8]) -> std::io::Result<State> {
+    let mut state_cursor = Cursor::new(state_bytes);
+    let metadata_size = state_cursor
+        .read_u64::<BigEndian>()
+        .map_err(|_| ContractError::InvalidState).unwrap();
+    let mut metadata = vec![0; metadata_size as usize];
+    state_cursor
+        .read_exact(&mut metadata)
+        .map_err(|_| ContractError::InvalidState).unwrap();
+    let state_size = state_cursor
+        .read_u64::<BigEndian>()
+        .map_err(|_| ContractError::InvalidState).unwrap();
+    let mut dynamic_state = vec![0; state_size as usize];
+    state_cursor
+        .read_exact(&mut dynamic_state)
+        .map_err(|_| ContractError::InvalidState).unwrap();
+
+    let state = State::from(dynamic_state);
+
+    Ok(state)
+}
+
 #[contract]
 impl ContractInterface for MessageFeed {
+
     fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
-        MessageFeed::try_from(state).is_ok()
+        let state_data = unpack_state(state.as_ref()).unwrap();
+        MessageFeed::try_from(state_data).is_ok()
     }
 
     fn validate_delta(_parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool {

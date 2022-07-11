@@ -22,20 +22,21 @@ pub enum WebContractError {
 
 pub struct UnpackedWeb {
     pub metadata: Vec<u8>,
-    web: Archive<XzDecoder<Cursor<Vec<u8>>>>,
+    web: Cursor<Vec<u8>>,
 }
 
 impl UnpackedWeb {
     pub fn store(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
-        self.web
+        let mut decoded_web = self.decode_web();
+        decoded_web
             .unpack(dst)
             .map_err(WebContractError::StoringError)?;
         Ok(())
     }
 
     pub fn get_file(&mut self, path: &str) -> Result<Vec<u8>, WebContractError> {
-        for e in self
-            .web
+        let mut decoded_web = self.decode_web();
+        for e in decoded_web
             .entries()
             .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?
         {
@@ -53,6 +54,11 @@ impl UnpackedWeb {
         }
         Err(WebContractError::FileNotFound(path.to_owned()))
     }
+
+    fn decode_web(&mut self) -> Archive<XzDecoder<Cursor<Vec<u8>>>> {
+        let decoder = XzDecoder::new(self.web.clone());
+        Archive::new(decoder)
+    }
 }
 
 impl<'a> TryFrom<State<'a>> for UnpackedWeb {
@@ -60,6 +66,8 @@ impl<'a> TryFrom<State<'a>> for UnpackedWeb {
 
     fn try_from(mut state: State) -> Result<Self, Self::Error> {
         // Decompose the state and extract the compressed web interface
+        let mut state = Cursor::new(state);
+
         let metadata_size = state
             .read_u64::<BigEndian>()
             .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
@@ -75,8 +83,10 @@ impl<'a> TryFrom<State<'a>> for UnpackedWeb {
             .read_exact(&mut web)
             .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
 
-        let decoder = XzDecoder::new(Cursor::new(web));
-        let web = Archive::new(decoder);
+        let web = Cursor::new(web);
+
+        // let decoder = XzDecoder::new(Cursor::new(web));
+        // let web = Archive::new(decoder);
 
         Ok(Self { metadata, web })
     }
