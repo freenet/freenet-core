@@ -2,7 +2,6 @@ use futures::{SinkExt, StreamExt};
 use locutus_node::either::Either;
 
 use locutus_node::*;
-use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
     future::Future,
