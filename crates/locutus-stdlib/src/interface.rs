@@ -495,8 +495,8 @@ impl std::fmt::Display for ContractCode<'_> {
     }
 }
 
-#[serde_as]
 /// The key representing a contract.
+#[serde_as]
 #[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 pub struct ContractKey {

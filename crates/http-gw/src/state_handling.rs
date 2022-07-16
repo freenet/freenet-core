@@ -126,10 +126,7 @@ pub(crate) async fn state_changes_notification(
     request_sender
         .send(Either::Right((
             client_id,
-            ClientRequest::Subscribe {
-                key: contract_key,
-                updates,
-            },
+            ClientRequest::Subscribe { key: contract_key },
         )))
         .await
         .map_err(|_| reject::custom(errors::NodeError))

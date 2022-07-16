@@ -15,13 +15,13 @@ use rmp_serde as rmps;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use warp::{filters::BoxedFilter, Filter, Reply};
 
-use super::{ClientError, ClientEventsProxy, ClientId, ErrorKind, HostResult};
+use super::{ClientError, ClientEventsProxy, ClientId, ErrorKind, HostResult, OpenRequest};
 use crate::{ClientRequest, HostResponse};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 pub struct WebSocketProxy {
-    server_request: Receiver<(ClientId, ClientRequest)>,
+    server_request: Receiver<OpenRequest>,
     server_response: Sender<(ClientId, HostResult)>,
 }
 
@@ -68,16 +68,14 @@ impl WebSocketProxy {
 impl ClientEventsProxy for WebSocketProxy {
     fn recv<'a>(
         &'a mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>> + Send + Sync + 'a>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + 'a>> {
         Box::pin(async move {
-            let (id, msg) = self
+            let req = self
                 .server_request
                 .recv()
                 .await
                 .ok_or(ErrorKind::ChannelClosed)?;
-            Ok((id, msg))
+            Ok(req)
         })
     }
 
@@ -97,7 +95,7 @@ impl ClientEventsProxy for WebSocketProxy {
 }
 
 async fn serve(
-    request_sender: Arc<Sender<(ClientId, ClientRequest)>>,
+    request_sender: Arc<Sender<OpenRequest>>,
     new_responses: Arc<Sender<ClientHandling>>,
     socket: SocketAddr,
     server_config: BoxedFilter<(impl Reply + 'static,)>,
@@ -159,7 +157,7 @@ static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 async fn handle_socket(
     socket: warp::ws::WebSocket,
-    request_sender: Arc<Sender<(ClientId, ClientRequest)>>,
+    request_sender: Arc<Sender<OpenRequest>>,
     client_handler: Arc<Sender<ClientHandling>>,
 ) {
     let client_id = ClientId(CLIENT_ID.fetch_add(1, Ordering::SeqCst));
@@ -191,8 +189,8 @@ async fn handle_socket(
 }
 
 async fn new_request(
-    request_sender: &Arc<Sender<(ClientId, ClientRequest)>>,
-    client_id: ClientId,
+    request_sender: &Arc<Sender<OpenRequest>>,
+    id: ClientId,
     result: Option<Result<warp::ws::Message, warp::Error>>,
 ) -> Result<(), ()> {
     let msg = match result {
@@ -202,12 +200,13 @@ async fn new_request(
                 Ok(m) => m,
                 Err(e) => {
                     let _ = request_sender
-                        .send((
-                            client_id,
-                            ClientRequest::Disconnect {
+                        .send(OpenRequest {
+                            id,
+                            request: ClientRequest::Disconnect {
                                 cause: Some(format!("{e}")),
                             },
-                        ))
+                            notification_channel: None,
+                        })
                         .await;
                     return Ok(());
                 }
@@ -217,18 +216,27 @@ async fn new_request(
         Some(Ok(_)) => return Ok(()),
         Some(Err(e)) => {
             let _ = request_sender
-                .send((
-                    client_id,
-                    ClientRequest::Disconnect {
+                .send(OpenRequest {
+                    id,
+                    request: ClientRequest::Disconnect {
                         cause: Some(format!("{e}")),
                     },
-                ))
+                    notification_channel: None,
+                })
                 .await;
             return Err(());
         }
         None => return Err(()),
     };
-    if request_sender.send((client_id, msg)).await.is_err() {
+    if request_sender
+        .send(OpenRequest {
+            id,
+            request: msg,
+            notification_channel: None,
+        })
+        .await
+        .is_err()
+    {
         return Err(());
     }
     Ok(())

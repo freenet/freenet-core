@@ -76,7 +76,7 @@ pub(crate) async fn contract_home(
                                     UnpackedWeb::try_from(state).map_err(|e| err(e, &contract))?;
                                 web.store(path).map_err(|e| err(e, &contract))?;
                                 let index =
-                                    web.get_file("index.html").map_err(|e| err(e, &contract))?;
+                                    web.get_file("web/index.html").map_err(|e| err(e, &contract))?;
                                 warp::hyper::Body::from(index)
                             }
                             other => {

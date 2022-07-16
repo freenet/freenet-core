@@ -84,7 +84,24 @@ impl Display for ClientError {
 
 impl StdError for ClientError {}
 
-type HostIncomingMsg = Result<(ClientId, ClientRequest), ClientError>;
+type HostIncomingMsg = Result<OpenRequest, ClientError>;
+
+#[non_exhaustive]
+pub struct OpenRequest {
+    pub id: ClientId,
+    pub request: ClientRequest,
+    pub notification_channel: Option<UnboundedSender<HostResponse>>,
+}
+
+impl OpenRequest {
+    pub fn new(id: ClientId, request: ClientRequest) -> Self {
+        Self {
+            id,
+            request,
+            notification_channel: None,
+        }
+    }
+}
 
 #[allow(clippy::needless_lifetimes)]
 pub trait ClientEventsProxy {
@@ -181,12 +198,8 @@ pub enum ClientRequest {
     },
     /// Subscribe to the changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
-    /// After this action the client will start receiving all changes through the open
-    /// connection, and relied through the provided channel.
-    #[serde(skip)]
     Subscribe {
         key: ContractKey,
-        updates: UnboundedSender<HostResponse>,
     },
     Disconnect {
         cause: Option<String>,
@@ -316,8 +329,7 @@ pub(crate) mod test {
                             // self.non_owned_contracts[contract_no]
                             todo!() // fixme
                         };
-                        let (updates, _) = tokio::sync::mpsc::unbounded_channel();
-                        break ClientRequest::Subscribe { key, updates };
+                        break ClientRequest::Subscribe { key };
                     }
                     0 => {}
                     1 => {}
@@ -336,26 +348,28 @@ pub(crate) mod test {
     impl ClientEventsProxy for MemoryEventsGen {
         fn recv<'a>(
             &'a mut self,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<(ClientId, ClientRequest), ClientError>>
-                    + Send
-                    + Sync
-                    + '_,
-            >,
-        > {
+        ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>>
+        {
             Box::pin(async move {
                 loop {
                     if self.signal.changed().await.is_ok() {
                         let (ev_id, pk) = *self.signal.borrow();
                         if pk == self.id && !self.random {
-                            return Ok((
-                                ClientId(1),
-                                self.generate_deterministic_event(&ev_id)
+                            let res = OpenRequest {
+                                id: ClientId(1),
+                                request: self
+                                    .generate_deterministic_event(&ev_id)
                                     .expect("event not found"),
-                            ));
+                                notification_channel: None,
+                            };
+                            return Ok(res);
                         } else if pk == self.id {
-                            return Ok((ClientId(1), self.generate_rand_event()));
+                            let res = OpenRequest {
+                                id: ClientId(1),
+                                request: self.generate_rand_event(),
+                                notification_channel: None,
+                            };
+                            return Ok(res);
                         }
                     } else {
                         log::debug!("sender half of user event gen dropped");
@@ -374,9 +388,5 @@ pub(crate) mod test {
         ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
             Box::pin(async { Ok(()) })
         }
-
-        // fn cloned(&self) -> BoxedClient {
-        //     Box::new(self.clone())
-        // }
     }
 }

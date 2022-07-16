@@ -79,7 +79,11 @@ impl LocalNode {
         state: WrappedState,
     ) {
         if let Err(err) = self
-            .handle_request(cli_id, locutus_node::ClientRequest::Put { contract, state })
+            .handle_request(
+                cli_id,
+                locutus_node::ClientRequest::Put { contract, state },
+                None,
+            )
             .await
         {
             match err {
@@ -89,7 +93,12 @@ impl LocalNode {
         }
     }
 
-    pub async fn handle_request(&mut self, id: ClientId, req: ClientRequest) -> Response {
+    pub async fn handle_request(
+        &mut self,
+        id: ClientId,
+        req: ClientRequest,
+        updates: Option<UnboundedSender<HostResponse>>,
+    ) -> Response {
         match req {
             ClientRequest::Put { contract, state } => {
                 // FIXME: in net node, we don't allow puts for existing contract states
@@ -204,7 +213,9 @@ impl LocalNode {
                 key,
                 fetch_contract: contract,
             } => self.perform_get(contract, key).await.map_err(Either::Left),
-            ClientRequest::Subscribe { key, updates } => {
+            ClientRequest::Subscribe { key } => {
+                let updates =
+                    updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
                 self.register_contract_notifier(key, id, updates, [].as_ref().into())
                     .unwrap();
                 log::info!("getting contract: {}", key.encode());

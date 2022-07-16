@@ -23,7 +23,7 @@ use self::{
     p2p_impl::NodeP2P,
 };
 use crate::{
-    client_events::{BoxedClient, ClientEventsProxy, ClientRequest},
+    client_events::{BoxedClient, ClientEventsProxy, ClientRequest, OpenRequest},
     config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
@@ -295,8 +295,8 @@ async fn client_event_handling<ClientEv, CErr>(
 {
     loop {
         // fixme: send back responses to client
-        let (id, ev) = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
-        if let ClientRequest::Disconnect { .. } = ev {
+        let OpenRequest { id, request, .. } = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
+        if let ClientRequest::Disconnect { .. } = request {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
                 log::error!("{}", err);
             }
@@ -305,7 +305,7 @@ async fn client_event_handling<ClientEv, CErr>(
 
         let op_storage_cp = op_storage.clone();
         GlobalExecutor::spawn(async move {
-            match ev {
+            match request {
                 ClientRequest::Put { state, contract } => {
                     // Initialize a put op.
                     log::debug!(
