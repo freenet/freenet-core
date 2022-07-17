@@ -37,7 +37,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
             public_key: Vec<u8>,
         }
         let params = serde_json::to_vec(&Verification {
-            public_key: public_key.encode().to_vec(),
+            public_key: vec![],
         })
         .unwrap();
         let contract = WrappedContract::new(Arc::new(ContractCode::from(bytes)), params.into());

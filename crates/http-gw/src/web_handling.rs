@@ -160,6 +160,8 @@ fn get_file_path(uri: warp::http::Uri) -> Result<String, Rejection> {
         .chars()
         .skip_while(|c| ALPHABET.contains(*c))
         .skip_while(|c| c == &'/')
+        .skip_while(|c| ALPHABET.contains(*c))
+        .skip_while(|c| c == &'/')
         .collect::<String>();
     Ok(path)
 }
