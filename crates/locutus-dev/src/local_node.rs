@@ -1,5 +1,5 @@
-use std::{collections::HashMap, sync::Arc};
 use log::log;
+use std::{collections::HashMap, sync::Arc};
 
 use locutus_node::{
     either::Either, ClientId, ClientRequest, HostResponse, PeerKey, RequestError, SqlitePool,
@@ -155,10 +155,6 @@ impl LocalNode {
                 Ok(res)
             }
             ClientRequest::Update { key, delta } => {
-                println!("updated key: {:?}", key.encode());
-                for (key, params) in self.contract_params.iter() {
-                    log::info!("saved contract key {}", key.encode())
-                }
                 let parameters = {
                     match self
                         .contract_params
@@ -294,23 +290,10 @@ impl LocalNode {
             })
             .transpose()?;
         match self.contract_state.get(&key).await {
-            Ok(state) => {
-                let path = contract
-                    .then(|| {
-                        self.runtime.contracts.get_contract_path(&key).map_err(|_| {
-                            RequestError::Get {
-                                key,
-                                cause: "contract code hash key not specified".to_owned(),
-                            }
-                        })
-                    })
-                    .transpose()?;
-                Ok(HostResponse::GetResponse {
-                    contract: got_contract,
-                    state,
-                    path,
-                })
-            }
+            Ok(state) => Ok(HostResponse::GetResponse {
+                contract: got_contract,
+                state,
+            }),
             Err(StateStoreError::MissingContract) => Err(RequestError::Get {
                 key,
                 cause: "missing contract state".into(),
