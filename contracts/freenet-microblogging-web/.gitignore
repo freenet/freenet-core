@@ -1,3 +1,4 @@
 *.wasm
 encoded_state
 node_modules/*
+web/dist/*

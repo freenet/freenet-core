@@ -23,7 +23,7 @@ async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool,
     match req {
         req @ ClientRequest::Put { .. } => {
             match node.handle_request(ClientId::FIRST, req, None).await {
-                Ok(HostResponse::PutResponse(key)) => {
+                Ok(HostResponse::PutResponse { key }) => {
                     println!("valid put for {key}");
                 }
                 Err(err) => {

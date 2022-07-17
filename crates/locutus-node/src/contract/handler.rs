@@ -423,12 +423,7 @@ pub(in crate::contract) mod sqlite {
                     fetch_contract,
                 } => {
                     let (state, contract) = self.get_contract(&key, fetch_contract).await?;
-                    let path = todo!();
-                    Ok(HostResponse::GetResponse {
-                        contract,
-                        state,
-                        path,
-                    })
+                    Ok(HostResponse::GetResponse { contract, state })
                 }
                 ClientRequest::Put { contract, state } => {
                     match self.get_contract(contract.key(), false).await {

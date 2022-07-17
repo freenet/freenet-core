@@ -1,5 +1,5 @@
 use locutus_stdlib::prelude::{ContractCode, ContractKey, Parameters};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 
 use crate::ContractRuntimeError;
@@ -7,9 +7,28 @@ use crate::ContractRuntimeError;
 /// Just as `locutus_stdlib::Contract` but with some convenience impl.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct WrappedContract<'a> {
+    #[serde(
+        serialize_with = "inner_ser_contract_data",
+        deserialize_with = "inner_deser_contract_data"
+    )]
     pub(crate) data: Arc<ContractCode<'a>>,
     pub(crate) params: Parameters<'a>,
     pub(crate) key: ContractKey,
+}
+
+fn inner_ser_contract_data<S>(data: &Arc<ContractCode<'_>>, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    (&*data).serialize(ser)
+}
+
+fn inner_deser_contract_data<'de, D>(deser: D) -> Result<Arc<ContractCode<'static>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let data: ContractCode<'static> = Deserialize::deserialize(deser)?;
+    Ok(Arc::new(data))
 }
 
 impl PartialEq for WrappedContract<'_> {
@@ -98,7 +117,28 @@ impl<'a> arbitrary::Arbitrary<'a> for WrappedContract<'_> {
 /// The state for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct WrappedState(Arc<Vec<u8>>);
+pub struct WrappedState(
+    #[serde(
+        serialize_with = "inner_ser_state",
+        deserialize_with = "inner_deser_state"
+    )]
+    Arc<Vec<u8>>,
+);
+
+fn inner_ser_state<S>(data: &Arc<Vec<u8>>, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serde_bytes::serialize(&**data, ser)
+}
+
+fn inner_deser_state<'de, D>(deser: D) -> Result<Arc<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let data: Vec<u8> = serde_bytes::deserialize(deser)?;
+    Ok(Arc::new(data))
+}
 
 impl WrappedState {
     pub fn new(bytes: Vec<u8>) -> Self {

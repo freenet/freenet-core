@@ -298,6 +298,7 @@ impl<'a> std::io::Read for State<'a> {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct StateDelta<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateDelta<'a> {
@@ -392,6 +393,14 @@ impl<'a> Deref for StateSummary<'a> {
 impl<'a> DerefMut for StateSummary<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let data: Vec<u8> = u.arbitrary()?;
+        Ok(StateSummary::from(data))
     }
 }
 
@@ -495,7 +504,7 @@ impl std::fmt::Display for ContractCode<'_> {
     }
 }
 
-/// The key representing a contract.
+/// The key representing the tuple of a contract code and a set of parameters.
 #[serde_as]
 #[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]

@@ -125,7 +125,7 @@ impl LocalNode {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 let res = is_valid
-                    .then(|| HostResponse::PutResponse(*key))
+                    .then(|| HostResponse::PutResponse { key: *key })
                     .ok_or_else(|| {
                         Either::Left(RequestError::Put {
                             key: *key,

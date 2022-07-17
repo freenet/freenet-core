@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
 
@@ -122,7 +121,9 @@ pub trait ClientEventsProxy {
 /// A response to a previous [`ClientRequest`]
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum HostResponse {
-    PutResponse(ContractKey),
+    PutResponse {
+        key: ContractKey,
+    },
     /// Successful update
     UpdateResponse {
         key: ContractKey,
@@ -130,8 +131,6 @@ pub enum HostResponse {
     },
     GetResponse {
         contract: Option<WrappedContract<'static>>,
-        /// path in the filesystem to where the actual contract file is stored
-        path: Option<PathBuf>,
         state: WrappedState,
     },
     /// Message sent when there is an update to a subscribed contract.
@@ -143,7 +142,7 @@ pub enum HostResponse {
 
 impl HostResponse {
     pub fn unwrap_put(self) -> ContractKey {
-        if let Self::PutResponse(key) = self {
+        if let Self::PutResponse { key } = self {
             key
         } else {
             panic!("called `HostResponse::unwrap_put()` on other than `PutResponse` value")
@@ -238,6 +237,7 @@ impl Display for ClientRequest {
 pub(crate) mod test {
     use std::{collections::HashMap, time::Duration};
 
+    use locutus_runtime::{ContractCode, Parameters};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
@@ -388,5 +388,75 @@ pub(crate) mod test {
         ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    #[test]
+    fn put_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = crate::util::test::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+
+        let key = ContractKey::from((
+            &gen.arbitrary::<Parameters>()?,
+            &gen.arbitrary::<ContractCode>()?,
+        ));
+        let complete_put: HostResult = Ok(HostResponse::PutResponse { key });
+        let encoded = rmp_serde::to_vec(&complete_put)?;
+        let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
+
+        let key = ContractKey::from_spec(key.encode())?;
+        let only_spec: HostResult = Ok(HostResponse::PutResponse { key });
+        let encoded = rmp_serde::to_vec(&only_spec)?;
+        let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
+        Ok(())
+    }
+
+    #[test]
+    fn update_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = crate::util::test::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+
+        let update: HostResult = Ok(HostResponse::UpdateResponse {
+            key: gen.arbitrary()?,
+            summary: gen.arbitrary()?,
+        });
+        let encoded = rmp_serde::to_vec(&update)?;
+        let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = crate::util::test::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+
+        let state: WrappedState = gen.arbitrary()?;
+        let complete_get: HostResult = Ok(HostResponse::GetResponse {
+            contract: Some(gen.arbitrary()?),
+            state: state.clone(),
+        });
+        let encoded = rmp_serde::to_vec(&complete_get)?;
+        let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
+
+        let incomplete_get: HostResult = Ok(HostResponse::GetResponse {
+            contract: None,
+            state,
+        });
+        let encoded = rmp_serde::to_vec(&incomplete_get)?;
+        let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
+        Ok(())
+    }
+
+    #[test]
+    fn update_notification_serialization() -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = crate::util::test::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+
+        let update_notif: HostResult = Ok(HostResponse::UpdateNotification {
+            key: gen.arbitrary()?,
+            update: StateDelta::from(gen.arbitrary::<Vec<u8>>()?),
+        });
+        let encoded = rmp_serde::to_vec(&update_notif)?;
+        let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
+        Ok(())
     }
 }
