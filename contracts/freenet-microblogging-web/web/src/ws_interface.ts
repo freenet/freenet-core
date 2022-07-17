@@ -1,10 +1,8 @@
 import { decode, Encoder } from "@msgpack/msgpack"
 import base58 from "bs58"
 
-
 const MAX_U8: number = 255;
 const MIN_U8: number = 0;
-
 
 // base interface types:
 

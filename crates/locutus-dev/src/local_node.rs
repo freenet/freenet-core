@@ -1,4 +1,3 @@
-use log::log;
 use std::{collections::HashMap, sync::Arc};
 
 use locutus_node::{

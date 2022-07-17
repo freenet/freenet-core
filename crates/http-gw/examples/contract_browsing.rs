@@ -1,10 +1,9 @@
 //! Serves a new contract so is available for browsing.
 
-use std::{fs::File, io::{Cursor, Read}, path::PathBuf, sync::Arc};
-use byteorder::{BigEndian, ReadBytesExt};
+use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 
-use locutus_node::{ErrorKind, libp2p::identity::ed25519::PublicKey, SqlitePool, WrappedState};
-use locutus_runtime::{ContractCode, ContractKey, StateStore, WrappedContract};
+use locutus_node::{libp2p::identity::ed25519::PublicKey, SqlitePool, WrappedState};
+use locutus_runtime::{ContractCode, StateStore, WrappedContract};
 use serde::Serialize;
 
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
@@ -18,15 +17,9 @@ struct WebBundle {
     web_content: WrappedState,
 }
 
-struct UnpackedState {
-    pub metadata: Vec<u8>,
-    pub state: WrappedState,
-}
-
 fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
-
     fn get_data_contract(
-        public_key: PublicKey,
+        _public_key: PublicKey,
     ) -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_data.wasm");
         let mut bytes = Vec::new();
@@ -36,10 +29,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         struct Verification {
             public_key: Vec<u8>,
         }
-        let params = serde_json::to_vec(&Verification {
-            public_key: vec![],
-        })
-        .unwrap();
+        let params = serde_json::to_vec(&Verification { public_key: vec![] }).unwrap();
         let contract = WrappedContract::new(Arc::new(ContractCode::from(bytes)), params.into());
 
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_data");
@@ -82,7 +72,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use locutus_node::libp2p::identity::ed25519::Keypair;
 
     let keypair = Keypair::generate();
-
     let bundle = test_web(keypair.public())?;
     log::info!(
         "loading web contract {} in local node",

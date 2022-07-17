@@ -76,7 +76,7 @@ pub(crate) async fn contract_home(
                                     UnpackedWeb::try_from(state).map_err(|e| err(e, &contract))?;
                                 web.store(path).map_err(|e| err(e, &contract))?;
                                 let index =
-                                    web.get_file("web/index.html").map_err(|e| err(e, &contract))?;
+                                    web.get_file("index.html").map_err(|e| err(e, &contract))?;
                                 warp::hyper::Body::from(index)
                             }
                             other => {
@@ -122,7 +122,7 @@ pub async fn variable_content(
 ) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
-    let base_path = contract_web_path(&key).join("web/");
+    let base_path = contract_web_path(&key);
     let req_uri = req_path.as_str().parse().unwrap();
     let file_path = base_path.join(get_file_path(req_uri)?);
     let mut buf = vec![];
@@ -136,7 +136,7 @@ pub async fn variable_content(
 }
 
 async fn get_web_body(path: &Path) -> std::io::Result<warp::hyper::Body> {
-    let web_path = path.join("index.html");
+    let web_path = path.join("web").join("index.html");
     let mut key_file = File::open(&web_path).await?;
     let mut buf = vec![];
     key_file.read_to_end(&mut buf).await?;
@@ -148,6 +148,7 @@ fn contract_web_path(key: &ContractKey) -> PathBuf {
         .join("locutus")
         .join("webs")
         .join(key.encode())
+        .join("web")
 }
 
 #[inline]

@@ -1,14 +1,13 @@
+use byteorder::{BigEndian, ReadBytesExt};
 use chrono::{DateTime, Utc};
-use std::{fs::File, io::{Cursor, Read}, path::PathBuf, sync::Arc};
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use ed25519_dalek::Verifier;
 use locutus_stdlib::{
     blake2::{Blake2b512, Digest},
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::value::Value;
 use serde_with::serde_as;
+use std::io::{Cursor, Read};
 
 #[derive(Serialize, Deserialize)]
 struct MessageFeed {
@@ -102,44 +101,55 @@ impl<'a> TryFrom<Parameters<'a>> for Verification {
     }
 }
 
-fn get_unpacked_state(state_bytes: &[u8]) -> std::io::Result<(Vec<u8>)> {
+fn get_unpacked_state(state_bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut state_cursor = Cursor::new(state_bytes);
     let metadata_size = state_cursor
         .read_u64::<BigEndian>()
-        .map_err(|_| ContractError::InvalidState).unwrap();
+        .map_err(|_| ContractError::InvalidState)
+        .unwrap();
     let mut metadata = vec![0; metadata_size as usize];
     state_cursor
         .read_exact(&mut metadata)
-        .map_err(|_| ContractError::InvalidState).unwrap();
+        .map_err(|_| ContractError::InvalidState)
+        .unwrap();
     let state_size = state_cursor
         .read_u64::<BigEndian>()
-        .map_err(|_| ContractError::InvalidState).unwrap();
+        .map_err(|_| ContractError::InvalidState)
+        .unwrap();
     let mut dynamic_state = vec![0; state_size as usize];
     state_cursor
         .read_exact(&mut dynamic_state)
-        .map_err(|_| ContractError::InvalidState).unwrap();
+        .map_err(|_| ContractError::InvalidState)
+        .unwrap();
 
     Ok(dynamic_state)
 }
 
-fn pack_updated_state(state_bytes: &[u8], updated_state_data: &[u8]) -> std::io::Result<(Vec<u8>)> {
+fn pack_updated_state(state_bytes: &[u8], updated_state_data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut state_cursor = Cursor::new(state_bytes);
     let metadata_size = state_cursor
         .read_u64::<BigEndian>()
-        .map_err(|_| ContractError::InvalidState).unwrap();
+        .map_err(|_| ContractError::InvalidState)
+        .unwrap();
     let mut metadata = vec![0; metadata_size as usize];
     state_cursor
         .read_exact(&mut metadata)
-        .map_err(|_| ContractError::InvalidState).unwrap();
+        .map_err(|_| ContractError::InvalidState)
+        .unwrap();
     let new_state_size_bytes = updated_state_data.len().to_be_bytes().to_vec();
-    let updated_state: Vec<u8> = [metadata_size.to_be_bytes().to_vec(), metadata, new_state_size_bytes, updated_state_data.to_vec()].concat();
+    let updated_state: Vec<u8> = [
+        metadata_size.to_be_bytes().to_vec(),
+        metadata,
+        new_state_size_bytes,
+        updated_state_data.to_vec(),
+    ]
+    .concat();
 
     Ok(updated_state)
 }
 
 #[contract]
 impl ContractInterface for MessageFeed {
-
     fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
         let state_data = get_unpacked_state(state.as_ref()).unwrap();
         MessageFeed::try_from(State::from(state_data)).is_ok()
@@ -179,11 +189,11 @@ impl ContractInterface for MessageFeed {
                 }
             }
         }
-        let feed_bytes: Vec<u8> = serde_json::to_vec(&feed).map_err(|err| ContractError::Other(err.into()))?;
-        let updated_state: Vec<u8> = pack_updated_state(state.as_ref(), feed_bytes.as_slice()).unwrap();
-        Ok(UpdateModification::ValidUpdate(State::from(
-            updated_state,
-        )))
+        let feed_bytes: Vec<u8> =
+            serde_json::to_vec(&feed).map_err(|err| ContractError::Other(err.into()))?;
+        let updated_state: Vec<u8> =
+            pack_updated_state(state.as_ref(), feed_bytes.as_slice()).unwrap();
+        Ok(UpdateModification::ValidUpdate(State::from(updated_state)))
     }
 
     fn summarize_state(
@@ -232,6 +242,9 @@ impl ContractInterface for MessageFeed {
 
 #[cfg(test)]
 mod test {
+    use byteorder::WriteBytesExt;
+    use serde_json::Value;
+
     use super::*;
 
     fn get_test_state(mut data: Vec<u8>) -> Vec<u8> {
@@ -271,11 +284,12 @@ mod test {
                     "content": "..."
                 }
             ]
-        }"#.as_bytes().to_vec();
+        }"#
+        .as_bytes()
+        .to_vec();
 
         let mut state: Vec<u8> = get_test_state(json_bytes);
-        let valid =
-            MessageFeed::validate_state([].as_ref().into(), State::from(state));
+        let valid = MessageFeed::validate_state([].as_ref().into(), State::from(state));
         assert!(valid);
     }
 
@@ -299,7 +313,9 @@ mod test {
     #[test]
     fn update_state() {
         let state_bytes = r#"{"messages":[{"author":"IDG","content":"...",
-        "date":"2022-05-10T00:00:00Z","title":"Lore ipsum"}]}"#.as_bytes().to_vec();
+        "date":"2022-05-10T00:00:00Z","title":"Lore ipsum"}]}"#
+            .as_bytes()
+            .to_vec();
         let mut state: Vec<u8> = get_test_state(state_bytes);
 
         let delta =
@@ -309,8 +325,8 @@ mod test {
             state.into(),
             delta.as_bytes().to_vec().into(),
         )
-            .unwrap()
-            .unwrap_valid();
+        .unwrap()
+        .unwrap_valid();
         let new_state_data = get_unpacked_state(new_state.as_ref()).unwrap();
         let new_state = State::from(new_state_data);
         assert_eq!(
@@ -349,12 +365,13 @@ mod test {
                     "content": "..."
                 }
             ]
-        }"#.as_bytes().to_vec();
+        }"#
+        .as_bytes()
+        .to_vec();
 
         let mut state: Vec<u8> = get_test_state(state_bytes);
 
-        let summary =
-            MessageFeed::summarize_state([].as_ref().into(), State::from(state));
+        let summary = MessageFeed::summarize_state([].as_ref().into(), State::from(state));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(summary.as_ref()).unwrap(),
             serde_json::json!([{
@@ -383,7 +400,9 @@ mod test {
                     "content": "..."
                 }
             ]
-        }"#.as_bytes().to_vec();
+        }"#
+        .as_bytes()
+        .to_vec();
         let mut state: Vec<u8> = get_test_state(state_bytes);
 
         let summary = serde_json::json!([{

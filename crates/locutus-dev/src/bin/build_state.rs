@@ -1,7 +1,6 @@
 use byteorder::{BigEndian, WriteBytesExt};
 use clap::Parser;
 use std::{fs::File, io::Write, path::PathBuf};
-use tar::Header;
 
 use locutus_dev::{ContractType, StateConfig};
 
@@ -63,10 +62,15 @@ fn append_web_content(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let web_tar = {
         let web_content = Vec::new();
-        let content_path = PathBuf::from(source_path);
         let mut tar = tar::Builder::new(web_content);
-        tar.append_path(content_path.join("index.html"))?;
-        tar.append_path(content_path.join("state.html"))?;
+        tar.append_file(
+            "index.html",
+            &mut File::open(source_path.join("index.html"))?,
+        )?;
+        tar.append_file(
+            "state.html",
+            &mut File::open(source_path.join("state.html"))?,
+        )?;
         tar.into_inner()?
     };
     assert!(!web_tar.is_empty());
