@@ -68,7 +68,14 @@ Locutus is the development name for this software; it will probably change befor
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join. If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
 
-### 9. License
+### 9. Acknowledgements and Funding
+
+In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
+generously supported our work with a grant.
+
+If you are in a position to support our work please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at *ian at freenet dot org*.
+
+### 10. License
 
 This project is licensed under either of:
 
