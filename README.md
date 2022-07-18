@@ -73,7 +73,8 @@ We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freene
 In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
 generously supported our work with a grant.
 
-If you are in a position to support our work please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at *ian at freenet dot org*.
+If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
+*ian at freenet dot org*.
 
 ### 10. License
 
