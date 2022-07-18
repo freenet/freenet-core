@@ -8,8 +8,8 @@ mod user_events;
 pub(crate) mod util;
 
 pub use config::Config;
-pub use config::StateConfig;
 pub use config::ContractType;
+pub use config::StateConfig;
 pub use executor::wasm_runtime;
 pub use local_node::LocalNode;
 pub use locutus_runtime::ContractStore;
