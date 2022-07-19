@@ -1,6 +1,11 @@
 use byteorder::{BigEndian, WriteBytesExt};
 use clap::Parser;
-use std::{fs::File, io::Write, path::PathBuf};
+use locutus_runtime::locutus_stdlib::web::model::WebModelState;
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 use locutus_dev::{ContractType, StateConfig};
 
@@ -17,8 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ContractType::Web => {
             build_web_state(&mut complete_state, source_path, dest_file)?;
         }
-        ContractType::Data => {
-            build_data_state(&mut complete_state, source_path, dest_file)?;
+        ContractType::Model => {
+            build_model_state(source_path, dest_file)?;
         }
     }
     Ok(())
@@ -30,6 +35,7 @@ fn build_web_state(
     dest_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Bundling web state from {source_path:?} into {dest_file:?}");
+    // FIXME: use instead WebModelState
     append_metadata(complete_state)?;
     append_web_content(complete_state, source_path)?;
     let mut state = File::create(dest_file)?;
@@ -37,16 +43,20 @@ fn build_web_state(
     Ok(())
 }
 
-fn build_data_state(
-    complete_state: &mut Vec<u8>,
+fn build_model_state(
     source_path: PathBuf,
     dest_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Bundling data contract state from {source_path:?} into {dest_file:?}");
-    append_metadata(complete_state)?;
-    append_dynamic_state(complete_state, source_path)?;
+    println!("Bundling `model` contract state from {source_path:?} into {dest_file:?}");
+    // FIXME: optionally provide a path to the metadata
+    // 4. from both bundle them in a `WebModelState`
+    let mut model = vec![];
+    let mut model_f = File::open(source_path)?;
+    model_f.read_to_end(&mut model)?;
+    let model = WebModelState::from_data(vec![], model);
+
     let mut state = File::create(dest_file)?;
-    state.write_all(complete_state)?;
+    state.write_all(model.pack()?.as_slice())?;
     Ok(())
 }
 
@@ -83,17 +93,5 @@ fn append_web_content(
     assert!(!encoded.is_empty());
     state.write_u64::<BigEndian>(encoded.len() as u64)?;
     state.append(&mut encoded);
-    Ok(())
-}
-
-fn append_dynamic_state(
-    state: &mut Vec<u8>,
-    source_path: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let dynamic_state = source_path.join("initial_state.json");
-    let json: serde_json::Value = serde_json::from_reader(File::open(dynamic_state)?)?;
-    let mut bytes = serde_json::to_vec(&json)?;
-    state.write_u64::<BigEndian>(bytes.len() as u64)?;
-    state.append(&mut bytes);
     Ok(())
 }

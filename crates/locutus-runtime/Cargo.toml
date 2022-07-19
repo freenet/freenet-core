@@ -35,7 +35,7 @@ wasmer-default = [
 	# "wasmer/dylib"
 	"wasmer/universal"
 ]
-wasmser-universal = [
+wasmer-universal = [
 	"wasmer/default-cranelift",
 	"wasmer/universal"
 ]

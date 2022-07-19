@@ -15,7 +15,7 @@ pub enum DeserializationFmt {
 #[derive(clap::ArgEnum, Clone, Copy, Debug)]
 pub enum ContractType {
     Web,
-    Data,
+    Model,
 }
 
 /// A CLI utility for testing out contracts against a Locutus local node.

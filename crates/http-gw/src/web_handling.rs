@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use locutus_node::either::Either;
 use locutus_runtime::{
-    locutus_stdlib::web::{UnpackedWeb, WebContractError},
+    locutus_stdlib::web::view::{WebContractError, WebViewState},
     ContractKey, State, WrappedContract,
 };
 
@@ -73,7 +73,7 @@ pub(crate) async fn contract_home(
                                     ))
                                 }
                                 let mut web =
-                                    UnpackedWeb::try_from(state).map_err(|e| err(e, &contract))?;
+                                    WebViewState::try_from(state).map_err(|e| err(e, &contract))?;
                                 web.store(path).map_err(|e| err(e, &contract))?;
                                 let index =
                                     web.get_file("index.html").map_err(|e| err(e, &contract))?;

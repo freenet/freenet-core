@@ -197,6 +197,11 @@ impl LocalNode {
                     new_state
                 };
                 // in the network impl this would be sent over the network
+                // eprintln!(
+                //     "state:\n {:?}\nparams:\n {:?}\n",
+                //     new_state.as_ref(),
+                //     parameters.as_ref()
+                // );
                 let summary = self
                     .runtime
                     .summarize_state(&key, &parameters, &new_state)
