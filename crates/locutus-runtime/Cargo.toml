@@ -37,6 +37,7 @@ wasmer-default = [
 ]
 wasmer-universal = [
 	"wasmer/default-cranelift",
+	# "wasmer/dylib"
 	"wasmer/universal"
 ]
 testing = ["arbitrary", "locutus-stdlib/testing"]

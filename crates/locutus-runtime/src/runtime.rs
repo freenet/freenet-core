@@ -231,11 +231,20 @@ impl Runtime {
 
     #[cfg(not(test))]
     fn instance_store() -> Store {
-        // use wasmer::Dylib;
         use wasmer::Universal;
-        use wasmer_compiler_llvm::LLVM;
+
+        if cfg!(target_arch = "aarch64") {
+            use wasmer::Cranelift;
+
+            Store::new(&Universal::new(Cranelift::new()).engine())
+        } else {
+            use wasmer_compiler_llvm::LLVM;
+
+            Store::new(&Universal::new(LLVM::new()).engine())
+        }
+
+        // use wasmer::Dylib;
         // Store::new(&Dylib::headless().engine())
-        Store::new(&Universal::new(LLVM::new()).engine())
     }
 
     #[cfg(test)]
