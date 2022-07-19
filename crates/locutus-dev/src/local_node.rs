@@ -31,7 +31,10 @@ impl LocalNode {
     pub async fn new(
         store: ContractStore,
         contract_state: StateStore<SqlitePool>,
+        set_handle: impl FnOnce(),
     ) -> Result<Self, DynError> {
+        set_handle();
+
         Ok(Self {
             contract_params: HashMap::default(),
             contract_data: HashMap::default(),
@@ -67,7 +70,9 @@ impl LocalNode {
             .insert(cli_id, summary)
             .is_some()
         {
-            log::warn!("contract {key} already was registered for peer {cli_id}; replaced summary");
+            tracing::warn!(
+                "contract {key} already was registered for peer {cli_id}; replaced summary"
+            );
         }
         Ok(())
     }
@@ -87,8 +92,8 @@ impl LocalNode {
             .await
         {
             match err {
-                Either::Left(err) => log::error!("req error: {err}"),
-                Either::Right(err) => log::error!("other error: {err}"),
+                Either::Left(err) => tracing::error!("req error: {err}"),
+                Either::Right(err) => tracing::error!("other error: {err}"),
             }
         }
     }
@@ -118,7 +123,7 @@ impl LocalNode {
                     .map_err(Either::Right)?;
 
                 let key = contract.key();
-                log::debug!("executing with params: {:?}", contract.params());
+                tracing::debug!("executing with params: {:?}", contract.params());
                 let is_valid = self
                     .runtime
                     .validate_state(key, contract.params(), &state)
@@ -223,14 +228,14 @@ impl LocalNode {
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
                 self.register_contract_notifier(key, id, updates, [].as_ref().into())
                     .unwrap();
-                log::info!("getting contract: {}", key.encode());
+                tracing::info!("getting contract: {}", key.encode());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)
                 // todo: in network mode, also send a subscribe to keep up to date
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
-                    log::info!("disconnecting cause: {cause}");
+                    tracing::info!("disconnecting cause: {cause}");
                 }
                 Err(Either::Left(RequestError::Disconnect))
             }
@@ -307,5 +312,31 @@ impl LocalNode {
                 cause: format!("{err}"),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::LocalNode;
+    use locutus_node::SqlitePool;
+    use locutus_runtime::{ContractStore, StateStore};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_SIZE: i64 = 10 * 1024 * 1024;
+        const MAX_MEM_CACHE: u32 = 10_000_000;
+        let tmp_path = std::env::temp_dir().join("locutus");
+        let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
+        let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
+        let mut counter = 0;
+        LocalNode::new(contract_store.clone(), state_store.clone(), || {
+            counter += 1;
+        })
+        .await
+        .expect("local node with handle");
+
+        assert_eq!(counter, 1);
+
+        Ok(())
     }
 }

@@ -30,6 +30,9 @@ pub enum ContractType {
         .args(&["output-file", "terminal-output"])
 ))]
 pub struct Config {
+    /// Cleanups all state which was created locally during execution
+    #[clap(long, requires = "fmt")]
+    pub clean_exit: bool,
     /// Path to the contract to be loaded.
     #[clap(parse(from_os_str))]
     pub contract: PathBuf,
