@@ -23,8 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dest_file: PathBuf = cli.output_file;
 
     match cli.contract_type {
-        ContractType::Web => {
-            build_web_state(&mut complete_state, source_path, dest_file)?;
+        ContractType::View => {
+            build_view_state(&mut complete_state, source_path, dest_file)?;
         }
         ContractType::Model => {
             build_model_state(source_path, dest_file)?;
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn build_web_state(
+fn build_view_state(
     complete_state: &mut Vec<u8>,
     source_path: PathBuf,
     dest_file: PathBuf,
@@ -53,7 +53,6 @@ fn build_model_state(
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::debug!("Bundling `model` contract state from {source_path:?} into {dest_file:?}");
     // FIXME: optionally provide a path to the metadata
-    // 4. from both bundle them in a `WebModelState`
     let mut model = vec![];
     let mut model_f = File::open(source_path)?;
     model_f.read_to_end(&mut model)?;

@@ -6,8 +6,10 @@ rust-version = "1.58.0"
 resolver = "2"
 publish = false
 
+[workspace]
+
 [dependencies]
-locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+locutus-stdlib = { path = "../../../crates/locutus-stdlib" }
 
 [lib]
 crate-type = ["cdylib"]

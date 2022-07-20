@@ -24,7 +24,7 @@ impl ContractInterface for Contract {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> StateSummary<'static> {
-        StateSummary::from(&[])
+        StateSummary::from(vec![])
     }
 
     fn get_state_delta(
@@ -32,6 +32,6 @@ impl ContractInterface for Contract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> StateDelta<'static> {
-        StateDelta::from(&[])
+        StateDelta::from(vec![])
     }
 }

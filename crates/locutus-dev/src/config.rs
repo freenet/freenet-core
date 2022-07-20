@@ -14,7 +14,7 @@ pub enum DeserializationFmt {
 
 #[derive(clap::ArgEnum, Clone, Copy, Debug)]
 pub enum ContractType {
-    Web,
+    View,
     Model,
 }
 
