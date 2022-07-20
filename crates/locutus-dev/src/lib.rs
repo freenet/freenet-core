@@ -15,6 +15,7 @@ pub use local_node::LocalNode;
 pub use locutus_runtime::ContractStore;
 pub use state::AppState;
 pub use user_events::user_fn_handler;
+pub use util::set_cleanup_on_exit;
 
 type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest>;
 type CommandSender = tokio::sync::mpsc::Sender<ClientRequest>;

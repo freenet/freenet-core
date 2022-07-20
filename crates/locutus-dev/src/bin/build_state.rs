@@ -6,11 +6,15 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
 };
+use tracing_subscriber::EnvFilter;
 
 use locutus_dev::{ContractType, StateConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("error"));
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
     let cli = StateConfig::parse();
 
     let mut complete_state = Vec::new();
@@ -34,7 +38,7 @@ fn build_web_state(
     source_path: PathBuf,
     dest_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Bundling web state from {source_path:?} into {dest_file:?}");
+    tracing::debug!("Bundling web state from {source_path:?} into {dest_file:?}");
     // FIXME: use instead WebModelState
     append_metadata(complete_state)?;
     append_web_content(complete_state, source_path)?;
@@ -47,7 +51,7 @@ fn build_model_state(
     source_path: PathBuf,
     dest_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Bundling `model` contract state from {source_path:?} into {dest_file:?}");
+    tracing::debug!("Bundling `model` contract state from {source_path:?} into {dest_file:?}");
     // FIXME: optionally provide a path to the metadata
     // 4. from both bundle them in a `WebModelState`
     let mut model = vec![];

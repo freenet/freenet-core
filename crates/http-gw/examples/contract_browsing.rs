@@ -86,7 +86,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node =
-        locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone()).await?;
+        locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone(), || {
+            locutus_dev::set_cleanup_on_exit();
+        })
+        .await?;
     let id = HttpGateway::next_client_id();
     local_node
         .preload(id, bundle.data_contract, bundle.initial_state)

@@ -8,17 +8,17 @@ publish = false
 [dependencies]
 byteorder = "1"
 clap = { version = "3", features = ["derive", "env"] }
-env_logger = "0.9"
 either = "1"
 futures = "0.3"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3.14", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "signal", "parking_lot"] }
 pico-args = "0.5"
-log = "0.4"
 serde = "1"
 bincode = "1"
 tar = "0.4"
 xz2 = "0.1"
+ctrlc = { version = "3.0", features = ["termination"] }
 
 # (mp) message pack feature
 rmp = { version = "0.8", optional = true }
