@@ -4,11 +4,28 @@ pub(crate) mod state_handling;
 pub(crate) mod web_handling;
 
 pub use http_gateway::HttpGateway;
-use locutus_node::{either::Either, ClientError, ClientId, ClientRequest, HostResponse};
+use locutus_node::{ClientError, ClientId, ClientRequest, HostResponse};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
-type ClientHandlingMessage =
-    Either<tokio::sync::mpsc::UnboundedSender<HostResult>, (ClientId, ClientRequest)>;
+
+#[derive(Debug)]
+enum ClientConnection {
+    NewConnection(tokio::sync::mpsc::UnboundedSender<HostResult>),
+    Request {
+        id: ClientId,
+        req: ClientRequest,
+    },
+    UpdateChannel {
+        id: ClientId,
+        callback: tokio::sync::mpsc::UnboundedSender<HostResult>,
+    },
+}
+
+// struct UpdateNotification {
+//     id: ClientId,
+//     channel: tokio::sync::mpsc::UnboundedSender<HostResult>,
+//     req: ClientRequest,
+// }
 
 #[derive(Debug)]
 enum HostResult {

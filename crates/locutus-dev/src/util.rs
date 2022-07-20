@@ -22,7 +22,7 @@ where
     }
 }
 
-pub fn set_cleanup_on_exit() {
+pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 
@@ -43,5 +43,5 @@ pub fn set_cleanup_on_exit() {
 
             std::process::exit(-1);
         }
-    });
+    })
 }

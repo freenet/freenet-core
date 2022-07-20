@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     }
 
     if cli.clean_exit {
-        set_cleanup_on_exit();
+        set_cleanup_on_exit()?;
     }
 
     let app_state = AppState::new(&cli).await?;

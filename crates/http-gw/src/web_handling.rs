@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use locutus_node::either::Either;
 use locutus_runtime::{
     locutus_stdlib::web::view::{WebContractError, WebViewState},
     ContractKey, State, WrappedContract,
@@ -14,20 +13,20 @@ use warp::{reject, reply, Rejection, Reply};
 
 use crate::{
     errors::{self, InvalidParam, NodeError},
-    ClientHandlingMessage, HostResult,
+    ClientConnection, HostResult,
 };
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 pub(crate) async fn contract_home(
     key: String,
-    request_sender: mpsc::Sender<ClientHandlingMessage>,
+    request_sender: mpsc::Sender<ClientConnection>,
 ) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
-        .send(Either::Left(response_sender))
+        .send(ClientConnection::NewConnection(response_sender))
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let client_id = if let Some(HostResult::NewId(id)) = response_recv.recv().await {
@@ -36,13 +35,13 @@ pub(crate) async fn contract_home(
         todo!("this is an error");
     };
     request_sender
-        .send(Either::Right((
-            client_id,
-            ClientRequest::Get {
+        .send(ClientConnection::Request {
+            id: client_id,
+            req: ClientRequest::Get {
                 key,
                 fetch_contract: true,
             },
-        )))
+        })
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let response = match response_recv.recv().await {
@@ -109,10 +108,10 @@ pub(crate) async fn contract_home(
         other => unreachable!("received unexpected node response: {other:?}"),
     };
     request_sender
-        .send(Either::Right((
-            client_id,
-            ClientRequest::Disconnect { cause: None },
-        )))
+        .send(ClientConnection::Request {
+            id: client_id,
+            req: ClientRequest::Disconnect { cause: None },
+        })
         .await
         .map_err(|_| NodeError)?;
     response

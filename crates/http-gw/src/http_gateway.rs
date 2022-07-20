@@ -1,5 +1,4 @@
 use futures::{SinkExt, StreamExt};
-use locutus_node::either::Either;
 
 use locutus_node::*;
 use std::{
@@ -16,7 +15,7 @@ use warp::{hyper::body::Bytes, ws::Message};
 use crate::{
     errors,
     state_handling::{get_state, state_changes_notification, update_state},
-    ClientHandlingMessage, HostResult,
+    ClientConnection, HostResult,
 };
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
@@ -25,7 +24,7 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct HttpGateway {
-    server_request: mpsc::Receiver<ClientHandlingMessage>,
+    server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostResult>>,
 }
 
@@ -129,11 +128,11 @@ impl HttpGateway {
 }
 
 async fn new_client_connection(
-    request_sender: &mpsc::Sender<ClientHandlingMessage>,
+    request_sender: &mpsc::Sender<ClientConnection>,
 ) -> Result<(mpsc::UnboundedReceiver<HostResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
-        .send(Either::Left(response_sender))
+        .send(ClientConnection::NewConnection(response_sender))
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;
     match response_recv.recv().await {
@@ -148,7 +147,7 @@ async fn home() -> Result<impl Reply, Rejection> {
 }
 
 async fn websocket_interface(
-    request_sender: mpsc::Sender<ClientHandlingMessage>,
+    request_sender: mpsc::Sender<ClientConnection>,
     ws: WebSocket,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut response_recv, client_id) = new_client_connection(&request_sender).await?;
@@ -166,7 +165,7 @@ async fn websocket_interface(
             Ok(_) => continue,
             Err(_err) => todo!(),
         };
-        let msg: ClientRequest = {
+        let req: ClientRequest = {
             match rmp_serde::from_read(std::io::Cursor::new(msg)) {
                 Ok(r) => r,
                 Err(e) => {
@@ -181,7 +180,9 @@ async fn websocket_interface(
                 }
             }
         };
-        request_sender.send(Either::Right((client_id, msg))).await?;
+        request_sender
+            .send(ClientConnection::Request { id: client_id, req })
+            .await?;
         if let Some(HostResult::Result { id, result }) = response_recv.recv().await {
             debug_assert_eq!(id, client_id);
             let res = rmp_serde::to_vec(&result)?;
@@ -208,7 +209,7 @@ impl ClientEventsProxy for HttpGateway {
             loop {
                 if let Some(msg) = self.server_request.recv().await {
                     match msg {
-                        Either::Left(new_client_ch) => {
+                        ClientConnection::NewConnection(new_client_ch) => {
                             // is a new client, assign an id and open a channel to communicate responses from the node
                             let cli_id = Self::next_client_id();
                             new_client_ch
@@ -216,10 +217,11 @@ impl ClientEventsProxy for HttpGateway {
                                 .map_err(|_e| ErrorKind::NodeUnavailable)?;
                             self.response_channels.insert(cli_id, new_client_ch);
                         }
-                        Either::Right((existing_client, req)) => {
+                        ClientConnection::Request { id, req } => {
                             // just forward the request to the node
-                            break Ok(OpenRequest::new(existing_client, req));
+                            break Ok(OpenRequest::new(id, req));
                         }
+                        ClientConnection::UpdateChannel { id, callback } => todo!(),
                     }
                 } else {
                     todo!()

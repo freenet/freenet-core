@@ -27,7 +27,7 @@ impl AppState {
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
                 LocalNode::new(contract_store, state_store, || {
-                    set_cleanup_on_exit();
+                    set_cleanup_on_exit().unwrap();
                 })
                 .await?,
             )),
