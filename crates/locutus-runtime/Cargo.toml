@@ -29,13 +29,9 @@ locutus-stdlib = { path = "../locutus-stdlib", features = ["archive"] }
 
 [features]
 default = [ "wasmer-default" ]
-wasmer-default = [ 
+wasmer-default = [ 	
 	"wasmer/llvm",
 	"wasmer-compiler-llvm",
-	# "wasmer/dylib"
-	"wasmer/universal"
-]
-wasmer-universal = [
 	"wasmer/default-cranelift",
 	# "wasmer/dylib"
 	"wasmer/universal"
