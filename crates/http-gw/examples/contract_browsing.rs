@@ -11,10 +11,10 @@ const MAX_MEM_CACHE: u32 = 10_000_000;
 const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 struct WebBundle {
-    data_contract: WrappedContract<'static>,
+    model_contract: WrappedContract<'static>,
     initial_state: WrappedState,
-    web_contract: WrappedContract<'static>,
-    web_content: WrappedState,
+    view_contract: WrappedContract<'static>,
+    view_content: WrappedState,
 }
 
 fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
@@ -39,29 +39,29 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         Ok((contract, bytes.into()))
     }
 
-    fn get_web_contract() -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web.wasm");
+    fn get_view_contract() -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_view.wasm");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
         let contract =
             WrappedContract::new(Arc::new(ContractCode::from(bytes)), [].as_ref().into());
 
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web");
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_view");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
         Ok((contract, bytes.into()))
     }
 
-    let (data_contract, initial_state) = get_model_contract(public_key)?;
-    let (web_contract, web_content) = get_web_contract()?;
+    let (model_contract, initial_state) = get_model_contract(public_key)?;
+    let (view_contract, view_content) = get_view_contract()?;
 
     Ok(WebBundle {
-        data_contract,
+        model_contract,
         initial_state,
-        web_contract,
-        web_content,
+        view_contract,
+        view_content,
     })
 }
 
@@ -75,11 +75,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bundle = test_web(keypair.public())?;
     log::info!(
         "loading web contract {} in local node",
-        bundle.web_contract.key().encode()
+        bundle.view_contract.key().encode()
     );
     log::info!(
         "loading data contract {} in local node",
-        bundle.data_contract.key().encode()
+        bundle.model_contract.key().encode()
     );
 
     let tmp_path = std::env::temp_dir().join("locutus");
@@ -92,10 +92,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     let id = HttpGateway::next_client_id();
     local_node
-        .preload(id, bundle.data_contract, bundle.initial_state)
+        .preload(id, bundle.model_contract, bundle.initial_state)
         .await;
     local_node
-        .preload(id, bundle.web_contract, bundle.web_content)
+        .preload(id, bundle.view_contract, bundle.view_content)
         .await;
     http_gw::local_node::set_local_node(local_node).await
 }
