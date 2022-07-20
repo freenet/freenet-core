@@ -18,7 +18,7 @@ struct WebBundle {
 }
 
 fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
-    fn get_data_contract(
+    fn get_model_contract(
         _public_key: PublicKey,
     ) -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_data.wasm");
@@ -54,7 +54,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         Ok((contract, bytes.into()))
     }
 
-    let (data_contract, initial_state) = get_data_contract(public_key)?;
+    let (data_contract, initial_state) = get_model_contract(public_key)?;
     let (web_contract, web_content) = get_web_contract()?;
 
     Ok(WebBundle {

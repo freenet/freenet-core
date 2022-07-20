@@ -4,6 +4,6 @@ const config: Config.InitialOptions = {
 	transform: {
 		"^.+\\.tsx?$": "ts-jest",
 	},
-	roots: ["<rootDir>/tests", "<rootDir>/web/src"]
+	roots: ["<rootDir>/tests", "<rootDir>/src"]
 };
 export default config;

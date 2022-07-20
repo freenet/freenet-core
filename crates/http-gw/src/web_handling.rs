@@ -62,6 +62,7 @@ pub(crate) async fn contract_home(
                         match err {
                             std::io::ErrorKind::NotFound => {
                                 let state = State::from(state.as_ref());
+
                                 fn err(
                                     err: WebContractError,
                                     contract: &WrappedContract,
@@ -72,6 +73,7 @@ pub(crate) async fn contract_home(
                                         contract.key()
                                     ))
                                 }
+
                                 let mut web =
                                     WebViewState::try_from(state).map_err(|e| err(e, &contract))?;
                                 web.store(path).map_err(|e| err(e, &contract))?;

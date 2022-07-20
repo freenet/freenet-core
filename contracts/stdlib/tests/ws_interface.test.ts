@@ -1,4 +1,4 @@
-import { HostResponse } from "../web/src/ws_interface";
+import { HostResponse } from "../src/ws_interface";
 
 describe('locutus websocket API', () => {
     test('put op deserialization', () => {

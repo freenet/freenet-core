@@ -24,10 +24,7 @@ impl ContractInterface for Contract {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> StateSummary<'static> {
-        let state = state.as_ref();
-        // eprintln!("state: {state:?}");
-        // eprintln!("summary: {:?}", &state[0..1]);
-        StateSummary::from(state[0..1].to_vec())
+        StateSummary::from(&[])
     }
 
     fn get_state_delta(
@@ -35,6 +32,6 @@ impl ContractInterface for Contract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> StateDelta<'static> {
-        StateDelta::from((&state).to_vec())
+        StateDelta::from(&[])
     }
 }
