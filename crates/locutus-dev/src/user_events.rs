@@ -37,7 +37,7 @@ pub async fn user_fn_handler(
     app_state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let mut input = StdInput::new(config, app_state)?;
-    println!("running... send a command or write \"help\" for help");
+    tracing::debug!("running... send a command or write \"help\" for help");
     loop {
         let command = input.recv().await;
         let command = command?;
@@ -109,7 +109,7 @@ impl StdInput {
                     serde_json::to_string_pretty(&state).map_err(|e| ErrorKind::Unhandled {
                         cause: format!("{e}"),
                     })?;
-                println!("{cmd:?} value:\n{json_str}");
+                tracing::debug!("{cmd:?} value:\n{json_str}");
                 Ok(json_str.into_bytes().into())
             }
             #[cfg(feature = "messagepack")]
@@ -121,7 +121,7 @@ impl StdInput {
                         cause: format!("deserialization error: {e}"),
                     }
                 })?;
-                println!("{cmd:?} value:\n{state}");
+                tracing::debug!("{cmd:?} value:\n{state}");
                 Ok(buf.into())
             }
             _ => {
@@ -256,13 +256,13 @@ impl ClientEventsProxy for StdInput {
                     // try parse command
                     match Command::try_from(&self.buf[..]) {
                         Ok(Command::Help) => {
-                            println!("{HELP}");
+                            tracing::debug!("{HELP}");
                         }
                         Ok(cmd @ Command::Put) => {
                             let state: State = match self.get_command_input(Command::Put) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    println!("Put event error: {e}");
+                                    tracing::debug!("Put event error: {e}");
                                     return Ok(Either::Right(()));
                                 }
                             };
@@ -279,7 +279,7 @@ impl ClientEventsProxy for StdInput {
                             let delta: StateDelta = match self.get_command_input(Command::Update) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    println!("Update event error: {e}");
+                                    tracing::debug!("Update event error: {e}");
                                     return Ok(Either::Right(()));
                                 }
                             };
@@ -312,7 +312,7 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Err(err) => {
-                            println!("{err}");
+                            tracing::debug!("{err}");
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;

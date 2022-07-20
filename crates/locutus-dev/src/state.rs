@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     config::{Config, DeserializationFmt},
-    DynError, LocalNode,
+    set_cleanup_on_exit, DynError, LocalNode,
 };
 
 #[derive(Clone)]
@@ -26,7 +26,10 @@ impl AppState {
         let state_store = StateStore::new(SqlitePool::new().await?, Self::MAX_MEM_CACHE).unwrap();
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
-                LocalNode::new(contract_store, state_store).await?,
+                LocalNode::new(contract_store, state_store, || {
+                    set_cleanup_on_exit();
+                })
+                .await?,
             )),
             config: config.clone(),
         })
@@ -38,7 +41,7 @@ impl AppState {
                 let mut f = File::create(p)?;
                 f.write_all(pprinted.as_bytes())?;
             } else if config.terminal_output {
-                println!("{pprinted}");
+                tracing::debug!("{pprinted}");
             }
             Ok(())
         }
