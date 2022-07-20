@@ -38,7 +38,7 @@ fn build_view_state(
     source_path: PathBuf,
     dest_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::debug!("Bundling web state from {source_path:?} into {dest_file:?}");
+    tracing::debug!("Bundling `view` state from {source_path:?} into {dest_file:?}");
     // FIXME: use instead WebModelState
     append_metadata(complete_state)?;
     append_web_content(complete_state, source_path)?;
