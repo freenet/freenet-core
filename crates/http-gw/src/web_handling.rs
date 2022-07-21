@@ -13,7 +13,7 @@ use warp::{reject, reply, Rejection, Reply};
 
 use crate::{
     errors::{self, InvalidParam, NodeError},
-    ClientConnection, HostResult,
+    ClientConnection, HostCallbackResult,
 };
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -29,14 +29,14 @@ pub(crate) async fn contract_home(
         .send(ClientConnection::NewConnection(response_sender))
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
-    let client_id = if let Some(HostResult::NewId(id)) = response_recv.recv().await {
+    let client_id = if let Some(HostCallbackResult::NewId(id)) = response_recv.recv().await {
         id
     } else {
         todo!("this is an error");
     };
     request_sender
         .send(ClientConnection::Request {
-            id: client_id,
+            client_id,
             req: ClientRequest::Get {
                 key,
                 fetch_contract: true,
@@ -45,7 +45,7 @@ pub(crate) async fn contract_home(
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let response = match response_recv.recv().await {
-        Some(HostResult::Result {
+        Some(HostCallbackResult::Result {
             result:
                 Ok(HostResponse::GetResponse {
                     contract, state, ..
@@ -96,7 +96,7 @@ pub(crate) async fn contract_home(
                 todo!("error indicating the contract is not present");
             }
         },
-        Some(HostResult::Result {
+        Some(HostCallbackResult::Result {
             result: Err(err), ..
         }) => {
             log::error!("error getting contract `{key}`: {err}");
@@ -109,7 +109,7 @@ pub(crate) async fn contract_home(
     };
     request_sender
         .send(ClientConnection::Request {
-            id: client_id,
+            client_id,
             req: ClientRequest::Disconnect { cause: None },
         })
         .await

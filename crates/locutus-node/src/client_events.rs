@@ -14,7 +14,7 @@ pub(crate) mod combinator;
 pub(crate) mod websocket;
 
 pub type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
-type HostResult = Result<HostResponse, ClientError>;
+pub type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -89,7 +89,7 @@ type HostIncomingMsg = Result<OpenRequest, ClientError>;
 pub struct OpenRequest {
     pub id: ClientId,
     pub request: ClientRequest,
-    pub notification_channel: Option<UnboundedSender<HostResponse>>,
+    pub notification_channel: Option<UnboundedSender<HostResult>>,
 }
 
 impl OpenRequest {
@@ -99,6 +99,11 @@ impl OpenRequest {
             request,
             notification_channel: None,
         }
+    }
+
+    pub fn with_notification(mut self, ch: UnboundedSender<HostResult>) -> Self {
+        self.notification_channel = Some(ch);
+        self
     }
 }
 

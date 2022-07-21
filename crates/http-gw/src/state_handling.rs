@@ -1,5 +1,4 @@
 //! Handles the `state data` part of the bundles.
-use locutus_node::either::Either;
 use locutus_runtime::{ContractKey, StateDelta};
 
 use futures::future::ready;
@@ -9,7 +8,7 @@ use tokio::sync::mpsc;
 use warp::ws::{Message, WebSocket};
 use warp::{reject, reply, Rejection, Reply};
 
-use crate::{errors, ClientConnection, HostResult, UpdateNotification};
+use crate::{errors, ClientConnection, HostCallbackResult};
 
 use self::errors::NodeError;
 
@@ -17,22 +16,22 @@ pub(crate) async fn get_state(
     client_id: ClientId,
     key: String,
     request_sender: &mpsc::Sender<ClientConnection>,
-    response_recv: &mut mpsc::UnboundedReceiver<HostResult>,
+    response_recv: &mut mpsc::UnboundedReceiver<HostCallbackResult>,
 ) -> Result<impl Reply, Rejection> {
     let key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     request_sender
-        .send(Either::Right((
+        .send(ClientConnection::Request {
             client_id,
-            ClientRequest::Get {
+            req: ClientRequest::Get {
                 key,
                 fetch_contract: false,
             },
-        )))
+        })
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let response = match response_recv.recv().await {
-        Some(HostResult::Result {
+        Some(HostCallbackResult::Result {
             result: Ok(HostResponse::GetResponse { state, .. }),
             ..
         }) => {
@@ -46,10 +45,10 @@ pub(crate) async fn get_state(
         _ => unreachable!(),
     };
     request_sender
-        .send(Either::Right((
+        .send(ClientConnection::Request {
             client_id,
-            ClientRequest::Disconnect { cause: None },
-        )))
+            req: ClientRequest::Disconnect { cause: None },
+        })
         .await
         .map_err(|_| NodeError)?;
     response
@@ -60,29 +59,29 @@ pub(crate) async fn update_state(
     key: String,
     delta: StateDelta<'static>,
     request_sender: &mpsc::Sender<ClientConnection>,
-    response_recv: &mut mpsc::UnboundedReceiver<HostResult>,
+    response_recv: &mut mpsc::UnboundedReceiver<HostCallbackResult>,
 ) -> Result<impl Reply, Rejection> {
     let contract_key = ContractKey::from_spec(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     request_sender
-        .send(Either::Right((
+        .send(ClientConnection::Request {
             client_id,
-            ClientRequest::Update {
+            req: ClientRequest::Update {
                 key: contract_key,
                 delta,
             },
-        )))
+        })
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let response = match response_recv.recv().await {
-        Some(HostResult::Result {
+        Some(HostCallbackResult::Result {
             result: Ok(HostResponse::UpdateResponse { key, .. }),
             ..
         }) => {
             assert_eq!(key, contract_key);
             Ok(reply::json(&serde_json::json!({"result": "ok"})))
         }
-        Some(HostResult::Result {
+        Some(HostCallbackResult::Result {
             result: Err(err), ..
         }) => Ok(reply::json(
             &serde_json::json!({"result": "error", "err": format!("{err}")}),
@@ -94,7 +93,7 @@ pub(crate) async fn update_state(
     };
     request_sender
         .send(ClientConnection::Request {
-            id: client_id,
+            client_id,
             req: ClientRequest::Disconnect { cause: None },
         })
         .await
@@ -107,7 +106,7 @@ pub(crate) async fn state_changes_notification(
     key: String,
     ws: WebSocket,
     request_sender: &mpsc::Sender<ClientConnection>,
-    response_recv: &mut mpsc::UnboundedReceiver<HostResult>,
+    _response_recv: &mut mpsc::UnboundedReceiver<HostCallbackResult>,
 ) {
     let contract_key = ContractKey::from_spec(key).unwrap();
     let (updates, mut updates_recv) = mpsc::unbounded_channel();
@@ -124,33 +123,20 @@ pub(crate) async fn state_changes_notification(
     };
 
     request_sender
-        .send(ClientConnection::UpdateChannel {
-            id: client_id,
+        .send(ClientConnection::UpdateSubChannel {
+            client_id,
             callback: updates,
-            // req: ClientRequest::Subscribe { key: contract_key },
+            key: contract_key,
         })
         .await
         .map_err(|_| reject::custom(errors::NodeError))
         .unwrap();
 
-    // request_sender
-    //     .send(Either::Left((
-    //         client_id,
-    //         ClientRequest::Subscribe { key: contract_key },
-    //     )))
-    //     .await
-    //     .map_err(|_| reject::custom(errors::NodeError))
-    //     .unwrap();
-
     // FIXME: at this point must give back control back to the main websocket stream (probably through a `select`)
     //        in here, otherwise will block communication until an update is received
     // todo: await for some sort of confirmation through "response_recv"
     while let Some(response) = updates_recv.recv().await {
-        if let HostResult::Result {
-            result: Ok(HostResponse::UpdateNotification { key, update }),
-            ..
-        } = response
-        {
+        if let Ok(HostResponse::UpdateNotification { key, update }) = response {
             assert_eq!(key, contract_key);
             let s = update.as_ref();
             // fixme: state delta off by one err when reading from buf
@@ -161,7 +147,7 @@ pub(crate) async fn state_changes_notification(
     }
     request_sender
         .send(ClientConnection::Request {
-            id: client_id,
+            client_id,
             req: ClientRequest::Disconnect { cause: None },
         })
         .await

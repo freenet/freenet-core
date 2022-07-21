@@ -16,7 +16,7 @@ pub use crate::config::Config;
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
-    ClientRequest, ErrorKind, HostResponse, OpenRequest, RequestError,
+    ClientRequest, ErrorKind, HostResponse, HostResult, OpenRequest, RequestError,
 };
 pub use contract::{SQLiteContractHandler, SqlitePool};
 pub use either;

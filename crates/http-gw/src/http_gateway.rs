@@ -15,7 +15,7 @@ use warp::{hyper::body::Bytes, ws::Message};
 use crate::{
     errors,
     state_handling::{get_state, state_changes_notification, update_state},
-    ClientConnection, HostResult,
+    ClientConnection, HostCallbackResult,
 };
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
@@ -25,7 +25,7 @@ static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct HttpGateway {
     server_request: mpsc::Receiver<ClientConnection>,
-    response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostResult>>,
+    response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
 
 impl HttpGateway {
@@ -129,14 +129,14 @@ impl HttpGateway {
 
 async fn new_client_connection(
     request_sender: &mpsc::Sender<ClientConnection>,
-) -> Result<(mpsc::UnboundedReceiver<HostResult>, ClientId), ClientError> {
+) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection(response_sender))
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;
     match response_recv.recv().await {
-        Some(HostResult::NewId(client_id)) => Ok((response_recv, client_id)),
+        Some(HostCallbackResult::NewId(client_id)) => Ok((response_recv, client_id)),
         None => Err(ErrorKind::NodeUnavailable.into()),
         other => unreachable!("received unexpected message: {other:?}"),
     }
@@ -181,9 +181,9 @@ async fn websocket_interface(
             }
         };
         request_sender
-            .send(ClientConnection::Request { id: client_id, req })
+            .send(ClientConnection::Request { client_id, req })
             .await?;
-        if let Some(HostResult::Result { id, result }) = response_recv.recv().await {
+        if let Some(HostCallbackResult::Result { id, result }) = response_recv.recv().await {
             debug_assert_eq!(id, client_id);
             let res = rmp_serde::to_vec(&result)?;
             tx.send(Message::binary(res)).await?;
@@ -213,15 +213,25 @@ impl ClientEventsProxy for HttpGateway {
                             // is a new client, assign an id and open a channel to communicate responses from the node
                             let cli_id = Self::next_client_id();
                             new_client_ch
-                                .send(HostResult::NewId(cli_id))
+                                .send(HostCallbackResult::NewId(cli_id))
                                 .map_err(|_e| ErrorKind::NodeUnavailable)?;
                             self.response_channels.insert(cli_id, new_client_ch);
                         }
-                        ClientConnection::Request { id, req } => {
+                        ClientConnection::Request { client_id: id, req } => {
                             // just forward the request to the node
                             break Ok(OpenRequest::new(id, req));
                         }
-                        ClientConnection::UpdateChannel { id, callback } => todo!(),
+                        ClientConnection::UpdateSubChannel {
+                            key: contract,
+                            client_id,
+                            callback,
+                        } => {
+                            break Ok(OpenRequest::new(
+                                client_id,
+                                ClientRequest::Subscribe { key: contract },
+                            )
+                            .with_notification(callback));
+                        }
                     }
                 } else {
                     todo!()
@@ -242,7 +252,7 @@ impl ClientEventsProxy for HttpGateway {
                     .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
                     .err()
                     .unwrap_or(false);
-                if ch.send(HostResult::Result { id, result }).is_ok() && !should_rm {
+                if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(id, ch);
                 }

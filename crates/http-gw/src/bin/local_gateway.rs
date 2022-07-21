@@ -16,10 +16,10 @@ async fn run() -> Result<(), DynError> {
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let local_node =
         locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone(), || {
-            locutus_dev::set_cleanup_on_exit();
+            locutus_dev::set_cleanup_on_exit().unwrap();
         })
         .await?;
-    http_gw::local_node::set_local_node(local_node).await
+    http_gw::local_node::run_local_node(local_node).await
 }
 
 #[allow(unreachable_code)]

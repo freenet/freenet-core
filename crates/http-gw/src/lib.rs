@@ -4,19 +4,21 @@ pub(crate) mod state_handling;
 pub(crate) mod web_handling;
 
 pub use http_gateway::HttpGateway;
-use locutus_node::{ClientError, ClientId, ClientRequest, HostResponse};
+use locutus_node::{ClientError, ClientId, ClientRequest, HostResponse, HostResult};
+use locutus_runtime::ContractKey;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug)]
 enum ClientConnection {
-    NewConnection(tokio::sync::mpsc::UnboundedSender<HostResult>),
+    NewConnection(tokio::sync::mpsc::UnboundedSender<HostCallbackResult>),
     Request {
-        id: ClientId,
+        client_id: ClientId,
         req: ClientRequest,
     },
-    UpdateChannel {
-        id: ClientId,
+    UpdateSubChannel {
+        key: ContractKey,
+        client_id: ClientId,
         callback: tokio::sync::mpsc::UnboundedSender<HostResult>,
     },
 }
@@ -28,7 +30,7 @@ enum ClientConnection {
 // }
 
 #[derive(Debug)]
-enum HostResult {
+enum HostCallbackResult {
     NewId(ClientId),
     Result {
         id: ClientId,
@@ -48,7 +50,7 @@ pub mod local_node {
 
     use crate::{DynError, HttpGateway};
 
-    pub async fn set_local_node(mut local_node: LocalNode) -> Result<(), DynError> {
+    pub async fn run_local_node(mut local_node: LocalNode) -> Result<(), DynError> {
         let (mut http_handle, filter) = HttpGateway::as_filter();
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
         let _ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;

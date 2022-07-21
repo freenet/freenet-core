@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use locutus_node::{
-    either::Either, ClientId, ClientRequest, HostResponse, PeerKey, RequestError, SqlitePool,
+    either::Either, ClientError, ClientId, ClientRequest, HostResponse, HostResult, PeerKey,
+    RequestError, SqlitePool,
 };
 use locutus_runtime::{prelude::*, ContractRuntimeError};
 use tokio::sync::mpsc::UnboundedSender;
@@ -21,7 +22,7 @@ pub struct LocalNode {
     contract_params: HashMap<ContractKey, Parameters<'static>>,
     contract_data: HashMap<String, Arc<ContractCode<'static>>>,
     pub runtime: Runtime,
-    update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResponse>)>>,
+    update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, StateSummary<'static>>>,
     pub contract_state: StateStore<SqlitePool>,
     peer_key: PeerKey,
@@ -31,9 +32,9 @@ impl LocalNode {
     pub async fn new(
         store: ContractStore,
         contract_state: StateStore<SqlitePool>,
-        set_handle: impl FnOnce(),
+        ctrl_handler: impl FnOnce(),
     ) -> Result<Self, DynError> {
-        set_handle();
+        ctrl_handler();
 
         Ok(Self {
             contract_params: HashMap::default(),
@@ -50,7 +51,7 @@ impl LocalNode {
         &mut self,
         key: ContractKey,
         cli_id: ClientId,
-        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResponse>,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: StateSummary<'static>,
     ) -> Result<(), DynError> {
         let channels = self.update_notifications.entry(key).or_default();
@@ -102,7 +103,7 @@ impl LocalNode {
         &mut self,
         id: ClientId,
         req: ClientRequest,
-        updates: Option<UnboundedSender<HostResponse>>,
+        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
             ClientRequest::Put { contract, state } => {
@@ -202,11 +203,6 @@ impl LocalNode {
                     new_state
                 };
                 // in the network impl this would be sent over the network
-                // eprintln!(
-                //     "state:\n {:?}\nparams:\n {:?}\n",
-                //     new_state.as_ref(),
-                //     parameters.as_ref()
-                // );
                 let summary = self
                     .runtime
                     .summarize_state(&key, &parameters, &new_state)
@@ -265,7 +261,7 @@ impl LocalNode {
                         other => Either::Right(other.into()),
                     })?;
                 notifier
-                    .send(HostResponse::UpdateNotification { key: *key, update })
+                    .send(Ok(HostResponse::UpdateNotification { key: *key, update }))
                     .unwrap();
             }
         }
