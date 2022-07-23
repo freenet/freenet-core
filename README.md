@@ -10,8 +10,8 @@ Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vu
 
 ### 1. News
 
-**16th July, 2022: ** Ian gave a talk on Decentralized Reputation and Trust, [watch here](https://github.com/freenet/locutus/wiki/Decentralized-Reputation-and-Trust)
-**7th July, 2022:** Ian gave an introductory talk on Locutus which you can watch [on YouTube](https://www.youtube.com/watch?v=d31jmv5Tx5k).
+* **16th July, 2022:** Ian gave a talk on Decentralized Reputation and Trust, [watch here](https://github.com/freenet/locutus/wiki/Decentralized-Reputation-and-Trust)
+* **7th July, 2022:** Ian gave an introductory talk on Locutus which you can watch [on YouTube](https://www.youtube.com/watch?v=d31jmv5Tx5k).
 
 ### 2. Applications
 
@@ -49,26 +49,30 @@ A very simple contract might require that the state is a list of messages, each 
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
-### 5. Status
+### 5. Documentation
+
+* [Glossary](https://github.com/freenet/locutus/wiki/Glossary)
+
+### 6. Status
 
 We're working hard and expect an early prototype in August 2022. 
 
 You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
 
 
-### 6. Stay up to date
+### 7. Stay up to date
 
 [![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
 
-### 7. Name
+### 8. Name
 
 Locutus is the development name for this software; it will probably change before launch.
 
-### 8. Chat with us
+### 9. Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join. If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
 
-### 9. Acknowledgements and Funding
+### 10. Acknowledgements and Funding
 
 In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
 generously supported our work with a grant.
@@ -76,7 +80,7 @@ generously supported our work with a grant.
 If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
 *ian at freenet dot org*.
 
-### 10. License
+### 11. License
 
 This project is licensed under either of:
 
