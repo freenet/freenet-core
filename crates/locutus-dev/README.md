@@ -13,9 +13,9 @@ Follow the instructions under the `help` command when running the tool in consol
 
 In order to build an initial state for data or web you need to compile and run the `build_state` executable. The executable requires a number of input parameters, you can run `build_state --help` in order to see the different options. Here are some examples running the CLI:
 ```
-$ ./build_state --input-path contracts/freenet-microblogging-web/web --output-file contracts/freenet-microblogging-web/encoded_web_state --contract-type web
+$ ./build_state --input-path contracts/freenet-microblogging/view/web --output-file contracts/freenet-microblogging-web/encoded_web_state --contract-type view
 
-$ ./build_state --input-path contracts/freenet-microblogging-data/ --output-file contracts/tfreenet-microblogging-data/encoded_data_state --contract-type data
+$ ./build_state --input-path contracts/freenet-microblogging/model/ --output-file contracts/freenet-microblogging-data/encoded_data_state --contract-type model
 ```
 
 Follow the instructions under the `help` command when running the tool in console mode to see the different options and commands to interact with the contract.

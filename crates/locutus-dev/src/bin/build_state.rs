@@ -73,27 +73,11 @@ fn append_web_content(
     state: &mut Vec<u8>,
     source_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let web_tar = {
-        let web_content = Vec::new();
-        let mut tar = tar::Builder::new(web_content);
-        tar.append_file(
-            "index.html",
-            &mut File::open(source_path.join("index.html"))?,
-        )?;
-        tar.append_file(
-            "state.html",
-            &mut File::open(source_path.join("state.html"))?,
-        )?;
-        tar.into_inner()?
-    };
-    assert!(!web_tar.is_empty());
-    let mut encoded = vec![];
-    {
-        let mut encoder = xz2::write::XzEncoder::new(&mut encoded, 6);
-        encoder.write_all(&web_tar)?;
-        encoder.flush()?;
-    }
-    assert!(!encoded.is_empty());
+    let encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+    let mut tar = tar::Builder::new(encoder);
+    tar.append_dir_all(".", &source_path)?;
+    let encoder_data= tar.into_inner()?;
+    let mut encoded: Vec<u8> = encoder_data.finish()?;
     state.write_u64::<BigEndian>(encoded.len() as u64)?;
     state.append(&mut encoded);
     Ok(())
