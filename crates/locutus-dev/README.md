@@ -3,19 +3,18 @@ A crate for local development purposes.
 
 ## Local node example
 
-In order to explore a conract in local mode you need to compile and run the `local-node` executable. The executable requires a number of input parameters, you can run `local-node --help` in order to see the different options. Here is an example running the CLI:
+In order to explore a contract in local mode you need to compile and run the `local-node` executable. The executable requires a number of input parameters, you can run `local-node local-node-cli --help` in order to see the different options. Here is an example running the CLI:
 ```
-$ ./local-node --input-file /tmp/input --terminal-output --deser-format json "/home/.../locutus/crates/http-gw/examples/test_web_contract.wasm"
+$ ./local-node local-node-cli --input-file /tmp/input --terminal-output --deser-format json "/home/.../locutus/crates/http-gw/examples/test_web_contract.wasm"
 ```
-Follow the instructions under the `help` command when running the tool in console mode to see the different options and commands to interact with the contract.
 
 ## Contract state builder example
 
-In order to build an initial state for data or web you need to compile and run the `build_state` executable. The executable requires a number of input parameters, you can run `build_state --help` in order to see the different options. Here are some examples running the CLI:
+In order to build an initial state for data or web you need to compile and run the `build_state` executable. The executable requires a number of input parameters, you can run `local-node contract-state-builder --help` in order to see the different options. Here are some examples running the CLI:
 ```
-$ ./build_state --input-path contracts/freenet-microblogging/view/web --output-file contracts/freenet-microblogging-web/encoded_web_state --contract-type view
+$ ./local-node contract-state-builder --input-path contracts/freenet-microblogging/view/web --output-file contracts/freenet-microblogging-web/encoded_web_state --contract-type view
 
-$ ./build_state --input-path contracts/freenet-microblogging/model/ --output-file contracts/freenet-microblogging-data/encoded_data_state --contract-type model
+$ ./local-node contract-state-builder --input-path contracts/freenet-microblogging/model/ --output-file contracts/freenet-microblogging-data/encoded_data_state --contract-type model
 ```
 
 Follow the instructions under the `help` command when running the tool in console mode to see the different options and commands to interact with the contract.
