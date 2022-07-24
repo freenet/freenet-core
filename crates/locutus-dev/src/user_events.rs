@@ -15,7 +15,7 @@ use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    config::{Config, DeserializationFmt},
+    config::{LocalNodeConfig, DeserializationFmt},
     state::AppState,
     util, CommandSender, DynError,
 };
@@ -32,7 +32,7 @@ SUBCOMMANDS:
 type HostIncomingMsg = Result<OpenRequest, ClientError>;
 
 pub async fn user_fn_handler(
-    config: Config,
+    config: LocalNodeConfig,
     command_sender: CommandSender,
     app_state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -51,7 +51,7 @@ pub async fn user_fn_handler(
 }
 
 struct StdInput {
-    config: Config,
+    config: LocalNodeConfig,
     contract: WrappedContract<'static>,
     input: File,
     buf: Vec<u8>,
@@ -59,7 +59,7 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: Config, app_state: AppState) -> Result<Self, DynError> {
+    fn new(config: LocalNodeConfig, app_state: AppState) -> Result<Self, DynError> {
         let params = config
             .params
             .as_ref()

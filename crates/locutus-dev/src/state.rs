@@ -4,21 +4,18 @@ use locutus_node::SqlitePool;
 use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
-use crate::{
-    config::{Config, DeserializationFmt},
-    set_cleanup_on_exit, DynError, LocalNode,
-};
+use crate::{config::{DeserializationFmt}, set_cleanup_on_exit, DynError, LocalNode, LocalNodeConfig};
 
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) local_node: Arc<RwLock<LocalNode>>,
-    config: Config,
+    config: LocalNodeConfig,
 }
 
 impl AppState {
     const MAX_MEM_CACHE: u32 = 10_000_000;
 
-    pub async fn new(config: &Config) -> Result<Self, DynError> {
+    pub async fn new(config: &LocalNodeConfig) -> Result<Self, DynError> {
         let tmp_path = std::env::temp_dir().join("locutus").join("contracts");
         std::fs::create_dir_all(&tmp_path)?;
         let contract_store =
@@ -36,7 +33,7 @@ impl AppState {
     }
 
     pub fn printout_deser<R: AsRef<[u8]> + ?Sized>(&self, data: &R) -> Result<(), std::io::Error> {
-        fn write_res(config: &Config, pprinted: &str) -> Result<(), std::io::Error> {
+        fn write_res(config: &LocalNodeConfig, pprinted: &str) -> Result<(), std::io::Error> {
             if let Some(p) = &config.output_file {
                 let mut f = File::create(p)?;
                 f.write_all(pprinted.as_bytes())?;
