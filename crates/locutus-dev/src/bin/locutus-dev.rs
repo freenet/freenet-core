@@ -49,17 +49,16 @@ async fn run_local_node_client(cli: LocalNodeConfig) -> Result<(), Box<dyn std::
 }
 
 fn generate_state(cli: StateConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let mut complete_state = Vec::new();
-
-    let source_path: PathBuf = cli.input_path;
+    let metadata_path: Option<PathBuf> = cli.input_metadata_path;
+    let state_path: PathBuf = cli.input_state_path;
     let dest_file: PathBuf = cli.output_file;
 
     match cli.contract_type {
         ContractType::View => {
-            build_view_state(&mut complete_state, source_path, dest_file)?;
+            build_view_state(metadata_path, state_path, dest_file)?;
         }
         ContractType::Model => {
-            build_model_state(source_path, dest_file)?;
+            build_model_state(metadata_path, state_path, dest_file)?;
         }
     }
 
@@ -67,51 +66,60 @@ fn generate_state(cli: StateConfig) -> Result<(), Box<dyn std::error::Error + Se
 }
 
 fn build_view_state(
-    complete_state: &mut Vec<u8>,
-    source_path: PathBuf,
+    metadata_path: Option<PathBuf>,
+    state_path: PathBuf,
     dest_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    tracing::debug!("Bundling `view` state from {source_path:?} into {dest_file:?}");
-    // FIXME: use instead WebModelState
-    append_metadata(complete_state)?;
-    append_web_content(complete_state, source_path)?;
-    let mut state = File::create(dest_file)?;
-    state.write_all(complete_state)?;
-    Ok(())
-}
+    tracing::debug!("Bundling `view` state from {state_path:?} into {dest_file:?}");
 
-fn build_model_state(
-    source_path: PathBuf,
-    dest_file: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    tracing::debug!("Bundling `model` contract state from {source_path:?} into {dest_file:?}");
-    // FIXME: optionally provide a path to the metadata
-    let mut model = vec![];
-    let mut model_f = File::open(source_path)?;
-    model_f.read_to_end(&mut model)?;
-    let model = WebModelState::from_data(vec![], model);
+    let mut metadata = vec![];
+
+    if let Some(path) = metadata_path {
+        let mut metadata_f = File::open(path)?;
+        metadata_f.read_to_end(&mut metadata)?;
+    }
+
+    let view = get_encoded_view(state_path).expect("Failed encoding view");
+    let model = WebModelState::from_data(metadata, view);
 
     let mut state = File::create(dest_file)?;
     state.write_all(model.pack()?.as_slice())?;
     Ok(())
 }
 
-fn append_metadata(state: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let metadata: &[u8] = &[];
-    state.write_u64::<BigEndian>(metadata.len() as u64)?;
+fn build_model_state(
+    metadata_path: Option<PathBuf>,
+    state_path: PathBuf,
+    dest_file: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    tracing::debug!("Bundling `model` contract state from {state_path:?} into {dest_file:?}");
+
+    let mut metadata = vec![];
+    let mut model = vec![];
+
+    if let Some(path) = metadata_path {
+        let mut metadata_f = File::open(path)?;
+        metadata_f.read_to_end(&mut metadata)?;
+    }
+
+    let mut model_f = File::open(state_path)?;
+    model_f.read_to_end(&mut model)?;
+    let model = WebModelState::from_data(metadata, model);
+
+    let mut state = File::create(dest_file)?;
+    state.write_all(model.pack()?.as_slice())?;
     Ok(())
 }
 
-fn append_web_content(
-    state: &mut Vec<u8>,
-    source_path: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+fn get_encoded_view(
+    view_path: PathBuf,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let mut encoded_view: Vec<u8> = vec![];
     let encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
     let mut tar = tar::Builder::new(encoder);
-    tar.append_dir_all(".", &source_path)?;
+    tar.append_dir_all(".", &view_path)?;
     let encoder_data= tar.into_inner()?;
     let mut encoded: Vec<u8> = encoder_data.finish()?;
-    state.write_u64::<BigEndian>(encoded.len() as u64)?;
-    state.append(&mut encoded);
-    Ok(())
+    encoded_view.append(&mut encoded);
+    Ok(encoded_view)
 }

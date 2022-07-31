@@ -88,8 +88,10 @@ pub struct LocalNodeConfig {
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.1")]
 pub struct StateConfig {
-    #[clap(long, parse(from_os_str), value_name = "INPUT_PATH")]
-    pub input_path: PathBuf,
+    #[clap(long, parse(from_os_str), value_name = "INPUT_METADATA_PATH")]
+    pub input_metadata_path: Option<PathBuf>,
+    #[clap(long, parse(from_os_str), value_name = "INPUT_STATE_PATH")]
+    pub input_state_path: PathBuf,
     #[clap(long, parse(from_os_str), value_name = "OUTPUT_PATH")]
     pub output_file: PathBuf,
     #[clap(long = "contract-type", arg_enum, group = "type", value_name = "TYPE")]
