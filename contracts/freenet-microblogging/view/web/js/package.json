@@ -1,0 +1,15 @@
+{
+  "dependencies": {
+    "stdlib": "file:../../../../stdlib"
+  },
+  "devDependencies": {
+    "@types/jest": "^28.1.5",
+    "jest": "^28.1.3",
+    "ts-jest": "^28.0.6",
+    "ts-node": "10.9.1"
+  },
+  "scripts": {
+    "test": "jest",
+    "build": "tsc"
+  }
+}
