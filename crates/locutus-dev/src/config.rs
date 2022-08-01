@@ -18,6 +18,22 @@ pub enum ContractType {
     Model,
 }
 
+#[derive(clap::Subcommand, Clone)]
+pub enum SubCommand {
+    RunLocal(LocalNodeConfig),
+    Build(StateConfig),
+
+}
+
+#[derive(clap::Parser, Clone)]
+#[clap(name = "Locutus Development Environment")]
+#[clap(author = "The Freenet Project Inc.")]
+#[clap(version = "0.0.1")]
+pub struct Config {
+    #[clap(subcommand)]
+    pub sub_command: SubCommand,
+}
+
 /// A CLI utility for testing out contracts against a Locutus local node.
 ///
 #[derive(clap::Parser, Clone)]
@@ -29,7 +45,7 @@ pub enum ContractType {
         .required(true)
         .args(&["output-file", "terminal-output"])
 ))]
-pub struct Config {
+pub struct LocalNodeConfig {
     /// Cleanups all state which was created locally during execution
     #[clap(long, requires = "fmt")]
     pub clean_exit: bool,
@@ -65,13 +81,17 @@ pub struct Config {
     pub max_contract_size: i64,
 }
 
+/// A CLI utility for build contract states.
+///
 #[derive(clap::Parser, Clone)]
-#[clap(name = "Locutus Contract Development Environment1")]
+#[clap(name = "Locutus Contract State Development Environment1")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.1")]
 pub struct StateConfig {
-    #[clap(long, parse(from_os_str), value_name = "INPUT_PATH")]
-    pub input_path: PathBuf,
+    #[clap(long, parse(from_os_str), value_name = "INPUT_METADATA_PATH")]
+    pub input_metadata_path: Option<PathBuf>,
+    #[clap(long, parse(from_os_str), value_name = "INPUT_STATE_PATH")]
+    pub input_state_path: PathBuf,
     #[clap(long, parse(from_os_str), value_name = "OUTPUT_PATH")]
     pub output_file: PathBuf,
     #[clap(long = "contract-type", arg_enum, group = "type", value_name = "TYPE")]
