@@ -22,63 +22,9 @@
     <button id="btn">Send Update</button>
     <h1>Updates:</h1>
     <pre id="updates"></pre>
+    <script src="./js/handleContractUpdates.js"></script>
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
-    <script>
-        let log = console.log;
-        let MODEL_CONTRACT = "JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC";
-
-        const wsUri =
-            ((window.location.protocol === "https:" && "wss://") || "ws://") +
-            window.location.host +
-            `/contract/dependency/${MODEL_CONTRACT}/changes/`;
-
-        const reader = new FileReader();
-
-        log("Connecting...");
-
-        conn = new WebSocket(wsUri);
-
-        conn.onopen = function () {
-            log("Connected");
-        };
-
-        conn.onmessage = function (e) {
-            reader.onload = () => {
-                log("Received update: " + reader.result);
-                let val = JSON.parse(reader.result);
-                val = val.map((e) => {
-                    delete e.signature;
-                    return e;
-                });
-                document.getElementById("updates").textContent =
-                    JSON.stringify(val, null, 2);
-            };
-            reader.readAsText(e.data);
-        };
-
-        conn.onclose = function () {
-            log("Disconnected");
-            conn = null;
-        };
-
-        function send() {
-            let update = document.getElementById("input").value;
-            log("Sending: " + JSON.stringify(JSON.parse(update)));
-            $.ajax({
-                url: `/contract/dependency/${MODEL_CONTRACT}/update/`,
-                method: 'POST',
-                dataType: 'json',
-                contentType: 'application/json',
-                success: function (data) {
-                    log("Update response: " + JSON.stringify(data))
-                },
-                data: update
-            });
-            // conn.send(state);
-        }
-
-        document.getElementById("btn").addEventListener("click", send);
-    </script>
+   
 </body>
 
 </html>

@@ -32,7 +32,7 @@ export class Key {
     /**
      * @returns {Uint8Array | null} Hash of the contract code part of the full specification.
      */
-    contract_part(): Uint8Array | null {
+    contractPart(): Uint8Array | null {
         return this.contract;
     }
 
@@ -83,18 +83,44 @@ export type DisconnectRequest = {
 
 // API
 
+export interface ResponseHandler {
+    onPut: (response: PutResponse) => void,
+    onGet: (response: GetResponse) => void,
+    onUpdate: (response: UpdateResponse) => void,
+    onUpdateNotification: (response: UpdateNotification) => void,
+    onErr: (response: Error) => void,
+}
+
 export class LocutusWsApi {
     private ws: WebSocket
     private encoder: Encoder
+    private reponseHandler: ResponseHandler
 
-    constructor(url: URL, _handler: (response: HostResponse) => void) {
+    constructor(url: URL, handler: ResponseHandler) {
         this.ws = new WebSocket(url);
         this.encoder = new Encoder();
+        this.reponseHandler = handler;
         this.ws.onmessage = (ev) => {
-            let decoded = decode(ev.data);
-            console.log(decoded)
-            // handler(decoded)
+            this.handleResponse(ev);
         };
+    }
+
+    private handleResponse(ev: MessageEvent<any>) {
+        let response = new HostResponse(ev.data);
+        if (response.isOk()) {
+            switch (response.unwrapOk().kind) {
+                case "put":
+                    this.reponseHandler.onPut(response.unwrapPut());
+                case "get":
+                    this.reponseHandler.onGet(response.unwrapGet());
+                case "update":
+                    this.reponseHandler.onUpdate(response.unwrapUpdate());
+                case "updateNotification":
+                    this.reponseHandler.onUpdateNotification(response.unwrapUpdateNotification());
+            }
+        } else {
+            this.reponseHandler.onErr(response.unwrapErr())
+        }
     }
 
     async put(put: PutRequest): Promise<void> {
@@ -149,7 +175,7 @@ interface GetResponse {
 }
 
 interface UpdateNotification {
-    readonly kind: "update_notification"
+    readonly kind: "updateNotification"
     key: Key
     update: StateDelta
 }
@@ -170,15 +196,15 @@ export class HostResponse {
             if ("PutResponse" in ok.Ok) {
                 ok.Ok as { "PutResponse": any };
                 assert(Array.isArray(ok.Ok.PutResponse));
-                let key = HostResponse.assert_key(ok.Ok.PutResponse[0][0]);
+                let key = HostResponse.assertKey(ok.Ok.PutResponse[0][0]);
                 this.result = { kind: "put", key };
                 return;
             } else if ("UpdateResponse" in ok.Ok) {
                 ok.Ok as { "UpdateResponse": any };
                 assert(Array.isArray(ok.Ok.UpdateResponse));
                 assert(ok.Ok.UpdateResponse.length == 2);
-                let key = HostResponse.assert_key(ok.Ok.UpdateResponse[0][0]);
-                let summary = HostResponse.assert_bytes(ok.Ok.UpdateResponse[1]);
+                let key = HostResponse.assertKey(ok.Ok.UpdateResponse[0][0]);
+                let summary = HostResponse.assertBytes(ok.Ok.UpdateResponse[1]);
                 this.result = { kind: "update", key, summary };
                 return;
             } else if ("GetResponse" in ok.Ok) {
@@ -207,23 +233,23 @@ export class HostResponse {
                 ok.Ok as { "UpdateNotification": any };
                 assert(Array.isArray(ok.Ok.UpdateNotification));
                 assert(ok.Ok.UpdateNotification.length == 2);
-                let key = HostResponse.assert_key(ok.Ok.UpdateNotification[0][0]);
-                let update = HostResponse.assert_bytes(ok.Ok.UpdateNotification[1]);
-                this.result = { kind: "update_notification", key, update } as UpdateNotification;
+                let key = HostResponse.assertKey(ok.Ok.UpdateNotification[0][0]);
+                let update = HostResponse.assertBytes(ok.Ok.UpdateNotification[1]);
+                this.result = { kind: "updateNotification", key, update } as UpdateNotification;
                 return;
             }
         }
         throw new TypeError("bytes are not a valid HostResponse");
     }
 
-    is_ok(): boolean {
+    isOk(): boolean {
         if ("kind" in this.result)
             return true
         else
             return false
     }
 
-    unwrap_ok(): Ok {
+    unwrapOk(): Ok {
         if ("kind" in this.result) {
             return this.result
         }
@@ -231,75 +257,75 @@ export class HostResponse {
             throw new TypeError
     }
 
-    is_err(): boolean {
+    isErr(): boolean {
         if (this.result instanceof Error)
             return true
         else
             return false;
     }
 
-    unwrap_err(): Error {
+    unwrapErr(): Error {
         if (this.result instanceof Error)
             return this.result as Error
         else
             throw new TypeError
     }
 
-    is_put(): boolean {
-        return this.is_of_type("put")
+    isPut(): boolean {
+        return this.isOfType("put")
     }
 
-    unwrap_put(): PutResponse {
-        if (this.is_of_type("put"))
+    unwrapPut(): PutResponse {
+        if (this.isOfType("put"))
             return this.result as PutResponse
         else
             throw new TypeError
     }
 
-    is_update(): boolean {
-        return this.is_of_type("update")
+    isUpdate(): boolean {
+        return this.isOfType("update")
     }
 
-    unwrap_update(): UpdateResponse {
-        if (this.is_of_type("update"))
+    unwrapUpdate(): UpdateResponse {
+        if (this.isOfType("update"))
             return this.result as UpdateResponse
         else
             throw new TypeError
     }
 
-    is_get(): boolean {
-        return this.is_of_type("get")
+    isGet(): boolean {
+        return this.isOfType("get")
     }
 
-    unwrap_get(): GetResponse {
-        if (this.is_of_type("get"))
+    unwrapGet(): GetResponse {
+        if (this.isOfType("get"))
             return this.result as GetResponse
         else
             throw new TypeError
     }
 
-    is_update_notification(): boolean {
-        return this.is_of_type("update_notification")
+    isUpdateNotification(): boolean {
+        return this.isOfType("updateNotification")
     }
 
-    unwrap_update_notification(): UpdateNotification {
-        if (this.is_of_type("update_notification"))
+    unwrapUpdateNotification(): UpdateNotification {
+        if (this.isOfType("updateNotification"))
             return this.result as UpdateNotification
         else
             throw new TypeError
     }
 
-    private is_of_type(ty: string): boolean {
+    private isOfType(ty: string): boolean {
         return "kind" in this.result && this.result.kind === ty
     }
 
-    private static assert_key(key: any): Key {
-        let bytes = HostResponse.assert_bytes(key);
+    private static assertKey(key: any): Key {
+        let bytes = HostResponse.assertBytes(key);
         assert(bytes.length === 32, "expected exactly 32 bytes");
         return new Key(bytes as Uint8Array);
     }
 
-    private static assert_bytes(state: any): Uint8Array {
+    private static assertBytes(state: any): Uint8Array {
         assert(Array.isArray(state));
         assert(state.every((value: any) => {
             if (typeof value === 'number' && value >= MIN_U8 && value <= MAX_U8)
