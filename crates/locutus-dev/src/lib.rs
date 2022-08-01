@@ -7,8 +7,10 @@ mod state;
 mod user_events;
 pub(crate) mod util;
 
-pub use config::Config;
+pub use config::SubCommand;
 pub use config::ContractType;
+pub use config::Config;
+pub use config::LocalNodeConfig;
 pub use config::StateConfig;
 pub use executor::wasm_runtime;
 pub use local_node::LocalNode;
