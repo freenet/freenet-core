@@ -1,6 +1,4 @@
-import { LocutusWsApi, PutResponse, GetResponse, UpdateResponse, UpdateNotification } from "stdlib";
-
-const MODEL_CONTRACT = "JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC";
+import { LocutusWsApi, PutResponse, GetResponse, UpdateResponse, UpdateNotification, Key, HostError } from "locutus-stdlib/src/webSocketInterface";
 
 function getDocument(): Document {
     if (document) {
@@ -11,20 +9,22 @@ function getDocument(): Document {
 }
 const DOCUMENT: Document = getDocument();
 
-let wsUri = ((window.location.protocol === "https:" && "wss://") || "ws://") +
-    window.location.host +
-    `/contract/dependency/${MODEL_CONTRACT}/changes/`;
+const MODEL_CONTRACT = "JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC";
 
-function getState(hostResponse: GetResponse) { }
+// let wsUri = ((window.location.protocol === "https:" && "wss://") || "ws://") +
+//     window.location.host +
+//     `/contract/dependency/${MODEL_CONTRACT}/changes/`;
 
-function getUpdate(update: UpdateNotification) { }
+function getState(_hostResponse: GetResponse) { }
+
+function getUpdate(_update: UpdateNotification) { }
 
 const HANDLER = {
     onPut: (_response: PutResponse) => { },
     onGet: getState,
     onUpdate: (_response: UpdateResponse) => { },
     onUpdateNotification: getUpdate,
-    onErr: (_response: Error) => { },
+    onErr: (_response: HostError) => { },
 }
 
 const API_URL = new URL("");
@@ -39,9 +39,10 @@ function sendUpdate() {
         sendVal = input;
     }
 
+    let encoder = new TextEncoder();
     let updateRequest = {
-        key: new Key(""),
-        delta: new Uint8Array(sendVal.value)
+        key: Key.fromSpec(MODEL_CONTRACT),
+        delta: encoder.encode(sendVal.value)
     }
     locutusApi.update(updateRequest);
 }
@@ -57,24 +58,22 @@ registerUpdater();
 
 
 /*
- <script>
-        // this script should be ported to typescript and compiled+bundled with the web
-        
-        const reader = new FileReader();
-        (response) => {
-            reader.onload = () => {
-                log("Received update: " + reader.result);
-                let val = JSON.parse(reader.result);
-                val = val.map((e) => {
-                    delete e.signature;
-                    return e;
-                });
-                document.getElementById("updates").textContent =
-                    JSON.stringify(val, null, 2);
-            };
-            reader.readAsText(e.data);
-        }
-        
-
-    </script>
+<script>
+    // this script should be ported to typescript and compiled+bundled with the web
+    
+    const reader = new FileReader();
+    (response) => {
+        reader.onload = () => {
+            log("Received update: " + reader.result);
+            let val = JSON.parse(reader.result);
+            val = val.map((e) => {
+                delete e.signature;
+                return e;
+            });
+            document.getElementById("updates").textContent =
+                JSON.stringify(val, null, 2);
+        };
+        reader.readAsText(e.data);
+    }
+</script>
 */

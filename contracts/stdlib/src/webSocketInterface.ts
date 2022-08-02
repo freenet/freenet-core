@@ -22,6 +22,11 @@ export class Key {
         }
     }
 
+    static fromSpec(spec: string): Key {
+        let encoded = base58.decode(spec);
+        return new Key(encoded);
+    }
+
     /**
      * @returns {Uint8Array} Hash of the full key specification (contract code + parameter).
      */
@@ -88,7 +93,7 @@ export interface ResponseHandler {
     onGet: (response: GetResponse) => void,
     onUpdate: (response: UpdateResponse) => void,
     onUpdateNotification: (response: UpdateNotification) => void,
-    onErr: (response: Error) => void,
+    onErr: (response: HostError) => void,
 }
 
 export class LocutusWsApi {
@@ -152,29 +157,29 @@ export class LocutusWsApi {
 
 // host replies:
 
-type Ok = PutResponse | UpdateResponse | GetResponse | UpdateNotification;
-type Error = {
+export type Ok = PutResponse | UpdateResponse | GetResponse | UpdateNotification;
+export type HostError = {
     cause: string
 }
 
-interface PutResponse {
+export interface PutResponse {
     readonly kind: "put"
     key: Key
 }
 
-interface UpdateResponse {
+export interface UpdateResponse {
     readonly kind: "update"
     key: Key
     summary: State
 }
 
-interface GetResponse {
+export interface GetResponse {
     readonly kind: "get"
     contract?: Contract,
     state: State,
 }
 
-interface UpdateNotification {
+export interface UpdateNotification {
     readonly kind: "updateNotification"
     key: Key
     update: StateDelta
@@ -187,7 +192,7 @@ function assert(condition: boolean, msg?: string) {
 
 export class HostResponse {
 
-    private result: Ok | Error
+    private result: Ok | HostError
 
     constructor(bytes: Uint8Array) {
         let decoded = decode(bytes) as object;
@@ -264,9 +269,9 @@ export class HostResponse {
             return false;
     }
 
-    unwrapErr(): Error {
+    unwrapErr(): HostError {
         if (this.result instanceof Error)
-            return this.result as Error
+            return this.result as HostError
         else
             throw new TypeError
     }

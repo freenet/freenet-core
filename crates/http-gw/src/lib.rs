@@ -23,12 +23,6 @@ enum ClientConnection {
     },
 }
 
-// struct UpdateNotification {
-//     id: ClientId,
-//     channel: tokio::sync::mpsc::UnboundedSender<HostResult>,
-//     req: ClientRequest,
-// }
-
 #[derive(Debug)]
 enum HostCallbackResult {
     NewId(ClientId),
