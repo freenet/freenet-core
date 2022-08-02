@@ -1,4 +1,11 @@
 {
+  "name": "locutus-stdlib",
+  "version": "0.0.1",
+  "description": "Locutus Standard Library And Utils",
+  "main": "src/index.ts",
+  "files": [
+    "src/**/*.ts"
+  ],
   "dependencies": {
     "@msgpack/msgpack": "^2.7.2",
     "bs58": "^5.0.0"

@@ -1,4 +1,3 @@
 *.wasm
-encoded_state
-node_modules/*
+**/node_modules/*
 dist/*
