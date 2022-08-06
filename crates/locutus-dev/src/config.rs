@@ -22,7 +22,6 @@ pub enum ContractType {
 pub enum SubCommand {
     RunLocal(LocalNodeConfig),
     Build(StateConfig),
-
 }
 
 #[derive(clap::Parser, Clone)]
@@ -37,7 +36,7 @@ pub struct Config {
 /// A CLI utility for testing out contracts against a Locutus local node.
 ///
 #[derive(clap::Parser, Clone)]
-#[clap(name = "Locutus Contract Development Environment")]
+#[clap(name = "Locutus Local Development Node Environment")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.1")]
 #[clap(group(
@@ -84,7 +83,7 @@ pub struct LocalNodeConfig {
 /// A CLI utility for build contract states.
 ///
 #[derive(clap::Parser, Clone)]
-#[clap(name = "Locutus Contract State Development Environment1")]
+#[clap(name = "Locutus Contract Packaging Tool")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.1")]
 pub struct StateConfig {
