@@ -3,7 +3,8 @@ mod http_gateway;
 pub(crate) mod web_handling;
 
 pub use http_gateway::HttpGateway;
-use locutus_node::{ClientError, ClientId, ClientRequest, HostResponse};
+use locutus_node::{ClientError, ClientId, ClientRequest, HostResponse, HostResult};
+use locutus_runtime::ContractKey;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -22,6 +23,11 @@ enum HostCallbackResult {
     Result {
         id: ClientId,
         result: Result<HostResponse, ClientError>,
+    },
+    SubscriptionChannel {
+        key: ContractKey,
+        id: ClientId,
+        callback: tokio::sync::mpsc::UnboundedReceiver<HostResult>,
     },
 }
 
