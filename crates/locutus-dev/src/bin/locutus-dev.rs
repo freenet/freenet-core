@@ -1,15 +1,14 @@
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
-use byteorder::{BigEndian, WriteBytesExt};
 use std::{
     fs::File,
     io::{Read, Write},
     path::PathBuf,
 };
+use tracing_subscriber::EnvFilter;
 
-use locutus_runtime::locutus_stdlib::web::model::WebModelState;
-use locutus_dev::{LocalNodeConfig, StateConfig, SubCommand, ContractType, set_cleanup_on_exit};
+use locutus_dev::{set_cleanup_on_exit, ContractType, LocalNodeConfig, StateConfig, SubCommand};
 use locutus_dev::{user_fn_handler, wasm_runtime, AppState, Config};
+use locutus_runtime::locutus_stdlib::web::model::WebModelState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -18,16 +17,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         .init();
 
     match Config::parse().sub_command {
-        SubCommand::RunLocal(contract_cli) => {
-            run_local_node_client(contract_cli).await
-        },
-        SubCommand::Build(state_cli) => {
-            generate_state(state_cli)
-        }
+        SubCommand::RunLocal(contract_cli) => run_local_node_client(contract_cli).await,
+        SubCommand::Build(state_cli) => generate_state(state_cli),
     }
 }
 
-async fn run_local_node_client(cli: LocalNodeConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+async fn run_local_node_client(
+    cli: LocalNodeConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     if cli.disable_tui_mode {
         return Err("CLI mode not yet implemented".into());
     }
@@ -48,7 +45,9 @@ async fn run_local_node_client(cli: LocalNodeConfig) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn generate_state(cli: StateConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+fn generate_state(
+    cli: StateConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let metadata_path: Option<PathBuf> = cli.input_metadata_path;
     let state_path: PathBuf = cli.input_state_path;
     let dest_file: PathBuf = cli.output_file;
@@ -118,7 +117,7 @@ fn get_encoded_view(
     let encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
     let mut tar = tar::Builder::new(encoder);
     tar.append_dir_all(".", &view_path)?;
-    let encoder_data= tar.into_inner()?;
+    let encoder_data = tar.into_inner()?;
     let mut encoded: Vec<u8> = encoder_data.finish()?;
     encoded_view.append(&mut encoded);
     Ok(encoded_view)

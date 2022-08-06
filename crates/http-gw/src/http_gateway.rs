@@ -7,16 +7,12 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use warp::ws::Message;
 use warp::ws::WebSocket;
 use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
-use warp::{hyper::body::Bytes, ws::Message};
 
-use crate::{
-    errors,
-    state_handling::{get_state, state_changes_notification, update_state},
-    ClientConnection, HostCallbackResult,
-};
+use crate::{errors, ClientConnection, HostCallbackResult};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
@@ -26,6 +22,7 @@ static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 pub struct HttpGateway {
     server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
+    update_channels: HashMap<ClientId, UnboundedReceiver<Result<HostResponse, ClientError>>>,
 }
 
 impl HttpGateway {
@@ -38,11 +35,11 @@ impl HttpGateway {
         let gateway = Self {
             server_request,
             response_channels: HashMap::new(),
+            update_channels: HashMap::new(),
         };
 
         let get_home = warp::path::end().and_then(home);
         let base_web_contract = warp::path::path("contract").and(warp::path::path("web"));
-        let data_contracts = warp::path::path("contract").and(warp::path::path("dependency"));
 
         let rs = request_sender.clone();
         let websocket_commands = warp::path!("contract" / "command")
@@ -57,9 +54,8 @@ impl HttpGateway {
                 })
             });
 
-        let rs = request_sender.clone();
         let web_home = base_web_contract
-            .map(move || rs.clone())
+            .map(move || request_sender.clone())
             .and(warp::path::param())
             .and(warp::path::end())
             .and_then(|rs, key: String| async move {
@@ -73,49 +69,10 @@ impl HttpGateway {
                 crate::web_handling::variable_content(key, path).await
             });
 
-        let rs = request_sender.clone();
-        let get_state = data_contracts
-            .map(move || rs.clone())
-            .and(warp::path::param())
-            .and(warp::path("get"))
-            .and_then(|rs, key: String| async move {
-                let (mut rx, id) = new_client_connection(&rs).await.unwrap();
-                get_state(id, key, &rs, &mut rx).await
-            });
-
-        let rs = request_sender.clone();
-        let state_changes = data_contracts
-            .map(move || rs.clone())
-            .and(warp::path::param())
-            .and(warp::path("changes"))
-            .and(warp::path::end())
-            .and(warp::ws())
-            .map(|rs, key: String, ws: warp::ws::Ws| {
-                ws.on_upgrade(move |websocket: WebSocket| async move {
-                    let (mut rx, id) = new_client_connection(&rs).await.unwrap();
-                    state_changes_notification(id, key, websocket, &rs, &mut rx).await
-                })
-            });
-
-        let state_update = data_contracts
-            .map(move || request_sender.clone())
-            .and(warp::path::param())
-            .and(warp::path("update"))
-            .and(warp::path::end())
-            .and(warp::post())
-            .and(warp::body::bytes())
-            .and_then(move |rs, key: String, update_val: Bytes| async move {
-                let (mut recv, id) = new_client_connection(&rs).await.unwrap();
-                update_state(id, key, update_val.to_vec().into(), &rs, &mut recv).await
-            });
-
         let filters = websocket_commands
             .or(get_home)
             .or(web_home)
             .or(web_subpages)
-            .or(get_state)
-            .or(state_changes)
-            .or(state_update)
             .recover(errors::handle_error)
             .with(warp::trace::request());
 
@@ -123,8 +80,12 @@ impl HttpGateway {
     }
 
     pub fn next_client_id() -> ClientId {
-        ClientId::new(REQUEST_ID.fetch_add(1, Ordering::SeqCst))
+        internal_next_client_id()
     }
+}
+
+fn internal_next_client_id() -> ClientId {
+    ClientId::new(REQUEST_ID.fetch_add(1, Ordering::SeqCst))
 }
 
 async fn new_client_connection(
@@ -200,6 +161,41 @@ async fn websocket_interface(
     Ok(())
 }
 
+impl HttpGateway {
+    fn internal_proxy_recv(
+        &mut self,
+        msg: ClientConnection,
+    ) -> Result<Option<OpenRequest>, ClientError> {
+        match msg {
+            ClientConnection::NewConnection(new_client_ch) => {
+                // is a new client, assign an id and open a channel to communicate responses from the node
+                let cli_id = internal_next_client_id();
+                new_client_ch
+                    .send(HostCallbackResult::NewId(cli_id))
+                    .map_err(|_e| ErrorKind::NodeUnavailable)?;
+                self.response_channels.insert(cli_id, new_client_ch);
+                Ok(None)
+            }
+            ClientConnection::Request {
+                client_id,
+                req: ClientRequest::Subscribe { key },
+            } => {
+                // intercept subscription messages because they require a callback subscription channel
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                self.update_channels.insert(client_id, rx);
+                Ok(Some(
+                    OpenRequest::new(client_id, ClientRequest::Subscribe { key })
+                        .with_notification(tx),
+                ))
+            }
+            ClientConnection::Request { client_id, req } => {
+                // just forward the request to the node
+                Ok(Some(OpenRequest::new(client_id, req)))
+            }
+        }
+    }
+}
+
 #[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for HttpGateway {
     fn recv<'a>(
@@ -207,31 +203,10 @@ impl ClientEventsProxy for HttpGateway {
     ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
             loop {
-                if let Some(msg) = self.server_request.recv().await {
-                    match msg {
-                        ClientConnection::NewConnection(new_client_ch) => {
-                            // is a new client, assign an id and open a channel to communicate responses from the node
-                            let cli_id = Self::next_client_id();
-                            new_client_ch
-                                .send(HostCallbackResult::NewId(cli_id))
-                                .map_err(|_e| ErrorKind::NodeUnavailable)?;
-                            self.response_channels.insert(cli_id, new_client_ch);
-                        }
-                        ClientConnection::Request { client_id: id, req } => {
-                            // just forward the request to the node
-                            break Ok(OpenRequest::new(id, req));
-                        }
-                        ClientConnection::UpdateSubChannel {
-                            key: contract,
-                            client_id,
-                            callback,
-                        } => {
-                            break Ok(OpenRequest::new(
-                                client_id,
-                                ClientRequest::Subscribe { key: contract },
-                            )
-                            .with_notification(callback));
-                        }
+                let msg = self.server_request.recv().await;
+                if let Some(msg) = msg {
+                    if let Some(reply) = self.internal_proxy_recv(msg)? {
+                        break Ok(reply);
                     }
                 } else {
                     todo!()

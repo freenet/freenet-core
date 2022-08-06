@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use locutus_node::{
-    either::Either, ClientError, ClientId, ClientRequest, HostResponse, HostResult, PeerKey,
-    RequestError, SqlitePool,
+    either::Either, ClientError, ClientId, ClientRequest, HostResponse, HostResult, RequestError,
+    SqlitePool,
 };
 use locutus_runtime::{prelude::*, ContractRuntimeError};
 use tokio::sync::mpsc::UnboundedSender;
@@ -25,7 +25,6 @@ pub struct LocalNode {
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, StateSummary<'static>>>,
     pub contract_state: StateStore<SqlitePool>,
-    peer_key: PeerKey,
 }
 
 impl LocalNode {
@@ -43,7 +42,6 @@ impl LocalNode {
             runtime: Runtime::build(store, false).unwrap(),
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
-            peer_key: PeerKey::random(),
         })
     }
 

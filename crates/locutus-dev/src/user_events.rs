@@ -15,7 +15,7 @@ use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    config::{LocalNodeConfig, DeserializationFmt},
+    config::{DeserializationFmt, LocalNodeConfig},
     state::AppState,
     util, CommandSender, DynError,
 };
