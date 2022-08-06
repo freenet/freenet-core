@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, HostResult};
 use crate::client_events::{ErrorKind, OpenRequest};
-use crate::{ClientEventsProxy, ClientId, ClientRequest, HostResponse};
+use crate::{ClientEventsProxy, ClientId, HostResponse};
 
 type HostIncomingMsg = Result<OpenRequest, ClientError>;
 
@@ -244,6 +244,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::ClientRequest;
 
     struct SampleProxy {
         id: usize,

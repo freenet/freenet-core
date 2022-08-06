@@ -4,7 +4,9 @@ use locutus_node::SqlitePool;
 use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
-use crate::{config::{DeserializationFmt}, set_cleanup_on_exit, DynError, LocalNode, LocalNodeConfig};
+use crate::{
+    config::DeserializationFmt, set_cleanup_on_exit, DynError, LocalNode, LocalNodeConfig,
+};
 
 #[derive(Clone)]
 pub struct AppState {

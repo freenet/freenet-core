@@ -148,7 +148,7 @@ impl ClientEventsProxy for UserEvents {
     ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
         Box::pin(async move {
             Ok(OpenRequest::new(
-                ClientId::new(1),
+                ClientId::FIRST,
                 self.rx_ev.recv().await.expect("channel open"),
             ))
         })
