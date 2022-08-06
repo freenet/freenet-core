@@ -1,6 +1,7 @@
-use futures::{SinkExt, StreamExt};
+use futures::{stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
 use locutus_node::*;
+use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
     future::Future,
@@ -12,7 +13,7 @@ use warp::ws::Message;
 use warp::ws::WebSocket;
 use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
 
-use crate::{errors, ClientConnection, HostCallbackResult};
+use crate::{errors, ClientConnection, DynError, HostCallbackResult};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
@@ -22,7 +23,6 @@ static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 pub struct HttpGateway {
     server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
-    update_channels: HashMap<ClientId, UnboundedReceiver<Result<HostResponse, ClientError>>>,
 }
 
 impl HttpGateway {
@@ -35,7 +35,6 @@ impl HttpGateway {
         let gateway = Self {
             server_request,
             response_channels: HashMap::new(),
-            update_channels: HashMap::new(),
         };
 
         let get_home = warp::path::end().and_then(home);
@@ -144,25 +143,69 @@ async fn websocket_interface(
         request_sender
             .send(ClientConnection::Request { client_id, req })
             .await?;
-        if let Some(HostCallbackResult::Result { id, result }) = response_recv.recv().await {
+        // let mut opt_cb_fut = futures::future::pending::<HostResult>().boxed();
+        match response_recv.recv().await {
+            Some(HostCallbackResult::Result { id, result }) => {
+                debug_assert_eq!(id, client_id);
+                let res = rmp_serde::to_vec(&result)?;
+                tx.send(Message::binary(res)).await?;
+            }
+            Some(HostCallbackResult::SubscriptionChannel {
+                key,
+                id: client_id,
+                callback,
+            }) => {
+                todo!()
+            }
+            _ => {
+                let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+                    ErrorKind::NodeUnavailable.into(),
+                ))?;
+                tx.send(Message::binary(result_error)).await?;
+                tx.send(Message::close()).await?;
+                log::warn!("node shut down while handling responses for {client_id}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct NewSubscription {
+    key: ContractKey,
+    callback: UnboundedReceiver<HostResult>,
+}
+
+async fn response_recv(
+    msg: Option<HostCallbackResult>,
+    client_id: ClientId,
+    tx: &mut SplitSink<WebSocket, Message>,
+) -> Result<Option<NewSubscription>, DynError> {
+    match msg {
+        Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
             let res = rmp_serde::to_vec(&result)?;
             tx.send(Message::binary(res)).await?;
-        } else {
+            Ok(None)
+        }
+        Some(HostCallbackResult::SubscriptionChannel { key, id, callback }) => {
+            debug_assert_eq!(id, client_id);
+            Ok(Some(NewSubscription { key, callback }))
+        }
+        _ => {
             let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
                 ErrorKind::NodeUnavailable.into(),
             ))?;
             tx.send(Message::binary(result_error)).await?;
             tx.send(Message::close()).await?;
             log::warn!("node shut down while handling responses for {client_id}");
-            break;
+            Err(format!("node shut down while handling responses for {client_id}").into())
         }
     }
-    Ok(())
 }
 
 impl HttpGateway {
-    fn internal_proxy_recv(
+    async fn internal_proxy_recv(
         &mut self,
         msg: ClientConnection,
     ) -> Result<Option<OpenRequest>, ClientError> {
@@ -182,11 +225,21 @@ impl HttpGateway {
             } => {
                 // intercept subscription messages because they require a callback subscription channel
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                self.update_channels.insert(client_id, rx);
-                Ok(Some(
-                    OpenRequest::new(client_id, ClientRequest::Subscribe { key })
-                        .with_notification(tx),
-                ))
+                if let Some(ch) = self.response_channels.get(&client_id) {
+                    ch.send(HostCallbackResult::SubscriptionChannel {
+                        key,
+                        id: client_id,
+                        callback: rx,
+                    })
+                    .map_err(|_| ErrorKind::ChannelClosed)?;
+                    Ok(Some(
+                        OpenRequest::new(client_id, ClientRequest::Subscribe { key })
+                            .with_notification(tx),
+                    ))
+                } else {
+                    log::warn!("client: {client_id} not found");
+                    Err(ErrorKind::UnknownClient(client_id).into())
+                }
             }
             ClientConnection::Request { client_id, req } => {
                 // just forward the request to the node
@@ -205,7 +258,7 @@ impl ClientEventsProxy for HttpGateway {
             loop {
                 let msg = self.server_request.recv().await;
                 if let Some(msg) = msg {
-                    if let Some(reply) = self.internal_proxy_recv(msg)? {
+                    if let Some(reply) = self.internal_proxy_recv(msg).await? {
                         break Ok(reply);
                     }
                 } else {
