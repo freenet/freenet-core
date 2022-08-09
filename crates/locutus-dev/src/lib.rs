@@ -5,12 +5,13 @@ mod executor;
 mod local_node;
 mod state;
 mod user_events;
+pub mod package_manager;
 pub(crate) mod util;
 
 pub use config::Config;
 pub use config::ContractType;
 pub use config::LocalNodeConfig;
-pub use config::StateConfig;
+pub use config::PackageManagerConfig;
 pub use config::SubCommand;
 pub use executor::wasm_runtime;
 pub use local_node::LocalNode;

@@ -1,0 +1,6 @@
+[sources]
+source_dirs = ["web"]
+files = [
+	# "web/**/*.html",
+	"dist/bundle.js"
+]

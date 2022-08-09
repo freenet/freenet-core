@@ -21,7 +21,7 @@ pub enum ContractType {
 #[derive(clap::Subcommand, Clone)]
 pub enum SubCommand {
     RunLocal(LocalNodeConfig),
-    Build(StateConfig),
+    Build(PackageManagerConfig),
 }
 
 #[derive(clap::Parser, Clone)]
@@ -34,7 +34,6 @@ pub struct Config {
 }
 
 /// A CLI utility for testing out contracts against a Locutus local node.
-///
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Locutus Local Development Node Environment")]
 #[clap(author = "The Freenet Project Inc.")]
@@ -80,19 +79,18 @@ pub struct LocalNodeConfig {
     pub max_contract_size: i64,
 }
 
-/// A CLI utility for build contract states.
-///
+/// Locutus Package Manager
 #[derive(clap::Parser, Clone)]
-#[clap(name = "Locutus Contract Packaging Tool")]
+#[clap(name = "Locutus Contract Package Manager")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.1")]
-pub struct StateConfig {
-    #[clap(long, parse(from_os_str), value_name = "INPUT_METADATA_PATH")]
-    pub input_metadata_path: Option<PathBuf>,
-    #[clap(long, parse(from_os_str), value_name = "INPUT_STATE_PATH")]
-    pub input_state_path: PathBuf,
-    #[clap(long, parse(from_os_str), value_name = "OUTPUT_PATH")]
-    pub output_file: PathBuf,
-    #[clap(long = "contract-type", arg_enum, group = "type", value_name = "TYPE")]
+pub struct PackageManagerConfig {
+    #[clap(
+        short,
+        long = "contract-type",
+        arg_enum,
+        group = "type",
+        value_name = "TYPE"
+    )]
     pub contract_type: ContractType,
 }
