@@ -136,15 +136,15 @@ async fn websocket_interface(
         };
 
         let client_req_task = async {
-            let next_msg = rx
+            let next_msg = match rx
                 .next()
                 .await
-                .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())?;
-            match process_client_request(client_id, next_msg, &request_sender).await {
-                Ok(response) => Ok(response),
-                Err(None) => Ok(None),
-                Err(Some(err)) => Err(err),
-            }
+                .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
+            {
+                Err(err) => return Err(Some(err.into())),
+                Ok(v) => v,
+            };
+            process_client_request(client_id, next_msg, &request_sender).await
         };
 
         tokio::select! { biased;
@@ -159,14 +159,12 @@ async fn websocket_interface(
             }
             process_client_request = client_req_task => {
                 match process_client_request {
-                    Err(err) => {
-                        log::error!("{err}");
-                        return Err(err);
-                    }
                     Ok(Some(response)) => {
                         tx.send(response).await?;
                     }
                     Ok(None) => continue,
+                    Err(None) => return Ok(()),
+                    Err(Some(err)) => return Err(err),
                 }
             }
             response = listeners_task => {
