@@ -15,9 +15,17 @@ const MODEL_CONTRACT = "JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC";
 //     window.location.host +
 //     `/contract/dependency/${MODEL_CONTRACT}/changes/`;
 
-function getState(_hostResponse: GetResponse) { }
+function getState(_hostResponse: GetResponse) {
+    let getRequest = {
+        key: Key.fromSpec(MODEL_CONTRACT),
+        fetch_contract: false
+    }
+    locutusApi.get(getRequest);
+}
 
-function getUpdate(_update: UpdateNotification) { }
+function getUpdate(_update: UpdateNotification) {
+    console.log('recived update');
+}
 
 const HANDLER = {
     onPut: (_response: PutResponse) => { },
@@ -27,7 +35,7 @@ const HANDLER = {
     onErr: (_response: HostError) => { },
 }
 
-const API_URL = new URL("");
+const API_URL = new URL(`ws://${location.host}/contract/command/`);
 let locutusApi = new LocutusWsApi(API_URL, HANDLER);
 
 function sendUpdate() {
