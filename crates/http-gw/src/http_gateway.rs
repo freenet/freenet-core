@@ -1,4 +1,4 @@
-use futures::{stream::SplitSink, FutureExt, SinkExt, StreamExt};
+use futures::{stream::SplitSink, SinkExt, StreamExt};
 
 use locutus_node::*;
 use locutus_runtime::ContractKey;
@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, error::TryRecvError, UnboundedReceiver};
 use warp::ws::Message;
 use warp::ws::WebSocket;
 use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
@@ -109,66 +109,80 @@ async fn home() -> Result<impl Reply, Rejection> {
 async fn websocket_interface(
     request_sender: mpsc::Sender<ClientConnection>,
     ws: WebSocket,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut response_recv, client_id) = new_client_connection(&request_sender).await?;
+) -> Result<(), DynError> {
+    let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     let (mut tx, mut rx) = ws.split();
-    while let Some(msg) = rx.next().await {
-        let msg = match msg {
-            Ok(m) if m.is_binary() || m.is_text() => m.into_bytes(),
-            Ok(m) if m.is_close() => break,
-            Ok(m) if m.is_ping() => {
-                if let Err(err) = tx.send(Message::pong(vec![0, 3, 2])).await {
-                    log::debug!("{err}");
-                }
-                continue;
-            }
-            Ok(_) => continue,
-            Err(_err) => todo!(),
-        };
-        let req: ClientRequest = {
-            match rmp_serde::from_read(std::io::Cursor::new(msg)) {
-                Ok(r) => r,
-                Err(e) => {
-                    let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
-                        ErrorKind::DeserializationError {
-                            cause: format!("{e}"),
-                        }
-                        .into(),
-                    ))?;
-                    tx.send(Message::binary(result_error)).await?;
-                    continue;
+    let mut listeners = Some(Vec::new());
+    loop {
+        let mut active_listeners: Vec<(ContractKey, UnboundedReceiver<HostResult>)> =
+            listeners.take().unwrap();
+        let listeners_task = async move {
+            let mut response = None;
+            for _ in 0..active_listeners.len() {
+                let (key, mut listener) = active_listeners.swap_remove(0);
+                match listener.try_recv() {
+                    Ok(r) => {
+                        active_listeners.push((key, listener));
+                        response = Some(r);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        active_listeners.push((key, listener));
+                    }
+                    Err(err @ TryRecvError::Disconnected) => return Err(Box::new(err) as DynError),
                 }
             }
+            Ok((response, active_listeners))
         };
-        request_sender
-            .send(ClientConnection::Request { client_id, req })
-            .await?;
-        // let mut opt_cb_fut = futures::future::pending::<HostResult>().boxed();
-        match response_recv.recv().await {
-            Some(HostCallbackResult::Result { id, result }) => {
-                debug_assert_eq!(id, client_id);
-                let res = rmp_serde::to_vec(&result)?;
-                tx.send(Message::binary(res)).await?;
+
+        let client_req_task = async {
+            let next_msg = rx
+                .next()
+                .await
+                .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())?;
+            match process_client_request(client_id, next_msg, &request_sender).await {
+                Ok(response) => Ok(response),
+                Err(None) => Ok(None),
+                Err(Some(err)) => Err(err),
             }
-            Some(HostCallbackResult::SubscriptionChannel {
-                key,
-                id: client_id,
-                callback,
-            }) => {
-                todo!()
+        };
+
+        tokio::select! { biased;
+            msg = async { process_host_response(response_rx.recv().await, client_id, &mut tx).await } => {
+                if let Some(NewSubscription { key, callback }) = msg? {
+                    if let Some( l) = listeners.as_mut() {
+                        l.push((key, callback));
+                    } else {
+                        listeners = Some(vec![(key, callback)]);
+                    }
+                }
             }
-            _ => {
-                let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
-                    ErrorKind::NodeUnavailable.into(),
-                ))?;
-                tx.send(Message::binary(result_error)).await?;
-                tx.send(Message::close()).await?;
-                log::warn!("node shut down while handling responses for {client_id}");
-                break;
+            process_client_request = client_req_task => {
+                match process_client_request {
+                    Err(err) => {
+                        log::error!("{err}");
+                        return Err(err);
+                    }
+                    Ok(Some(response)) => {
+                        tx.send(response).await?;
+                    }
+                    Ok(None) => continue,
+                }
+            }
+            response = listeners_task => {
+                let (response, mut old_listeners) = response?;
+                if let Some(new_listeners) = listeners.as_mut() {
+                    new_listeners.append(&mut old_listeners);
+                } else {
+                    listeners = Some(old_listeners);
+                }
+                if let Some(response) = response {
+                    let msg = rmp_serde::to_vec(&response)?;
+                    tx.send(Message::binary(msg)).await?;
+                }
             }
         }
     }
-    Ok(())
 }
 
 struct NewSubscription {
@@ -176,7 +190,43 @@ struct NewSubscription {
     callback: UnboundedReceiver<HostResult>,
 }
 
-async fn response_recv(
+async fn process_client_request(
+    client_id: ClientId,
+    msg: Result<Message, warp::Error>,
+    request_sender: &mpsc::Sender<ClientConnection>,
+) -> Result<Option<Message>, Option<DynError>> {
+    let msg = match msg {
+        Ok(m) if m.is_binary() || m.is_text() => m.into_bytes(),
+        Ok(m) if m.is_close() => return Err(None),
+        Ok(m) if m.is_ping() => {
+            return Ok(Some(Message::pong(vec![0, 3, 2])));
+        }
+        Ok(_) => return Ok(None),
+        Err(err) => return Err(Some(err.into())),
+    };
+    let req: ClientRequest = {
+        match rmp_serde::from_read(std::io::Cursor::new(msg)) {
+            Ok(r) => r,
+            Err(e) => {
+                let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+                    ErrorKind::DeserializationError {
+                        cause: format!("{e}"),
+                    }
+                    .into(),
+                ))
+                .map_err(|err| Some(err.into()))?;
+                return Ok(Some(Message::binary(result_error)));
+            }
+        }
+    };
+    request_sender
+        .send(ClientConnection::Request { client_id, req })
+        .await
+        .map_err(|err| Some(err.into()))?;
+    Ok(None)
+}
+
+async fn process_host_response(
     msg: Option<HostCallbackResult>,
     client_id: ClientId,
     tx: &mut SplitSink<WebSocket, Message>,
