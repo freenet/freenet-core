@@ -2,6 +2,10 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
+use std::collections::HashMap;
+use std::io::Cursor;
+use log::log;
+use rmpv::Value;
 
 use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
 use serde::{Deserialize, Serialize};
@@ -214,6 +218,84 @@ impl ClientRequest {
     pub fn is_disconnect(&self) -> bool {
         matches!(self, Self::Disconnect { .. })
     }
+
+    pub fn from_vec(msg: Vec<u8>) -> Result<Self, ErrorKind> {
+        let msp_value = rmpv::decode::read_value(&mut Cursor::new(msg));
+
+        let req = match msp_value {
+            Ok(value) => {
+                if value.is_map() {
+                    let value_map: HashMap<_, _> = value
+                        .as_map()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, val)| {
+                            (key.as_str().unwrap(), val.clone())
+                        }).collect();
+
+                    let mut map_keys = Vec::from_iter(value_map.keys().cloned());
+                    map_keys.sort();
+
+                    match map_keys.as_slice() {
+                        ["contract", "state"] => {
+                            ClientRequest::Disconnect {
+                                cause: None
+                            }
+                        },
+                        ["delta", "key"] => {
+                            log::info!("Recived update request");
+                            ClientRequest::Update {
+                                key: get_key_from_rmpv(value_map.get("key").unwrap().clone()),
+                                delta: get_delta_from_rmpv(value_map.get("delta").unwrap().clone())
+                            }
+                        },
+                        ["fetch_contract", "key"] => {
+                            ClientRequest::Disconnect {
+                                cause: None
+                            }
+                        },
+                        ["key"] => {
+                            ClientRequest::Disconnect {
+                                cause: None
+                            }
+                        },
+                        ["cause"] => {
+                            ClientRequest::Disconnect {
+                                cause: None
+                            }
+                        },
+                        _ => unreachable!(),
+                    }
+                } else {
+                    panic!("Error getting client request value, request is no a map")
+                }
+            },
+            Err(err) => panic!("Error getting client request value: {}", err)
+        };
+
+        Ok(req)
+    }
+}
+
+fn get_key_from_rmpv(value: Value) -> ContractKey {
+    let key = value.as_map().unwrap();
+    let key_spec = key.get(0).clone().unwrap().1.as_slice().unwrap();
+    let _ = key.get(1).unwrap().clone().0;
+    let key_str = bs58::encode(&key_spec).into_string();
+    ContractKey::from_spec(key_str).unwrap()
+}
+
+fn get_contract_from_rmpv(value: Value) -> WrappedContract<'static> {
+    todo!()
+}
+
+fn get_state_from_rmpv(value: Value) -> WrappedState {
+    todo!()
+}
+
+fn get_delta_from_rmpv(value: Value) -> StateDelta<'static> {
+    let delta = value.as_slice().unwrap().to_vec();
+    StateDelta::from(delta)
 }
 
 impl Display for ClientRequest {
