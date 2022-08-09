@@ -4,16 +4,16 @@ use std::{
     path::Path,
 };
 
-use byteorder::{BigEndian, ReadBytesExt};
-use tar::Archive;
-use xz2::read::XzDecoder;
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use tar::{Archive, Builder};
+use xz2::read::{XzDecoder, XzEncoder};
 
 use crate::interface::State;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebContractError {
     #[error("unpacking error: {0}")]
-    UnpackingError(Box<dyn std::error::Error>),
+    UnpackingError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(transparent)]
     StoringError(std::io::Error),
     #[error("file not found: {0}")]
@@ -22,10 +22,35 @@ pub enum WebContractError {
 
 pub struct WebViewState {
     pub metadata: Vec<u8>,
-    web: Cursor<Vec<u8>>,
+    web: Vec<u8>,
 }
 
 impl WebViewState {
+    pub fn from_data(
+        metadata: Vec<u8>,
+        web: Builder<Cursor<Vec<u8>>>,
+    ) -> Result<Self, WebContractError> {
+        let buf = web.into_inner().unwrap().into_inner();
+        let mut encoder = XzEncoder::new(Cursor::new(buf), 6);
+        let mut compressed = vec![];
+        encoder.read_to_end(&mut compressed).unwrap();
+        Ok(Self {
+            metadata,
+            web: compressed,
+        })
+    }
+
+    pub fn pack(mut self) -> std::io::Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(
+            self.metadata.len() + self.web.len() + (std::mem::size_of::<u64>() * 2),
+        );
+        output.write_u64::<BigEndian>(self.metadata.len() as u64)?;
+        output.append(&mut self.metadata);
+        output.write_u64::<BigEndian>(self.web.len() as u64)?;
+        output.append(&mut self.web);
+        Ok(output)
+    }
+
     pub fn store(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
         let mut decoded_web = self.decode_web();
         decoded_web
@@ -55,8 +80,8 @@ impl WebViewState {
         Err(WebContractError::FileNotFound(path.to_owned()))
     }
 
-    fn decode_web(&mut self) -> Archive<XzDecoder<Cursor<Vec<u8>>>> {
-        let decoder = XzDecoder::new(self.web.clone());
+    fn decode_web(&self) -> Archive<XzDecoder<&[u8]>> {
+        let decoder = XzDecoder::new(self.web.as_slice());
         Archive::new(decoder)
     }
 }
@@ -82,9 +107,6 @@ impl<'a> TryFrom<State<'a>> for WebViewState {
         state
             .read_exact(&mut web)
             .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
-
-        let web = Cursor::new(web);
-
         Ok(Self { metadata, web })
     }
 }
