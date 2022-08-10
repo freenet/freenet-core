@@ -15,20 +15,22 @@ view: $(VIEW_FILES)
 	cd apps/freenet-microblogging
 	cd $(VIEW_DIR)
 
-	CARGO_TARGET_DIR=./ bash compile_contract.sh
-	mv ./freenet_microblogging_view.wasm ../../../crates/http-gw/examples/
+	CARGO_TARGET_DIR=$(LOCUTUS_DIR)/target/
+	bash compile_contract.sh
+	mv $(LOCUTUS_DIR)/target/freenet_microblogging_view.wasm ../../../crates/http-gw/examples/
 
 	cd $(LOCUTUS_DIR)
 	cd crates/locutus-dev
-	cargo run --bin build_state -- --input-path ../../apps/freenet-microblogging/view/web --output-file ../http-gw/examples/freenet_microblogging_view --contract-type view
+	cargo run --bin locutus-dev -- build
 
 controller: $(CONTROLLER_FILES)
 	cd $(LOCUTUS_DIR)
 	cd apps/freenet-microblogging
 	cd $(CONTROLLER_DIR)
 
-	CARGO_TARGET_DIR=./ bash compile_contract.sh
-	mv ./freenet_microblogging_controller.wasm ../../../crates/http-gw/examples/
+	CARGO_TARGET_DIR=$(LOCUTUS_DIR)/target/
+	bash compile_contract.sh
+	mv $(LOCUTUS_DIR)/target/freenet_microblogging_controller.wasm ../../../crates/http-gw/examples/
 
 	cd $(LOCUTUS_DIR)
 	cd crates/locutus-dev

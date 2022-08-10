@@ -1,5 +1,8 @@
+[package]
+type = "view"
+
 [sources]
 source_dirs = ["web/static"]
 files = [
-	"dist/bundle.js"
+	"web/dist/bundle.js"
 ]

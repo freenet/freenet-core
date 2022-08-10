@@ -1,2 +1,5 @@
+[package]
+type = "controller"
+
 [sources]
 files = ["initial_state.json"]
