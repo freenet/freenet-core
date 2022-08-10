@@ -1,5 +1,0 @@
-*.wasm
-encoded_state
-node_modules/*
-**/dist/*
-target/*
