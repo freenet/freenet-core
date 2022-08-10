@@ -75,7 +75,7 @@ pub(crate) async fn contract_home(
 
                                 let mut web =
                                     WebViewState::try_from(state).map_err(|e| err(e, &contract))?;
-                                web.store(path).map_err(|e| err(e, &contract))?;
+                                web.unpack(path).map_err(|e| err(e, &contract))?;
                                 let index =
                                     web.get_file("index.html").map_err(|e| err(e, &contract))?;
                                 warp::hyper::Body::from(index)
