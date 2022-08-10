@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::ArgGroup;
+use serde::Deserialize;
 
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
@@ -12,10 +13,11 @@ pub enum DeserializationFmt {
     MessagePack,
 }
 
-#[derive(clap::ArgEnum, Clone, Copy, Debug)]
+#[derive(clap::ArgEnum, Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ContractType {
+    Controller,
     View,
-    Model,
 }
 
 #[derive(clap::Subcommand, Clone)]
@@ -84,13 +86,4 @@ pub struct LocalNodeConfig {
 #[clap(name = "Locutus Contract Package Manager")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.1")]
-pub struct PackageManagerConfig {
-    #[clap(
-        short,
-        long = "contract-type",
-        arg_enum,
-        group = "type",
-        value_name = "TYPE"
-    )]
-    pub contract_type: ContractType,
-}
+pub struct PackageManagerConfig {}

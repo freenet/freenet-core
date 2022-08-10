@@ -2016,6 +2016,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
