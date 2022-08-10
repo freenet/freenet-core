@@ -133,8 +133,8 @@ export class LocutusWsApi {
         this.ws.send(encoded);
     }
 
-    async update(get: UpdateRequest): Promise<void> {
-        let encoded = this.encoder.encode(get);
+    async update(update: UpdateRequest): Promise<void> {
+        let encoded = this.encoder.encode(update);
         this.ws.send(encoded);
     }
 
@@ -143,13 +143,13 @@ export class LocutusWsApi {
         this.ws.send(encoded);
     }
 
-    async subscribe(get: SubscribeRequest): Promise<void> {
-        let encoded = this.encoder.encode(get);
+    async subscribe(subscribe: SubscribeRequest): Promise<void> {
+        let encoded = this.encoder.encode(subscribe);
         this.ws.send(encoded);
     }
 
-    async disconnect(get: DisconnectRequest): Promise<void> {
-        let encoded = this.encoder.encode(get);
+    async disconnect(disconnect: DisconnectRequest): Promise<void> {
+        let encoded = this.encoder.encode(disconnect);
         this.ws.send(encoded);
         this.ws.close();
     }
