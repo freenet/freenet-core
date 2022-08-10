@@ -370,3 +370,20 @@ fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
     let result_client_request = ClientRequest::decode_mp(msg);
     Ok(())
 }
+
+#[test]
+fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
+    let expected_client_request = ClientRequest::Get {
+        key: ContractKey::from_spec("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
+            .unwrap(),
+        fetch_contract: false,
+    };
+    let msg: Vec<u8> = vec![
+        130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194, 187,
+        46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151, 188, 167, 153, 197, 129, 25,
+        179, 198, 218, 99, 159, 139, 168, 99, 111, 110, 116, 114, 97, 99, 116, 192, 174, 102, 101,
+        116, 99, 104, 95, 99, 111, 110, 116, 114, 97, 99, 116, 194,
+    ];
+    let result_client_request = ClientRequest::decode_mp(msg);
+    Ok(())
+}

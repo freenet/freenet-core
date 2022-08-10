@@ -11,20 +11,21 @@ const DOCUMENT: Document = getDocument();
 
 const MODEL_CONTRACT = "JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC";
 
-// let wsUri = ((window.location.protocol === "https:" && "wss://") || "ws://") +
-//     window.location.host +
-//     `/contract/dependency/${MODEL_CONTRACT}/changes/`;
-
-function getState(_hostResponse: GetResponse) {
-    let getRequest = {
-        key: Key.fromSpec(MODEL_CONTRACT),
-        fetch_contract: false
-    }
-    locutusApi.get(getRequest);
+function getState(hostResponse: GetResponse) {
+    console.log("Received get");
+    let decoder = new TextDecoder();
+    let state_content = JSON.parse(decoder.decode(hostResponse.state));
+    let text_box =  DOCUMENT.getElementById("input") as HTMLTextAreaElement;
+    text_box.textContent = JSON.stringify(state_content, null, 2)
 }
 
-function getUpdate(_update: UpdateNotification) {
-    console.log('recived update');
+function getUpdate(update: UpdateNotification) {
+    console.log("Received update");
+    let decoder = new TextDecoder();
+    let update_content = JSON.parse(decoder.decode(update.update));
+    let updates_box =  DOCUMENT.getElementById("updates") as HTMLPreElement;
+    updates_box.textContent =
+        updates_box.textContent + "\n" + JSON.stringify(update_content, null, 2);
 }
 
 const HANDLER = {
@@ -37,6 +38,14 @@ const HANDLER = {
 
 const API_URL = new URL(`ws://${location.host}/contract/command/`);
 let locutusApi = new LocutusWsApi(API_URL, HANDLER);
+
+function loadState() {
+    let getRequest = {
+        key: Key.fromSpec(MODEL_CONTRACT),
+        fetch_contract: false
+    }
+    locutusApi.get(getRequest);
+}
 
 function sendUpdate() {
     let input = DOCUMENT.getElementById("input") as null | HTMLTextAreaElement;
@@ -56,13 +65,23 @@ function sendUpdate() {
 }
 
 function registerUpdater() {
-    let updateBtn = DOCUMENT.getElementById("btn");
+    let updateBtn = DOCUMENT.getElementById("su-btn");
     if (!updateBtn)
         throw new Error();
     else
         updateBtn.addEventListener("click", sendUpdate);
 }
+
+function registerGetter() {
+    let getBtn = DOCUMENT.getElementById("ls-btn");
+    if (!getBtn)
+        throw new Error();
+    else
+        getBtn.addEventListener("click", loadState);
+}
+
 registerUpdater();
+registerGetter();
 
 
 /*
