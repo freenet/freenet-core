@@ -368,6 +368,5 @@ fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
         32, 32, 32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
     ];
     let result_client_request = ClientRequest::decode_mp(msg);
-    assert!(true);
     Ok(())
 }

@@ -51,7 +51,7 @@ impl WebViewState {
         Ok(output)
     }
 
-    pub fn store(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
+    pub fn unpack(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
         let mut decoded_web = self.decode_web();
         decoded_web
             .unpack(dst)
