@@ -18,7 +18,7 @@ serde = "1"
 bincode = "1"
 tar = "0.4"
 xz2 = "0.1"
-ctrlc = { version = "3.0", features = ["termination"] }
+ctrlc = { version = "3.2", features = ["termination"] }
 
 # (mp) message pack feature
 rmp = { version = "0.8", optional = true }
