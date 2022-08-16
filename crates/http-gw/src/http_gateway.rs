@@ -217,6 +217,7 @@ async fn process_client_request(
             }
         }
     };
+    tracing::info!(req = %req, "received client request");
     request_sender
         .send(ClientConnection::Request { client_id, req })
         .await
