@@ -237,7 +237,9 @@ impl ClientRequest {
                     map_keys.sort();
 
                     match map_keys.as_slice() {
-                        ["contract", "state"] => todo!("Not implemented, this transformation needs to be implemented"),
+                        ["contract", "state"] => {
+                            todo!("Not implemented, this transformation needs to be implemented")
+                        }
                         ["delta", "key"] => {
                             log::info!("Recived update request");
                             ClientRequest::Update {
@@ -247,13 +249,24 @@ impl ClientRequest {
                         }
                         ["fetch_contract", "key"] => ClientRequest::Get {
                             key: get_key_from_rmpv(value_map.get("key").unwrap().clone()),
-                            fetch_contract: value_map.get("fetch_contract").unwrap().as_bool().unwrap(),
+                            fetch_contract: value_map
+                                .get("fetch_contract")
+                                .unwrap()
+                                .as_bool()
+                                .unwrap(),
                         },
                         ["key"] => ClientRequest::Subscribe {
                             key: get_key_from_rmpv(value_map.get("key").unwrap().clone()),
                         },
                         ["cause"] => ClientRequest::Disconnect {
-                            cause: Some(value_map.get("cause").unwrap().as_str().unwrap().to_string()),
+                            cause: Some(
+                                value_map
+                                    .get("cause")
+                                    .unwrap()
+                                    .as_str()
+                                    .unwrap()
+                                    .to_string(),
+                            ),
                         },
                         _ => unreachable!(),
                     }

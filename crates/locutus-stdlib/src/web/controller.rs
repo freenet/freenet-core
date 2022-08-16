@@ -57,7 +57,8 @@ mod test {
     fn package_model() -> Result<(), Box<dyn std::error::Error>> {
         let metadata = vec![0, 2];
         let controller_data = vec![5, 2, 9, 6];
-        let packed = ControllerState::from_data(metadata.clone(), controller_data.clone()).pack()?;
+        let packed =
+            ControllerState::from_data(metadata.clone(), controller_data.clone()).pack()?;
         let unpacked = ControllerState::try_from(packed.as_ref())?;
         assert_eq!(unpacked.metadata.as_ref(), &*metadata);
         assert_eq!(unpacked.controller_data.as_ref(), &*controller_data);

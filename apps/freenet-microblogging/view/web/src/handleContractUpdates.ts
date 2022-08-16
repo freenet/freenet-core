@@ -9,13 +9,13 @@ function getDocument(): Document {
 }
 const DOCUMENT: Document = getDocument();
 
-const MODEL_CONTRACT = "JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC";
+const MODEL_CONTRACT = "3kF9dWtuTmV33MSA7sjPW86reeevB1X8CdZ7rzvmWmNB";
 
 function getState(hostResponse: GetResponse) {
     console.log("Received get");
     let decoder = new TextDecoder();
     let state_content = JSON.parse(decoder.decode(hostResponse.state));
-    let text_box =  DOCUMENT.getElementById("input") as HTMLTextAreaElement;
+    let text_box = DOCUMENT.getElementById("input") as HTMLTextAreaElement;
     text_box.textContent = JSON.stringify(state_content, null, 2)
 }
 
@@ -23,7 +23,7 @@ function getUpdate(update: UpdateNotification) {
     console.log("Received update");
     let decoder = new TextDecoder();
     let update_content = JSON.parse(decoder.decode(update.update));
-    let updates_box =  DOCUMENT.getElementById("updates") as HTMLPreElement;
+    let updates_box = DOCUMENT.getElementById("updates") as HTMLPreElement;
     updates_box.textContent =
         updates_box.textContent + "\n" + JSON.stringify(update_content, null, 2);
 }

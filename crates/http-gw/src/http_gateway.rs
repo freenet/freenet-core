@@ -6,9 +6,15 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
-use tokio::sync::mpsc::{self, error::TryRecvError, UnboundedReceiver};
+use tokio::sync::{
+    mpsc::{self, error::TryRecvError, UnboundedReceiver},
+    Mutex,
+};
 use warp::ws::Message;
 use warp::ws::WebSocket;
 use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
@@ -112,12 +118,13 @@ async fn websocket_interface(
 ) -> Result<(), DynError> {
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     let (mut tx, mut rx) = ws.split();
-    let mut listeners = Some(Vec::new());
+    let listeners: Arc<Mutex<Vec<(_, UnboundedReceiver<HostResult>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     loop {
-        let mut active_listeners: Vec<(ContractKey, UnboundedReceiver<HostResult>)> =
-            listeners.take().unwrap();
+        let active_listeners = listeners.clone();
         let listeners_task = async move {
             let mut response = None;
+            let active_listeners = &mut *active_listeners.lock().await;
             for _ in 0..active_listeners.len() {
                 let (key, mut listener) = active_listeners.swap_remove(0);
                 match listener.try_recv() {
@@ -132,7 +139,7 @@ async fn websocket_interface(
                     Err(err @ TryRecvError::Disconnected) => return Err(Box::new(err) as DynError),
                 }
             }
-            Ok((response, active_listeners))
+            Ok(response)
         };
 
         let client_req_task = async {
@@ -147,14 +154,12 @@ async fn websocket_interface(
             process_client_request(client_id, next_msg, &request_sender).await
         };
 
+        let active_listeners = listeners.clone();
         tokio::select! { biased;
             msg = async { process_host_response(response_rx.recv().await, client_id, &mut tx).await } => {
                 if let Some(NewSubscription { key, callback }) = msg? {
-                    if let Some( l) = listeners.as_mut() {
-                        l.push((key, callback));
-                    } else {
-                        listeners = Some(vec![(key, callback)]);
-                    }
+                    let active_listeners = &mut *active_listeners.lock().await;
+                    active_listeners.push((key, callback));
                 }
             }
             process_client_request = client_req_task => {
@@ -168,12 +173,7 @@ async fn websocket_interface(
                 }
             }
             response = listeners_task => {
-                let (response, mut old_listeners) = response?;
-                if let Some(new_listeners) = listeners.as_mut() {
-                    new_listeners.append(&mut old_listeners);
-                } else {
-                    listeners = Some(old_listeners);
-                }
+                let response = response?;
                 if let Some(response) = response {
                     let msg = rmp_serde::to_vec(&response)?;
                     tx.send(Message::binary(msg)).await?;

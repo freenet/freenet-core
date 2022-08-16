@@ -82,6 +82,7 @@ impl LocalNode {
         contract: WrappedContract<'static>,
         state: WrappedState,
     ) {
+        tracing::warn!("preload: {}", contract.key());
         if let Err(err) = self
             .handle_request(
                 cli_id,
@@ -143,6 +144,7 @@ impl LocalNode {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.contract_params.insert(*key, contract.params().clone());
+                tracing::warn!("inserting: {}", contract.key());
                 self.contract_data.insert(
                     key.contract_part_encoded().unwrap(),
                     contract.code().clone(),
@@ -159,6 +161,7 @@ impl LocalNode {
             }
             ClientRequest::Update { key, delta } => {
                 let parameters = {
+                    tracing::warn!("updating: {key}");
                     match self
                         .contract_params
                         .get(&key)

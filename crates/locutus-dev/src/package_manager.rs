@@ -80,7 +80,6 @@ fn build_view_state(metadata: Vec<u8>, config: PackageConfig) -> Result<(), DynE
         for src in sources {
             for entry in glob::glob(src)? {
                 let p = entry?;
-                println!("p: {p:?}");
                 if p.ends_with("index.html") && p.starts_with("index.html") {
                     // ensures that index is present and at the root
                     found_entry = true;
