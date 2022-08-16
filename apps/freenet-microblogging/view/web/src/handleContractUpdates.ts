@@ -39,15 +39,15 @@ const HANDLER = {
 const API_URL = new URL(`ws://${location.host}/contract/command/`);
 let locutusApi = new LocutusWsApi(API_URL, HANDLER);
 
-function loadState() {
+async function loadState() {
     let getRequest = {
         key: Key.fromSpec(MODEL_CONTRACT),
         fetch_contract: false
     }
-    locutusApi.get(getRequest);
+    await locutusApi.get(getRequest);
 }
 
-function sendUpdate() {
+async function sendUpdate() {
     let input = DOCUMENT.getElementById("input") as null | HTMLTextAreaElement;
     let sendVal: HTMLTextAreaElement;
     if (!input) {
@@ -61,7 +61,7 @@ function sendUpdate() {
         key: Key.fromSpec(MODEL_CONTRACT),
         delta: encoder.encode(sendVal.value)
     }
-    locutusApi.update(updateRequest);
+    await locutusApi.update(updateRequest);
 }
 
 function registerUpdater() {
@@ -80,27 +80,14 @@ function registerGetter() {
         getBtn.addEventListener("click", loadState);
 }
 
+async function subscribeToUpdates() {
+    console.log("subscribing to contract:" + MODEL_CONTRACT);
+    await locutusApi.subscribe({
+        key: Key.fromSpec(MODEL_CONTRACT)
+    });
+    console.log("sent subscription request");
+}
+
 registerUpdater();
 registerGetter();
-
-
-/*
-<script>
-    // this script should be ported to typescript and compiled+bundled with the web
-    
-    const reader = new FileReader();
-    (response) => {
-        reader.onload = () => {
-            log("Received update: " + reader.result);
-            let val = JSON.parse(reader.result);
-            val = val.map((e) => {
-                delete e.signature;
-                return e;
-            });
-            document.getElementById("updates").textContent =
-                JSON.stringify(val, null, 2);
-        };
-        reader.readAsText(e.data);
-    }
-</script>
-*/
+subscribeToUpdates();

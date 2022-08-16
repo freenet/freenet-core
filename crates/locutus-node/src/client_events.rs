@@ -241,7 +241,7 @@ impl ClientRequest {
                             todo!("Not implemented, this transformation needs to be implemented")
                         }
                         ["delta", "key"] => {
-                            log::info!("Recived update request");
+                            log::info!("Received update request");
                             ClientRequest::Update {
                                 key: get_key_from_rmpv(value_map.get("key").unwrap().clone()),
                                 delta: get_delta_from_rmpv(value_map.get("delta").unwrap().clone()),

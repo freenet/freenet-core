@@ -143,7 +143,6 @@ impl LocalNode {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.contract_params.insert(*key, contract.params().clone());
-                tracing::warn!("inserting: {}", contract.key());
                 self.contract_data.insert(
                     key.contract_part_encoded().unwrap(),
                     contract.code().clone(),
