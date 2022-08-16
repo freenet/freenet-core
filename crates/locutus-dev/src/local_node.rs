@@ -82,7 +82,6 @@ impl LocalNode {
         contract: WrappedContract<'static>,
         state: WrappedState,
     ) {
-        tracing::warn!("preload: {}", contract.key());
         if let Err(err) = self
             .handle_request(
                 cli_id,
@@ -161,7 +160,6 @@ impl LocalNode {
             }
             ClientRequest::Update { key, delta } => {
                 let parameters = {
-                    tracing::warn!("updating: {key}");
                     match self
                         .contract_params
                         .get(&key)

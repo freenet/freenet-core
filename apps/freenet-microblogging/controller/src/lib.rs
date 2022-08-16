@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+// use chrono::{DateTime, Utc};
 use ed25519_dalek::Verifier;
 use locutus_stdlib::{
     blake2::{Blake2b512, Digest},
@@ -16,7 +16,7 @@ struct MessageFeed {
 #[derive(Serialize, Deserialize)]
 struct Message {
     author: String,
-    date: DateTime<Utc>,
+    // date: DateTime<Utc>,
     title: String,
     content: String,
     #[serde(default = "Message::modded")]
@@ -57,7 +57,7 @@ struct FeedSummary {
 
 impl<'a> From<&'a mut MessageFeed> for FeedSummary {
     fn from(feed: &'a mut MessageFeed) -> Self {
-        feed.messages.sort_by_key(|m| m.date);
+        // feed.messages.sort_by_key(|m| m.date);
         let mut summaries = Vec::with_capacity(feed.messages.len());
         for msg in &feed.messages {
             summaries.push(MessageSummary(msg.hash()));
@@ -282,7 +282,7 @@ mod test {
         .unwrap_valid();
         let new_model_data = ControllerState::try_from(new_state.as_ref()).unwrap();
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(new_model_data.model_data.as_ref())
+            serde_json::from_slice::<serde_json::Value>(new_model_data.controller_data.as_ref())
                 .unwrap(),
             serde_json::json!({
                 "messages": [

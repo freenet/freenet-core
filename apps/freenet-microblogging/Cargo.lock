@@ -295,7 +295,6 @@ name = "freenet-microblogging-controller"
 version = "0.0.0"
 dependencies = [
  "byteorder",
- "chrono",
  "ed25519-dalek",
  "locutus-stdlib",
  "serde",
@@ -639,9 +638,9 @@ dependencies = [
 
 [[package]]
 name = "signature"
-version = "1.5.0"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f054c6c1a6e95179d6f23ed974060dcefb2d9388bb7256900badad682c499de4"
+checksum = "f0ea32af43239f0d353a7dd75a22d94c329c8cdaafdcb4c1c1335aa10c298a4a"
 
 [[package]]
 name = "strsim"
