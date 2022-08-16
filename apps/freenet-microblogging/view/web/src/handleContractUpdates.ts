@@ -9,7 +9,7 @@ function getDocument(): Document {
 }
 const DOCUMENT: Document = getDocument();
 
-const MODEL_CONTRACT = "3kF9dWtuTmV33MSA7sjPW86reeevB1X8CdZ7rzvmWmNB";
+const MODEL_CONTRACT = "6Q2zMtcHwsUyWg5VaR15Xn2yoNxjzufTJsSUHuajEijG";
 
 function getState(hostResponse: GetResponse) {
     console.log("Received get");

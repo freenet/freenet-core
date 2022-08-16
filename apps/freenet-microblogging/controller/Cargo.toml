@@ -7,7 +7,7 @@ resolver = "2"
 publish = false
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
+# chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 locutus-stdlib = { path = "../../../crates/locutus-stdlib" }
 serde = "1"
 serde_json = "1"
