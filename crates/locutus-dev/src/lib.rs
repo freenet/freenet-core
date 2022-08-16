@@ -3,9 +3,9 @@ use locutus_node::ClientRequest;
 mod config;
 mod executor;
 mod local_node;
+pub mod package_manager;
 mod state;
 mod user_events;
-pub mod package_manager;
 pub(crate) mod util;
 
 pub use config::Config;
