@@ -170,6 +170,23 @@ impl HostResponse {
     }
 }
 
+impl std::fmt::Display for HostResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HostResponse::PutResponse { key } => f.write_fmt(format_args!("put response: {key}")),
+            HostResponse::UpdateResponse { key, .. } => {
+                f.write_fmt(format_args!("update response ({key})"))
+            }
+            HostResponse::GetResponse { state, .. } => {
+                f.write_fmt(format_args!("get response: {state}"))
+            }
+            HostResponse::UpdateNotification { key, .. } => {
+                f.write_fmt(format_args!("update notification (key: {key})"))
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum RequestError {
     #[error("put error for contract {key}, reason: {cause}")]

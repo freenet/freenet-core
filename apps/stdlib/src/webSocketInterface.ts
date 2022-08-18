@@ -110,8 +110,14 @@ export class LocutusWsApi {
         };
     }
 
-    private handleResponse(ev: MessageEvent<any>) {
-        let response = new HostResponse(ev.data);
+    private handleResponse(ev: MessageEvent<any>): void | Error {
+        let response;
+        try {
+            response = new HostResponse(ev.data);
+        } catch (err) {
+            console.log(`found error: ${err}`);
+            return new Error(`${err}`);
+        }
         if (response.isOk()) {
             switch (response.unwrapOk().kind) {
                 case "put":
