@@ -20,9 +20,9 @@ function getState(hostResponse: GetResponse) {
 }
 
 function getUpdate(update: UpdateNotification) {
-    console.log("Received update");
     let decoder = new TextDecoder();
     let update_content = JSON.parse(decoder.decode(update.update));
+    console.log("Received update: " + JSON.stringify(update_content, null, 2));
     let updates_box = DOCUMENT.getElementById("updates") as HTMLPreElement;
     updates_box.textContent =
         updates_box.textContent + "\n" + JSON.stringify(update_content, null, 2);
@@ -43,7 +43,7 @@ async function loadState() {
     let getRequest = {
         key: Key.fromSpec(MODEL_CONTRACT),
         fetch_contract: false
-    }
+    };
     await locutusApi.get(getRequest);
 }
 
@@ -60,7 +60,7 @@ async function sendUpdate() {
     let updateRequest = {
         key: Key.fromSpec(MODEL_CONTRACT),
         delta: encoder.encode(sendVal.value)
-    }
+    };
     await locutusApi.update(updateRequest);
 }
 

@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tokio::sync::{
     mpsc::{self, error::TryRecvError, UnboundedReceiver},
@@ -123,23 +124,25 @@ async fn websocket_interface(
     loop {
         let active_listeners = listeners.clone();
         let listeners_task = async move {
-            let mut response = None;
-            let active_listeners = &mut *active_listeners.lock().await;
-            for _ in 0..active_listeners.len() {
-                let (key, mut listener) = active_listeners.swap_remove(0);
-                match listener.try_recv() {
-                    Ok(r) => {
-                        active_listeners.push((key, listener));
-                        response = Some(r);
-                        break;
+            loop {
+                let active_listeners = &mut *active_listeners.lock().await;
+                for _ in 0..active_listeners.len() {
+                    let (key, mut listener) = active_listeners.swap_remove(0);
+                    match listener.try_recv() {
+                        Ok(r) => {
+                            active_listeners.push((key, listener));
+                            return Ok(r);
+                        }
+                        Err(TryRecvError::Empty) => {
+                            active_listeners.push((key, listener));
+                        }
+                        Err(err @ TryRecvError::Disconnected) => {
+                            return Err(Box::new(err) as DynError)
+                        }
                     }
-                    Err(TryRecvError::Empty) => {
-                        active_listeners.push((key, listener));
-                    }
-                    Err(err @ TryRecvError::Disconnected) => return Err(Box::new(err) as DynError),
                 }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            Ok(response)
         };
 
         let client_req_task = async {
@@ -174,10 +177,12 @@ async fn websocket_interface(
             }
             response = listeners_task => {
                 let response = response?;
-                if let Some(response) = response {
-                    let msg = rmp_serde::to_vec(&response)?;
-                    tx.send(Message::binary(msg)).await?;
+                match &response {
+                    Ok(res) => tracing::info!(response = %res, cli_id = %client_id, "sending response"),
+                    Err(err) => tracing::info!(response = %err, cli_id = %client_id, "sending response error"),
                 }
+                let msg = rmp_serde::to_vec(&response)?;
+                tx.send(Message::binary(msg)).await?;
             }
         }
     }
@@ -233,6 +238,10 @@ async fn process_host_response(
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
+            match &result {
+                Ok(res) => tracing::info!(response = ?res, cli_id = %id, "sending response"),
+                Err(err) => tracing::info!(response = %err, cli_id = %id, "sending response error"),
+            }
             let res = rmp_serde::to_vec(&result)?;
             tx.send(Message::binary(res)).await?;
             Ok(None)
