@@ -189,7 +189,7 @@ mod test {
         )?
         .read_to_end(&mut buf)?;
         let state = locutus_runtime::locutus_stdlib::interface::State::from(buf);
-        let mut view = WebViewState::try_from(state).unwrap();
+        let mut view = WebViewState::try_from(state.as_ref()).unwrap();
 
         let target = std::env::temp_dir().join("locutus-unpack-state");
         let e = view.unpack(&target);

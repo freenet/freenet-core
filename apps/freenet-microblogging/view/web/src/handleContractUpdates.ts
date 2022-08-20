@@ -13,33 +13,26 @@ const MODEL_CONTRACT = "6Q2zMtcHwsUyWg5VaR15Xn2yoNxjzufTJsSUHuajEijG";
 
 function getState(hostResponse: GetResponse) {
     console.log("Received get");
-    let decoder = new TextDecoder();
-    let state_content = JSON.parse(decoder.decode(hostResponse.state));
-    let text_box = DOCUMENT.getElementById("input") as HTMLTextAreaElement;
-    text_box.textContent = JSON.stringify(state_content, null, 2)
+    let decoder = new TextDecoder("utf8");
+    let inputBox = DOCUMENT.getElementById("input") as HTMLTextAreaElement;
+    inputBox.textContent = decoder.decode(Uint8Array.from(hostResponse.state));
 }
 
-function getUpdate(update: UpdateResponse) {
-    let decoder = new TextDecoder();
-    let decoded_summary = decoder.decode(new Uint8Array(update.summary));
-    decoded_summary = decoded_summary.replaceAll('\x00', '');
-    let summaries = JSON.parse(decoded_summary)['summaries'];
-    summaries.forEach(function (update: Uint8Array) {
-        let decoded_update = decoder.decode(update);
-        let update_content = JSON.parse(decoded_update);
-        console.log("Received update: " + JSON.stringify(update_content, null, 2));
-        let updates_box = DOCUMENT.getElementById("updates") as HTMLPreElement;
-        updates_box.textContent =
-            updates_box.textContent + "\n" + JSON.stringify(update_content, null, 2);
-    });
+function getUpdateNotification(notification: UpdateNotification) {
+    let decoder = new TextDecoder("utf8");
+    let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
+    updatesBox.textContent =
+        updatesBox.textContent + "\n" + decoder.decode(Uint8Array.from(notification.update));
 }
 
 const handler = {
     onPut: (_response: PutResponse) => { },
     onGet: getState,
-    onUpdate: getUpdate,
-    onUpdateNotification: (_response: UpdateNotification) => { },
-    onErr: (_response: HostError) => { },
+    onUpdate: (_up: UpdateResponse) => { },
+    onUpdateNotification: getUpdateNotification,
+    onErr: (err: HostError) => {
+        console.log("Received error, cause: " + err.cause);
+    },
     onOpen: () => {
         registerUpdater();
         registerGetter();
