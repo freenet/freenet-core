@@ -19,20 +19,26 @@ function getState(hostResponse: GetResponse) {
     text_box.textContent = JSON.stringify(state_content, null, 2)
 }
 
-function getUpdate(update: UpdateNotification) {
+function getUpdate(update: UpdateResponse) {
     let decoder = new TextDecoder();
-    let update_content = JSON.parse(decoder.decode(update.update));
-    console.log("Received update: " + JSON.stringify(update_content, null, 2));
-    let updates_box = DOCUMENT.getElementById("updates") as HTMLPreElement;
-    updates_box.textContent =
-        updates_box.textContent + "\n" + JSON.stringify(update_content, null, 2);
+    let decoded_summary = decoder.decode(new Uint8Array(update.summary));
+    decoded_summary = decoded_summary.replaceAll('\x00', '');
+    let summaries = JSON.parse(decoded_summary)['summaries'];
+    summaries.forEach(function (update: Uint8Array) {
+        let decoded_update = decoder.decode(update);
+        let update_content = JSON.parse(decoded_update);
+        console.log("Received update: " + JSON.stringify(update_content, null, 2));
+        let updates_box = DOCUMENT.getElementById("updates") as HTMLPreElement;
+        updates_box.textContent =
+            updates_box.textContent + "\n" + JSON.stringify(update_content, null, 2);
+    });
 }
 
 const HANDLER = {
     onPut: (_response: PutResponse) => { },
     onGet: getState,
-    onUpdate: (_response: UpdateResponse) => { },
-    onUpdateNotification: getUpdate,
+    onUpdate: getUpdate,
+    onUpdateNotification: (_response: UpdateNotification) => {},
     onErr: (_response: HostError) => { },
 }
 
@@ -88,6 +94,9 @@ async function subscribeToUpdates() {
     console.log("sent subscription request");
 }
 
-registerUpdater();
-registerGetter();
-subscribeToUpdates();
+// Connection opened
+locutusApi.ws.addEventListener('open', (_) => {
+    registerUpdater();
+    registerGetter();
+    subscribeToUpdates();
+});
