@@ -1,6 +1,6 @@
 use locutus_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
+use std::{borrow::Borrow, fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 
 use crate::ContractRuntimeError;
 
@@ -166,6 +166,12 @@ impl Deref for WrappedState {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl Borrow<[u8]> for WrappedState {
+    fn borrow(&self) -> &[u8] {
         &*self.0
     }
 }

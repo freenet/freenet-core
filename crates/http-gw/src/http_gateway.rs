@@ -1,7 +1,7 @@
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 
 use locutus_node::*;
-use locutus_runtime::ContractKey;
+use locutus_runtime::{locutus_stdlib::web::controller::ControllerState, ContractKey};
 use std::{
     collections::HashMap,
     future::Future,
@@ -244,10 +244,28 @@ async fn process_host_response(
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
-            match &result {
-                Ok(res) => tracing::info!(response = %res, cli_id = %id, "sending response"),
-                Err(err) => tracing::info!(response = %err, cli_id = %id, "sending response error"),
-            }
+            let mut _wrapped_state = None; // avoids copying
+            let result = match result {
+                Ok(res) => {
+                    tracing::info!(response = %res, cli_id = %id, "sending response");
+                    match res {
+                        HostResponse::GetResponse { contract, state } => {
+                            _wrapped_state = Some(state);
+                            let borrowed_state = _wrapped_state.as_ref().unwrap();
+                            let inner_state = ControllerState::try_from(&**borrowed_state)?;
+                            Ok(HostResponse::GetResponse {
+                                contract,
+                                state: inner_state.controller_data,
+                            })
+                        }
+                        other => Ok(other.try_into()?),
+                    }
+                }
+                Err(err) => {
+                    tracing::info!(response = %err, cli_id = %id, "sending response error");
+                    Err(err)
+                }
+            };
             let res = rmp_serde::to_vec(&result)?;
             tx.send(Message::binary(res)).await?;
             Ok(None)

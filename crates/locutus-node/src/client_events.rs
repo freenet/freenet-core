@@ -1,5 +1,5 @@
-use log::log;
 use rmpv::Value;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -129,7 +129,7 @@ pub trait ClientEventsProxy {
 
 /// A response to a previous [`ClientRequest`]
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum HostResponse {
+pub enum HostResponse<T: Borrow<[u8]> = WrappedState> {
     PutResponse {
         key: ContractKey,
     },
@@ -140,7 +140,7 @@ pub enum HostResponse {
     },
     GetResponse {
         contract: Option<WrappedContract<'static>>,
-        state: WrappedState,
+        state: T,
     },
     /// Message sent when there is an update to a subscribed contract.
     UpdateNotification {
@@ -182,6 +182,22 @@ impl std::fmt::Display for HostResponse {
             }
             HostResponse::UpdateNotification { key, .. } => {
                 f.write_fmt(format_args!("update notification (key: {key})"))
+            }
+        }
+    }
+}
+
+impl<'a> TryFrom<HostResponse> for HostResponse<Cow<'a, [u8]>> {
+    type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+    fn try_from(owned: HostResponse) -> Result<Self, Self::Error> {
+        match owned {
+            HostResponse::PutResponse { key } => Ok(HostResponse::PutResponse { key }),
+            HostResponse::UpdateResponse { key, summary } => {
+                Ok(HostResponse::UpdateResponse { key, summary })
+            }
+            HostResponse::GetResponse { .. } => Err("self outlives borrowed content".into()),
+            HostResponse::UpdateNotification { key, update } => {
+                Ok(HostResponse::UpdateNotification { key, update })
             }
         }
     }
@@ -260,12 +276,12 @@ impl ClientRequest {
                         ["delta", "key"] => {
                             log::info!("Received update request");
                             ClientRequest::Update {
-                                key: get_key_from_rmpv(value_map.get("key").unwrap().clone()),
-                                delta: get_delta_from_rmpv(value_map.get("delta").unwrap().clone()),
+                                key: key_from_rmpv(value_map.get("key").unwrap().clone()),
+                                delta: delta_from_rmpv(value_map.get("delta").unwrap().clone()),
                             }
                         }
                         ["fetch_contract", "key"] => ClientRequest::Get {
-                            key: get_key_from_rmpv(value_map.get("key").unwrap().clone()),
+                            key: key_from_rmpv(value_map.get("key").unwrap().clone()),
                             fetch_contract: value_map
                                 .get("fetch_contract")
                                 .unwrap()
@@ -273,7 +289,7 @@ impl ClientRequest {
                                 .unwrap(),
                         },
                         ["key"] => ClientRequest::Subscribe {
-                            key: get_key_from_rmpv(value_map.get("key").unwrap().clone()),
+                            key: key_from_rmpv(value_map.get("key").unwrap().clone()),
                         },
                         ["cause"] => ClientRequest::Disconnect {
                             cause: Some(
@@ -298,23 +314,17 @@ impl ClientRequest {
     }
 }
 
-fn get_key_from_rmpv(value: Value) -> ContractKey {
+// todo: impl TryFrom<Value> for ContractKey
+fn key_from_rmpv(value: Value) -> ContractKey {
     let key = value.as_map().unwrap();
-    let key_spec = key.get(0).clone().unwrap().1.as_slice().unwrap();
+    let key_spec = key.get(0).unwrap().1.as_slice().unwrap();
     let _ = key.get(1).unwrap().clone().0;
     let key_str = bs58::encode(&key_spec).into_string();
     ContractKey::from_spec(key_str).unwrap()
 }
 
-fn get_contract_from_rmpv(value: Value) -> WrappedContract<'static> {
-    todo!()
-}
-
-fn get_state_from_rmpv(value: Value) -> WrappedState {
-    todo!()
-}
-
-fn get_delta_from_rmpv(value: Value) -> StateDelta<'static> {
+// todo: impl TryFrom<Value> for StateDelta<'static>
+fn delta_from_rmpv(value: Value) -> StateDelta<'static> {
     let delta = value.as_slice().unwrap().to_vec();
     StateDelta::from(delta)
 }

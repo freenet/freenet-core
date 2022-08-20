@@ -14,6 +14,9 @@ export class Key {
     private contract: Uint8Array | null
 
     constructor(spec: Uint8Array, contract?: Uint8Array) {
+        if (spec.length != 32 || contract && contract.length != 32) {
+            throw TypeError("invalid array lenth (expected 32 bytes): " + spec.length);
+        }
         this.spec = spec;
         if (typeof contract == "undefined") {
             this.contract = null;
@@ -254,6 +257,16 @@ export class HostResponse {
                 let update = HostResponse.assertBytes(ok.Ok.UpdateNotification[1]);
                 this.result = { kind: "updateNotification", key, update } as UpdateNotification;
                 return;
+            }
+        } else if ("Err" in decoded) {
+            let err = decoded as { "Err": Array<any> };
+            if ("RequestError" in err.Err[0]) {
+                if ("Update" in err.Err[0].RequestError) {
+                    let updateErr = err.Err[0].RequestError.Update as Array<Array<any>>;
+                    let contractKey = new Key(updateErr[0][0] as Uint8Array);
+                    this.result = { cause: "Update error for contract " + contractKey.encode() };
+                    return;
+                }
             }
         }
         throw new TypeError("bytes are not a valid HostResponse");

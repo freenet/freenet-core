@@ -8,8 +8,6 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tar::{Archive, Builder};
 use xz2::read::{XzDecoder, XzEncoder};
 
-use crate::interface::State;
-
 #[derive(Debug, thiserror::Error)]
 pub enum WebContractError {
     #[error("unpacking error: {0}")]
@@ -86,10 +84,10 @@ impl WebViewState {
     }
 }
 
-impl<'a> TryFrom<State<'a>> for WebViewState {
+impl<'a> TryFrom<&'a [u8]> for WebViewState {
     type Error = WebContractError;
 
-    fn try_from(state: State) -> Result<Self, Self::Error> {
+    fn try_from(state: &'a [u8]) -> Result<Self, Self::Error> {
         // Decompose the state and extract the compressed web interface
         let mut state = Cursor::new(state);
 
