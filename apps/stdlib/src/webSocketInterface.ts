@@ -97,12 +97,13 @@ export interface ResponseHandler {
 }
 
 export class LocutusWsApi {
-    private ws: WebSocket
+    public ws: WebSocket
     private encoder: Encoder
     private reponseHandler: ResponseHandler
 
     constructor(url: URL, handler: ResponseHandler) {
         this.ws = new WebSocket(url);
+        this.ws.binaryType = 'arraybuffer';
         this.encoder = new Encoder();
         this.reponseHandler = handler;
         this.ws.onmessage = (ev) => {
@@ -113,7 +114,8 @@ export class LocutusWsApi {
     private handleResponse(ev: MessageEvent<any>): void | Error {
         let response;
         try {
-            response = new HostResponse(ev.data);
+            let data = new Uint8Array(ev.data);
+            response = new HostResponse(data);
         } catch (err) {
             console.log(`found error: ${err}`);
             return new Error(`${err}`);
