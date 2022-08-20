@@ -94,6 +94,7 @@ export interface ResponseHandler {
     onUpdate: (response: UpdateResponse) => void,
     onUpdateNotification: (response: UpdateNotification) => void,
     onErr: (response: HostError) => void,
+    onOpen: () => void,
 }
 
 export class LocutusWsApi {
@@ -109,6 +110,9 @@ export class LocutusWsApi {
         this.ws.onmessage = (ev) => {
             this.handleResponse(ev);
         };
+        this.ws.addEventListener('open', (_) => {
+            handler.onOpen();
+        });
     }
 
     private handleResponse(ev: MessageEvent<any>): void | Error {

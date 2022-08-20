@@ -34,16 +34,21 @@ function getUpdate(update: UpdateResponse) {
     });
 }
 
-const HANDLER = {
+const handler = {
     onPut: (_response: PutResponse) => { },
     onGet: getState,
     onUpdate: getUpdate,
-    onUpdateNotification: (_response: UpdateNotification) => {},
+    onUpdateNotification: (_response: UpdateNotification) => { },
     onErr: (_response: HostError) => { },
+    onOpen: () => {
+        registerUpdater();
+        registerGetter();
+        subscribeToUpdates();
+    }
 }
 
 const API_URL = new URL(`ws://${location.host}/contract/command/`);
-let locutusApi = new LocutusWsApi(API_URL, HANDLER);
+const locutusApi = new LocutusWsApi(API_URL, handler);
 
 async function loadState() {
     let getRequest = {
@@ -86,17 +91,12 @@ function registerGetter() {
         getBtn.addEventListener("click", loadState);
 }
 
-async function subscribeToUpdates() {
-    console.log("subscribing to contract:" + MODEL_CONTRACT);
-    await locutusApi.subscribe({
-        key: Key.fromSpec(MODEL_CONTRACT)
-    });
-    console.log("sent subscription request");
-}
+const key = Key.fromSpec(MODEL_CONTRACT)
 
-// Connection opened
-locutusApi.ws.addEventListener('open', (_) => {
-    registerUpdater();
-    registerGetter();
-    subscribeToUpdates();
-});
+async function subscribeToUpdates() {
+    console.log(`subscribing to contract: ${MODEL_CONTRACT}`);
+    await locutusApi.subscribe({
+        key: key
+    });
+    console.log(`sent subscription request to key: '${key.encode()}'`);
+}

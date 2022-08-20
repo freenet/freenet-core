@@ -151,7 +151,10 @@ async fn websocket_interface(
                 .await
                 .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
             {
-                Err(err) => return Err(Some(err.into())),
+                Err(err) => {
+                    tracing::info!(err = %err, "client channel error");
+                    return Err(Some(err.into()));
+                }
                 Ok(v) => v,
             };
             process_client_request(client_id, next_msg, &request_sender).await
@@ -178,8 +181,8 @@ async fn websocket_interface(
             response = listeners_task => {
                 let response = response?;
                 match &response {
-                    Ok(res) => tracing::info!(response = %res, cli_id = %client_id, "sending response"),
-                    Err(err) => tracing::info!(response = %err, cli_id = %client_id, "sending response error"),
+                    Ok(res) => tracing::info!(response = %res, cli_id = %client_id, "sending notification"),
+                    Err(err) => tracing::info!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
                 let msg = rmp_serde::to_vec(&response)?;
                 tx.send(Message::binary(msg)).await?;
@@ -204,7 +207,10 @@ async fn process_client_request(
         Ok(m) if m.is_ping() => {
             return Ok(Some(Message::pong(vec![0, 3, 2])));
         }
-        Ok(_) => return Ok(None),
+        Ok(m) => {
+            tracing::info!(msg = ?m);
+            return Ok(None);
+        }
         Err(err) => return Err(Some(err.into())),
     };
     let req: ClientRequest = {
@@ -239,7 +245,7 @@ async fn process_host_response(
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
             match &result {
-                Ok(res) => tracing::info!(response = ?res, cli_id = %id, "sending response"),
+                Ok(res) => tracing::info!(response = %res, cli_id = %id, "sending response"),
                 Err(err) => tracing::info!(response = %err, cli_id = %id, "sending response error"),
             }
             let res = rmp_serde::to_vec(&result)?;
