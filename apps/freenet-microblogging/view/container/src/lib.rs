@@ -4,33 +4,33 @@ struct Contract;
 
 #[contract]
 impl ContractInterface for Contract {
-    fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
+    fn validate_state(_parameters: Parameters<'static>, _state: State<'static>) -> bool {
         true
     }
 
-    fn validate_delta(_parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool {
+    fn validate_delta(_parameters: Parameters<'static>, _delta: StateDelta<'static>) -> bool {
         true
     }
 
     fn update_state(
         _parameters: Parameters<'static>,
-        mut state: State<'static>,
-        delta: StateDelta<'static>,
+        state: State<'static>,
+        _delta: StateDelta<'static>,
     ) -> Result<UpdateModification, ContractError> {
         Ok(UpdateModification::ValidUpdate(state))
     }
 
     fn summarize_state(
         _parameters: Parameters<'static>,
-        state: State<'static>,
+        _state: State<'static>,
     ) -> StateSummary<'static> {
         StateSummary::from(vec![])
     }
 
     fn get_state_delta(
         _parameters: Parameters<'static>,
-        state: State<'static>,
-        summary: StateSummary<'static>,
+        _state: State<'static>,
+        _summary: StateSummary<'static>,
     ) -> StateDelta<'static> {
         StateDelta::from(vec![])
     }
