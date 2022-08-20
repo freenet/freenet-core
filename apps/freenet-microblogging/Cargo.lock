@@ -296,6 +296,7 @@ version = "0.0.0"
 dependencies = [
  "byteorder",
  "ed25519-dalek",
+ "freenet-microblogging-model",
  "locutus-stdlib",
  "serde",
  "serde_json",
@@ -309,7 +310,7 @@ name = "freenet-microblogging-model"
 version = "0.0.0"
 dependencies = [
  "byteorder",
- "chrono",
+ "ed25519-dalek",
  "locutus-stdlib",
  "serde",
  "serde_json",

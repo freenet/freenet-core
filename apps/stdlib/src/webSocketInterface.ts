@@ -14,7 +14,7 @@ export class Key {
     private contract: Uint8Array | null
 
     constructor(spec: Uint8Array, contract?: Uint8Array) {
-        if (spec.length != 32 || contract && contract.length != 32) {
+        if (spec.length != 32 || typeof contract != "undefined" && contract.length != 32) {
             throw TypeError("invalid array lenth (expected 32 bytes): " + spec.length);
         }
         this.spec = spec;
@@ -262,8 +262,8 @@ export class HostResponse {
             let err = decoded as { "Err": Array<any> };
             if ("RequestError" in err.Err[0]) {
                 if ("Update" in err.Err[0].RequestError) {
-                    let updateErr = err.Err[0].RequestError.Update as Array<Array<any>>;
-                    let contractKey = new Key(updateErr[0][0] as Uint8Array);
+                    let updateErr = err.Err[0].RequestError.Update as Array<Array<Uint8Array>>;
+                    let contractKey = new Key(updateErr[0][0]);
                     this.result = { cause: "Update error for contract " + contractKey.encode() };
                     return;
                 }

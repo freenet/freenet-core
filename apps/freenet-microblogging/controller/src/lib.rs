@@ -1,5 +1,6 @@
 // use chrono::{DateTime, Utc};
 use ed25519_dalek::Verifier;
+use freenet_microblogging_model::Message;
 use locutus_stdlib::{
     blake2::{Blake2b512, Digest},
     prelude::*,
@@ -11,34 +12,6 @@ use serde_with::serde_as;
 #[derive(Serialize, Deserialize)]
 struct MessageFeed {
     messages: Vec<Message>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Message {
-    author: String,
-    // date: DateTime<Utc>,
-    title: String,
-    content: String,
-    #[serde(default = "Message::modded")]
-    mod_msg: bool,
-    signature: Option<ed25519_dalek::Signature>,
-}
-
-impl Message {
-    fn hash(&self) -> [u8; 64] {
-        let mut hasher = Blake2b512::new();
-        hasher.update(self.author.as_bytes());
-        hasher.update(self.title.as_bytes());
-        hasher.update(self.content.as_bytes());
-        let hash_val = hasher.finalize();
-        let mut key = [0; 64];
-        key.copy_from_slice(&hash_val[..]);
-        key
-    }
-
-    fn modded() -> bool {
-        false
-    }
 }
 
 // TODO: make this build from a `ControllerState`
@@ -271,12 +244,29 @@ mod test {
             .to_vec();
         let state: Vec<u8> = get_test_state(state_bytes);
 
-        let delta =
+        let _delta =
             r#"[{"author":"IDG","content":"...","date":"2022-06-15T00:00:00Z","title":"New msg"}]"#;
+
+        let delta = StateDelta::from(vec![
+            123u8, 10, 9, 9, 9, 34, 97, 117, 116, 104, 111, 114, 34, 58, 32, 34, 73, 68, 71, 34,
+            44, 10, 9, 9, 9, 34, 100, 97, 116, 101, 34, 58, 32, 34, 50, 48, 50, 50, 45, 48, 53, 45,
+            49, 48, 84, 48, 48, 58, 48, 48, 58, 48, 48, 90, 34, 44, 10, 9, 9, 9, 34, 116, 105, 116,
+            108, 101, 34, 58, 32, 34, 76, 111, 114, 101, 32, 105, 112, 115, 117, 109, 34, 44, 10,
+            9, 9, 9, 34, 99, 111, 110, 116, 101, 110, 116, 34, 58, 32, 34, 76, 111, 114, 101, 109,
+            32, 105, 112, 115, 117, 109, 32, 100, 111, 108, 111, 114, 32, 115, 105, 116, 32, 97,
+            109, 101, 116, 44, 32, 99, 111, 110, 115, 101, 99, 116, 101, 116, 117, 114, 32, 97,
+            100, 105, 112, 105, 115, 99, 105, 110, 103, 32, 101, 108, 105, 116, 44, 32, 115, 101,
+            100, 32, 100, 111, 32, 101, 105, 117, 115, 109, 111, 100, 32, 116, 101, 109, 112, 111,
+            114, 32, 105, 110, 99, 105, 100, 105, 100, 117, 110, 116, 32, 117, 116, 32, 108, 97,
+            98, 111, 114, 101, 32, 101, 116, 32, 100, 111, 108, 111, 114, 101, 32, 109, 97, 103,
+            110, 97, 32, 97, 108, 105, 113, 117, 97, 46, 34, 10, 9, 9, 125,
+        ]);
+
         let new_state = MessageFeed::update_state(
             [].as_ref().into(),
             state.into(),
-            delta.as_bytes().to_vec().into(),
+            // delta.as_bytes().to_vec().into(),
+            delta,
         )
         .unwrap()
         .unwrap_valid();
