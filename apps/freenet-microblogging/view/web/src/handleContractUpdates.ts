@@ -27,19 +27,29 @@ function getState(hostResponse: GetResponse) {
   let decoder = new TextDecoder("utf8");
   let currentStateBox = DOCUMENT.getElementById(
     "current-state"
-  ) as HTMLTextAreaElement;
-  currentStateBox.textContent = decoder.decode(
-    Uint8Array.from(hostResponse.state)
+  ) as HTMLPreElement;
+  let state = decoder.decode(
+      Uint8Array.from(hostResponse.state)
+  );
+  currentStateBox.textContent = JSON.stringify(
+      JSON.parse(state),
+      ['messages', 'author', 'date', 'title', 'content'],
+      2
   );
 }
 
 function getUpdateNotification(notification: UpdateNotification) {
   let decoder = new TextDecoder("utf8");
   let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
-  updatesBox.textContent =
-    updatesBox.textContent +
-    "\n" +
-    decoder.decode(Uint8Array.from(notification.update));
+  let new_update = decoder.decode(Uint8Array.from(notification.update));
+  let new_update_json = JSON.parse(new_update.replace('\x00', ''));
+  let new_content = JSON.stringify(
+      new_update_json,
+      ['author', 'title', 'content', 'mod_msg', 'signature'],
+      2
+  );
+
+  updatesBox.textContent = updatesBox.textContent + new_content;
 }
 
 async function sendUpdate() {
@@ -51,12 +61,43 @@ async function sendUpdate() {
     sendVal = input;
   }
 
-  let encoder = new TextEncoder();
-  let updateRequest = {
-    key: KEY,
-    delta: encoder.encode("[" + sendVal.value + "]"),
-  };
-  await locutusApi.update(updateRequest);
+  if (is_valid_update(sendVal.value)) {
+    let encoder = new TextEncoder();
+    let updateRequest = {
+      key: KEY,
+      delta: encoder.encode("[" + sendVal.value + "]"),
+    };
+    await locutusApi.update(updateRequest);
+  }
+}
+
+function is_valid_update(input: string) : boolean {
+  const expected_keys = new Set(['author', 'date', 'title', 'content']);
+  try {
+    let input_json = JSON.parse(input);
+
+    if (Array.isArray(input_json)) {
+      return false;
+    }
+
+    let keys_set = new Set(Object.keys(input_json));
+    if (keys_set.size !== expected_keys.size) {
+      alert("The input json does not contain the expected keys")
+      return false;
+    }
+
+    for (let key of expected_keys) {
+      if (!keys_set.has(key)) {
+        alert("The input key" + key + "does not exist")
+        return false;
+      }
+    }
+
+   return true;
+  } catch (e) {
+    alert("Invalid json: " + input);
+    return false;
+  }
 }
 
 function registerUpdater() {
