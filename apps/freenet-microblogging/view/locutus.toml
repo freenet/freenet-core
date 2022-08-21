@@ -3,6 +3,3 @@ type = "view"
 
 [sources]
 source_dirs = ["web/dist"]
-files = [
-	"src/scss/styles.scss"
-]
