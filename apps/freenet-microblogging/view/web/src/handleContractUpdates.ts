@@ -7,6 +7,8 @@ import {
   Key,
   HostError,
 } from "locutus-stdlib/src/webSocketInterface";
+import "../src/scss/styles.scss";
+// import * as bootstrap from 'bootstrap'
 
 function getDocument(): Document {
   if (document) {
@@ -18,12 +20,17 @@ function getDocument(): Document {
 const DOCUMENT: Document = getDocument();
 
 const MODEL_CONTRACT = "6Q2zMtcHwsUyWg5VaR15Xn2yoNxjzufTJsSUHuajEijG";
+const KEY = Key.fromSpec(MODEL_CONTRACT);
 
 function getState(hostResponse: GetResponse) {
   console.log("Received get");
   let decoder = new TextDecoder("utf8");
-  let inputBox = DOCUMENT.getElementById("input") as HTMLTextAreaElement;
-  inputBox.textContent = decoder.decode(Uint8Array.from(hostResponse.state));
+  let currentStateBox = DOCUMENT.getElementById(
+    "current-state"
+  ) as HTMLTextAreaElement;
+  currentStateBox.textContent = decoder.decode(
+    Uint8Array.from(hostResponse.state)
+  );
 }
 
 function getUpdateNotification(notification: UpdateNotification) {
@@ -33,6 +40,43 @@ function getUpdateNotification(notification: UpdateNotification) {
     updatesBox.textContent +
     "\n" +
     decoder.decode(Uint8Array.from(notification.update));
+}
+
+async function sendUpdate() {
+  let input = DOCUMENT.getElementById("input") as null | HTMLTextAreaElement;
+  let sendVal: HTMLTextAreaElement;
+  if (!input) {
+    throw new Error();
+  } else {
+    sendVal = input;
+  }
+
+  let encoder = new TextEncoder();
+  let updateRequest = {
+    key: KEY,
+    delta: encoder.encode("[" + sendVal.value + "]"),
+  };
+  await locutusApi.update(updateRequest);
+}
+
+function registerUpdater() {
+  let updateBtn = DOCUMENT.getElementById("su-btn");
+  if (!updateBtn) throw new Error();
+  else updateBtn.addEventListener("click", sendUpdate);
+}
+
+function registerGetter() {
+  let getBtn = DOCUMENT.getElementById("ls-btn");
+  if (!getBtn) throw new Error();
+  else getBtn.addEventListener("click", loadState);
+}
+
+async function subscribeToUpdates() {
+  console.log(`subscribing to contract: ${MODEL_CONTRACT}`);
+  await locutusApi.subscribe({
+    key: KEY,
+  });
+  console.log(`sent subscription request to key: '${KEY.encode()}'`);
 }
 
 const handler = {
@@ -61,41 +105,6 @@ async function loadState() {
   await locutusApi.get(getRequest);
 }
 
-async function sendUpdate() {
-  let input = DOCUMENT.getElementById("input") as null | HTMLTextAreaElement;
-  let sendVal: HTMLTextAreaElement;
-  if (!input) {
-    throw new Error();
-  } else {
-    sendVal = input;
-  }
-
-  let encoder = new TextEncoder();
-  let updateRequest = {
-    key: Key.fromSpec(MODEL_CONTRACT),
-    delta: encoder.encode(sendVal.value),
-  };
-  await locutusApi.update(updateRequest);
-}
-
-function registerUpdater() {
-  let updateBtn = DOCUMENT.getElementById("su-btn");
-  if (!updateBtn) throw new Error();
-  else updateBtn.addEventListener("click", sendUpdate);
-}
-
-function registerGetter() {
-  let getBtn = DOCUMENT.getElementById("ls-btn");
-  if (!getBtn) throw new Error();
-  else getBtn.addEventListener("click", loadState);
-}
-
-const key = Key.fromSpec(MODEL_CONTRACT);
-
-async function subscribeToUpdates() {
-  console.log(`subscribing to contract: ${MODEL_CONTRACT}`);
-  await locutusApi.subscribe({
-    key: key,
-  });
-  console.log(`sent subscription request to key: '${key.encode()}'`);
-}
+window.addEventListener("load", function (_ev: Event) {
+  loadState();
+});
