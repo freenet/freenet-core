@@ -2,7 +2,7 @@
 type = "view"
 
 [sources]
-source_dirs = ["web/static"]
+source_dirs = ["web/dist"]
 files = [
-	"web/dist/bundle.js"
+	"src/scss/styles.scss"
 ]
