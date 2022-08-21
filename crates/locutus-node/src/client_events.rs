@@ -216,7 +216,7 @@ pub enum RequestError {
 }
 
 /// A request from a client application to the host.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum ClientRequest {
     /// Insert a new value in a contract corresponding with the provided key.
@@ -254,60 +254,59 @@ impl ClientRequest {
 
     /// Deserializes a `ClientRequest` from a MessagePack encoded request.  
     pub fn decode_mp(msg: Vec<u8>) -> Result<Self, ErrorKind> {
-        let msp_value = rmpv::decode::read_value(&mut Cursor::new(msg));
-
-        let req = match msp_value {
-            Ok(value) => {
-                if value.is_map() {
-                    let value_map: HashMap<_, _> = value
-                        .as_map()
-                        .unwrap()
-                        .iter()
-                        .map(|(key, val)| (key.as_str().unwrap(), val.clone()))
-                        .collect();
-
-                    let mut map_keys = Vec::from_iter(value_map.keys().cloned());
-                    map_keys.sort();
-
-                    match map_keys.as_slice() {
-                        ["contract", "state"] => {
-                            todo!("Not implemented, this transformation needs to be implemented")
-                        }
-                        ["delta", "key"] => {
-                            log::info!("Received update request");
-                            ClientRequest::Update {
-                                key: key_from_rmpv(value_map.get("key").unwrap().clone()),
-                                delta: delta_from_rmpv(value_map.get("delta").unwrap().clone()),
-                            }
-                        }
-                        ["fetch_contract", "key"] => ClientRequest::Get {
-                            key: key_from_rmpv(value_map.get("key").unwrap().clone()),
-                            fetch_contract: value_map
-                                .get("fetch_contract")
-                                .unwrap()
-                                .as_bool()
-                                .unwrap(),
-                        },
-                        ["key"] => ClientRequest::Subscribe {
-                            key: key_from_rmpv(value_map.get("key").unwrap().clone()),
-                        },
-                        ["cause"] => ClientRequest::Disconnect {
-                            cause: Some(
-                                value_map
-                                    .get("cause")
-                                    .unwrap()
-                                    .as_str()
-                                    .unwrap()
-                                    .to_string(),
-                            ),
-                        },
-                        _ => unreachable!(),
-                    }
-                } else {
-                    panic!("Error getting client request value, request is no a map")
-                }
+        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
+            ErrorKind::DeserializationError {
+                cause: format!("{e}"),
             }
-            Err(err) => panic!("Error getting client request value: {}", err),
+        })?;
+
+        let req = {
+            if value.is_map() {
+                let value_map: HashMap<_, _> = value
+                    .as_map()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, val)| (key.as_str().unwrap(), val.clone()))
+                    .collect();
+
+                let mut map_keys = Vec::from_iter(value_map.keys().cloned());
+                map_keys.sort();
+
+                match map_keys.as_slice() {
+                    ["contract", "state"] => {
+                        todo!("Not implemented, this transformation needs to be implemented")
+                    }
+                    ["delta", "key"] => {
+                        log::info!("Received update request");
+                        ClientRequest::Update {
+                            key: key_from_rmpv(value_map.get("key").unwrap().clone()),
+                            delta: delta_from_rmpv(value_map.get("delta").unwrap().clone()),
+                        }
+                    }
+                    ["fetch_contract", "key"] => ClientRequest::Get {
+                        key: key_from_rmpv(value_map.get("key").unwrap().clone()),
+                        fetch_contract: value_map.get("fetch_contract").unwrap().as_bool().unwrap(),
+                    },
+                    ["key"] => ClientRequest::Subscribe {
+                        key: key_from_rmpv(value_map.get("key").unwrap().clone()),
+                    },
+                    ["cause"] => ClientRequest::Disconnect {
+                        cause: Some(
+                            value_map
+                                .get("cause")
+                                .unwrap()
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        ),
+                    },
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err(ErrorKind::DeserializationError {
+                    cause: "value is not a map".into(),
+                });
+            }
         };
 
         Ok(req)
@@ -575,6 +574,56 @@ pub(crate) mod test {
         });
         let encoded = rmp_serde::to_vec(&update_notif)?;
         let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
+        let expected_client_request = ClientRequest::Update {
+            key: ContractKey::from_spec("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
+                .unwrap(),
+            delta: locutus_runtime::StateDelta::from(vec![
+                91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 97, 117, 116,
+                104, 111, 114, 34, 58, 34, 73, 68, 71, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+                34, 100, 97, 116, 101, 34, 58, 34, 50, 48, 50, 50, 45, 48, 54, 45, 49, 53, 84, 48,
+                48, 58, 48, 48, 58, 48, 48, 90, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34,
+                116, 105, 116, 108, 101, 34, 58, 34, 78, 101, 119, 32, 109, 115, 103, 34, 44, 10,
+                32, 32, 32, 32, 32, 32, 32, 32, 34, 99, 111, 110, 116, 101, 110, 116, 34, 58, 34,
+                46, 46, 46, 34, 10, 32, 32, 32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
+            ]),
+        };
+        let msg: Vec<u8> = vec![
+            130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194,
+            187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151, 188, 167, 153, 197,
+            129, 25, 179, 198, 218, 99, 159, 139, 168, 99, 111, 110, 116, 114, 97, 99, 116, 192,
+            165, 100, 101, 108, 116, 97, 196, 134, 91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32,
+            32, 32, 32, 32, 34, 97, 117, 116, 104, 111, 114, 34, 58, 34, 73, 68, 71, 34, 44, 10,
+            32, 32, 32, 32, 32, 32, 32, 32, 34, 100, 97, 116, 101, 34, 58, 34, 50, 48, 50, 50, 45,
+            48, 54, 45, 49, 53, 84, 48, 48, 58, 48, 48, 58, 48, 48, 90, 34, 44, 10, 32, 32, 32, 32,
+            32, 32, 32, 32, 34, 116, 105, 116, 108, 101, 34, 58, 34, 78, 101, 119, 32, 109, 115,
+            103, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 99, 111, 110, 116, 101, 110, 116,
+            34, 58, 34, 46, 46, 46, 34, 10, 32, 32, 32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
+        ];
+        let result_client_request = ClientRequest::decode_mp(msg)?;
+        assert_eq!(result_client_request, expected_client_request);
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
+        let expected_client_request = ClientRequest::Get {
+            key: ContractKey::from_spec("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
+                .unwrap(),
+            fetch_contract: false,
+        };
+        let msg: Vec<u8> = vec![
+            130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194,
+            187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151, 188, 167, 153, 197,
+            129, 25, 179, 198, 218, 99, 159, 139, 168, 99, 111, 110, 116, 114, 97, 99, 116, 192,
+            174, 102, 101, 116, 99, 104, 95, 99, 111, 110, 116, 114, 97, 99, 116, 194,
+        ];
+        let result_client_request = ClientRequest::decode_mp(msg)?;
+        assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }
 }

@@ -297,7 +297,7 @@ impl<'a> std::io::Read for State<'a> {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct StateDelta<'a>(Cow<'a, [u8]>);
 
