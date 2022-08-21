@@ -152,7 +152,7 @@ async fn websocket_interface(
                 .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
             {
                 Err(err) => {
-                    tracing::info!(err = %err, "client channel error");
+                    tracing::debug!(err = %err, "client channel error");
                     return Err(Some(err.into()));
                 }
                 Ok(v) => v,
@@ -181,8 +181,8 @@ async fn websocket_interface(
             response = listeners_task => {
                 let response = response?;
                 match &response {
-                    Ok(res) => tracing::info!(response = %res, cli_id = %client_id, "sending notification"),
-                    Err(err) => tracing::info!(response = %err, cli_id = %client_id, "sending notification error"),
+                    Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
+                    Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
                 let msg = rmp_serde::to_vec(&response)?;
                 tx.send(Message::binary(msg)).await?;
@@ -208,7 +208,7 @@ async fn process_client_request(
             return Ok(Some(Message::pong(vec![0, 3, 2])));
         }
         Ok(m) => {
-            tracing::info!(msg = ?m);
+            tracing::debug!(msg = ?m, "received random message");
             return Ok(None);
         }
         Err(err) => return Err(Some(err.into())),
@@ -228,7 +228,7 @@ async fn process_client_request(
             }
         }
     };
-    tracing::info!(req = %req, "received client request");
+    tracing::debug!(req = %req, "received client request");
     request_sender
         .send(ClientConnection::Request { client_id, req })
         .await
@@ -247,7 +247,7 @@ async fn process_host_response(
             let mut _wrapped_state = None; // avoids copying
             let result = match result {
                 Ok(res) => {
-                    tracing::info!(response = %res, cli_id = %id, "sending response");
+                    tracing::debug!(response = %res, cli_id = %id, "sending response");
                     match res {
                         HostResponse::GetResponse { contract, state } => {
                             _wrapped_state = Some(state);
@@ -262,7 +262,7 @@ async fn process_host_response(
                     }
                 }
                 Err(err) => {
-                    tracing::info!(response = %err, cli_id = %id, "sending response error");
+                    tracing::debug!(response = %err, cli_id = %id, "sending response error");
                     Err(err)
                 }
             };
@@ -372,52 +372,4 @@ impl ClientEventsProxy for HttpGateway {
             Ok(())
         })
     }
-}
-
-#[test]
-fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
-    let expected_client_request = ClientRequest::Update {
-        key: ContractKey::from_spec("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
-            .unwrap(),
-        delta: locutus_runtime::StateDelta::from(vec![
-            91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 97, 117, 116, 104,
-            111, 114, 34, 58, 34, 73, 68, 71, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 100,
-            97, 116, 101, 34, 58, 34, 50, 48, 50, 50, 45, 48, 54, 45, 49, 53, 84, 48, 48, 58, 48,
-            48, 58, 48, 48, 90, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 116, 105, 116, 108,
-            101, 34, 58, 34, 78, 101, 119, 32, 109, 115, 103, 34, 44, 10, 32, 32, 32, 32, 32, 32,
-            32, 32, 34, 99, 111, 110, 116, 101, 110, 116, 34, 58, 34, 46, 46, 46, 34, 10, 32, 32,
-            32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
-        ]),
-    };
-    let msg: Vec<u8> = vec![
-        130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194, 187,
-        46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151, 188, 167, 153, 197, 129, 25,
-        179, 198, 218, 99, 159, 139, 168, 99, 111, 110, 116, 114, 97, 99, 116, 192, 165, 100, 101,
-        108, 116, 97, 196, 134, 91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32,
-        34, 97, 117, 116, 104, 111, 114, 34, 58, 34, 73, 68, 71, 34, 44, 10, 32, 32, 32, 32, 32,
-        32, 32, 32, 34, 100, 97, 116, 101, 34, 58, 34, 50, 48, 50, 50, 45, 48, 54, 45, 49, 53, 84,
-        48, 48, 58, 48, 48, 58, 48, 48, 90, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 116,
-        105, 116, 108, 101, 34, 58, 34, 78, 101, 119, 32, 109, 115, 103, 34, 44, 10, 32, 32, 32,
-        32, 32, 32, 32, 32, 34, 99, 111, 110, 116, 101, 110, 116, 34, 58, 34, 46, 46, 46, 34, 10,
-        32, 32, 32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
-    ];
-    let result_client_request = ClientRequest::decode_mp(msg);
-    Ok(())
-}
-
-#[test]
-fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
-    let expected_client_request = ClientRequest::Get {
-        key: ContractKey::from_spec("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
-            .unwrap(),
-        fetch_contract: false,
-    };
-    let msg: Vec<u8> = vec![
-        130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194, 187,
-        46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151, 188, 167, 153, 197, 129, 25,
-        179, 198, 218, 99, 159, 139, 168, 99, 111, 110, 116, 114, 97, 99, 116, 192, 174, 102, 101,
-        116, 99, 104, 95, 99, 111, 110, 116, 114, 97, 99, 116, 194,
-    ];
-    let result_client_request = ClientRequest::decode_mp(msg);
-    Ok(())
 }
