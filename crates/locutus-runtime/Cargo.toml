@@ -15,7 +15,7 @@ dashmap = "^5.1"
 futures = "0.3"
 serde = { version = "1", features = ["rc", "derive"] }
 serde_bytes = "0.11"
-stretto = { version = "0.4", features = ["async", "sync"], default-features = false }
+stretto = { version = "0.6", features = ["async", "sync"], default-features = false }
 tracing = "0.1"
 thiserror = "1"
 walkdir = "2.3.2"
