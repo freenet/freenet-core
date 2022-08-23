@@ -1,5 +1,6 @@
 [package]
 type = "controller"
+lang = "rust"
 
 [sources]
 files = ["initial_state.json"]

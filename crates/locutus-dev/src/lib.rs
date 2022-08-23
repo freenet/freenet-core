@@ -3,7 +3,7 @@ use locutus_node::ClientRequest;
 mod config;
 mod executor;
 mod local_node;
-pub mod package_manager;
+pub mod build_tool;
 mod state;
 mod user_events;
 pub(crate) mod util;

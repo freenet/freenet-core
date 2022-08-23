@@ -2,7 +2,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use locutus_dev::{
-    package_manager::package_state, set_cleanup_on_exit, user_fn_handler, wasm_runtime, AppState,
+    build_tool::build_package, set_cleanup_on_exit, user_fn_handler, wasm_runtime, AppState,
     Config, LocalNodeConfig, SubCommand,
 };
 
@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     match Config::parse().sub_command {
         SubCommand::RunLocal(local_node_config) => run_local_node_client(local_node_config).await,
-        SubCommand::Build(package_manager_config) => package_state(package_manager_config),
+        SubCommand::Build(build_tool_config) => build_package(build_tool_config),
     }
 }
 

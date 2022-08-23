@@ -309,26 +309,16 @@ dependencies = [
 name = "freenet-microblogging-model"
 version = "0.0.0"
 dependencies = [
- "byteorder",
  "ed25519-dalek",
  "locutus-stdlib",
  "serde",
- "serde_json",
- "serde_with 1.14.0",
- "tar",
- "xz2",
 ]
 
 [[package]]
 name = "freenet-microblogging-view"
 version = "0.0.0"
 dependencies = [
- "byteorder",
  "locutus-stdlib",
- "serde",
- "serde_json",
- "tar",
- "xz2",
 ]
 
 [[package]]
