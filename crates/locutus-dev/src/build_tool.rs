@@ -132,7 +132,14 @@ fn build_view_state(
                         .map(|c| c.webpack)
                         .unwrap_or_default();
                     if webpack {
+                        let cmd_args: &[&str] =
+                            if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+                                &["--color"]
+                            } else {
+                                &[]
+                            };
                         let child = Command::new("webpack")
+                            .args(cmd_args)
                             .current_dir(web_dir)
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
@@ -144,7 +151,14 @@ fn build_view_state(
                         pipe_std_streams(child)?;
                         println!("Compiled input using webpack");
                     } else {
+                        let cmd_args: &[&str] =
+                            if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+                                &["--pretty"]
+                            } else {
+                                &[]
+                            };
                         let child = Command::new("tsc")
+                            .args(cmd_args)
                             .current_dir(web_dir)
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
@@ -265,10 +279,19 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
             const RUST_TARGET_ARGS: &[&str] =
                 &["build", "--release", "--target", "wasm32-unknown-unknown"];
             const ERR: &str = "Cargo.toml definition incorrect";
+            let cmd_args = if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+                RUST_TARGET_ARGS
+                    .iter()
+                    .copied()
+                    .chain(["--color", "always"])
+                    .collect::<Vec<_>>()
+            } else {
+                RUST_TARGET_ARGS.to_vec()
+            };
 
             println!("Compiling contract with rust");
             let child = Command::new("cargo")
-                .args(RUST_TARGET_ARGS)
+                .args(&cmd_args)
                 .current_dir(&work_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -314,8 +337,6 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
             };
             out_file.set_extension("wasm");
             fs::copy(output_lib, out_file)?;
-            // std::io::stdout().write_all(&output.stdout)?;
-            // std::io::stderr().write_all(&output.stderr)?;
         }
         None => println!("no lang specified, skipping contract compilation"),
     }

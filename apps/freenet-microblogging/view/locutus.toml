@@ -9,4 +9,4 @@ source_dirs = ["web/dist"]
 lang = "typescript"
 
 [view.typescript]
-webpack = true
+webpack =  true
