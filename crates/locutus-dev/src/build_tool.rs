@@ -2,9 +2,10 @@ use std::{
     borrow::Cow,
     env,
     fs::{self, File},
-    io::{Cursor, Read, Write},
+    io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    time::Duration,
 };
 
 use locutus_runtime::locutus_stdlib::web::{controller::ControllerState, view::WebViewState};
@@ -131,27 +132,28 @@ fn build_view_state(
                         .map(|c| c.webpack)
                         .unwrap_or_default();
                     if webpack {
-                        let output = Command::new("webpack")
+                        let child = Command::new("webpack")
                             .current_dir(web_dir)
-                            .output()
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
                             .map_err(|e| {
-                                eprintln!("Error while executing cmd webpack: {e}");
+                                eprintln!("Error while executing webpack command: {e}");
                                 Error::CommandFailed("tsc")
                             })?;
-                        std::io::stdout().write_all(&output.stdout)?;
-                        std::io::stderr().write_all(&output.stderr)?;
+                        pipe_std_streams(child)?;
                         println!("Compiled input using webpack");
                     } else {
-                        let output =
-                            Command::new("tsc")
-                                .current_dir(web_dir)
-                                .output()
-                                .map_err(|e| {
-                                    eprintln!("Error while executing cmd tsc: {e}");
-                                    Error::CommandFailed("tsc")
-                                })?;
-                        std::io::stdout().write_all(&output.stdout)?;
-                        std::io::stderr().write_all(&output.stderr)?;
+                        let child = Command::new("tsc")
+                            .current_dir(web_dir)
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .map_err(|e| {
+                                eprintln!("Error while executing command tsc: {e}");
+                                Error::CommandFailed("tsc")
+                            })?;
+                        pipe_std_streams(child)?;
                         println!("Compiled input using tsc");
                     }
                 } else {
@@ -265,16 +267,17 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
             const ERR: &str = "Cargo.toml definition incorrect";
 
             println!("Compiling contract with rust");
-            Command::new("cargo")
+            let child = Command::new("cargo")
                 .args(RUST_TARGET_ARGS)
                 .current_dir(&work_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .output()
+                .spawn()
                 .map_err(|e| {
-                    eprintln!("Error while executing cmd webpack: {e}");
+                    eprintln!("Error while executing cargo command: {e}");
                     Error::CommandFailed("tsc")
                 })?;
+            pipe_std_streams(child)?;
 
             let mut f_content = vec![];
             File::open(work_dir.join("Cargo.toml"))?.read_to_end(&mut f_content)?;
@@ -317,6 +320,50 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
         None => println!("no lang specified, skipping contract compilation"),
     }
     println!("Contract compiled");
+    Ok(())
+}
+
+fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
+    let mut c_stdout = child.stdout.take().expect("Failed to open command stdout");
+    let mut stdout = io::stdout();
+    let mut stdout_buf = vec![];
+
+    let mut c_stderr = child.stderr.take().expect("Failed to open command stderr");
+    let mut stderr = io::stderr();
+    let mut stderr_buf = vec![];
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Err(format!("exist with status: {status}").into());
+                }
+                break;
+            }
+            Ok(None) => {
+                // attempt to write output to parent stds
+                c_stdout.read_to_end(&mut stdout_buf)?;
+                stdout.write_all(&stdout_buf)?;
+                stdout_buf.clear();
+
+                c_stderr.read_to_end(&mut stderr_buf)?;
+                stderr.write_all(&stderr_buf)?;
+                stderr_buf.clear();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    // write out any remaining input
+    c_stdout.read_to_end(&mut stdout_buf)?;
+    stdout.write_all(&stdout_buf)?;
+    stdout_buf.clear();
+
+    c_stderr.read_to_end(&mut stderr_buf)?;
+    stderr.write_all(&stderr_buf)?;
+    stderr_buf.clear();
+
     Ok(())
 }
 
