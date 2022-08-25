@@ -1,7 +1,7 @@
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 
 use locutus_node::*;
-use locutus_runtime::{locutus_stdlib::web::controller::ControllerState, ContractKey};
+use locutus_runtime::{locutus_stdlib::web::data::WebDataState, ContractKey};
 use std::{
     collections::HashMap,
     future::Future,
@@ -252,10 +252,10 @@ async fn process_host_response(
                         HostResponse::GetResponse { contract, state } => {
                             _wrapped_state = Some(state);
                             let borrowed_state = _wrapped_state.as_ref().unwrap();
-                            let inner_state = ControllerState::try_from(&**borrowed_state)?;
+                            let inner_state = WebDataState::try_from(&**borrowed_state)?;
                             Ok(HostResponse::GetResponse {
                                 contract,
-                                state: inner_state.controller_data,
+                                state: inner_state.contract_data,
                             })
                         }
                         other => Ok(other.try_into()?),

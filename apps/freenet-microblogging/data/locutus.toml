@@ -1,5 +1,4 @@
-[package]
-type = "controller"
+[contract]
 lang = "rust"
 
 [sources]

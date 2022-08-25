@@ -7,7 +7,7 @@ import {
   Key,
   HostError,
 } from "locutus-stdlib/src/webSocketInterface";
-import "../src/scss/styles.scss";
+import "./scss/styles.scss";
 // import * as bootstrap from 'bootstrap'
 
 function getDocument(): Document {
@@ -18,12 +18,6 @@ function getDocument(): Document {
   }
 }
 const DOCUMENT: Document = getDocument();
-
-/*
-{
-  my-view: { key: " hjcsd787cyd"}
-}
-*/
 
 const MODEL_CONTRACT = "6Q2zMtcHwsUyWg5VaR15Xn2yoNxjzufTJsSUHuajEijG";
 const KEY = Key.fromSpec(MODEL_CONTRACT);

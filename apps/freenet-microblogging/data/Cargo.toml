@@ -14,9 +14,6 @@ serde_with = "1"
 ed25519-dalek = { version = "1", features = ["serde", "u32_backend"], default-features = false }
 byteorder = "1"
 
-# internal
-freenet-microblogging-model = { path = "../model" }
-
 [lib]
 crate-type = ["cdylib"]
 

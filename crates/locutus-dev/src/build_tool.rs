@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use locutus_runtime::locutus_stdlib::web::{controller::ControllerState, view::WebViewState};
+use locutus_runtime::locutus_stdlib::web::{data::WebDataState, view::WebViewState};
 use serde::{Deserialize, Serialize};
 use tar::Builder;
 
@@ -40,15 +40,15 @@ pub fn build_package(_cli_config: BuildToolCliConfig) -> Result<(), DynError> {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct BuildToolConfig {
-    pub package: Package,
-    pub sources: Sources,
+    pub contract: Contract,
+    pub sources: Option<Sources>,
     pub metadata: Option<PathBuf>,
     pub output: Option<Output>,
-    pub view: Option<ViewContract>,
+    pub webapp: Option<WebAppContract>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Package {
+pub(crate) struct Contract {
     #[serde(rename(deserialize = "type"))]
     pub c_type: ContractType,
     pub lang: Option<SupportedContractLangs>,
@@ -79,7 +79,7 @@ pub(crate) struct Output {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ViewContract {
+pub(crate) struct WebAppContract {
     pub lang: SupportedViewLangs,
     pub typescript: Option<TypescriptConfig>,
 }
@@ -108,12 +108,12 @@ fn internal_package_state(mut config: BuildToolConfig, cwd: &Path) -> Result<(),
 
     compile_contract(&config, cwd)?;
 
-    match config.package.c_type {
+    match config.contract.c_type {
         ContractType::View => build_view_state(metadata, &config, cwd)?,
-        ContractType::Controller => build_controller_state(metadata, &mut config)?,
+        ContractType::Controller => build_generic_state(metadata, &mut config)?,
     }
 
-    if let Some(_lang) = &config.package.lang {
+    if let Some(_lang) = &config.contract.lang {
         // todo: try to compile the package
     }
     Ok(())
@@ -126,9 +126,8 @@ fn build_view_state(
 ) -> Result<(), DynError> {
     println!("Bundling `view` contract state");
     let mut archive: Builder<Cursor<Vec<u8>>> = Builder::new(Cursor::new(Vec::new()));
-    let mut found_entry = false;
 
-    if let Some(view_config) = &config.view {
+    if let Some(view_config) = &config.webapp {
         match &view_config.lang {
             SupportedViewLangs::Typescript => {
                 let web_dir = cwd.join("web");
@@ -185,59 +184,72 @@ fn build_view_state(
         }
     }
 
-    if let Some(sources) = &config.sources.files {
-        for src in sources {
-            for entry in glob::glob(src)? {
-                let p = entry?;
-                if p.ends_with("index.html") && p.starts_with("index.html") {
-                    // ensures that index is present and at the root
-                    found_entry = true;
+    let build_state = |sources: &Sources| -> Result<(), DynError> {
+        let mut found_entry = false;
+        if let Some(sources) = &sources.files {
+            for src in sources {
+                for entry in glob::glob(src)? {
+                    let p = entry?;
+                    if p.ends_with("index.html") && p.starts_with("index.html") {
+                        // ensures that index is present and at the root
+                        found_entry = true;
+                    }
+                    let mut f = File::open(&p)?;
+                    archive.append_file(p, &mut f)?;
                 }
-                let mut f = File::open(&p)?;
-                archive.append_file(p, &mut f)?;
             }
         }
-    }
-    if let Some(src_dirs) = &config.sources.source_dirs {
-        for dir in src_dirs {
-            if dir.is_dir() {
-                let present_entry = dir.join("index.html").exists();
-                if !found_entry && present_entry {
-                    found_entry = true;
-                } else if present_entry {
-                    return Err(format!(
-                        "duplicate entry point (index.html) found at directory: {dir:?}"
-                    )
-                    .into());
+        if let Some(src_dirs) = &sources.source_dirs {
+            for dir in src_dirs {
+                if dir.is_dir() {
+                    let present_entry = dir.join("index.html").exists();
+                    if !found_entry && present_entry {
+                        found_entry = true;
+                    } else if present_entry {
+                        return Err(format!(
+                            "duplicate entry point (index.html) found at directory: {dir:?}"
+                        )
+                        .into());
+                    }
+                    archive.append_dir_all(".", &dir)?;
+                } else {
+                    return Err(format!("unknown directory: {dir:?}").into());
                 }
-                archive.append_dir_all(".", &dir)?;
-            } else {
-                return Err(format!("unknown directory: {dir:?}").into());
             }
         }
-    }
 
-    if config.sources.source_dirs.is_none() && config.sources.files.is_none() {
-        return Err("need to specify source dirs and/or files".into());
-    }
-    if !found_entry {
-        return Err("didn't find entry point `index.html` in package".into());
+        if sources.source_dirs.is_none() && sources.files.is_none() {
+            return Err("need to specify source dirs and/or files".into());
+        }
+        if !found_entry {
+            return Err("didn't find entry point `index.html` in package".into());
+        } else {
+            let state = WebViewState::from_data(metadata, archive)?;
+            let packed = state.pack()?;
+            output_artifact(&config.output, &packed)?;
+            println!("Finished bundling `view` contract state");
+        }
+
+        Ok(())
+    };
+
+    if let Some(sources) = &config.sources {
+        build_state(sources)
     } else {
-        let state = WebViewState::from_data(metadata, archive)?;
-        let packed = state.pack()?;
-        output_artifact(&config.output, &packed)?;
-        println!("Finished bundling `view` contract state");
+        todo!()
     }
-
-    Ok(())
 }
 
-fn build_controller_state(metadata: Vec<u8>, config: &mut BuildToolConfig) -> Result<(), DynError> {
+fn build_generic_state(metadata: Vec<u8>, config: &mut BuildToolConfig) -> Result<(), DynError> {
     const REQ_ONE_FILE_ERR: &str = "Requires exactly one source file specified for the state.";
 
+    let sources = if let Some(src) = &mut config.sources {
+        src
+    } else {
+        return Ok(());
+    };
     println!("Bundling `controller` contract state");
-    let src_files = config
-        .sources
+    let src_files = sources
         .files
         .as_mut()
         .ok_or_else(|| Error::MissConfiguration(REQ_ONE_FILE_ERR.into()))?;
@@ -250,7 +262,7 @@ fn build_controller_state(metadata: Vec<u8>, config: &mut BuildToolConfig) -> Re
     let mut buf = vec![];
     let mut model_f = File::open(state)?;
     model_f.read_to_end(&mut buf)?;
-    let controller_state = ControllerState::from_data(metadata, buf);
+    let controller_state = WebDataState::from_data(metadata, buf);
     let packed = controller_state.pack()?;
     output_artifact(&config.output, &packed)?;
     println!("Finished bundling `controller` contract state");
@@ -277,11 +289,11 @@ fn output_artifact(output: &Option<Output>, packed: &[u8]) -> Result<(), DynErro
 }
 
 fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
-    let work_dir = match config.package.c_type {
+    let work_dir = match config.contract.c_type {
         ContractType::View => cwd.join("container"),
         ContractType::Controller => cwd.to_path_buf(),
     };
-    match config.package.lang {
+    match config.contract.lang {
         Some(SupportedContractLangs::Rust) => {
             const RUST_TARGET_ARGS: &[&str] =
                 &["build", "--release", "--target", "wasm32-unknown-unknown"];
@@ -399,23 +411,23 @@ fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
 mod test {
     use super::*;
 
-    fn setup_view_contract() -> Result<(BuildToolConfig, PathBuf), DynError> {
+    fn setup_webapp_contract() -> Result<(BuildToolConfig, PathBuf), DynError> {
         const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-        let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/view");
+        let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/web");
         env::set_current_dir(&cwd)?;
         Ok((
             BuildToolConfig {
-                sources: Sources {
-                    source_dirs: Some(vec!["web/dist".into()]),
+                sources: Some(Sources {
+                    source_dirs: Some(vec!["dist".into()]),
                     files: None,
-                },
-                package: Package {
+                }),
+                contract: Contract {
                     c_type: ContractType::View,
                     lang: Some(SupportedContractLangs::Rust),
                 },
                 metadata: None,
                 output: None,
-                view: Some(ViewContract {
+                webapp: Some(WebAppContract {
                     lang: SupportedViewLangs::Typescript,
                     typescript: Some(TypescriptConfig { webpack: true }),
                 }),
@@ -425,8 +437,8 @@ mod test {
     }
 
     #[test]
-    fn package_view_state() -> Result<(), DynError> {
-        let (config, cwd) = setup_view_contract()?;
+    fn package_webapp_state() -> Result<(), DynError> {
+        let (config, cwd) = setup_webapp_contract()?;
         build_view_state(vec![], &config, &cwd)?;
 
         let mut buf = vec![];
@@ -451,32 +463,32 @@ mod test {
     }
 
     #[test]
-    fn compile_view_contract() -> Result<(), DynError> {
-        let (config, cwd) = setup_view_contract()?;
+    fn compile_webapp_contract() -> Result<(), DynError> {
+        let (config, cwd) = setup_webapp_contract()?;
         compile_contract(&config, &cwd)?;
         Ok(())
     }
 
     #[test]
-    fn package_controller_state() -> Result<(), DynError> {
+    fn package_web_data_state() -> Result<(), DynError> {
         const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-        let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/controller");
+        let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/data");
         env::set_current_dir(&cwd)?;
         let mut config = BuildToolConfig {
-            sources: Sources {
+            sources: Some(Sources {
                 source_dirs: None,
                 files: Some(vec!["initial_state.json".into()]),
-            },
-            package: Package {
+            }),
+            contract: Contract {
                 c_type: ContractType::Controller,
                 lang: Some(SupportedContractLangs::Rust),
             },
             metadata: None,
             output: None,
-            view: None,
+            webapp: None,
         };
 
-        build_controller_state(vec![], &mut config)?;
+        build_generic_state(vec![], &mut config)?;
 
         assert!(PathBuf::from("target")
             .join("locutus")

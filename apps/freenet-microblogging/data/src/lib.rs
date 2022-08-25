@@ -1,10 +1,9 @@
 // use chrono::{DateTime, Utc};
 use ed25519_dalek::Verifier;
-use freenet_microblogging_model::Message;
 use locutus_stdlib::{
     blake2::{Blake2b512, Digest},
     prelude::*,
-    web::controller::ControllerState,
+    web::data::WebDataState,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -14,12 +13,40 @@ struct MessageFeed {
     messages: Vec<Message>,
 }
 
-// TODO: make this build from a `ControllerState`
+// TODO: make this build from a `WebDataState`
 impl<'a> TryFrom<State<'a>> for MessageFeed {
     type Error = ContractError;
 
     fn try_from(value: State<'a>) -> Result<Self, Self::Error> {
         serde_json::from_slice(value.as_ref()).map_err(|_| ContractError::InvalidState)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Message {
+    pub author: String,
+    // date: DateTime<Utc>,
+    pub title: String,
+    pub content: String,
+    #[serde(default = "Message::modded")]
+    pub mod_msg: bool,
+    pub signature: Option<ed25519_dalek::Signature>,
+}
+
+impl Message {
+    pub fn hash(&self) -> [u8; 64] {
+        let mut hasher = Blake2b512::new();
+        hasher.update(self.author.as_bytes());
+        hasher.update(self.title.as_bytes());
+        hasher.update(self.content.as_bytes());
+        let hash_val = hasher.finalize();
+        let mut key = [0; 64];
+        key.copy_from_slice(&hash_val[..]);
+        key
+    }
+
+    pub fn modded() -> bool {
+        false
     }
 }
 
@@ -77,7 +104,7 @@ impl<'a> TryFrom<Parameters<'a>> for Verification {
 #[contract]
 impl ContractInterface for MessageFeed {
     fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
-        let model = ControllerState::try_from(state.as_ref()).unwrap();
+        let model = WebDataState::try_from(state.as_ref()).unwrap();
         MessageFeed::try_from(State::from(model.controller_data.as_ref())).is_ok()
     }
 
@@ -90,7 +117,7 @@ impl ContractInterface for MessageFeed {
         state: State<'static>,
         delta: StateDelta<'static>,
     ) -> Result<UpdateModification, ContractError> {
-        let model = ControllerState::try_from(state.as_ref()).unwrap();
+        let model = WebDataState::try_from(state.as_ref()).unwrap();
         let mut feed = MessageFeed::try_from(State::from(model.controller_data.as_ref()))?;
         let verifier = Verification::try_from(parameters).ok();
         feed.messages.sort_by_cached_key(|m| m.hash());
@@ -118,7 +145,7 @@ impl ContractInterface for MessageFeed {
         let feed_bytes: Vec<u8> =
             serde_json::to_vec(&feed).map_err(|err| ContractError::Other(err.into()))?;
         let updated_state: Vec<u8> =
-            ControllerState::from_data(model.metadata.to_vec(), feed_bytes)
+            WebDataState::from_data(model.metadata.to_vec(), feed_bytes)
                 .pack()
                 .unwrap();
         Ok(UpdateModification::ValidUpdate(State::from(updated_state)))
@@ -128,7 +155,7 @@ impl ContractInterface for MessageFeed {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> StateSummary<'static> {
-        let model = ControllerState::try_from(state.as_ref()).unwrap();
+        let model = WebDataState::try_from(state.as_ref()).unwrap();
         let mut feed = MessageFeed::try_from(State::from(model.controller_data.as_ref())).unwrap();
         let only_messages = FeedSummary::from(&mut feed);
         StateSummary::from(serde_json::to_vec(&only_messages).expect("serialization failed"))
@@ -139,7 +166,7 @@ impl ContractInterface for MessageFeed {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> StateDelta<'static> {
-        let model = ControllerState::try_from(state.as_ref()).unwrap();
+        let model = WebDataState::try_from(state.as_ref()).unwrap();
         let feed = MessageFeed::try_from(State::from(model.controller_data.as_ref())).unwrap();
         let mut summary = match serde_json::from_slice::<FeedSummary>(&summary) {
             Ok(summary) => summary,
@@ -270,7 +297,7 @@ mod test {
         )
         .unwrap()
         .unwrap_valid();
-        let new_model_data = ControllerState::try_from(new_state.as_ref()).unwrap();
+        let new_model_data = WebDataState::try_from(new_state.as_ref()).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(new_model_data.controller_data.as_ref())
                 .unwrap(),

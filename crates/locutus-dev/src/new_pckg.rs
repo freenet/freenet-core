@@ -17,17 +17,17 @@ pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), DynError> {
 fn create_view_package(cwd: &Path) -> Result<(), DynError> {
     fs::create_dir_all(cwd.join("container"))?;
     let locutus_file_config = BuildToolConfig {
-        package: Package {
+        contract: Contract {
             c_type: ContractType::View,
             lang: Some(SupportedContractLangs::Rust),
         },
-        sources: Sources {
+        sources: Some(Sources {
             source_dirs: Some(vec![PathBuf::from("web").join("dist")]),
             files: None,
-        },
+        }),
         metadata: None,
         output: None,
-        view: Some(ViewContract {
+        webapp: Some(WebAppContract {
             lang: SupportedViewLangs::Typescript,
             typescript: Some(TypescriptConfig { webpack: true }),
         }),

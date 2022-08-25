@@ -18,9 +18,10 @@ pub enum WebContractError {
     FileNotFound(String),
 }
 
+#[non_exhaustive]
 pub struct WebViewState {
     pub metadata: Vec<u8>,
-    web: Vec<u8>,
+    pub web: Vec<u8>,
 }
 
 impl WebViewState {

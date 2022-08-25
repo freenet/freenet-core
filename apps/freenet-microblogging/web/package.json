@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "locutus-stdlib": "file:../../../stdlib",
+    "locutus-stdlib": "file:../../stdlib",
     "module-alias": "^2.2.2",
     "bootstrap": "5.2.0"
   },

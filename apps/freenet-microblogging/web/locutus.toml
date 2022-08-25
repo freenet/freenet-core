@@ -1,0 +1,12 @@
+[contract]
+type = "webapp"
+lang = "rust"
+
+[sources]
+source_dirs = ["dist"]
+
+[webapp]
+lang = "typescript"
+
+[webapp.typescript]
+webpack =  true
