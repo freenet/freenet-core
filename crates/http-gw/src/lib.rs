@@ -35,7 +35,7 @@ enum HostCallbackResult {
 pub mod local_node {
     use std::net::{Ipv4Addr, SocketAddr};
 
-    use locutus_dev::LocalNode;
+    use locutus_dev::local_node::LocalNode;
     use locutus_node::{
         either, ClientError, ClientEventsProxy, ErrorKind, OpenRequest, RequestError,
         WebSocketProxy,

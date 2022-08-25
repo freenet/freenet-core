@@ -7,7 +7,38 @@ use locutus_node::{
 use locutus_runtime::{prelude::*, ContractRuntimeError};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::DynError;
+use crate::{config::LocalNodeCliConfig, DynError};
+
+mod executor;
+mod state;
+mod user_events;
+
+pub async fn run_local_node_client(
+    config: LocalNodeCliConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    if config.disable_tui_mode {
+        return Err("TUI mode not yet implemented".into());
+    }
+
+    if config.clean_exit {
+        crate::util::set_cleanup_on_exit()?;
+    }
+
+    let app_state = state::AppState::new(&config).await?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(100);
+    let runtime = tokio::task::spawn(executor::wasm_runtime(
+        config.clone(),
+        receiver,
+        app_state.clone(),
+    ));
+    let user_fn = user_events::user_fn_handler(config, sender, app_state);
+    tokio::select! {
+        res = runtime => { res?? }
+        res = user_fn => { res? }
+    };
+    println!("Shutdown...");
+    Ok(())
+}
 
 type Response = Result<HostResponse, Either<RequestError, DynError>>;
 
@@ -311,9 +342,10 @@ impl LocalNode {
 
 #[cfg(test)]
 mod test {
-    use crate::LocalNode;
     use locutus_node::SqlitePool;
     use locutus_runtime::{ContractStore, StateStore};
+
+    use crate::local_node::LocalNode;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {

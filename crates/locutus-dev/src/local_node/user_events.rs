@@ -15,10 +15,11 @@ use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    config::{DeserializationFmt, LocalNodeConfig},
-    state::AppState,
+    config::{DeserializationFmt, LocalNodeCliConfig},
     util, CommandSender, DynError,
 };
+
+use super::state::AppState;
 
 const HELP: &str = "Locutus Contract Development Environment
 
@@ -31,8 +32,8 @@ SUBCOMMANDS:
 
 type HostIncomingMsg = Result<OpenRequest, ClientError>;
 
-pub async fn user_fn_handler(
-    config: LocalNodeConfig,
+pub(super) async fn user_fn_handler(
+    config: LocalNodeCliConfig,
     command_sender: CommandSender,
     app_state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -51,7 +52,7 @@ pub async fn user_fn_handler(
 }
 
 struct StdInput {
-    config: LocalNodeConfig,
+    config: LocalNodeCliConfig,
     contract: WrappedContract<'static>,
     input: File,
     buf: Vec<u8>,
@@ -59,7 +60,7 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: LocalNodeConfig, app_state: AppState) -> Result<Self, DynError> {
+    fn new(config: LocalNodeCliConfig, app_state: AppState) -> Result<Self, DynError> {
         let params = config
             .params
             .as_ref()
@@ -136,7 +137,7 @@ impl StdInput {
 
 #[derive(Serialize, Deserialize)]
 /// Data to be read from the input file after commands are issued.
-pub enum CommandInput {
+pub(super) enum CommandInput {
     Put { state: State<'static> },
     Update { delta: StateDelta<'static> },
 }

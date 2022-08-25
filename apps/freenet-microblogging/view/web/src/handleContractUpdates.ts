@@ -19,6 +19,12 @@ function getDocument(): Document {
 }
 const DOCUMENT: Document = getDocument();
 
+/*
+{
+  my-view: { key: " hjcsd787cyd"}
+}
+*/
+
 const MODEL_CONTRACT = "6Q2zMtcHwsUyWg5VaR15Xn2yoNxjzufTJsSUHuajEijG";
 const KEY = Key.fromSpec(MODEL_CONTRACT);
 
@@ -28,13 +34,11 @@ function getState(hostResponse: GetResponse) {
   let currentStateBox = DOCUMENT.getElementById(
     "current-state"
   ) as HTMLPreElement;
-  let state = decoder.decode(
-      Uint8Array.from(hostResponse.state)
-  );
+  let state = decoder.decode(Uint8Array.from(hostResponse.state));
   currentStateBox.textContent = JSON.stringify(
-      JSON.parse(state),
-      ['messages', 'author', 'date', 'title', 'content'],
-      2
+    JSON.parse(state),
+    ["messages", "author", "date", "title", "content"],
+    2
   );
 }
 
@@ -42,11 +46,11 @@ function getUpdateNotification(notification: UpdateNotification) {
   let decoder = new TextDecoder("utf8");
   let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
   let new_update = decoder.decode(Uint8Array.from(notification.update));
-  let new_update_json = JSON.parse(new_update.replace('\x00', ''));
+  let new_update_json = JSON.parse(new_update.replace("\x00", ""));
   let new_content = JSON.stringify(
-      new_update_json,
-      ['author', 'title', 'content', 'mod_msg', 'signature'],
-      2
+    new_update_json,
+    ["author", "title", "content", "mod_msg", "signature"],
+    2
   );
 
   updatesBox.textContent = updatesBox.textContent + new_content;
@@ -71,8 +75,8 @@ async function sendUpdate() {
   }
 }
 
-function is_valid_update(input: string) : boolean {
-  const expected_keys = new Set(['author', 'date', 'title', 'content']);
+function is_valid_update(input: string): boolean {
+  const expected_keys = new Set(["author", "date", "title", "content"]);
   try {
     let input_json = JSON.parse(input);
 
@@ -82,18 +86,18 @@ function is_valid_update(input: string) : boolean {
 
     let keys_set = new Set(Object.keys(input_json));
     if (keys_set.size !== expected_keys.size) {
-      alert("The input json does not contain the expected keys")
+      alert("The input json does not contain the expected keys");
       return false;
     }
 
     for (let key of expected_keys) {
       if (!keys_set.has(key)) {
-        alert("The input key" + key + "does not exist")
+        alert("The input key" + key + "does not exist");
         return false;
       }
     }
 
-   return true;
+    return true;
   } catch (e) {
     alert("Invalid json: " + input);
     return false;

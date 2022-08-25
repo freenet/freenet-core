@@ -1,9 +1,11 @@
 use locutus_node::{ClientId, ClientRequest, HostResponse};
 
-use crate::{state::AppState, CommandReceiver, DynError, LocalNodeConfig};
+use crate::{config::LocalNodeCliConfig, CommandReceiver, DynError};
 
-pub async fn wasm_runtime(
-    _config: LocalNodeConfig,
+use super::state::AppState;
+
+pub(super) async fn wasm_runtime(
+    _config: LocalNodeCliConfig,
     mut command_receiver: CommandReceiver,
     mut app: AppState,
 ) -> Result<(), DynError> {

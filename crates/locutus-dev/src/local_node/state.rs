@@ -5,19 +5,21 @@ use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::DeserializationFmt, set_cleanup_on_exit, DynError, LocalNode, LocalNodeConfig,
+    config::{DeserializationFmt, LocalNodeCliConfig},
+    local_node::LocalNode,
+    DynError,
 };
 
 #[derive(Clone)]
-pub struct AppState {
+pub(super) struct AppState {
     pub(crate) local_node: Arc<RwLock<LocalNode>>,
-    config: LocalNodeConfig,
+    config: LocalNodeCliConfig,
 }
 
 impl AppState {
     const MAX_MEM_CACHE: u32 = 10_000_000;
 
-    pub async fn new(config: &LocalNodeConfig) -> Result<Self, DynError> {
+    pub async fn new(config: &LocalNodeCliConfig) -> Result<Self, DynError> {
         let tmp_path = std::env::temp_dir().join("locutus").join("contracts");
         std::fs::create_dir_all(&tmp_path)?;
         let contract_store =
@@ -26,7 +28,7 @@ impl AppState {
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
                 LocalNode::new(contract_store, state_store, || {
-                    set_cleanup_on_exit().unwrap();
+                    crate::util::set_cleanup_on_exit().unwrap();
                 })
                 .await?,
             )),
@@ -35,7 +37,7 @@ impl AppState {
     }
 
     pub fn printout_deser<R: AsRef<[u8]> + ?Sized>(&self, data: &R) -> Result<(), std::io::Error> {
-        fn write_res(config: &LocalNodeConfig, pprinted: &str) -> Result<(), std::io::Error> {
+        fn write_res(config: &LocalNodeCliConfig, pprinted: &str) -> Result<(), std::io::Error> {
             if let Some(p) = &config.output_file {
                 let mut f = File::create(p)?;
                 f.write_all(pprinted.as_bytes())?;

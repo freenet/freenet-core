@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use clap::ArgGroup;
-use serde::Deserialize;
 
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
@@ -13,17 +12,11 @@ pub enum DeserializationFmt {
     MessagePack,
 }
 
-#[derive(clap::ArgEnum, Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ContractType {
-    Controller,
-    View,
-}
-
 #[derive(clap::Subcommand, Clone)]
 pub enum SubCommand {
-    RunLocal(LocalNodeConfig),
-    Build(PackageManagerConfig),
+    RunLocal(LocalNodeCliConfig),
+    Build(BuildToolCliConfig),
+    New(NewPackageCliConfig),
 }
 
 #[derive(clap::Parser, Clone)]
@@ -45,19 +38,19 @@ pub struct Config {
         .required(true)
         .args(&["output-file", "terminal-output"])
 ))]
-pub struct LocalNodeConfig {
+pub struct LocalNodeCliConfig {
     /// Cleanups all state which was created locally during execution
     #[clap(long, requires = "fmt")]
-    pub clean_exit: bool,
+    pub(crate) clean_exit: bool,
     /// Path to the contract to be loaded.
     #[clap(parse(from_os_str))]
-    pub contract: PathBuf,
+    pub(crate) contract: PathBuf,
     /// Path to the file containing the parameters for this contract. If not set the default parameters will be empty.
     #[clap(long = "parameters", parse(from_os_str))]
-    pub params: Option<PathBuf>,
+    pub(crate) params: Option<PathBuf>,
     /// Path to the input file to read from on command.
     #[clap(short, long, parse(from_os_str), value_name = "INPUT_FILE")]
-    pub input_file: PathBuf,
+    pub(crate) input_file: PathBuf,
     /// Deserialization format, requires feature flags enabled.
     #[clap(
         short,
@@ -66,24 +59,39 @@ pub struct LocalNodeConfig {
         group = "fmt",
         value_name = "FORMAT"
     )]
-    pub ser_format: Option<DeserializationFmt>,
+    pub(crate) ser_format: Option<DeserializationFmt>,
     /// Disable TUI mode (run only though CLI commands)
     #[clap(long)]
-    pub disable_tui_mode: bool,
+    pub(crate) disable_tui_mode: bool,
     /// Path to output file
     #[clap(short, long, parse(from_os_str), value_name = "OUTPUT_FILE")]
-    pub output_file: Option<PathBuf>,
+    pub(crate) output_file: Option<PathBuf>,
     /// Terminal output
     #[clap(long, requires = "fmt")]
-    pub terminal_output: bool,
+    pub(crate) terminal_output: bool,
     /// Max contract size
     #[clap(long, env = "LOCUTUS_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
-    pub max_contract_size: i64,
+    pub(crate) max_contract_size: i64,
 }
 
-/// Locutus Package Manager
+/// Locutus Build Tool
+#[derive(clap::Parser, Clone)]
+#[clap(name = "Locutus Build Tool")]
+#[clap(author = "The Freenet Project Inc.")]
+#[clap(version = "0.0.1")]
+pub struct BuildToolCliConfig {}
+
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Locutus Contract Package Manager")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.1")]
-pub struct PackageManagerConfig {}
+pub struct NewPackageCliConfig {
+    #[clap(id = "type", value_enum)]
+    pub(crate) kind: ContractKind,
+}
+
+#[derive(clap::ValueEnum, Clone)]
+pub(crate) enum ContractKind {
+    WebView,
+    WebController,
+}

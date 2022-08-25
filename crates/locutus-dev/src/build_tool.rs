@@ -9,10 +9,10 @@ use std::{
 };
 
 use locutus_runtime::locutus_stdlib::web::{controller::ControllerState, view::WebViewState};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tar::Builder;
 
-use crate::{ContractType, DynError, PackageManagerConfig};
+use crate::{config::BuildToolCliConfig, DynError};
 
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
 
@@ -25,7 +25,7 @@ enum Error {
     CommandFailed(&'static str),
 }
 
-pub fn build_package(_cli_config: PackageManagerConfig) -> Result<(), DynError> {
+pub fn build_package(_cli_config: BuildToolCliConfig) -> Result<(), DynError> {
     let cwd = env::current_dir()?;
     let config_file = cwd.join("locutus.toml");
     if config_file.exists() {
@@ -38,56 +38,63 @@ pub fn build_package(_cli_config: PackageManagerConfig) -> Result<(), DynError> 
     }
 }
 
-#[derive(Deserialize)]
-struct BuildToolConfig {
-    package: Package,
-    sources: Sources,
-    metadata: Option<PathBuf>,
-    output: Option<Output>,
-    view: Option<ViewContract>,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct BuildToolConfig {
+    pub package: Package,
+    pub sources: Sources,
+    pub metadata: Option<PathBuf>,
+    pub output: Option<Output>,
+    pub view: Option<ViewContract>,
 }
 
-#[derive(Deserialize)]
-struct Package {
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Package {
     #[serde(rename(deserialize = "type"))]
-    c_type: ContractType,
-    lang: Option<SupportedContractLangs>,
+    pub c_type: ContractType,
+    pub lang: Option<SupportedContractLangs>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum SupportedContractLangs {
+pub(crate) enum ContractType {
+    Controller,
+    View,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SupportedContractLangs {
     Rust,
 }
 
-#[derive(Deserialize)]
-struct Sources {
-    source_dirs: Option<Vec<PathBuf>>,
-    files: Option<Vec<String>>,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Sources {
+    pub source_dirs: Option<Vec<PathBuf>>,
+    pub files: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-struct Output {
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Output {
     path: PathBuf,
 }
 
-#[derive(Deserialize)]
-struct ViewContract {
-    lang: SupportedViewLangs,
-    typescript: Option<TypescriptConfig>,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ViewContract {
+    pub lang: SupportedViewLangs,
+    pub typescript: Option<TypescriptConfig>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum SupportedViewLangs {
+pub(crate) enum SupportedViewLangs {
     Javascript,
     Typescript,
 }
 
-#[derive(Deserialize)]
-struct TypescriptConfig {
+#[derive(Serialize, Deserialize)]
+pub(crate) struct TypescriptConfig {
     #[serde(default)]
-    webpack: bool,
+    pub webpack: bool,
 }
 
 fn internal_package_state(mut config: BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
