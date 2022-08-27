@@ -445,6 +445,7 @@ fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Location>>) 
     connections
 }
 
+#[ignore]
 #[test]
 fn group_locations_test() -> Result<(), anyhow::Error> {
     let locations = vec![

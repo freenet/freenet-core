@@ -295,7 +295,9 @@ async fn client_event_handling<ClientEv, CErr>(
 {
     loop {
         // fixme: send back responses to client
-        let OpenRequest { id, request, .. } = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
+        let OpenRequest {
+            id: _id, request, ..
+        } = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
         if let ClientRequest::Disconnect { .. } = request {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
                 log::error!("{}", err);
@@ -322,7 +324,10 @@ async fn client_event_handling<ClientEv, CErr>(
                         log::error!("{}", err);
                     }
                 }
-                ClientRequest::Update { key, delta } => {
+                ClientRequest::Update {
+                    key: _key,
+                    delta: _delta,
+                } => {
                     todo!()
                 }
                 ClientRequest::Get {

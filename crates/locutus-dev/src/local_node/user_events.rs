@@ -293,7 +293,7 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(Command::GetParams) => {
-                            let node = &*self.app_state.local_node.read().await;
+                            let _node = &*self.app_state.local_node.read().await;
                             // let p = node
                             //     .contract_state
                             //     .get_params(self.contract.key())

@@ -3,7 +3,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+#[cfg(feature = "local")]
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
+#[cfg(feature = "local")]
 const MAX_MEM_CACHE: u32 = 10_000_000;
 
 #[cfg(feature = "local")]

@@ -20,7 +20,7 @@ fn inner_ser_contract_data<S>(data: &Arc<ContractCode<'_>>, ser: S) -> Result<S:
 where
     S: Serializer,
 {
-    (&*data).serialize(ser)
+    (&**data).serialize(ser)
 }
 
 fn inner_deser_contract_data<'de, D>(deser: D) -> Result<Arc<ContractCode<'static>>, D::Error>

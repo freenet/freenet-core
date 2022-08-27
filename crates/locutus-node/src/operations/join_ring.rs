@@ -979,6 +979,7 @@ mod test {
     use crate::node::test::{check_connectivity, SimNetwork};
 
     /// Given a network of one node and one gateway test that both are connected.
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
@@ -988,6 +989,7 @@ mod test {
     }
 
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
@@ -999,6 +1001,7 @@ mod test {
 
     /// Given a network of N peers all nodes should have connections.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;

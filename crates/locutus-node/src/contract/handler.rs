@@ -108,7 +108,7 @@ impl<CErr: std::error::Error> ContractHandlerChannel<CErr, CHSenderHalve> {
                     if msg.id == id {
                         return Ok(msg.ev);
                     } else {
-                        let _ = self.queue.push_front((id, msg.ev)); // should never be duplicates
+                        self.queue.push_front((id, msg.ev)); // should never be duplicates
                     }
                 }
                 tokio::time::sleep(Duration::from_nanos(100)).await;
@@ -443,7 +443,8 @@ pub(in crate::contract) mod sqlite {
                     if !is_valid {
                         todo!("return error");
                     }
-                    let params: Parameters<'static> = contract.params().clone().into_owned().into();
+                    let _params: Parameters<'static> =
+                        contract.params().clone().into_owned().into();
                     self.state_store.store(*contract.key(), state, None).await?;
                     todo!()
                 }
@@ -474,6 +475,7 @@ pub(in crate::contract) mod sqlite {
             SQLiteContractHandler::new(ch_handler, store, MockRuntime {}).await
         }
 
+        #[ignore]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn contract_handler() -> Result<(), anyhow::Error> {
             // Create a sqlite handler and initialize the database
@@ -597,7 +599,7 @@ pub mod test {
 
         async fn handle_request(
             &mut self,
-            req: ClientRequest,
+            _req: ClientRequest,
         ) -> Result<HostResponse, Self::Error> {
             // async fn get_state(
             //     &self,
@@ -623,6 +625,7 @@ pub mod test {
         }
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_test() -> Result<(), anyhow::Error> {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
