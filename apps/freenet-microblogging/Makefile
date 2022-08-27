@@ -2,44 +2,36 @@
 
 .ONESHELL:
 
-VIEW_DIR =./view
-VIEW_FILES=$(wildcard ./view/*)
-
-CONTROLLER_DIR =./controller
-CONTROLLER_FILES=$(wildcard ./controllers/*)
-
+WEB_DIR =./web
+POSTS_DIR =./contracts/posts
 LOCUTUS_DIR=$(shell cd ../.. && pwd)
 
-view: $(VIEW_FILES)
-	cd $(LOCUTUS_DIR)
-	cd apps/freenet-microblogging
-	cd $(VIEW_DIR)
-
-	CARGO_TARGET_DIR=$(LOCUTUS_DIR)/target/
-	bash compile_contract.sh
-	mv $(LOCUTUS_DIR)/target/freenet_microblogging_view.wasm ../../../crates/http-gw/examples/
-
+build-tool:
 	cd $(LOCUTUS_DIR)
 	cd crates/locutus-dev
-	cargo run --bin locutus-dev -- build
+	cargo build --bin locutus-dev
 
-controller: $(CONTROLLER_FILES)
+view:
 	cd $(LOCUTUS_DIR)
 	cd apps/freenet-microblogging
-	cd $(CONTROLLER_DIR)
+	cd $(WEB_DIR)
 
-	CARGO_TARGET_DIR=$(LOCUTUS_DIR)/target/
-	bash compile_contract.sh
-	mv $(LOCUTUS_DIR)/target/freenet_microblogging_controller.wasm ../../../crates/http-gw/examples/
+	${CARGO_TARGET_DIR}/debug/locutus-dev build
+	mv ./build/locutus/freenet_microblogging_web.wasm ../../../crates/http-gw/examples/
+	mv ./build/locutus/contract-state ../../../crates/http-gw/examples/freenet_microblogging_web
 
+posts:
 	cd $(LOCUTUS_DIR)
-	cd crates/locutus-dev
-	cargo run --bin build_state -- --input-path ../../apps/freenet-microblogging/controllers/initial_state.json --output-file ../http-gw/examples/freenet_microblogging_controller --contract-type controllers
+	cd apps/freenet-microblogging
+	cd $(POSTS_DIR)
 
-build: controller view
+	${CARGO_TARGET_DIR}/debug/locutus-dev build
+	mv ./build/locutus/freenet_microblogging_posts.wasm ../../../../crates/http-gw/examples/
+	mv ./build/locutus/contract-state ../../../../crates/http-gw/examples/freenet_microblogging_posts
+
+build: build-tool view posts
 
 run: build
+	cd $(LOCUTUS_DIR)
+	cd crates/http-gw/examples
 	cargo run --example contract_browsing --features local
-
-insert_controllers_key_into_web:
-	bash insert_controllers_key_into_web.sh 

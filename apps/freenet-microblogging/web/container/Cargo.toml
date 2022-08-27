@@ -1,5 +1,5 @@
 [package]
-name = "freenet-microblogging-view"
+name = "freenet-microblogging-web"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.58.0"

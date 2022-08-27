@@ -18,19 +18,21 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
     fs::create_dir_all(cwd.join("container"))?;
     let locutus_file_config = BuildToolConfig {
         contract: Contract {
-            c_type: ContractType::View,
+            c_type: Some(ContractType::WebApp),
             lang: Some(SupportedContractLangs::Rust),
+            output_dir: None,
         },
-        sources: Some(Sources {
-            source_dirs: Some(vec![PathBuf::from("web").join("dist")]),
-            files: None,
-        }),
-        metadata: None,
-        output: None,
         webapp: Some(WebAppContract {
-            lang: SupportedViewLangs::Typescript,
+            lang: SupportedWebLangs::Typescript,
             typescript: Some(TypescriptConfig { webpack: true }),
+            state_sources: Some(Sources {
+                source_dirs: Some(vec![PathBuf::from("web").join("dist")]),
+                files: None,
+                output_path: None,
+            }),
+            metadata: None,
         }),
+        state: None,
     };
     Ok(())
 }

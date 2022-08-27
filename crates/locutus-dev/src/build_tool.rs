@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use locutus_runtime::locutus_stdlib::web::{data::WebDataState, view::WebViewState};
+use locutus_runtime::locutus_stdlib::web::WebApp;
 use serde::{Deserialize, Serialize};
 use tar::Builder;
 
@@ -31,8 +31,19 @@ pub fn build_package(_cli_config: BuildToolCliConfig) -> Result<(), DynError> {
     if config_file.exists() {
         let mut f_content = vec![];
         File::open(config_file)?.read_to_end(&mut f_content)?;
-        let config: BuildToolConfig = toml::from_slice(&f_content)?;
-        internal_package_state(config, &cwd)
+        let mut config: BuildToolConfig = toml::from_slice(&f_content)?;
+
+        compile_contract(&config, &cwd)?;
+
+        match config.contract.c_type.unwrap_or(ContractType::Standard) {
+            ContractType::WebApp => build_web_state(&config)?,
+            ContractType::Standard => build_generic_state(&mut config)?,
+        }
+
+        if let Some(_lang) = &config.contract.lang {
+            // todo: try to compile the package
+        }
+        Ok(())
     } else {
         Err("could not locate `locutus.toml` config file in current dir".into())
     }
@@ -41,24 +52,30 @@ pub fn build_package(_cli_config: BuildToolCliConfig) -> Result<(), DynError> {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct BuildToolConfig {
     pub contract: Contract,
-    pub sources: Option<Sources>,
-    pub metadata: Option<PathBuf>,
-    pub output: Option<Output>,
+    pub state: Option<Sources>,
     pub webapp: Option<WebAppContract>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Sources {
+    pub source_dirs: Option<Vec<PathBuf>>,
+    pub files: Option<Vec<String>>,
+    pub output_path: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Contract {
     #[serde(rename(deserialize = "type"))]
-    pub c_type: ContractType,
+    pub c_type: Option<ContractType>,
     pub lang: Option<SupportedContractLangs>,
+    pub output_dir: Option<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ContractType {
-    Controller,
-    View,
+    Standard,
+    WebApp,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,25 +85,17 @@ pub(crate) enum SupportedContractLangs {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Sources {
-    pub source_dirs: Option<Vec<PathBuf>>,
-    pub files: Option<Vec<String>>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(crate) struct Output {
-    path: PathBuf,
-}
-
-#[derive(Serialize, Deserialize)]
 pub(crate) struct WebAppContract {
-    pub lang: SupportedViewLangs,
+    pub lang: SupportedWebLangs,
     pub typescript: Option<TypescriptConfig>,
+    #[serde(rename = "state-sources")]
+    pub state_sources: Option<Sources>,
+    pub metadata: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum SupportedViewLangs {
+pub(crate) enum SupportedWebLangs {
     Javascript,
     Typescript,
 }
@@ -97,8 +106,8 @@ pub(crate) struct TypescriptConfig {
     pub webpack: bool,
 }
 
-fn internal_package_state(mut config: BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
-    let metadata = if let Some(md) = &config.metadata {
+fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
+    let metadata = if let Some(md) = config.webapp.as_ref().and_then(|a| a.metadata.as_ref()) {
         let mut buf = vec![];
         File::open(md)?.read_to_end(&mut buf)?;
         buf
@@ -106,82 +115,59 @@ fn internal_package_state(mut config: BuildToolConfig, cwd: &Path) -> Result<(),
         vec![]
     };
 
-    compile_contract(&config, cwd)?;
-
-    match config.contract.c_type {
-        ContractType::View => build_view_state(metadata, &config, cwd)?,
-        ContractType::Controller => build_generic_state(metadata, &mut config)?,
-    }
-
-    if let Some(_lang) = &config.contract.lang {
-        // todo: try to compile the package
-    }
-    Ok(())
-}
-
-fn build_view_state(
-    metadata: Vec<u8>,
-    config: &BuildToolConfig,
-    cwd: &Path,
-) -> Result<(), DynError> {
-    println!("Bundling `view` contract state");
     let mut archive: Builder<Cursor<Vec<u8>>> = Builder::new(Cursor::new(Vec::new()));
-
-    if let Some(view_config) = &config.webapp {
-        match &view_config.lang {
-            SupportedViewLangs::Typescript => {
-                let web_dir = cwd.join("web");
-                if web_dir.exists() {
-                    let webpack = view_config
-                        .typescript
-                        .as_ref()
-                        .map(|c| c.webpack)
-                        .unwrap_or_default();
-                    if webpack {
-                        let cmd_args: &[&str] =
-                            if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
-                                &["--color"]
-                            } else {
-                                &[]
-                            };
-                        let child = Command::new("webpack")
-                            .args(cmd_args)
-                            .current_dir(web_dir)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .map_err(|e| {
-                                eprintln!("Error while executing webpack command: {e}");
-                                Error::CommandFailed("tsc")
-                            })?;
-                        pipe_std_streams(child)?;
-                        println!("Compiled input using webpack");
-                    } else {
-                        let cmd_args: &[&str] =
-                            if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
-                                &["--pretty"]
-                            } else {
-                                &[]
-                            };
-                        let child = Command::new("tsc")
-                            .args(cmd_args)
-                            .current_dir(web_dir)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .map_err(|e| {
-                                eprintln!("Error while executing command tsc: {e}");
-                                Error::CommandFailed("tsc")
-                            })?;
-                        pipe_std_streams(child)?;
-                        println!("Compiled input using tsc");
-                    }
+    if let Some(web_config) = &config.webapp {
+        println!("Bundling webapp contract state");
+        match &web_config.lang {
+            SupportedWebLangs::Typescript => {
+                let webpack = web_config
+                    .typescript
+                    .as_ref()
+                    .map(|c| c.webpack)
+                    .unwrap_or_default();
+                if webpack {
+                    let cmd_args: &[&str] =
+                        if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+                            &["--color"]
+                        } else {
+                            &[]
+                        };
+                    let child = Command::new("webpack")
+                        .args(cmd_args)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| {
+                            eprintln!("Error while executing webpack command: {e}");
+                            Error::CommandFailed("tsc")
+                        })?;
+                    pipe_std_streams(child)?;
+                    println!("Compiled input using webpack");
                 } else {
-                    println!("`web` dir not written, skipping compiling web dependencies");
+                    let cmd_args: &[&str] =
+                        if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+                            &["--pretty"]
+                        } else {
+                            &[]
+                        };
+                    let child = Command::new("tsc")
+                        .args(cmd_args)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| {
+                            eprintln!("Error while executing command tsc: {e}");
+                            Error::CommandFailed("tsc")
+                        })?;
+                    pipe_std_streams(child)?;
+                    println!("Compiled input using tsc");
                 }
             }
-            SupportedViewLangs::Javascript => todo!(),
+            SupportedWebLangs::Javascript => todo!(),
         }
+    } else {
+        println!("No webapp config found.");
+        return Ok(());
     }
 
     let build_state = |sources: &Sources| -> Result<(), DynError> {
@@ -224,48 +210,50 @@ fn build_view_state(
         if !found_entry {
             return Err("didn't find entry point `index.html` in package".into());
         } else {
-            let state = WebViewState::from_data(metadata, archive)?;
+            let state = WebApp::from_data(metadata, archive)?;
             let packed = state.pack()?;
-            output_artifact(&config.output, &packed)?;
-            println!("Finished bundling `view` contract state");
+            output_artifact(&sources.output_path, &packed)?;
+            println!("Finished bundling webapp contract state");
         }
 
         Ok(())
     };
 
-    if let Some(sources) = &config.sources {
+    if let Some(sources) = config
+        .webapp
+        .as_ref()
+        .and_then(|a| a.state_sources.as_ref())
+    {
         build_state(sources)
     } else {
         todo!()
     }
 }
 
-fn build_generic_state(metadata: Vec<u8>, config: &mut BuildToolConfig) -> Result<(), DynError> {
+fn build_generic_state(config: &mut BuildToolConfig) -> Result<(), DynError> {
     const REQ_ONE_FILE_ERR: &str = "Requires exactly one source file specified for the state.";
 
-    let sources = if let Some(src) = &mut config.sources {
-        src
+    let sources = config.state.as_mut().and_then(|s| s.files.as_mut());
+    let sources = if let Some(s) = sources {
+        s
     } else {
         return Ok(());
     };
-    println!("Bundling `controller` contract state");
-    let src_files = sources
-        .files
-        .as_mut()
-        .ok_or_else(|| Error::MissConfiguration(REQ_ONE_FILE_ERR.into()))?;
 
-    let state: PathBuf = (src_files.len() == 1)
-        .then(|| src_files.pop().unwrap())
+    let output_path = config
+        .contract
+        .output_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| get_default_ouput_dir().map(|p| p.join(DEFAULT_OUTPUT_NAME)))?;
+
+    println!("Bundling contract state");
+    let state: PathBuf = (sources.len() == 1)
+        .then(|| sources.pop().unwrap())
         .ok_or_else(|| Error::MissConfiguration(REQ_ONE_FILE_ERR.into()))?
         .into();
-
-    let mut buf = vec![];
-    let mut model_f = File::open(state)?;
-    model_f.read_to_end(&mut buf)?;
-    let controller_state = WebDataState::from_data(metadata, buf);
-    let packed = controller_state.pack()?;
-    output_artifact(&config.output, &packed)?;
-    println!("Finished bundling `controller` contract state");
+    std::fs::copy(state, &output_path)?;
+    println!("Finished bundling state");
     Ok(())
 }
 
@@ -276,9 +264,9 @@ fn get_default_ouput_dir() -> std::io::Result<PathBuf> {
     Ok(output)
 }
 
-fn output_artifact(output: &Option<Output>, packed: &[u8]) -> Result<(), DynError> {
-    if let Some(output) = output {
-        File::create(&output.path)?.write_all(packed)?;
+fn output_artifact(output: &Option<PathBuf>, packed: &[u8]) -> Result<(), DynError> {
+    if let Some(path) = output {
+        File::create(&path)?.write_all(packed)?;
     } else {
         let default_out_dir = get_default_ouput_dir()?;
         fs::create_dir_all(&default_out_dir)?;
@@ -289,9 +277,9 @@ fn output_artifact(output: &Option<Output>, packed: &[u8]) -> Result<(), DynErro
 }
 
 fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
-    let work_dir = match config.contract.c_type {
-        ContractType::View => cwd.join("container"),
-        ContractType::Controller => cwd.to_path_buf(),
+    let work_dir = match config.contract.c_type.unwrap_or(ContractType::Standard) {
+        ContractType::WebApp => cwd.join("container"),
+        ContractType::Standard => cwd.to_path_buf(),
     };
     match config.contract.lang {
         Some(SupportedContractLangs::Rust) => {
@@ -317,7 +305,7 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
                 .spawn()
                 .map_err(|e| {
                     eprintln!("Error while executing cargo command: {e}");
-                    Error::CommandFailed("tsc")
+                    Error::CommandFailed("cargo")
                 })?;
             pipe_std_streams(child)?;
 
@@ -349,8 +337,8 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
                 )
                 .into());
             }
-            let mut out_file = if let Some(output) = &config.output {
-                output.path.join(package_name)
+            let mut out_file = if let Some(output) = &config.contract.output_dir {
+                output.join(package_name)
             } else {
                 get_default_ouput_dir()?.join(package_name)
             };
@@ -417,19 +405,21 @@ mod test {
         env::set_current_dir(&cwd)?;
         Ok((
             BuildToolConfig {
-                sources: Some(Sources {
-                    source_dirs: Some(vec!["dist".into()]),
-                    files: None,
-                }),
                 contract: Contract {
-                    c_type: ContractType::View,
+                    c_type: Some(ContractType::WebApp),
                     lang: Some(SupportedContractLangs::Rust),
+                    output_dir: None,
                 },
-                metadata: None,
-                output: None,
+                state: None,
                 webapp: Some(WebAppContract {
-                    lang: SupportedViewLangs::Typescript,
+                    lang: SupportedWebLangs::Typescript,
                     typescript: Some(TypescriptConfig { webpack: true }),
+                    state_sources: Some(Sources {
+                        source_dirs: Some(vec!["dist".into()]),
+                        files: None,
+                        output_path: None,
+                    }),
+                    metadata: None,
                 }),
             },
             cwd,
@@ -438,8 +428,8 @@ mod test {
 
     #[test]
     fn package_webapp_state() -> Result<(), DynError> {
-        let (config, cwd) = setup_webapp_contract()?;
-        build_view_state(vec![], &config, &cwd)?;
+        let (config, _cwd) = setup_webapp_contract()?;
+        build_web_state(&config)?;
 
         let mut buf = vec![];
         File::open(
@@ -449,10 +439,10 @@ mod test {
         )?
         .read_to_end(&mut buf)?;
         let state = locutus_runtime::locutus_stdlib::interface::State::from(buf);
-        let mut view = WebViewState::try_from(state.as_ref()).unwrap();
+        let mut web = WebApp::try_from(state.as_ref()).unwrap();
 
         let target = env::temp_dir().join("locutus-unpack-state");
-        let e = view.unpack(&target);
+        let e = web.unpack(&target);
         let unpacked_successfully = target.join("index.html").exists();
 
         fs::remove_dir_all(target)?;
@@ -470,27 +460,28 @@ mod test {
     }
 
     #[test]
-    fn package_web_data_state() -> Result<(), DynError> {
+    fn package_generic_state() -> Result<(), DynError> {
         const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-        let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/data");
+        let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/contracts/posts");
         env::set_current_dir(&cwd)?;
         let mut config = BuildToolConfig {
-            sources: Some(Sources {
+            contract: Contract {
+                c_type: Some(ContractType::Standard),
+                lang: Some(SupportedContractLangs::Rust),
+                output_dir: None,
+            },
+            state: Some(Sources {
                 source_dirs: None,
                 files: Some(vec!["initial_state.json".into()]),
+                output_path: None,
             }),
-            contract: Contract {
-                c_type: ContractType::Controller,
-                lang: Some(SupportedContractLangs::Rust),
-            },
-            metadata: None,
-            output: None,
             webapp: None,
         };
 
-        build_generic_state(vec![], &mut config)?;
+        build_generic_state(&mut config)?;
 
-        assert!(PathBuf::from("target")
+        assert!(cwd
+            .join("target")
             .join("locutus")
             .join(DEFAULT_OUTPUT_NAME)
             .exists());

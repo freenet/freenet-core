@@ -1,7 +1,7 @@
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 
 use locutus_node::*;
-use locutus_runtime::{locutus_stdlib::web::data::WebDataState, ContractKey};
+use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
     future::Future,
@@ -244,21 +244,14 @@ async fn process_host_response(
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
-            let mut _wrapped_state = None; // avoids copying
             let result = match result {
                 Ok(res) => {
                     tracing::debug!(response = %res, cli_id = %id, "sending response");
                     match res {
                         HostResponse::GetResponse { contract, state } => {
-                            _wrapped_state = Some(state);
-                            let borrowed_state = _wrapped_state.as_ref().unwrap();
-                            let inner_state = WebDataState::try_from(&**borrowed_state)?;
-                            Ok(HostResponse::GetResponse {
-                                contract,
-                                state: inner_state.contract_data,
-                            })
+                            Ok(HostResponse::GetResponse { contract, state })
                         }
-                        other => Ok(other.try_into()?),
+                        other => Ok(other),
                     }
                 }
                 Err(err) => {
