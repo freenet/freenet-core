@@ -1,4 +1,0 @@
-*.wasm
-**/node_modules/*
-**/dist/*.js
-**/target/*

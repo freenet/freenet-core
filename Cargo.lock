@@ -2029,6 +2029,7 @@ dependencies = [
 name = "locutus-dev"
 version = "0.0.0"
 dependencies = [
+ "atty",
  "bincode",
  "byteorder",
  "clap",

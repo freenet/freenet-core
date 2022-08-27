@@ -1,3 +1,0 @@
-*.wasm
-**/node_modules/*
-dist/*

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Update State</title>
+  </head>
+
+  <body>
+    <div class="container mx-auto">
+      <div class="row">
+        <div class="col">
+          <h1>Contract Test</h1>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col-6 p-2 m-2">
+          <h3>New message:</h3>
+          <textarea class="form-control" id="input" rows="6">
+                  {
+                      "author":"John Doe",
+                      "date":"2022-06-15T00:00:00Z",
+                      "title":"New msg",
+                      "content":"Lore ipsum ..."
+                  }
+          </textarea>
+          <br>
+          <button class="btn btn-primary" id="su-btn">Send</button>
+        </div>
+        <div class="col-6 p-2 m-2">
+          <h3>Current State:</h3>
+          <pre id="current-state" class="form-control">
+          </pre>
+          <br>
+          <button class="btn btn-primary" id="ls-btn">Load State</button>
+        </div>
+      </div>
+      <div class="row">
+        <h1>Updates:</h1>
+        <pre id="updates"></pre>
+      </div>
+    </div>
+    <script src="bundle.js"></script>
+  </body>
+</html>

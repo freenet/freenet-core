@@ -1,5 +1,0 @@
-[package]
-type = "view"
-
-[sources]
-source_dirs = ["web/dist"]

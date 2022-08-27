@@ -11,17 +11,17 @@ const MAX_MEM_CACHE: u32 = 10_000_000;
 const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 struct WebBundle {
-    controller_contract: WrappedContract<'static>,
-    initial_state: WrappedState,
-    view_contract: WrappedContract<'static>,
-    view_content: WrappedState,
+    posts_contract: WrappedContract<'static>,
+    posts_state: WrappedState,
+    web_contract: WrappedContract<'static>,
+    web_state: WrappedState,
 }
 
 fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
-    fn get_controller_contract(
+    fn get_posts_contract(
         _public_key: PublicKey,
     ) -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_controller.wasm");
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts.wasm");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
@@ -32,70 +32,73 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         let params = serde_json::to_vec(&Verification { public_key: vec![] }).unwrap();
         let contract = WrappedContract::new(Arc::new(ContractCode::from(bytes)), params.into());
 
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_controller");
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
         Ok((contract, bytes.into()))
     }
 
-    fn get_view_contract() -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_view.wasm");
+    fn get_web_contract() -> std::io::Result<(WrappedContract<'static>, WrappedState)> {
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web.wasm");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
         let contract =
             WrappedContract::new(Arc::new(ContractCode::from(bytes)), [].as_ref().into());
 
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_view");
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
         Ok((contract, bytes.into()))
     }
 
-    let (controller_contract, initial_state) = get_controller_contract(public_key)?;
-    let (view_contract, view_content) = get_view_contract()?;
+    let (posts_contract, initial_state) = get_posts_contract(public_key)?;
+    let (web_contract, web_content) = get_web_contract()?;
 
     Ok(WebBundle {
-        controller_contract,
-        initial_state,
-        view_contract,
-        view_content,
+        posts_contract,
+        posts_state: initial_state,
+        web_contract,
+        web_state: web_content,
     })
 }
 
 #[cfg(feature = "local")]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use http_gw::HttpGateway;
-    use locutus_dev::ContractStore;
     use locutus_node::libp2p::identity::ed25519::Keypair;
+    use locutus_runtime::ContractStore;
 
     let keypair = Keypair::generate();
     let bundle = test_web(keypair.public())?;
     log::info!(
-        "loading view contract {} in local node",
-        bundle.view_contract.key().encode()
+        "loading web contract {} in local node",
+        bundle.web_contract.key().encode()
     );
     log::info!(
-        "loading controller contract {} in local node",
-        bundle.controller_contract.key().encode()
+        "loading posts contract {} in local node",
+        bundle.posts_contract.key().encode()
     );
 
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
-    let mut local_node =
-        locutus_dev::LocalNode::new(contract_store.clone(), state_store.clone(), || {
-            locutus_dev::set_cleanup_on_exit().unwrap();
-        })
-        .await?;
+    let mut local_node = locutus_dev::local_node::LocalNode::new(
+        contract_store.clone(),
+        state_store.clone(),
+        || {
+            locutus_dev::util::set_cleanup_on_exit().unwrap();
+        },
+    )
+    .await?;
     let id = HttpGateway::next_client_id();
     local_node
-        .preload(id, bundle.controller_contract, bundle.initial_state)
+        .preload(id, bundle.posts_contract, bundle.posts_state)
         .await;
     local_node
-        .preload(id, bundle.view_contract, bundle.view_content)
+        .preload(id, bundle.web_contract, bundle.web_state)
         .await;
     http_gw::local_node::run_local_node(local_node).await
 }

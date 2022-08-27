@@ -6,6 +6,7 @@ rust-version = "1.58.0"
 publish = false
 
 [dependencies]
+atty = "0.2"
 byteorder = "1"
 clap = { version = "3", features = ["derive", "env"] }
 either = "1"
