@@ -92,6 +92,8 @@ pub struct NewPackageCliConfig {
 
 #[derive(clap::ValueEnum, Clone)]
 pub(crate) enum ContractKind {
-    WebView,
-    WebController,
+    /// A web app container contract.
+    WebApp,
+    /// An standard contract.
+    Contract,
 }

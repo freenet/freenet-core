@@ -1,29 +1,18 @@
 use std::{
-    borrow::Cow,
     env,
     fs::{self, File},
-    io::{self, Cursor, Read, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    time::Duration,
+    process::{Command, Stdio},
 };
 
 use locutus_runtime::locutus_stdlib::web::WebApp;
 use serde::{Deserialize, Serialize};
 use tar::Builder;
 
-use crate::{config::BuildToolCliConfig, DynError};
+use crate::{config::BuildToolCliConfig, util::pipe_std_streams, DynError, Error};
 
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
-
-// TODO: polish error handling with its own error type
-#[derive(Debug, thiserror::Error)]
-enum Error {
-    #[error("Configuration error: {0}")]
-    MissConfiguration(Cow<'static, str>),
-    #[error("Command failed: {0}")]
-    CommandFailed(&'static str),
-}
 
 pub fn build_package(_cli_config: BuildToolCliConfig) -> Result<(), DynError> {
     let cwd = env::current_dir()?;
@@ -65,7 +54,7 @@ pub(crate) struct Sources {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Contract {
-    #[serde(rename(deserialize = "type"))]
+    #[serde(rename = "type")]
     pub c_type: Option<ContractType>,
     pub lang: Option<SupportedContractLangs>,
     pub output_dir: Option<PathBuf>,
@@ -348,50 +337,6 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
         None => println!("no lang specified, skipping contract compilation"),
     }
     println!("Contract compiled");
-    Ok(())
-}
-
-fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
-    let mut c_stdout = child.stdout.take().expect("Failed to open command stdout");
-    let mut stdout = io::stdout();
-    let mut stdout_buf = vec![];
-
-    let mut c_stderr = child.stderr.take().expect("Failed to open command stderr");
-    let mut stderr = io::stderr();
-    let mut stderr_buf = vec![];
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(format!("exist with status: {status}").into());
-                }
-                break;
-            }
-            Ok(None) => {
-                // attempt to write output to parent stds
-                c_stdout.read_to_end(&mut stdout_buf)?;
-                stdout.write_all(&stdout_buf)?;
-                stdout_buf.clear();
-
-                c_stderr.read_to_end(&mut stderr_buf)?;
-                stderr.write_all(&stderr_buf)?;
-                stderr_buf.clear();
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    // write out any remaining input
-    c_stdout.read_to_end(&mut stdout_buf)?;
-    stdout.write_all(&stdout_buf)?;
-    stdout_buf.clear();
-
-    c_stderr.read_to_end(&mut stderr_buf)?;
-    stderr.write_all(&stderr_buf)?;
-    stderr_buf.clear();
-
     Ok(())
 }
 
