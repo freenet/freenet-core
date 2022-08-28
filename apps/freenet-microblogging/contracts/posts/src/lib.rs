@@ -8,12 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 #[derive(Serialize, Deserialize)]
-struct MessageFeed {
-    messages: Vec<Message>,
+struct PostsFeed {
+    messages: Vec<Post>,
 }
 
-// TODO: make this build from a `WebDataState`
-impl<'a> TryFrom<State<'a>> for MessageFeed {
+impl<'a> TryFrom<State<'a>> for PostsFeed {
     type Error = ContractError;
 
     fn try_from(value: State<'a>) -> Result<Self, Self::Error> {
@@ -22,17 +21,17 @@ impl<'a> TryFrom<State<'a>> for MessageFeed {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Message {
+pub struct Post {
     pub author: String,
     // date: DateTime<Utc>,
     pub title: String,
     pub content: String,
-    #[serde(default = "Message::modded")]
+    #[serde(default = "Post::modded")]
     pub mod_msg: bool,
     pub signature: Option<ed25519_dalek::Signature>,
 }
 
-impl Message {
+impl Post {
     pub fn hash(&self) -> [u8; 64] {
         let mut hasher = Blake2b512::new();
         hasher.update(self.author.as_bytes());
@@ -54,8 +53,8 @@ struct FeedSummary {
     summaries: Vec<MessageSummary>,
 }
 
-impl<'a> From<&'a mut MessageFeed> for FeedSummary {
-    fn from(feed: &'a mut MessageFeed) -> Self {
+impl<'a> From<&'a mut PostsFeed> for FeedSummary {
+    fn from(feed: &'a mut PostsFeed) -> Self {
         // feed.messages.sort_by_key(|m| m.date);
         let mut summaries = Vec::with_capacity(feed.messages.len());
         for msg in &feed.messages {
@@ -82,7 +81,7 @@ pub struct Verification {
 }
 
 impl Verification {
-    fn verify(&self, msg: &Message) -> bool {
+    fn verify(&self, msg: &Post) -> bool {
         if let Some(sig) = msg.signature {
             self.public_key
                 .verify(&serde_json::to_vec(msg).unwrap(), &sig)
@@ -101,13 +100,13 @@ impl<'a> TryFrom<Parameters<'a>> for Verification {
 }
 
 #[contract]
-impl ContractInterface for MessageFeed {
+impl ContractInterface for PostsFeed {
     fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
-        MessageFeed::try_from(state).is_ok()
+        PostsFeed::try_from(state).is_ok()
     }
 
     fn validate_delta(_parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool {
-        serde_json::from_slice::<Vec<Message>>(&delta).is_ok()
+        serde_json::from_slice::<Vec<Post>>(&delta).is_ok()
     }
 
     fn update_state(
@@ -115,11 +114,11 @@ impl ContractInterface for MessageFeed {
         state: State<'static>,
         delta: StateDelta<'static>,
     ) -> Result<UpdateModification, ContractError> {
-        let mut feed = MessageFeed::try_from(state)?;
+        let mut feed = PostsFeed::try_from(state)?;
         let verifier = Verification::try_from(parameters).ok();
         feed.messages.sort_by_cached_key(|m| m.hash());
-        let mut incoming = serde_json::from_slice::<Vec<Message>>(&delta)
-            .map_err(|_| ContractError::InvalidDelta)?;
+        let mut incoming =
+            serde_json::from_slice::<Vec<Post>>(&delta).map_err(|_| ContractError::InvalidDelta)?;
         incoming.sort_by_cached_key(|m| m.hash());
         for m in incoming {
             if feed
@@ -149,7 +148,7 @@ impl ContractInterface for MessageFeed {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> StateSummary<'static> {
-        let mut feed = MessageFeed::try_from(state).unwrap();
+        let mut feed = PostsFeed::try_from(state).unwrap();
         let only_messages = FeedSummary::from(&mut feed);
         StateSummary::from(serde_json::to_vec(&only_messages).expect("serialization failed"))
     }
@@ -159,7 +158,7 @@ impl ContractInterface for MessageFeed {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> StateDelta<'static> {
-        let feed = MessageFeed::try_from(state).unwrap();
+        let feed = PostsFeed::try_from(state).unwrap();
         let mut summary = match serde_json::from_slice::<FeedSummary>(&summary) {
             Ok(summary) => summary,
             Err(_) => {
@@ -215,7 +214,7 @@ mod test {
                 }
             ]
         }"#;
-        let _feed = MessageFeed::try_from(State::from(json.as_bytes()))?;
+        let _feed = PostsFeed::try_from(State::from(json.as_bytes()))?;
         Ok(())
     }
 
@@ -235,7 +234,7 @@ mod test {
         .to_vec();
 
         let state: Vec<u8> = get_test_state(json_bytes);
-        let valid = MessageFeed::validate_state([].as_ref().into(), State::from(state));
+        let valid = PostsFeed::validate_state([].as_ref().into(), State::from(state));
         assert!(valid);
     }
 
@@ -249,7 +248,7 @@ mod test {
                 "content": "..."
             }
         ]"#;
-        let valid = MessageFeed::validate_delta(
+        let valid = PostsFeed::validate_delta(
             [].as_ref().into(),
             StateDelta::from(json.as_bytes().to_vec()),
         );
@@ -281,7 +280,7 @@ mod test {
             110, 97, 32, 97, 108, 105, 113, 117, 97, 46, 34, 10, 9, 9, 125,
         ]);
 
-        let new_state = MessageFeed::update_state([].as_ref().into(), state.into(), delta)
+        let new_state = PostsFeed::update_state([].as_ref().into(), state.into(), delta)
             .unwrap()
             .unwrap_valid();
         assert_eq!(
@@ -325,7 +324,7 @@ mod test {
         .to_vec();
 
         let state: Vec<u8> = get_test_state(state_bytes);
-        let summary = MessageFeed::summarize_state([].as_ref().into(), State::from(state));
+        let summary = PostsFeed::summarize_state([].as_ref().into(), State::from(state));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(summary.as_ref()).unwrap(),
             serde_json::json!([{
@@ -365,7 +364,7 @@ mod test {
                 "content": "..."
         }]);
 
-        let delta = MessageFeed::get_state_delta(
+        let delta = PostsFeed::get_state_delta(
             [].as_ref().into(),
             State::from(state),
             serde_json::to_vec(&summary).unwrap().into(),

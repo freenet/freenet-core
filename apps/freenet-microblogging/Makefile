@@ -11,7 +11,7 @@ build-tool:
 	cd crates/locutus-dev
 	cargo build --bin locutus-dev
 
-view:
+webapp:
 	cd $(LOCUTUS_DIR)
 	cd apps/freenet-microblogging
 	cd $(WEB_DIR)
@@ -29,7 +29,7 @@ posts:
 	mv ./build/locutus/freenet_microblogging_posts.wasm ../../../../crates/http-gw/examples/
 	mv ./build/locutus/contract-state ../../../../crates/http-gw/examples/freenet_microblogging_posts
 
-build: build-tool view posts
+build: build-tool webapp posts
 
 run: build
 	cd $(LOCUTUS_DIR)
