@@ -6,7 +6,6 @@ const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
 #[derive(clap::ArgEnum, Clone, Copy, Debug)]
 pub enum DeserializationFmt {
-    #[cfg(feature = "json")]
     Json,
     #[cfg(feature = "messagepack")]
     MessagePack,

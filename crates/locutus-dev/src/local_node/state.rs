@@ -47,7 +47,6 @@ impl AppState {
             Ok(())
         }
         match self.config.ser_format {
-            #[cfg(feature = "json")]
             Some(DeserializationFmt::Json) => {
                 let deser: serde_json::Value = serde_json::from_slice(data.as_ref())?;
                 let pp = serde_json::to_string_pretty(&deser)?;

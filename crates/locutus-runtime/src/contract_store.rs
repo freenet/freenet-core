@@ -8,15 +8,15 @@ use crate::{contract::WrappedContract, ContractRuntimeError, RuntimeResult};
 
 use super::ContractKey;
 
-type ContractKeyCodePart = [u8; 32];
+type ContractCodeKey = [u8; 32];
 
 /// Handle contract blob storage on the file system.
 #[derive(Clone)]
 pub struct ContractStore {
     contracts_dir: PathBuf,
-    contract_cache: Cache<ContractKeyCodePart, Arc<ContractCode<'static>>>,
+    contract_cache: Cache<ContractCodeKey, Arc<ContractCode<'static>>>,
     // todo: persist this somewhere
-    key_to_code_part: Arc<DashMap<ContractKey, ContractKeyCodePart>>,
+    key_to_code_part: Arc<DashMap<ContractKey, ContractCodeKey>>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
@@ -44,7 +44,7 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'a>,
     ) -> Option<WrappedContract<'a>> {
-        let contract_hash = if let Some(s) = key.contract_part() {
+        let contract_hash = if let Some(s) = key.code_hash() {
             s
         } else {
             tracing::warn!("requested partially unspecified contract `{key}`");
@@ -77,7 +77,7 @@ impl ContractStore {
 
     /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
     pub fn store_contract(&mut self, contract: WrappedContract) -> RuntimeResult<()> {
-        let contract_hash = contract.key().contract_part().ok_or_else(|| {
+        let contract_hash = contract.key().code_hash().ok_or_else(|| {
             tracing::warn!(
                 "trying to store partially unspecified contract `{}`",
                 contract.key()
@@ -115,7 +115,7 @@ impl ContractStore {
     }
 
     pub fn get_contract_path(&mut self, key: &ContractKey) -> RuntimeResult<PathBuf> {
-        let contract_hash = match key.contract_part() {
+        let contract_hash = match key.code_hash() {
             Some(k) => *k,
             None => self.code_hash_from_key(key).ok_or_else(|| {
                 tracing::warn!("trying to store partially unspecified contract `{key}`");
@@ -130,7 +130,7 @@ impl ContractStore {
         Ok(self.contracts_dir.join(key_path).with_extension("wasm"))
     }
 
-    pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<ContractKeyCodePart> {
+    pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<ContractCodeKey> {
         self.key_to_code_part.get(key).map(|r| *r.value())
     }
 }

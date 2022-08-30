@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     fs::{self, File},
     io::{Cursor, Read, Write},
@@ -6,36 +7,32 @@ use std::{
     process::{Command, Stdio},
 };
 
-use locutus_runtime::locutus_stdlib::web::WebApp;
+use locutus_runtime::{locutus_stdlib::web::WebApp, ContractCode, ContractId};
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use tar::Builder;
 
 use crate::{config::BuildToolCliConfig, util::pipe_std_streams, DynError, Error};
 
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
 
-pub fn build_package(_cli_config: BuildToolCliConfig) -> Result<(), DynError> {
-    let cwd = env::current_dir()?;
-    let config_file = cwd.join("locutus.toml");
-    if config_file.exists() {
-        let mut f_content = vec![];
-        File::open(config_file)?.read_to_end(&mut f_content)?;
-        let mut config: BuildToolConfig = toml::from_slice(&f_content)?;
-
-        compile_contract(&config, &cwd)?;
-
-        match config.contract.c_type.unwrap_or(ContractType::Standard) {
-            ContractType::WebApp => build_web_state(&config)?,
-            ContractType::Standard => build_generic_state(&mut config)?,
+pub fn build_package(_cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), DynError> {
+    let mut config = get_config(cwd)?;
+    compile_contract(&config, cwd)?;
+    match config.contract.c_type.unwrap_or(ContractType::Standard) {
+        ContractType::WebApp => {
+            let embedded =
+                if let Some(d) = config.webapp.as_ref().and_then(|a| a.dependencies.as_ref()) {
+                    let deps = include_deps(d)?;
+                    embed_deps(cwd, deps)?
+                } else {
+                    EmbeddedDeps::default()
+                };
+            build_web_state(&config, embedded, cwd)?
         }
-
-        if let Some(_lang) = &config.contract.lang {
-            // todo: try to compile the package
-        }
-        Ok(())
-    } else {
-        Err("could not locate `locutus.toml` config file in current dir".into())
+        ContractType::Standard => build_generic_state(&mut config, cwd)?,
     }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,6 +77,7 @@ pub(crate) struct WebAppContract {
     #[serde(rename = "state-sources")]
     pub state_sources: Option<Sources>,
     pub metadata: Option<PathBuf>,
+    pub dependencies: Option<toml::value::Table>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -95,7 +93,11 @@ pub(crate) struct TypescriptConfig {
     pub webpack: bool,
 }
 
-fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
+fn build_web_state(
+    config: &BuildToolConfig,
+    embedded_deps: EmbeddedDeps,
+    cwd: &Path,
+) -> Result<(), DynError> {
     let metadata = if let Some(md) = config.webapp.as_ref().and_then(|a| a.metadata.as_ref()) {
         let mut buf = vec![];
         File::open(md)?.read_to_end(&mut buf)?;
@@ -123,6 +125,7 @@ fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
                         };
                     let child = Command::new("webpack")
                         .args(cmd_args)
+                        .current_dir(cwd)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()
@@ -141,6 +144,7 @@ fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
                         };
                     let child = Command::new("tsc")
                         .args(cmd_args)
+                        .current_dir(cwd)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()
@@ -170,14 +174,15 @@ fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
                         found_entry = true;
                     }
                     let mut f = File::open(&p)?;
-                    archive.append_file(p, &mut f)?;
+                    archive.append_file(cwd.join(p), &mut f)?;
                 }
             }
         }
         if let Some(src_dirs) = &sources.source_dirs {
             for dir in src_dirs {
-                if dir.is_dir() {
-                    let present_entry = dir.join("index.html").exists();
+                let ori_dir = cwd.join(dir);
+                if ori_dir.is_dir() {
+                    let present_entry = ori_dir.join("index.html").exists();
                     if !found_entry && present_entry {
                         found_entry = true;
                     } else if present_entry {
@@ -186,11 +191,28 @@ fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
                         )
                         .into());
                     }
-                    archive.append_dir_all(".", &dir)?;
+                    archive.append_dir_all(".", &ori_dir)?;
                 } else {
                     return Err(format!("unknown directory: {dir:?}").into());
                 }
             }
+        }
+
+        if !embedded_deps.code.is_empty() {
+            for (hash, code) in embedded_deps.code {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(code.data().len() as u64);
+                header.set_cksum();
+                archive.append_data(&mut header, format!("contracts/{hash}"), code.data())?;
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_size(embedded_deps.json_def.len() as u64);
+            header.set_cksum();
+            archive.append_data(
+                &mut header,
+                "contracts/dependencies.json",
+                embedded_deps.json_def.as_slice(),
+            )?;
         }
 
         if sources.source_dirs.is_none() && sources.files.is_none() {
@@ -201,7 +223,7 @@ fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
         } else {
             let state = WebApp::from_data(metadata, archive)?;
             let packed = state.pack()?;
-            output_artifact(&sources.output_path, &packed)?;
+            output_artifact(&sources.output_path, &packed, cwd)?;
             println!("Finished bundling webapp contract state");
         }
 
@@ -219,7 +241,7 @@ fn build_web_state(config: &BuildToolConfig) -> Result<(), DynError> {
     }
 }
 
-fn build_generic_state(config: &mut BuildToolConfig) -> Result<(), DynError> {
+fn build_generic_state(config: &mut BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
     const REQ_ONE_FILE_ERR: &str = "Requires exactly one source file specified for the state.";
 
     let sources = config.state.as_mut().and_then(|s| s.files.as_mut());
@@ -234,35 +256,46 @@ fn build_generic_state(config: &mut BuildToolConfig) -> Result<(), DynError> {
         .output_dir
         .clone()
         .map(Ok)
-        .unwrap_or_else(|| get_default_ouput_dir().map(|p| p.join(DEFAULT_OUTPUT_NAME)))?;
+        .unwrap_or_else(|| get_default_ouput_dir(cwd).map(|p| p.join(DEFAULT_OUTPUT_NAME)))?;
 
     println!("Bundling contract state");
     let state: PathBuf = (sources.len() == 1)
         .then(|| sources.pop().unwrap())
         .ok_or_else(|| Error::MissConfiguration(REQ_ONE_FILE_ERR.into()))?
         .into();
-    std::fs::copy(state, &output_path)?;
+    std::fs::copy(cwd.join(state), &output_path)?;
     println!("Finished bundling state");
     Ok(())
 }
 
 #[inline]
-fn get_default_ouput_dir() -> std::io::Result<PathBuf> {
-    let output = env::current_dir()?.join("build").join("locutus");
+fn get_default_ouput_dir(cwd: &Path) -> std::io::Result<PathBuf> {
+    let output = cwd.join("build").join("locutus");
     fs::create_dir_all(&output)?;
     Ok(output)
 }
 
-fn output_artifact(output: &Option<PathBuf>, packed: &[u8]) -> Result<(), DynError> {
+fn output_artifact(output: &Option<PathBuf>, packed: &[u8], cwd: &Path) -> Result<(), DynError> {
     if let Some(path) = output {
         File::create(&path)?.write_all(packed)?;
     } else {
-        let default_out_dir = get_default_ouput_dir()?;
+        let default_out_dir = get_default_ouput_dir(cwd)?;
         fs::create_dir_all(&default_out_dir)?;
         let mut f = File::create(default_out_dir.join(DEFAULT_OUTPUT_NAME))?;
         f.write_all(packed)?;
     }
     Ok(())
+}
+
+fn get_config(cwd: &Path) -> Result<BuildToolConfig, DynError> {
+    let config_file = cwd.join("locutus.toml");
+    if config_file.exists() {
+        let mut f_content = vec![];
+        File::open(config_file)?.read_to_end(&mut f_content)?;
+        Ok(toml::from_slice(&f_content)?)
+    } else {
+        Err("could not locate `locutus.toml` config file in current dir".into())
+    }
 }
 
 fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
@@ -274,7 +307,6 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
         Some(SupportedContractLangs::Rust) => {
             const RUST_TARGET_ARGS: &[&str] =
                 &["build", "--release", "--target", "wasm32-unknown-unknown"];
-            const ERR: &str = "Cargo.toml definition incorrect";
             let cmd_args = if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
                 RUST_TARGET_ARGS
                     .iter()
@@ -298,28 +330,7 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
                 })?;
             pipe_std_streams(child)?;
 
-            let mut f_content = vec![];
-            File::open(work_dir.join("Cargo.toml"))?.read_to_end(&mut f_content)?;
-            let cargo_config: toml::Value = toml::from_slice(&f_content)?;
-            let package_name = cargo_config
-                .as_table()
-                .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
-                .get("package")
-                .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
-                .as_table()
-                .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
-                .get("name")
-                .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
-                .as_str()
-                .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
-                .replace('-', "_");
-            let mut output_lib = env::var("CARGO_TARGET_DIR")?
-                .parse::<PathBuf>()?
-                .join("wasm32-unknown-unknown")
-                .join("release")
-                .join(&package_name);
-            output_lib.set_extension("wasm");
-
+            let (package_name, output_lib) = get_out_lib(&work_dir)?;
             if !output_lib.exists() {
                 return Err(Error::MissConfiguration(
                     format!("couldn't find output file: {output_lib:?}").into(),
@@ -329,7 +340,7 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
             let mut out_file = if let Some(output) = &config.contract.output_dir {
                 output.join(package_name)
             } else {
-                get_default_ouput_dir()?.join(package_name)
+                get_default_ouput_dir(cwd)?.join(package_name)
             };
             out_file.set_extension("wasm");
             fs::copy(output_lib, out_file)?;
@@ -340,6 +351,133 @@ fn compile_contract(config: &BuildToolConfig, cwd: &Path) -> Result<(), DynError
     Ok(())
 }
 
+fn get_out_lib(work_dir: &Path) -> Result<(String, PathBuf), DynError> {
+    const ERR: &str = "Cargo.toml definition incorrect";
+    let mut f_content = vec![];
+    File::open(work_dir.join("Cargo.toml"))?.read_to_end(&mut f_content)?;
+    let cargo_config: toml::Value = toml::from_slice(&f_content)?;
+    let package_name = cargo_config
+        .as_table()
+        .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
+        .get("package")
+        .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
+        .as_table()
+        .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
+        .get("name")
+        .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
+        .as_str()
+        .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
+        .replace('-', "_");
+    let mut output_lib = env::var("CARGO_TARGET_DIR")?
+        .parse::<PathBuf>()?
+        .join("wasm32-unknown-unknown")
+        .join("release")
+        .join(&package_name);
+    output_lib.set_extension("wasm");
+    Ok((package_name, output_lib))
+}
+
+#[skip_serializing_none]
+#[derive(Default, Serialize)]
+struct DependencyDefinition {
+    #[serde(serialize_with = "DependencyDefinition::ser_key")]
+    key: Option<ContractId>,
+    path: Option<String>,
+}
+
+impl DependencyDefinition {
+    fn ser_key<S>(value: &Option<ContractId>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let v = value.map(|s| s.encode());
+        <Option<String> as serde::Serialize>::serialize(&v, ser)
+    }
+}
+
+fn include_deps(
+    contracts: &toml::value::Table,
+) -> Result<HashMap<&String, DependencyDefinition>, DynError> {
+    let mut deps = HashMap::with_capacity(contracts.len());
+    for (alias, definition) in contracts {
+        let mut dep = DependencyDefinition::default();
+        match definition {
+            toml::Value::String(key) => {
+                dep.key = Some(ContractId::try_from(key.clone())?);
+            }
+            toml::Value::Table(table) => {
+                for (k, v) in table {
+                    match (k.as_str(), v) {
+                        ("key", toml::Value::String(key)) => {
+                            if table.contains_key("path") {
+                                return Err(Error::MissConfiguration(
+                                    "key `key` is mutually exclusive with `path`".into(),
+                                )
+                                .into());
+                            }
+                            dep.key = Some(ContractId::try_from(key.clone())?);
+                        }
+                        ("path", toml::Value::String(path)) => {
+                            if table.contains_key("key") {
+                                return Err(Error::MissConfiguration(
+                                    "key `path` is mutually exclusive with `key`".into(),
+                                )
+                                .into());
+                            }
+                            dep.path = Some(path.clone());
+                        }
+                        (k, _) => {
+                            return Err(Error::MissConfiguration(
+                                format!("unknown key: {k}").into(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+            _ => panic!(),
+        }
+        deps.insert(alias, dep);
+    }
+    Ok(deps)
+}
+
+type CodeHash = String;
+
+#[derive(Default)]
+struct EmbeddedDeps {
+    code: HashMap<CodeHash, ContractCode<'static>>,
+    json_def: Vec<u8>,
+}
+
+fn embed_deps(
+    cwd: &Path,
+    mut deps: HashMap<&String, DependencyDefinition>,
+) -> Result<EmbeddedDeps, DynError> {
+    let mut embedded = HashMap::new();
+
+    let mut to_embed = EmbeddedDeps::default();
+    let cwd = fs::canonicalize(cwd)?;
+    for (alias, dep) in deps.iter_mut() {
+        if let Some(path) = &dep.path {
+            let path = cwd.join(path);
+            let config = get_config(&path)?;
+            compile_contract(&config, &path)?;
+            let mut buf = vec![];
+            let (_pname, out) = get_out_lib(&path)?;
+            let mut f = File::open(out)?;
+            f.read_to_end(&mut buf)?;
+            let code = ContractCode::from(buf);
+            let code_hash = code.hash_str();
+            to_embed.code.insert(code_hash.clone(), code);
+            embedded.insert(alias, code_hash);
+        }
+    }
+    let serialized = serde_json::to_vec(&embedded)?;
+    to_embed.json_def = serialized;
+    Ok(to_embed)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -347,7 +485,6 @@ mod test {
     fn setup_webapp_contract() -> Result<(BuildToolConfig, PathBuf), DynError> {
         const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/web");
-        env::set_current_dir(&cwd)?;
         Ok((
             BuildToolConfig {
                 contract: Contract {
@@ -365,6 +502,14 @@ mod test {
                         output_path: None,
                     }),
                     metadata: None,
+                    dependencies: Some(
+                        toml::toml! {
+                            posts = { path = "../contracts/posts" }
+                        }
+                        .as_table()
+                        .unwrap()
+                        .clone(),
+                    ),
                 }),
             },
             cwd,
@@ -373,16 +518,13 @@ mod test {
 
     #[test]
     fn package_webapp_state() -> Result<(), DynError> {
-        let (config, _cwd) = setup_webapp_contract()?;
-        build_web_state(&config)?;
+        let (config, cwd) = setup_webapp_contract()?;
+        // env::set_current_dir(&cwd)?;
+        build_web_state(&config, EmbeddedDeps::default(), &cwd)?;
 
         let mut buf = vec![];
-        File::open(
-            PathBuf::from("build")
-                .join("locutus")
-                .join(DEFAULT_OUTPUT_NAME),
-        )?
-        .read_to_end(&mut buf)?;
+        File::open(cwd.join("build").join("locutus").join(DEFAULT_OUTPUT_NAME))?
+            .read_to_end(&mut buf)?;
         let state = locutus_runtime::locutus_stdlib::interface::State::from(buf);
         let mut web = WebApp::try_from(state.as_ref()).unwrap();
 
@@ -408,7 +550,6 @@ mod test {
     fn package_generic_state() -> Result<(), DynError> {
         const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/contracts/posts");
-        env::set_current_dir(&cwd)?;
         let mut config = BuildToolConfig {
             contract: Contract {
                 c_type: Some(ContractType::Standard),
@@ -423,7 +564,7 @@ mod test {
             webapp: None,
         };
 
-        build_generic_state(&mut config)?;
+        build_generic_state(&mut config, &cwd)?;
 
         assert!(cwd
             .join("build")
@@ -431,6 +572,29 @@ mod test {
             .join(DEFAULT_OUTPUT_NAME)
             .exists());
 
+        Ok(())
+    }
+
+    #[test]
+    fn deps_parsing() -> Result<(), DynError> {
+        let deps = toml::toml! {
+            posts = { path = "../contracts/posts" }
+            third-party-1 = "moHBnP2j9F8Epkxc1JMNLgdGZ6iQnv4oAm"
+            third-party-2 = { key = "moHBnP2j9F8Epkxc1JMNLgdGZ6iQnv4oAm" }
+        };
+        include_deps(deps.as_table().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_deps() -> Result<(), DynError> {
+        const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
+        let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/web");
+        let deps = toml::toml! {
+            posts = { path = "../contracts/posts" }
+        };
+        let defs = include_deps(deps.as_table().unwrap())?;
+        embed_deps(&cwd, defs)?;
         Ok(())
     }
 }

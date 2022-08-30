@@ -75,11 +75,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bundle = test_web(keypair.public())?;
     log::info!(
         "loading web contract {} in local node",
-        bundle.web_contract.key().encode()
+        bundle.web_contract.key().encoded_contract_id()
     );
     log::info!(
         "loading posts contract {} in local node",
-        bundle.posts_contract.key().encode()
+        bundle.posts_contract.key().encoded_contract_id()
     );
 
     let tmp_path = std::env::temp_dir().join("locutus");

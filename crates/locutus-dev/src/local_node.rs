@@ -174,10 +174,8 @@ impl LocalNode {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
                 self.contract_params.insert(*key, contract.params().clone());
-                self.contract_data.insert(
-                    key.contract_part_encoded().unwrap(),
-                    contract.code().clone(),
-                );
+                self.contract_data
+                    .insert(key.encoded_code_hash().unwrap(), contract.code().clone());
                 self.send_update_notification(key, contract.params(), &state)
                     .await
                     .map_err(|_| {
@@ -253,7 +251,7 @@ impl LocalNode {
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
                 self.register_contract_notifier(key, id, updates, [].as_ref().into())
                     .unwrap();
-                tracing::info!("getting contract: {}", key.encode());
+                tracing::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)
                 // todo: in network mode, also send a subscribe to keep up to date
@@ -312,9 +310,9 @@ impl LocalNode {
                             cause: "missing contract".to_owned(),
                         })?;
                 let data_key = key
-                    .contract_part_encoded()
+                    .encoded_code_hash()
                     .or_else(|| {
-                        Some(ContractCode::encode_key(
+                        Some(ContractCode::encode_hash(
                             &self.runtime.contracts.code_hash_from_key(&key).unwrap(),
                         ))
                     })
