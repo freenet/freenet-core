@@ -14,7 +14,7 @@ blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
 config = { version = "0.13.0", features = [ "toml" ] } 
 crossbeam = "0.8.2"
-dashmap = "^5.1"
+dashmap = "^5.4"
 directories = "4"
 either = { version = "1", features = ["serde"] }
 env_logger = "0.9.0"
