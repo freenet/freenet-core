@@ -319,7 +319,7 @@ fn key_from_rmpv(value: Value) -> ContractKey {
     let key_spec = key.get(0).unwrap().1.as_slice().unwrap();
     let _ = key.get(1).unwrap().clone().0;
     let key_str = bs58::encode(&key_spec).into_string();
-    ContractKey::from_spec(key_str).unwrap()
+    ContractKey::from_id(key_str).unwrap()
 }
 
 // todo: impl TryFrom<Value> for StateDelta<'static>
@@ -520,7 +520,7 @@ pub(crate) mod test {
         let encoded = rmp_serde::to_vec(&complete_put)?;
         let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
 
-        let key = ContractKey::from_spec(key.encode())?;
+        let key = ContractKey::from_id(key.encoded_contract_id())?;
         let only_spec: HostResult = Ok(HostResponse::PutResponse { key });
         let encoded = rmp_serde::to_vec(&only_spec)?;
         let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
@@ -580,7 +580,7 @@ pub(crate) mod test {
     #[test]
     fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request = ClientRequest::Update {
-            key: ContractKey::from_spec("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
+            key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
                 .unwrap(),
             delta: locutus_runtime::StateDelta::from(vec![
                 91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 97, 117, 116,
@@ -612,7 +612,7 @@ pub(crate) mod test {
     #[test]
     fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request = ClientRequest::Get {
-            key: ContractKey::from_spec("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
+            key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
                 .unwrap(),
             fetch_contract: false,
         };

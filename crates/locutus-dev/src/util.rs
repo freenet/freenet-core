@@ -14,7 +14,6 @@ where
     R: AsRef<[u8]> + ?Sized,
 {
     match deser_format {
-        #[cfg(feature = "json")]
         Some(DeserializationFmt::Json) => {
             let deser = serde_json::from_slice(data.as_ref())?;
             Ok(deser)

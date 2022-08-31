@@ -100,7 +100,6 @@ impl StdInput {
             cause: format!("{e}"),
         })?;
         match self.config.ser_format {
-            #[cfg(feature = "json")]
             Some(DeserializationFmt::Json) => {
                 let state: serde_json::Value =
                     self.read_input().map_err(|e| ErrorKind::Unhandled {

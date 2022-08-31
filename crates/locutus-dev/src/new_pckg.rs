@@ -39,6 +39,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
                 output_path: None,
             }),
             metadata: None,
+            dependencies: None,
         }),
         state: None,
     };

@@ -22,7 +22,7 @@ pub(crate) async fn contract_home(
     key: String,
     request_sender: mpsc::Sender<ClientConnection>,
 ) -> Result<impl Reply, Rejection> {
-    let key = ContractKey::from_spec(key)
+    let key = ContractKey::from_id(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
@@ -121,7 +121,7 @@ pub async fn variable_content(
     key: String,
     req_path: warp::path::FullPath,
 ) -> Result<impl Reply, Rejection> {
-    let key = ContractKey::from_spec(key)
+    let key = ContractKey::from_id(key)
         .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
     let base_path = contract_web_path(&key);
     let req_uri = req_path.as_str().parse().unwrap();
@@ -148,7 +148,7 @@ fn contract_web_path(key: &ContractKey) -> PathBuf {
     std::env::temp_dir()
         .join("locutus")
         .join("webs")
-        .join(key.encode())
+        .join(key.encoded_contract_id())
         .join("web")
 }
 

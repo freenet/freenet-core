@@ -2045,6 +2045,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "serde_with",
  "tar",
  "thiserror",
  "tokio",

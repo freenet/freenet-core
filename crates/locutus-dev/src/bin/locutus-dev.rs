@@ -12,10 +12,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-
+    let cwd = std::env::current_dir()?;
     match Config::parse().sub_command {
         SubCommand::RunLocal(local_node_config) => run_local_node_client(local_node_config).await,
-        SubCommand::Build(build_tool_config) => build_package(build_tool_config),
+        SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),
         SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
     }
 }

@@ -6,9 +6,11 @@
 
 use std::{
     borrow::{Borrow, Cow},
+    fmt::Display,
     hash::Hasher,
     io::{Cursor, Read},
     ops::{Deref, DerefMut},
+    str::FromStr,
 };
 
 use blake2::{Blake2s256, Digest};
@@ -127,8 +129,8 @@ impl<'a> Contract<'a> {
         &self.key
     }
 
-    /// Data portion of the specification.
-    pub fn into_data(self) -> ContractCode<'a> {
+    /// Code portion of the specification.
+    pub fn into_code(self) -> ContractCode<'a> {
         self.data
     }
 }
@@ -171,7 +173,7 @@ impl Eq for Contract<'_> {}
 impl std::fmt::Display for Contract<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ContractSpec( key: ")?;
-        internal_fmt_key(&self.key.spec, f)?;
+        internal_fmt_key(&self.key.id.0, f)?;
         let data: String = if self.data.data.len() > 8 {
             (&self.data.data[..4])
                 .iter()
@@ -417,8 +419,12 @@ pub struct ContractCode<'a> {
 }
 
 impl ContractCode<'_> {
-    pub fn key(&self) -> &[u8; CONTRACT_KEY_SIZE] {
+    pub fn hash(&self) -> &[u8; CONTRACT_KEY_SIZE] {
         &self.key
+    }
+
+    pub fn hash_str(&self) -> String {
+        Self::encode_hash(&self.key)
     }
 
     pub fn data(&self) -> &[u8] {
@@ -429,12 +435,8 @@ impl ContractCode<'_> {
         self.data.to_owned().to_vec()
     }
 
-    pub fn hash(&self) -> String {
-        Self::encode_key(&self.key)
-    }
-
-    pub fn encode_key(key: &[u8; CONTRACT_KEY_SIZE]) -> String {
-        bs58::encode(key)
+    pub fn encode_hash(hash: &[u8; CONTRACT_KEY_SIZE]) -> String {
+        bs58::encode(hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
     }
@@ -506,24 +508,78 @@ impl std::fmt::Display for ContractCode<'_> {
 
 /// The key representing the tuple of a contract code and a set of parameters.
 #[serde_as]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
+#[repr(transparent)]
+pub struct ContractId(#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] [u8; CONTRACT_KEY_SIZE]);
+
+impl ContractId {
+    pub fn encode(&self) -> String {
+        bs58::encode(self.0)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
+    }
+
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, bs58::decode::Error> {
+        let mut spec = [0; CONTRACT_KEY_SIZE];
+        bs58::decode(bytes)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into(&mut spec)?;
+        Ok(Self(spec))
+    }
+}
+
+impl FromStr for ContractId {
+    type Err = bs58::decode::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ContractId::from_bytes(s)
+    }
+}
+
+impl TryFrom<String> for ContractId {
+    type Error = bs58::decode::Error;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        ContractId::from_bytes(s)
+    }
+}
+
+impl<'a, T, U> From<(T, U)> for ContractId
+where
+    T: Borrow<Parameters<'a>>,
+    U: Borrow<ContractCode<'a>>,
+{
+    fn from(val: (T, U)) -> Self {
+        let (parameters, code_data) = (val.0.borrow(), val.1.borrow());
+        generate_id(parameters, code_data)
+    }
+}
+
+impl Display for ContractId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.encode())
+    }
+}
+
+#[serde_as]
 #[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 pub struct ContractKey {
-    #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
-    spec: [u8; CONTRACT_KEY_SIZE],
+    id: ContractId,
     #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
     contract: Option<[u8; CONTRACT_KEY_SIZE]>,
 }
 
 impl PartialEq for ContractKey {
     fn eq(&self, other: &Self) -> bool {
-        self.spec == other.spec
+        self.id == other.id
     }
 }
 
 impl std::hash::Hash for ContractKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.spec.hash(state);
+        self.id.0.hash(state);
     }
 }
 
@@ -532,21 +588,12 @@ where
     T: Borrow<Parameters<'a>>,
     U: Borrow<ContractCode<'a>>,
 {
-    fn from(spec: (T, U)) -> Self {
-        let (parameters, code_data) = (spec.0.borrow(), spec.1.borrow());
-
-        let contract_hash = code_data.key();
-
-        let mut hasher = Blake2s256::new();
-        hasher.update(contract_hash);
-        hasher.update(parameters.as_ref());
-        let full_key_arr = hasher.finalize();
-
-        debug_assert_eq!((&full_key_arr[..]).len(), CONTRACT_KEY_SIZE);
-        let mut spec = [0; CONTRACT_KEY_SIZE];
-        spec.copy_from_slice(&full_key_arr);
+    fn from(val: (T, U)) -> Self {
+        let (parameters, code_data) = (val.0.borrow(), val.1.borrow());
+        let id = generate_id(parameters, code_data);
+        let contract_hash = code_data.hash();
         Self {
-            spec,
+            id,
             contract: Some(*contract_hash),
         }
     }
@@ -554,29 +601,23 @@ where
 
 impl ContractKey {
     /// Builds a partial `ContractKey`, the contract code part is unspecified.
-    pub fn from_spec(spec_key: impl Into<String>) -> Result<Self, bs58::decode::Error> {
-        let mut spec = [0; CONTRACT_KEY_SIZE];
-        bs58::decode(spec_key.into())
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut spec)?;
-        Ok(Self {
-            spec,
-            contract: None,
-        })
+    pub fn from_id(id: impl Into<String>) -> Result<Self, bs58::decode::Error> {
+        let id = ContractId::try_from(id.into())?;
+        Ok(Self { id, contract: None })
     }
 
     /// Gets the whole spec key hash.
     pub fn bytes(&self) -> &[u8] {
-        self.spec.as_ref()
+        self.id.0.as_ref()
     }
 
     /// Returns the hash of the contract code only, if the key is fully specified.
-    pub fn contract_part(&self) -> Option<&[u8; CONTRACT_KEY_SIZE]> {
+    pub fn code_hash(&self) -> Option<&[u8; CONTRACT_KEY_SIZE]> {
         self.contract.as_ref()
     }
 
-    /// Returns the encoded key of the contract code only, if the key is fully specified.
-    pub fn contract_part_encoded(&self) -> Option<String> {
+    /// Returns the encoded hash of the contract code, if the key is fully specified.
+    pub fn encoded_code_hash(&self) -> Option<String> {
         self.contract.as_ref().map(|c| {
             bs58::encode(c)
                 .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -601,15 +642,13 @@ impl ContractKey {
         let mut spec = [0; CONTRACT_KEY_SIZE];
         spec.copy_from_slice(&full_key_arr);
         Ok(Self {
-            spec,
+            id: ContractId(spec),
             contract: Some(contract),
         })
     }
 
-    pub fn encode(&self) -> String {
-        bs58::encode(self.spec)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into_string()
+    pub fn encoded_contract_id(&self) -> String {
+        self.id.encode()
     }
 }
 
@@ -617,14 +656,28 @@ impl Deref for ContractKey {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.spec
+        &self.id.0
     }
 }
 
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        internal_fmt_key(&self.spec, f)
+        internal_fmt_key(&self.id.0, f)
     }
+}
+
+fn generate_id<'a>(parameters: &Parameters<'a>, code_data: &ContractCode<'a>) -> ContractId {
+    let contract_hash = code_data.hash();
+
+    let mut hasher = Blake2s256::new();
+    hasher.update(contract_hash);
+    hasher.update(parameters.as_ref());
+    let full_key_arr = hasher.finalize();
+
+    debug_assert_eq!((&full_key_arr[..]).len(), CONTRACT_KEY_SIZE);
+    let mut spec = [0; CONTRACT_KEY_SIZE];
+    spec.copy_from_slice(&full_key_arr);
+    ContractId(spec)
 }
 
 #[inline]
@@ -660,9 +713,9 @@ mod test {
         // let encoded_code = expected.contract_part_as_str();
         // println!("encoded key: {encoded_code}");
 
-        let decoded = ContractKey::decode(code.hash(), [].as_ref().into())?;
+        let decoded = ContractKey::decode(code.hash_str(), [].as_ref().into())?;
         assert_eq!(expected, decoded);
-        assert_eq!(expected.contract_part(), decoded.contract_part());
+        assert_eq!(expected.code_hash(), decoded.code_hash());
         Ok(())
     }
 
