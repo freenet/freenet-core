@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use locutus_runtime::{locutus_stdlib::web::WebApp, ContractCode, ContractId};
+use locutus_runtime::{locutus_stdlib::web::WebApp, ContractCode};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use tar::Builder;
@@ -203,15 +203,16 @@ fn build_web_state(
                 let mut header = tar::Header::new_gnu();
                 header.set_size(code.data().len() as u64);
                 header.set_cksum();
-                archive.append_data(&mut header, format!("contracts/{hash}"), code.data())?;
+                archive.append_data(&mut header, format!("contracts/{hash}.wasm"), code.data())?;
             }
             let mut header = tar::Header::new_gnu();
-            header.set_size(embedded_deps.json_def.len() as u64);
+            header.set_size(embedded_deps.dependencies.len() as u64);
             header.set_cksum();
+            let serialized_deps = serde_json::to_vec(&embedded_deps.dependencies)?;
             archive.append_data(
                 &mut header,
                 "contracts/dependencies.json",
-                embedded_deps.json_def.as_slice(),
+                serialized_deps.as_slice(),
             )?;
         }
 
@@ -380,19 +381,8 @@ fn get_out_lib(work_dir: &Path) -> Result<(String, PathBuf), DynError> {
 #[skip_serializing_none]
 #[derive(Default, Serialize)]
 struct DependencyDefinition {
-    #[serde(serialize_with = "DependencyDefinition::ser_key")]
-    key: Option<ContractId>,
     path: Option<String>,
-}
-
-impl DependencyDefinition {
-    fn ser_key<S>(value: &Option<ContractId>, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let v = value.map(|s| s.encode());
-        <Option<String> as serde::Serialize>::serialize(&v, ser)
-    }
+    wasm: Option<String>,
 }
 
 fn include_deps(
@@ -402,21 +392,9 @@ fn include_deps(
     for (alias, definition) in contracts {
         let mut dep = DependencyDefinition::default();
         match definition {
-            toml::Value::String(key) => {
-                dep.key = Some(ContractId::try_from(key.clone())?);
-            }
             toml::Value::Table(table) => {
                 for (k, v) in table {
                     match (k.as_str(), v) {
-                        ("key", toml::Value::String(key)) => {
-                            if table.contains_key("path") {
-                                return Err(Error::MissConfiguration(
-                                    "key `key` is mutually exclusive with `path`".into(),
-                                )
-                                .into());
-                            }
-                            dep.key = Some(ContractId::try_from(key.clone())?);
-                        }
                         ("path", toml::Value::String(path)) => {
                             if table.contains_key("key") {
                                 return Err(Error::MissConfiguration(
@@ -447,18 +425,17 @@ type CodeHash = String;
 #[derive(Default)]
 struct EmbeddedDeps {
     code: HashMap<CodeHash, ContractCode<'static>>,
-    json_def: Vec<u8>,
+    dependencies: HashMap<String, DependencyDefinition>,
 }
 
 fn embed_deps(
     cwd: &Path,
-    mut deps: HashMap<&String, DependencyDefinition>,
+    deps: HashMap<impl Into<String>, DependencyDefinition>,
 ) -> Result<EmbeddedDeps, DynError> {
-    let mut embedded = HashMap::new();
-
-    let mut to_embed = EmbeddedDeps::default();
     let cwd = fs::canonicalize(cwd)?;
-    for (alias, dep) in deps.iter_mut() {
+    let mut deps_json = HashMap::new();
+    let mut to_embed = EmbeddedDeps::default();
+    for (alias, dep) in deps.into_iter() {
         if let Some(path) = &dep.path {
             let path = cwd.join(path);
             let config = get_config(&path)?;
@@ -470,11 +447,16 @@ fn embed_deps(
             let code = ContractCode::from(buf);
             let code_hash = code.hash_str();
             to_embed.code.insert(code_hash.clone(), code);
-            embedded.insert(alias, code_hash);
+            deps_json.insert(
+                alias.into(),
+                DependencyDefinition {
+                    wasm: Some(code_hash),
+                    ..Default::default()
+                },
+            );
         }
     }
-    let serialized = serde_json::to_vec(&embedded)?;
-    to_embed.json_def = serialized;
+    to_embed.dependencies = deps_json;
     Ok(to_embed)
 }
 
