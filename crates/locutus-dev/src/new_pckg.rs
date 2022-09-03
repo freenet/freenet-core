@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::File,
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -24,6 +24,7 @@ pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), DynError> {
 
 fn create_view_package(cwd: &Path) -> Result<(), DynError> {
     create_rust_crate(cwd, ContractKind::WebApp)?;
+    create_web_init_files(cwd)?;
     let locutus_file_config = BuildToolConfig {
         contract: Contract {
             c_type: Some(ContractType::WebApp),
@@ -34,7 +35,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
             lang: SupportedWebLangs::Typescript,
             typescript: Some(TypescriptConfig { webpack: true }),
             state_sources: Some(Sources {
-                source_dirs: Some(vec![PathBuf::from("web").join("dist")]),
+                source_dirs: Some(vec![PathBuf::from("dist")]),
                 files: None,
                 output_path: None,
             }),
@@ -114,5 +115,80 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
     std::mem::drop(cargo_file);
     let mut cargo_file = File::create(dest_path.join("Cargo.toml"))?;
     cargo_file.write_all(&toml::to_vec(&cargo_def)?)?;
+    Ok(())
+}
+
+fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
+    let child = Command::new("npm")
+        .args(&["init", "--force"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(cwd)
+        .spawn()
+        .map_err(|e| {
+            eprintln!("Error while executing npm command: {e}");
+            Error::CommandFailed("npm")
+        })?;
+    pipe_std_streams(child)?;
+    // todo: change pacakge.json:
+    // - include dependencies: locutus-stdlib
+
+    let child = Command::new("tsc")
+        .args(&["--init", "--pretty"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(cwd)
+        .spawn()
+        .map_err(|e| {
+            eprintln!("Error while executing npm command: {e}");
+            Error::CommandFailed("tsc")
+        })?;
+    pipe_std_streams(child)?;
+    // todo: config tsc config file options:
+    // - rootDirs: ["./src"]
+    // - outDirs: "./dist"
+
+    const WEBPACK_CONFIG: &str = r#"
+        const path = require("path");
+
+        module.exports = {
+        entry: "./src/index.ts",
+        devtool: "inline-source-map",
+        output: {
+            filename: "bundle.js",
+            path: path.resolve(__dirname, "dist"),
+        },
+        resolve: {
+            extensions: [".tsx", ".ts", ".js"],
+        },
+        devServer: {
+            static: path.resolve(__dirname, "dist"),
+            port: 8080,
+            hot: true,
+        },
+        module: {
+            rules: [
+                {
+                    test: /\.tsx?$/,
+                    use: "ts-loader",
+                    exclude: /node_modules/,
+                }
+            ],
+        },
+        };"#;
+
+    let mut f = File::create(cwd.join("webpack.config.js"))?;
+    f.write_all(WEBPACK_CONFIG.as_bytes())?;
+
+    fs::create_dir_all(cwd.join("src"))?;
+    let mut idx = cwd.join("src").join("index");
+    idx.set_extension("ts");
+    File::create(idx)?;
+
+    fs::create_dir_all(cwd.join("dist"))?;
+    let mut idx = cwd.join("dist").join("index");
+    idx.set_extension("html");
+    File::create(idx)?;
+
     Ok(())
 }
