@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     time::{Duration, Instant},
 };
@@ -435,11 +436,10 @@ fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Location>>) 
         if peer.starts_with("gateway") {
             continue;
         }
-        connections.push_str(&format!("{peer}:"));
-        connections.push('\n');
+        writeln!(&mut connections, "{peer}:").unwrap();
         for (conn, dist) in conns {
             let dist = dist.0;
-            connections.push_str(&format!("    {conn} (dist: {dist:.3})\n"))
+            writeln!(&mut connections, "    {conn} (dist: {dist:.3})").unwrap();
         }
     }
     connections

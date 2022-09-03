@@ -1,4 +1,4 @@
-use locutus_node::{ClientId, ClientRequest, HostResponse};
+use locutus_core::{ClientId, ClientRequest, HostResponse};
 
 use crate::{config::LocalNodeCliConfig, CommandReceiver, DynError};
 

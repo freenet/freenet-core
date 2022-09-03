@@ -1440,29 +1440,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "http-gw"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "byteorder",
- "bytes",
- "env_logger",
- "futures",
- "locutus-dev",
- "locutus-node",
- "locutus-runtime",
- "log",
- "serde",
- "serde_json",
- "tar",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "warp",
- "xz2",
-]
-
-[[package]]
 name = "httparse"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2026,46 +2003,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "locutus-dev"
-version = "0.0.0"
-dependencies = [
- "atty",
- "bincode",
- "byteorder",
- "clap",
- "ctrlc",
- "either",
- "futures",
- "glob",
- "locutus-node",
- "locutus-runtime",
- "pico-args",
- "rmp",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_json",
- "serde_with",
- "tar",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "xz2",
-]
-
-[[package]]
-name = "locutus-macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "locutus-node"
+name = "locutus-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
@@ -2077,6 +2015,7 @@ dependencies = [
  "bs58",
  "config",
  "crossbeam",
+ "ctrlc",
  "dashmap",
  "directories",
  "either",
@@ -2107,6 +2046,65 @@ dependencies = [
  "unsigned-varint",
  "uuid",
  "warp",
+]
+
+[[package]]
+name = "locutus-dev"
+version = "0.0.0"
+dependencies = [
+ "atty",
+ "bincode",
+ "byteorder",
+ "clap",
+ "either",
+ "futures",
+ "glob",
+ "locutus-core",
+ "locutus-runtime",
+ "pico-args",
+ "rmp",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tar",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "xz2",
+]
+
+[[package]]
+name = "locutus-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "locutus-node"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "bytes",
+ "env_logger",
+ "futures",
+ "locutus-core",
+ "log",
+ "serde",
+ "serde_json",
+ "tar",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "warp",
+ "xz2",
 ]
 
 [[package]]
