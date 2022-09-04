@@ -1,11 +1,12 @@
 [package]
 name = "locutus-stdlib"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.58.0"
 publish = true
 description = "Locutus P2P network standard library"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/freenet/locutus"
 
 [dependencies]
 arbitrary = { version = "1", optional = true, features = ["derive"] }
@@ -21,7 +22,7 @@ thiserror = "1"
 xz2 = { version = "0.1", optional = true }
 
 # internal
-locutus-macros = { path = "../locutus-macros", version = "0.0.1" }
+locutus-macros = { path = "../locutus-macros", version = "0.0.2" }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }

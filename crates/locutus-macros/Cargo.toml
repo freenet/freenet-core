@@ -1,11 +1,12 @@
 [package]
 name = "locutus-macros"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.58.0"
 publish = true 
 description = "Procedural macros for Locutus P2P network project"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/freenet/locutus"
 
 [lib]
 proc-macro = true
