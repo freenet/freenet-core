@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "locutus-dev"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "atty",
  "bincode",
@@ -2081,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "locutus-macros"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "locutus-node"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "locutus-runtime"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "arbitrary",
  "arrayvec",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "locutus-stdlib"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "arbitrary",
  "arrayvec",

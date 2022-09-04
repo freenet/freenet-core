@@ -1,9 +1,11 @@
 [package]
 name = "locutus-dev"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.58.0"
 publish = true
+description = "Locutus P2P development tools"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 atty = "0.2"
@@ -31,8 +33,8 @@ rmpv = { version = "1", optional = true }
 rmp-serde = { version = "1", optional = true }
 
 # internal
-locutus-core = { path = "../locutus-core" }
-locutus-runtime = { path = "../locutus-runtime" }
+locutus-core = { path = "../locutus-core", version = "0.0.1" }
+locutus-runtime = { path = "../locutus-runtime", version = "0.0.1" }
 
 [features]
 messagepack = ["rmp", "rmpv", "rmp-serde"]

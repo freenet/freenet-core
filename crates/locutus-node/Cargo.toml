@@ -1,9 +1,11 @@
 [package]
 name = "locutus-node"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.58.0"
 publish = true
+description = "Locutus P2P network main node implementation"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = "0.1"
@@ -22,7 +24,7 @@ xz2 = "0.1"
 warp = { version = "0.3", default-features = false, features = ["multipart", "tls"] }
 
 # internal:
-locutus-core = { path = "../locutus-core", features = ["websocket"] }
+locutus-core = { path = "../locutus-core", features = ["websocket"], version = "0.0.1" }
 
 [features]
 default = []
