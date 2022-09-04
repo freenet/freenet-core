@@ -487,6 +487,7 @@ mod test {
     use crate::client_events::test::MemoryEventsGen;
     use tokio::sync::watch::channel;
 
+    #[ignore]
     #[test]
     fn location_dist() {
         let l0 = Location(0.);
@@ -498,6 +499,7 @@ mod test {
         assert!(l0.distance(&l1) == Location(0.25));
     }
 
+    #[ignore]
     #[test]
     fn find_closest() {
         let peer_key: PeerKey = PeerKey::random();

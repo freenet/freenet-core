@@ -170,7 +170,7 @@ fn get_file_path(uri: warp::http::Uri) -> Result<String, Rejection> {
 
 #[test]
 fn get_path() {
-    let req_path = "/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state.html";
+    let req_path = "/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/state.html";
     let base_dir =
         PathBuf::from("/tmp/locutus/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/");
     let uri: warp::http::Uri = req_path.parse().unwrap();

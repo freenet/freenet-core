@@ -10,10 +10,10 @@ use rand::{
 
 pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
-        tracing::info!("Received Ctrl+C. Cleaning up...");
+        log::info!("Received Ctrl+C. Cleaning up...");
 
         let path = std::env::temp_dir().join("locutus");
-        tracing::info!("Removing content stored at {path:?}");
+        log::info!("Removing content stored at {path:?}");
 
         let rm = std::process::Command::new("rm")
             .arg("-rf")
@@ -21,11 +21,11 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
             .spawn();
 
         if rm.is_ok() {
-            tracing::info!("Successful cleanup");
+            log::info!("Successful cleanup");
 
             std::process::exit(0);
         } else {
-            tracing::error!("Failed to remove content at {path:?}");
+            log::error!("Failed to remove content at {path:?}");
 
             std::process::exit(-1);
         }

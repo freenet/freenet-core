@@ -3,7 +3,7 @@ name = "locutus-node"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.58.0"
-publish = false
+publish = true
 
 [dependencies]
 async-trait = "0.1"

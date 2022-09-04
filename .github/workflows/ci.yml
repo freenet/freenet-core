@@ -42,6 +42,10 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Install stdlib packages
+        working-directory: apps/stdlib
+        run: npm install
+
       - name: Test
         run: cargo test --workspace ${{ matrix.args }}
 

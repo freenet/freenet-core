@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(unreachable_code)]
 pub(crate) mod client_events;
 mod config;
 mod contract;

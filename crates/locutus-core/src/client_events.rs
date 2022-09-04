@@ -507,6 +507,7 @@ pub(crate) mod test {
         }
     }
 
+    #[ignore]
     #[test]
     fn put_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -527,6 +528,7 @@ pub(crate) mod test {
         Ok(())
     }
 
+    #[ignore]
     #[test]
     fn update_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -541,6 +543,7 @@ pub(crate) mod test {
         Ok(())
     }
 
+    #[ignore]
     #[test]
     fn get_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -563,6 +566,7 @@ pub(crate) mod test {
         Ok(())
     }
 
+    #[ignore]
     #[test]
     fn update_notification_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -577,6 +581,7 @@ pub(crate) mod test {
         Ok(())
     }
 
+    #[ignore]
     #[test]
     fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request = ClientRequest::Update {
@@ -609,6 +614,7 @@ pub(crate) mod test {
         Ok(())
     }
 
+    #[ignore]
     #[test]
     fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request = ClientRequest::Get {

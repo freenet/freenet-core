@@ -280,13 +280,14 @@ mod test {
 
         fn send<'a>(
             &'a mut self,
-            id: ClientId,
-            response: Result<HostResponse, ClientError>,
+            _id: ClientId,
+            _response: Result<HostResponse, ClientError>,
         ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>> {
             todo!()
         }
     }
 
+    #[ignore]
     #[tokio::test]
     async fn combinator_recv() {
         let mut cnt = 0;
