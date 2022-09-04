@@ -662,6 +662,7 @@ mod test {
         WrappedContract, WrappedState,
     };
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 1usize;
@@ -710,6 +711,7 @@ mod test {
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contract_not_found() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 2usize;
@@ -746,6 +748,7 @@ mod test {
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contract_found_after_retry() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 2usize;

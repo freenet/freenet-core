@@ -337,6 +337,7 @@ mod test_utils {
         }
     }
 
+    #[ignore]
     #[test]
     fn test_get_connections() -> Result<(), anyhow::Error> {
         let peer_id = PeerKey::random();

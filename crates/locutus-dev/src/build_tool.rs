@@ -117,6 +117,17 @@ fn build_web_state(
                     .map(|c| c.webpack)
                     .unwrap_or_default();
                 if webpack {
+                    let child = Command::new("npm")
+                        .args(&["install"])
+                        .current_dir(cwd)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| {
+                            eprintln!("Error while installing npm packages: {e}");
+                            Error::CommandFailed("npm")
+                        })?;
+                    pipe_std_streams(child)?;
                     let cmd_args: &[&str] =
                         if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
                             &["--color"]

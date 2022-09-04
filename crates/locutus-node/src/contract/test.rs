@@ -65,23 +65,23 @@ impl StateStorage for MemKVStore {
 
     async fn store(
         &mut self,
-        key: ContractKey,
-        state: locutus_runtime::WrappedState,
+        _key: ContractKey,
+        _state: locutus_runtime::WrappedState,
     ) -> Result<(), Self::Error> {
         todo!()
     }
 
     async fn get(
         &self,
-        key: &ContractKey,
+        _key: &ContractKey,
     ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
         todo!()
     }
 
     async fn store_params(
         &mut self,
-        key: ContractKey,
-        state: locutus_runtime::Parameters<'static>,
+        _key: ContractKey,
+        _state: locutus_runtime::Parameters<'static>,
     ) -> Result<(), Self::Error> {
         todo!()
     }
@@ -168,7 +168,7 @@ impl ContractHandler for MemoryContractHandler {
 
     async fn handle_request(
         &mut self,
-        req: crate::ClientRequest,
+        _req: crate::ClientRequest,
     ) -> Result<crate::HostResponse, Self::Error> {
         // async fn get_state(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         //     Ok(self.kv_store.get(contract).cloned())
@@ -212,6 +212,7 @@ impl From<std::io::Error> for SimStoreError {
 mod tests {
     use crate::WrappedContract;
 
+    #[ignore]
     #[test]
     fn serialization() -> Result<(), anyhow::Error> {
         let bytes = crate::util::test::random_bytes_1024();

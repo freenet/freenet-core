@@ -449,6 +449,7 @@ mod test {
         WrappedContract, WrappedState,
     };
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 4usize;

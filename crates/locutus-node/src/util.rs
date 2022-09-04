@@ -127,6 +127,7 @@ where
 
 impl<T> IterExt for T where T: Iterator {}
 
+#[ignore]
 #[test]
 fn randomize_iter() {
     let iter = [0, 1, 2, 3, 4, 5];
