@@ -1,6 +1,5 @@
 pub(crate) mod errors;
 mod http_gateway;
-pub mod util;
 pub(crate) mod web_handling;
 
 pub use http_gateway::HttpGateway;
