@@ -293,6 +293,7 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(Command::GetParams) => {
+                            // FIXME: related to issue 272
                             let _node = &*self.app_state.local_node.read().await;
                             // let p = node
                             //     .contract_state
