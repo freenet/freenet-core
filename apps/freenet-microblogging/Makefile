@@ -33,5 +33,5 @@ build: build-tool webapp posts
 
 run: build
 	cd $(LOCUTUS_DIR)
-	cd crates/http-gw/examples
+	cd crates/locutus-node/examples
 	cargo run --example contract_browsing --features local

@@ -3,7 +3,7 @@ name = "locutus-dev"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.58.0"
-publish = false
+publish = true
 
 [dependencies]
 atty = "0.2"
@@ -24,7 +24,6 @@ bincode = "1"
 tar = "0.4"
 toml = { version = "0.5", features = ["preserve_order"] }
 xz2 = "0.1"
-ctrlc = { version = "3.0", features = ["termination"] }
 
 # (mp) message pack feature
 rmp = { version = "0.8", optional = true }
@@ -32,7 +31,7 @@ rmpv = { version = "1", optional = true }
 rmp-serde = { version = "1", optional = true }
 
 # internal
-locutus-node = { path = "../locutus-node" }
+locutus-core = { path = "../locutus-core" }
 locutus-runtime = { path = "../locutus-runtime" }
 
 [features]

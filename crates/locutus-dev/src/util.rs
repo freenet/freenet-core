@@ -27,30 +27,6 @@ where
     }
 }
 
-pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
-    ctrlc::set_handler(move || {
-        tracing::info!("Received Ctrl+C. Cleaning up...");
-
-        let path = std::env::temp_dir().join("locutus");
-        tracing::info!("Removing content stored at {path:?}");
-
-        let rm = std::process::Command::new("rm")
-            .arg("-rf")
-            .arg(path.to_str().expect("correct path to locutus tmp"))
-            .spawn();
-
-        if rm.is_ok() {
-            tracing::info!("Successful cleanup");
-
-            std::process::exit(0);
-        } else {
-            tracing::error!("Failed to remove content at {path:?}");
-
-            std::process::exit(-1);
-        }
-    })
-}
-
 pub(crate) fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
     let mut c_stdout = child.stdout.take().expect("Failed to open command stdout");
     let mut stdout = io::stdout();

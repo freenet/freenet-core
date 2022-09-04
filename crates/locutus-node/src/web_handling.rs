@@ -7,7 +7,7 @@ use locutus_runtime::{
     ContractKey, State, WrappedContract,
 };
 
-use locutus_node::*;
+use locutus_core::*;
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 use warp::{reject, reply, Rejection, Reply};
 

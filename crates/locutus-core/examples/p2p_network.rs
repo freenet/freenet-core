@@ -6,7 +6,7 @@ use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
 };
-use locutus_node::*;
+use locutus_core::*;
 use locutus_runtime::prelude::{WrappedContract, WrappedState};
 use locutus_stdlib::prelude::{ContractCode, Parameters};
 use tokio::sync::mpsc::{channel, Receiver, Sender};

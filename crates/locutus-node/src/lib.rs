@@ -1,30 +1,91 @@
-#![allow(dead_code)]
-#![allow(unreachable_code)]
-pub(crate) mod client_events;
-mod config;
-mod contract;
-mod message;
-mod node;
-mod operations;
-mod ring;
-pub(crate) mod util;
+pub(crate) mod errors;
+mod http_gateway;
+pub mod util;
+pub(crate) mod web_handling;
 
-pub(crate) type WrappedContract<'a> = locutus_runtime::prelude::WrappedContract<'a>;
-pub type WrappedState = locutus_runtime::prelude::WrappedState;
-
-// exports:
-pub use crate::config::Config;
-#[cfg(feature = "websocket")]
-pub use client_events::websocket::WebSocketProxy;
-pub use client_events::{
-    combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
-    ClientRequest, ErrorKind, HostResponse, HostResult, OpenRequest, RequestError,
+pub use http_gateway::HttpGateway;
+use locutus_core::{
+    locutus_runtime::ContractKey, ClientError, ClientId, ClientRequest, HostResponse, HostResult,
 };
-pub use contract::{SQLiteContractHandler, SqlitePool};
-pub use either;
-pub use libp2p;
-pub use node::PeerKey;
-pub use node::{InitPeerNode, NodeConfig};
-pub use ring::Location;
-pub use rmp;
-pub use rmp_serde;
+
+type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+#[derive(Debug)]
+enum ClientConnection {
+    NewConnection(tokio::sync::mpsc::UnboundedSender<HostCallbackResult>),
+    Request {
+        client_id: ClientId,
+        req: ClientRequest,
+    },
+}
+
+#[derive(Debug)]
+enum HostCallbackResult {
+    NewId(ClientId),
+    Result {
+        id: ClientId,
+        result: Result<HostResponse, ClientError>,
+    },
+    SubscriptionChannel {
+        key: ContractKey,
+        id: ClientId,
+        callback: tokio::sync::mpsc::UnboundedReceiver<HostResult>,
+    },
+}
+
+#[cfg(feature = "local")]
+pub mod local_node {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use locutus_core::{
+        either, ClientError, ClientEventsProxy, ContractExecutor, ErrorKind, OpenRequest,
+        RequestError, WebSocketProxy,
+    };
+
+    use crate::{DynError, HttpGateway};
+
+    pub async fn run_local_node(mut executor: ContractExecutor) -> Result<(), DynError> {
+        let (mut http_handle, filter) = HttpGateway::as_filter();
+        let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
+        let _ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;
+        // FIXME: use combinator
+        // let mut all_clients =
+        //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
+        loop {
+            let OpenRequest {
+                id,
+                request,
+                notification_channel,
+                ..
+            } = http_handle.recv().await?;
+            tracing::debug!("client {id}, req -> {request}");
+            match executor
+                .handle_request(id, request, notification_channel)
+                .await
+            {
+                Ok(res) => {
+                    http_handle.send(id, Ok(res)).await?;
+                }
+                Err(either::Left(RequestError::Disconnect)) => {}
+                Err(either::Left(err)) => {
+                    log::error!("{err}");
+                    http_handle
+                        .send(id, Err(ClientError::from(ErrorKind::from(err))))
+                        .await?;
+                }
+                Err(either::Right(err)) => {
+                    log::error!("{err}");
+                    http_handle
+                        .send(
+                            id,
+                            Err(ErrorKind::Unhandled {
+                                cause: format!("{err}"),
+                            }
+                            .into()),
+                        )
+                        .await?;
+                }
+            }
+        }
+    }
+}

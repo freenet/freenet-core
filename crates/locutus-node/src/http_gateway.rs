@@ -1,6 +1,6 @@
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 
-use locutus_node::*;
+use locutus_core::*;
 use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,

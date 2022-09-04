@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use libp2p::identity::Keypair;
-use locutus_node::*;
+use locutus_core::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {

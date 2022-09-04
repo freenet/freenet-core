@@ -8,7 +8,7 @@ use std::{
 };
 
 use either::Either;
-use locutus_node::{
+use locutus_core::{
     ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse, OpenRequest,
 };
 use locutus_runtime::prelude::*;

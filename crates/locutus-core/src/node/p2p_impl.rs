@@ -232,8 +232,7 @@ mod test {
                 .swarm
                 .dial(peer1_config.addr.unwrap())
                 .map_err(|_| ())?;
-            let res = ping_ev_loop(&mut peer2).await;
-            res
+            ping_ev_loop(&mut peer2).await
         });
 
         dialer.await.map_err(|_| ())?

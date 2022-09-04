@@ -1,18 +1,17 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use locutus_node::SqlitePool;
+use locutus_core::{ContractExecutor, SqlitePool};
 use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
 use crate::{
     config::{DeserializationFmt, LocalNodeCliConfig},
-    local_node::LocalNode,
     DynError,
 };
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    pub(crate) local_node: Arc<RwLock<LocalNode>>,
+    pub(crate) local_node: Arc<RwLock<ContractExecutor>>,
     config: LocalNodeCliConfig,
 }
 
@@ -27,8 +26,8 @@ impl AppState {
         let state_store = StateStore::new(SqlitePool::new().await?, Self::MAX_MEM_CACHE).unwrap();
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
-                LocalNode::new(contract_store, state_store, || {
-                    crate::util::set_cleanup_on_exit().unwrap();
+                ContractExecutor::new(contract_store, state_store, || {
+                    locutus_core::util::set_cleanup_on_exit().unwrap();
                 })
                 .await?,
             )),

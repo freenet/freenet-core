@@ -2,8 +2,11 @@
 
 use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 
-use locutus_node::{libp2p::identity::ed25519::PublicKey, SqlitePool, WrappedState};
-use locutus_runtime::{ContractCode, StateStore, WrappedContract};
+use locutus_core::{
+    libp2p::identity::ed25519::PublicKey,
+    locutus_runtime::{ContractCode, StateStore, WrappedContract},
+    SqlitePool, WrappedState,
+};
 use serde::Serialize;
 
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
@@ -67,9 +70,10 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
 
 #[cfg(feature = "local")]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use http_gw::HttpGateway;
-    use locutus_node::libp2p::identity::ed25519::Keypair;
-    use locutus_runtime::ContractStore;
+    use locutus_core::{
+        libp2p::identity::ed25519::Keypair, locutus_runtime::ContractStore, ContractExecutor,
+    };
+    use locutus_node::HttpGateway;
 
     let keypair = Keypair::generate();
     let bundle = test_web(keypair.public())?;
@@ -85,13 +89,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tmp_path = std::env::temp_dir().join("locutus");
     let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
-    let mut local_node = locutus_dev::local_node::LocalNode::new(
-        contract_store.clone(),
-        state_store.clone(),
-        || {
-            locutus_dev::util::set_cleanup_on_exit().unwrap();
-        },
-    )
+    let mut local_node = ContractExecutor::new(contract_store.clone(), state_store.clone(), || {
+        locutus_core::util::set_cleanup_on_exit().unwrap();
+    })
     .await?;
     let id = HttpGateway::next_client_id();
     local_node
@@ -100,7 +100,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     local_node
         .preload(id, bundle.web_contract, bundle.web_state)
         .await;
-    http_gw::local_node::run_local_node(local_node).await
+    locutus_node::local_node::run_local_node(local_node).await
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
