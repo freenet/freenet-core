@@ -21,6 +21,7 @@ jobs:
           ]
     env:
       LOCUTUS_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target"
 
     steps:
       - name: Cancel Previous Runs
