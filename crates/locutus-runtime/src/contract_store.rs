@@ -1,41 +1,76 @@
-use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    iter::FromIterator,
+    path::PathBuf,
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use locutus_stdlib::prelude::{ContractCode, Parameters};
+use notify::Watcher;
+use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
-use crate::{contract::WrappedContract, ContractRuntimeError, RuntimeResult};
+use crate::{contract::WrappedContract, ContractRuntimeError, DynError, RuntimeResult};
 
 use super::ContractKey;
 
 type ContractCodeKey = [u8; 32];
+
+#[derive(Serialize, Deserialize)]
+struct KeyToCodeMap(Vec<(ContractKey, ContractCodeKey)>);
+
+impl From<&DashMap<ContractKey, ContractCodeKey>> for KeyToCodeMap {
+    fn from(vals: &DashMap<ContractKey, ContractCodeKey>) -> Self {
+        let mut map = vec![];
+        for r in vals.iter() {
+            map.push((*r.key(), *r.value()));
+        }
+        Self(map)
+    }
+}
 
 /// Handle contract blob storage on the file system.
 #[derive(Clone)]
 pub struct ContractStore {
     contracts_dir: PathBuf,
     contract_cache: Cache<ContractCodeKey, Arc<ContractCode<'static>>>,
-    // todo: persist this somewhere
     key_to_code_part: Arc<DashMap<ContractKey, ContractCodeKey>>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
 
+static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
+static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
+
 impl ContractStore {
     /// # Arguments
     /// - max_size: max size in bytes of the contracts being cached
-    pub fn new(contracts_dir: PathBuf, max_size: i64) -> Self {
-        if !contracts_dir.exists() {
-            std::fs::create_dir_all(&contracts_dir)
-                .map_err(|err| tracing::error!("error creating contract dir: {err}"))
-                .expect("coudln't create dir");
-        }
+    pub fn new(contracts_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
         const ERR: &str = "failed to build mem cache";
-        Self {
+        let key_to_code_part;
+        LOCK_FILE_PATH.set(contracts_dir.join("__LOCK")).unwrap();
+        KEY_FILE_PATH.set(contracts_dir.join("KEY_DATA")).unwrap();
+        if !contracts_dir.exists() {
+            std::fs::create_dir_all(&contracts_dir).map_err(|err| {
+                tracing::error!("error creating contract dir: {err}");
+                err
+            })?;
+            key_to_code_part = Arc::new(DashMap::new());
+            File::create(contracts_dir.join("KEY_DATA"))?;
+        } else {
+            let map = Self::load_from_file()?;
+            key_to_code_part = Arc::new(DashMap::from_iter(map.0));
+        }
+        Self::watch_changes(key_to_code_part.clone())?;
+        Ok(Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
-            key_to_code_part: Arc::new(DashMap::new()),
-        }
+            key_to_code_part,
+        })
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
@@ -87,8 +122,22 @@ impl ContractStore {
         if self.contract_cache.get(contract_hash).is_some() {
             return Ok(());
         }
+
+        // lock the map file to insert changes
+        let lock = LOCK_FILE_PATH.get().unwrap();
+        while lock.exists() {
+            thread::sleep(Duration::from_micros(5));
+        }
+        File::create(lock)?;
         self.key_to_code_part
             .insert(*contract.key(), *contract_hash);
+        let map = KeyToCodeMap::from(&*self.key_to_code_part);
+        let serialized = bincode::serialize(&map).map_err(|e| ContractRuntimeError::Any(e))?;
+        // FIXME: make this more reliable, append to the file instead of truncating it
+        let mut f = File::create(KEY_FILE_PATH.get().unwrap())?;
+        f.write_all(&serialized)?;
+        // release the lock
+        fs::remove_file(LOCK_FILE_PATH.get().unwrap())?;
 
         let key_path = bs58::encode(contract_hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -133,6 +182,44 @@ impl ContractStore {
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<ContractCodeKey> {
         self.key_to_code_part.get(key).map(|r| *r.value())
     }
+
+    fn watch_changes(ori_map: Arc<DashMap<ContractKey, ContractCodeKey>>) -> Result<(), DynError> {
+        let mut watcher = notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| match res {
+                Ok(ev) => {
+                    if let notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) = ev.kind {
+                        match Self::load_from_file() {
+                            Err(err) => tracing::error!("{err}"),
+                            Ok(map) => {
+                                for (k, v) in map.0 {
+                                    ori_map.insert(k, v);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::error!("{e}"),
+            },
+        )?;
+
+        watcher.watch(
+            KEY_FILE_PATH.get().unwrap(),
+            notify::RecursiveMode::NonRecursive,
+        )?;
+        Ok(())
+    }
+
+    fn load_from_file() -> RuntimeResult<KeyToCodeMap> {
+        let mut buf = vec![];
+        let mut f = File::open(KEY_FILE_PATH.get().unwrap())?;
+        f.read_to_end(&mut buf)?;
+        let map = if buf.is_empty() {
+            KeyToCodeMap(vec![])
+        } else {
+            bincode::deserialize(&buf).map_err(|e| ContractRuntimeError::Any(e))?
+        };
+        Ok(map)
+    }
 }
 
 #[cfg(test)]
@@ -144,7 +231,7 @@ mod test {
         let mut store = ContractStore::new(
             std::env::temp_dir().join("locutus_test").join("contracts"),
             10_000,
-        );
+        )?;
         let contract = WrappedContract::new(
             Arc::new(ContractCode::from(vec![0, 1, 2])),
             [0, 1].as_ref().into(),
