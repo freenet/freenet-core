@@ -68,12 +68,11 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
     })
 }
 
-#[cfg(feature = "local")]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use locutus::HttpGateway;
     use locutus_core::{
         libp2p::identity::ed25519::Keypair, locutus_runtime::ContractStore, ContractExecutor,
     };
-    use locutus_node::HttpGateway;
 
     let keypair = Keypair::generate();
     let bundle = test_web(keypair.public())?;
@@ -87,7 +86,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let tmp_path = std::env::temp_dir().join("locutus");
-    let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
+    let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node = ContractExecutor::new(contract_store.clone(), state_store.clone(), || {
         locutus_core::util::set_cleanup_on_exit().unwrap();
@@ -100,14 +99,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     local_node
         .preload(id, bundle.web_contract, bundle.web_state)
         .await;
-    locutus_node::local_node::run_local_node(local_node).await
+    locutus::local_node::run_local_node(local_node).await
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(not(feature = "local"))]
-    {
-        panic!("only allowed if local feature is enabled");
-    }
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     // env_logger::Builder::from_default_env()
     //     .format_module_path(true)
@@ -120,10 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .enable_all()
         .build()
         .unwrap();
-    #[cfg(feature = "local")]
-    {
-        rt.block_on(run())?;
-    }
+    rt.block_on(run())?;
 
     Ok(())
 }

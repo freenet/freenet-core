@@ -583,6 +583,12 @@ impl std::hash::Hash for ContractKey {
     }
 }
 
+impl From<ContractId> for ContractKey {
+    fn from(id: ContractId) -> Self {
+        Self { id, contract: None }
+    }
+}
+
 impl<'a, T, U> From<(T, U)> for ContractKey
 where
     T: Borrow<Parameters<'a>>,
@@ -662,7 +668,7 @@ impl Deref for ContractKey {
 
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        internal_fmt_key(&self.id.0, f)
+        self.id.fmt(f)
     }
 }
 

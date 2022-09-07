@@ -2,10 +2,11 @@ use std::borrow::Cow;
 
 use locutus_core::ClientRequest;
 
-pub mod build_tool;
+pub mod build;
 pub mod config;
 pub mod local_node;
 pub mod new_pckg;
+pub mod commands;
 pub mod util;
 
 type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest>;

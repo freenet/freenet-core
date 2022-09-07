@@ -6,7 +6,7 @@ use std::{
 
 use serde::de::DeserializeOwned;
 
-use crate::{config::DeserializationFmt, DynError};
+use crate::{local_node::DeserializationFmt, DynError};
 
 pub fn deserialize<T, R>(deser_format: Option<DeserializationFmt>, data: &R) -> Result<T, DynError>
 where
