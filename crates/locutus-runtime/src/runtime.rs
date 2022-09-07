@@ -511,12 +511,14 @@ mod test {
 
     fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
         let mut store = ContractStore::new(test_dir(), 10_000)?;
+        // FIXME: Generate required test contract
         let contract = test_contract("test_contract_guest.wasi.wasm");
         let key = *contract.key();
         store.store_contract(contract)?;
         Ok((store, key))
     }
 
+    #[ignore]
     #[test]
     fn update_state() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = get_guest_test_contract()?;
@@ -533,6 +535,7 @@ mod test {
         Ok(())
     }
 
+    #[ignore]
     #[test]
     fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = get_guest_test_contract()?;

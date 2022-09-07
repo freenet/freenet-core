@@ -572,9 +572,8 @@ mod test {
     fn deps_parsing() -> Result<(), DynError> {
         let deps = toml::toml! {
             posts = { path = "../contracts/posts" }
-            third-party-1 = "moHBnP2j9F8Epkxc1JMNLgdGZ6iQnv4oAm"
-            third-party-2 = { key = "moHBnP2j9F8Epkxc1JMNLgdGZ6iQnv4oAm" }
         };
+        println!("{:?}", deps.as_table().unwrap().clone());
         include_deps(deps.as_table().unwrap())?;
         Ok(())
     }
