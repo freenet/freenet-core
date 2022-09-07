@@ -8,6 +8,8 @@ use locutus_core::{
     SqlitePool, WrappedState,
 };
 use serde::Serialize;
+use tracing::metadata::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 const MAX_SIZE: i64 = 10 * 1024 * 1024;
 const MAX_MEM_CACHE: u32 = 10_000_000;
@@ -103,12 +105,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    // env_logger::Builder::from_default_env()
-    //     .format_module_path(true)
-    //     .filter_level(log::LevelFilter::Info)
-    //     .init();
-
+    tracing_subscriber::fmt()
+        .with_level(true)
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
     #[allow(unused_variables)]
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

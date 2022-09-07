@@ -386,7 +386,7 @@ checksum = "64de3cc433455c14174d42e554d4027ee631c4d046d43e3ecc6efc4636cdc7a7"
 
 [[package]]
 name = "locutus-macros"
-version = "0.0.0"
+version = "0.0.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "locutus-stdlib"
-version = "0.0.0"
+version = "0.0.2"
 dependencies = [
  "arrayvec",
  "blake2",

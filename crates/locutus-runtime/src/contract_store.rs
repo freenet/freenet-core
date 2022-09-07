@@ -1,4 +1,5 @@
 use std::{
+    borrow::Borrow,
     fs::{self, File},
     io::{Read, Write},
     iter::FromIterator,
@@ -79,16 +80,21 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'a>,
     ) -> Option<WrappedContract<'a>> {
-        let contract_hash = if let Some(s) = key.code_hash() {
-            s
-        } else {
-            tracing::warn!("requested partially unspecified contract `{key}`");
-            return None;
-        };
-        if let Some(data) = self.contract_cache.get(contract_hash) {
-            Some(WrappedContract::new(data.value().clone(), params.clone()))
-        } else {
-            let path = bs58::encode(contract_hash)
+        let result = key
+            .code_hash()
+            .and_then(|code_hash| {
+                self.contract_cache
+                    .get(code_hash.borrow())
+                    .map(|data| Some(WrappedContract::new(data.value().clone(), params.clone())))
+            })
+            .flatten();
+        if result.is_some() {
+            return result;
+        }
+
+        self.key_to_code_part.get(key).and_then(|key| {
+            let code_hash = key.value();
+            let path = bs58::encode(code_hash.as_slice())
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string()
                 .to_lowercase();
@@ -101,13 +107,11 @@ impl ContractStore {
                         err
                     })
                     .ok()?;
-
             // add back the contract part to the mem store
             let size = data.data().len() as i64;
-            self.contract_cache
-                .insert(*contract_hash, data.clone(), size);
+            self.contract_cache.insert(*code_hash, data.clone(), size);
             Some(WrappedContract::new(data, params))
-        }
+        })
     }
 
     /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
