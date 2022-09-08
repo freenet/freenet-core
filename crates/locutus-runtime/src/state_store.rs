@@ -50,7 +50,7 @@ where
     pub fn new(store: S, max_size: u32) -> Result<Self, StateStoreError> {
         let counters = max_size as usize / Self::AVG_STATE_SIZE * 10;
         Ok(Self {
-            state_mem_cache: AsyncCache::new(counters, max_size as i64)
+            state_mem_cache: AsyncCache::new(counters, max_size as i64, tokio::spawn)
                 .map_err(|err| StateStoreError::Any(Box::new(err)))?,
             // params_mem_cache: AsyncCache::new(counters, max_size as i64)
             //     .map_err(|err| StateStoreError::Any(Box::new(err)))?,
