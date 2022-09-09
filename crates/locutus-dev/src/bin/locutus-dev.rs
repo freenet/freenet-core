@@ -1,6 +1,7 @@
 use clap::Parser;
 use locutus_dev::{
-    build_tool::build_package,
+    build::build_package,
+    commands::{put, update},
     config::{Config, SubCommand},
     local_node::run_local_node_client,
     new_pckg::create_new_package,
@@ -13,9 +14,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     let cwd = std::env::current_dir()?;
-    match Config::parse().sub_command {
+    let config = Config::parse();
+    match config.sub_command {
         SubCommand::RunLocal(local_node_config) => run_local_node_client(local_node_config).await,
         SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),
         SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
+        SubCommand::Publish(publish_config) => put(publish_config, config.additional).await,
+        SubCommand::Execute(cmd_config) => match cmd_config.command {
+            locutus_dev::config::NodeCommand::Put(put_config) => {
+                put(put_config, config.additional).await
+            }
+            locutus_dev::config::NodeCommand::Update(update_config) => {
+                update(update_config, config.additional).await
+            }
+        },
     }
 }

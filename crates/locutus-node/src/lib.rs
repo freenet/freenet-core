@@ -32,7 +32,6 @@ enum HostCallbackResult {
     },
 }
 
-#[cfg(feature = "local")]
 pub mod local_node {
     use std::net::{Ipv4Addr, SocketAddr};
 

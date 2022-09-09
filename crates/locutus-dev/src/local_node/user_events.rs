@@ -14,12 +14,9 @@ use locutus_core::{
 use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{
-    config::{DeserializationFmt, LocalNodeCliConfig},
-    util, CommandSender, DynError,
-};
+use crate::{util, CommandSender, DynError};
 
-use super::state::AppState;
+use super::{state::AppState, DeserializationFmt, LocalNodeCliConfig};
 
 const HELP: &str = "Locutus Contract Development Environment
 

@@ -510,7 +510,7 @@ mod test {
     }
 
     fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
-        let mut store = ContractStore::new(test_dir(), 10_000);
+        let mut store = ContractStore::new(test_dir(), 10_000)?;
         // FIXME: Generate required test contract
         let contract = test_contract("test_contract_guest.wasi.wasm");
         let key = *contract.key();

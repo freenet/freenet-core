@@ -1114,6 +1114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsevent-sys"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1561,6 +1570,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "inotify"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8069d3ec154eb856955c1c0fbffefbf5f3c40a104ec912d4797314c1801abff"
+dependencies = [
+ "bitflags",
+ "inotify-sys",
+ "libc",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "instant"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1651,6 +1680,26 @@ dependencies = [
  "pest",
  "pest_derive",
  "serde",
+]
+
+[[package]]
+name = "kqueue"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d6112e8f37b59803ac47a42d14f1f3a59bbf72fc6857ffc5be455e28a691f8e"
+dependencies = [
+ "kqueue-sys",
+ "libc",
+]
+
+[[package]]
+name = "kqueue-sys"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8367585489f01bc55dd27404dcf56b95e6da061a256a666ab23be9ba96a2e587"
+dependencies = [
+ "bitflags",
+ "libc",
 ]
 
 [[package]]
@@ -2005,6 +2054,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "locutus"
+version = "0.0.2"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "bytes",
+ "clap",
+ "env_logger",
+ "futures",
+ "locutus-core",
+ "log",
+ "serde",
+ "serde_json",
+ "tar",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "warp",
+ "xz2",
+]
+
+[[package]]
 name = "locutus-core"
 version = "0.0.2"
 dependencies = [
@@ -2089,27 +2160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "locutus-node"
-version = "0.0.2"
-dependencies = [
- "async-trait",
- "byteorder",
- "bytes",
- "env_logger",
- "futures",
- "locutus-core",
- "log",
- "serde",
- "serde_json",
- "tar",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "warp",
- "xz2",
-]
-
-[[package]]
 name = "locutus-runtime"
 version = "0.0.2"
 dependencies = [
@@ -2122,6 +2172,7 @@ dependencies = [
  "dashmap",
  "futures",
  "locutus-stdlib",
+ "notify",
  "once_cell",
  "rand 0.8.5",
  "serde",
@@ -2429,6 +2480,24 @@ checksum = "a8903e5a29a317527874d0402f867152a3d21c908bb0b933e416c65e301d4c36"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "notify"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2c66da08abae1c024c01d635253e402341b4060a12e99b31c7594063bf490a"
+dependencies = [
+ "bitflags",
+ "crossbeam-channel",
+ "filetime",
+ "fsevent-sys",
+ "inotify",
+ "kqueue",
+ "libc",
+ "mio",
+ "walkdir",
+ "winapi",
 ]
 
 [[package]]

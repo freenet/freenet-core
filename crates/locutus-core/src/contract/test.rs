@@ -134,7 +134,8 @@ where
             contract_store: ContractStore::new(
                 CONFIG.config_paths.contracts_dir.clone(),
                 Self::MAX_MEM_CACHE,
-            ),
+            )
+            .unwrap(),
             _runtime: MockRuntime {},
         }
     }
