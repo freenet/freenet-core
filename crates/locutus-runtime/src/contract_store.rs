@@ -53,9 +53,15 @@ impl ContractStore {
     pub fn new(contracts_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
         const ERR: &str = "failed to build mem cache";
         let key_to_code_part;
-        LOCK_FILE_PATH.set(contracts_dir.join("__LOCK")).unwrap();
-        KEY_FILE_PATH.set(contracts_dir.join("KEY_DATA")).unwrap();
-        if !contracts_dir.exists() {
+        let _ = LOCK_FILE_PATH.try_insert(contracts_dir.join("__LOCK"));
+        let key_file = match KEY_FILE_PATH
+            .try_insert(contracts_dir.join("KEY_DATA"))
+            .map_err(|(e, _)| e)
+        {
+            Ok(f) => f,
+            Err(f) => f,
+        };
+        if !key_file.exists() {
             std::fs::create_dir_all(&contracts_dir).map_err(|err| {
                 tracing::error!("error creating contract dir: {err}");
                 err
