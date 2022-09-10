@@ -1,5 +1,4 @@
 use std::{
-    borrow::Borrow,
     fs::{self, File},
     io::{Read, Write},
     iter::FromIterator,
@@ -90,7 +89,7 @@ impl ContractStore {
             .code_hash()
             .and_then(|code_hash| {
                 self.contract_cache
-                    .get(code_hash.borrow())
+                    .get(code_hash)
                     .map(|data| Some(WrappedContract::new(data.value().clone(), params.clone())))
             })
             .flatten();
