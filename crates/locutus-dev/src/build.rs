@@ -111,23 +111,23 @@ fn build_web_state(
         println!("Bundling webapp contract state");
         match &web_config.lang {
             SupportedWebLangs::Typescript => {
+                let child = Command::new("npm")
+                    .args(&["install"])
+                    .current_dir(cwd)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| {
+                        eprintln!("Error while installing npm packages: {e}");
+                        Error::CommandFailed("npm")
+                    })?;
+                pipe_std_streams(child)?;
                 let webpack = web_config
                     .typescript
                     .as_ref()
                     .map(|c| c.webpack)
                     .unwrap_or_default();
                 if webpack {
-                    let child = Command::new("npm")
-                        .args(&["install"])
-                        .current_dir(cwd)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .map_err(|e| {
-                            eprintln!("Error while installing npm packages: {e}");
-                            Error::CommandFailed("npm")
-                        })?;
-                    pipe_std_streams(child)?;
                     let cmd_args: &[&str] =
                         if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
                             &["--color"]
@@ -380,12 +380,12 @@ fn get_out_lib(work_dir: &Path) -> Result<(String, PathBuf), DynError> {
         .as_str()
         .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
         .replace('-', "_");
-    let mut output_lib = env::var("CARGO_TARGET_DIR")?
+    let output_lib = env::var("CARGO_TARGET_DIR")?
         .parse::<PathBuf>()?
         .join("wasm32-unknown-unknown")
         .join("release")
-        .join(&package_name);
-    output_lib.set_extension("wasm");
+        .join(&package_name)
+        .with_extension("wasm");
     Ok((package_name, output_lib))
 }
 

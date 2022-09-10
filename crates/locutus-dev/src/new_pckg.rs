@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    build_tool::*,
+    build::*,
     config::{ContractKind, NewPackageCliConfig},
     util::pipe_std_streams,
     DynError, Error,
@@ -45,8 +45,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
         state: None,
     };
     let serialized = toml::to_vec(&locutus_file_config)?;
-    let mut path = cwd.join("locutus");
-    path.set_extension("toml");
+    let path = cwd.join("locutus").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
     Ok(())
@@ -64,8 +63,7 @@ fn create_regular_contract(cwd: &Path) -> Result<(), DynError> {
         state: None,
     };
     let serialized = toml::to_vec(&locutus_file_config)?;
-    let mut path = cwd.join("locutus");
-    path.set_extension("toml");
+    let path = cwd.join("locutus").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
     Ok(())
@@ -181,13 +179,11 @@ fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
     f.write_all(WEBPACK_CONFIG.as_bytes())?;
 
     fs::create_dir_all(cwd.join("src"))?;
-    let mut idx = cwd.join("src").join("index");
-    idx.set_extension("ts");
+    let idx = cwd.join("src").join("index").with_extension("ts");
     File::create(idx)?;
 
     fs::create_dir_all(cwd.join("dist"))?;
-    let mut idx = cwd.join("dist").join("index");
-    idx.set_extension("html");
+    let idx = cwd.join("dist").join("index").with_extension("html");
     File::create(idx)?;
 
     Ok(())

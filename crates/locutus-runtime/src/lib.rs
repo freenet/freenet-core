@@ -58,4 +58,7 @@ pub enum ContractRuntimeError {
 
     #[error(transparent)]
     WasmRtError(#[from] wasmer::RuntimeError),
+
+    #[error(transparent)]
+    Any(#[from] Box<dyn std::error::Error + Send + Sync>),
 }

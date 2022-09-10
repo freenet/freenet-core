@@ -4,10 +4,9 @@ use locutus_core::{ContractExecutor, SqlitePool};
 use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
-use crate::{
-    config::{DeserializationFmt, LocalNodeCliConfig},
-    DynError,
-};
+use crate::{local_node::DeserializationFmt, DynError};
+
+use super::LocalNodeCliConfig;
 
 #[derive(Clone)]
 pub(super) struct AppState {
@@ -22,7 +21,7 @@ impl AppState {
         let tmp_path = std::env::temp_dir().join("locutus").join("contracts");
         std::fs::create_dir_all(&tmp_path)?;
         let contract_store =
-            ContractStore::new(tmp_path.join("contracts"), config.max_contract_size);
+            ContractStore::new(tmp_path.join("contracts"), config.max_contract_size)?;
         let state_store = StateStore::new(SqlitePool::new().await?, Self::MAX_MEM_CACHE).unwrap();
         Ok(AppState {
             local_node: Arc::new(RwLock::new(

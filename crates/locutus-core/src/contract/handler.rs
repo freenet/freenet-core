@@ -303,7 +303,7 @@ pub(in crate::contract) mod sqlite {
             Box::pin(async move {
                 match sqlx::query("SELECT params FROM states WHERE contract = ?")
                     .bind(key.bytes())
-                    .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("state"))))
+                    .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("params"))))
                     .fetch_one(&self.0)
                     .await
                 {
@@ -384,7 +384,8 @@ pub(in crate::contract) mod sqlite {
             channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
         ) -> Self {
             let store =
-                ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE);
+                ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE)
+                    .unwrap();
             let runtime = MockRuntime {};
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current()
@@ -471,7 +472,8 @@ pub(in crate::contract) mod sqlite {
         async fn get_handler() -> Result<SQLiteContractHandler<MockRuntime>, SqlDbError> {
             let (_, ch_handler) = contract_handler_channel();
             let store: ContractStore =
-                ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE);
+                ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE)
+                    .unwrap();
             SQLiteContractHandler::new(ch_handler, store, MockRuntime {}).await
         }
 
@@ -566,7 +568,8 @@ pub mod test {
                 contract_store: ContractStore::new(
                     CONFIG.config_paths.contracts_dir.clone(),
                     MAX_MEM_CACHE,
-                ),
+                )
+                .unwrap(),
                 _runtime: MockRuntime {},
             }
         }

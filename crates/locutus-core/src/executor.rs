@@ -1,6 +1,6 @@
 //! Contract executor.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use locutus_runtime::{prelude::*, ContractRuntimeError};
 use tokio::sync::mpsc::UnboundedSender;
@@ -20,12 +20,10 @@ type Response = Result<HostResponse, Either<RequestError, DynError>>;
 /// of changes or can alternatively use the notification channel.
 #[derive(Clone)]
 pub struct ContractExecutor {
-    contract_params: HashMap<ContractKey, Parameters<'static>>,
-    contract_data: HashMap<String, Arc<ContractCode<'static>>>,
     runtime: Runtime,
+    contract_state: StateStore<SqlitePool>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, StateSummary<'static>>>,
-    contract_state: StateStore<SqlitePool>,
 }
 
 impl ContractExecutor {
@@ -37,10 +35,8 @@ impl ContractExecutor {
         ctrl_handler();
 
         Ok(Self {
-            contract_params: HashMap::default(),
-            contract_data: HashMap::default(),
-            contract_state,
             runtime: Runtime::build(store, false).unwrap(),
+            contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
         })
@@ -137,9 +133,6 @@ impl ContractExecutor {
                     .await
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                self.contract_params.insert(*key, contract.params().clone());
-                self.contract_data
-                    .insert(key.encoded_code_hash().unwrap(), contract.code().clone());
                 self.send_update_notification(key, contract.params(), &state)
                     .await
                     .map_err(|_| {
@@ -152,20 +145,11 @@ impl ContractExecutor {
             }
             ClientRequest::Update { key, delta } => {
                 let parameters = {
-                    match self
-                        .contract_params
-                        .get(&key)
-                        .ok_or_else(|| Either::Right("contract not found".into()))
-                    {
-                        Ok(state) => state.clone(),
-                        Err(err) => self
-                            .contract_state
-                            .get_params(&key)
-                            .await
-                            .map_err(|_| err)?,
-                    }
+                    self.contract_state
+                        .get_params(&key)
+                        .await
+                        .map_err(|err| Either::Right(err.into()))?
                 };
-
                 let new_state = {
                     let state = self
                         .contract_state
@@ -264,27 +248,22 @@ impl ContractExecutor {
         contract: bool,
         key: ContractKey,
     ) -> Result<HostResponse, RequestError> {
-        let got_contract = contract
-            .then(|| {
-                let parameters =
-                    self.contract_params
-                        .get(&key)
-                        .ok_or_else(|| RequestError::Get {
-                            key,
-                            cause: "missing contract".to_owned(),
-                        })?;
-                let data_key = key
-                    .encoded_code_hash()
-                    .or_else(|| {
-                        Some(ContractCode::encode_hash(
-                            &self.runtime.contracts.code_hash_from_key(&key).unwrap(),
-                        ))
-                    })
-                    .unwrap();
-                let data = self.contract_data.get(&data_key).unwrap();
-                Ok(WrappedContract::new(data.clone(), parameters.clone()))
-            })
-            .transpose()?;
+        let mut got_contract = None;
+        if contract {
+            let parameters = self.contract_state.get_params(&key).await.map_err(|e| {
+                log::error!("{e}");
+                RequestError::Get {
+                    key,
+                    cause: "missing contract".to_owned(),
+                }
+            })?;
+            let contract = self
+                .runtime
+                .contracts
+                .fetch_contract(&key, &parameters)
+                .unwrap();
+            got_contract = Some(contract);
+        }
         match self.contract_state.get(&key).await {
             Ok(state) => Ok(HostResponse::GetResponse {
                 contract: got_contract,
@@ -312,7 +291,7 @@ mod test {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_path = std::env::temp_dir().join("locutus");
-        let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE);
+        let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE)?;
         let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         ContractExecutor::new(contract_store.clone(), state_store.clone(), || {
@@ -322,7 +301,6 @@ mod test {
         .expect("local node with handle");
 
         assert_eq!(counter, 1);
-
         Ok(())
     }
 }
