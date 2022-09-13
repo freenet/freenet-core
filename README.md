@@ -1,6 +1,24 @@
-# Locutus 
 
-[![Matrix](https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix)](https://matrix.to/#/#freenet-locutus:matrix.org) [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=discord&logo=discord)](https://discord.gg/2kZuKNxYXv) [![CI](https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/ci.yml) 
+<br>
+
+<div align = center>
+
+[![Badge Matrix]][Matrix]   
+[![Badge Discord]][Discord]   
+[![Badge Twitter]][Twitter]   
+
+[![Badge Apache]][License Apache]
+    **or**    
+[![Badge MIT]][License MIT]
+
+[![Badge CI]][CI]
+<br>
+
+# Locutus
+
+</div>
+
+<br>
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
@@ -60,10 +78,6 @@ We're working hard and expect an early prototype in August 2022.
 You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
 
 
-### 7. Stay up to date
-
-[![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
-
 ### 8. Name
 
 Locutus is the development name for this software; it will probably change before launch.
@@ -82,11 +96,26 @@ generously supported our work with a grant.
 If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
 *ian at freenet dot org*.
 
-### 11. License
+  
+<br>
 
-This project is licensed under either of:
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-  http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  http://opensource.org/licenses/MIT)
+<!----------------------------------------------------------------------------->
+
+[Twitter]: https://twitter.com/FreenetOrg
+[Discord]: https://discord.gg/2kZuKNxYXv
+[Matrix]: https://matrix.to/#/#freenet-locutus:matrix.org
+[CI]: https://github.com/freenet/locutus/actions/workflows/ci.yml
+
+[License Apache]: LICENSE-APACHE
+[License MIT]: LICENSE-MIT
+
+
+<!---------------------------------[ Badges ]---------------------------------->
+
+[Badge Twitter]: https://img.shields.io/twitter/follow/freenetorg?color=1780bd&labelColor=1DA1F2&logoColor=white&logo=Twitter&style=for-the-badge&label=FreenetOrg
+[Badge Discord]: https://img.shields.io/discord/917499817758978089?logoColor=white&style=for-the-badge&label=Discord&logo=Discord&labelColor=7289da&color=5d71b3
+[Badge Matrix]: https://img.shields.io/matrix/freenet-locutus:matrix.org?logoColor=white&style=for-the-badge&label=matrix&logo=matrix&labelColor=0DBD8B&color=0b9f73
+[Badge Apache]: https://img.shields.io/badge/License-Apache_2-961b1f?style=for-the-badge&labelColor=D22128
+[Badge MIT]: https://img.shields.io/badge/License-MIT-ac8b11.svg?style=for-the-badge&labelColor=yellow
+[Badge CI]: https://img.shields.io/github/workflow/status/freenet/locutus/CI?logoColor=white&style=for-the-badge&color=a81d59&labelColor=cb236c&logo=GitHub
