@@ -7,18 +7,32 @@
 [![Badge Discord]][Discord]   
 [![Badge Twitter]][Twitter]   
 
-[![Badge Apache]][License Apache]
-    **or**    
+[![Badge Apache]][License Apache]    
+![Badge Or]    
 [![Badge MIT]][License MIT]
 
 [![Badge CI]][CI]
+
 <br>
 
 # Locutus
 
+<br>
+<br>
+
+[![Button Documentation]][Documentation]   
+[![Button Donate]][Donate]
+
 </div>
 
 <br>
+
+
+We're working hard and expect an early prototype in August 2022. 
+
+Locutus is the development name for this software; it will probably change before launch.
+
+
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
@@ -26,40 +40,91 @@ Locutus is a software platform that makes it easy to create decentralized altern
 
 Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
 
-### 1. News
+## News
 
-* **16th July, 2022:** Ian gave a talk on Decentralized Reputation and Trust, [watch here](https://github.com/freenet/locutus/wiki/Decentralized-Reputation-and-Trust)
-* **7th July, 2022:** Ian gave an introductory talk on Locutus which you can watch on [YouTube](https://www.youtube.com/watch?v=d31jmv5Tx5k) or [Vimeo](https://vimeo.com/740461100).
+### 2022   July 16th
 
-### 2. Applications
+*Ian gave a talk on Decentralized Reputation and Trust.*
 
-Examples of what can be built on Locutus include:
+[![Button YouTube]][16th YouTube]
 
-* Decentralized email (with a gateway to legacy email via the @freenet.org domain)
-* Decentralized microblogging (think Twitter or Facebook)
-* Instant Messaging (Whatsapp, Signal)
-* Online Store (Amazon)
-* Discussion (Reddit, HN)
-* Video discovery (Youtube, TikTok)
-* Search (Google, Bing)
+### 2022   July 7th
 
-All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
+*Ian gave an introductory talk on **Locutus**.*
 
-### 3. Components
+[![Button YouTube]][7th YouTube]  
+[![Button Vimeo]][7th Vimeo]
+
+<br>
+<br>
+
+## Applications
+
+*What can be built on Locutus:*
+
+<br>
+
+-   **Decentralized Micro-blogging**
+    
+    *Think Twitter or Facebook*
+
+-   **Decentralized Email**
+
+    *With a gateway to legacy email* <br>
+    *via the @freenet.org domain*
+
+-   **Instant Messaging**
+
+    *Whatsapp , Signal*
+
+-   **Video Discovery**
+
+    *Youtube , TikTok*
+
+-   **Online Stores**
+
+    *Amazon*
+
+-   **Discussions**
+    
+    *Reddit , HN*
+
+-   **Search**
+    
+    *Google , Bing*
+
+<br>
+
+***Everything will be:***
+
+<kbd>  Decentralized  </kbd>  
+<kbd>  Scalable  </kbd>  
+<kbd>  Cryptographically Secure  </kbd>
+
+<br>
+
+We want **Locutus** to be useful out-of-the-box, so we <br>
+plan to provide reference implementations for some <br>
+or all of these.
+
+<br>
+<br>
+
+## Components
 
 Decentralized services that can be used by other decentralized services:
 
-#### 3.1 Reputation system
+### Reputation system
 
 Allows users to build up reputation over time based on feedback from those they interact with. Think of the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
 
 This is conceptually similar to Freenet's [Web of Trust](http://www.draketo.de/english/freenet/friendly-communication-with-anonymity) plugin.
 
-#### 3.2 Arbiters
+### Arbiters
 
 Arbiters are trusted services that can perform tasks and authenticate the results, such as verifying that a contract had a particular state at a given time, or that external blockchains (Bitcoin, Ethereum, Solana etc) contain specific transactions. Trust is achieved through the reputation system.
 
-### 4. How does it work?
+## How does it work?
 
 Locutus is a decentralized key-value database. It uses the same [small world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as the original Freenet design, but each key is a cryptographic contract implemented in [Web Assembly](https://webassembly.org/), and the value associated with each contract is called its *state*. The role of the cryptographic contract is to specify what state is allowed for this contract, and how the state is modified.
 
@@ -67,45 +132,36 @@ A very simple contract might require that the state is a list of messages, each 
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
-### 5. Documentation
+<br>
+<br>
 
-* [Glossary](https://github.com/freenet/locutus/wiki/Glossary)
+## Acknowledgments
 
-### 6. Status
+<br>
 
-We're working hard and expect an early prototype in August 2022. 
+-   **[Protocol Labs]**
 
-You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
+    *In addition to creating the excellent **[libp2p]** library,* <br>
+    *which we use for low-level transport, they have* <br>
+    *also generously supported our work with a grant.*
 
-
-### 8. Name
-
-Locutus is the development name for this software; it will probably change before launch.
-
-### 9. Chat with us
-
-We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join. If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
-
-Many developers are active in [r/freenet](https://www.reddit.com/r/Freenet/), but remember that Reddit engages in political and ideological censorship so don't make this your only point of contact with us.
-
-### 10. Acknowledgements and Funding
-
-In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
-generously supported our work with a grant.
-
-If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
-*ian at freenet dot org*.
-
-  
 <br>
 
 
 <!----------------------------------------------------------------------------->
 
+[Documentation]: https://github.com/freenet/locutus/wiki/Glossary
+[Protocol Labs]: https://protocol.ai/
 [Twitter]: https://twitter.com/FreenetOrg
 [Discord]: https://discord.gg/2kZuKNxYXv
 [Matrix]: https://matrix.to/#/#freenet-locutus:matrix.org
+[Donate]: https://freenetproject.org/pages/donate.html
+[libp2p]: https://github.com/libp2p/rust-libp2p
 [CI]: https://github.com/freenet/locutus/actions/workflows/ci.yml
+
+[16th YouTube]: https://youtu.be/4L9pXIBAdG4
+[7th YouTube]: https://www.youtube.com/watch?v=d31jmv5Tx5k
+[7th Vimeo]: https://vimeo.com/740461100
 
 [License Apache]: LICENSE-APACHE
 [License MIT]: LICENSE-MIT
@@ -119,3 +175,13 @@ If you are in a position to fund our continued efforts please contact us on [twi
 [Badge Apache]: https://img.shields.io/badge/License-Apache_2-961b1f?style=for-the-badge&labelColor=D22128
 [Badge MIT]: https://img.shields.io/badge/License-MIT-ac8b11.svg?style=for-the-badge&labelColor=yellow
 [Badge CI]: https://img.shields.io/github/workflow/status/freenet/locutus/CI?logoColor=white&style=for-the-badge&color=a81d59&labelColor=cb236c&logo=GitHub
+[Badge Or]: https://img.shields.io/badge/OR-66b9c2?style=flat
+
+
+<!---------------------------------[ Buttons ]--------------------------------->
+
+[Button Documentation]: https://img.shields.io/badge/Documentation-1da1f2?style=for-the-badge&logoColor=white&logo=GitBook
+[Button Donate]: https://img.shields.io/badge/Donate-cb236c?style=for-the-badge&logoColor=white&logo=GitHubSponsors
+[Button YouTube]: https://img.shields.io/badge/YouTube-FF0000?style=flat&logoColor=white&logo=YouTube
+[Button Vimeo]: https://img.shields.io/badge/Vimeo-1AB7EA?style=flat&logoColor=white&logo=Vimeo
+
