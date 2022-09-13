@@ -17,28 +17,45 @@
 
 # Locutus
 
+*Software platform for creating decentralized alternatives* <br>
+*to today's centralized tech companies with familiar tools* <br>
+*like **[React]** and **[Vue.js]**.*
+
 <br>
 <br>
 
 [![Button Documentation]][Documentation]   
 [![Button Donate]][Donate]
 
+
+<br>
+<br>
+
+*The project name - **Locutus** - may still be changed.*
+
+*An **Early Prototype** is being worked* <br>
+*on and expected for **August 2022**.*
+
 </div>
 
 <br>
+<br>
 
+## Mission
 
-We're working hard and expect an early prototype in August 2022. 
+The Internet has grown increasingly centralized over <br>
+the past 25 years, such that a handful of companies <br>
+now effectively control the Internet's infrastructure.
 
-Locutus is the development name for this software; it will probably change before launch.
+The public square is privately owned, thus not only <br>
+threatening freedom of speech but also democracy.
 
+**Locutus** as an alternative platform wants to make <br>
+decentralized apps be easy to use, scalable & secure <br>
+through cryptography to regain these lost freedoms.
 
-
-The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
-
-Locutus is a software platform that makes it easy to create decentralized alternatives to today's centralized tech companies. These decentralized apps will be easy to use, scalable, and secured through cryptography.
-
-Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
+<br>
+<br>
 
 ## News
 
@@ -95,14 +112,6 @@ Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vu
 
 <br>
 
-***Everything will be:***
-
-<kbd>  Decentralized  </kbd>  
-<kbd>  Scalable  </kbd>  
-<kbd>  Cryptographically Secure  </kbd>
-
-<br>
-
 We want **Locutus** to be useful out-of-the-box, so we <br>
 plan to provide reference implementations for some <br>
 or all of these.
@@ -154,9 +163,11 @@ Locutus is implemented in Rust and will be available across all major operating 
 [Protocol Labs]: https://protocol.ai/
 [Twitter]: https://twitter.com/FreenetOrg
 [Discord]: https://discord.gg/2kZuKNxYXv
+[Vue.js]: https://vuejs.org/
 [Matrix]: https://matrix.to/#/#freenet-locutus:matrix.org
 [Donate]: https://freenetproject.org/pages/donate.html
 [libp2p]: https://github.com/libp2p/rust-libp2p
+[React]: https://reactjs.org/
 [CI]: https://github.com/freenet/locutus/actions/workflows/ci.yml
 
 [16th YouTube]: https://youtu.be/4L9pXIBAdG4
@@ -175,7 +186,7 @@ Locutus is implemented in Rust and will be available across all major operating 
 [Badge Apache]: https://img.shields.io/badge/License-Apache_2-961b1f?style=for-the-badge&labelColor=D22128
 [Badge MIT]: https://img.shields.io/badge/License-MIT-ac8b11.svg?style=for-the-badge&labelColor=yellow
 [Badge CI]: https://img.shields.io/github/workflow/status/freenet/locutus/CI?logoColor=white&style=for-the-badge&color=a81d59&labelColor=cb236c&logo=GitHub
-[Badge Or]: https://img.shields.io/badge/OR-66b9c2?style=flat
+[Badge Or]: https://img.shields.io/badge/OR-66b9c2?style=for-the-badge
 
 
 <!---------------------------------[ Buttons ]--------------------------------->
