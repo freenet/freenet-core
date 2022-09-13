@@ -79,7 +79,7 @@ through cryptography to regain these lost freedoms.
 
 <div align = center>
 
-## Applications
+## Application
 
 *What can be built on **Locutus**.*
 
@@ -97,9 +97,8 @@ through cryptography to regain these lost freedoms.
 
 <br>
 
-We want **Locutus** to be useful out-of-the-box, so we <br>
-plan to provide reference implementations for some <br>
-or all of these.
+We want **Locutus** to be useful out-of-the-box, so we plan to <br>
+provide reference implementations for some or all of these.
 
 </div>
 
@@ -116,11 +115,11 @@ or all of these.
 
 ### Reputation System
 
-Allows users to build up reputation over time <br>
-based on feedback from those they interact with.
+This system allows users to build up reputation over <br>
+time  based on feedback from those they interact with.
 
 Think of the feedback system in services such as Uber, <br>
-but with **Locutus** it will be completely decentralized & <br>
+but with **Locutus** it will be completely decentralized and <br>
 cryptographically secure.
 
 <br>
@@ -130,8 +129,6 @@ It can be used for things like:
 -   **Spam Prevention**
 
     *With IM and email*
-    
-    <br>
     
 -   **Fraud prevention**
     
@@ -159,17 +156,23 @@ Trust is achieved through the reputation system.
 
 ## How does it work?
 
-**Locutus** is a decentralized key - value database.
+***Locutus*** *is a decentralized key - value database.*
+
+<br>
 
 It uses the same **[Small World]** routing algorithm as the <br>
 original **Freenet** design, but each key is a cryptographic <br>
 contract implemented in **[Web Assembly]** and the value <br>
 associated with each contract is called its  `state` .
 
+<br>
+
 ### Cryptography Contract
 
 The role of a contract is to specify what <br>
 state is allowed and how it is modified.
+
+<br>
 
 ### State
 
@@ -180,10 +183,12 @@ The state can be updated to add new messages <br>
 if appropriately signed, which could for example <br>
 serve as the basis for a blog or Twitter feed.
 
+<br>
+
 ### Implementation
 
 **Locutus** is implemented in **Rust** and will be available <br>
-across all major operating systems, desktop and mobile.
+across all major operating systems, desktop & mobile.
 
 <br>
 <br>
@@ -204,6 +209,8 @@ across all major operating systems, desktop and mobile.
 ## Licensing
 
 *Either one of the following licenses is applicable.*
+
+<br>
 
 [![Badge Apache]][License Apache]    
 [![Badge MIT]][License MIT]
