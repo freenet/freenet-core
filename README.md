@@ -39,16 +39,22 @@
 
 <br>
 
-The Internet has grown increasingly centralized over <br>
-the past 25 years, such that a handful of companies <br>
+```
+
+
+The Internet has grown increasingly centralized over
+the past 25 years, such that a handful of companies
 now effectively control the Internet's infrastructure.
 
-The public square is privately owned, thus not only <br>
+The public square is privately owned, thus not only
 threatening freedom of speech but also democracy.
 
-**Locutus** as an alternative platform wants to make <br>
-decentralized apps be easy to use, scalable & secure <br>
+Locutus as an alternative platform wants to make
+decentralized apps be easy to use, scalable & secure
 through cryptography to regain these lost freedoms.
+
+
+```
 
 <br>
 <br>
@@ -163,7 +169,7 @@ Trust is achieved through the reputation system.
 It uses the same **[Small World]** routing algorithm as the <br>
 original **Freenet** design, but each key is a cryptographic <br>
 contract implemented in **[Web Assembly]** and the value <br>
-associated with each contract is called its  `state` .
+associated with each contract is called its `state` .
 
 <br>
 
@@ -245,9 +251,9 @@ across all major operating systems, desktop & mobile.
 
 <!---------------------------------[ Badges ]---------------------------------->
 
-[Badge Twitter]: https://img.shields.io/twitter/follow/freenetorg?color=1780bd&labelColor=1DA1F2&logoColor=white&logo=Twitter&style=for-the-badge&label=FreenetOrg
-[Badge Discord]: https://img.shields.io/discord/917499817758978089?logoColor=white&style=for-the-badge&label=Discord&logo=Discord&labelColor=7289da&color=5d71b3
-[Badge Matrix]: https://img.shields.io/matrix/freenet-locutus:matrix.org?logoColor=white&style=for-the-badge&label=matrix&logo=matrix&labelColor=0DBD8B&color=0b9f73
+[Badge Twitter]: https://img.shields.io/twitter/follow/freenetorg?color=1780bd&labelColor=1DA1F2&logoColor=white&logo=Twitter&style=for-the-badge&label=
+[Badge Discord]: https://img.shields.io/discord/917499817758978089?logoColor=white&style=for-the-badge&label=&logo=Discord&labelColor=7289da&color=5d71b3
+[Badge Matrix]: https://img.shields.io/matrix/freenet-locutus:matrix.org?logoColor=white&style=for-the-badge&label=&logo=matrix&labelColor=0DBD8B&color=0b9f73
 [Badge Apache]: https://img.shields.io/badge/License-Apache_2-961b1f?style=for-the-badge&labelColor=D22128
 [Badge MIT]: https://img.shields.io/badge/License-MIT-ac8b11.svg?style=for-the-badge&labelColor=yellow
 [Badge CI]: https://img.shields.io/github/workflow/status/freenet/locutus/CI?logoColor=white&style=for-the-badge&color=a81d59&labelColor=cb236c&logo=GitHub
