@@ -27,17 +27,17 @@
 <br>
 <br>
 
-*The project name - **Locutus** - may still be changed.*
+*The name - **Locutus** - may still be changed.*
 
 *An **Early Prototype** is being worked* <br>
 *on and expected for **August 2022**.*
-
-</div>
 
 <br>
 <br>
 
 ## Mission
+
+<br>
 
 The Internet has grown increasingly centralized over <br>
 the past 25 years, such that a handful of companies <br>
@@ -55,11 +55,17 @@ through cryptography to regain these lost freedoms.
 
 ## News
 
+</div>
+
+<br>
+
 ### 2022   July 16th
 
 *Ian gave a talk on Decentralized Reputation and Trust.*
 
 [![Button YouTube]][16th YouTube]
+
+<br>
 
 ### 2022   July 7th
 
@@ -71,27 +77,31 @@ through cryptography to regain these lost freedoms.
 <br>
 <br>
 
+<div align = center>
+
 ## Applications
 
 *What can be built on **Locutus**.*
 
 <br>
 
-<div align = center>
-
 | Decentralized Micro-blogging | Decentralized Email | Search
 |:----------------------------:|:-------------------:|:------:
 | *Twitter , Facebook* | *With a gateway to legacy email* <br> *via the @freenet.org domain* | *Google , Bing*
+
+<br>
 
 | Instant Messaging | Video Discovery | Online Stores | Discussions
 |:-----------------:|:---------------:|:-------------:|:-----------:
 | *Whatsapp , Signal* | *Youtube , TikTok* | *Amazon* | *Reddit , HN* 
 
-</div>
+<br>
 
 We want **Locutus** to be useful out-of-the-box, so we <br>
 plan to provide reference implementations for some <br>
 or all of these.
+
+</div>
 
 <br>
 <br>
