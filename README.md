@@ -5,11 +5,9 @@
 
 [![Badge Matrix]][Matrix]   
 [![Badge Discord]][Discord]   
-[![Badge Twitter]][Twitter]   
+[![Badge Twitter]][Twitter]
 
-[![Badge Apache]][License Apache]    
-![Badge Or]    
-[![Badge MIT]][License MIT]
+<br>
 
 [![Badge CI]][CI]
 
@@ -119,27 +117,82 @@ or all of these.
 <br>
 <br>
 
+<!--  TODO : Move out of README  -->
+
 ## Components
 
-Decentralized services that can be used by other decentralized services:
+*Decentralized services that can be used by one another.*
 
-### Reputation system
+<br>
 
-Allows users to build up reputation over time based on feedback from those they interact with. Think of the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
+### Reputation System
 
-This is conceptually similar to Freenet's [Web of Trust](http://www.draketo.de/english/freenet/friendly-communication-with-anonymity) plugin.
+Allows users to build up reputation over time <br>
+based on feedback from those they interact with.
+
+Think of the feedback system in services such as Uber, <br>
+but with **Locutus** it will be completely decentralized & <br>
+cryptographically secure.
+
+<br>
+
+It can be used for things like:
+
+-   Spam Prevention
+
+    *With IM and email*
+    
+-   Fraud prevention
+    
+    *With an online store*
+
+<br>
+
+This is conceptually similar to <br>
+**Freenet**'s **[Web of Trust]** plugin.
+
+<br>
 
 ### Arbiters
 
-Arbiters are trusted services that can perform tasks and authenticate the results, such as verifying that a contract had a particular state at a given time, or that external blockchains (Bitcoin, Ethereum, Solana etc) contain specific transactions. Trust is achieved through the reputation system.
+Arbiters are trusted services that can perform tasks <br>
+and authenticate the results, such as verifying that <br>
+a contract had a particular state at a given time, or <br>
+that external blockchains - like Bitcoin , Ethereum , <br>
+Solana - contain specific transactions.
+
+Trust is achieved through the reputation system.
+
+<br>
+<br>
 
 ## How does it work?
 
-Locutus is a decentralized key-value database. It uses the same [small world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as the original Freenet design, but each key is a cryptographic contract implemented in [Web Assembly](https://webassembly.org/), and the value associated with each contract is called its *state*. The role of the cryptographic contract is to specify what state is allowed for this contract, and how the state is modified.
+**Locutus** is a decentralized key - value database.
 
-A very simple contract might require that the state is a list of messages, each signed with a specific cryptographic keypair. The state can be updated to add new messages if appropriately signed. Something like this could serve as the basis for a blog or Twitter feed.
+It uses the same **[Small World]** routing algorithm as the <br>
+original **Freenet** design, but each key is a cryptographic <br>
+contract implemented in **[Web Assembly]** and the value <br>
+associated with each contract is called its  `state` .
 
-Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
+### Cryptography Contract
+
+The role of a contract is to specify what <br>
+state is allowed and how it is modified.
+
+### State
+
+A very simple contract might require that the state is a list of <br>
+messages, each signed with a specific cryptographic keypair.
+
+The state can be updated to add new messages <br>
+if appropriately signed, which could for example <br>
+serve as the basis for a blog or Twitter feed.
+
+### Implementation
+
+**Locutus** is implemented in **Rust** and will be available <br>
+across all major operating systems, desktop and mobile.
 
 <br>
 <br>
@@ -155,12 +208,25 @@ Locutus is implemented in Rust and will be available across all major operating 
     *also generously supported our work with a grant.*
 
 <br>
+<br>
+
+## Licensing
+
+*Either one of the following licenses is applicable.*
+
+[![Badge Apache]][License Apache]    
+[![Badge MIT]][License MIT]
+
+<br>
 
 
 <!----------------------------------------------------------------------------->
 
 [Documentation]: https://github.com/freenet/locutus/wiki/Glossary
 [Protocol Labs]: https://protocol.ai/
+[Web of Trust]: http://www.draketo.de/english/freenet/friendly-communication-with-anonymity
+[Web Assembly]: https://webassembly.org/
+[Small World]: https://freenetproject.org/assets/papers/lic.pdf
 [Twitter]: https://twitter.com/FreenetOrg
 [Discord]: https://discord.gg/2kZuKNxYXv
 [Vue.js]: https://vuejs.org/
@@ -169,6 +235,7 @@ Locutus is implemented in Rust and will be available across all major operating 
 [libp2p]: https://github.com/libp2p/rust-libp2p
 [React]: https://reactjs.org/
 [CI]: https://github.com/freenet/locutus/actions/workflows/ci.yml
+
 
 [16th YouTube]: https://youtu.be/4L9pXIBAdG4
 [7th YouTube]: https://www.youtube.com/watch?v=d31jmv5Tx5k
@@ -186,7 +253,7 @@ Locutus is implemented in Rust and will be available across all major operating 
 [Badge Apache]: https://img.shields.io/badge/License-Apache_2-961b1f?style=for-the-badge&labelColor=D22128
 [Badge MIT]: https://img.shields.io/badge/License-MIT-ac8b11.svg?style=for-the-badge&labelColor=yellow
 [Badge CI]: https://img.shields.io/github/workflow/status/freenet/locutus/CI?logoColor=white&style=for-the-badge&color=a81d59&labelColor=cb236c&logo=GitHub
-[Badge Or]: https://img.shields.io/badge/OR-66b9c2?style=for-the-badge
+[Badge Or]: https://img.shields.io/badge/OR-1da1f2?style=for-the-badge
 
 
 <!---------------------------------[ Buttons ]--------------------------------->
