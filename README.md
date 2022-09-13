@@ -7,8 +7,6 @@
 [![Badge Discord]][Discord]   
 [![Badge Twitter]][Twitter]
 
-<br>
-
 [![Badge CI]][CI]
 
 <br>
@@ -75,40 +73,21 @@ through cryptography to regain these lost freedoms.
 
 ## Applications
 
-*What can be built on Locutus:*
+*What can be built on **Locutus**.*
 
 <br>
 
--   **Decentralized Micro-blogging**
-    
-    *Think Twitter or Facebook*
+<div align = center>
 
--   **Decentralized Email**
+| Decentralized Micro-blogging | Decentralized Email | Search
+|:----------------------------:|:-------------------:|:------:
+| *Twitter , Facebook* | *With a gateway to legacy email* <br> *via the @freenet.org domain* | *Google , Bing*
 
-    *With a gateway to legacy email* <br>
-    *via the @freenet.org domain*
+| Instant Messaging | Video Discovery | Online Stores | Discussions
+|:-----------------:|:---------------:|:-------------:|:-----------:
+| *Whatsapp , Signal* | *Youtube , TikTok* | *Amazon* | *Reddit , HN* 
 
--   **Instant Messaging**
-
-    *Whatsapp , Signal*
-
--   **Video Discovery**
-
-    *Youtube , TikTok*
-
--   **Online Stores**
-
-    *Amazon*
-
--   **Discussions**
-    
-    *Reddit , HN*
-
--   **Search**
-    
-    *Google , Bing*
-
-<br>
+</div>
 
 We want **Locutus** to be useful out-of-the-box, so we <br>
 plan to provide reference implementations for some <br>
@@ -138,11 +117,13 @@ cryptographically secure.
 
 It can be used for things like:
 
--   Spam Prevention
+-   **Spam Prevention**
 
     *With IM and email*
     
--   Fraud prevention
+    <br>
+    
+-   **Fraud prevention**
     
     *With an online store*
 
