@@ -19,6 +19,13 @@ impl BufferBuilder {
         self.start as _
     }
 
+
+    /*
+    Process: [0x0,      [0x5F6E76  ...       ,0xFFFFF]
+        Runtime (WASM): [0x00...       ]
+
+    */
+
     /// # Safety
     /// Requires that there are no living references to the current
     /// underlying buffer or will trigger UB
@@ -35,7 +42,7 @@ impl BufferBuilder {
         self.start = new_ptr as i64;
         self.size = data.capacity() as _;
         *read_ptr = 0;
-        *write_ptr = data.len().saturating_sub(1) as _;
+        *write_ptr = data.len().saturating_sub(1) as _; // []
         std::mem::forget(data);
     }
 
@@ -177,11 +184,11 @@ unsafe fn compute_ptr<T>(ptr: *mut T, start_ptr: *const u8, _end_ptr: *const u8)
 struct BuilderInfo<'instance> {
     buffer: &'instance mut [u8],
     read_ptr: &'instance mut u32,
-    write_ptr: &'instance mut u32,
+    write_ptr: &'instance mut u32
 }
 
 fn from_raw_builder<'a>(
-    builder_ptr: *mut BufferBuilder,
+    builder_ptr: *mut BufferBuilder, // 0x01 <- 0x5FE436
     linear_mem_space: (*const u8, u64),
 ) -> BuilderInfo<'a> {
     let (start_ptr, size) = linear_mem_space;

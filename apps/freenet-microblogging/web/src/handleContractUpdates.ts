@@ -6,7 +6,7 @@ import {
   UpdateNotification,
   Key,
   HostError,
-} from "locutus-stdlib/src/webSocketInterface";
+} from "@locutus/locutus-stdlib/webSocketInterface";
 import "./scss/styles.scss";
 // import * as bootstrap from 'bootstrap'
 
@@ -59,7 +59,7 @@ async function sendUpdate() {
     sendVal = input;
   }
 
-  if (is_valid_update(sendVal.value)) {
+  if (isValidUpdate(sendVal.value)) {
     let encoder = new TextEncoder();
     let updateRequest = {
       key: KEY,
@@ -69,7 +69,7 @@ async function sendUpdate() {
   }
 }
 
-function is_valid_update(input: string): boolean {
+function isValidUpdate(input: string): boolean {
   const expected_keys = new Set(["author", "date", "title", "content"]);
   try {
     let input_json = JSON.parse(input);

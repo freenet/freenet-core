@@ -12,6 +12,10 @@ repository = "https://github.com/freenet/locutus"
 name = "locutus-node"
 path = "src/bin/node.rs"
 
+[[bin]]
+name = "ldt"
+path = "src/bin/dev-tool.rs"
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
@@ -31,3 +35,4 @@ warp = { version = "0.3", default-features = false, features = ["multipart", "tl
 
 # internal:
 locutus-core = { path = "../locutus-core", features = ["websocket"], version = "0.0.2" }
+locutus-dev = { path = "../locutus-dev", version = "0.0.2" }

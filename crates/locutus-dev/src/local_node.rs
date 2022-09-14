@@ -46,7 +46,6 @@ pub enum DeserializationFmt {
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Locutus Local Development Node Environment")]
 #[clap(author = "The Freenet Project Inc.")]
-#[clap(version = "0.0.1")]
 #[clap(group(
     ArgGroup::new("output")
         .required(true)

@@ -98,6 +98,19 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
         })?;
     pipe_std_streams(child)?;
 
+    // add the stdlib dependency
+    let child = Command::new("cargo")
+        .args(&["add", "locutus-stdlib"])
+        .current_dir(&dest_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            eprintln!("Error while executing cargo command: {e}");
+            Error::CommandFailed("cargo")
+        })?;
+    pipe_std_streams(child)?;
+
     // add any additional config keys
     // todo: improve error handling here, in case something fails would have to rollback any changes
     let mut cargo_file = File::open(dest_path.join("Cargo.toml"))?;
