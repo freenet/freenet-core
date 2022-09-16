@@ -19,13 +19,6 @@ impl BufferBuilder {
         self.start as _
     }
 
-
-    /*
-    Process: [0x0,      [0x5F6E76  ...       ,0xFFFFF]
-        Runtime (WASM): [0x00...       ]
-
-    */
-
     /// # Safety
     /// Requires that there are no living references to the current
     /// underlying buffer or will trigger UB
@@ -184,7 +177,7 @@ unsafe fn compute_ptr<T>(ptr: *mut T, start_ptr: *const u8, _end_ptr: *const u8)
 struct BuilderInfo<'instance> {
     buffer: &'instance mut [u8],
     read_ptr: &'instance mut u32,
-    write_ptr: &'instance mut u32
+    write_ptr: &'instance mut u32,
 }
 
 fn from_raw_builder<'a>(
