@@ -140,6 +140,8 @@ impl ContractInterface for Contract {
 
       🛈 The exact interface still is an evolving specification.
 
+> **TODO:** Elsewhere in the documentation, explain the intricate details of how interfacing through WASM works. In theory users could implement their own wrapping code as long as the follow the low level WASM code specification.
+
 Here we create a new type, `Contract` for which we will be implementing the `ContractInterface` trait. To know more details about the functionality of a contract, delve into the details of the [contract interface](contract-interface.md).
 
 Notice the `#[contract]` macro call, this will generate the necessary code for the WASM runtime to interact with your contract in an ergonomic ans safe way. Trying to use this macro more than once in the same module will result in a compiler error, and only the code generated at the top level module will be used by the runtime.
@@ -155,7 +157,7 @@ In order to do that, we can go and modify the code of the contract state, which 
 ```
 {
   "dependencies": {
-    "@locutus/locutus-stdlib": "0.0.1"
+    "@locutus/locutus-stdlib": "0.0.2"
   }
 }
 ```
@@ -287,7 +289,72 @@ function getUpdateNotification(notification: UpdateNotification) {
 
 Now that we have the frontend and the backend of our web app, we can package the contracts and run them in the node to test them out.
 
-## Testing out your contract in the local node
+In order to do that, we can again use the development tool to help us out with the process, in each contract directory we run the following commands:
+
+```
+$ ldt build
+```
+
+This command will read your contract manifest file (`locutus.toml`) and take care of building the contract and packaging it, ready for the node and the network to consume it.
+
+> **TODO:** Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the usecase doesn't fit with the current tooling, so they know the necessary steeps to itneract with the node at a lower level.
+
+Under the `./build/locutus` directory you will see both a `*.wasm` file, which is the contract file, and `contract-state`, in case it applies, which is the initial state that will be uploaded when initially putting the contract.
+
+Web applications can access the code of backend contracts directly in their applications and put new contracts (that is, assigning a new location for the code, plus any parameters that may be generated dinamically by the web app, and the initial state for that combination of contract code + parameters) dinamically.
+
+Let's take a look at the manifest for our web app container contract:
+
+```
+[contract]
+type = "webapp"
+lang = "rust"
+
+...
+
+[webapp.state-sources]
+source_dirs = ["dist"]
+```
+
+This means that the + dist` directory will be packaged as the initial state for the webapp (that is the code the browser will be interpreting and in the end, rendering).
+
+If we add the following keys to the manifesto:
+
+```
+[webapp.dependencies]
+posts = { path = "../backend" }
+```
+
+The WASM code from the `backend` contract will be embedded in our web application state, so it will be accesible as a resource just via the local HTTP gateway access and then we can re-use it for publishing additional contracts.
+
+> **TODO:** Publishing to the real functioning Locutus network is not yet supported.
+
+## Testing out contracts in the local node
+
+Once we have all our contracts sorted and ready for testing, we can do this in local mode in our node. For this the node must be running, we can make sure that is running by running the following command as a background process or in other terminal, since we have installed it:
+
+```
+$ locutus-node
+```
+
+You should see some logs printed via the stdout of the process indicating that the node HTTP gateway is running.
+
+Once the HTTP gateway is running, we are ready to put the contracts in the node:
+
+```
+$ cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
+$ cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
+```
+
+In this case we are not passing any parameters (so ours parameters will be basically an empty byte array), and we are passing an initial state with out current backend contract. In a typical use both the parameters would have meaningful data, and the backend contract may be dinamically egenrated from the app and published from there. But the main idea is that how you would publish your application.
+
+Once this is done, you can browse your web just pointing to it in the browser: `http://127.0.0.1:50509/contract/web/<CONTRACT KEY>/`
+
+For example: `http://127.0.0.1:50509/contract/web/CYXGxQGSmcd5xHRJNQygPwmUJsWS2njh3pdVjfVz9EV/`
+
+Iteratively you can repeat this process of modifying, publishing locally, until you are confident with the results and ready to publish your application.
+
+Since the web is part of your state, you are always able to update it, pointing to new contracts, and evolve it over time.
 
 ## Publishing
 
