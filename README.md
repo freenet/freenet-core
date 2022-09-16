@@ -5,7 +5,8 @@
 
 [![Badge Matrix]][Matrix]   
 [![Badge Discord]][Discord]   
-[![Badge Twitter]][Twitter]
+[![Badge Twitter]][Twitter]   
+[![Badge Reddit]][Reddit]
 
 [![Badge CI]][CI]
 
@@ -237,9 +238,9 @@ across all major operating systems, desktop & mobile.
 [Matrix]: https://matrix.to/#/#freenet-locutus:matrix.org
 [Donate]: https://freenetproject.org/pages/donate.html
 [libp2p]: https://github.com/libp2p/rust-libp2p
+[Reddit]: https://www.reddit.com/r/Freenet/
 [React]: https://reactjs.org/
 [CI]: https://github.com/freenet/locutus/actions/workflows/ci.yml
-
 
 [16th YouTube]: https://youtu.be/4L9pXIBAdG4
 [7th YouTube]: https://www.youtube.com/watch?v=d31jmv5Tx5k
@@ -251,6 +252,7 @@ across all major operating systems, desktop & mobile.
 
 <!---------------------------------[ Badges ]---------------------------------->
 
+[Badge Reddit]: https://img.shields.io/reddit/subreddit-subscribers/Freenet?style=for-the-badge&logoColor=white&logo=Reddit&label=&color=bf4e3a&labelColor=e05d44
 [Badge Twitter]: https://img.shields.io/twitter/follow/freenetorg?color=1780bd&labelColor=1DA1F2&logoColor=white&logo=Twitter&style=for-the-badge&label=
 [Badge Discord]: https://img.shields.io/discord/917499817758978089?logoColor=white&style=for-the-badge&label=&logo=Discord&labelColor=7289da&color=5d71b3
 [Badge Matrix]: https://img.shields.io/matrix/freenet-locutus:matrix.org?logoColor=white&style=for-the-badge&label=&logo=matrix&labelColor=0DBD8B&color=0b9f73
