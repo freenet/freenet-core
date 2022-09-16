@@ -9,4 +9,4 @@ jobs:
       - uses: XAMPPRocky/deploy-mdbook@v1.1
         with:
             token: ${{ secrets.GITHUB_TOKEN }}
-            workspace: docs
+            workspace: ${{ secrets.GITHUB_WORKSPACE }}/docs
