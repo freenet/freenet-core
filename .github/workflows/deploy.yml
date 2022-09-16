@@ -25,7 +25,8 @@ jobs:
           git config user.email ""
           cd gh-pages
           # Delete the ref to avoid keeping history.
-          git update-ref -d refs/heads/gh-pages
+          ### Disabled following line to avoid screwing up custom domain
+          ### git update-ref -d refs/heads/gh-pages
           rm -rf *
           mv ../book/* .
           git add .
