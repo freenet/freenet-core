@@ -6,7 +6,7 @@ import {
   UpdateNotification,
   Key,
   HostError,
-} from "@locutus/locutus-stdlib/webSocketInterface";
+} from "locutus-stdlib/src/webSocketInterface";
 import "./scss/styles.scss";
 // import * as bootstrap from 'bootstrap'
 
