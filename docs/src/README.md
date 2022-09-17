@@ -2,19 +2,24 @@
 
 ## What is Locutus?
 
-The heart of Locutus is a global, decentralized key-value store. The values in the store are arbitrary blocks of data, called the contract's "state." The keys are cryptographic contracts that specify what state is permissible and how the state can be modified over time.
+Locutus is a global, [observable](https://en.wikipedia.org/wiki/Small-world_network), decentralized key-value store. Values are arbitrary blocks of data, called the contract's "state." Keys are cryptographic contracts that specify:
 
-Locutus is a true peer-to-peer network, data is stored in a distributed fashion across all the peers participating in the network.
+* Whether a given state permitted under this contract
+* How the state can be modified over time
+* How two valid states can be merged
+* How to efficiently synchronize a contract's state between peers
 
-Applications on Locutus can be built in any language that is supported by web browsers, including JavaScript and WebAssembly. These applications are distributed over Locutus and can create, retrieve, and update contracts through a websocket connection to the local Locutus peer.
+Locutus is a true decentralized peer-to-peer network, and is robust and scalable, through its use of a [small-world network](https://en.wikipedia.org/wiki/Small-world_network).
+
+Applications on Locutus can be built in any language that is supported by web browsers, including JavaScript and WebAssembly. These applications are distributed over Locutus and can create, retrieve, and update contracts through a WebSocket connection to the local Locutus peer.
 
 ## Writing a Contract
 
-Locutus contracts can be written in any language that compiles to webassembly. This includes [Rust](https://www.rust-lang.org/), [TypeScript](https://www.typescriptlang.org/), and [AssemblyScript](https://www.assemblyscript.org/), among many others.
+Locutus contracts can be written in any language that compiles to WebAssembly. This includes [Rust](https://www.rust-lang.org/), [TypeScript](https://www.typescriptlang.org/), and [AssemblyScript](https://www.assemblyscript.org/), among many others.
 
-A contract consists of the webassembly code itself and its "parameters," which are additional data like cryptographic keys. This makes it easy to configure contracts without having to recompile them.
+A contract consists of the WebAssembly code itself and its "parameters," which are additional data like cryptographic keys. This makes it easy to configure contracts without having to recompile them.
 
-A contract can be retrieved using a key, which is a cryptographic hash derived from the contract's webassembly code together with it's parameters.
+A contract can be retrieved using a key, which is a cryptographic hash derived from the contract's WebAssembly code together with its parameters.
 
 ## Small world routing
 
@@ -38,13 +43,7 @@ Through this the application can:
 
 ## How to use Contracts
 
-Contracts are designed to be extremely flexible. they can be used to create decentralized data-structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
+Contracts are designed to be extremely flexible. they can be used to create decentralized data structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
 
-A contract must implement functions that do the following:
+## Distributing your App on Locutus
 
-- Verify that the contract state is valid for this contract and parameters
-- Verify that an update to a contract, a "delta", is valid
-
-## Distributing your App on Locut
-
-_TODO_
