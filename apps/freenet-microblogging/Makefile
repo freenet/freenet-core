@@ -8,15 +8,15 @@ LOCUTUS_DIR=$(shell cd ../.. && pwd)
 
 build-tool:
 	cd $(LOCUTUS_DIR)
-	cd crates/locutus-dev
-	cargo build --bin locutus-dev
+	cd crates/locutus-node
+	cargo build --bin ldt
 
 webapp:
 	cd $(LOCUTUS_DIR)
 	cd apps/freenet-microblogging
 	cd $(WEB_DIR)
 
-	${CARGO_TARGET_DIR}/debug/locutus-dev build
+	${CARGO_TARGET_DIR}/debug/ldt build
 	mv ./build/locutus/freenet_microblogging_web.wasm ../../../crates/locutus-node/examples/
 	mv ./build/locutus/contract-state ../../../crates/locutus-node/examples/freenet_microblogging_web
 
@@ -25,7 +25,7 @@ posts:
 	cd apps/freenet-microblogging
 	cd $(POSTS_DIR)
 
-	${CARGO_TARGET_DIR}/debug/locutus-dev build
+	${CARGO_TARGET_DIR}/debug/ldt build
 	mv ./build/locutus/freenet_microblogging_posts.wasm ../../../../crates/locutus-node/examples/
 	mv ./build/locutus/contract-state ../../../../crates/locutus-node/examples/freenet_microblogging_posts
 

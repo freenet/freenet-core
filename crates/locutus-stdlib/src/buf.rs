@@ -35,7 +35,7 @@ impl BufferBuilder {
         self.start = new_ptr as i64;
         self.size = data.capacity() as _;
         *read_ptr = 0;
-        *write_ptr = data.len().saturating_sub(1) as _;
+        *write_ptr = data.len().saturating_sub(1) as _; // []
         std::mem::forget(data);
     }
 
@@ -181,7 +181,7 @@ struct BuilderInfo<'instance> {
 }
 
 fn from_raw_builder<'a>(
-    builder_ptr: *mut BufferBuilder,
+    builder_ptr: *mut BufferBuilder, // 0x01 <- 0x5FE436
     linear_mem_space: (*const u8, u64),
 ) -> BuilderInfo<'a> {
     let (start_ptr, size) = linear_mem_space;
