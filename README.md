@@ -81,8 +81,17 @@ Many developers are active in [r/freenet](https://www.reddit.com/r/Freenet/), bu
 
 ### 10. Acknowledgements and Funding
 
+
+#### 10.1. Protocol Labs
+
 In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
 generously supported our work with a grant.
+
+#### 10.2. FUTO
+
+FUTO has generously awarded Freenet a Legendary Grant to support Locutus development.
+
+#### 10.3. Supporting Locutus
 
 If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
 *ian at freenet dot org*.
