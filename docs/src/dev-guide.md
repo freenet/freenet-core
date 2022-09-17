@@ -1,6 +1,8 @@
 # Development Guide
 
-This guide will walk through how to develop a simple distributed web application using Locutus. To do that we will be using Rust for the contracts themselves and Typescript for developing the web application.
+This guide will walk through how to develop a simple distributed web application using Locutus. To do that, we'll be using Rust for the contracts themselves and Typescript for developing the web application.
+
+At the time of writing (September 2022) the Locutus network is not yet active, we've published this guide so that people can experiment with building and running Locutus applications locally, and provide [feedback](https://github.com/freenet/locutus/issues) on our development documentation and tools.
 
 ## Installation
 
@@ -24,7 +26,7 @@ $ cargo install locutus
 
 This command will install `ldt` (Locutus Dev Tool) and a working node that can be used for local development.
 
-You can find more information about the available commands by looking at [ldt](ldt.md)](ldt.md) information or by executing ldt with the `--help` argument.
+You can find more information about the available commands by looking at [ldt](ldt.md)](ldt.md) information or by executing `ldt` with the `--help` argument.
 
 ## Creating a new contract
 
@@ -123,7 +125,7 @@ Here we are importing the necessary types and traits to write a Locutus contract
 pub const RANDOM_SIGNATURE: &[u8] = &[6, 8, 2, 5, 6, 9, 9, 10];
 ```
 
-This will make our contract unique, notice the `pub` qualifier so the compiler doesn't remove this constant because is unused and is included in the output of the compiler.
+This will make our contract[^contifce] unique, notice the `pub` qualifier so the compiler doesn't remove this constant because is unused and is included in the output of the compiler.
 
 ```rust,noplayground
 struct Contract;
@@ -134,13 +136,15 @@ impl ContractInterface for Contract {
 }
 ```
 
-      🛈 The exact interface still is an evolving specification.
+[^contifce]: The exact interface still is an evolving specification, find the latest version in [interface.rs](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/interface.rs#L76).
 
-> **TODO:** Elsewhere in the documentation, explain the intricate details of how interfacing through WASM works. In theory users could implement their own wrapping code as long as the follow the low level WASM code specification.
+<!--
+TODO: Elsewhere in the documentation, explain the intricate details of how interfacing through WASM works. In theory users could implement their own wrapping code as long as the follow the low level WASM code specification.
+-->
 
 Here we create a new type, `Contract` for which we will be implementing the `ContractInterface` trait. To know more details about the functionality of a contract, delve into the details of the [contract interface](contract-interface.md).
 
-Notice the `#[contract]` macro call, this will generate the necessary code for the WASM runtime to interact with your contract in an ergonomic and safe way. Trying to use this macro more than once in the same module will result in a compiler error, and only the code generated at the top-level module will be used by the runtime.
+Notice the `#[contract]` macro call, this will generate the necessary code for the WASM runtime to interact with your contract ergonomically and safely. Trying to use this macro more than once in the same module will result in a compiler error, and only the code generated at the top-level module will be used by the runtime.
 
 As a rule of thumb, one contract will require implementing the `ContractInterface`` exactly once.
 
@@ -222,7 +226,9 @@ async function loadState() {
 
 Here we use the API wrapper to make a get request (which requires a key and specifies if we require fetching the contract code or not) to get the state for a contract with the given address. The response from the node will be directed to the `onGet` callback. You can use any other methods available in the API to interact with the node.
 
-> **TODO:** Add a link to documentation for the WebSocket API in typescript
+<!--
+TODO: Add a link to documentation for the WebSocket API in typescript
+-->
 
 ## Writing the backend for our web application
 
@@ -293,7 +299,9 @@ $ ldt build
 
 This command will read your contract manifest file (`locutus.toml`) and take care of building the contract and packaging it, ready for the node and the network to consume it.
 
-> **TODO:** Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the use-case doesn't fit with the current tooling, so they know the necessary steeps to interact with the node at a lower level.
+<!--
+TODO: Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the use-case doesn't fit with the current tooling, so they know the necessary steeps to interact with the node at a lower level.
+-->
 
 Under the `./build/locutus` directory, you will see both a `*.wasm` file, which is the contract file, and `contract-state`, in case it applies, which is the initial state that will be uploaded when initially putting the contract.
 
@@ -323,7 +331,9 @@ posts = { path = "../backend" }
 
 The WASM code from the `backend` contract will be embedded in our web application state, so it will be accessible as a resource just via the local HTTP gateway access and then we can re-use it for publishing additional contracts.
 
-> **TODO:** Publishing to the real functioning Locutus network is not yet supported.
+<!--
+TODO: Publishing to the real functioning Locutus network is not yet supported.
+-->
 
 ## Testing out contracts in the local node
 
@@ -354,4 +364,4 @@ Since the web is part of your state, you are always able to update it, pointing 
 
 ## Publishing
 
-> **TODO:** Publishing to the real functioning Locutus network is not yet supported.
+Publishing to the Locutus network is not yet supported.
