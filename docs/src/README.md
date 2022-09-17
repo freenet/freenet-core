@@ -1,3 +1,5 @@
+**NOTE:** This document is a work in progress. You can [submit an issue](https://github.com/freenet/locutus/issues/new?labels=A-documentation) if you find a problem or have a suggestion. The source for this documentation is in our repository at [locutus/docs/src](https://github.com/freenet/locutus/tree/main/docs/src). We welcome pull requests.
+
 # Introduction
 
 ## What is Locutus?
