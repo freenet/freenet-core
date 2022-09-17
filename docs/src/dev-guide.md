@@ -4,11 +4,11 @@ This guide will walk through how to develop a simple distributed web application
 
 ## Installation
 
-Development for Locutus requires setting initial dependencies. Currently, the following dependencies are necessary:
+Development for Locutus requires setting initial dependencies. You'll need the following:
 
 - A [Rust](https://www.rust-lang.org/tools/install) installation, along with [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager.
 
-      🛈 Currently, contract development is only supported in Rust.
+      🛈 Only Rust is supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
 
 - Locutus development tools and node.
 
@@ -28,7 +28,7 @@ You can find more information about the available commands by looking at [ldt](l
 
 ## Creating a new contract
 
-You can create a new [contract](glossary.md#contract) skeleton by executing the `new` command with `ldt`. Two contract types are supported currently by the tool, regular [contracts](glossary.md#contract), and [web application](glossary.md#web-application) [container contracts](glossary.md#container-contract).Currently, the following technological stacks are supported (more to be added in the future):
+You can create a new [contract](glossary.md#contract) skeleton by executing the `new` command with `ldt`. Two contract types are supported currently by the tool, regular [contracts](glossary.md#contract), and [web application](glossary.md#web-application) [container contracts](glossary.md#container-contract). Currently, the following technological stacks are supported (more to be added in the future):
 
 - Regular contracts:
   - Rust (_default_)
