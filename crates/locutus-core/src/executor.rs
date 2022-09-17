@@ -261,7 +261,10 @@ impl ContractExecutor {
                 .runtime
                 .contracts
                 .fetch_contract(&key, &parameters)
-                .unwrap();
+                .ok_or_else(|| RequestError::Get {
+                    key,
+                    cause: "Missing contract".into(),
+                })?;
             got_contract = Some(contract);
         }
         match self.contract_state.get(&key).await {
