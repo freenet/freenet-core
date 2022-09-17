@@ -8,13 +8,13 @@ At the time of writing (September 2022) the Locutus network is not yet active, w
 
 Development for Locutus requires setting initial dependencies. You'll need the following:
 
-- A [Rust](https://www.rust-lang.org/tools/install) installation, along with [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager.
+- A [Rust](https://www.rust-lang.org/tools/install) installation, along with [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager[^contractrust].
 
-      🛈 Only Rust is supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
+[^contractrust]: Only Rust is supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
 
-- Locutus development tools and node.
+- Locutus development tools and node[^binaries].
 
-      🛈 In the future, we will distribute binaries for all the required tools.
+[^binaries]: In the future, we will distribute binaries for all the required tools.
 
 - The [LLVM](https://llvm.org) compiler backend core libraries. Usually available at most OS package managers for Linux distributions and Mac OS.
 
@@ -67,8 +67,10 @@ In this case, and for simplicity's sake, the contract won't be performing any fu
 
 To make our contract unique so it doesn't collide with an existing contract, we can generate a random signature that will be embedded with the contract.
 
-  🛈 What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `locutus-stdlib`. 
-      
+<!--
+What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `locutus-stdlib`. 
+-->
+
 For example in the `lib.rs` file we will write the following:
 
 ```rust,noplayground
