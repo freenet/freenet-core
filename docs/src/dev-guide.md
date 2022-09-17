@@ -65,7 +65,9 @@ In this case, and for simplicity's sake, the contract won't be performing any fu
 
 To make our contract unique so it doesn't collide with an existing contract, we can generate a random signature that will be embedded with the contract.
 
-      🛈 What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from the locutus-stdlib. For example in the `lib.rs` file we will write the following:
+  🛈 What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `locutus-stdlib`. 
+      
+For example in the `lib.rs` file we will write the following:
 
 ```rust,noplayground
 use locutus_stdlib::prelude::*;
@@ -146,7 +148,7 @@ As a rule of thumb, one contract will require implementing the `ContractInterfac
 
 Now we have a working example of a contract, but our contract is an empty shell, which does not do anything yet. To change this, we will start developing our web application.
 
-To do that, we can go and modify the code of the contract state, which in this case is the web application. Locutus offers a std library that can be used with Typescript/JavaScript to facilitate the development of web applications and interfacing with your local node, so we will make our `package.json` contains the dependency:
+To do that, we can go and modify the code of the contract state, which in this case is the web application. Locutus offers a standard library (stdlib) that can be used with Typescript/JavaScript to facilitate the development of web applications and interfacing with your local node, so we will make our `package.json` contains the dependency:
 
 ```
 {
@@ -224,7 +226,7 @@ Here we use the API wrapper to make a get request (which requires a key and spec
 
 ## Writing the backend for our web application
 
-In the [creating a new contract](dev-guide.md#creating-a-new-contract) section we described the contract interface, but we were using to write a simple container contract that won't be doing anything in practice, just carrying around the front end of your application. The core logic of the application, and a back end where we will be storing all the information, requires another contract. So we will create a new contract in a different directory for it:
+In the [creating a new contract](dev-guide.md#creating-a-new-contract) section we described the contract interface, but we were using it to write a simple container contract that won't be doing anything in practice, just carrying around the front end of your application. The core logic of the application, and a back end where we will be storing all the information, requires another contract. So we will create a new contract in a different directory for it:
 
 ```
 $ cd ../backend
@@ -291,7 +293,7 @@ $ ldt build
 
 This command will read your contract manifest file (`locutus.toml`) and take care of building the contract and packaging it, ready for the node and the network to consume it.
 
-> **TODO:** Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the usecase doesn't fit with the current tooling, so they know the necessary steeps to itneract with the node at a lower level.
+> **TODO:** Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the use-case doesn't fit with the current tooling, so they know the necessary steeps to interact with the node at a lower level.
 
 Under the `./build/locutus` directory, you will see both a `*.wasm` file, which is the contract file, and `contract-state`, in case it applies, which is the initial state that will be uploaded when initially putting the contract.
 
@@ -325,7 +327,7 @@ The WASM code from the `backend` contract will be embedded in our web applicatio
 
 ## Testing out contracts in the local node
 
-Once we have all our contracts sorted and ready for testing, we can do this in local mode in our node. For this the node must be running, we can make sure that is running by running the following command as a background process or in another terminal, since we have installed it:
+Once we have all our contracts sorted and ready for testing, we can do this in local mode in our node. For this the node must be running, we can make sure that is running by running the following command as a background process or in another terminal; since we have installed it:
 
 ```
 $ locutus-node
