@@ -10,8 +10,13 @@ Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vu
 
 ### 1. News
 
-* **16th July, 2022:** Ian gave a talk on Decentralized Reputation and Trust, [watch here](https://github.com/freenet/locutus/wiki/Decentralized-Reputation-and-Trust)
-* **7th July, 2022:** Ian gave an introductory talk on Locutus which you can watch on [YouTube](https://www.youtube.com/watch?v=d31jmv5Tx5k) or [Vimeo](https://vimeo.com/740461100).
+* **5th September, 2022:** Ian gave an [interview](https://youtu.be/eoV9amsnaQg) (YouTube) to Louis Rossmann about Locutus
+* **16th July, 2022:** Ian gave a [talk](https://www.youtube.com/watch?v=4L9pXIBAdG4) (YouTube) on Decentralized Reputation and Trust in Locutus
+* **7th July, 2022:** Ian gave an introductory talk ([Youtube](https://www.youtube.com/watch?v=d31jmv5Tx5k), [Vimeo](https://vimeo.com/740461100)) on Locutus
+* **6th July, 2022:** Locutus makes the [front page](https://www.reddit.com/r/CryptoCurrency/comments/vt069a/23_years_ago_i_created_freenet_the_first/) of the r/cryptocurrency subreddit
+* **18th April, 2022:** Locutus makes the [front page](https://www.reddit.com/r/programming/comments/u6erfe/23_years_ago_i_created_freenet_the_first/) of the r/programming subreddit
+* **10th April, 2022:** Locutus makes the [front page](https://news.ycombinator.com/item?id=30979002) of Hacker News
+* **27th March, 2022:** Locutus makes the [front page](https://www.reddit.com/r/privacy/comments/tpp306/23_years_ago_i_created_freenet_the_first/) of the r/privacy subreddit
 
 ### 2. Applications
 
