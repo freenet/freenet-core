@@ -27,7 +27,11 @@ Locutus is a software platform that makes it easy to create decentralized altern
 
 To learn more about Locutus as a developer read [The Locutus Book](https://docs.freenet.org/). For an introduction to Locutus watch **Ian's talk and Q&A** - [youtube](https://youtu.be/d31jmv5Tx5k) / [vimeo](https://vimeo.com/manage/videos/740461100).
 
-## 1. Applications
+## 1. Status
+
+Locutus is currently under development. Using our [development guide](https://docs.freenet.org/dev-guide.html), developers can experiment with building decentralized applications using our SDK and testing them locally. We expect the Locutus network to go live in November 2022.
+
+## 2. Applications
 
 Examples of what can be built on Locutus include:
 
@@ -40,20 +44,6 @@ Examples of what can be built on Locutus include:
 * Search (Google, Bing)
 
 All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
-
-## 2. Components
-
-Decentralized services that can be used by other decentralized services:
-
-### 2.1 Reputation system
-
-Allows users to build up reputation over time based on feedback from those they interact with. Think of the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
-
-This is conceptually similar to Freenet's [Web of Trust](http://www.draketo.de/english/freenet/friendly-communication-with-anonymity) plugin.
-
-### 2.2 Arbiters
-
-Arbiters are trusted services that can perform tasks and authenticate the results, such as verifying that a contract had a particular state at a given time, or that external blockchains (Bitcoin, Ethereum, Solana etc) contain specific transactions. Trust is achieved through the reputation system.
 
 ## 3. How does it work?
 
