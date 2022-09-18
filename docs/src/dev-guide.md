@@ -271,7 +271,7 @@ TODO: Add a link to documentation for the WebSocket API in typescript
 
 In the [creating a new contract](dev-guide.md#creating-a-new-contract) section we described the contract interface, but we were using it to write a simple container contract that won't be doing anything in practice, just carrying around the front end of your application. The core logic of the application, and a back end where we will be storing all the information, requires another contract. So we will create a new contract in a different directory for it:
 
-```
+```bash
 $ cd ../backend
 $ ldt new contract
 ```
@@ -330,7 +330,7 @@ Now that we have the front end and the back end of our web app, we can package t
 
 In order to do that, we can again use the development tool to help us out with the process, in each contract directory we run the following commands:
 
-```
+```bash
 $ ldt build
 ```
 
@@ -346,7 +346,7 @@ Web applications can access the code of backend contracts directly in their appl
 
 Let's take a look at the manifest for our web app container contract:
 
-```
+```toml
 [contract]
 type = "webapp"
 lang = "rust"
@@ -361,7 +361,7 @@ This means that the `dist` directory will be packaged as the initial state for t
 
 If we add the following keys to the manifesto:
 
-```
+```toml
 [webapp.dependencies]
 posts = { path = "../backend" }
 ```
@@ -376,7 +376,7 @@ TODO: Publishing to the real functioning Locutus network is not yet supported.
 
 Once we have all our contracts sorted and ready for testing, we can do this in local mode in our node. For this the node must be running, we can make sure that is running by running the following command as a background process or in another terminal; since we have installed it:
 
-```
+```bash
 $ locutus-node
 ```
 
@@ -384,7 +384,7 @@ You should see some logs printed via the stdout of the process indicating that t
 
 Once the HTTP gateway is running, we are ready to put the contracts in the node:
 
-```
+```bash
 $ cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
 $ cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
 ```
