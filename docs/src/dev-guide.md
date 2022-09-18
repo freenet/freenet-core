@@ -4,7 +4,7 @@
 
 This guide will walk through how to develop a simple distributed web application using Locutus. To do that, we'll be using Rust for the contracts themselves and Typescript for developing the web application.
 
-At the time of writing (September 2022) the Locutus network is not yet active. We've published this guide so that people can experiment with building and running Locutus applications locally, and provide [feedback](https://github.com/freenet/locutus/issues).
+At the time of writing (September 2022) the Locutus network is not yet active. We've published this guide so that people can experiment with building and running Locutus applications locally[^publish], and provide [feedback](https://github.com/freenet/locutus/issues).
 
 ## Installation
 
@@ -12,11 +12,7 @@ Development for Locutus requires setting initial dependencies. You'll need the f
 
 - A [Rust](https://www.rust-lang.org/tools/install) installation, along with [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager[^contractrust].
 
-[^contractrust]: Only Rust is supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
-
 - Locutus development tools and node[^binaries].
-
-[^binaries]: In the future, we will distribute binaries for all the required tools.
 
 - The [LLVM](https://llvm.org) compiler backend core libraries. Usually available at most OS package managers for Linux distributions and Mac OS.
 
@@ -366,6 +362,8 @@ Iteratively you can repeat this process of modifying, and publishing locally unt
 
 Since the web is part of your state, you are always able to update it, pointing to new contracts, and evolve it over time.
 
-## Publishing
+## Limitations
 
-Publishing to the Locutus network is not yet supported.
+[^publish]: Publishing to the Locutus network is not yet supported.
+[^contractrust]: Only Rust is supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
+[^binaries]: Binaries for all the required tools are not yet available, they must be compiled from source
