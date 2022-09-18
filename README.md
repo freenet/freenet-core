@@ -3,21 +3,18 @@
 <div align="center">
   <!-- Github Actions -->
   <a href="https://github.com/freenet/locutus/actions/workflows/ci.yml">
-    <img src="https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg" alt="actions status" />
+    <img src="https://img.shields.io/github/workflow/status/freenet/locutus/CI?label=CI&style=flat-square" alt="continuous integration status" />
   </a>
-  <!-- Version -->
   <a href="https://crates.io/crates/locutus">
     <img src="https://img.shields.io/crates/v/locutus.svg?style=flat-square"
     alt="Crates.io version" />
   </a>
-  <!-- Discord -->
   <a href="https://discord.gg/2kZuKNxYXv">
     <img src="https://img.shields.io/discord/917499817758978089?style=flat-square" alt="chat" />
   </a>
   <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
     <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
-  <!-- Docs -->
   <a href="https://docs.rs/locutus">
     <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square"
       alt="docs.rs docs" />
