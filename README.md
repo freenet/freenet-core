@@ -68,28 +68,24 @@ You can support our work through a [donation](https://freenetproject.org/pages/d
 
 [![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
 
-## 7. Name
-
-Locutus is the development name for this software; it will probably change before launch.
-
-## 8. Chat with us
+## 7. Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join. If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
 
 Many developers are active in [r/freenet](https://www.reddit.com/r/Freenet/), but remember that Reddit engages in political and ideological censorship so don't make this your only point of contact with us.
 
-## 9. Acknowledgements and Funding
+## 8. Acknowledgements and Funding
 
-### 9.1. Protocol Labs
+### 8.1. Protocol Labs
 
 In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
 generously supported our work with a grant.
 
-### 9.2. FUTO
+### 8.2. FUTO
 
 FUTO has generously awarded Freenet a Legendary Grant to support Locutus development.
 
-### 9.3. Supporting Locutus
+### 8.3. Supporting Locutus
 
 If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
 *ian at freenet dot org*.
