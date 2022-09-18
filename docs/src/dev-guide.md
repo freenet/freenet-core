@@ -8,15 +8,27 @@ At the time of writing (September 2022) the Locutus network is not yet active. W
 
 ## Installation
 
-Development for Locutus requires setting initial dependencies. You'll need the following:
+Development for Locutus[^binaries] requires installing some dependencies:
 
-- A [Rust](https://www.rust-lang.org/tools/install) installation, along with [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager[^contractrust].
+### 1. [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)
 
-- Locutus development tools and node[^binaries].
+Locutus is developed in [Rust](https://www.rust-lang.org/), on Linux/Mac this will install Rust and its build tool Cargo which Locutus also requires:
+
+```
+$ curl https://sh.rustup.rs -sSf | sh
+```
+
+### 2. LLVM
 
 - The [LLVM](https://llvm.org) compiler backend core libraries. Usually available at most OS package managers for Linux distributions and Mac OS.
 
-Once you have a working installation of Cargo you can install the dev tools:
+```
+$ sudo apt install llvm # For Ubuntu
+```
+
+### 3. Locutus Dev Tool (LTD)
+
+Once you have a working installation of Cargo you can install the Locutus dev tools:
 
 ```
 $ cargo install locutus
@@ -24,7 +36,34 @@ $ cargo install locutus
 
 This command will install `ldt` (Locutus Dev Tool) and a working node that can be used for local development.
 
-You can find more information about the available commands by looking at [ldt](ldt.md)](ldt.md) information or by executing `ldt` with the `--help` argument.
+#### 3.1 Usage
+
+You can find more information about the available commands by executing `ldt` with the `--help` argument:
+
+```
+$ ldt --help
+
+Locutus Development Tool 0.0.2
+The Freenet Project Inc.
+
+USAGE:
+    ldt [DATA_DIR] <SUBCOMMAND>
+
+ARGS:
+    <DATA_DIR>    Overrides the default data directory where Locutus files are stored
+
+OPTIONS:
+    -h, --help       Print help information
+    -V, --version    Print version information
+
+SUBCOMMANDS:
+    build        Builds and packages a contract
+    execute      Node CLI
+    help         Print this message or the help of the given subcommand(s)
+    new          Create a new Locutus contract and/or app
+    publish      Publishes a new contract to the network
+    run-local    A CLI utility for testing out contracts against a Locutus local node
+```
 
 ## Creating a new contract
 
