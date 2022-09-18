@@ -73,6 +73,7 @@ impl UpdateModification {
     }
 }
 
+// ANCHOR: contractifce
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
@@ -105,6 +106,7 @@ pub trait ContractInterface {
         summary: StateSummary<'static>,
     ) -> StateDelta<'static>;
 }
+// ANCHOR_END: contractifce
 
 /// A complete contract specification requires a `parameters` section
 /// and a `contract` section.
