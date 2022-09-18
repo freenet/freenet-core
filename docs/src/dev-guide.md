@@ -382,22 +382,22 @@ $ locutus-node
 
 You should see some logs printed via the stdout of the process indicating that the node HTTP gateway is running.
 
-Once the HTTP gateway is running, we are ready to put the contracts in the node:
+Once the HTTP gateway is running, we are ready to publish the contracts to our local Locutus node:
 
 ```bash
 $ cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
 $ cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
 ```
 
-In this case, we are not passing any parameters (so our parameters will be an empty byte array), and we are passing an initial state without the current backend contract. In typical use, both the parameters would have meaningful data, and the backend contract may be dynamically generated from the app and published from there. 
+In this case, we're not passing any parameters (so our parameters will be an empty byte array), and we are passing an initial state without the current backend contract. In typical use, both the parameters would have meaningful data, and the backend contract may be dynamically generated from the app and published from there. 
 
-Once this is done, you can browse your web just by pointing to it in the browser: `http://127.0.0.1:50509/contract/web/<CONTRACT KEY>`
+Once this is done, you can start your app just by pointing to it in the browser: `http://127.0.0.1:50509/contract/web/<CONTRACT KEY>`
 
 For example `http://127.0.0.1:50509/contract/web/CYXGxQGSmcd5xHRJNQygPwmUJsWS2njh3pdVjfVz9EV/`
 
 Iteratively you can repeat this process of modifying, and publishing locally until you are confident with the results and ready to publish your application.
 
-Since the web is part of your state, you are always able to update it, pointing to new contracts, and evolve it over time.
+Since the web is part of your state, you are always able to update it, pointing to new contracts, and evolving it over time.
 
 ## Limitations
 
