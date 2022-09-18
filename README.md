@@ -1,12 +1,34 @@
 # Locutus 
 
-[![Matrix](https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix)](https://matrix.to/#/#freenet-locutus:matrix.org) [![Chat on Discord](https://img.shields.io/discord/917499817758978089?label=discord&logo=discord)](https://discord.gg/2kZuKNxYXv) [![CI](https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg)](https://github.com/freenet/locutus/actions/workflows/ci.yml) 
+<div align="center">
+  <!-- Github Actions -->
+  <img src="https://img.shields.io/github/workflow/status/launchbadge/freenet/locutus?style=flat-square" alt="actions status" />
+  <!-- Version -->
+  <a href="https://crates.io/crates/locutus">
+    <img src="https://img.shields.io/crates/v/locutus.svg?style=flat-square"
+    alt="Crates.io version" />
+  </a>
+  <!-- Discord -->
+  <a href="https://discord.gg/2kZuKNxYXv">
+    <img src="https://img.shields.io/discord/917499817758978089?style=flat-square" alt="chat" />
+  </a>
+  <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
+    <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
+  </a>
+  <!-- Docs -->
+  <a href="https://docs.rs/locutus">
+    <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square"
+      alt="docs.rs docs" />
+  </a>
+</div>
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
 Locutus is a software platform that makes it easy to create decentralized alternatives to today's centralized tech companies. These decentralized apps will be easy to use, scalable, and secured through cryptography.
 
-Build Locutus apps with familiar tools like [React](https://reactjs.org/) or [Vue.js](https://vuejs.org/).
+To learn more about Locutus as a developer read [The Locutus Book](https://docs.freenet.org/).
+
+
 
 ### 1. News
 
