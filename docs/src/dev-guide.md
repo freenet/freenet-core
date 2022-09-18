@@ -365,5 +365,9 @@ Since the web is part of your state, you are always able to update it, pointing 
 ## Limitations
 
 [^publish]: Publishing to the Locutus network is not yet supported.
-[^contractrust]: Only Rust is supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
+
+[^contractrust]: Only Rust is supported for contract development, but we'll support more languages like 
+
+[AssemblyScript](https://www.assemblyscript.org/) in the future.
+
 [^binaries]: Binaries for all the required tools are not yet available, they must be compiled from source
