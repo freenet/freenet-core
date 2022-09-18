@@ -78,7 +78,8 @@ pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
 
-    /// Verify that a delta is valid - at least as much as possible.
+    /// Verify that a delta is valid if possible, returns false if and only delta is 
+    /// definitely invalid, true otherwise.
     fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool;
 
     /// Update the state to account for the state_delta, assuming it is valid.
@@ -88,7 +89,6 @@ pub trait ContractInterface {
         delta: StateDelta<'static>,
     ) -> Result<UpdateModification, ContractError>;
 
-    // FIXME: should return a result type, instead
     /// Generate a concise summary of a state that can be used to create deltas
     /// relative to this state.
     fn summarize_state(
@@ -96,7 +96,6 @@ pub trait ContractInterface {
         state: State<'static>,
     ) -> StateSummary<'static>;
 
-    // FIXME: should return a result type, instead
     /// Generate a state delta using a summary from the current state.
     /// This along with [`Self::summarize_state`] allows flexible and efficient
     /// state synchronization between peers.

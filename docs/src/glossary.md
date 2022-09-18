@@ -20,11 +20,17 @@ For example, if the contract id is `6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2
 
 ## Contract State
 
-A **contract's state** is data associated with a contract that can be retrieved by Applications and Components. The role of a contract is to control how its state can be modified and efficiently propagated through the network.
+Data associated with a contract that can be retrieved by Applications and Components. A contract's role is to control how its state can be modified and efficiently propagated through the network.
 
 ## Delta
 
 Represents a modification to some state - similar to a [diff](https://en.wikipedia.org/wiki/Diff) in source code. The exact format of a delta is determined by the contract. A contract will determine whether a delta is valid - perhaps by verifying it is signed by someone authorized to modify the contract state. A delta may be created in response to a [State Summary](glossary.md#state-summary) as part of the [State Synchronization](glossary.md#state-synchronization) mechanism.
+
+## Parameters
+
+Data that forms part of a contract along with the WebAssembly code. This is supplied to the contract as a parameter to the contract's functions. Parameters are typically be used to configure a contract, much like the parameters of a constructor function.
+
+For example, the parameters could contain a hash of the state itself. The contract would then use it to verify that the state hashes to that value. This would create a contract that is guaranteed to contain the same state. In the original Freenet, this was known as a [content hash key](http://justsolve.archiveteam.org/wiki/Content_Hash_Key_(Freenet)).
 
 ## State Summary
 
