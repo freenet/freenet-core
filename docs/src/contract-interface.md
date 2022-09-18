@@ -1,9 +1,9 @@
 # Contract Interface
 
-Locutus contracts must implement the contract interface[^ifacesrc]:
+Locutus contracts must implement the contract interface:
 
 ```rust,no_run,noplayground
 {{#include ../../crates/locutus-stdlib/src/interface.rs:contractifce}}
 ```
 
-[^ifacesrc]: This interface is subject to change, find the latest version in [interface.rs](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/interface.rs#L76).
+From [interface.rs](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/interface.rs).
