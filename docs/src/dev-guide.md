@@ -10,11 +10,11 @@ At the time of writing (September 2022) the Locutus network is not yet active. W
 
 Development for Locutus[^binaries] requires installing some dependencies:
 
-### 1. [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)
+### 1. Rust & Cargo
 
-Locutus is developed in [Rust](https://www.rust-lang.org/), on Linux/Mac this will install Rust and its build tool Cargo which Locutus also requires:
+Locutus is developed in [Rust](https://www.rust-lang.org/), on Linux/Mac this will install Rust and its build tool [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) which Locutus also requires:
 
-```
+```bash
 $ curl https://sh.rustup.rs -sSf | sh
 ```
 
@@ -22,7 +22,7 @@ $ curl https://sh.rustup.rs -sSf | sh
 
 - The [LLVM](https://llvm.org) compiler backend core libraries. Usually available at most OS package managers for Linux distributions and Mac OS.
 
-```
+```bash
 $ sudo apt install llvm # For Ubuntu
 ```
 
@@ -30,7 +30,7 @@ $ sudo apt install llvm # For Ubuntu
 
 Once you have a working installation of Cargo you can install the Locutus dev tools:
 
-```
+```bash
 $ cargo install locutus
 ```
 
@@ -81,7 +81,7 @@ You can create a new [contract](glossary.md#contract) skeleton by executing the 
 
 We will need to create a directory that will hold our web app and initialize it:
 
-```
+```bash
 $ mkdir -p my-app/web
 $ mkdir -p my-app/backend
 $ cd my-app/web
@@ -96,7 +96,7 @@ In order to create a contract, the first thing that we need is to write the code
 
 The `new` command has created the source ready to be modified for us, in your favorite editor open the following file:
 
-```
+```bash
 $ ./container/src/lib.rs
 ```
 
