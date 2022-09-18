@@ -2,7 +2,9 @@
 
 <div align="center">
   <!-- Github Actions -->
-  <img src="https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg" alt="actions status" />
+  <a href="https://github.com/freenet/locutus/actions/workflows/ci.yml">
+    <img src="https://github.com/freenet/locutus/actions/workflows/ci.yml/badge.svg" alt="actions status" />
+  </a>
   <!-- Version -->
   <a href="https://crates.io/crates/locutus">
     <img src="https://img.shields.io/crates/v/locutus.svg?style=flat-square"
