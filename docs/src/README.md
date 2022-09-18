@@ -6,7 +6,7 @@
 
 Locutus is a global, [observable](https://en.wikipedia.org/wiki/Small-world_network), decentralized key-value store. Values are arbitrary blocks of data, called the contract's "state." Keys are cryptographic contracts that specify:
 
-* Whether a given state permitted under this contract
+* Whether a given state is permitted under this contract
 * How the state can be modified over time
 * How two valid states can be merged
 * How to efficiently synchronize a contract's state between peers
