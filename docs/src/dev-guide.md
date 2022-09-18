@@ -4,11 +4,11 @@
 
 This guide will walk through how to develop a simple distributed web application using Locutus. To do that, we'll be using Rust for the contracts themselves and Typescript for developing the web application.
 
-At the time of writing (September 2022) the Locutus network is not yet active. We've published this guide so that people can experiment with building and running Locutus applications locally[^publish], and provide [feedback](https://github.com/freenet/locutus/issues).
+At the time of writing (September 2022) the Locutus network is not yet active. We've published this guide so that people can experiment with building and running Locutus applications locally, and provide [feedback](https://github.com/freenet/locutus/issues).
 
 ## Installation
 
-Development for Locutus[^binaries] requires installing some dependencies:
+Development for Locutus requires installing some dependencies:
 
 ### 1. Rust & Cargo
 
@@ -164,7 +164,7 @@ Here we are importing the necessary types and traits to write a Locutus contract
 pub const RANDOM_SIGNATURE: &[u8] = &[6, 8, 2, 5, 6, 9, 9, 10];
 ```
 
-This will make our contract[^contifce] unique, notice the `pub` qualifier so the compiler doesn't remove this constant because is unused and is included in the output of the compiler.
+This will make our contract unique, notice the `pub` qualifier so the compiler doesn't remove this constant because is unused and is included in the output of the compiler.
 
 ```rust,noplayground
 struct Contract;
@@ -174,8 +174,6 @@ impl ContractInterface for Contract {
   ...
 }
 ```
-
-[^contifce]: The exact interface still is an evolving specification, find the latest version in [interface.rs](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/interface.rs#L76).
 
 <!--
 TODO: Elsewhere in the documentation, explain the intricate details of how interfacing through WASM works. In theory users could implement their own wrapping code as long as the follow the low level WASM code specification.
@@ -403,8 +401,7 @@ Since the web is part of your state, you are always able to update it, pointing 
 
 ## Limitations
 
-[^publish]: Publishing to the Locutus network is not yet supported.
+* Publishing to the Locutus network is not yet supported.
+* Only Rust is currently supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
 
-[^contractrust]: Only Rust is currently supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
-
-[^binaries]: Binaries for all the required tools are not yet available, they must be compiled from source
+* Binaries for all the required tools are not yet available, they must be compiled from source
