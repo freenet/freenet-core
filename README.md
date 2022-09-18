@@ -27,11 +27,11 @@ Locutus is a software platform that makes it easy to create decentralized altern
 
 To learn more about Locutus as a developer read [The Locutus Book](https://docs.freenet.org/). For an introduction to Locutus watch **Ian's talk and Q&A** - [youtube](https://youtu.be/d31jmv5Tx5k) / [vimeo](https://vimeo.com/manage/videos/740461100).
 
-## 1. Status
+## Status
 
 Locutus is currently under development. Using our [development guide](https://docs.freenet.org/dev-guide.html), developers can experiment with building decentralized applications using our SDK and testing them locally. We expect the Locutus network to go live in November 2022.
 
-## 2. Applications
+## Applications
 
 Examples of what can be built on Locutus include:
 
@@ -45,7 +45,7 @@ Examples of what can be built on Locutus include:
 
 All will be completely decentralized, scalable, and cryptographically secure. We want Locutus to be useful out-of-the-box, so we plan to provide reference implementations for some or all of these.
 
-## 3. How does it work?
+## How does it work?
 
 Locutus is a decentralized key-value database. It uses the same [small world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as the original Freenet design, but each key is a cryptographic contract implemented in [Web Assembly](https://webassembly.org/), and the value associated with each contract is called its *state*. The role of the cryptographic contract is to specify what state is allowed for this contract, and how the state is modified.
 
@@ -53,44 +53,40 @@ A very simple contract might require that the state is a list of messages, each 
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
-## 4. Documentation
-
-* [Glossary](https://github.com/freenet/locutus/wiki/Glossary)
-
-## 5. Status
+## Status
 
 We're working hard and expect an early prototype in August 2022. 
 
 You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
 
 
-## 6. Stay up to date
+## Stay up to date
 
 [![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
 
-## 7. Chat with us
+## Chat with us
 
 We're in [#locutus](https://discord.gg/2kZuKNxYXv) on Discord, and also [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). These rooms are bridged so it doesn't matter which you join. If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
 
 Many developers are active in [r/freenet](https://www.reddit.com/r/Freenet/), but remember that Reddit engages in political and ideological censorship so don't make this your only point of contact with us.
 
-## 8. Acknowledgements and Funding
+## Acknowledgements and Funding
 
-### 8.1. Protocol Labs
+### Protocol Labs
 
 In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
 generously supported our work with a grant.
 
-### 8.2. FUTO
+### FUTO
 
 FUTO has generously awarded Freenet a Legendary Grant to support Locutus development.
 
-### 8.3. Supporting Locutus
+### Supporting Locutus
 
 If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
 *ian at freenet dot org*.
 
-## 11. License
+## License
 
 This project is licensed under either of:
 
