@@ -25,7 +25,7 @@ The Internet has grown increasingly centralized over the past 25 years, such tha
 
 Locutus is a software platform that makes it easy to create decentralized alternatives to today's centralized tech companies. These decentralized apps will be easy to use, scalable, and secured through cryptography.
 
-To learn more about Locutus as a developer read [The Locutus Book](https://docs.freenet.org/). For an introduction to Locutus watch **Ian's talk and Q&A** - [youtube](https://youtu.be/d31jmv5Tx5k) / [vimeo](https://vimeo.com/manage/videos/740461100).
+To learn more about Locutus as a developer read [The Locutus Book](https://docs.freenet.org/). For an introduction to Locutus watch **Ian's talk and Q&A** - [YouTube](https://youtu.be/d31jmv5Tx5k) / [Vimeo](https://vimeo.com/manage/videos/740461100).
 
 ## Status
 
