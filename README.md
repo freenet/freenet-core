@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
   <a href="https://docs.rs/locutus">
-    <img src="https://img.shields.io/badge/api-docs-latest-blue.svg?style=flat-square"
+    <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square&label=api"
       alt="docs.rs docs" />
   </a>
 </div>
