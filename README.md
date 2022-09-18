@@ -1,5 +1,3 @@
-# Locutus 
-
 <div align="center">
   <!-- Github Actions -->
   <a href="https://github.com/freenet/locutus/actions/workflows/ci.yml">
@@ -21,6 +19,7 @@
   </a>
 </div>
 
+# Locutus 
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
