@@ -92,7 +92,7 @@ will create the skeleton for a web application and its container contract for Lo
 
 ## Making a container contract
 
-In order to create a contract, the first thing that we need is to write the code for our container contract. This is a shell contract that will be deployed in the network in order to access the content of our web application.
+The first thing that we need is to write the code for our container contract. This contract's role is to contain the web application code itself, allowing it to be distributed over Locutus.
 
 The `new` command has created the source ready to be modified for us, in your favorite editor open the following file:
 
@@ -100,7 +100,7 @@ The `new` command has created the source ready to be modified for us, in your fa
 $ ./container/src/lib.rs
 ```
 
-In this case, and for simplicity's sake, the contract won't be performing any functions, but in a real contract, this contract would be including some basic security functionality, e.g. verifying that whoever is trying to update the contract has the required credentials.
+In this case, and for simplicity's sake, the contract won't be performing any functions, but in a realistic scenario, this contract would include some basic security functionality like verifying that whoever is trying to update the contract has the required credentials.
 
 To make our contract unique so it doesn't collide with an existing contract, we can generate a random signature that will be embedded with the contract.
 
