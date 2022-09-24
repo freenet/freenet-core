@@ -35,7 +35,7 @@ Contracts also have a location, which is derived from the contract's key. Peers 
 
 Creating a decentralized application on Locutus is very similar to creating a normal web application. You can use familiar frameworks like React, Bootstrap, Angular, Vue.js, and so on.
 
-The main difference is that instead of connecting to a REST API running on a server, the app connects to the Locutus peer running on the local computer through a [WebSocket](https://en.wikipedia.org/wiki/WebSocket) connection.
+The main difference is that instead of connecting to a REST API running on a server, the web application connects to the Locutus peer running on the local computer through a [WebSocket](https://en.wikipedia.org/wiki/WebSocket) connection.
 
 Through this the application can:
 
@@ -45,11 +45,11 @@ Through this the application can:
 
 ## How to use Contracts
 
-Contracts are designed to be extremely flexible. they can be used to create decentralized data structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
+Contracts are extremely flexible. they can be used to create decentralized data structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
 
 ## Component Ecosystem
 
-Decentralized services that can be used by other decentralized services:
+Applications in Locutus don't need to be built from scratch, they can be built on top of components provided by us or others.
 
 ### Reputation system
 
