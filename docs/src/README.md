@@ -17,8 +17,8 @@ Applications on Locutus can be built in any language that is supported by web br
 
 ## Writing a Contract
 
-Locutus contracts can be written in any language that compiles to WebAssembly. 
-This includes [Rust](https://www.rust-lang.org/), and 
+Locutus contracts can be written in any language that compiles to WebAssembly.
+This includes [Rust](https://www.rust-lang.org/), and
 [AssemblyScript](https://www.assemblyscript.org/), among many others.
 
 A contract consists of the WebAssembly code itself and its "parameters," which are additional data like cryptographic keys. This makes it easy to configure contracts without having to recompile them.
