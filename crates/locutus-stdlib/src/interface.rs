@@ -78,7 +78,7 @@ pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
 
-    /// Verify that a delta is valid if possible, returns false if and only delta is 
+    /// Verify that a delta is valid if possible, returns false if and only delta is
     /// definitely invalid, true otherwise.
     fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool;
 
