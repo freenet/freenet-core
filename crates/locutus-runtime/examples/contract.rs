@@ -42,7 +42,7 @@ impl ContractInterface for Contract {
         let summary = summary.as_ref();
         assert!(summary.len() == 2);
         assert!(&state[1..=2] == summary);
-        StateDelta::from((&state[3..=3]).to_vec())
+        StateDelta::from(state[3..=3].to_vec())
     }
 }
 

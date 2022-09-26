@@ -176,11 +176,11 @@ impl std::fmt::Display for Contract<'_> {
         write!(f, "ContractSpec( key: ")?;
         internal_fmt_key(&self.key.id.0, f)?;
         let data: String = if self.data.data.len() > 8 {
-            (&self.data.data[..4])
+            self.data.data[..4]
                 .iter()
                 .map(|b| char::from(*b))
                 .chain("...".chars())
-                .chain((&self.data.data[4..]).iter().map(|b| char::from(*b)))
+                .chain(self.data.data[4..].iter().map(|b| char::from(*b)))
                 .collect()
         } else {
             self.data.data.iter().copied().map(char::from).collect()
@@ -446,7 +446,7 @@ impl ContractCode<'_> {
         let mut hasher = Blake2s256::new();
         hasher.update(&data);
         let key_arr = hasher.finalize();
-        debug_assert_eq!((&key_arr[..]).len(), CONTRACT_KEY_SIZE);
+        debug_assert_eq!(key_arr[..].len(), CONTRACT_KEY_SIZE);
         let mut key = [0; CONTRACT_KEY_SIZE];
         key.copy_from_slice(&key_arr);
         key
@@ -494,11 +494,11 @@ impl std::fmt::Display for ContractCode<'_> {
         write!(f, "Contract( key: ")?;
         internal_fmt_key(&self.key, f)?;
         let data: String = if self.data.len() > 8 {
-            (&self.data[..4])
+            self.data[..4]
                 .iter()
                 .map(|b| char::from(*b))
                 .chain("...".chars())
-                .chain((&self.data[4..]).iter().map(|b| char::from(*b)))
+                .chain(self.data[4..].iter().map(|b| char::from(*b)))
                 .collect()
         } else {
             self.data.iter().copied().map(char::from).collect()
@@ -681,7 +681,7 @@ fn generate_id<'a>(parameters: &Parameters<'a>, code_data: &ContractCode<'a>) ->
     hasher.update(parameters.as_ref());
     let full_key_arr = hasher.finalize();
 
-    debug_assert_eq!((&full_key_arr[..]).len(), CONTRACT_KEY_SIZE);
+    debug_assert_eq!(full_key_arr[..].len(), CONTRACT_KEY_SIZE);
     let mut spec = [0; CONTRACT_KEY_SIZE];
     spec.copy_from_slice(&full_key_arr);
     ContractId(spec)
