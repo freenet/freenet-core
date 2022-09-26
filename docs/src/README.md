@@ -1,20 +1,29 @@
+**NOTE:** This document is a work in progress. You can [submit an issue](https://github.com/freenet/locutus/issues/new?labels=A-documentation) if you find a problem or have a suggestion. The source for this documentation is in our repository at [locutus/docs/src](https://github.com/freenet/locutus/tree/main/docs/src). We welcome pull requests.
+
 # Introduction
 
 ## What is Locutus?
 
-The heart of Locutus is a global, decentralized key-value store. The values in the store are arbitrary blocks of data, called the contract's "state." The keys are cryptographic contracts that specify what state is permissible and how the state can be modified over time.
+Locutus is a global, [observable](https://en.wikipedia.org/wiki/Small-world_network), decentralized key-value store. Values are arbitrary blocks of data, called the contract's "state." Keys are cryptographic contracts that specify:
 
-Locutus is a true peer-to-peer network, data is stored in a distributed fashion across all the peers participating in the network.
+- Whether a given state is permitted under this contract
+- How the state can be modified over time
+- How two valid states can be merged
+- How to efficiently synchronize a contract's state between peers
 
-Applications on Locutus can be built in any language that is supported by web browsers, including JavaScript and WebAssembly. These applications are distributed over Locutus and can create, retrieve, and update contracts through a websocket connection to the local Locutus peer.
+Locutus is a true decentralized peer-to-peer network, and is robust and scalable, through its use of a [small-world network](https://en.wikipedia.org/wiki/Small-world_network).
+
+Applications on Locutus can be built in any language that is supported by web browsers, including JavaScript and WebAssembly. These applications are distributed over Locutus and can create, retrieve, and update contracts through a WebSocket connection to the local Locutus peer.
 
 ## Writing a Contract
 
-Locutus contracts can be written in any language that compiles to webassembly. This includes [Rust](https://www.rust-lang.org/), [TypeScript](https://www.typescriptlang.org/), and [AssemblyScript](https://www.assemblyscript.org/), among many others.
+Locutus contracts can be written in any language that compiles to WebAssembly.
+This includes [Rust](https://www.rust-lang.org/), and
+[AssemblyScript](https://www.assemblyscript.org/), among many others.
 
-A contract consists of the webassembly code itself and its "parameters," which are additional data like cryptographic keys. This makes it easy to configure contracts without having to recompile them.
+A contract consists of the WebAssembly code itself and its "parameters," which are additional data like cryptographic keys. This makes it easy to configure contracts without having to recompile them.
 
-A contract can be retrieved using a key, which is a cryptographic hash derived from the contract's webassembly code together with it's parameters.
+A contract can be retrieved using a key, which is a cryptographic hash derived from the contract's WebAssembly code together with its parameters.
 
 ## Small world routing
 
@@ -28,7 +37,7 @@ Contracts also have a location, which is derived from the contract's key. Peers 
 
 Creating a decentralized application on Locutus is very similar to creating a normal web application. You can use familiar frameworks like React, Bootstrap, Angular, Vue.js, and so on.
 
-The main difference is that instead of connecting to a REST API running on a server, the app connects to the Locutus peer running on the local computer through a [WebSocket](https://en.wikipedia.org/wiki/WebSocket) connection.
+The main difference is that instead of connecting to a REST API running on a server, the web application connects to the Locutus peer running on the local computer through a [WebSocket](https://en.wikipedia.org/wiki/WebSocket) connection.
 
 Through this the application can:
 
@@ -38,13 +47,18 @@ Through this the application can:
 
 ## How to use Contracts
 
-Contracts are designed to be extremely flexible. they can be used to create decentralized data-structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
+Contracts are extremely flexible. they can be used to create decentralized data structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
 
-A contract must implement functions that do the following:
+## Component Ecosystem
 
-- Verify that the contract state is valid for this contract and parameters
-- Verify that an update to a contract, a "delta", is valid
+Applications in Locutus don't need to be built from scratch, they can be built on top of components provided by us or others.
 
-## Distributing your App on Locut
+### Reputation system
 
-_TODO_
+Allows users to build up reputation over time based on feedback from those they interact with. Think of the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
+
+This is conceptually similar to Freenet's [Web of Trust](http://www.draketo.de/english/freenet/friendly-communication-with-anonymity) plugin.
+
+### Arbiters
+
+Arbiters are trusted services that can perform tasks and authenticate the results, such as verifying that a contract had a particular state at a given time, or that external blockchains (Bitcoin, Ethereum, Solana etc) contain specific transactions. Trust is achieved through the reputation system.

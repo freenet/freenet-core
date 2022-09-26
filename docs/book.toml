@@ -3,4 +3,4 @@ authors = ["The Freenet Project Inc."]
 language = "en"
 multilingual = false
 src = "src"
-title = "Locutus Documentation"
+title = "The Locutus Book"

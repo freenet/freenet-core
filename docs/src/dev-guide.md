@@ -1,36 +1,73 @@
+**NOTE:** This document is a work in progress. You can [submit an issue](https://github.com/freenet/locutus/issues/new?labels=A-documentation) if you find a problem or have a suggestion. The source for this documentation is in our repository at [locutus/docs/src](https://github.com/freenet/locutus/tree/main/docs/src). We welcome pull requests.
+
 # Development Guide
 
-This guide will walkthrough how to develop a simple distributed web application using Locutus. To do that we will be using Rust for the contracts themselves and Typescript for developing the web application.
+This guide will walk through how to develop a simple distributed web application using Locutus. To do that, we'll be using Rust for the contracts themselves and Typescript for developing the web application.
+
+At the time of writing (September 2022) the Locutus network is not yet active. We've published this guide so that people can experiment with building and running Locutus applications locally, and provide [feedback](https://github.com/freenet/locutus/issues).
 
 ## Installation
 
-Development for Locutus requires setting initial dependencies. Currently the following dependencies are necessary:
+Development for Locutus requires installing some dependencies:
 
-- A [Rust](https://www.rust-lang.org/tools/install) installation, along with [Cargo](https://doc.rust-lang.org/cargo/), the Rust package manager.
+### 1. Rust & Cargo
 
-      🛈 Currently contract development is only supported in Rust.
+Locutus is developed in [Rust](https://www.rust-lang.org/), on Linux/Mac this will install Rust and its build tool [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) which Locutus also requires:
 
-- Locutus development tools and node.
+```bash
+$ curl https://sh.rustup.rs -sSf | sh
+```
 
-      🛈 In the future we will distribute binaries for all the required tools.
+### 2. LLVM
 
 - The [LLVM](https://llvm.org) compiler backend core libraries. Usually available at most OS package managers for Linux distributions and Mac OS.
 
-Once you have a working installation of Cargo you can install the dev tools:
-
+```bash
+$ sudo apt install llvm # For Ubuntu
 ```
+
+### 3. Locutus Dev Tool (LTD)
+
+Once you have a working installation of Cargo you can install the Locutus dev tools:
+
+```bash
 $ cargo install locutus
 ```
 
 This command will install `ldt` (Locutus Dev Tool) and a working node that can be used for local development.
 
-You can find more information about the available commands looking at [ldt](ldt.md) information or by executing lbt with the `--help` argument.
+#### 3.1 Usage
+
+You can find more information about the available commands by executing `ldt` with the `--help` argument:
+
+```
+$ ldt --help
+
+Locutus Development Tool 0.0.2
+The Freenet Project Inc.
+
+USAGE:
+    ldt [DATA_DIR] <SUBCOMMAND>
+
+ARGS:
+    <DATA_DIR>    Overrides the default data directory where Locutus files are stored
+
+OPTIONS:
+    -h, --help       Print help information
+    -V, --version    Print version information
+
+SUBCOMMANDS:
+    build        Builds and packages a contract
+    execute      Node CLI
+    help         Print this message or the help of the given subcommand(s)
+    new          Create a new Locutus contract and/or app
+    publish      Publishes a new contract to the network
+    run-local    A CLI utility for testing out contracts against a Locutus local node
+```
 
 ## Creating a new contract
 
-You can create a new [contract](glossary.md#contract) skeleton by executing the `new` command with `lbt`. Two contract types are supported currently by the tool, regular [contracts](glossary.md#contract), and [web application](glossary.md#web-application) [container contracts](glossary.md#container-contract).
-
-Currently the following technological stacks are supported (more to be added in the future):
+You can create a new [contract](glossary.md#contract) skeleton by executing the `new` command with `ldt`. Two contract types are supported currently by the tool, regular [contracts](glossary.md#contract), and [web application](glossary.md#web-application) [container contracts](glossary.md#container-contract). Currently, the following technological stacks are supported (more to be added in the future):
 
 - Regular contracts:
   - Rust (_default_)
@@ -39,12 +76,12 @@ Currently the following technological stacks are supported (more to be added in 
     - Rust (_default_)
   - Web/state development:
     - Typescript. (_default: using npm and webpack_)
-    - Javascript.
+    - JavaScript.
     - Rust (**WIP**).
 
-We will need to create a directory which will hold our web app and initialize it:
+We will need to create a directory that will hold our web app and initialize it:
 
-```
+```bash
 $ mkdir -p my-app/web
 $ mkdir -p my-app/backend
 $ cd my-app/web
@@ -55,23 +92,23 @@ will create the skeleton for a web application and its container contract for Lo
 
 ## Making a container contract
 
-In order to create a contract, the first thing that we need is to write the code for our container contract. This is a shell contract that will be deployed in the network in order to access the content of our web application.
+The first thing that we need is to write the code for our container contract. This contract's role is to contain the web application code itself, allowing it to be distributed over Locutus.
 
-The `new` command has created the source ready to be modified for us, in your favourite editor open the following file:
+The `new` command has created the source ready to be modified for us, in your favorite editor open the following file:
 
-```
+```bash
 $ ./container/src/lib.rs
 ```
 
-In this case, and for simplicity sake, the contract won't be performing any functions, but in a real contract this contract would be including some basic security functionality, e.g. verifiying that whoever is trying to update the contract has the required credentials.
+In this case, and for simplicity's sake, the contract won't be performing any functions, but in a realistic scenario, this contract would include some basic security functionality like verifying that whoever is trying to update the contract has the required credentials.
 
-> **TODO:** Point to included stdlib functionality to generate safe contract containers.
+To make our contract unique so it doesn't collide with an existing contract, we can generate a random signature that will be embedded with the contract.
 
-In order to make our contract unique so it doesn't collide with an existing contract, we can generate a random signature that will be embeeded with the contract.
+<!--
+What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `locutus-stdlib`. 
+-->
 
-      🛈 What would happen in case of collision with an existing contract? (That would be if we try to publish a contract which has the same exact combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided.
-
-In order to make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContracInterface` trait from the locutus-stdlib. For example in the `lib.rs` file we will write the following:
+For example in the `lib.rs` file we will write the following:
 
 ```rust,noplayground
 use locutus_stdlib::prelude::*;
@@ -138,21 +175,21 @@ impl ContractInterface for Contract {
 }
 ```
 
-      🛈 The exact interface still is an evolving specification.
-
-> **TODO:** Elsewhere in the documentation, explain the intricate details of how interfacing through WASM works. In theory users could implement their own wrapping code as long as the follow the low level WASM code specification.
+<!--
+TODO: Elsewhere in the documentation, explain the intricate details of how interfacing through WASM works. In theory users could implement their own wrapping code as long as the follow the low level WASM code specification.
+-->
 
 Here we create a new type, `Contract` for which we will be implementing the `ContractInterface` trait. To know more details about the functionality of a contract, delve into the details of the [contract interface](contract-interface.md).
 
-Notice the `#[contract]` macro call, this will generate the necessary code for the WASM runtime to interact with your contract in an ergonomic ans safe way. Trying to use this macro more than once in the same module will result in a compiler error, and only the code generated at the top level module will be used by the runtime.
+Notice the `#[contract]` macro call, this will generate the necessary code for the WASM runtime to interact with your contract ergonomically and safely. Trying to use this macro more than once in the same module will result in a compiler error, and only the code generated at the top-level module will be used by the runtime.
 
-As a rule of thumb, one contract will require to implement the `ContractInterface` exactly once.
+As a rule of thumb, one contract will require implementing the `ContractInterface`` exactly once.
 
 ### Creating a web application
 
 Now we have a working example of a contract, but our contract is an empty shell, which does not do anything yet. To change this, we will start developing our web application.
 
-In order to do that, we can go and modify the code of the contract state, which in this case is the web application. Locutus offers a std library which can be used with Typescript/Javascript to facilitate the development of web applications and interfacing with your local node, so we will make our `package.json` contains the dependency:
+To do that, we can go and modify the code of the contract state, which in this case is the web application. Locutus offers a standard library (stdlib) that can be used with Typescript/JavaScript to facilitate the development of web applications and interfacing with your local node, so we will make our `package.json` contains the dependency:
 
 ```
 {
@@ -164,9 +201,9 @@ In order to do that, we can go and modify the code of the contract state, which 
 
 Open the file `src/index.ts` in a code editor and you can start developing the web application.
 
-An important thing to notice is that our application will have be interfacing with our local node, the entry point for our machine to communicate with other nodes in the network. The stdlib offers a series of facilities in which you will be able to communicate with the network ergonomically.
+An important thing to notice is that our application will need to interface with our local node, the entry point for our machine to communicate with other nodes in the network. The stdlib offers a series of facilities in which you will be able to communicate with the network ergonomically.
 
-Here is an example on how you could write your application to interact with the node:
+Here is an example of how you could write your application to interact with the node:
 
 ```typescript
 import { LocutusWsApi } from "@locutus/locutus-stdlib/webSocketInterface";
@@ -210,7 +247,7 @@ const API_URL = new URL(`ws://${location.host}/contract/command/`);
 const locutusApi = new LocutusWsApi(API_URL, handler);
 ```
 
-This type wraps the node websocket API, and allows communicating with. It receives an object which handles the different responses from the node via callbacks. Here you would be able to interact with DOM objects or other parts of your code.
+This type provides a convenient interface to the WebSocket API. It receives an object which handles the different responses from the node via callbacks. Here you would be able to interact with DOM objects or other parts of your code.
 
 ```typescript
 const CONTRACT = "DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1";
@@ -224,15 +261,17 @@ async function loadState() {
 }
 ```
 
-Here we use the API wrapper to make a get request (which requires a key and specifying if we require fetching the contract code or not) to get the state for a contract with the given address. The response from the node will be directed to the `onGet` callback. You can use any other methods available in the API to interact with the node.
+Here we use the API wrapper to make a get request (which requires a key and specifies if we require fetching the contract code or not) to get the state for a contract with the given address. The response from the node will be directed to the `onGet` callback. You can use any other methods available in the API to interact with the node.
 
-> **TODO:** Add a link to documentation for the websocket API in typescript
+<!--
+TODO: Add a link to documentation for the WebSocket API in typescript
+-->
 
 ## Writing the backend for our web application
 
-On the [creating a new contract](dev-guide.md#creating-a-new-contract) section we described the contract interface, but we were using to write a simple container contract which won't be doing nothing in practice, just carrying around the frontend of your application. The core logic of the application, and backend where we will be storing all the information, requires an other contract. So we will create a new contract in a different directory for it:
+In the [creating a new contract](dev-guide.md#creating-a-new-contract) section we described the contract interface, but we were using it to write a simple container contract that won't be doing anything in practice, just carrying around the front end of your application. The core logic of the application, and a back end where we will be storing all the information, requires another contract. So we will create a new contract in a different directory for it:
 
-```
+```bash
 $ cd ../backend
 $ ldt new contract
 ```
@@ -271,7 +310,7 @@ impl ContractInterface for Contract {
 }
 ```
 
-In this simple example, we convert a new incoming delta to a post, and the state to a list of posts we maintain, and we appen the post to the list of posts.
+In this simple example, we convert a new incoming delta to a post and the state to a list of posts we maintain, and we append the post to the list of posts.
 
 If we subscribe to the contract changes or our web app, we will receive a notification with the updates after they are successful, and we will be able to render them in our browser. We can do that, for example, using the API:
 
@@ -287,25 +326,27 @@ function getUpdateNotification(notification: UpdateNotification) {
 
 ### Building and packaging a contract
 
-Now that we have the frontend and the backend of our web app, we can package the contracts and run them in the node to test them out.
+Now that we have the front end and the back end of our web app, we can package the contracts and run them in the node to test them out.
 
 In order to do that, we can again use the development tool to help us out with the process, in each contract directory we run the following commands:
 
-```
+```bash
 $ ldt build
 ```
 
 This command will read your contract manifest file (`locutus.toml`) and take care of building the contract and packaging it, ready for the node and the network to consume it.
 
-> **TODO:** Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the usecase doesn't fit with the current tooling, so they know the necessary steeps to itneract with the node at a lower level.
+<!--
+TODO: Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the use-case doesn't fit with the current tooling, so they know the necessary steeps to interact with the node at a lower level.
+-->
 
-Under the `./build/locutus` directory you will see both a `*.wasm` file, which is the contract file, and `contract-state`, in case it applies, which is the initial state that will be uploaded when initially putting the contract.
+Under the `./build/locutus` directory, you will see both a `*.wasm` file, which is the contract file, and `contract-state`, in case it applies, which is the initial state that will be uploaded when initially putting the contract.
 
-Web applications can access the code of backend contracts directly in their applications and put new contracts (that is, assigning a new location for the code, plus any parameters that may be generated dinamically by the web app, and the initial state for that combination of contract code + parameters) dinamically.
+Web applications can access the code of backend contracts directly in their applications and put new contracts (that is, assigning a new location for the code, plus any parameters that may be generated dynamically by the web app, and the initial state for that combination of contract code + parameters) dynamically.
 
 Let's take a look at the manifest for our web app container contract:
 
-```
+```toml
 [contract]
 type = "webapp"
 lang = "rust"
@@ -316,46 +357,51 @@ lang = "rust"
 source_dirs = ["dist"]
 ```
 
-This means that the + dist` directory will be packaged as the initial state for the webapp (that is the code the browser will be interpreting and in the end, rendering).
+This means that the `dist` directory will be packaged as the initial state for the webapp (that is the code the browser will be interpreting and in the end, rendering).
 
 If we add the following keys to the manifesto:
 
-```
+```toml
 [webapp.dependencies]
 posts = { path = "../backend" }
 ```
 
-The WASM code from the `backend` contract will be embedded in our web application state, so it will be accesible as a resource just via the local HTTP gateway access and then we can re-use it for publishing additional contracts.
+The WASM code from the `backend` contract will be embedded in our web application state, so it will be accessible as a resource just via the local HTTP gateway access and then we can re-use it for publishing additional contracts.
 
-> **TODO:** Publishing to the real functioning Locutus network is not yet supported.
+<!--
+TODO: Publishing to the real functioning Locutus network is not yet supported.
+-->
 
 ## Testing out contracts in the local node
 
-Once we have all our contracts sorted and ready for testing, we can do this in local mode in our node. For this the node must be running, we can make sure that is running by running the following command as a background process or in other terminal, since we have installed it:
+Once we have all our contracts sorted and ready for testing, we can do this in local mode in our node. For this the node must be running, we can make sure that is running by running the following command as a background process or in another terminal; since we have installed it:
 
-```
+```bash
 $ locutus-node
 ```
 
 You should see some logs printed via the stdout of the process indicating that the node HTTP gateway is running.
 
-Once the HTTP gateway is running, we are ready to put the contracts in the node:
+Once the HTTP gateway is running, we are ready to publish the contracts to our local Locutus node:
 
-```
+```bash
 $ cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
 $ cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
 ```
 
-In this case we are not passing any parameters (so ours parameters will be basically an empty byte array), and we are passing an initial state with out current backend contract. In a typical use both the parameters would have meaningful data, and the backend contract may be dinamically egenrated from the app and published from there. But the main idea is that how you would publish your application.
+In this case, we're not passing any parameters (so our parameters will be an empty byte array), and we are passing an initial state without the current backend contract. In typical use, both the parameters would have meaningful data, and the backend contract may be dynamically generated from the app and published from there. 
 
-Once this is done, you can browse your web just pointing to it in the browser: `http://127.0.0.1:50509/contract/web/<CONTRACT KEY>/`
+Once this is done, you can start your app just by pointing to it in the browser: `http://127.0.0.1:50509/contract/web/<CONTRACT KEY>`
 
-For example: `http://127.0.0.1:50509/contract/web/CYXGxQGSmcd5xHRJNQygPwmUJsWS2njh3pdVjfVz9EV/`
+For example `http://127.0.0.1:50509/contract/web/CYXGxQGSmcd5xHRJNQygPwmUJsWS2njh3pdVjfVz9EV/`
 
-Iteratively you can repeat this process of modifying, publishing locally, until you are confident with the results and ready to publish your application.
+Iteratively you can repeat this process of modifying, and publishing locally until you are confident with the results and ready to publish your application.
 
-Since the web is part of your state, you are always able to update it, pointing to new contracts, and evolve it over time.
+Since the web is part of your state, you are always able to update it, pointing to new contracts, and evolving it over time.
 
-## Publishing
+## Limitations
 
-> **TODO:** Publishing to the real functioning Locutus network is not yet supported.
+* Publishing to the Locutus network is not yet supported.
+* Only Rust is currently supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
+
+* Binaries for all the required tools are not yet available, they must be compiled from source
