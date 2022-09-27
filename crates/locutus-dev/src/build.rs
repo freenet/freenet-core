@@ -46,7 +46,6 @@ pub(crate) struct BuildToolConfig {
 pub(crate) struct Sources {
     pub source_dirs: Option<Vec<PathBuf>>,
     pub files: Option<Vec<String>>,
-    pub output_path: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -235,7 +234,7 @@ fn build_web_state(
         } else {
             let state = WebApp::from_data(metadata, archive)?;
             let packed = state.pack()?;
-            output_artifact(&sources.output_path, &packed, cwd)?;
+            output_artifact(&config.contract.output_dir, &packed, cwd)?;
             println!("Finished bundling webapp contract state");
         }
 
@@ -492,7 +491,6 @@ mod test {
                     state_sources: Some(Sources {
                         source_dirs: Some(vec!["dist".into()]),
                         files: None,
-                        output_path: None,
                     }),
                     metadata: None,
                     dependencies: Some(
@@ -552,7 +550,6 @@ mod test {
             state: Some(Sources {
                 source_dirs: None,
                 files: Some(vec!["initial_state.json".into()]),
-                output_path: None,
             }),
             webapp: None,
         };
