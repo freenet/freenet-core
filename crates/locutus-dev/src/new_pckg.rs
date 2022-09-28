@@ -37,7 +37,6 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
             state_sources: Some(Sources {
                 source_dirs: Some(vec![PathBuf::from("dist")]),
                 files: None,
-                output_path: None,
             }),
             metadata: None,
             dependencies: None,
