@@ -20,7 +20,7 @@ function getDocument(): Document {
 const DOCUMENT: Document = getDocument();
 
 const MODEL_CONTRACT = "DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1";
-const KEY = Key.fromSpec(MODEL_CONTRACT);
+const KEY = Key.fromInstanceId(MODEL_CONTRACT);
 
 function getState(hostResponse: GetResponse) {
   console.log("Received get");
@@ -39,15 +39,15 @@ function getState(hostResponse: GetResponse) {
 function getUpdateNotification(notification: UpdateNotification) {
   let decoder = new TextDecoder("utf8");
   let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
-  let new_update = decoder.decode(Uint8Array.from(notification.update));
-  let new_update_json = JSON.parse(new_update.replace("\x00", ""));
-  let new_content = JSON.stringify(
-    new_update_json,
+  let newUpdate = decoder.decode(Uint8Array.from(notification.update));
+  let newUpdateJson = JSON.parse(newUpdate.replace("\x00", ""));
+  let newContent = JSON.stringify(
+    newUpdateJson,
     ["author", "title", "content", "mod_msg", "signature"],
     2
   );
 
-  updatesBox.textContent = updatesBox.textContent + new_content;
+  updatesBox.textContent = updatesBox.textContent + newContent;
 }
 
 async function sendUpdate() {
@@ -70,21 +70,21 @@ async function sendUpdate() {
 }
 
 function isValidUpdate(input: string): boolean {
-  const expected_keys = new Set(["author", "date", "title", "content"]);
+  const expectedKeys = new Set(["author", "date", "title", "content"]);
   try {
-    let input_json = JSON.parse(input);
+    let inputJson = JSON.parse(input);
 
-    if (Array.isArray(input_json)) {
+    if (Array.isArray(inputJson)) {
       return false;
     }
 
-    let keys_set = new Set(Object.keys(input_json));
-    if (keys_set.size !== expected_keys.size) {
+    let keys_set = new Set(Object.keys(inputJson));
+    if (keys_set.size !== expectedKeys.size) {
       alert("The input json does not contain the expected keys");
       return false;
     }
 
-    for (let key of expected_keys) {
+    for (let key of expectedKeys) {
       if (!keys_set.has(key)) {
         alert("The input key" + key + "does not exist");
         return false;
@@ -138,8 +138,8 @@ const locutusApi = new LocutusWsApi(API_URL, handler);
 
 async function loadState() {
   let getRequest = {
-    key: Key.fromSpec(MODEL_CONTRACT),
-    fetch_contract: false,
+    key: Key.fromInstanceId(MODEL_CONTRACT),
+    fetchContract: false,
   };
   await locutusApi.get(getRequest);
 }

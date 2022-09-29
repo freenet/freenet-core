@@ -1,5 +1,8 @@
 use dashmap::DashMap;
-use locutus_runtime::{ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore};
+use locutus_runtime::{
+    ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore, UpdateModification,
+    ValidateResult,
+};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 use crate::{config::CONFIG, WrappedState};
@@ -13,7 +16,7 @@ impl RuntimeInterface for MockRuntime {
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'a>,
         state: &locutus_runtime::WrappedState,
-    ) -> locutus_runtime::RuntimeResult<bool> {
+    ) -> locutus_runtime::RuntimeResult<ValidateResult> {
         todo!()
     }
 
@@ -32,7 +35,7 @@ impl RuntimeInterface for MockRuntime {
         parameters: &locutus_runtime::Parameters<'a>,
         state: &locutus_runtime::WrappedState,
         delta: &locutus_runtime::StateDelta<'a>,
-    ) -> locutus_runtime::RuntimeResult<locutus_runtime::WrappedState> {
+    ) -> locutus_runtime::RuntimeResult<UpdateModification> {
         todo!()
     }
 

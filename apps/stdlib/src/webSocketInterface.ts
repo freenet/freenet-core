@@ -10,7 +10,7 @@ const MIN_U8: number = 0;
  * The key representing the tuple of a contract code and a set of parameters.
  */
 export class Key {
-  private spec: Uint8Array;
+  private instance: Uint8Array;
   private contract: Uint8Array | null;
 
   constructor(spec: Uint8Array, contract?: Uint8Array) {
@@ -22,7 +22,7 @@ export class Key {
         "invalid array lenth (expected 32 bytes): " + spec.length
       );
     }
-    this.spec = spec;
+    this.instance = spec;
     if (typeof contract == "undefined") {
       this.contract = null;
     } else {
@@ -30,7 +30,7 @@ export class Key {
     }
   }
 
-  static fromSpec(spec: string): Key {
+  static fromInstanceId(spec: string): Key {
     let encoded = base58.decode(spec);
     return new Key(encoded);
   }
@@ -39,13 +39,13 @@ export class Key {
    * @returns {Uint8Array} Hash of the full key specification (contract code + parameter).
    */
   bytes(): Uint8Array {
-    return this.spec;
+    return this.instance;
   }
 
   /**
    * @returns {Uint8Array | null} Hash of the contract code part of the full specification.
    */
-  contractPart(): Uint8Array | null {
+  codePart(): Uint8Array | null {
     return this.contract;
   }
 
@@ -55,7 +55,7 @@ export class Key {
    * @returns {string} The encoded string representation.
    */
   encode(): string {
-    return base58.encode(this.spec);
+    return base58.encode(this.instance);
   }
 }
 
@@ -83,7 +83,7 @@ export type UpdateRequest = {
 
 export type GetRequest = {
   key: Key;
-  fetch_contract: boolean;
+  fetchContract: boolean;
 };
 
 export type SubscribeRequest = {
@@ -282,8 +282,8 @@ export class HostResponse {
         }
 
         if (typeof err.Err[0].RequestError === "string") {
-            this.result = { cause: err.Err[0].RequestError }
-            return;
+          this.result = { cause: err.Err[0].RequestError };
+          return;
         }
         if ("Put" in err.Err[0].RequestError) {
           let putErr = err.Err[0].RequestError.Put as Array<any>;

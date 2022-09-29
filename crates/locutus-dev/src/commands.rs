@@ -1,7 +1,7 @@
 use std::{fs::File, io::Read, sync::Arc};
 
 use locutus_core::{ClientId, ClientRequest, ContractExecutor, SqlitePool};
-use locutus_runtime::{ContractId, ContractStore, Parameters, StateStore, WrappedContract};
+use locutus_runtime::{ContractInstanceId, ContractStore, Parameters, StateStore, WrappedContract};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},
@@ -42,7 +42,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), DynEr
     if config.release {
         return Err("Cannot publish contracts in the network yet".into());
     }
-    let key = ContractId::try_from(config.key)?.into();
+    let key = ContractInstanceId::try_from(config.key)?.into();
     println!("Updating contract {key}");
     let delta = {
         let mut buf = vec![];

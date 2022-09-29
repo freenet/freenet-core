@@ -6,6 +6,7 @@
 
 use std::{
     borrow::{Borrow, Cow},
+    collections::HashMap,
     fmt::Display,
     hash::Hasher,
     io::{Cursor, Read},
@@ -20,7 +21,7 @@ use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 32;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum ContractError {
     #[error("invalid contract update")]
     InvalidUpdate,
@@ -28,65 +29,106 @@ pub enum ContractError {
     InvalidState,
     #[error("trying to read an invalid delta")]
     InvalidDelta,
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    Other(String),
 }
 
-#[doc(hidden)]
-#[repr(i32)]
-pub enum UpdateResult {
-    ValidUpdate = 0i32,
-    ValidNoChange = 1i32,
-    Invalid = 2i32,
-}
-
-impl From<ContractError> for UpdateResult {
-    fn from(_err: ContractError) -> Self {
-        UpdateResult::Invalid
-    }
-}
-
-impl TryFrom<i32> for UpdateResult {
-    type Error = ();
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::ValidUpdate),
-            1 => Ok(Self::ValidNoChange),
-            2 => Ok(Self::Invalid),
-            _ => Err(()),
-        }
-    }
-}
-
-pub enum UpdateModification {
-    ValidUpdate(State<'static>),
-    NoChange,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateModification {
+    pub new_state: Option<State<'static>>,
+    related: Vec<RelatedContract>,
 }
 
 impl UpdateModification {
     pub fn unwrap_valid(self) -> State<'static> {
-        match self {
-            Self::ValidUpdate(s) => s,
+        match self.new_state {
+            Some(s) => s,
             _ => panic!("failed unwrapping state in modification"),
         }
     }
+
+    pub fn get_related(&self) -> &[RelatedContract] {
+        &self.related
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RelatedContracts {
+    map: HashMap<ContractInstanceId, Option<State<'static>>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RelatedContract {
+    pub contract_instance_id: ContractInstanceId,
+    pub mode: RelatedMode,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RelatedMode {
+    /// Retrieve the state once, not concerned with subsequent changes.
+    StateOnce,
+    /// Retrieve the state once, and then supply deltas from then on.
+    StateOnceThenDeltas,
+    /// Retrieve the state and then provide new states every time it updates.
+    StateEvery,
+    /// Retrieve the state and then provide new states and deltas every time it updates.
+    StateThenStateAndDeltas,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// The result of calling the [`ContractInterface::validate_state`] function.
+pub enum ValidateResult {
+    Valid,
+    Invalid,
+    /// The peer will attempt to retrieve the requested contract states
+    /// and will call validate_state() again when it retrieves them.
+    RequestRelated(Vec<ContractInstanceId>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum UpdateData {
+    State(State<'static>),
+    Delta(StateDelta<'static>),
+    StateAndDelta {
+        state: State<'static>,
+        delta: StateDelta<'static>,
+    },
+    RelatedState {
+        related_to: ContractInstanceId,
+        state: State<'static>,
+    },
+    RelatedDelta {
+        related_to: ContractInstanceId,
+        delta: StateDelta<'static>,
+    },
+    RelatedStateAndDelta {
+        related_to: ContractInstanceId,
+        state: State<'static>,
+        delta: StateDelta<'static>,
+    },
 }
 
 // ANCHOR: contractifce
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
-    fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
+    fn validate_state(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        related: RelatedContracts,
+    ) -> Result<ValidateResult, ContractError>;
 
     /// Verify that a delta is valid if possible, returns false if and only delta is
     /// definitely invalid, true otherwise.
-    fn validate_delta(parameters: Parameters<'static>, delta: StateDelta<'static>) -> bool;
+    fn validate_delta(
+        parameters: Parameters<'static>,
+        delta: StateDelta<'static>,
+    ) -> Result<bool, ContractError>;
 
-    /// Update the state to account for the state_delta, assuming it is valid.
+    /// Update the state to account for the new data
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
-        delta: StateDelta<'static>,
+        data: Vec<UpdateData>,
     ) -> Result<UpdateModification, ContractError>;
 
     /// Generate a concise summary of a state that can be used to create deltas
@@ -94,7 +136,7 @@ pub trait ContractInterface {
     fn summarize_state(
         parameters: Parameters<'static>,
         state: State<'static>,
-    ) -> StateSummary<'static>;
+    ) -> Result<StateSummary<'static>, ContractError>;
 
     /// Generate a state delta using a summary from the current state.
     /// This along with [`Self::summarize_state`] allows flexible and efficient
@@ -103,7 +145,7 @@ pub trait ContractInterface {
         parameters: Parameters<'static>,
         state: State<'static>,
         summary: StateSummary<'static>,
-    ) -> StateDelta<'static>;
+    ) -> Result<StateDelta<'static>, ContractError>;
 }
 // ANCHOR_END: contractifce
 
@@ -174,7 +216,7 @@ impl Eq for Contract<'_> {}
 impl std::fmt::Display for Contract<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ContractSpec( key: ")?;
-        internal_fmt_key(&self.key.id.0, f)?;
+        internal_fmt_key(&self.key.instance.0, f)?;
         let data: String = if self.data.data.len() > 8 {
             self.data.data[..4]
                 .iter()
@@ -206,7 +248,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct Parameters<'a>(Cow<'a, [u8]>);
 
@@ -241,7 +283,7 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct State<'a>(Cow<'a, [u8]>);
 
@@ -509,12 +551,12 @@ impl std::fmt::Display for ContractCode<'_> {
 
 /// The key representing the tuple of a contract code and a set of parameters.
 #[serde_as]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 #[repr(transparent)]
-pub struct ContractId(#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] [u8; CONTRACT_KEY_SIZE]);
+pub struct ContractInstanceId(#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] [u8; CONTRACT_KEY_SIZE]);
 
-impl ContractId {
+impl ContractInstanceId {
     pub fn encode(&self) -> String {
         bs58::encode(self.0)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -530,23 +572,23 @@ impl ContractId {
     }
 }
 
-impl FromStr for ContractId {
+impl FromStr for ContractInstanceId {
     type Err = bs58::decode::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ContractId::from_bytes(s)
+        ContractInstanceId::from_bytes(s)
     }
 }
 
-impl TryFrom<String> for ContractId {
+impl TryFrom<String> for ContractInstanceId {
     type Error = bs58::decode::Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        ContractId::from_bytes(s)
+        ContractInstanceId::from_bytes(s)
     }
 }
 
-impl<'a, T, U> From<(T, U)> for ContractId
+impl<'a, T, U> From<(T, U)> for ContractInstanceId
 where
     T: Borrow<Parameters<'a>>,
     U: Borrow<ContractCode<'a>>,
@@ -557,7 +599,7 @@ where
     }
 }
 
-impl Display for ContractId {
+impl Display for ContractInstanceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.encode())
     }
@@ -567,26 +609,29 @@ impl Display for ContractId {
 #[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 pub struct ContractKey {
-    id: ContractId,
+    instance: ContractInstanceId,
     #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
     contract: Option<[u8; CONTRACT_KEY_SIZE]>,
 }
 
 impl PartialEq for ContractKey {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.instance == other.instance
     }
 }
 
 impl std::hash::Hash for ContractKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.0.hash(state);
+        self.instance.0.hash(state);
     }
 }
 
-impl From<ContractId> for ContractKey {
-    fn from(id: ContractId) -> Self {
-        Self { id, contract: None }
+impl From<ContractInstanceId> for ContractKey {
+    fn from(instance: ContractInstanceId) -> Self {
+        Self {
+            instance,
+            contract: None,
+        }
     }
 }
 
@@ -600,7 +645,7 @@ where
         let id = generate_id(parameters, code_data);
         let contract_hash = code_data.hash();
         Self {
-            id,
+            instance: id,
             contract: Some(*contract_hash),
         }
     }
@@ -608,14 +653,17 @@ where
 
 impl ContractKey {
     /// Builds a partial `ContractKey`, the contract code part is unspecified.
-    pub fn from_id(id: impl Into<String>) -> Result<Self, bs58::decode::Error> {
-        let id = ContractId::try_from(id.into())?;
-        Ok(Self { id, contract: None })
+    pub fn from_id(instance: impl Into<String>) -> Result<Self, bs58::decode::Error> {
+        let instance = ContractInstanceId::try_from(instance.into())?;
+        Ok(Self {
+            instance,
+            contract: None,
+        })
     }
 
     /// Gets the whole spec key hash.
     pub fn bytes(&self) -> &[u8] {
-        self.id.0.as_ref()
+        self.instance.0.as_ref()
     }
 
     /// Returns the hash of the contract code only, if the key is fully specified.
@@ -649,13 +697,13 @@ impl ContractKey {
         let mut spec = [0; CONTRACT_KEY_SIZE];
         spec.copy_from_slice(&full_key_arr);
         Ok(Self {
-            id: ContractId(spec),
+            instance: ContractInstanceId(spec),
             contract: Some(contract),
         })
     }
 
     pub fn encoded_contract_id(&self) -> String {
-        self.id.encode()
+        self.instance.encode()
     }
 }
 
@@ -663,17 +711,20 @@ impl Deref for ContractKey {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.id.0
+        &self.instance.0
     }
 }
 
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.id.fmt(f)
+        self.instance.fmt(f)
     }
 }
 
-fn generate_id<'a>(parameters: &Parameters<'a>, code_data: &ContractCode<'a>) -> ContractId {
+fn generate_id<'a>(
+    parameters: &Parameters<'a>,
+    code_data: &ContractCode<'a>,
+) -> ContractInstanceId {
     let contract_hash = code_data.hash();
 
     let mut hasher = Blake2s256::new();
@@ -684,7 +735,7 @@ fn generate_id<'a>(parameters: &Parameters<'a>, code_data: &ContractCode<'a>) ->
     debug_assert_eq!(full_key_arr[..].len(), CONTRACT_KEY_SIZE);
     let mut spec = [0; CONTRACT_KEY_SIZE];
     spec.copy_from_slice(&full_key_arr);
-    ContractId(spec)
+    ContractInstanceId(spec)
 }
 
 #[inline]
@@ -696,6 +747,80 @@ fn internal_fmt_key(
         .with_alphabet(bs58::Alphabet::BITCOIN)
         .into_string();
     write!(f, "{}", &r[..8])
+}
+
+#[doc(hidden)]
+pub(crate) mod wasm_interface {
+    //! Contains all the types to interface between the host environment and
+    //! the wasm module execution.
+    use super::*;
+
+    pub struct InterfaceResult {
+        ptr: i64,
+        kind: i32,
+    }
+
+    impl InterfaceResult {
+        pub fn unwrap_validate_state_res(self) -> Result<ValidateResult, ContractError> {
+            todo!()
+        }
+
+        pub fn unwrap_validate_delta_res(self) -> Result<bool, ContractError> {
+            todo!()
+        }
+
+        pub fn unwrap_update_state(self) -> Result<UpdateModification, ContractError> {
+            todo!()
+        }
+
+        pub fn unwrap_summarize_state(self) -> Result<StateSummary<'static>, ContractError> {
+            todo!()
+        }
+
+        pub fn unwrap_get_state_delta(self) -> Result<StateDelta<'static>, ContractError> {
+            todo!()
+        }
+    }
+
+    impl From<(i64, i32)> for InterfaceResult {
+        fn from(v: (i64, i32)) -> Self {
+            Self {
+                ptr: v.0,
+                kind: v.1,
+            }
+        }
+    }
+
+    #[repr(i32)]
+    enum ResultKind {
+        ValidateState = 0,
+        ValidateDelta = 2,
+        UpdateState = 3,
+        SummarizeState = 4,
+        StateDelta = 5,
+    }
+
+    macro_rules! conversion {
+        ($value:ty: $kind:expr) => {
+            impl From<$value> for InterfaceResult {
+                fn from(value: $value) -> Self {
+                    let kind = $kind as i32;
+                    // TODO: research if there is a safe way to just transmute the pointer in memory
+                    //       independently of the architecture when stored in WASM and accessed from
+                    //       the host, maybe even if is just for some architectures
+                    let serialized = bincode::serialize(&value).unwrap();
+                    let ptr = Box::into_raw(Box::new(serialized)) as i64;
+                    Self { kind, ptr }
+                }
+            }
+        };
+    }
+
+    conversion!(Result<ValidateResult, ContractError>: ResultKind::ValidateState);
+    conversion!(Result<bool, ContractError>: ResultKind::ValidateDelta);
+    conversion!(Result<UpdateModification, ContractError>: ResultKind::UpdateState);
+    conversion!(Result<StateSummary<'static>, ContractError>: ResultKind::SummarizeState);
+    conversion!(Result<StateDelta<'static>, ContractError>: ResultKind::StateDelta);
 }
 
 #[cfg(test)]
