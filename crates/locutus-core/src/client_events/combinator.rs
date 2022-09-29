@@ -95,15 +95,17 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                             notification_channel,
                         }) => {
                             log::debug!("received request; internal_id={external}; req={request}");
-                            let id = *(&mut self.external_clients[idx])
-                                .entry(external)
-                                .or_insert_with(|| {
-                                    // add a new mapped external client id
-                                    let internal =
-                                        ClientId(COMBINATOR_INDEXES.fetch_add(1, Ordering::SeqCst));
-                                    self.internal_clients.insert(internal, (idx, external));
-                                    internal
-                                });
+                            let id =
+                                *self.external_clients[idx]
+                                    .entry(external)
+                                    .or_insert_with(|| {
+                                        // add a new mapped external client id
+                                        let internal = ClientId(
+                                            COMBINATOR_INDEXES.fetch_add(1, Ordering::SeqCst),
+                                        );
+                                        self.internal_clients.insert(internal, (idx, external));
+                                        internal
+                                    });
 
                             Ok(OpenRequest {
                                 id,
@@ -136,7 +138,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                 .internal_clients
                 .get(&internal)
                 .ok_or(ErrorKind::UnknownClient(internal))?;
-            (&self.clients[*idx])
+            self.clients[*idx]
                 .send((*external, response))
                 .await
                 .map_err(|_| ErrorKind::TransportProtocolDisconnect)?;
