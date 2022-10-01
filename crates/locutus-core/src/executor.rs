@@ -76,9 +76,18 @@ impl ContractExecutor {
         cli_id: ClientId,
         contract: WrappedContract<'static>,
         state: WrappedState,
+        related_contracts: RelatedContracts,
     ) {
         if let Err(err) = self
-            .handle_request(cli_id, ClientRequest::Put { contract, state }, None)
+            .handle_request(
+                cli_id,
+                ClientRequest::Put {
+                    contract,
+                    state,
+                    related_contracts,
+                },
+                None,
+            )
             .await
         {
             match err {
@@ -95,7 +104,11 @@ impl ContractExecutor {
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
-            ClientRequest::Put { contract, state } => {
+            ClientRequest::Put {
+                contract,
+                state,
+                related_contracts,
+            } => {
                 // FIXME: in net node, we don't allow puts for existing contract states
                 //        if it hits a node which already has it it will get rejected
                 //        while we wait for confirmation for the state,
@@ -116,7 +129,7 @@ impl ContractExecutor {
                 log::debug!("executing with params: {:?}", contract.params());
                 let is_valid = self
                     .runtime
-                    .validate_state(key, contract.params(), &state)
+                    .validate_state(key, contract.params(), &state, related_contracts)
                     .map_err(Into::into)
                     .map_err(Either::Right)?
                     == ValidateResult::Valid;
@@ -145,7 +158,7 @@ impl ContractExecutor {
                     })?;
                 Ok(res)
             }
-            ClientRequest::Update { key, delta } => {
+            ClientRequest::Update { key, data } => {
                 let parameters = {
                     self.contract_state
                         .get_params(&key)
@@ -163,7 +176,7 @@ impl ContractExecutor {
 
                     let update_modification = self
                         .runtime
-                        .update_state(&key, &parameters, &state, &delta)
+                        .update_state(&key, &parameters, &state, &data)
                         .map_err(|err| match err {
                             ContractRuntimeError::ExecError(ExecError::ContractError(err)) => {
                                 Either::Left(RequestError::Update {
@@ -230,6 +243,7 @@ impl ContractExecutor {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
+                // FIXME: here we are always sending an state_delta, but what we send back depends
                 let update = self
                     .runtime
                     .get_state_delta(key, params, new_state, &*peer_summary)
@@ -241,7 +255,8 @@ impl ContractExecutor {
                             })
                         }
                         other => Either::Right(other.into()),
-                    })?;
+                    })?
+                    .into();
                 notifier
                     .send(Ok(HostResponse::UpdateNotification { key: *key, update }))
                     .unwrap();

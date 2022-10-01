@@ -212,13 +212,14 @@ impl From<CommandInfo> for OpenRequest {
                 ClientRequest::Put {
                     contract: cmd.contract,
                     state: WrappedState::new(state.into_owned()),
+                    related_contracts: Default::default(),
                 }
             }
             Command::Update => {
-                let delta = cmd.input.unwrap().unwrap_delta();
+                let data = cmd.input.unwrap().unwrap_delta().into();
                 ClientRequest::Update {
                     key: *cmd.contract.key(),
-                    delta,
+                    data,
                 }
             }
             Command::Exit => ClientRequest::Disconnect {

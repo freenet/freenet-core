@@ -96,10 +96,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
     let id = HttpGateway::next_client_id();
     local_node
-        .preload(id, bundle.posts_contract, bundle.posts_state)
+        .preload(
+            id,
+            bundle.posts_contract,
+            bundle.posts_state,
+            Default::default(),
+        )
         .await;
     local_node
-        .preload(id, bundle.web_contract, bundle.web_state)
+        .preload(
+            id,
+            bundle.web_contract,
+            bundle.web_state,
+            Default::default(),
+        )
         .await;
     locutus::local_node::run_local_node(local_node).await
 }

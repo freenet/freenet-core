@@ -1,4 +1,4 @@
-use rmpv::Value;
+use locutus_runtime::{RelatedContracts, UpdateData};
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -7,7 +7,7 @@ use std::io::Cursor;
 use std::pin::Pin;
 use std::{error::Error as StdError, fmt::Display};
 
-use locutus_runtime::prelude::{ContractKey, StateDelta, StateSummary};
+use locutus_runtime::prelude::{ContractKey, StateSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -75,6 +75,12 @@ pub enum ErrorKind {
     Unhandled { cause: String },
     #[error("unknown client id: {0}")]
     UnknownClient(ClientId),
+}
+
+impl ErrorKind {
+    fn deserialization(cause: String) -> Self {
+        Self::DeserializationError { cause }
+    }
 }
 
 impl warp::reject::Reject for ErrorKind {}
@@ -145,7 +151,7 @@ pub enum HostResponse<T: Borrow<[u8]> = WrappedState> {
     /// Message sent when there is an update to a subscribed contract.
     UpdateNotification {
         key: ContractKey,
-        update: StateDelta<'static>,
+        update: UpdateData<'static>,
     },
 }
 
@@ -224,11 +230,13 @@ pub enum ClientRequest {
         contract: WrappedContract<'static>,
         /// Value to upsert in the contract.
         state: WrappedState,
+        /// Related contracts.
+        related_contracts: RelatedContracts,
     },
     /// Update an existing contract corresponding with the provided key.
     Update {
         key: ContractKey,
-        delta: StateDelta<'static>,
+        data: UpdateData<'static>,
     },
     /// Fetch the current state from a contract corresponding to the provided key.
     Get {
@@ -276,19 +284,23 @@ impl ClientRequest {
                     ["contract", "state"] => {
                         todo!("Not implemented, this transformation needs to be implemented")
                     }
-                    ["delta", "key"] => {
+                    ["key", "data"] => {
                         log::info!("Received update request");
                         ClientRequest::Update {
-                            key: key_from_rmpv(value_map.get("key").unwrap().clone()),
-                            delta: delta_from_rmpv(value_map.get("delta").unwrap().clone()),
+                            key: ContractKey::try_from(value_map.get("key").unwrap())
+                                .map_err(ErrorKind::deserialization)?,
+                            data: UpdateData::try_from(value_map.get("data").unwrap())
+                                .map_err(ErrorKind::deserialization)?,
                         }
                     }
                     ["fetch_contract", "key"] => ClientRequest::Get {
-                        key: key_from_rmpv(value_map.get("key").unwrap().clone()),
+                        key: ContractKey::try_from(value_map.get("key").unwrap())
+                            .map_err(ErrorKind::deserialization)?,
                         fetch_contract: value_map.get("fetch_contract").unwrap().as_bool().unwrap(),
                     },
                     ["key"] => ClientRequest::Subscribe {
-                        key: key_from_rmpv(value_map.get("key").unwrap().clone()),
+                        key: ContractKey::try_from(value_map.get("key").unwrap())
+                            .map_err(ErrorKind::deserialization)?,
                     },
                     ["cause"] => ClientRequest::Disconnect {
                         cause: Some(
@@ -311,21 +323,6 @@ impl ClientRequest {
 
         Ok(req)
     }
-}
-
-// todo: impl TryFrom<Value> for ContractKey
-fn key_from_rmpv(value: Value) -> ContractKey {
-    let key = value.as_map().unwrap();
-    let key_spec = key.get(0).unwrap().1.as_slice().unwrap();
-    let _ = key.get(1).unwrap().clone().0;
-    let key_str = bs58::encode(&key_spec).into_string();
-    ContractKey::from_id(key_str).unwrap()
-}
-
-// todo: impl TryFrom<Value> for StateDelta<'static>
-fn delta_from_rmpv(value: Value) -> StateDelta<'static> {
-    let delta = value.as_slice().unwrap().to_vec();
-    StateDelta::from(delta)
 }
 
 impl Display for ClientRequest {
@@ -354,7 +351,7 @@ impl Display for ClientRequest {
 pub(crate) mod test {
     use std::{collections::HashMap, time::Duration};
 
-    use locutus_runtime::{ContractCode, Parameters};
+    use locutus_runtime::{ContractCode, Parameters, StateDelta};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
@@ -416,7 +413,11 @@ pub(crate) mod test {
                     0 if !self.owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.owned_contracts.len());
                         let (contract, state) = self.owned_contracts[contract_no].clone();
-                        break ClientRequest::Put { contract, state };
+                        break ClientRequest::Put {
+                            contract,
+                            state,
+                            related_contracts: Default::default(),
+                        };
                     }
                     1 if !self.non_owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
@@ -574,7 +575,7 @@ pub(crate) mod test {
 
         let update_notif: HostResult = Ok(HostResponse::UpdateNotification {
             key: gen.arbitrary()?,
-            update: StateDelta::from(gen.arbitrary::<Vec<u8>>()?),
+            update: StateDelta::from(gen.arbitrary::<Vec<u8>>()?).into(),
         });
         let encoded = rmp_serde::to_vec(&update_notif)?;
         let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
@@ -587,7 +588,7 @@ pub(crate) mod test {
         let expected_client_request = ClientRequest::Update {
             key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
                 .unwrap(),
-            delta: locutus_runtime::StateDelta::from(vec![
+            data: locutus_runtime::StateDelta::from(vec![
                 91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 97, 117, 116,
                 104, 111, 114, 34, 58, 34, 73, 68, 71, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32,
                 34, 100, 97, 116, 101, 34, 58, 34, 50, 48, 50, 50, 45, 48, 54, 45, 49, 53, 84, 48,
@@ -595,7 +596,8 @@ pub(crate) mod test {
                 116, 105, 116, 108, 101, 34, 58, 34, 78, 101, 119, 32, 109, 115, 103, 34, 44, 10,
                 32, 32, 32, 32, 32, 32, 32, 32, 34, 99, 111, 110, 116, 101, 110, 116, 34, 58, 34,
                 46, 46, 46, 34, 10, 32, 32, 32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
-            ]),
+            ])
+            .into(),
         };
         let msg: Vec<u8> = vec![
             130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194,

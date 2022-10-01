@@ -52,7 +52,7 @@ impl UpdateModification {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct RelatedContracts {
     map: HashMap<ContractInstanceId, Option<State<'static>>>,
 }
@@ -85,27 +85,47 @@ pub enum ValidateResult {
     RequestRelated(Vec<ContractInstanceId>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum UpdateData {
-    State(State<'static>),
-    Delta(StateDelta<'static>),
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum UpdateData<'a> {
+    State(State<'a>),
+    Delta(StateDelta<'a>),
     StateAndDelta {
-        state: State<'static>,
-        delta: StateDelta<'static>,
+        state: State<'a>,
+        delta: StateDelta<'a>,
     },
     RelatedState {
         related_to: ContractInstanceId,
-        state: State<'static>,
+        state: State<'a>,
     },
     RelatedDelta {
         related_to: ContractInstanceId,
-        delta: StateDelta<'static>,
+        delta: StateDelta<'a>,
     },
     RelatedStateAndDelta {
         related_to: ContractInstanceId,
-        state: State<'static>,
-        delta: StateDelta<'static>,
+        state: State<'a>,
+        delta: StateDelta<'a>,
     },
+}
+
+impl UpdateData<'_> {
+    pub fn size(&self) -> usize {
+        todo!()
+    }
+}
+
+impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
+    fn from(delta: StateDelta<'a>) -> Self {
+        UpdateData::Delta(delta)
+    }
+}
+
+impl TryFrom<&rmpv::Value> for UpdateData<'static> {
+    type Error = String;
+
+    fn try_from(_value: &rmpv::Value) -> Result<Self, Self::Error> {
+        todo!()
+    }
 }
 
 // ANCHOR: contractifce
@@ -611,7 +631,7 @@ impl Display for ContractInstanceId {
 pub struct ContractKey {
     instance: ContractInstanceId,
     #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
-    contract: Option<[u8; CONTRACT_KEY_SIZE]>,
+    code: Option<[u8; CONTRACT_KEY_SIZE]>,
 }
 
 impl PartialEq for ContractKey {
@@ -630,7 +650,7 @@ impl From<ContractInstanceId> for ContractKey {
     fn from(instance: ContractInstanceId) -> Self {
         Self {
             instance,
-            contract: None,
+            code: None,
         }
     }
 }
@@ -646,7 +666,7 @@ where
         let contract_hash = code_data.hash();
         Self {
             instance: id,
-            contract: Some(*contract_hash),
+            code: Some(*contract_hash),
         }
     }
 }
@@ -657,7 +677,7 @@ impl ContractKey {
         let instance = ContractInstanceId::try_from(instance.into())?;
         Ok(Self {
             instance,
-            contract: None,
+            code: None,
         })
     }
 
@@ -668,12 +688,12 @@ impl ContractKey {
 
     /// Returns the hash of the contract code only, if the key is fully specified.
     pub fn code_hash(&self) -> Option<&[u8; CONTRACT_KEY_SIZE]> {
-        self.contract.as_ref()
+        self.code.as_ref()
     }
 
     /// Returns the encoded hash of the contract code, if the key is fully specified.
     pub fn encoded_code_hash(&self) -> Option<String> {
-        self.contract.as_ref().map(|c| {
+        self.code.as_ref().map(|c| {
             bs58::encode(c)
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string()
@@ -698,7 +718,7 @@ impl ContractKey {
         spec.copy_from_slice(&full_key_arr);
         Ok(Self {
             instance: ContractInstanceId(spec),
-            contract: Some(contract),
+            code: Some(contract),
         })
     }
 
@@ -718,6 +738,18 @@ impl Deref for ContractKey {
 impl std::fmt::Display for ContractKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.instance.fmt(f)
+    }
+}
+
+impl TryFrom<&rmpv::Value> for ContractKey {
+    type Error = String;
+
+    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
+        let contract_key = value.as_map().unwrap();
+        // let _code = contract_key.get(1).unwrap().clone().0;
+        let instance_id = contract_key.get(0).unwrap().1.as_slice().unwrap();
+        let instance_id = bs58::encode(&instance_id).into_string();
+        Ok(ContractKey::from_id(instance_id).unwrap())
     }
 }
 
@@ -779,6 +811,10 @@ pub(crate) mod wasm_interface {
 
         pub fn unwrap_get_state_delta(self) -> Result<StateDelta<'static>, ContractError> {
             todo!()
+        }
+
+        pub fn into_raw(self) -> (i64, i32) {
+            (self.ptr, self.kind)
         }
     }
 

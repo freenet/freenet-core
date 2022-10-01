@@ -6,27 +6,29 @@ const MIN_U8: number = 0;
 
 // base interface types:
 
+type ContractInstanceId = Uint8Array;
+
 /**
  * The key representing the tuple of a contract code and a set of parameters.
  */
 export class Key {
-  private instance: Uint8Array;
-  private contract: Uint8Array | null;
+  private instance: ContractInstanceId;
+  private code: Uint8Array | null;
 
-  constructor(spec: Uint8Array, contract?: Uint8Array) {
+  constructor(instance: ContractInstanceId, code?: Uint8Array) {
     if (
-      spec.length != 32 ||
-      (typeof contract != "undefined" && contract.length != 32)
+      instance.length != 32 ||
+      (typeof code != "undefined" && code.length != 32)
     ) {
       throw TypeError(
-        "invalid array lenth (expected 32 bytes): " + spec.length
+        "invalid array lenth (expected 32 bytes): " + instance.length
       );
     }
-    this.instance = spec;
-    if (typeof contract == "undefined") {
-      this.contract = null;
+    this.instance = instance;
+    if (typeof code == "undefined") {
+      this.code = null;
     } else {
-      this.contract = contract;
+      this.code = code;
     }
   }
 
@@ -46,7 +48,7 @@ export class Key {
    * @returns {Uint8Array | null} Hash of the contract code part of the full specification.
    */
   codePart(): Uint8Array | null {
-    return this.contract;
+    return this.code;
   }
 
   /**
@@ -69,11 +71,22 @@ export type State = Uint8Array;
 export type StateSummary = Uint8Array;
 export type StateDelta = Uint8Array;
 
+export type UpdateData =
+  | State
+  | StateDelta
+  | { state: State; delta: StateDelta }
+  | { relatedTo: ContractInstanceId; state: State }
+  | { relatedTo: ContractInstanceId; delta: StateDelta }
+  | { relatedTo: ContractInstanceId; state: State; delta: StateDelta };
+
+export type RelatedContracts = Map<ContractInstanceId, State | null>;
+
 // ops:
 
 export type PutRequest = {
   contract: Contract;
   state: State;
+  relatedContracts: RelatedContracts;
 };
 
 export type UpdateRequest = {
@@ -209,7 +222,7 @@ export interface GetResponse {
 export interface UpdateNotification {
   readonly kind: "updateNotification";
   key: Key;
-  update: StateDelta;
+  update: UpdateData;
 }
 
 function assert(condition: boolean, msg?: string) {

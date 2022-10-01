@@ -74,6 +74,9 @@ pub struct PutConfig {
     /// to be executed in local mode only. By default puts are performed in local.
     #[clap(long)]
     pub(crate) release: bool,
+    /// A path to a JSON file listing the related contracts.
+    #[clap(long)]
+    pub(crate) related_contracts: Option<PathBuf>,
 }
 
 /// Builds and packages a contract.

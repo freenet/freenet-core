@@ -23,13 +23,10 @@ impl ContractInterface for Contract {
 
     fn update_state(
         _parameters: Parameters<'static>,
-        mut state: State<'static>,
+        _state: State<'static>,
         _data: Vec<UpdateData>,
     ) -> Result<UpdateModification, ContractError> {
-        // let new_state = state.to_mut();
-        // new_state.extend(delta.as_ref());
-        // Ok(UpdateModification::ValidUpdate(state))
-        todo!()
+        unimplemented!()
     }
 
     fn summarize_state(

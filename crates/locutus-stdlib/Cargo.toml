@@ -16,6 +16,7 @@ byteorder = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
 once_cell = "1"
+rmpv = { version = "1"}
 serde = { version = "1", features = ["derive"] }
 serde_with = "2"
 tar = "0.4.38"

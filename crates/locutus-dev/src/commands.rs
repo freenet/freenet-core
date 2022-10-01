@@ -1,6 +1,8 @@
 use std::{fs::File, io::Read, sync::Arc};
 
-use locutus_core::{ClientId, ClientRequest, ContractExecutor, SqlitePool};
+use locutus_core::{
+    locutus_runtime::StateDelta, ClientId, ClientRequest, ContractExecutor, SqlitePool,
+};
 use locutus_runtime::{ContractInstanceId, ContractStore, Parameters, StateStore, WrappedContract};
 
 use crate::{
@@ -33,8 +35,18 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         buf.into()
     };
     let contract = WrappedContract::new(Arc::new(code), params);
+    let related_contracts = if let Some(related) = config.related_contracts {
+        todo!()
+    } else {
+        Default::default()
+    };
+
     println!("Putting contract {}", contract.key());
-    let request = ClientRequest::Put { contract, state };
+    let request = ClientRequest::Put {
+        contract,
+        state,
+        related_contracts,
+    };
     execute_command(request, other).await
 }
 
@@ -44,12 +56,12 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), DynEr
     }
     let key = ContractInstanceId::try_from(config.key)?.into();
     println!("Updating contract {key}");
-    let delta = {
+    let data = {
         let mut buf = vec![];
         File::open(&config.delta)?.read_to_end(&mut buf)?;
-        buf.into()
+        StateDelta::from(buf).into()
     };
-    let request = ClientRequest::Update { key, delta };
+    let request = ClientRequest::Update { key, data };
     execute_command(request, other).await
 }
 

@@ -53,6 +53,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: init_val,
             contract: contract.clone(),
+            related_contracts: Default::default(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;
@@ -74,6 +75,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: second_val,
             contract,
+            related_contracts: Default::default(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;

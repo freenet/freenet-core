@@ -426,7 +426,11 @@ pub(in crate::contract) mod sqlite {
                     let (state, contract) = self.get_contract(&key, fetch_contract).await?;
                     Ok(HostResponse::GetResponse { contract, state })
                 }
-                ClientRequest::Put { contract, state } => {
+                ClientRequest::Put {
+                    contract,
+                    state,
+                    related_contracts,
+                } => {
                     match self.get_contract(contract.key(), false).await {
                         Ok((_old_state, _)) => {
                             return Err(ContractRuntimeError::from(ExecError::DoublePut(
@@ -438,9 +442,12 @@ pub(in crate::contract) mod sqlite {
                         Err(other) => return Err(other),
                     }
 
-                    let result =
-                        self.runtime
-                            .validate_state(contract.key(), contract.params(), &state)?;
+                    let result = self.runtime.validate_state(
+                        contract.key(),
+                        contract.params(),
+                        &state,
+                        related_contracts,
+                    )?;
                     // FIXME: should deal with additional related contracts requested
                     if result != ValidateResult::Valid {
                         todo!("return error");
@@ -497,6 +504,7 @@ pub(in crate::contract) mod sqlite {
                 .handle_request(ClientRequest::Put {
                     contract: contract.clone(),
                     state: state.clone(),
+                    related_contracts: Default::default(),
                 })
                 .await?
                 .unwrap_put();
@@ -514,7 +522,7 @@ pub(in crate::contract) mod sqlite {
             handler
                 .handle_request(ClientRequest::Update {
                     key: *contract.key(),
-                    delta,
+                    data: delta.into(),
                 })
                 .await?;
             // let (new_get_result_value, _) = handler

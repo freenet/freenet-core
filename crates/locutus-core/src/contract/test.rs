@@ -16,6 +16,7 @@ impl RuntimeInterface for MockRuntime {
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'a>,
         state: &locutus_runtime::WrappedState,
+        related: locutus_runtime::RelatedContracts,
     ) -> locutus_runtime::RuntimeResult<ValidateResult> {
         todo!()
     }
@@ -34,7 +35,7 @@ impl RuntimeInterface for MockRuntime {
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'a>,
         state: &locutus_runtime::WrappedState,
-        delta: &locutus_runtime::StateDelta<'a>,
+        data: &locutus_runtime::UpdateData<'a>,
     ) -> locutus_runtime::RuntimeResult<UpdateModification> {
         todo!()
     }

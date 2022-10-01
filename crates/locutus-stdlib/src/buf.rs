@@ -5,17 +5,26 @@
 #[repr(C)]
 pub struct BufferBuilder {
     start: i64,
-    size: u32,
+    capacity: u32,
     last_read: i64,
     last_write: i64,
 }
 
 impl BufferBuilder {
-    pub fn size(&self) -> usize {
-        self.size as _
+    pub fn capacity(&self) -> usize {
+        self.capacity as _
     }
 
-    pub fn start(&self) -> *const u8 {
+    pub fn len(&self) -> usize {
+        self.last_write as usize
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn start(&self) -> *mut u8 {
         self.start as _
     }
 
@@ -27,13 +36,13 @@ impl BufferBuilder {
         let write_ptr = Box::leak(Box::from_raw(self.last_write as *mut u32));
 
         // drop previous buffer
-        let prev = Vec::from_raw_parts(self.start as *mut u8, *write_ptr as usize, self.size());
+        let prev = Vec::from_raw_parts(self.start as *mut u8, *write_ptr as usize, self.capacity());
         std::mem::drop(prev);
 
         // write the new buffer information
         let new_ptr = data.as_ptr();
         self.start = new_ptr as i64;
-        self.size = data.capacity() as _;
+        self.capacity = data.capacity() as _;
         *read_ptr = 0;
         *write_ptr = data.len().saturating_sub(1) as _; // []
         std::mem::forget(data);
@@ -49,11 +58,11 @@ impl From<Vec<u8>> for BufferBuilder {
         let last_read = Box::into_raw(Box::new(0u32)) as i64;
         let last_write = Box::into_raw(Box::new(data.len() as u32)) as i64;
         let start = data.as_ptr() as _;
-        let size = data.capacity() as _;
+        let capacity = data.capacity() as _;
         std::mem::forget(data);
         BufferBuilder {
             start,
-            size,
+            capacity,
             last_read,
             last_write,
         }
@@ -138,7 +147,7 @@ impl<'instance> BufferMut<'instance> {
         unsafe {
             let end_ptr = self.mem.0.offset(self.mem.1 as isize);
             let p = &*compute_ptr(self.builder_ptr, self.mem.0, end_ptr);
-            p.size as _
+            p.capacity as _
         }
     }
 
@@ -201,7 +210,7 @@ fn from_raw_builder<'a>(
         )));
         let buffer_ptr = compute_ptr(buf_builder.start as *mut u8, start_ptr, end_ptr);
         let buffer =
-            &mut *std::ptr::slice_from_raw_parts_mut(buffer_ptr, buf_builder.size as usize);
+            &mut *std::ptr::slice_from_raw_parts_mut(buffer_ptr, buf_builder.capacity as usize);
         // eprintln!(
         //     "checking new ptr: {:p} -> {}; mem: {start_ptr:p} - {end_ptr:p};
         //     buf ptr: {buffer_ptr:p}; buf size {}",
@@ -280,8 +289,8 @@ impl<'instance> Buffer<'instance> {
 /// This buffer leaks it's own memory and will only be freed by the runtime when a contract instance is dropped.
 #[doc(hidden)]
 #[no_mangle]
-pub fn initiate_buffer(size: u32) -> i64 {
-    let buf: Vec<u8> = Vec::with_capacity(size as usize);
+pub fn initiate_buffer(capacity: u32) -> i64 {
+    let buf: Vec<u8> = Vec::with_capacity(capacity as usize);
     let start = buf.as_ptr() as i64;
     eprintln!("new buffer ptr: {:p} -> {} as i64", buf.as_ptr(), start);
     std::mem::forget(buf);
@@ -290,7 +299,7 @@ pub fn initiate_buffer(size: u32) -> i64 {
     let last_write = Box::into_raw(Box::new(0u32)) as i64;
     let buffer = Box::into_raw(Box::new(BufferBuilder {
         start,
-        size,
+        capacity,
         last_read,
         last_write,
     }));

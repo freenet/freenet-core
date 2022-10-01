@@ -42,12 +42,14 @@ fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> 
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 2, 3, 4]),
+        Default::default(),
     )? == ValidateResult::Valid;
     assert!(is_valid);
     let not_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 0, 0, 1]),
+        Default::default(),
     )? == ValidateResult::Invalid;
     assert!(not_valid);
     Ok(())
@@ -67,12 +69,14 @@ fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 2, 3, 4]),
+        Default::default(),
     )? == ValidateResult::Valid;
     assert!(is_valid);
     let not_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 0, 0, 1]),
+        Default::default(),
     )? == ValidateResult::Invalid;
     assert!(not_valid);
     Ok(())
@@ -114,7 +118,7 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
             &key,
             &Parameters::from([].as_ref()),
             &WrappedState::new(vec![5, 2, 3]),
-            &StateDelta::from([4].as_ref()),
+            &StateDelta::from([4].as_ref()).into(),
         )?
         .unwrap_valid();
     assert!(new_state.as_ref().len() == 4);

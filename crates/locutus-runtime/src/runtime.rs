@@ -18,6 +18,7 @@ pub trait RuntimeInterface {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
+        related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult>;
 
     fn validate_delta<'a>(
@@ -32,7 +33,7 @@ pub trait RuntimeInterface {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
-        delta: &StateDelta<'a>,
+        update_date: &UpdateData<'a>,
     ) -> RuntimeResult<UpdateModification>;
 
     fn summarize_state<'a>(
@@ -91,8 +92,9 @@ impl RuntimeInterface for Runtime {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
+        related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult> {
-        <Self>::validate_state(self, key, parameters, state)
+        <Self>::validate_state(self, key, parameters, state, related)
     }
 
     fn validate_delta<'a>(
@@ -109,9 +111,9 @@ impl RuntimeInterface for Runtime {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
-        delta: &StateDelta<'a>,
+        update_date: &UpdateData<'a>,
     ) -> RuntimeResult<UpdateModification> {
-        <Self>::update_state(self, key, parameters, state, delta)
+        <Self>::update_state(self, key, parameters, state, update_date)
     }
 
     fn summarize_state<'a>(
@@ -292,6 +294,7 @@ impl Runtime {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
+        related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
@@ -299,12 +302,18 @@ impl Runtime {
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
         state_buf.write(state)?;
+        let serialized =
+            bincode::serialize(&related).map_err(|e| ContractRuntimeError::Any(e.into()))?;
+        let mut related_buf = self.init_buf(&instance, &serialized)?;
+        related_buf.write(serialized)?;
 
-        let validate_func: NativeFunc<(i64, i64), (i64, i32)> =
+        let validate_func: NativeFunc<(i64, i64, i64), (i64, i32)> =
             instance.exports.get_native_function("validate_state")?;
-        let is_valid = InterfaceResult::from(
-            validate_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?,
-        )
+        let is_valid = InterfaceResult::from(validate_func.call(
+            param_buf.ptr() as i64,
+            state_buf.ptr() as i64,
+            related_buf.ptr() as i64,
+        )?)
         .unwrap_validate_state_res()
         .map_err(Into::<ExecError>::into)?;
         Ok(is_valid)
@@ -349,26 +358,28 @@ impl Runtime {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
-        delta: &StateDelta<'a>,
+        update_data: &UpdateData<'a>,
     ) -> RuntimeResult<UpdateModification> {
         // todo: if we keep this hot in memory some things to take into account:
         //       - over subsequent requests state size may change
         //       - the delta may not be necessarily the same size
-        let req_bytes = parameters.size() + state.size() + delta.size();
+        let req_bytes = parameters.size() + state.size() + update_data.size();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
         state_buf.write(state.clone())?;
-        let mut delta_buf = self.init_buf(&instance, &delta)?;
-        delta_buf.write(delta)?;
+        let serialized =
+            bincode::serialize(&update_data).map_err(|e| ContractRuntimeError::Any(e.into()))?;
+        let mut update_dat_buf = self.init_buf(&instance, &serialized)?;
+        update_dat_buf.write(serialized)?;
 
         let validate_func: NativeFunc<(i64, i64, i64), (i64, i32)> =
             instance.exports.get_native_function("update_state")?;
         let update_res = InterfaceResult::from(validate_func.call(
             param_buf.ptr() as i64,
             state_buf.ptr() as i64,
-            delta_buf.ptr() as i64,
+            update_dat_buf.ptr() as i64,
         )?)
         .unwrap_update_state()
         .map_err(Into::<ExecError>::into)?;
@@ -404,11 +415,11 @@ impl Runtime {
         // let summary_buf =
         //     unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
         // let summary: StateSummary = summary_buf.read_bytes(summary_buf.size()).into();
-        let res_ptr = int_res
+        let result = int_res
             .unwrap_summarize_state()
             .map_err(Into::<ExecError>::into)?;
         // Ok(StateSummary::from(summary.to_vec()))
-        Ok(res_ptr)
+        Ok(result)
     }
 
     /// Generate a state delta using a summary from the current state.
@@ -445,11 +456,11 @@ impl Runtime {
         // let delta_buf =
         //     unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
         // let mut delta = delta_buf.shared();
-        let res_ptr = int_res
+        let result = int_res
             .unwrap_get_state_delta()
             .map_err(Into::<ExecError>::into)?;
         // Ok(StateDelta::from(delta.read_all().to_vec()))
-        Ok(res_ptr)
+        Ok(result)
     }
 }
 
@@ -502,7 +513,7 @@ mod test {
                 &key,
                 &Parameters::from([].as_ref()),
                 &WrappedState::new(vec![5, 2, 3]),
-                &StateDelta::from([4].as_ref()),
+                &StateDelta::from([4].as_ref()).into(),
             )?
             .unwrap_valid();
         assert_eq!(new_state.as_ref().len(), 4);

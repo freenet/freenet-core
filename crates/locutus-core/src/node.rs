@@ -308,7 +308,11 @@ async fn client_event_handling<ClientEv, CErr>(
         let op_storage_cp = op_storage.clone();
         GlobalExecutor::spawn(async move {
             match request {
-                ClientRequest::Put { state, contract } => {
+                ClientRequest::Put {
+                    state,
+                    contract,
+                    related_contracts,
+                } => {
                     // Initialize a put op.
                     log::debug!(
                         "Received put from user event @ {}",
@@ -326,7 +330,7 @@ async fn client_event_handling<ClientEv, CErr>(
                 }
                 ClientRequest::Update {
                     key: _key,
-                    delta: _delta,
+                    data: _delta,
                 } => {
                     todo!()
                 }
