@@ -8,6 +8,9 @@ pub use blake2;
 pub use locutus_macros::contract;
 
 pub mod prelude {
+    pub use crate::interface::wasm_interface::*;
     pub use crate::interface::*;
     pub use locutus_macros::contract;
+
+    pub use bincode;
 }

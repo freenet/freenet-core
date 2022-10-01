@@ -42,13 +42,13 @@ fn validate_compiled_with_guest_mem() -> Result<(), Box<dyn std::error::Error>> 
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 2, 3, 4]),
-    )?;
+    )? == ValidateResult::Valid;
     assert!(is_valid);
-    let not_valid = !runtime.validate_state(
+    let not_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 0, 0, 1]),
-    )?;
+    )? == ValidateResult::Invalid;
     assert!(not_valid);
     Ok(())
 }
@@ -67,13 +67,13 @@ fn validate_compiled_with_host_mem() -> Result<(), Box<dyn std::error::Error>> {
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 2, 3, 4]),
-    )?;
+    )? == ValidateResult::Valid;
     assert!(is_valid);
-    let not_valid = !runtime.validate_state(
+    let not_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 0, 0, 1]),
-    )?;
+    )? == ValidateResult::Invalid;
     assert!(not_valid);
     Ok(())
 }
@@ -109,12 +109,14 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = get_guest_test_contract()?;
     let mut runtime = Runtime::build(store, false).unwrap();
     // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
-    let new_state = runtime.update_state(
-        &key,
-        &Parameters::from([].as_ref()),
-        &WrappedState::new(vec![5, 2, 3]),
-        &StateDelta::from([4].as_ref()),
-    )?;
+    let new_state = runtime
+        .update_state(
+            &key,
+            &Parameters::from([].as_ref()),
+            &WrappedState::new(vec![5, 2, 3]),
+            &StateDelta::from([4].as_ref()),
+        )?
+        .unwrap_valid();
     assert!(new_state.as_ref().len() == 4);
     assert!(new_state.as_ref()[3] == 4);
     Ok(())
@@ -150,22 +152,5 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert!(delta.as_ref().len() == 1);
     assert!(delta.as_ref()[0] == 4);
-    Ok(())
-}
-
-#[ignore]
-#[test]
-fn update_state_from_summary() -> Result<(), Box<dyn std::error::Error>> {
-    let (store, key) = get_guest_test_contract()?;
-    let mut runtime = Runtime::build(store, false).unwrap();
-    // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
-    let new_state = runtime.update_state_from_summary(
-        &key,
-        Parameters::from([].as_ref()),
-        WrappedState::new(vec![5, 2, 3]),
-        StateSummary::from([4].as_ref()),
-    )?;
-    assert!(new_state.as_ref().len() == 4);
-    assert!(new_state.as_ref()[3] == 4);
     Ok(())
 }

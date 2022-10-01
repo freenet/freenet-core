@@ -185,7 +185,7 @@ pub(in crate::contract) mod sqlite {
     use futures::Future;
     use locutus_runtime::{
         ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, StateStorage,
-        StateStoreError,
+        StateStoreError, ValidateResult,
     };
     use once_cell::sync::Lazy;
     use sqlx::{
@@ -438,10 +438,11 @@ pub(in crate::contract) mod sqlite {
                         Err(other) => return Err(other),
                     }
 
-                    let is_valid =
+                    let result =
                         self.runtime
                             .validate_state(contract.key(), contract.params(), &state)?;
-                    if !is_valid {
+                    // FIXME: should deal with additional related contracts requested
+                    if result != ValidateResult::Valid {
                         todo!("return error");
                     }
                     let _params: Parameters<'static> =
