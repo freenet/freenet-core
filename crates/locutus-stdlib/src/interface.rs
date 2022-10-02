@@ -123,7 +123,21 @@ impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
 impl TryFrom<&rmpv::Value> for UpdateData<'static> {
     type Error = String;
 
-    fn try_from(_value: &rmpv::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
+        let value_map: HashMap<_, _> = HashMap::from_iter(
+            value
+                .as_map()
+                .unwrap()
+                .iter()
+                .map(|(key, val)| (key.as_str().unwrap(), val)),
+        );
+
+        let mut map_keys = Vec::from_iter(value_map.keys().copied());
+        map_keys.sort();
+        match map_keys.as_slice() {
+            ["state"] => {}
+            _ => unreachable!(),
+        }
         todo!()
     }
 }
@@ -910,6 +924,18 @@ mod test {
         let serialized = bincode::serialize(&expected)?;
         let deserialized: Contract = bincode::deserialize(&serialized)?;
         assert_eq!(deserialized, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_update_data() -> Result<(), Box<dyn std::error::Error>> {
+        let mut delta: &[u8] = &[
+            130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 181,
+            41, 189, 142, 103, 137, 251, 46, 133, 213, 21, 255, 179, 17, 3, 17, 240, 208, 191, 5,
+            215, 72, 60, 41, 194, 14, 217, 228, 225, 251, 209, 100, 164, 99, 111, 100, 101, 192,
+            164, 100, 97, 116, 97, 129, 165, 100, 101, 108, 116, 97, 196, 3, 0, 1, 2,
+        ];
+        let _res = UpdateData::try_from(&rmpv::decode::read_value(&mut delta)?)?;
         Ok(())
     }
 }

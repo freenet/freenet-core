@@ -72,8 +72,8 @@ export type StateSummary = Uint8Array;
 export type StateDelta = Uint8Array;
 
 export type UpdateData =
-  | State
-  | StateDelta
+  | { state: State }
+  | { delta: StateDelta }
   | { state: State; delta: StateDelta }
   | { relatedTo: ContractInstanceId; state: State }
   | { relatedTo: ContractInstanceId; delta: StateDelta }
@@ -91,7 +91,7 @@ export type PutRequest = {
 
 export type UpdateRequest = {
   key: Key;
-  delta: Uint8Array;
+  data: UpdateData;
 };
 
 export type GetRequest = {
@@ -210,7 +210,7 @@ export interface PutResponse {
 export interface UpdateResponse {
   readonly kind: "update";
   key: Key;
-  summary: State;
+  summary: StateSummary;
 }
 
 export interface GetResponse {
@@ -276,7 +276,10 @@ export class HostResponse {
         assert(Array.isArray(ok.Ok.UpdateNotification));
         assert(ok.Ok.UpdateNotification.length == 2);
         let key = HostResponse.assertKey(ok.Ok.UpdateNotification[0][0]);
-        let update = HostResponse.assertBytes(ok.Ok.UpdateNotification[1]);
+        // FIXME:
+        let update = {
+          delta: HostResponse.assertBytes(ok.Ok.UpdateNotification[1]),
+        };
         this.result = {
           kind: "updateNotification",
           key,

@@ -6,6 +6,7 @@ import {
   UpdateNotification,
   Key,
   HostError,
+  StateDelta,
 } from "locutus-stdlib/src/webSocketInterface";
 import "./scss/styles.scss";
 // import * as bootstrap from 'bootstrap'
@@ -39,7 +40,8 @@ function getState(hostResponse: GetResponse) {
 function getUpdateNotification(notification: UpdateNotification) {
   let decoder = new TextDecoder("utf8");
   let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
-  let newUpdate = decoder.decode(Uint8Array.from(notification.update));
+  let delta = notification.update as { delta: StateDelta };
+  let newUpdate = decoder.decode(Uint8Array.from(delta.delta));
   let newUpdateJson = JSON.parse(newUpdate.replace("\x00", ""));
   let newContent = JSON.stringify(
     newUpdateJson,
@@ -63,7 +65,7 @@ async function sendUpdate() {
     let encoder = new TextEncoder();
     let updateRequest = {
       key: KEY,
-      delta: encoder.encode("[" + sendVal.value + "]"),
+      data: { delta: encoder.encode("[" + sendVal.value + "]") },
     };
     await locutusApi.update(updateRequest);
   }

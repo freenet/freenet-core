@@ -270,36 +270,36 @@ impl ClientRequest {
 
         let req = {
             if value.is_map() {
-                let value_map: HashMap<_, _> = value
-                    .as_map()
-                    .unwrap()
-                    .iter()
-                    .map(|(key, val)| (key.as_str().unwrap(), val.clone()))
-                    .collect();
+                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
+                    value
+                        .as_map()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, val)| (key.as_str().unwrap(), val)),
+                );
 
-                let mut map_keys = Vec::from_iter(value_map.keys().cloned());
+                let mut map_keys = Vec::from_iter(value_map.keys().copied());
                 map_keys.sort();
-
                 match map_keys.as_slice() {
                     ["contract", "state"] => {
                         todo!("Not implemented, this transformation needs to be implemented")
                     }
-                    ["key", "data"] => {
+                    ["data", "key"] => {
                         log::info!("Received update request");
                         ClientRequest::Update {
-                            key: ContractKey::try_from(value_map.get("key").unwrap())
+                            key: ContractKey::try_from(*value_map.get("key").unwrap())
                                 .map_err(ErrorKind::deserialization)?,
-                            data: UpdateData::try_from(value_map.get("data").unwrap())
+                            data: UpdateData::try_from(*value_map.get("data").unwrap())
                                 .map_err(ErrorKind::deserialization)?,
                         }
                     }
                     ["fetch_contract", "key"] => ClientRequest::Get {
-                        key: ContractKey::try_from(value_map.get("key").unwrap())
+                        key: ContractKey::try_from(*value_map.get("key").unwrap())
                             .map_err(ErrorKind::deserialization)?,
                         fetch_contract: value_map.get("fetch_contract").unwrap().as_bool().unwrap(),
                     },
                     ["key"] => ClientRequest::Subscribe {
-                        key: ContractKey::try_from(value_map.get("key").unwrap())
+                        key: ContractKey::try_from(*value_map.get("key").unwrap())
                             .map_err(ErrorKind::deserialization)?,
                     },
                     ["cause"] => ClientRequest::Disconnect {
