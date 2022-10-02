@@ -6,6 +6,9 @@ This guide will walk through how to develop a simple distributed web application
 
 At the time of writing (September 2022) the Locutus network is not yet active. We've published this guide so that people can experiment with building and running Locutus applications locally, and provide [feedback](https://github.com/freenet/locutus/issues).
 
+You can see some examples of working applications and contracts in the `apps` directory of the locutus repository, e.g.:
+- [freenet-microblogging](https://github.com/freenet/locutus/tree/main/apps/freenet-microblogging) (WIP)
+
 ## Installation
 
 Development for Locutus requires installing some dependencies:
