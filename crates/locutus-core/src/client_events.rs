@@ -508,7 +508,6 @@ pub(crate) mod test {
         }
     }
 
-    #[ignore]
     #[test]
     fn put_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -529,7 +528,6 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn update_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -544,7 +542,6 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn get_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -567,7 +564,6 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn update_notification_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -582,41 +578,25 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request = ClientRequest::Update {
-            key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
+            key: ContractKey::from_id("DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1".to_string())
                 .unwrap(),
-            data: locutus_runtime::StateDelta::from(vec![
-                91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 97, 117, 116,
-                104, 111, 114, 34, 58, 34, 73, 68, 71, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32,
-                34, 100, 97, 116, 101, 34, 58, 34, 50, 48, 50, 50, 45, 48, 54, 45, 49, 53, 84, 48,
-                48, 58, 48, 48, 58, 48, 48, 90, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34,
-                116, 105, 116, 108, 101, 34, 58, 34, 78, 101, 119, 32, 109, 115, 103, 34, 44, 10,
-                32, 32, 32, 32, 32, 32, 32, 32, 34, 99, 111, 110, 116, 101, 110, 116, 34, 58, 34,
-                46, 46, 46, 34, 10, 32, 32, 32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
-            ])
-            .into(),
+            data: locutus_runtime::StateDelta::from(vec![0, 1, 2]).into(),
         };
         let msg: Vec<u8> = vec![
-            130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194,
-            187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151, 188, 167, 153, 197,
-            129, 25, 179, 198, 218, 99, 159, 139, 168, 99, 111, 110, 116, 114, 97, 99, 116, 192,
-            165, 100, 101, 108, 116, 97, 196, 134, 91, 10, 32, 32, 32, 32, 123, 10, 32, 32, 32, 32,
-            32, 32, 32, 32, 34, 97, 117, 116, 104, 111, 114, 34, 58, 34, 73, 68, 71, 34, 44, 10,
-            32, 32, 32, 32, 32, 32, 32, 32, 34, 100, 97, 116, 101, 34, 58, 34, 50, 48, 50, 50, 45,
-            48, 54, 45, 49, 53, 84, 48, 48, 58, 48, 48, 58, 48, 48, 90, 34, 44, 10, 32, 32, 32, 32,
-            32, 32, 32, 32, 34, 116, 105, 116, 108, 101, 34, 58, 34, 78, 101, 119, 32, 109, 115,
-            103, 34, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 34, 99, 111, 110, 116, 101, 110, 116,
-            34, 58, 34, 46, 46, 46, 34, 10, 32, 32, 32, 32, 125, 10, 93, 10, 32, 32, 32, 32,
+            130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 181,
+            41, 189, 142, 103, 137, 251, 46, 133, 213, 21, 255, 179, 17, 3, 17, 240, 208, 191, 5,
+            215, 72, 60, 41, 194, 14, 217, 228, 225, 251, 209, 100, 164, 99, 111, 100, 101, 192,
+            164, 100, 97, 116, 97, 129, 165, 100, 101, 108, 116, 97, 196, 3, 0, 1, 2,
         ];
+
         let result_client_request = ClientRequest::decode_mp(msg)?;
         assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request = ClientRequest::Get {

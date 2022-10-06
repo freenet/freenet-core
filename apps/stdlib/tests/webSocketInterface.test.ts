@@ -1,17 +1,6 @@
-import { Encoder } from "@msgpack/msgpack";
-import { HostResponse, Key } from "../src/webSocketInterface";
+import { HostResponse } from "../src/webSocketInterface";
 
 describe("locutus websocket API ok result deserialization", () => {
-  test("foo", () => {
-    const encoder = new Encoder();
-    const update = {
-      key: Key.fromInstanceId("DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1"),
-      data: { delta: new Uint8Array([0, 1, 2]) },
-    };
-    const encoded = encoder.encode(update);
-    console.log(encoded);
-  });
-
   test("put op deserialization", () => {
     const PUT_OP_FULL_KEY = new Uint8Array([
       129, 162, 79, 107, 129, 171, 80, 117, 116, 82, 101, 115, 112, 111, 110,
