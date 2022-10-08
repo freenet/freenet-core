@@ -33,13 +33,28 @@ pub enum ContractError {
     Other(String),
 }
 
+#[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateModification {
     pub new_state: Option<State<'static>>,
-    related: Vec<RelatedContract>,
+    pub related: Vec<RelatedContract>,
 }
 
 impl UpdateModification {
+    pub fn valid(new_state: State<'static>) -> Self {
+        Self {
+            new_state: Some(new_state),
+            related: vec![],
+        }
+    }
+
+    pub fn requires(related: Vec<RelatedContract>) -> Self {
+        Self {
+            new_state: None,
+            related,
+        }
+    }
+
     pub fn unwrap_valid(self) -> State<'static> {
         match self.new_state {
             Some(s) => s,
@@ -55,6 +70,14 @@ impl UpdateModification {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct RelatedContracts {
     map: HashMap<ContractInstanceId, Option<State<'static>>>,
+}
+
+impl RelatedContracts {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,7 +133,23 @@ pub enum UpdateData<'a> {
 
 impl UpdateData<'_> {
     pub fn size(&self) -> usize {
-        todo!()
+        match self {
+            UpdateData::State(state) => state.size(),
+            UpdateData::Delta(delta) => delta.size(),
+            UpdateData::StateAndDelta { state, delta } => state.size() + delta.size(),
+            UpdateData::RelatedState { state, .. } => state.size() + CONTRACT_KEY_SIZE,
+            UpdateData::RelatedDelta { delta, .. } => delta.size() + CONTRACT_KEY_SIZE,
+            UpdateData::RelatedStateAndDelta { state, delta, .. } => {
+                state.size() + delta.size() + CONTRACT_KEY_SIZE
+            }
+        }
+    }
+
+    pub fn unwrap_delta(&self) -> &StateDelta<'_> {
+        match self {
+            UpdateData::Delta(delta) => delta,
+            _ => panic!(),
+        }
     }
 }
 

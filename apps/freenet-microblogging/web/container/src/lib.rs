@@ -7,34 +7,41 @@ struct Contract;
 
 #[contract]
 impl ContractInterface for Contract {
-    fn validate_state(_parameters: Parameters<'static>, _state: State<'static>) -> bool {
-        true
+    fn validate_state(
+        _parameters: Parameters<'static>,
+        _state: State<'static>,
+        _related: RelatedContracts,
+    ) -> Result<ValidateResult, ContractError> {
+        Ok(ValidateResult::Valid)
     }
 
-    fn validate_delta(_parameters: Parameters<'static>, _delta: StateDelta<'static>) -> bool {
-        true
+    fn validate_delta(
+        _parameters: Parameters<'static>,
+        _delta: StateDelta<'static>,
+    ) -> Result<bool, ContractError> {
+        Ok(true)
     }
 
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        _delta: StateDelta<'static>,
+        _data: Vec<UpdateData>,
     ) -> Result<UpdateModification, ContractError> {
-        Ok(UpdateModification::ValidUpdate(state))
+        Ok(UpdateModification::valid(state))
     }
 
     fn summarize_state(
         _parameters: Parameters<'static>,
         _state: State<'static>,
-    ) -> StateSummary<'static> {
-        StateSummary::from(vec![])
+    ) -> Result<StateSummary<'static>, ContractError> {
+        Ok(StateSummary::from(vec![]))
     }
 
     fn get_state_delta(
         _parameters: Parameters<'static>,
         _state: State<'static>,
         _summary: StateSummary<'static>,
-    ) -> StateDelta<'static> {
-        StateDelta::from(vec![])
+    ) -> Result<StateDelta<'static>, ContractError> {
+        Ok(StateDelta::from(vec![]))
     }
 }

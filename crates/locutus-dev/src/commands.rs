@@ -35,8 +35,8 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         buf.into()
     };
     let contract = WrappedContract::new(Arc::new(code), params);
-    let related_contracts = if let Some(related) = config.related_contracts {
-        todo!()
+    let related_contracts = if let Some(_related) = config.related_contracts {
+        todo!("use `related` contracts")
     } else {
         Default::default()
     };

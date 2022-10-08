@@ -13,5 +13,8 @@ codegen-units = 1
 panic = 'abort'
 strip = true
 
+[workspace.dependencies]
+locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+
 #[target.wasm32-unknown-unknown]
 #rustflags = ["-C", "link-arg=--import-memory"]

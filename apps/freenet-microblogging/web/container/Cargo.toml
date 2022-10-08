@@ -7,7 +7,7 @@ resolver = "2"
 publish = false
 
 [dependencies]
-locutus-stdlib = { path = "../../../../crates/locutus-stdlib" }
+locutus-stdlib = { workspace = true }
 
 [lib]
 crate-type = ["cdylib"]

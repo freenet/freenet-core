@@ -327,6 +327,7 @@ async fn client_event_handling<ClientEv, CErr>(
                     if let Err(err) = put::request_put(&op_storage_cp, op).await {
                         log::error!("{}", err);
                     }
+                    todo!("use `related_contracts`: {related_contracts:?}")
                 }
                 ClientRequest::Update {
                     key: _key,

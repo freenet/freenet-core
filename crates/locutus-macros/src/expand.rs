@@ -94,6 +94,7 @@ impl ImplStruct {
     }
 
     fn gen_update_state_fn(&self) -> TokenStream {
+        let type_name = &self.type_name;
         let ret = ffi_ret_type();
         quote! {
             #[no_mangle]
@@ -115,7 +116,7 @@ impl ImplStruct {
                     let bytes = &*std::ptr::slice_from_raw_parts(delta_buf.start(), delta_buf.len());
                     bincode::deserialize(bytes).unwrap()
                 };
-                let result = <Contract as ::locutus_stdlib::prelude::ContractInterface>::update_state(
+                let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::update_state(
                     parameters, state, updates,
                 );
                 ::locutus_stdlib::prelude::InterfaceResult::from(result).into_raw()
