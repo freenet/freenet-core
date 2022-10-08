@@ -281,8 +281,20 @@ impl ClientRequest {
                 let mut map_keys = Vec::from_iter(value_map.keys().copied());
                 map_keys.sort();
                 match map_keys.as_slice() {
-                    ["contract", "state"] => {
-                        todo!("Not implemented, this transformation needs to be implemented")
+                    ["contract", "relatedContracts", "state"] => {
+                        log::info!("Received put request");
+                        ClientRequest::Put {
+                            contract: WrappedContract::try_from(
+                                *value_map.get("contract").unwrap(),
+                            )
+                            .map_err(ErrorKind::deserialization)?,
+                            state: WrappedState::try_from(*value_map.get("state").unwrap())
+                                .map_err(ErrorKind::deserialization)?,
+                            related_contracts: RelatedContracts::try_from(
+                                *value_map.get("relatedContracts").unwrap(),
+                            )
+                            .map_err(ErrorKind::deserialization)?,
+                        }
                     }
                     ["data", "key"] => {
                         log::info!("Received update request");
@@ -349,15 +361,20 @@ impl Display for ClientRequest {
 
 #[cfg(test)]
 pub(crate) mod test {
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use std::{collections::HashMap, time::Duration};
 
     use locutus_runtime::{ContractCode, Parameters, StateDelta};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
+    use warp::body::bytes;
 
     use crate::node::{test::EventId, PeerKey};
 
     use super::*;
+
+    const TEST_CONTRACT_1: &str = "test_contract_1";
 
     #[derive(Clone)]
     pub(crate) struct MemoryEventsGen {
@@ -508,6 +525,22 @@ pub(crate) mod test {
         }
     }
 
+    fn get_test_contract(name: &str) -> WrappedContract<'static> {
+        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+        let contracts = PathBuf::from(CONTRACTS_DIR);
+        let mut dirs = contracts.ancestors();
+        let path = dirs.nth(2).unwrap();
+        let contract_path = path
+            .join("tests")
+            .join(name.replace('_', "-"))
+            .join("build/locutus")
+            .join(name)
+            .with_extension("wasm");
+        WrappedContract::try_from((&*contract_path, Parameters::from(vec![])))
+            .expect("contract found")
+    }
+
     #[test]
     fn put_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -612,6 +645,39 @@ pub(crate) mod test {
         ];
         let result_client_request = ClientRequest::decode_mp(msg)?;
         assert_eq!(result_client_request, expected_client_request);
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_put_request() -> Result<(), Box<dyn std::error::Error>> {
+        let contract = get_test_contract(TEST_CONTRACT_1);
+        let expected_client_request = ClientRequest::Put {
+            contract: WrappedContract::new(
+                Arc::new(ContractCode::from(vec![6, 7, 8, 9])),
+                Parameters::from(vec![]),
+            ),
+            state: WrappedState::new(vec![1, 2, 3, 4]),
+            related_contracts: Default::default(),
+        };
+        // let msg: Vec<u8> = rmp_serde::to_vec(&expected_client_request).unwrap();
+
+        let msg: Vec<u8> = vec![
+            131, 168, 99, 111, 110, 116, 114, 97, 99, 116, 131, 163, 107, 101, 121, 130, 168, 105,
+            110, 115, 116, 97, 110, 99, 101, 130, 164, 116, 121, 112, 101, 166, 66, 117, 102, 102,
+            101, 114, 164, 100, 97, 116, 97, 220, 0, 32, 204, 181, 41, 204, 189, 204, 142, 103,
+            204, 137, 204, 251, 46, 204, 133, 204, 213, 21, 204, 255, 204, 179, 17, 3, 17, 204,
+            240, 204, 208, 204, 191, 5, 204, 215, 72, 60, 41, 204, 194, 14, 204, 217, 204, 228,
+            204, 225, 204, 251, 204, 209, 100, 164, 99, 111, 100, 101, 192, 164, 100, 97, 116, 97,
+            130, 164, 116, 121, 112, 101, 166, 66, 117, 102, 102, 101, 114, 164, 100, 97, 116, 97,
+            145, 1, 170, 112, 97, 114, 97, 109, 101, 116, 101, 114, 115, 130, 164, 116, 121, 112,
+            101, 166, 66, 117, 102, 102, 101, 114, 164, 100, 97, 116, 97, 145, 2, 165, 115, 116,
+            97, 116, 101, 130, 164, 116, 121, 112, 101, 166, 66, 117, 102, 102, 101, 114, 164, 100,
+            97, 116, 97, 145, 3, 176, 114, 101, 108, 97, 116, 101, 100, 67, 111, 110, 116, 114, 97,
+            99, 116, 115, 130, 164, 116, 121, 112, 101, 163, 77, 97, 112, 164, 100, 97, 116, 97,
+            145, 146, 147, 1, 2, 3, 147, 4, 5, 6,
+        ];
+        let result_client_request = ClientRequest::decode_mp(msg)?;
+        assert_eq!(result_client_request, result_client_request);
         Ok(())
     }
 }
