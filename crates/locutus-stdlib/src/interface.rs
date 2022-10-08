@@ -847,53 +847,118 @@ pub(crate) mod wasm_interface {
     //! the wasm module execution.
     use super::*;
 
-    pub struct InterfaceResult {
-        ptr: i64,
-        kind: i32,
+    #[repr(i32)]
+    enum ResultKind {
+        ValidateState = 0,
+        ValidateDelta = 1,
+        UpdateState = 2,
+        SummarizeState = 3,
+        StateDelta = 4,
     }
 
-    impl InterfaceResult {
-        pub fn unwrap_validate_state_res(self) -> Result<ValidateResult, ContractError> {
-            todo!()
-        }
-
-        pub fn unwrap_validate_delta_res(self) -> Result<bool, ContractError> {
-            todo!()
-        }
-
-        pub fn unwrap_update_state(self) -> Result<UpdateModification, ContractError> {
-            todo!()
-        }
-
-        pub fn unwrap_summarize_state(self) -> Result<StateSummary<'static>, ContractError> {
-            todo!()
-        }
-
-        pub fn unwrap_get_state_delta(self) -> Result<StateDelta<'static>, ContractError> {
-            todo!()
-        }
-
-        pub fn into_raw(self) -> (i64, i32) {
-            (self.ptr, self.kind)
-        }
-    }
-
-    impl From<(i64, i32)> for InterfaceResult {
-        fn from(v: (i64, i32)) -> Self {
-            Self {
-                ptr: v.0,
-                kind: v.1,
+    impl From<i32> for ResultKind {
+        fn from(v: i32) -> Self {
+            match v {
+                0 => ResultKind::ValidateState,
+                1 => ResultKind::ValidateDelta,
+                2 => ResultKind::UpdateState,
+                3 => ResultKind::SummarizeState,
+                4 => ResultKind::StateDelta,
+                _ => panic!(),
             }
         }
     }
 
-    #[repr(i32)]
-    enum ResultKind {
-        ValidateState = 0,
-        ValidateDelta = 2,
-        UpdateState = 3,
-        SummarizeState = 4,
-        StateDelta = 5,
+    pub struct InterfaceResult {
+        ptr: i64,
+        kind: i32,
+        size: u32,
+    }
+
+    impl InterfaceResult {
+        pub fn new(ptr: i64, kind: i32, size: u32) -> Self {
+            Self { ptr, kind, size }
+        }
+
+        pub unsafe fn unwrap_validate_state_res(self) -> Result<ValidateResult, ContractError> {
+            let kind = ResultKind::from(self.kind);
+            match kind {
+                ResultKind::ValidateState => {
+                    // TODO: compute offset
+                    let ptr = self.ptr;
+                    let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))
+                }
+                _ => panic!(),
+            }
+        }
+
+        pub unsafe fn unwrap_validate_delta_res(self) -> Result<bool, ContractError> {
+            let kind = ResultKind::from(self.kind);
+            match kind {
+                ResultKind::ValidateDelta => {
+                    let ptr = self.ptr;
+                    let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))
+                }
+                _ => panic!(),
+            }
+        }
+
+        pub unsafe fn unwrap_update_state(self) -> Result<UpdateModification, ContractError> {
+            let kind = ResultKind::from(self.kind);
+            match kind {
+                ResultKind::UpdateState => {
+                    let ptr = self.ptr;
+                    let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))
+                }
+                _ => panic!(),
+            }
+        }
+
+        pub unsafe fn unwrap_summarize_state(self) -> Result<StateSummary<'static>, ContractError> {
+            let kind = ResultKind::from(self.kind);
+            match kind {
+                ResultKind::ValidateState => {
+                    let ptr = self.ptr;
+                    let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))
+                }
+                _ => panic!(),
+            }
+        }
+
+        pub unsafe fn unwrap_get_state_delta(self) -> Result<StateDelta<'static>, ContractError> {
+            let kind = ResultKind::from(self.kind);
+            match kind {
+                ResultKind::ValidateState => {
+                    let ptr = self.ptr;
+                    let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))
+                }
+                _ => panic!(),
+            }
+        }
+
+        pub fn into_raw(self) -> (i64, i32, u32) {
+            (self.ptr, self.kind, self.size)
+        }
+    }
+
+    impl From<(i64, i32, u32)> for InterfaceResult {
+        fn from(v: (i64, i32, u32)) -> Self {
+            Self {
+                ptr: v.0,
+                kind: v.1,
+                size: v.2,
+            }
+        }
     }
 
     macro_rules! conversion {
@@ -905,8 +970,9 @@ pub(crate) mod wasm_interface {
                     //       independently of the architecture when stored in WASM and accessed from
                     //       the host, maybe even if is just for some architectures
                     let serialized = bincode::serialize(&value).unwrap();
+                    let size = serialized.len() as _;
                     let ptr = Box::into_raw(Box::new(serialized)) as i64;
-                    Self { kind, ptr }
+                    Self { kind, ptr, size }
                 }
             }
         };

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use locutus_stdlib::{
-    buf::{BufferBuilder, BufferMut},
+    buf::{BufferBuilder, BufferMut, WasmLinearMem},
     prelude::*,
 };
 use wasmer::{
@@ -190,10 +190,15 @@ impl Runtime {
             .as_ref()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
+        let linear_mem = WasmLinearMem {
+            start_ptr: memory.data_ptr() as *const _,
+            size: memory.data_size(),
+        };
+
         unsafe {
             Ok(BufferMut::from_ptr(
                 builder_ptr as *mut BufferBuilder,
-                (memory.data_ptr() as _, memory.data_size()),
+                linear_mem,
             ))
         }
     }
@@ -307,15 +312,17 @@ impl Runtime {
         let mut related_buf = self.init_buf(&instance, &serialized)?;
         related_buf.write(serialized)?;
 
-        let validate_func: NativeFunc<(i64, i64, i64), (i64, i32)> =
+        let validate_func: NativeFunc<(i64, i64, i64), (i64, i32, u32)> =
             instance.exports.get_native_function("validate_state")?;
-        let is_valid = InterfaceResult::from(validate_func.call(
-            param_buf.ptr() as i64,
-            state_buf.ptr() as i64,
-            related_buf.ptr() as i64,
-        )?)
-        .unwrap_validate_state_res()
-        .map_err(Into::<ExecError>::into)?;
+        let is_valid = unsafe {
+            InterfaceResult::from(validate_func.call(
+                param_buf.ptr() as i64,
+                state_buf.ptr() as i64,
+                related_buf.ptr() as i64,
+            )?)
+            .unwrap_validate_state_res()
+            .map_err(Into::<ExecError>::into)?
+        };
         Ok(is_valid)
     }
 
@@ -336,13 +343,15 @@ impl Runtime {
         let mut delta_buf = self.init_buf(&instance, &delta)?;
         delta_buf.write(delta)?;
 
-        let validate_func: NativeFunc<(i64, i64), (i64, i32)> =
+        let validate_func: NativeFunc<(i64, i64), (i64, i32, u32)> =
             instance.exports.get_native_function("validate_delta")?;
-        let is_valid = InterfaceResult::from(
-            validate_func.call(param_buf.ptr() as i64, delta_buf.ptr() as i64)?,
-        )
-        .unwrap_validate_delta_res()
-        .map_err(Into::<ExecError>::into)?;
+        let is_valid = unsafe {
+            InterfaceResult::from(
+                validate_func.call(param_buf.ptr() as i64, delta_buf.ptr() as i64)?,
+            )
+            .unwrap_validate_delta_res()
+            .map_err(Into::<ExecError>::into)?
+        };
         Ok(is_valid)
     }
 
@@ -374,15 +383,17 @@ impl Runtime {
         let mut update_dat_buf = self.init_buf(&instance, &serialized)?;
         update_dat_buf.write(serialized)?;
 
-        let validate_func: NativeFunc<(i64, i64, i64), (i64, i32)> =
+        let validate_func: NativeFunc<(i64, i64, i64), (i64, i32, u32)> =
             instance.exports.get_native_function("update_state")?;
-        let update_res = InterfaceResult::from(validate_func.call(
-            param_buf.ptr() as i64,
-            state_buf.ptr() as i64,
-            update_dat_buf.ptr() as i64,
-        )?)
-        .unwrap_update_state()
-        .map_err(Into::<ExecError>::into)?;
+        let update_res = unsafe {
+            InterfaceResult::from(validate_func.call(
+                param_buf.ptr() as i64,
+                state_buf.ptr() as i64,
+                update_dat_buf.ptr() as i64,
+            )?)
+            .unwrap_update_state()
+            .map_err(Into::<ExecError>::into)?
+        };
         Ok(update_res)
     }
 
@@ -402,7 +413,7 @@ impl Runtime {
         let mut state_buf = self.init_buf(&instance, state)?;
         state_buf.write(state)?;
 
-        let summary_func: NativeFunc<(i64, i64), (i64, i32)> =
+        let summary_func: NativeFunc<(i64, i64), (i64, i32, u32)> =
             instance.exports.get_native_function("summarize_state")?;
         let int_res = InterfaceResult::from(
             summary_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?,
@@ -415,9 +426,11 @@ impl Runtime {
         // let summary_buf =
         //     unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
         // let summary: StateSummary = summary_buf.read_bytes(summary_buf.size()).into();
-        let result = int_res
-            .unwrap_summarize_state()
-            .map_err(Into::<ExecError>::into)?;
+        let result = unsafe {
+            int_res
+                .unwrap_summarize_state()
+                .map_err(Into::<ExecError>::into)?
+        };
         // Ok(StateSummary::from(summary.to_vec()))
         Ok(result)
     }
@@ -441,7 +454,7 @@ impl Runtime {
         let mut summary_buf = self.init_buf(&instance, &summary)?;
         summary_buf.write(summary)?;
 
-        let get_state_delta_func: NativeFunc<(i64, i64, i64), (i64, i32)> =
+        let get_state_delta_func: NativeFunc<(i64, i64, i64), (i64, i32, u32)> =
             instance.exports.get_native_function("get_state_delta")?;
         let int_res = InterfaceResult::from(get_state_delta_func.call(
             param_buf.ptr() as i64,
@@ -456,9 +469,11 @@ impl Runtime {
         // let delta_buf =
         //     unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
         // let mut delta = delta_buf.shared();
-        let result = int_res
-            .unwrap_get_state_delta()
-            .map_err(Into::<ExecError>::into)?;
+        let result = unsafe {
+            int_res
+                .unwrap_get_state_delta()
+                .map_err(Into::<ExecError>::into)?
+        };
         // Ok(StateDelta::from(delta.read_all().to_vec()))
         Ok(result)
     }

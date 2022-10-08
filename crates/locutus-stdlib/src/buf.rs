@@ -10,6 +10,13 @@ pub struct BufferBuilder {
     last_write: i64,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct WasmLinearMem {
+    pub start_ptr: *const u8,
+    pub size: u64,
+}
+
 impl BufferBuilder {
     pub fn capacity(&self) -> usize {
         self.capacity as _
@@ -86,7 +93,7 @@ pub struct BufferMut<'instance> {
     /// A pointer to the underlying builder
     builder_ptr: *mut BufferBuilder,
     /// Linear memory pointer and size in bytes
-    mem: (*const u8, u64),
+    mem: WasmLinearMem,
 }
 
 impl<'instance> BufferMut<'instance> {
@@ -145,8 +152,8 @@ impl<'instance> BufferMut<'instance> {
 
     pub fn size(&self) -> usize {
         unsafe {
-            let end_ptr = self.mem.0.offset(self.mem.1 as isize);
-            let p = &*compute_ptr(self.builder_ptr, self.mem.0, end_ptr);
+            let end_ptr = self.mem.start_ptr.offset(self.mem.size as isize);
+            let p = &*compute_ptr(self.builder_ptr, self.mem.start_ptr, end_ptr);
             p.capacity as _
         }
     }
@@ -156,7 +163,7 @@ impl<'instance> BufferMut<'instance> {
     /// The pointer passed come from a previous call to `initiate_buffer` exported function from the contract.
     pub unsafe fn from_ptr(
         builder_ptr: *mut BufferBuilder,
-        linear_mem_space: (*const u8, u64),
+        linear_mem_space: WasmLinearMem,
     ) -> Self {
         let BuilderInfo {
             buffer,
@@ -190,10 +197,11 @@ struct BuilderInfo<'instance> {
 }
 
 fn from_raw_builder<'a>(
-    builder_ptr: *mut BufferBuilder, // 0x01 <- 0x5FE436
-    linear_mem_space: (*const u8, u64),
+    builder_ptr: *mut BufferBuilder,
+    linear_mem_space: WasmLinearMem,
 ) -> BuilderInfo<'a> {
-    let (start_ptr, size) = linear_mem_space;
+    let start_ptr = linear_mem_space.start_ptr;
+    let size = linear_mem_space.size;
     unsafe {
         let end_ptr = start_ptr.offset(size as isize);
         let builder_ptr = compute_ptr(builder_ptr, start_ptr, end_ptr);
@@ -232,7 +240,7 @@ pub struct Buffer<'instance> {
     read_ptr: &'instance mut u32,
     write_ptr: &'instance u32,
     builder_ptr: *mut BufferBuilder,
-    mem: (*const u8, u64),
+    mem: WasmLinearMem,
 }
 
 impl<'instance> Buffer<'instance> {
@@ -364,7 +372,10 @@ mod test {
     fn read_and_write() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
         let mem = instance.exports.get_memory("memory")?;
-        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+        let linear_mem = WasmLinearMem {
+            start_ptr: mem.data_ptr() as *const _,
+            size: mem.data_size(),
+        };
 
         let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
         writer.write(&[1u8, 2])?;
@@ -385,7 +396,10 @@ mod test {
     fn read_and_write_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
         let mem = instance.exports.get_memory("memory")?;
-        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+        let linear_mem = WasmLinearMem {
+            start_ptr: mem.data_ptr() as *const _,
+            size: mem.data_size(),
+        };
 
         let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
         writer.write(&[1u8, 2])?;
@@ -406,7 +420,10 @@ mod test {
     fn update() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
         let mem = instance.exports.get_memory("memory")?;
-        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+        let linear_mem = WasmLinearMem {
+            start_ptr: mem.data_ptr() as *const _,
+            size: mem.data_size(),
+        };
 
         let ptr = {
             let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };

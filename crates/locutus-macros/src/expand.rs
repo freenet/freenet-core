@@ -24,6 +24,10 @@ pub fn ffi_impl_wrap(item: &ItemImpl) -> TokenStream {
     result
 }
 
+fn ffi_ret_type() -> TokenStream {
+    quote!((i64, i32, u32))
+}
+
 struct ImplStruct {
     type_name: TypePath,
 }
@@ -31,9 +35,10 @@ struct ImplStruct {
 impl ImplStruct {
     fn gen_validate_state(&self) -> TokenStream {
         let type_name = &self.type_name;
+        let ret = ffi_ret_type();
         quote! {
             #[no_mangle]
-            pub fn validate_state(parameters: i64, state: i64, related: i64) -> (i64, i32) {
+            pub fn validate_state(parameters: i64, state: i64, related: i64) -> #ret {
                 let parameters = unsafe {
                     // eprintln!("getting params: {:p}", state as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let param_buf = &*(parameters as *const ::locutus_stdlib::buf::BufferBuilder);
@@ -66,9 +71,10 @@ impl ImplStruct {
 
     fn gen_validate_delta(&self) -> TokenStream {
         let type_name = &self.type_name;
+        let ret = ffi_ret_type();
         quote! {
             #[no_mangle]
-            pub fn validate_delta(parameters: i64, delta: i64) -> (i64, i32) {
+            pub fn validate_delta(parameters: i64, delta: i64) -> #ret {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
@@ -88,9 +94,10 @@ impl ImplStruct {
     }
 
     fn gen_update_state_fn(&self) -> TokenStream {
+        let ret = ffi_ret_type();
         quote! {
             #[no_mangle]
-            pub fn update_state(parameters: i64, state: i64, delta: i64) -> (i64, i32) {
+            pub fn update_state(parameters: i64, state: i64, delta: i64) -> #ret {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
@@ -118,9 +125,10 @@ impl ImplStruct {
 
     fn gen_summarize_state_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
+        let ret = ffi_ret_type();
         quote! {
             #[no_mangle]
-            pub fn summarize_state(parameters: i64, state: i64) -> (i64, i32) {
+            pub fn summarize_state(parameters: i64, state: i64) -> #ret {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes = &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.len());
@@ -139,9 +147,10 @@ impl ImplStruct {
 
     fn gen_get_state_delta(&self) -> TokenStream {
         let type_name = &self.type_name;
+        let ret = ffi_ret_type();
         quote! {
             #[no_mangle]
-            pub fn get_state_delta(parameters: i64, state: i64, summary: i64) -> (i64, i32) {
+            pub fn get_state_delta(parameters: i64, state: i64, summary: i64) -> #ret {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
