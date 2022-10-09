@@ -1,5 +1,7 @@
 //! Memory buffers to interact with the WASM contracts.
 
+use crate::prelude::WasmLinearMem;
+
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -10,25 +12,20 @@ pub struct BufferBuilder {
     last_write: i64,
 }
 
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy)]
-pub struct WasmLinearMem {
-    pub start_ptr: *const u8,
-    pub size: u64,
-}
-
 impl BufferBuilder {
     pub fn capacity(&self) -> usize {
         self.capacity as _
     }
 
-    pub fn len(&self) -> usize {
-        self.last_write as usize
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn written(&self, mem: Option<&WasmLinearMem>) -> usize {
+        unsafe {
+            let ptr = if let Some(mem) = mem {
+                compute_ptr(self.last_write as *mut u32, mem)
+            } else {
+                self.last_write as *mut u32
+            };
+            *ptr as usize
+        }
     }
 
     pub fn start(&self) -> *mut u8 {
@@ -152,8 +149,7 @@ impl<'instance> BufferMut<'instance> {
 
     pub fn size(&self) -> usize {
         unsafe {
-            let end_ptr = self.mem.start_ptr.offset(self.mem.size as isize);
-            let p = &*compute_ptr(self.builder_ptr, self.mem.start_ptr, end_ptr);
+            let p = &*compute_ptr(self.builder_ptr, &self.mem);
             p.capacity as _
         }
     }
@@ -186,8 +182,11 @@ impl<'instance> BufferMut<'instance> {
 }
 
 #[inline(always)]
-unsafe fn compute_ptr<T>(ptr: *mut T, start_ptr: *const u8, _end_ptr: *const u8) -> *mut T {
-    (start_ptr as isize + ptr as isize) as _
+pub(crate) unsafe fn compute_ptr<T>(ptr: *mut T, linear_mem_space: &WasmLinearMem) -> *mut T {
+    let mem_start_ptr = linear_mem_space.start_ptr;
+    let result = (mem_start_ptr as isize + ptr as isize) as _;
+    log::trace!("map ptr: {ptr:p} -> {result:p}");
+    result
 }
 
 struct BuilderInfo<'instance> {
@@ -196,34 +195,38 @@ struct BuilderInfo<'instance> {
     write_ptr: &'instance mut u32,
 }
 
-fn from_raw_builder<'a>(
-    builder_ptr: *mut BufferBuilder,
-    linear_mem_space: WasmLinearMem,
-) -> BuilderInfo<'a> {
-    let start_ptr = linear_mem_space.start_ptr;
-    let size = linear_mem_space.size;
+fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> BuilderInfo<'a> {
     unsafe {
-        let end_ptr = start_ptr.offset(size as isize);
-        let builder_ptr = compute_ptr(builder_ptr, start_ptr, end_ptr);
+        if cfg!(debug_assertions) {
+            let contract_mem = std::slice::from_raw_parts(mem.start_ptr, mem.size as usize);
+            eprintln!(
+                "offset: {}; in mem: {:?}",
+                builder_ptr as usize,
+                &contract_mem[builder_ptr as usize
+                    ..builder_ptr as usize + std::mem::size_of::<BufferBuilder>()]
+            );
+            // use std::{fs::File, io::Write};
+            // let mut f = File::create(std::env::temp_dir().join("dump.mem")).unwrap();
+            // f.write_all(contract_mem).unwrap();
+        }
+
+        let builder_ptr = compute_ptr(builder_ptr, &mem);
         let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
+        if cfg!(debug_assertions) {
+            eprintln!("{buf_builder:?}");
+        }
+
         let read_ptr = Box::leak(Box::from_raw(compute_ptr(
             buf_builder.last_read as *mut u32,
-            start_ptr,
-            end_ptr,
+            &mem,
         )));
         let write_ptr = Box::leak(Box::from_raw(compute_ptr(
             buf_builder.last_write as *mut u32,
-            start_ptr,
-            end_ptr,
+            &mem,
         )));
-        let buffer_ptr = compute_ptr(buf_builder.start as *mut u8, start_ptr, end_ptr);
+        let buffer_ptr = compute_ptr(buf_builder.start as *mut u8, &mem);
         let buffer =
             &mut *std::ptr::slice_from_raw_parts_mut(buffer_ptr, buf_builder.capacity as usize);
-        // eprintln!(
-        //     "checking new ptr: {:p} -> {}; mem: {start_ptr:p} - {end_ptr:p};
-        //     buf ptr: {buffer_ptr:p}; buf size {}",
-        //     buf_builder.start as *mut u8, buf_builder.start, buf_builder.size
-        // );
         BuilderInfo {
             buffer,
             read_ptr,
@@ -300,17 +303,32 @@ impl<'instance> Buffer<'instance> {
 pub fn initiate_buffer(capacity: u32) -> i64 {
     let buf: Vec<u8> = Vec::with_capacity(capacity as usize);
     let start = buf.as_ptr() as i64;
-    eprintln!("new buffer ptr: {:p} -> {} as i64", buf.as_ptr(), start);
-    std::mem::forget(buf);
 
-    let last_read = Box::into_raw(Box::new(0u32)) as i64;
-    let last_write = Box::into_raw(Box::new(0u32)) as i64;
+    let last_read = Box::into_raw(Box::new(0u32));
+    let last_write = Box::into_raw(Box::new(0u32));
     let buffer = Box::into_raw(Box::new(BufferBuilder {
         start,
         capacity,
-        last_read,
-        last_write,
+        last_read: last_read as _,
+        last_write: last_write as _,
     }));
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "new buffer ptr: {:p} -> {} as i64 w/ cap: {capacity}",
+            buf.as_ptr(),
+            start
+        );
+        eprintln!(
+            "last read ptr: {last_read:p} -> {} as i64",
+            last_read as i64
+        );
+        eprintln!(
+            "last write ptr: {last_write:p} -> {} as i64",
+            last_write as i64
+        );
+        eprintln!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
+    }
+    std::mem::forget(buf);
     buffer as i64
 }
 

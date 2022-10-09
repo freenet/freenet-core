@@ -2207,6 +2207,7 @@ dependencies = [
  "bs58",
  "byteorder",
  "locutus-macros",
+ "log",
  "once_cell",
  "rand 0.8.5",
  "rmpv",

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use locutus_stdlib::{
-    buf::{BufferBuilder, BufferMut, WasmLinearMem},
+    buf::{BufferBuilder, BufferMut},
     prelude::*,
 };
 use wasmer::{
@@ -69,6 +69,8 @@ pub enum ExecError {
     #[error("unexpected result from contract interface")]
     UnexpectedResult,
 }
+
+type FfiReturnTy = i64;
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -185,22 +187,25 @@ impl Runtime {
         let initiate_buffer: NativeFunc<u32, i64> =
             instance.exports.get_native_function("initiate_buffer")?;
         let builder_ptr = initiate_buffer.call(data.len() as u32)?;
-        let memory = self
-            .host_memory
-            .as_ref()
-            .map(Ok)
-            .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
-        let linear_mem = WasmLinearMem {
-            start_ptr: memory.data_ptr() as *const _,
-            size: memory.data_size(),
-        };
-
+        let linear_mem = self.linear_mem(instance)?;
         unsafe {
             Ok(BufferMut::from_ptr(
                 builder_ptr as *mut BufferBuilder,
                 linear_mem,
             ))
         }
+    }
+
+    fn linear_mem(&self, instance: &Instance) -> RuntimeResult<WasmLinearMem> {
+        let memory = self
+            .host_memory
+            .as_ref()
+            .map(Ok)
+            .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
+        Ok(WasmLinearMem {
+            start_ptr: memory.data_ptr() as *const _,
+            size: memory.data_size(),
+        })
     }
 
     #[cfg(not(test))]
@@ -303,24 +308,29 @@ impl Runtime {
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&instance)?;
+
         let mut param_buf = self.init_buf(&instance, parameters)?;
         param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, &state)?;
+        let mut state_buf = self.init_buf(&instance, state)?;
         state_buf.write(state)?;
         let serialized =
             bincode::serialize(&related).map_err(|e| ContractRuntimeError::Any(e.into()))?;
         let mut related_buf = self.init_buf(&instance, &serialized)?;
         related_buf.write(serialized)?;
 
-        let validate_func: NativeFunc<(i64, i64, i64), (i64, i32, u32)> =
+        let validate_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
             instance.exports.get_native_function("validate_state")?;
         let is_valid = unsafe {
-            InterfaceResult::from(validate_func.call(
-                param_buf.ptr() as i64,
-                state_buf.ptr() as i64,
-                related_buf.ptr() as i64,
-            )?)
-            .unwrap_validate_state_res()
+            InterfaceResult::from_raw(
+                validate_func.call(
+                    param_buf.ptr() as i64,
+                    state_buf.ptr() as i64,
+                    related_buf.ptr() as i64,
+                )?,
+                &linear_mem,
+            )
+            .unwrap_validate_state_res(linear_mem)
             .map_err(Into::<ExecError>::into)?
         };
         Ok(is_valid)
@@ -338,18 +348,21 @@ impl Runtime {
         // todo: if we keep this hot in memory on next calls overwrite the buffer with new delta
         let req_bytes = parameters.size() + delta.size();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&instance)?;
+
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut delta_buf = self.init_buf(&instance, &delta)?;
         delta_buf.write(delta)?;
 
-        let validate_func: NativeFunc<(i64, i64), (i64, i32, u32)> =
+        let validate_func: NativeFunc<(i64, i64), FfiReturnTy> =
             instance.exports.get_native_function("validate_delta")?;
         let is_valid = unsafe {
-            InterfaceResult::from(
+            InterfaceResult::from_raw(
                 validate_func.call(param_buf.ptr() as i64, delta_buf.ptr() as i64)?,
+                &linear_mem,
             )
-            .unwrap_validate_delta_res()
+            .unwrap_validate_delta_res(linear_mem)
             .map_err(Into::<ExecError>::into)?
         };
         Ok(is_valid)
@@ -374,6 +387,8 @@ impl Runtime {
         //       - the delta may not be necessarily the same size
         let req_bytes = parameters.size() + state.size() + update_data.size();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&instance)?;
+
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -383,15 +398,18 @@ impl Runtime {
         let mut update_dat_buf = self.init_buf(&instance, &serialized)?;
         update_dat_buf.write(serialized)?;
 
-        let validate_func: NativeFunc<(i64, i64, i64), (i64, i32, u32)> =
+        let validate_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
             instance.exports.get_native_function("update_state")?;
         let update_res = unsafe {
-            InterfaceResult::from(validate_func.call(
-                param_buf.ptr() as i64,
-                state_buf.ptr() as i64,
-                update_dat_buf.ptr() as i64,
-            )?)
-            .unwrap_update_state()
+            InterfaceResult::from_raw(
+                validate_func.call(
+                    param_buf.ptr() as i64,
+                    state_buf.ptr() as i64,
+                    update_dat_buf.ptr() as i64,
+                )?,
+                &linear_mem,
+            )
+            .unwrap_update_state(linear_mem)
             .map_err(Into::<ExecError>::into)?
         };
         Ok(update_res)
@@ -408,30 +426,25 @@ impl Runtime {
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&instance)?;
+
         let mut param_buf = self.init_buf(&instance, parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, state)?;
         state_buf.write(state)?;
 
-        let summary_func: NativeFunc<(i64, i64), (i64, i32, u32)> =
+        let summary_func: NativeFunc<(i64, i64), FfiReturnTy> =
             instance.exports.get_native_function("summarize_state")?;
-        let int_res = InterfaceResult::from(
-            summary_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?,
-        );
-        // let memory = self
-        //     .host_memory
-        //     .as_ref()
-        //     .map(Ok)
-        //     .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
-        // let summary_buf =
-        //     unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
-        // let summary: StateSummary = summary_buf.read_bytes(summary_buf.size()).into();
+
         let result = unsafe {
+            let int_res = InterfaceResult::from_raw(
+                summary_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?,
+                &linear_mem,
+            );
             int_res
-                .unwrap_summarize_state()
+                .unwrap_summarize_state(linear_mem)
                 .map_err(Into::<ExecError>::into)?
         };
-        // Ok(StateSummary::from(summary.to_vec()))
         Ok(result)
     }
 
@@ -447,6 +460,8 @@ impl Runtime {
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&instance)?;
+
         let mut param_buf = self.init_buf(&instance, &parameters)?;
         param_buf.write(parameters)?;
         let mut state_buf = self.init_buf(&instance, &state)?;
@@ -454,38 +469,35 @@ impl Runtime {
         let mut summary_buf = self.init_buf(&instance, &summary)?;
         summary_buf.write(summary)?;
 
-        let get_state_delta_func: NativeFunc<(i64, i64, i64), (i64, i32, u32)> =
+        let get_state_delta_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
             instance.exports.get_native_function("get_state_delta")?;
-        let int_res = InterfaceResult::from(get_state_delta_func.call(
-            param_buf.ptr() as i64,
-            state_buf.ptr() as i64,
-            summary_buf.ptr() as i64,
-        )?);
-        // let memory = self
-        //     .host_memory
-        //     .as_ref()
-        //     .map(Ok)
-        //     .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
-        // let delta_buf =
-        //     unsafe { BufferMut::from_ptr(res_ptr, (memory.data_ptr() as _, memory.data_size())) };
-        // let mut delta = delta_buf.shared();
+
         let result = unsafe {
+            let int_res = {
+                InterfaceResult::from_raw(
+                    get_state_delta_func.call(
+                        param_buf.ptr() as i64,
+                        state_buf.ptr() as i64,
+                        summary_buf.ptr() as i64,
+                    )?,
+                    &linear_mem,
+                )
+            };
             int_res
-                .unwrap_get_state_delta()
+                .unwrap_get_state_delta(linear_mem)
                 .map_err(Into::<ExecError>::into)?
         };
-        // Ok(StateDelta::from(delta.read_all().to_vec()))
         Ok(result)
     }
 }
 
 #[cfg(test)]
 mod test {
+    use super::*;
+    use crate::contract::WrappedContract;
     use std::path::PathBuf;
 
-    use crate::contract::WrappedContract;
-
-    use super::*;
+    const TEST_CONTRACT_1: &str = "test_contract_1";
 
     fn test_dir() -> PathBuf {
         let test_dir = std::env::temp_dir().join("locutus").join("contracts");
@@ -495,34 +507,89 @@ mod test {
         test_dir
     }
 
-    fn test_contract(contract_path: &str) -> WrappedContract {
+    fn get_test_contract(name: &str) -> WrappedContract<'static> {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
         let contracts = PathBuf::from(CONTRACTS_DIR);
         let mut dirs = contracts.ancestors();
         let path = dirs.nth(2).unwrap();
         let contract_path = path
-            .join("contracts")
-            .join("test-contract")
-            .join(contract_path);
+            .join("tests")
+            .join(name.replace('_', "-"))
+            .join("build/locutus")
+            .join(name)
+            .with_extension("wasm");
         WrappedContract::try_from((&*contract_path, Parameters::from(vec![])))
             .expect("contract found")
     }
 
-    fn get_guest_test_contract() -> RuntimeResult<(ContractStore, ContractKey)> {
+    fn set_up_test_contract(name: &str) -> RuntimeResult<(ContractStore, ContractKey)> {
         let mut store = ContractStore::new(test_dir(), 10_000)?;
-        // FIXME: Generate required test contract
-        let contract = test_contract("test_contract_guest.wasi.wasm");
+        let contract = get_test_contract(name);
         let key = *contract.key();
         store.store_contract(contract)?;
         Ok((store, key))
     }
 
+    #[test]
+    fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let mut runtime = Runtime::build(store, false).unwrap();
+        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+
+        let is_valid = runtime.validate_state(
+            &key,
+            &Parameters::from([].as_ref()),
+            &WrappedState::new(vec![1, 2, 3, 4]),
+            Default::default(),
+        )?;
+        assert!(is_valid == ValidateResult::Valid);
+        eprintln!("RESULT: {is_valid:?}");
+
+        let not_valid = runtime.validate_state(
+            &key,
+            &Parameters::from([].as_ref()),
+            &WrappedState::new(vec![1, 0, 0, 1]),
+            Default::default(),
+        )?;
+        eprintln!("RESULT: {not_valid:?}");
+        assert!(matches!(not_valid, ValidateResult::RequestRelated(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let mut runtime = Runtime::build(store, false).unwrap();
+        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+
+        let is_valid = runtime.validate_delta(
+            &key,
+            &Parameters::from([].as_ref()),
+            &StateDelta::from([1, 2, 3, 4].as_ref()),
+        )?;
+        eprintln!("RESULT: {is_valid:?}");
+        assert!(is_valid);
+
+        let not_valid = !runtime.validate_delta(
+            &key,
+            &Parameters::from([].as_ref()),
+            &StateDelta::from([1, 0, 0, 1].as_ref()),
+        )?;
+        eprintln!("RESULT: {not_valid:?}");
+        assert!(not_valid);
+
+        Ok(())
+    }
+
     #[ignore]
     #[test]
     fn update_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = get_guest_test_contract()?;
+        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, false).unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+
         let new_state = runtime
             .update_state(
                 &key,
@@ -531,7 +598,7 @@ mod test {
                 &StateDelta::from([4].as_ref()).into(),
             )?
             .unwrap_valid();
-        assert_eq!(new_state.as_ref().len(), 4);
+        assert!(new_state.as_ref().len() == 4);
         assert!(new_state.as_ref()[3] == 4);
         Ok(())
     }
@@ -539,9 +606,10 @@ mod test {
     #[ignore]
     #[test]
     fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = get_guest_test_contract()?;
+        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, false).unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+
         let summary = runtime.summarize_state(
             &key,
             &Parameters::from([].as_ref()),
@@ -549,6 +617,24 @@ mod test {
         )?;
         assert!(summary.as_ref().len() == 1);
         assert!(summary.as_ref()[0] == 5);
+        Ok(())
+    }
+
+    #[ignore]
+    #[test]
+    fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let mut runtime = Runtime::build(store, false).unwrap();
+        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+
+        let delta = runtime.get_state_delta(
+            &key,
+            &Parameters::from([].as_ref()),
+            &WrappedState::new(vec![5, 2, 3, 4]),
+            &StateSummary::from([2, 3].as_ref()),
+        )?;
+        assert!(delta.as_ref().len() == 1);
+        assert!(delta.as_ref()[0] == 4);
         Ok(())
     }
 }

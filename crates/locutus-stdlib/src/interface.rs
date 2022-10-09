@@ -21,6 +21,13 @@ use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 32;
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct WasmLinearMem {
+    pub start_ptr: *const u8,
+    pub size: u64,
+}
+
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum ContractError {
     #[error("invalid contract update")]
@@ -31,6 +38,8 @@ pub enum ContractError {
     InvalidDelta,
     #[error("{0}")]
     Other(String),
+    #[error("de/serialization error: {0}")]
+    Deser(String),
 }
 
 #[non_exhaustive]
@@ -908,6 +917,8 @@ pub(crate) mod wasm_interface {
         }
     }
 
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
     pub struct InterfaceResult {
         ptr: i64,
         kind: i32,
@@ -915,17 +926,16 @@ pub(crate) mod wasm_interface {
     }
 
     impl InterfaceResult {
-        pub fn new(ptr: i64, kind: i32, size: u32) -> Self {
-            Self { ptr, kind, size }
-        }
-
-        pub unsafe fn unwrap_validate_state_res(self) -> Result<ValidateResult, ContractError> {
+        pub unsafe fn unwrap_validate_state_res(
+            self,
+            mem: WasmLinearMem,
+        ) -> Result<ValidateResult, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateState => {
-                    // TODO: compute offset
-                    let ptr = self.ptr;
+                    let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    eprintln!("DESER: {serialized:?}");
                     bincode::deserialize(serialized)
                         .map_err(|e| ContractError::Other(format!("{e}")))
                 }
@@ -933,11 +943,14 @@ pub(crate) mod wasm_interface {
             }
         }
 
-        pub unsafe fn unwrap_validate_delta_res(self) -> Result<bool, ContractError> {
+        pub unsafe fn unwrap_validate_delta_res(
+            self,
+            mem: WasmLinearMem,
+        ) -> Result<bool, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateDelta => {
-                    let ptr = self.ptr;
+                    let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
                     bincode::deserialize(serialized)
                         .map_err(|e| ContractError::Other(format!("{e}")))
@@ -946,11 +959,14 @@ pub(crate) mod wasm_interface {
             }
         }
 
-        pub unsafe fn unwrap_update_state(self) -> Result<UpdateModification, ContractError> {
+        pub unsafe fn unwrap_update_state(
+            self,
+            mem: WasmLinearMem,
+        ) -> Result<UpdateModification, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::UpdateState => {
-                    let ptr = self.ptr;
+                    let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
                     bincode::deserialize(serialized)
                         .map_err(|e| ContractError::Other(format!("{e}")))
@@ -959,11 +975,14 @@ pub(crate) mod wasm_interface {
             }
         }
 
-        pub unsafe fn unwrap_summarize_state(self) -> Result<StateSummary<'static>, ContractError> {
+        pub unsafe fn unwrap_summarize_state(
+            self,
+            mem: WasmLinearMem,
+        ) -> Result<StateSummary<'static>, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateState => {
-                    let ptr = self.ptr;
+                    let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
                     bincode::deserialize(serialized)
                         .map_err(|e| ContractError::Other(format!("{e}")))
@@ -972,11 +991,14 @@ pub(crate) mod wasm_interface {
             }
         }
 
-        pub unsafe fn unwrap_get_state_delta(self) -> Result<StateDelta<'static>, ContractError> {
+        pub unsafe fn unwrap_get_state_delta(
+            self,
+            mem: WasmLinearMem,
+        ) -> Result<StateDelta<'static>, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateState => {
-                    let ptr = self.ptr;
+                    let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
                     bincode::deserialize(serialized)
                         .map_err(|e| ContractError::Other(format!("{e}")))
@@ -985,18 +1007,23 @@ pub(crate) mod wasm_interface {
             }
         }
 
-        pub fn into_raw(self) -> (i64, i32, u32) {
-            (self.ptr, self.kind, self.size)
-        }
-    }
-
-    impl From<(i64, i32, u32)> for InterfaceResult {
-        fn from(v: (i64, i32, u32)) -> Self {
-            Self {
-                ptr: v.0,
-                kind: v.1,
-                size: v.2,
+        pub fn into_raw(self) -> i64 {
+            let ptr = Box::into_raw(Box::new(self));
+            if cfg!(debug_assertions) {
+                eprintln!("returning FFI result @ {ptr:p} ({}i64) ", ptr as i64);
             }
+            ptr as _
+        }
+
+        pub unsafe fn from_raw(ptr: i64, mem: &WasmLinearMem) -> Self {
+            if cfg!(debug_assertions) {
+                eprintln!("got FFI result @ {ptr} ({:p}) ", ptr as *mut Self);
+            }
+            let result = Box::leak(Box::from_raw(crate::buf::compute_ptr(
+                ptr as *mut Self,
+                mem,
+            )));
+            *result
         }
     }
 
@@ -1010,7 +1037,8 @@ pub(crate) mod wasm_interface {
                     //       the host, maybe even if is just for some architectures
                     let serialized = bincode::serialize(&value).unwrap();
                     let size = serialized.len() as _;
-                    let ptr = Box::into_raw(Box::new(serialized)) as i64;
+                    let ptr = serialized.as_ptr() as i64;
+                    std::mem::forget(serialized);
                     Self { kind, ptr, size }
                 }
             }

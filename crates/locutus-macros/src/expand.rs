@@ -25,7 +25,7 @@ pub fn ffi_impl_wrap(item: &ItemImpl) -> TokenStream {
 }
 
 fn ffi_ret_type() -> TokenStream {
-    quote!((i64, i32, u32))
+    quote!(i64)
 }
 
 struct ImplStruct {
@@ -40,30 +40,36 @@ impl ImplStruct {
             #[no_mangle]
             pub fn validate_state(parameters: i64, state: i64, related: i64) -> #ret {
                 let parameters = unsafe {
-                    // eprintln!("getting params: {:p}", state as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let param_buf = &*(parameters as *const ::locutus_stdlib::buf::BufferBuilder);
+                    // eprintln!("getting params: {:p}, {:?}", parameters as *const ::locutus_stdlib::buf::BufferBuilder, param_buf);
                     let bytes = &*std::ptr::slice_from_raw_parts(
                         param_buf.start(),
-                        param_buf.len(),
+                        param_buf.written(None),
                     );
                     Parameters::from(bytes)
                 };
                 let state = unsafe {
-                    // eprintln!("getting state: {:p}", state as *mut ::locutus_stdlib::buf::BufferBuilder);
+                    // eprintln!("getting state: {:p}", state as *const ::locutus_stdlib::buf::BufferBuilder);
                     let state_buf = &*(state as *const ::locutus_stdlib::buf::BufferBuilder);
                     let bytes = &*std::ptr::slice_from_raw_parts(
                         state_buf.start(),
-                        state_buf.len(),
+                        state_buf.written(None),
                     );
                     State::from(bytes)
                 };
                 let related: ::locutus_stdlib::prelude::RelatedContracts = unsafe {
+                    // eprintln!("getting related: {:p}", related as *const ::locutus_stdlib::buf::BufferBuilder);
                     let related = &*(related as *const ::locutus_stdlib::buf::BufferBuilder);
-                    let bytes = &*std::ptr::slice_from_raw_parts(related.start(), related.len());
-                    ::locutus_stdlib::prelude::bincode::deserialize(bytes)
-                        .expect("correctly serialized `RelatedContract`")
+                    let bytes = &*std::ptr::slice_from_raw_parts(related.start(), related.written(None));
+                    match ::locutus_stdlib::prelude::bincode::deserialize(bytes) {
+                        Ok(v) => v,
+                        Err(err) => return ::locutus_stdlib::prelude::InterfaceResult::from(
+                            Err::<::core::primitive::bool, _>(::locutus_stdlib::prelude::ContractError::Deser(format!("{}", err)))
+                        ).into_raw(),
+                    }
                 };
                 let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::validate_state(parameters, state, related);
+                // eprintln!("...returning: {:?}", result);
                 ::locutus_stdlib::prelude::InterfaceResult::from(result).into_raw()
             }
         }
@@ -78,13 +84,13 @@ impl ImplStruct {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
-                        &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.len());
+                        &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.written(None));
                     Parameters::from(bytes)
                 };
                 let delta = unsafe {
                     let delta_buf = &mut *(delta as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
-                        &*std::ptr::slice_from_raw_parts(delta_buf.start(), delta_buf.len());
+                        &*std::ptr::slice_from_raw_parts(delta_buf.start(), delta_buf.written(None));
                     StateDelta::from(bytes)
                 };
                 let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::validate_delta(parameters, delta);
@@ -102,19 +108,26 @@ impl ImplStruct {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
-                        &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.len());
+                        &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.written(None));
                     ::locutus_stdlib::prelude::Parameters::from(bytes)
                 };
                 let (state, mut result_buf) = unsafe {
                     let state_buf = &mut *(state as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
-                        &*std::ptr::slice_from_raw_parts(state_buf.start(), state_buf.len());
+                        &*std::ptr::slice_from_raw_parts(state_buf.start(), state_buf.written(None));
                     (::locutus_stdlib::prelude::State::from(bytes), state_buf)
                 };
                 let updates = unsafe {
                     let delta_buf = &mut *(delta as *mut ::locutus_stdlib::buf::BufferBuilder);
-                    let bytes = &*std::ptr::slice_from_raw_parts(delta_buf.start(), delta_buf.len());
-                    bincode::deserialize(bytes).unwrap()
+                    let bytes = &*std::ptr::slice_from_raw_parts(delta_buf.start(), delta_buf.written(None));
+                    match ::locutus_stdlib::prelude::bincode::deserialize(bytes) {
+                        Ok(v) => v,
+                        Err(err) => return ::locutus_stdlib::prelude::InterfaceResult::from(
+                            Err::<::locutus_stdlib::prelude::ValidateResult, _>(
+                                ::locutus_stdlib::prelude::ContractError::Deser(format!("{}", err))
+                            )
+                        ).into_raw(),
+                    }
                 };
                 let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::update_state(
                     parameters, state, updates,
@@ -132,12 +145,12 @@ impl ImplStruct {
             pub fn summarize_state(parameters: i64, state: i64) -> #ret {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
-                    let bytes = &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.len());
+                    let bytes = &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.written(None));
                     ::locutus_stdlib::prelude::Parameters::from(bytes)
                 };
                 let state = unsafe {
                     let state_buf = &mut *(state as *mut ::locutus_stdlib::buf::BufferBuilder);
-                    let bytes = &*std::ptr::slice_from_raw_parts(state_buf.start(), state_buf.len());
+                    let bytes = &*std::ptr::slice_from_raw_parts(state_buf.start(), state_buf.written(None));
                     ::locutus_stdlib::prelude::State::from(bytes)
                 };
                 let summary = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::summarize_state(parameters, state);
@@ -155,19 +168,19 @@ impl ImplStruct {
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
-                    &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.len());
+                    &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.written(None));
                     ::locutus_stdlib::prelude::Parameters::from(bytes)
                 };
                 let state = unsafe {
                     let state_buf = &mut *(state as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
-                    &*std::ptr::slice_from_raw_parts(state_buf.start(), state_buf.len());
+                    &*std::ptr::slice_from_raw_parts(state_buf.start(), state_buf.written(None));
                     ::locutus_stdlib::prelude::State::from(bytes)
                 };
                 let summary = unsafe {
                     let summary_buf = &mut *(summary as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
-                    &*std::ptr::slice_from_raw_parts(summary_buf.start(), summary_buf.len());
+                    &*std::ptr::slice_from_raw_parts(summary_buf.start(), summary_buf.written(None));
                     ::locutus_stdlib::prelude::StateSummary::from(bytes)
                 };
                 let new_delta = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::get_state_delta(parameters, state, summary);

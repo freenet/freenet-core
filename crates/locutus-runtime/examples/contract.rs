@@ -7,10 +7,9 @@ struct Contract;
 impl ContractInterface for Contract {
     fn validate_state(
         _parameters: Parameters<'static>,
-        state: State<'static>,
+        _state: State<'static>,
         _related: RelatedContracts,
     ) -> Result<ValidateResult, ContractError> {
-        let _state_bytes = state.as_ref();
         unimplemented!()
     }
 
@@ -31,23 +30,17 @@ impl ContractInterface for Contract {
 
     fn summarize_state(
         _parameters: Parameters<'static>,
-        state: State<'static>,
+        _state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        let state = state.as_ref();
-        Ok(StateSummary::from(state[0..3].to_vec()))
+        unimplemented!()
     }
 
     fn get_state_delta(
         _parameters: Parameters<'static>,
-        state: State<'static>,
-        summary: StateSummary<'static>,
+        _state: State<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let state = state.as_ref();
-        assert!(state.len() == 4);
-        let summary = summary.as_ref();
-        assert!(summary.len() == 2);
-        assert!(&state[1..=2] == summary);
-        Ok(StateDelta::from(state[3..=3].to_vec()))
+        unimplemented!()
     }
 }
 
