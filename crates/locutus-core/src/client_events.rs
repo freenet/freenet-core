@@ -282,7 +282,6 @@ impl ClientRequest {
                 map_keys.sort();
                 match map_keys.as_slice() {
                     ["contract", "relatedContracts", "state"] => {
-                        log::info!("Received put request");
                         ClientRequest::Put {
                             contract: WrappedContract::try_from(
                                 *value_map.get("contract").unwrap(),
@@ -297,7 +296,6 @@ impl ClientRequest {
                         }
                     }
                     ["data", "key"] => {
-                        log::info!("Received update request");
                         ClientRequest::Update {
                             key: ContractKey::try_from(*value_map.get("key").unwrap())
                                 .map_err(ErrorKind::deserialization)?,
@@ -361,20 +359,16 @@ impl Display for ClientRequest {
 
 #[cfg(test)]
 pub(crate) mod test {
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::{collections::HashMap, time::Duration};
 
     use locutus_runtime::{ContractCode, Parameters, StateDelta};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
-    use warp::body::bytes;
 
     use crate::node::{test::EventId, PeerKey};
 
     use super::*;
-
-    const TEST_CONTRACT_1: &str = "test_contract_1";
 
     #[derive(Clone)]
     pub(crate) struct MemoryEventsGen {
@@ -525,22 +519,6 @@ pub(crate) mod test {
         }
     }
 
-    fn get_test_contract(name: &str) -> WrappedContract<'static> {
-        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
-
-        let contracts = PathBuf::from(CONTRACTS_DIR);
-        let mut dirs = contracts.ancestors();
-        let path = dirs.nth(2).unwrap();
-        let contract_path = path
-            .join("tests")
-            .join(name.replace('_', "-"))
-            .join("build/locutus")
-            .join(name)
-            .with_extension("wasm");
-        WrappedContract::try_from((&*contract_path, Parameters::from(vec![])))
-            .expect("contract found")
-    }
-
     #[test]
     fn put_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = crate::util::test::random_bytes_1024();
@@ -650,7 +628,6 @@ pub(crate) mod test {
 
     #[test]
     fn test_handle_put_request() -> Result<(), Box<dyn std::error::Error>> {
-        let contract = get_test_contract(TEST_CONTRACT_1);
         let expected_client_request = ClientRequest::Put {
             contract: WrappedContract::new(
                 Arc::new(ContractCode::from(vec![6, 7, 8, 9])),
@@ -659,7 +636,6 @@ pub(crate) mod test {
             state: WrappedState::new(vec![1, 2, 3, 4]),
             related_contracts: Default::default(),
         };
-        // let msg: Vec<u8> = rmp_serde::to_vec(&expected_client_request).unwrap();
 
         let msg: Vec<u8> = vec![
             131, 168, 99, 111, 110, 116, 114, 97, 99, 116, 131, 163, 107, 101, 121, 130, 168, 105,

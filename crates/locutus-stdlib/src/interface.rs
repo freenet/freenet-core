@@ -78,7 +78,7 @@ impl UpdateModification {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct RelatedContracts {
-    pub map: HashMap<ContractInstanceId, Option<State<'static>>>,
+    map: HashMap<ContractInstanceId, Option<State<'static>>>,
 }
 
 impl TryFrom<&rmpv::Value> for RelatedContracts {
