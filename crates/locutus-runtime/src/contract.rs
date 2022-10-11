@@ -1,5 +1,6 @@
 use locutus_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::HashMap;
 use std::{borrow::Borrow, fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 
 use crate::ContractRuntimeError;
@@ -81,6 +82,43 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for WrappedContract<'static> {
     }
 }
 
+impl TryFrom<&'static rmpv::Value> for WrappedContract<'static> {
+    type Error = String;
+
+    fn try_from(value: &'static rmpv::Value) -> Result<Self, Self::Error> {
+        let contract_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
+            value
+                .as_map()
+                .unwrap()
+                .iter()
+                .map(|(key, val)| (key.as_str().unwrap(), val)),
+        );
+
+        let key_value = contract_map.get("key").unwrap().to_owned();
+        let key_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
+            key_value
+                .as_map()
+                .unwrap()
+                .iter()
+                .map(|(key, val)| (key.as_str().unwrap(), val)),
+        );
+        let key_instance = *key_map.get("instance").unwrap();
+        let contract_key = ContractKey::try_from(key_instance).unwrap();
+
+        let contract_data = contract_map.get("data").unwrap().to_owned();
+        let data = Arc::new(ContractCode::try_from(contract_data).unwrap());
+
+        let contract_params = contract_map.get("parameters").unwrap().to_owned();
+        let params = Parameters::try_from(contract_params).unwrap();
+
+        Ok(Self {
+            data,
+            params,
+            key: contract_key,
+        })
+    }
+}
+
 impl TryInto<Vec<u8>> for WrappedContract<'static> {
     type Error = ContractRuntimeError;
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
@@ -153,6 +191,22 @@ impl WrappedState {
 impl From<Vec<u8>> for WrappedState {
     fn from(bytes: Vec<u8>) -> Self {
         Self::new(bytes)
+    }
+}
+
+impl TryFrom<&rmpv::Value> for WrappedState {
+    type Error = String;
+
+    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
+        let contract_state = value.as_map().unwrap();
+        let state = contract_state
+            .get(0)
+            .unwrap()
+            .1
+            .as_slice()
+            .unwrap()
+            .to_vec();
+        Ok(WrappedState::from(state))
     }
 }
 
