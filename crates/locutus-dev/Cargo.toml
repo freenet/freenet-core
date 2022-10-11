@@ -17,7 +17,7 @@ futures = "0.3"
 glob = "0.3"
 thiserror = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3.15", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "signal", "parking_lot"] }
 pico-args = "0.5"
 serde = "1"
