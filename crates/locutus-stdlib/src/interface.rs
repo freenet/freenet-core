@@ -267,7 +267,9 @@ impl<'a> Parameters<'a> {
     }
 
     /// Extracts the owned data as a `Vec<u8>`.
-    pub fn into_owned(self) -> Vec<u8> { self.0.into_owned() }
+    pub fn into_owned(self) -> Vec<u8> {
+        self.0.into_owned()
+    }
 }
 
 impl<'a> From<Vec<u8>> for Parameters<'a> {
