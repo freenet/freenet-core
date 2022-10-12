@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use futures::future::BoxFuture;
 use locutus_runtime::{
     ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore, UpdateModification,
     ValidateResult,
@@ -156,7 +157,6 @@ impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHal
     }
 }
 
-#[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
     type Error = SimStoreError;
     type Store = MemKVStore;
@@ -171,10 +171,10 @@ impl ContractHandler for MemoryContractHandler {
         &mut self.contract_store
     }
 
-    async fn handle_request(
-        &mut self,
-        _req: crate::ClientRequest,
-    ) -> Result<crate::HostResponse, Self::Error> {
+    fn handle_request<'a, 's: 'a>(
+        &'s mut self,
+        _req: crate::ClientRequest<'a>,
+    ) -> BoxFuture<'static, Result<crate::HostResponse, Self::Error>> {
         // async fn get_state(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         //     Ok(self.kv_store.get(contract).cloned())
         // }

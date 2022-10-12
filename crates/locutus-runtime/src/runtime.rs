@@ -169,10 +169,10 @@ impl Runtime {
         Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
     }
 
-    fn get_module(&mut self, key: &ContractKey, parameters: &Parameters) -> RuntimeResult<()> {
+    fn get_module(&mut self, key: &ContractKey, parameters: &Parameters<'_>) -> RuntimeResult<()> {
         let contract = self
             .contracts
-            .fetch_contract(key, parameters)
+            .fetch_contract(key, parameters.clone())
             .ok_or(ContractRuntimeError::ContractNotFound(*key))?;
         let module = Module::new(&self.store, contract.code().data())?;
         self.modules.insert(*key, module);
@@ -507,7 +507,7 @@ mod test {
         test_dir
     }
 
-    fn get_test_contract(name: &str) -> WrappedContract<'static> {
+    fn get_test_contract(name: &str) -> WrappedContract {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
         let contracts = PathBuf::from(CONTRACTS_DIR);
@@ -569,7 +569,6 @@ mod test {
             &Parameters::from([].as_ref()),
             &StateDelta::from([1, 2, 3, 4].as_ref()),
         )?;
-        eprintln!("RESULT: {is_valid:?}");
         assert!(is_valid);
 
         let not_valid = !runtime.validate_delta(
@@ -577,7 +576,6 @@ mod test {
             &Parameters::from([].as_ref()),
             &StateDelta::from([1, 0, 0, 1].as_ref()),
         )?;
-        eprintln!("RESULT: {not_valid:?}");
         assert!(not_valid);
 
         Ok(())

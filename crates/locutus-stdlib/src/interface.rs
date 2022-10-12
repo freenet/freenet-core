@@ -44,13 +44,14 @@ pub enum ContractError {
 
 #[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize)]
-pub struct UpdateModification {
-    pub new_state: Option<State<'static>>,
+pub struct UpdateModification<'a> {
+    #[serde(borrow)]
+    pub new_state: Option<State<'a>>,
     pub related: Vec<RelatedContract>,
 }
 
-impl UpdateModification {
-    pub fn valid(new_state: State<'static>) -> Self {
+impl<'a> UpdateModification<'a> {
+    pub fn valid(new_state: State<'a>) -> Self {
         Self {
             new_state: Some(new_state),
             related: vec![],
@@ -64,7 +65,7 @@ impl UpdateModification {
         }
     }
 
-    pub fn unwrap_valid(self) -> State<'static> {
+    pub fn unwrap_valid(self) -> State<'a> {
         match self.new_state {
             Some(s) => s,
             _ => panic!("failed unwrapping state in modification"),
@@ -76,36 +77,40 @@ impl UpdateModification {
     }
 }
 
-// TODO: relax this to not neeed 'static
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-pub struct RelatedContracts {
-    map: HashMap<ContractInstanceId, Option<State<'static>>>,
+pub struct RelatedContracts<'a> {
+    #[serde(borrow)]
+    map: HashMap<ContractInstanceId, Option<State<'a>>>,
 }
 
-impl TryFrom<&rmpv::Value> for RelatedContracts {
+impl<'a> RelatedContracts<'a> {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    pub fn owned(self) -> RelatedContracts<'static> {
+        todo!()
+    }
+}
+
+impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
     type Error = String;
 
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let related_contracts: HashMap<ContractInstanceId, Option<State<'static>>> =
+    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+        let related_contracts: HashMap<ContractInstanceId, Option<State<'a>>> =
             HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
                 let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
-                let state = State::from(val.as_slice().unwrap().to_vec());
+                let state = State::from(val.as_slice().unwrap());
                 (id, Some(state))
             }));
         Ok(RelatedContracts::from(related_contracts))
     }
 }
 
-impl RelatedContracts {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
-}
-
-impl From<HashMap<ContractInstanceId, Option<State<'static>>>> for RelatedContracts {
-    fn from(related_contracts: HashMap<ContractInstanceId, Option<State<'static>>>) -> Self {
+impl<'a> From<HashMap<ContractInstanceId, Option<State<'a>>>> for RelatedContracts<'a> {
+    fn from(related_contracts: HashMap<ContractInstanceId, Option<State<'a>>>) -> Self {
         Self {
             map: related_contracts,
         }
@@ -142,23 +147,29 @@ pub enum ValidateResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum UpdateData<'a> {
-    State(State<'a>),
-    Delta(StateDelta<'a>),
+    State(#[serde(borrow)] State<'a>),
+    Delta(#[serde(borrow)] StateDelta<'a>),
     StateAndDelta {
+        #[serde(borrow)]
         state: State<'a>,
+        #[serde(borrow)]
         delta: StateDelta<'a>,
     },
     RelatedState {
         related_to: ContractInstanceId,
+        #[serde(borrow)]
         state: State<'a>,
     },
     RelatedDelta {
         related_to: ContractInstanceId,
+        #[serde(borrow)]
         delta: StateDelta<'a>,
     },
     RelatedStateAndDelta {
         related_to: ContractInstanceId,
+        #[serde(borrow)]
         state: State<'a>,
+        #[serde(borrow)]
         delta: StateDelta<'a>,
     },
 }
@@ -183,6 +194,10 @@ impl UpdateData<'_> {
             _ => panic!(),
         }
     }
+
+    pub fn owned(self) -> UpdateData<'static> {
+        todo!()
+    }
 }
 
 impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
@@ -191,10 +206,10 @@ impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
     }
 }
 
-impl TryFrom<&rmpv::Value> for UpdateData<'static> {
+impl<'a> TryFrom<&'a rmpv::Value> for UpdateData<'a> {
     type Error = String;
 
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
         let value_map: HashMap<_, _> = HashMap::from_iter(
             value
                 .as_map()
@@ -208,28 +223,28 @@ impl TryFrom<&rmpv::Value> for UpdateData<'static> {
             ["delta"] => {
                 let delta = value_map.get("delta").unwrap();
                 Ok(UpdateData::Delta(StateDelta::from(
-                    delta.as_slice().unwrap().to_vec(),
+                    delta.as_slice().unwrap(),
                 )))
             }
             ["state"] => {
                 let state = value_map.get("state").unwrap();
                 Ok(UpdateData::Delta(StateDelta::from(
-                    state.as_slice().unwrap().to_vec(),
+                    state.as_slice().unwrap(),
                 )))
             }
             ["delta", "state"] => {
                 let state = value_map.get("state").unwrap();
                 let delta = value_map.get("delta").unwrap();
                 Ok(UpdateData::StateAndDelta {
-                    state: State::from(state.as_slice().unwrap().to_vec()),
-                    delta: StateDelta::from(delta.as_slice().unwrap().to_vec()),
+                    state: State::from(state.as_slice().unwrap()),
+                    delta: StateDelta::from(delta.as_slice().unwrap()),
                 })
             }
             ["delta", "relatedTo"] => {
                 let delta = value_map.get("delta").unwrap();
                 let related_to = value_map.get("relatedTo").unwrap();
                 Ok(UpdateData::RelatedDelta {
-                    delta: StateDelta::from(delta.as_slice().unwrap().to_vec()),
+                    delta: StateDelta::from(delta.as_slice().unwrap()),
                     related_to: ContractInstanceId::from_bytes(related_to.as_slice().unwrap())
                         .unwrap(),
                 })
@@ -238,7 +253,7 @@ impl TryFrom<&rmpv::Value> for UpdateData<'static> {
                 let state = value_map.get("state").unwrap();
                 let related_to = value_map.get("relatedTo").unwrap();
                 Ok(UpdateData::RelatedState {
-                    state: State::from(state.as_slice().unwrap().to_vec()),
+                    state: State::from(state.as_slice().unwrap()),
                     related_to: ContractInstanceId::from_bytes(related_to.as_slice().unwrap())
                         .unwrap(),
                 })
@@ -248,8 +263,8 @@ impl TryFrom<&rmpv::Value> for UpdateData<'static> {
                 let delta = value_map.get("delta").unwrap();
                 let related_to = value_map.get("relatedTo").unwrap();
                 Ok(UpdateData::RelatedStateAndDelta {
-                    state: State::from(state.as_slice().unwrap().to_vec()),
-                    delta: StateDelta::from(delta.as_slice().unwrap().to_vec()),
+                    state: State::from(state.as_slice().unwrap()),
+                    delta: StateDelta::from(delta.as_slice().unwrap()),
                     related_to: ContractInstanceId::from_bytes(related_to.as_slice().unwrap())
                         .unwrap(),
                 })
@@ -280,7 +295,7 @@ pub trait ContractInterface {
         parameters: Parameters<'static>,
         state: State<'static>,
         data: Vec<UpdateData>,
-    ) -> Result<UpdateModification, ContractError>;
+    ) -> Result<UpdateModification<'static>, ContractError>;
 
     /// Generate a concise summary of a state that can be used to create deltas
     /// relative to this state.
@@ -304,7 +319,9 @@ pub trait ContractInterface {
 /// and a `contract` section.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Contract<'a> {
+    #[serde(borrow)]
     pub parameters: Parameters<'a>,
+    #[serde(borrow)]
     pub data: ContractCode<'a>,
     key: ContractKey,
 }
@@ -399,17 +416,27 @@ impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     }
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct Parameters<'a>(Cow<'a, [u8]>);
+pub struct Parameters<'a>(
+    #[serde_as(as = "serde_with::Bytes")]
+    #[serde(borrow)]
+    Cow<'a, [u8]>,
+);
 
 impl<'a> Parameters<'a> {
     pub fn size(&self) -> usize {
         self.0.len()
     }
 
-    pub fn into_owned(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
+    }
+
+    pub fn owned(self) -> Parameters<'static> {
+        let data: Cow<'static, _> = Cow::from(self.0.to_owned().to_vec());
+        Parameters(data)
     }
 }
 
@@ -425,18 +452,12 @@ impl<'a> From<&'a [u8]> for Parameters<'a> {
     }
 }
 
-impl TryFrom<&rmpv::Value> for Parameters<'static> {
+impl<'a> TryFrom<&'a rmpv::Value> for Parameters<'a> {
     type Error = String;
 
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
         let contract_params = value.as_map().unwrap();
-        let params = contract_params
-            .get(0)
-            .unwrap()
-            .1
-            .as_slice()
-            .unwrap()
-            .to_vec();
+        let params = contract_params.get(0).unwrap().1.as_slice().unwrap();
         Ok(Parameters::from(params))
     }
 }
@@ -450,16 +471,21 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
+#[serde_as]
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct State<'a>(Cow<'a, [u8]>);
+pub struct State<'a>(
+    #[serde_as(as = "serde_with::Bytes")]
+    #[serde(borrow)]
+    Cow<'a, [u8]>,
+);
 
 impl<'a> State<'a> {
     pub fn size(&self) -> usize {
         self.0.len()
     }
 
-    pub fn into_owned(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
     }
 
@@ -509,16 +535,21 @@ impl<'a> std::io::Read for State<'a> {
     }
 }
 
+#[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct StateDelta<'a>(Cow<'a, [u8]>);
+pub struct StateDelta<'a>(
+    #[serde_as(as = "serde_with::Bytes")]
+    #[serde(borrow)]
+    Cow<'a, [u8]>,
+);
 
 impl<'a> StateDelta<'a> {
     pub fn size(&self) -> usize {
         self.0.len()
     }
 
-    pub fn into_owned(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
     }
 }
@@ -558,11 +589,16 @@ impl<'a> DerefMut for StateDelta<'a> {
     }
 }
 
+#[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct StateSummary<'a>(Cow<'a, [u8]>);
+pub struct StateSummary<'a>(
+    #[serde_as(as = "serde_with::Bytes")]
+    #[serde(borrow)]
+    Cow<'a, [u8]>,
+);
 
 impl<'a> StateSummary<'a> {
-    pub fn into_owned(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
     }
 }
@@ -623,6 +659,8 @@ impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContractCode<'a> {
+    #[serde_as(as = "serde_with::Bytes")]
+    #[serde(borrow)]
     data: Cow<'a, [u8]>,
     #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     key: [u8; CONTRACT_KEY_SIZE],
@@ -641,7 +679,7 @@ impl ContractCode<'_> {
         &*self.data
     }
 
-    pub fn into_data(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         self.data.to_owned().to_vec()
     }
 
@@ -649,6 +687,14 @@ impl ContractCode<'_> {
         bs58::encode(hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
+    }
+
+    pub fn owned(self) -> ContractCode<'static> {
+        let data: Cow<'static, _> = Cow::from(self.data.to_owned().to_vec());
+        ContractCode {
+            data,
+            key: self.key,
+        }
     }
 
     fn gen_key(data: &[u8]) -> [u8; CONTRACT_KEY_SIZE] {
@@ -682,12 +728,12 @@ impl<'a> From<&'a [u8]> for ContractCode<'a> {
     }
 }
 
-impl TryFrom<&rmpv::Value> for ContractCode<'static> {
+impl<'a> TryFrom<&'a rmpv::Value> for ContractCode<'a> {
     type Error = String;
 
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
         let contract_data = value.as_map().unwrap();
-        let data = contract_data.get(0).unwrap().1.as_slice().unwrap().to_vec();
+        let data = contract_data.get(0).unwrap().1.as_slice().unwrap();
         Ok(ContractCode::from(data))
     }
 }
@@ -984,9 +1030,17 @@ pub(crate) mod wasm_interface {
                 ResultKind::ValidateState => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
-                    eprintln!("DESER: {serialized:?}");
-                    bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))
+                    let value = bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")));
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
+                             serialized: {serialized:?}
+                             value: {value:?}",
+                            self.ptr as *mut u8, self.ptr
+                        );
+                    }
+                    value
                 }
                 _ => panic!(),
             }
@@ -1011,7 +1065,7 @@ pub(crate) mod wasm_interface {
         pub unsafe fn unwrap_update_state(
             self,
             mem: WasmLinearMem,
-        ) -> Result<UpdateModification, ContractError> {
+        ) -> Result<UpdateModification<'static>, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::UpdateState => {
@@ -1057,21 +1111,27 @@ pub(crate) mod wasm_interface {
         }
 
         pub fn into_raw(self) -> i64 {
+            if cfg!(debug_assertions) {
+                eprintln!("returning FFI -> {self:?}");
+            }
             let ptr = Box::into_raw(Box::new(self));
             if cfg!(debug_assertions) {
-                eprintln!("returning FFI result @ {ptr:p} ({}i64) ", ptr as i64);
+                eprintln!("returning FFI result @ {ptr:p} ({}i64)", ptr as i64);
             }
             ptr as _
         }
 
         pub unsafe fn from_raw(ptr: i64, mem: &WasmLinearMem) -> Self {
-            if cfg!(debug_assertions) {
-                eprintln!("got FFI result @ {ptr} ({:p}) ", ptr as *mut Self);
-            }
             let result = Box::leak(Box::from_raw(crate::buf::compute_ptr(
                 ptr as *mut Self,
                 mem,
             )));
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "got FFI result @ {ptr} ({:p}) -> {result:?}",
+                    ptr as *mut Self
+                );
+            }
             *result
         }
     }
@@ -1086,9 +1146,15 @@ pub(crate) mod wasm_interface {
                     //       the host, maybe even if is just for some architectures
                     let serialized = bincode::serialize(&value).unwrap();
                     let size = serialized.len() as _;
-                    let ptr = serialized.as_ptr() as i64;
+                    let ptr = serialized.as_ptr();
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "sending result through FFI; addr: {ptr:p} ({}),\n  serialized: {serialized:?}\n  value: {value:?}",
+                            ptr as i64
+                        );
+                    }
                     std::mem::forget(serialized);
-                    Self { kind, ptr, size }
+                    Self { kind, ptr: ptr as i64, size }
                 }
             }
         };
@@ -1096,7 +1162,7 @@ pub(crate) mod wasm_interface {
 
     conversion!(Result<ValidateResult, ContractError>: ResultKind::ValidateState);
     conversion!(Result<bool, ContractError>: ResultKind::ValidateDelta);
-    conversion!(Result<UpdateModification, ContractError>: ResultKind::UpdateState);
+    conversion!(Result<UpdateModification<'static>, ContractError>: ResultKind::UpdateState);
     conversion!(Result<StateSummary<'static>, ContractError>: ResultKind::SummarizeState);
     conversion!(Result<StateDelta<'static>, ContractError>: ResultKind::StateDelta);
 }

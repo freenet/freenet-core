@@ -74,9 +74,9 @@ impl ContractExecutor {
     pub async fn preload(
         &mut self,
         cli_id: ClientId,
-        contract: WrappedContract<'static>,
+        contract: WrappedContract,
         state: WrappedState,
-        related_contracts: RelatedContracts,
+        related_contracts: RelatedContracts<'static>,
     ) {
         if let Err(err) = self
             .handle_request(
@@ -100,7 +100,7 @@ impl ContractExecutor {
     pub async fn handle_request(
         &mut self,
         id: ClientId,
-        req: ClientRequest,
+        req: ClientRequest<'static>,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
@@ -187,7 +187,7 @@ impl ContractExecutor {
                             other => Either::Right(other.into()),
                         })?;
                     if let Some(new_state) = update_modification.new_state {
-                        let new_state = WrappedState::new(new_state.into_owned());
+                        let new_state = WrappedState::new(new_state.into_bytes());
                         self.contract_state
                             .store(key, new_state.clone(), None)
                             .await
@@ -282,7 +282,7 @@ impl ContractExecutor {
             let contract = self
                 .runtime
                 .contracts
-                .fetch_contract(&key, &parameters)
+                .fetch_contract(&key, parameters)
                 .ok_or_else(|| RequestError::Get {
                     key,
                     cause: "Missing contract".into(),

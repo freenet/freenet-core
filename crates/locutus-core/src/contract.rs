@@ -36,7 +36,7 @@ where
                     let params = Parameters::from(vec![]); // FIXME
                     contract_handler
                         .contract_store()
-                        .fetch_contract(&key, &params)
+                        .fetch_contract(&key, params)
                 } else {
                     None
                 };
@@ -45,7 +45,7 @@ where
                         let parameters = Parameters::from(vec![]); // FIXME
                         contract_handler
                             .contract_store()
-                            .fetch_contract(&key, &parameters)
+                            .fetch_contract(&key, parameters)
                     } else {
                         None
                     };

@@ -65,7 +65,10 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), DynEr
     execute_command(request, other).await
 }
 
-async fn execute_command(request: ClientRequest, other: BaseConfig) -> Result<(), DynError> {
+async fn execute_command(
+    request: ClientRequest<'static>,
+    other: BaseConfig,
+) -> Result<(), DynError> {
     let data_path = other
         .data_dir
         .unwrap_or_else(|| std::env::temp_dir().join("locutus"));

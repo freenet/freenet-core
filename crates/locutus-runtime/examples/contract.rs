@@ -24,7 +24,7 @@ impl ContractInterface for Contract {
         _parameters: Parameters<'static>,
         _state: State<'static>,
         _data: Vec<UpdateData>,
-    ) -> Result<UpdateModification, ContractError> {
+    ) -> Result<UpdateModification<'static>, ContractError> {
         unimplemented!()
     }
 

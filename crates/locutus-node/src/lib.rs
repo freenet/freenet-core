@@ -14,7 +14,7 @@ enum ClientConnection {
     NewConnection(tokio::sync::mpsc::UnboundedSender<HostCallbackResult>),
     Request {
         client_id: ClientId,
-        req: ClientRequest,
+        req: ClientRequest<'static>,
     },
 }
 

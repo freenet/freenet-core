@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Context;
 use std::{collections::HashMap, task::Poll};
 
+use futures::future::BoxFuture;
 use futures::task::AtomicWaker;
 use futures::FutureExt;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -12,7 +13,7 @@ use super::{BoxedClient, ClientError, HostResult};
 use crate::client_events::{ErrorKind, OpenRequest};
 use crate::{ClientEventsProxy, ClientId, HostResponse};
 
-type HostIncomingMsg = Result<OpenRequest, ClientError>;
+type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
 static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
 
@@ -58,11 +59,8 @@ impl<const N: usize> ClientEventsCombinator<N> {
     }
 }
 
-#[allow(clippy::needless_lifetimes)]
 impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
-    fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<OpenRequest<'static>, ClientError>> {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
             let pend_futs = &mut self.pend_futs;
@@ -128,11 +126,11 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
         })
     }
 
-    fn send<'a>(
-        &'a mut self,
+    fn send(
+        &mut self,
         internal: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         Box::pin(async move {
             let (idx, external) = self
                 .internal_clients
@@ -150,7 +148,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
 async fn client_fn(
     mut client: BoxedClient,
     mut rx: Receiver<(ClientId, HostResult)>,
-    tx_host: Sender<Result<OpenRequest, ClientError>>,
+    tx_host: Sender<Result<OpenRequest<'static>, ClientError>>,
 ) {
     loop {
         tokio::select! {
@@ -260,10 +258,7 @@ mod test {
     }
 
     impl ClientEventsProxy for SampleProxy {
-        fn recv<'a>(
-            &'a mut self,
-        ) -> Pin<Box<dyn Future<Output = crate::client_events::HostIncomingMsg> + Send + Sync + 'a>>
-        {
+        fn recv(&mut self) -> BoxFuture<'_, crate::client_events::HostIncomingMsg> {
             Box::pin(async {
                 let id = self
                     .rx
@@ -280,11 +275,11 @@ mod test {
             })
         }
 
-        fn send<'a>(
-            &'a mut self,
+        fn send(
+            &mut self,
             _id: ClientId,
             _response: Result<HostResponse, ClientError>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>> {
+        ) -> BoxFuture<'_, Result<(), ClientError>> {
             todo!()
         }
     }

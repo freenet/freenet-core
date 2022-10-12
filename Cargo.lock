@@ -2213,6 +2213,7 @@ dependencies = [
  "rand 0.8.5",
  "rmpv",
  "serde",
+ "serde_bytes",
  "serde_with",
  "tar",
  "thiserror",

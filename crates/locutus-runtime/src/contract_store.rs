@@ -83,14 +83,17 @@ impl ContractStore {
     pub fn fetch_contract<'a>(
         &self,
         key: &ContractKey,
-        params: &Parameters<'a>,
-    ) -> Option<WrappedContract<'a>> {
+        params: Parameters<'a>,
+    ) -> Option<WrappedContract> {
         let result = key
             .code_hash()
             .and_then(|code_hash| {
-                self.contract_cache
-                    .get(code_hash)
-                    .map(|data| Some(WrappedContract::new(data.value().clone(), params.clone())))
+                self.contract_cache.get(code_hash).map(|data| {
+                    Some(WrappedContract::new(
+                        data.value().clone(),
+                        params.clone().owned(),
+                    ))
+                })
             })
             .flatten();
         if result.is_some() {
@@ -246,7 +249,7 @@ mod test {
             [0, 1].as_ref().into(),
         );
         store.store_contract(contract.clone())?;
-        let f = store.fetch_contract(contract.key(), &([0, 1].as_ref().into()));
+        let f = store.fetch_contract(contract.key(), [0, 1].as_ref().into());
         assert!(f.is_some());
         Ok(())
     }

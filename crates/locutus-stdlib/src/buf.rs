@@ -182,10 +182,12 @@ impl<'instance> BufferMut<'instance> {
 }
 
 #[inline(always)]
-pub(crate) unsafe fn compute_ptr<T>(ptr: *mut T, linear_mem_space: &WasmLinearMem) -> *mut T {
+pub(crate) fn compute_ptr<T>(ptr: *mut T, linear_mem_space: &WasmLinearMem) -> *mut T {
     let mem_start_ptr = linear_mem_space.start_ptr;
     let result = (mem_start_ptr as isize + ptr as isize) as _;
+    #[cfg(testing)] // FIXME: add a `trace`feature instead
     log::trace!("map ptr: {ptr:p} -> {result:p}");
+    #[allow(clippy::let_and_return)]
     result
 }
 
@@ -200,7 +202,7 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
         if cfg!(debug_assertions) {
             let contract_mem = std::slice::from_raw_parts(mem.start_ptr, mem.size as usize);
             eprintln!(
-                "offset: {}; in mem: {:?}",
+                "*mut BufferBuilder <- offset: {}; in mem: {:?}",
                 builder_ptr as usize,
                 &contract_mem[builder_ptr as usize
                     ..builder_ptr as usize + std::mem::size_of::<BufferBuilder>()]
@@ -213,7 +215,7 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
         let builder_ptr = compute_ptr(builder_ptr, &mem);
         let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
         if cfg!(debug_assertions) {
-            eprintln!("{buf_builder:?}");
+            eprintln!("buf builder from FFI: {buf_builder:?}");
         }
 
         let read_ptr = Box::leak(Box::from_raw(compute_ptr(

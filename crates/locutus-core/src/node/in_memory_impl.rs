@@ -92,7 +92,7 @@ where
 
     pub async fn append_contracts<'a>(
         &self,
-        contracts: Vec<(WrappedContract<'static>, WrappedState)>,
+        contracts: Vec<(WrappedContract, WrappedState)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, state) in contracts {
