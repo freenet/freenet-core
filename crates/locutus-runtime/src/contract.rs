@@ -82,10 +82,10 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for WrappedContract<'static> {
     }
 }
 
-impl TryFrom<&'static rmpv::Value> for WrappedContract<'static> {
+impl TryFrom<&rmpv::Value> for WrappedContract<'static> {
     type Error = String;
 
-    fn try_from(value: &'static rmpv::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
         let contract_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
             value
                 .as_map()
@@ -94,7 +94,7 @@ impl TryFrom<&'static rmpv::Value> for WrappedContract<'static> {
                 .map(|(key, val)| (key.as_str().unwrap(), val)),
         );
 
-        let key_value = contract_map.get("key").unwrap().to_owned();
+        let key_value = contract_map.get("key").unwrap();
         let key_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
             key_value
                 .as_map()
@@ -105,11 +105,11 @@ impl TryFrom<&'static rmpv::Value> for WrappedContract<'static> {
         let key_instance = *key_map.get("instance").unwrap();
         let contract_key = ContractKey::try_from(key_instance).unwrap();
 
-        let contract_data = contract_map.get("data").unwrap().to_owned();
-        let data = Arc::new(ContractCode::try_from(contract_data).unwrap());
+        let contract_data = contract_map.get("data").unwrap();
+        let data = Arc::new(ContractCode::try_from(*contract_data).unwrap());
 
-        let contract_params = contract_map.get("parameters").unwrap().to_owned();
-        let params = Parameters::try_from(contract_params).unwrap();
+        let contract_params = contract_map.get("parameters").unwrap();
+        let params = Parameters::try_from(*contract_params).unwrap();
 
         Ok(Self {
             data,

@@ -221,6 +221,7 @@ pub enum RequestError {
     Disconnect,
 }
 
+// TODO: relax this to not neeed 'static
 /// A request from a client application to the host.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
@@ -282,11 +283,10 @@ impl ClientRequest {
                 map_keys.sort();
                 match map_keys.as_slice() {
                     ["contract", "relatedContracts", "state"] => {
+                        let contract = value_map.get("contract").unwrap();
                         ClientRequest::Put {
-                            contract: WrappedContract::try_from(
-                                *value_map.get("contract").unwrap(),
-                            )
-                            .map_err(ErrorKind::deserialization)?,
+                            contract: WrappedContract::try_from(*contract)
+                                .map_err(ErrorKind::deserialization)?,
                             state: WrappedState::try_from(*value_map.get("state").unwrap())
                                 .map_err(ErrorKind::deserialization)?,
                             related_contracts: RelatedContracts::try_from(
@@ -295,14 +295,12 @@ impl ClientRequest {
                             .map_err(ErrorKind::deserialization)?,
                         }
                     }
-                    ["data", "key"] => {
-                        ClientRequest::Update {
-                            key: ContractKey::try_from(*value_map.get("key").unwrap())
-                                .map_err(ErrorKind::deserialization)?,
-                            data: UpdateData::try_from(*value_map.get("data").unwrap())
-                                .map_err(ErrorKind::deserialization)?,
-                        }
-                    }
+                    ["data", "key"] => ClientRequest::Update {
+                        key: ContractKey::try_from(*value_map.get("key").unwrap())
+                            .map_err(ErrorKind::deserialization)?,
+                        data: UpdateData::try_from(*value_map.get("data").unwrap())
+                            .map_err(ErrorKind::deserialization)?,
+                    },
                     ["fetch_contract", "key"] => ClientRequest::Get {
                         key: ContractKey::try_from(*value_map.get("key").unwrap())
                             .map_err(ErrorKind::deserialization)?,

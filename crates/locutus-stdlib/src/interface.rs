@@ -8,7 +8,7 @@ use std::{
     borrow::{Borrow, Cow},
     collections::HashMap,
     fmt::Display,
-    hash::{Hasher, Hash},
+    hash::{Hash, Hasher},
     io::{Cursor, Read},
     ops::{Deref, DerefMut},
     str::FromStr,
@@ -76,6 +76,7 @@ impl UpdateModification {
     }
 }
 
+// TODO: relax this to not neeed 'static
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct RelatedContracts {
     map: HashMap<ContractInstanceId, Option<State<'static>>>,
@@ -85,17 +86,12 @@ impl TryFrom<&rmpv::Value> for RelatedContracts {
     type Error = String;
 
     fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let related_contracts: HashMap<ContractInstanceId, Option<State<'static>>> = HashMap::from_iter(
-            value
-                .as_map()
-                .unwrap()
-                .iter()
-                .map(|(key, val)| {
-                    let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
-                    let state = State::from(val.as_slice().unwrap().to_vec());
-                    (id, Some(state))
-                }),
-        );
+        let related_contracts: HashMap<ContractInstanceId, Option<State<'static>>> =
+            HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
+                let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
+                let state = State::from(val.as_slice().unwrap().to_vec());
+                (id, Some(state))
+            }));
         Ok(RelatedContracts::from(related_contracts))
     }
 }
@@ -108,9 +104,11 @@ impl RelatedContracts {
     }
 }
 
-impl<'a> From<HashMap<ContractInstanceId, Option<State<'static>>>> for RelatedContracts {
+impl From<HashMap<ContractInstanceId, Option<State<'static>>>> for RelatedContracts {
     fn from(related_contracts: HashMap<ContractInstanceId, Option<State<'static>>>) -> Self {
-        Self { map: related_contracts }
+        Self {
+            map: related_contracts,
+        }
     }
 }
 
@@ -427,12 +425,18 @@ impl<'a> From<&'a [u8]> for Parameters<'a> {
     }
 }
 
-impl TryFrom<&'static rmpv::Value> for Parameters<'static> {
+impl TryFrom<&rmpv::Value> for Parameters<'static> {
     type Error = String;
 
-    fn try_from(value: &'static rmpv::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
         let contract_params = value.as_map().unwrap();
-        let params = contract_params.get(0).unwrap().1.as_slice().unwrap();
+        let params = contract_params
+            .get(0)
+            .unwrap()
+            .1
+            .as_slice()
+            .unwrap()
+            .to_vec();
         Ok(Parameters::from(params))
     }
 }
@@ -678,16 +682,15 @@ impl<'a> From<&'a [u8]> for ContractCode<'a> {
     }
 }
 
-impl TryFrom<&'static rmpv::Value> for ContractCode<'static> {
+impl TryFrom<&rmpv::Value> for ContractCode<'static> {
     type Error = String;
 
-    fn try_from(value: &'static rmpv::Value) -> Result<Self, Self::Error> {
+    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
         let contract_data = value.as_map().unwrap();
-        let data = contract_data.get(0).unwrap().1.as_slice().unwrap();
+        let data = contract_data.get(0).unwrap().1.as_slice().unwrap().to_vec();
         Ok(ContractCode::from(data))
     }
 }
-
 
 impl PartialEq for ContractCode<'_> {
     fn eq(&self, other: &Self) -> bool {
