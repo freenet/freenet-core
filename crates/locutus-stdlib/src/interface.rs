@@ -80,11 +80,16 @@ impl UpdateModification {
 ///
 /// Contains all necessary methods to interact with the contract.
 ///
-///# Examples
+/// # Examples
 ///
 /// Implementing `ContractInterface` on a type:
 ///
 /// ```
+/// use locutus_stdlib::prelude::*;
+///
+/// struct Contract;
+///
+/// #[contract]
 /// impl ContractInterface for Contract {
 ///     fn validate_state(_parameters: Parameters<'static>, _state: State<'static>) -> bool {
 ///         true
