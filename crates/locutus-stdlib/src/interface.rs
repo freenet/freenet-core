@@ -83,7 +83,7 @@ pub struct RelatedContracts<'a> {
     map: HashMap<ContractInstanceId, Option<State<'a>>>,
 }
 
-impl<'a> RelatedContracts<'a> {
+impl RelatedContracts<'_> {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
@@ -91,7 +91,11 @@ impl<'a> RelatedContracts<'a> {
     }
 
     pub fn owned(self) -> RelatedContracts<'static> {
-        todo!()
+        let mut map = HashMap::with_capacity(self.map.len());
+        for (k, v) in self.map {
+            map.insert(k, v.map(|s| State::from(s.into_bytes())));
+        }
+        RelatedContracts { map }
     }
 }
 
@@ -196,7 +200,31 @@ impl UpdateData<'_> {
     }
 
     pub fn owned(self) -> UpdateData<'static> {
-        todo!()
+        match self {
+            UpdateData::State(s) => UpdateData::State(State::from(s.into_bytes())),
+            UpdateData::Delta(d) => UpdateData::Delta(StateDelta::from(d.into_bytes())),
+            UpdateData::StateAndDelta { state, delta } => UpdateData::StateAndDelta {
+                delta: StateDelta::from(delta.into_bytes()),
+                state: State::from(state.into_bytes()),
+            },
+            UpdateData::RelatedState { related_to, state } => UpdateData::RelatedState {
+                related_to,
+                state: State::from(state.into_bytes()),
+            },
+            UpdateData::RelatedDelta { related_to, delta } => UpdateData::RelatedDelta {
+                related_to,
+                delta: StateDelta::from(delta.into_bytes()),
+            },
+            UpdateData::RelatedStateAndDelta {
+                related_to,
+                state,
+                delta,
+            } => UpdateData::RelatedStateAndDelta {
+                related_to,
+                state: State::from(state.into_bytes()),
+                delta: StateDelta::from(delta.into_bytes()),
+            },
+        }
     }
 }
 

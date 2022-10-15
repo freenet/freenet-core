@@ -372,7 +372,7 @@ pub(in crate::contract) mod sqlite {
                 .then(|| {
                     let params = self.params.get(key).ok_or(SqlDbError::ContractNotFound)?;
                     self.store
-                        .fetch_contract(key, params.clone())
+                        .fetch_contract(key, params)
                         .ok_or(SqlDbError::ContractNotFound)
                 })
                 .transpose()?;

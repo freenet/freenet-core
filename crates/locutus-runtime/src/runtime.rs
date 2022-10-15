@@ -172,7 +172,7 @@ impl Runtime {
     fn get_module(&mut self, key: &ContractKey, parameters: &Parameters<'_>) -> RuntimeResult<()> {
         let contract = self
             .contracts
-            .fetch_contract(key, parameters.clone())
+            .fetch_contract(key, parameters)
             .ok_or(ContractRuntimeError::ContractNotFound(*key))?;
         let module = Module::new(&self.store, contract.code().data())?;
         self.modules.insert(*key, module);

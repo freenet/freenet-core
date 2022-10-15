@@ -3,10 +3,7 @@ use std::{
     error::Error,
     future::Future,
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
@@ -20,7 +17,7 @@ use crate::{ClientRequest, HostResponse};
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 pub struct WebSocketProxy {
-    server_request: Receiver<OpenRequest<'static>>,
+    server_request: Receiver<StaticOpenRequest>,
     server_response: Sender<(ClientId, HostResult)>,
 }
 
@@ -53,17 +50,14 @@ impl WebSocketProxy {
         socket: SocketAddr,
         filter: BoxedFilter<(impl Reply + 'static,)>,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
-        let (request_sender, server_request): (Sender<OpenRequest<'static>>, _) =
-            channel(PARALLELISM);
+        let (request_sender, server_request) = channel(PARALLELISM);
         let (server_response, response_receiver) = channel(PARALLELISM);
         let (new_client_up, new_clients) = channel(PARALLELISM);
-        // tokio::spawn(serve(
-        //     Arc::new(request_sender),
-        //     Arc::new(new_client_up),
-        //     socket.into(),
-        //     filter,
-        // ));
+
+        let server = serve(request_sender, new_client_up, socket, filter);
+        tokio::spawn(server);
         tokio::spawn(responses(new_clients, response_receiver));
+
         Ok(Self {
             server_request,
             server_response,
@@ -71,13 +65,23 @@ impl WebSocketProxy {
     }
 }
 
+// work around for rustc issue #64552
+struct StaticOpenRequest(OpenRequest<'static>);
+
+impl From<OpenRequest<'static>> for StaticOpenRequest {
+    fn from(val: OpenRequest<'static>) -> Self {
+        StaticOpenRequest(val)
+    }
+}
+
 impl ClientEventsProxy for WebSocketProxy {
-    fn recv<'a>(&'a mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
+    fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
         Box::pin(async move {
             let req = self
                 .server_request
                 .recv()
                 .await
+                .map(|r| r.0)
                 .ok_or(ErrorKind::ChannelClosed)?;
             Ok(req)
         })
@@ -99,8 +103,8 @@ impl ClientEventsProxy for WebSocketProxy {
 }
 
 async fn serve(
-    request_sender: Arc<Sender<OpenRequest<'static>>>,
-    new_responses: Arc<Sender<ClientHandling>>,
+    request_sender: Sender<StaticOpenRequest>,
+    new_responses: Sender<ClientHandling>,
     socket: SocketAddr,
     server_config: BoxedFilter<(impl Reply + 'static,)>,
 ) {
@@ -161,8 +165,8 @@ static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 async fn handle_socket(
     socket: warp::ws::WebSocket,
-    request_sender: Arc<Sender<OpenRequest<'static>>>,
-    client_handler: Arc<Sender<ClientHandling>>,
+    request_sender: Sender<StaticOpenRequest>,
+    client_handler: Sender<ClientHandling>,
 ) {
     let client_id = ClientId(CLIENT_ID.fetch_add(1, Ordering::SeqCst));
     let (mut client_tx, mut client_rx) = socket.split();
@@ -193,7 +197,7 @@ async fn handle_socket(
 }
 
 async fn new_request(
-    request_sender: &Arc<Sender<OpenRequest<'static>>>,
+    request_sender: &Sender<StaticOpenRequest>,
     id: ClientId,
     result: Option<Result<warp::ws::Message, warp::Error>>,
 ) -> Result<(), ()> {
@@ -204,41 +208,49 @@ async fn new_request(
                 Ok(m) => m,
                 Err(e) => {
                     let _ = request_sender
-                        .send(OpenRequest {
-                            id,
-                            request: ClientRequest::Disconnect {
-                                cause: Some(format!("{e}")),
-                            },
-                            notification_channel: None,
-                        })
+                        .send(
+                            OpenRequest {
+                                id,
+                                request: ClientRequest::Disconnect {
+                                    cause: Some(format!("{e}")),
+                                },
+                                notification_channel: None,
+                            }
+                            .into(),
+                        )
                         .await;
                     return Ok(());
                 }
             };
-            // deserialized
-            todo!()
+            deserialized
         }
         Some(Ok(_)) => return Ok(()),
         Some(Err(e)) => {
             let _ = request_sender
-                .send(OpenRequest {
-                    id,
-                    request: ClientRequest::Disconnect {
-                        cause: Some(format!("{e}")),
-                    },
-                    notification_channel: None,
-                })
+                .send(
+                    OpenRequest {
+                        id,
+                        request: ClientRequest::Disconnect {
+                            cause: Some(format!("{e}")),
+                        },
+                        notification_channel: None,
+                    }
+                    .into(),
+                )
                 .await;
             return Err(());
         }
         None => return Err(()),
     };
     if request_sender
-        .send(OpenRequest {
-            id,
-            request: msg,
-            notification_channel: None,
-        })
+        .send(
+            OpenRequest {
+                id,
+                request: msg,
+                notification_channel: None,
+            }
+            .into(),
+        )
         .await
         .is_err()
     {

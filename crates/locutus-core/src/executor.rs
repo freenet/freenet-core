@@ -282,7 +282,7 @@ impl ContractExecutor {
             let contract = self
                 .runtime
                 .contracts
-                .fetch_contract(&key, parameters)
+                .fetch_contract(&key, &parameters)
                 .ok_or_else(|| RequestError::Get {
                     key,
                     cause: "Missing contract".into(),

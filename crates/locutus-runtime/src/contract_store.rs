@@ -83,7 +83,7 @@ impl ContractStore {
     pub fn fetch_contract<'a>(
         &self,
         key: &ContractKey,
-        params: Parameters<'a>,
+        params: &Parameters<'a>,
     ) -> Option<WrappedContract> {
         let result = key
             .code_hash()
@@ -107,9 +107,8 @@ impl ContractStore {
                 .into_string()
                 .to_lowercase();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
-            let owned_params = Parameters::from(params.as_ref().to_owned());
             let WrappedContract { data, params, .. } =
-                WrappedContract::try_from((&*key_path, owned_params))
+                WrappedContract::try_from((&*key_path, params.clone().owned()))
                     .map_err(|err| {
                         tracing::debug!("contract not found: {err}");
                         err
@@ -249,7 +248,7 @@ mod test {
             [0, 1].as_ref().into(),
         );
         store.store_contract(contract.clone())?;
-        let f = store.fetch_contract(contract.key(), [0, 1].as_ref().into());
+        let f = store.fetch_contract(contract.key(), &[0, 1].as_ref().into());
         assert!(f.is_some());
         Ok(())
     }

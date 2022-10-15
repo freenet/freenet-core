@@ -36,16 +36,16 @@ where
                     let params = Parameters::from(vec![]); // FIXME
                     contract_handler
                         .contract_store()
-                        .fetch_contract(&key, params)
+                        .fetch_contract(&key, &params)
                 } else {
                     None
                 };
                 let _response = {
                     let _contract = if fetch_contract {
-                        let parameters = Parameters::from(vec![]); // FIXME
+                        let params = Parameters::from(vec![]); // FIXME
                         contract_handler
                             .contract_store()
-                            .fetch_contract(&key, parameters)
+                            .fetch_contract(&key, &params)
                     } else {
                         None
                     };

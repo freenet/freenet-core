@@ -103,7 +103,10 @@ pub struct OpenRequest<'a> {
 
 impl<'a> OpenRequest<'a> {
     pub fn owned(self) -> OpenRequest<'static> {
-        todo!()
+        OpenRequest {
+            request: self.request.owned(),
+            ..self
+        }
     }
 
     pub fn new(id: ClientId, request: ClientRequest<'a>) -> Self {
@@ -223,7 +226,6 @@ pub enum RequestError {
     Disconnect,
 }
 
-// TODO: relax this to not neeed 'static
 /// A request from a client application to the host.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
@@ -261,8 +263,34 @@ pub enum ClientRequest<'a> {
 }
 
 impl ClientRequest<'_> {
-    pub fn into_owned(self) -> ClientRequest<'static> {
-        todo!()
+    pub fn owned(self) -> ClientRequest<'static> {
+        match self {
+            ClientRequest::Put {
+                contract,
+                state,
+                related_contracts,
+            } => {
+                let related_contracts = related_contracts.owned();
+                ClientRequest::Put {
+                    contract,
+                    state,
+                    related_contracts,
+                }
+            }
+            ClientRequest::Update { key, data } => {
+                let data = data.owned();
+                ClientRequest::Update { key, data }
+            }
+            ClientRequest::Get {
+                key,
+                fetch_contract,
+            } => ClientRequest::Get {
+                key,
+                fetch_contract,
+            },
+            ClientRequest::Subscribe { key } => ClientRequest::Subscribe { key },
+            ClientRequest::Disconnect { cause } => ClientRequest::Disconnect { cause },
+        }
     }
 
     pub fn is_disconnect(&self) -> bool {
