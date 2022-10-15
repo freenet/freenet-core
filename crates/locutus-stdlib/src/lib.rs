@@ -5,8 +5,10 @@ pub mod interface;
 pub mod web;
 
 pub use blake2;
+/// Generate the necessary code for the WASM runtime to interact with your contract ergonomically and safely.
 pub use locutus_macros::contract;
 
+/// Locutus stdlib prelude.
 pub mod prelude {
     pub use crate::interface::wasm_interface::*;
     pub use crate::interface::*;
