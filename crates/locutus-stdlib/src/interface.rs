@@ -355,7 +355,7 @@ pub trait ContractInterface {
     fn validate_state(
         parameters: Parameters<'static>,
         state: State<'static>,
-        related: RelatedContracts,
+        related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError>;
 
     /// Verify that a delta is valid if possible, returns false if and only delta is
@@ -369,7 +369,7 @@ pub trait ContractInterface {
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
-        data: Vec<UpdateData>,
+        data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError>;
 
     /// Generate a concise summary of a state that can be used to create deltas

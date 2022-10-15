@@ -7,7 +7,7 @@ impl ContractInterface for Contract {
     fn validate_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        _related: RelatedContracts,
+        _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         let bytes = state.as_ref();
         if bytes.len() == 4 {
@@ -40,7 +40,7 @@ impl ContractInterface for Contract {
     fn update_state(
         _parameters: Parameters<'static>,
         _state: State<'static>,
-        _data: Vec<UpdateData>,
+        _data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification, ContractError> {
         unimplemented!()
     }
