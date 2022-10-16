@@ -176,7 +176,7 @@ impl ContractExecutor {
 
                     let update_modification = self
                         .runtime
-                        .update_state(&key, &parameters, &state, &data)
+                        .update_state(&key, &parameters, &state, &[data])
                         .map_err(|err| match err {
                             ContractRuntimeError::ExecError(ExecError::ContractError(err)) => {
                                 Either::Left(RequestError::Update {

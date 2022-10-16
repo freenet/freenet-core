@@ -21,7 +21,8 @@ notify = "5"
 once_cell = "1"
 serde = { version = "1", features = ["rc", "derive"] }
 serde_bytes = "0.11"
-rmpv = { version = "1"}
+rmpv = "1"
+rmp-serde = { version = "1" } 
 stretto = { version = "0.7", features = ["async", "sync"], default-features = false }
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"

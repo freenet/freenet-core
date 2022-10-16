@@ -33,7 +33,7 @@ pub trait RuntimeInterface {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
-        update_date: &UpdateData<'a>,
+        update_data: &[UpdateData<'a>],
     ) -> RuntimeResult<UpdateModification>;
 
     fn summarize_state<'a>(
@@ -113,9 +113,9 @@ impl RuntimeInterface for Runtime {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
-        update_date: &UpdateData<'a>,
+        update_data: &[UpdateData<'a>],
     ) -> RuntimeResult<UpdateModification> {
-        <Self>::update_state(self, key, parameters, state, update_date)
+        <Self>::update_state(self, key, parameters, state, update_data)
     }
 
     fn summarize_state<'a>(
@@ -380,12 +380,13 @@ impl Runtime {
         key: &ContractKey,
         parameters: &Parameters<'a>,
         state: &WrappedState,
-        update_data: &UpdateData<'a>,
+        update_data: &[UpdateData<'a>],
     ) -> RuntimeResult<UpdateModification> {
         // todo: if we keep this hot in memory some things to take into account:
         //       - over subsequent requests state size may change
         //       - the delta may not be necessarily the same size
-        let req_bytes = parameters.size() + state.size() + update_data.size();
+        let req_bytes =
+            parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
         let instance = self.prepare_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
@@ -394,9 +395,9 @@ impl Runtime {
         let mut state_buf = self.init_buf(&instance, &state)?;
         state_buf.write(state.clone())?;
         let serialized =
-            bincode::serialize(&update_data).map_err(|e| ContractRuntimeError::Any(e.into()))?;
-        let mut update_dat_buf = self.init_buf(&instance, &serialized)?;
-        update_dat_buf.write(serialized)?;
+            bincode::serialize(update_data).map_err(|e| ContractRuntimeError::Any(e.into()))?;
+        let mut update_data_buf = self.init_buf(&instance, &serialized)?;
+        update_data_buf.write(serialized)?;
 
         let validate_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
             instance.exports.get_native_function("update_state")?;
@@ -405,7 +406,7 @@ impl Runtime {
                 validate_func.call(
                     param_buf.ptr() as i64,
                     state_buf.ptr() as i64,
-                    update_dat_buf.ptr() as i64,
+                    update_data_buf.ptr() as i64,
                 )?,
                 &linear_mem,
             )
@@ -544,7 +545,6 @@ mod test {
             Default::default(),
         )?;
         assert!(is_valid == ValidateResult::Valid);
-        eprintln!("RESULT: {is_valid:?}");
 
         let not_valid = runtime.validate_state(
             &key,
@@ -552,7 +552,6 @@ mod test {
             &WrappedState::new(vec![1, 0, 0, 1]),
             Default::default(),
         )?;
-        eprintln!("RESULT: {not_valid:?}");
         assert!(matches!(not_valid, ValidateResult::RequestRelated(_)));
 
         Ok(())
@@ -581,7 +580,6 @@ mod test {
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn update_state() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
@@ -593,15 +591,16 @@ mod test {
                 &key,
                 &Parameters::from([].as_ref()),
                 &WrappedState::new(vec![5, 2, 3]),
-                &StateDelta::from([4].as_ref()).into(),
+                &[StateDelta::from([4].as_ref()).into()],
             )?
             .unwrap_valid();
+        eprintln!("RESULT: {new_state:?}");
+        // FIXME: don't deserialize as borrowed since data will be invalid
         assert!(new_state.as_ref().len() == 4);
         assert!(new_state.as_ref()[3] == 4);
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
@@ -618,7 +617,6 @@ mod test {
         Ok(())
     }
 
-    #[ignore]
     #[test]
     fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;

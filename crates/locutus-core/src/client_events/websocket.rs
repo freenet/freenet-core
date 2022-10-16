@@ -7,7 +7,6 @@ use std::{
 };
 
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
-use rmp_serde as rmps;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use warp::{filters::BoxedFilter, Filter, Reply};
 
@@ -263,7 +262,7 @@ async fn send_reponse_to_client(
     response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
     response: Result<HostResponse, ClientError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let serialize = rmps::to_vec(&response).unwrap();
+    let serialize = rmp_serde::to_vec(&response).unwrap();
     response_stream
         .send(warp::ws::Message::binary(serialize))
         .await?;

@@ -1144,7 +1144,7 @@ pub(crate) mod wasm_interface {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
                     let value = bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")));
+                        .map_err(|e| ContractError::Other(format!("{e}")))?;
                     if cfg!(debug_assertions) {
                         eprintln!(
                             "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
@@ -1155,7 +1155,7 @@ pub(crate) mod wasm_interface {
                     }
                     value
                 }
-                _ => panic!(),
+                _ => unreachable!(),
             }
         }
 
@@ -1168,10 +1168,19 @@ pub(crate) mod wasm_interface {
                 ResultKind::ValidateDelta => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
-                    bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))
+                    let value = bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))?;
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
+                             serialized: {serialized:?}
+                             value: {value:?}",
+                            self.ptr as *mut u8, self.ptr
+                        );
+                    }
+                    value
                 }
-                _ => panic!(),
+                _ => unreachable!(),
             }
         }
 
@@ -1184,10 +1193,19 @@ pub(crate) mod wasm_interface {
                 ResultKind::UpdateState => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
-                    bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))
+                    let value = bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))?;
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
+                             serialized: {serialized:?}
+                             value: {value:?}",
+                            self.ptr as *mut u8, self.ptr
+                        );
+                    }
+                    value
                 }
-                _ => panic!(),
+                _ => unreachable!(),
             }
         }
 
@@ -1200,10 +1218,19 @@ pub(crate) mod wasm_interface {
                 ResultKind::ValidateState => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
-                    bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
+                                     serialized: {serialized:?}
+                                     ",
+                            self.ptr as *mut u8, self.ptr
+                        );
+                    }
+                    let value = bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))?;
+                    value
                 }
-                _ => panic!(),
+                _ => unreachable!(),
             }
         }
 
@@ -1216,10 +1243,19 @@ pub(crate) mod wasm_interface {
                 ResultKind::ValidateState => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
-                    bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
+                                     serialized: {serialized:?}
+                                     ",
+                            self.ptr as *mut u8, self.ptr
+                        );
+                    }
+                    let value = bincode::deserialize(serialized)
+                        .map_err(|e| ContractError::Other(format!("{e}")))?;
+                    value
                 }
-                _ => panic!(),
+                _ => unreachable!(),
             }
         }
 

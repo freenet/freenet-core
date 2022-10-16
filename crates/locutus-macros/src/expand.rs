@@ -118,8 +118,8 @@ impl ImplStruct {
                     (::locutus_stdlib::prelude::State::from(bytes), state_buf)
                 };
                 let updates = unsafe {
-                    let delta_buf = &mut *(delta as *mut ::locutus_stdlib::buf::BufferBuilder);
-                    let bytes = &*std::ptr::slice_from_raw_parts(delta_buf.start(), delta_buf.written(None));
+                    let updates = &mut *(delta as *mut ::locutus_stdlib::buf::BufferBuilder);
+                    let bytes = &*std::ptr::slice_from_raw_parts(updates.start(), updates.written(None));
                     match ::locutus_stdlib::prelude::bincode::deserialize(bytes) {
                         Ok(v) => v,
                         Err(err) => return ::locutus_stdlib::prelude::InterfaceResult::from(

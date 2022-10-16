@@ -2175,6 +2175,7 @@ dependencies = [
  "notify",
  "once_cell",
  "rand 0.8.5",
+ "rmp-serde",
  "rmpv",
  "serde",
  "serde_bytes",

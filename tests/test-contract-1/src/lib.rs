@@ -39,10 +39,18 @@ impl ContractInterface for Contract {
 
     fn update_state(
         _parameters: Parameters<'static>,
-        _state: State<'static>,
-        _data: Vec<UpdateData<'static>>,
+        state: State<'static>,
+        mut data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification, ContractError> {
-        unimplemented!()
+        if let Some(UpdateData::Delta(delta)) = data.pop() {
+            if delta.as_ref() == [4] && state.as_ref() == [5, 2, 3] {
+                Ok(UpdateModification::valid(State::from(vec![5, 2, 3, 4])))
+            } else {
+                Err(ContractError::InvalidUpdate)
+            }
+        } else {
+            Err(ContractError::InvalidUpdate)
+        }
     }
 
     fn summarize_state(
