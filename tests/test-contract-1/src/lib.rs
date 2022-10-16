@@ -58,7 +58,11 @@ impl ContractInterface for Contract {
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
         let state = state.as_ref();
-        Ok(StateSummary::from(state[0..3].to_vec()))
+        if state.len() < 3 {
+            Err(ContractError::Other("incorrect data".to_owned()))
+        } else {
+            Ok(StateSummary::from(state[0..3].to_vec()))
+        }
     }
 
     fn get_state_delta(
@@ -66,12 +70,17 @@ impl ContractInterface for Contract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let state = state.as_ref();
-        assert!(state.len() == 4);
-        let summary = summary.as_ref();
-        assert!(summary.len() == 2);
-        assert!(&state[1..=2] == summary);
-        Ok(StateDelta::from(state[3..=3].to_vec()))
+        if state.len() != 4 {
+            return Err(ContractError::Other("incorrect state data".to_owned()));
+        }
+        if summary.len() != 2 {
+            return Err(ContractError::Other("incorrect summ data".to_owned()));
+        }
+        if &state.as_ref()[1..=2] == summary.as_ref() {
+            Ok(StateDelta::from(state[3..=3].to_vec()))
+        } else {
+            Err(ContractError::Other("cannot summarize".to_owned()))
+        }
     }
 }
 

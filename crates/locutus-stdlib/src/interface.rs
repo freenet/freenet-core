@@ -76,6 +76,14 @@ impl<'a> UpdateModification<'a> {
     pub fn get_related(&self) -> &[RelatedContract] {
         &self.related
     }
+
+    pub fn owned(self) -> UpdateModification<'static> {
+        let Self { new_state, related } = self;
+        UpdateModification {
+            new_state: new_state.map(|s| State::from(s.into_bytes())),
+            related,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -1193,8 +1201,9 @@ pub(crate) mod wasm_interface {
                 ResultKind::UpdateState => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
-                    let value = bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))?;
+                    let value: Result<UpdateModification<'_>, ContractError> =
+                        bincode::deserialize(serialized)
+                            .map_err(|e| ContractError::Other(format!("{e}")))?;
                     if cfg!(debug_assertions) {
                         eprintln!(
                             "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
@@ -1203,7 +1212,9 @@ pub(crate) mod wasm_interface {
                             self.ptr as *mut u8, self.ptr
                         );
                     }
-                    value
+                    // TODO: it may be possible to not own this value while deserializing
+                    //       under certain circumstances (e.g. when the cotnract mem is kept alive)
+                    value.map(|r| r.owned())
                 }
                 _ => unreachable!(),
             }
@@ -1215,20 +1226,23 @@ pub(crate) mod wasm_interface {
         ) -> Result<StateSummary<'static>, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
-                ResultKind::ValidateState => {
+                ResultKind::SummarizeState => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    let value: Result<StateSummary<'static>, ContractError> =
+                        bincode::deserialize(serialized)
+                            .map_err(|e| ContractError::Other(format!("{e}")))?;
                     if cfg!(debug_assertions) {
                         eprintln!(
                             "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
-                                     serialized: {serialized:?}
-                                     ",
+                             serialized: {serialized:?}
+                             value: {value:?}",
                             self.ptr as *mut u8, self.ptr
                         );
                     }
-                    let value = bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))?;
-                    value
+                    // TODO: it may be possible to not own this value while deserializing
+                    //       under certain circumstances (e.g. when the contract mem is kept alive)
+                    value.map(|s| StateSummary::from(s.into_bytes()))
                 }
                 _ => unreachable!(),
             }
@@ -1240,20 +1254,23 @@ pub(crate) mod wasm_interface {
         ) -> Result<StateDelta<'static>, ContractError> {
             let kind = ResultKind::from(self.kind);
             match kind {
-                ResultKind::ValidateState => {
+                ResultKind::StateDelta => {
                     let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+                    let value: Result<StateDelta<'static>, ContractError> =
+                        bincode::deserialize(serialized)
+                            .map_err(|e| ContractError::Other(format!("{e}")))?;
                     if cfg!(debug_assertions) {
                         eprintln!(
                             "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
-                                     serialized: {serialized:?}
-                                     ",
+                             serialized: {serialized:?}
+                             value: {value:?}",
                             self.ptr as *mut u8, self.ptr
                         );
                     }
-                    let value = bincode::deserialize(serialized)
-                        .map_err(|e| ContractError::Other(format!("{e}")))?;
-                    value
+                    // TODO: it may be possible to not own this value while deserializing
+                    //       under certain circumstances (e.g. when the contract mem is kept alive)
+                    value.map(|d| StateDelta::from(d.into_bytes()))
                 }
                 _ => unreachable!(),
             }

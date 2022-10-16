@@ -594,8 +594,6 @@ mod test {
                 &[StateDelta::from([4].as_ref()).into()],
             )?
             .unwrap_valid();
-        eprintln!("RESULT: {new_state:?}");
-        // FIXME: don't deserialize as borrowed since data will be invalid
         assert!(new_state.as_ref().len() == 4);
         assert!(new_state.as_ref()[3] == 4);
         Ok(())
@@ -612,8 +610,7 @@ mod test {
             &Parameters::from([].as_ref()),
             &WrappedState::new(vec![5, 2, 3, 4]),
         )?;
-        assert!(summary.as_ref().len() == 1);
-        assert!(summary.as_ref()[0] == 5);
+        assert_eq!(summary.as_ref(), &[5, 2, 3]);
         Ok(())
     }
 
@@ -621,7 +618,7 @@ mod test {
     fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, false).unwrap();
-        // runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
         let delta = runtime.get_state_delta(
             &key,
