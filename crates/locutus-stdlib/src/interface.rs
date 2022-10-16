@@ -1142,6 +1142,7 @@ pub(crate) mod wasm_interface {
     }
 
     impl InterfaceResult {
+        #![allow(clippy::let_and_return)]
         pub unsafe fn unwrap_validate_state_res(
             self,
             mem: WasmLinearMem,
@@ -1153,14 +1154,8 @@ pub(crate) mod wasm_interface {
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
                     let value = bincode::deserialize(serialized)
                         .map_err(|e| ContractError::Other(format!("{e}")))?;
-                    if cfg!(debug_assertions) {
-                        eprintln!(
-                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
-                             serialized: {serialized:?}
-                             value: {value:?}",
-                            self.ptr as *mut u8, self.ptr
-                        );
-                    }
+                    #[cfg(feature = "trace")]
+                    self.log_input(serialized, &value, ptr);
                     value
                 }
                 _ => unreachable!(),
@@ -1178,14 +1173,8 @@ pub(crate) mod wasm_interface {
                     let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
                     let value = bincode::deserialize(serialized)
                         .map_err(|e| ContractError::Other(format!("{e}")))?;
-                    if cfg!(debug_assertions) {
-                        eprintln!(
-                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
-                             serialized: {serialized:?}
-                             value: {value:?}",
-                            self.ptr as *mut u8, self.ptr
-                        );
-                    }
+                    #[cfg(feature = "trace")]
+                    self.log_input(serialized, &value, ptr);
                     value
                 }
                 _ => unreachable!(),
@@ -1204,14 +1193,8 @@ pub(crate) mod wasm_interface {
                     let value: Result<UpdateModification<'_>, ContractError> =
                         bincode::deserialize(serialized)
                             .map_err(|e| ContractError::Other(format!("{e}")))?;
-                    if cfg!(debug_assertions) {
-                        eprintln!(
-                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
-                             serialized: {serialized:?}
-                             value: {value:?}",
-                            self.ptr as *mut u8, self.ptr
-                        );
-                    }
+                    #[cfg(feature = "trace")]
+                    self.log_input(serialized, &value, ptr);
                     // TODO: it may be possible to not own this value while deserializing
                     //       under certain circumstances (e.g. when the cotnract mem is kept alive)
                     value.map(|r| r.owned())
@@ -1232,14 +1215,8 @@ pub(crate) mod wasm_interface {
                     let value: Result<StateSummary<'static>, ContractError> =
                         bincode::deserialize(serialized)
                             .map_err(|e| ContractError::Other(format!("{e}")))?;
-                    if cfg!(debug_assertions) {
-                        eprintln!(
-                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
-                             serialized: {serialized:?}
-                             value: {value:?}",
-                            self.ptr as *mut u8, self.ptr
-                        );
-                    }
+                    #[cfg(feature = "trace")]
+                    self.log_input(serialized, &value, ptr);
                     // TODO: it may be possible to not own this value while deserializing
                     //       under certain circumstances (e.g. when the contract mem is kept alive)
                     value.map(|s| StateSummary::from(s.into_bytes()))
@@ -1260,14 +1237,8 @@ pub(crate) mod wasm_interface {
                     let value: Result<StateDelta<'static>, ContractError> =
                         bincode::deserialize(serialized)
                             .map_err(|e| ContractError::Other(format!("{e}")))?;
-                    if cfg!(debug_assertions) {
-                        eprintln!(
-                            "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
-                             serialized: {serialized:?}
-                             value: {value:?}",
-                            self.ptr as *mut u8, self.ptr
-                        );
-                    }
+                    #[cfg(feature = "trace")]
+                    self.log_input(serialized, &value, ptr);
                     // TODO: it may be possible to not own this value while deserializing
                     //       under certain circumstances (e.g. when the contract mem is kept alive)
                     value.map(|d| StateDelta::from(d.into_bytes()))
@@ -1277,12 +1248,14 @@ pub(crate) mod wasm_interface {
         }
 
         pub fn into_raw(self) -> i64 {
-            if cfg!(debug_assertions) {
-                eprintln!("returning FFI -> {self:?}");
+            #[cfg(feature = "trace")]
+            {
+                log::trace!("returning FFI -> {self:?}");
             }
             let ptr = Box::into_raw(Box::new(self));
-            if cfg!(debug_assertions) {
-                eprintln!("returning FFI result @ {ptr:p} ({}i64)", ptr as i64);
+            #[cfg(feature = "trace")]
+            {
+                log::trace!("FFI result ptr: {ptr:p} ({}i64)", ptr as i64);
             }
             ptr as _
         }
@@ -1292,13 +1265,25 @@ pub(crate) mod wasm_interface {
                 ptr as *mut Self,
                 mem,
             )));
-            if cfg!(debug_assertions) {
-                eprintln!(
+            #[cfg(feature = "trace")]
+            {
+                log::trace!(
                     "got FFI result @ {ptr} ({:p}) -> {result:?}",
                     ptr as *mut Self
                 );
             }
             *result
+        }
+
+        #[cfg(feature = "trace")]
+        fn log_input<T: std::fmt::Debug>(&self, serialized: &[u8], value: &T, ptr: *mut u8) {
+            log::trace!(
+                "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
+                 serialized: {serialized:?}
+                 value: {value:?}",
+                self.ptr as *mut u8,
+                self.ptr
+            );
         }
     }
 
@@ -1313,8 +1298,8 @@ pub(crate) mod wasm_interface {
                     let serialized = bincode::serialize(&value).unwrap();
                     let size = serialized.len() as _;
                     let ptr = serialized.as_ptr();
-                    if cfg!(debug_assertions) {
-                        eprintln!(
+                    #[cfg(feature = "trace")] {
+                        log::trace!(
                             "sending result through FFI; addr: {ptr:p} ({}),\n  serialized: {serialized:?}\n  value: {value:?}",
                             ptr as i64
                         );

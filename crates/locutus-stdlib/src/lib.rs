@@ -15,4 +15,6 @@ pub mod prelude {
     pub use locutus_macros::contract;
 
     pub use bincode;
+    pub use env_logger;
+    pub use log;
 }

@@ -46,6 +46,7 @@ wasmer-default = [
 	"wasmer/universal"
 ]
 testing = ["arbitrary", "locutus-stdlib/testing"]
+trace = ["locutus-stdlib/trace"]
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }

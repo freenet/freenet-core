@@ -33,15 +33,37 @@ struct ImplStruct {
 }
 
 impl ImplStruct {
+    fn set_logger(&self) -> TokenStream {
+        // TODO: add log level as a aprameter to the macro
+        quote! {
+            #[cfg(feature = "trace")]
+            {
+                use ::locutus_stdlib::prelude::log;
+                if let Err(err) = ::locutus_stdlib::prelude::env_logger::builder()
+                    .filter_level(log::LevelFilter::Info)
+                    .filter_module("locutus_stdlib", log::LevelFilter::Trace)
+                    .try_init()
+                {
+                    return ::locutus_stdlib::prelude::InterfaceResult::from(
+                        Err::<::locutus_stdlib::prelude::ValidateResult, _>(
+                            ::locutus_stdlib::prelude::ContractError::Other(format!("{}", err))
+                        )
+                    ).into_raw();
+                }
+            }
+        }
+    }
+
     fn gen_validate_state(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = ffi_ret_type();
+        let set_logger = self.set_logger();
         quote! {
             #[no_mangle]
             pub fn validate_state(parameters: i64, state: i64, related: i64) -> #ret {
+                #set_logger
                 let parameters = unsafe {
                     let param_buf = &*(parameters as *const ::locutus_stdlib::buf::BufferBuilder);
-                    // eprintln!("getting params: {:p}, {:?}", parameters as *const ::locutus_stdlib::buf::BufferBuilder, param_buf);
                     let bytes = &*std::ptr::slice_from_raw_parts(
                         param_buf.start(),
                         param_buf.written(None),
@@ -49,7 +71,6 @@ impl ImplStruct {
                     Parameters::from(bytes)
                 };
                 let state = unsafe {
-                    // eprintln!("getting state: {:p}", state as *const ::locutus_stdlib::buf::BufferBuilder);
                     let state_buf = &*(state as *const ::locutus_stdlib::buf::BufferBuilder);
                     let bytes = &*std::ptr::slice_from_raw_parts(
                         state_buf.start(),
@@ -58,7 +79,6 @@ impl ImplStruct {
                     State::from(bytes)
                 };
                 let related: ::locutus_stdlib::prelude::RelatedContracts = unsafe {
-                    // eprintln!("getting related: {:p}", related as *const ::locutus_stdlib::buf::BufferBuilder);
                     let related = &*(related as *const ::locutus_stdlib::buf::BufferBuilder);
                     let bytes = &*std::ptr::slice_from_raw_parts(related.start(), related.written(None));
                     match ::locutus_stdlib::prelude::bincode::deserialize(bytes) {
@@ -69,7 +89,6 @@ impl ImplStruct {
                     }
                 };
                 let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::validate_state(parameters, state, related);
-                // eprintln!("...returning: {:?}", result);
                 ::locutus_stdlib::prelude::InterfaceResult::from(result).into_raw()
             }
         }
@@ -78,9 +97,11 @@ impl ImplStruct {
     fn gen_validate_delta(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = ffi_ret_type();
+        let set_logger = self.set_logger();
         quote! {
             #[no_mangle]
             pub fn validate_delta(parameters: i64, delta: i64) -> #ret {
+                #set_logger
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
@@ -102,9 +123,11 @@ impl ImplStruct {
     fn gen_update_state_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = ffi_ret_type();
+        let set_logger = self.set_logger();
         quote! {
             #[no_mangle]
             pub fn update_state(parameters: i64, state: i64, delta: i64) -> #ret {
+                #set_logger
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
@@ -140,9 +163,11 @@ impl ImplStruct {
     fn gen_summarize_state_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = ffi_ret_type();
+        let set_logger = self.set_logger();
         quote! {
             #[no_mangle]
             pub fn summarize_state(parameters: i64, state: i64) -> #ret {
+                #set_logger
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes = &*std::ptr::slice_from_raw_parts(param_buf.start(), param_buf.written(None));
@@ -162,9 +187,11 @@ impl ImplStruct {
     fn gen_get_state_delta(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = ffi_ret_type();
+        let set_logger = self.set_logger();
         quote! {
             #[no_mangle]
             pub fn get_state_delta(parameters: i64, state: i64, summary: i64) -> #ret {
+                #set_logger
                 let parameters = unsafe {
                     let param_buf = &mut *(parameters as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =

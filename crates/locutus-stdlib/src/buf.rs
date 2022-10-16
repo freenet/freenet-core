@@ -60,22 +60,6 @@ impl BufferBuilder {
     }
 }
 
-impl From<Vec<u8>> for BufferBuilder {
-    fn from(data: Vec<u8>) -> Self {
-        let last_read = Box::into_raw(Box::new(0u32)) as i64;
-        let last_write = Box::into_raw(Box::new(data.len() as u32)) as i64;
-        let start = data.as_ptr() as _;
-        let capacity = data.capacity() as _;
-        std::mem::forget(data);
-        BufferBuilder {
-            start,
-            capacity,
-            last_read,
-            last_write,
-        }
-    }
-}
-
 /// Type of buffer errors.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -193,11 +177,7 @@ impl<'instance> BufferMut<'instance> {
 #[inline(always)]
 pub(crate) fn compute_ptr<T>(ptr: *mut T, linear_mem_space: &WasmLinearMem) -> *mut T {
     let mem_start_ptr = linear_mem_space.start_ptr;
-    let result = (mem_start_ptr as isize + ptr as isize) as _;
-    #[cfg(testing)] // FIXME: add a `trace`feature instead
-    log::trace!("map ptr: {ptr:p} -> {result:p}");
-    #[allow(clippy::let_and_return)]
-    result
+    (mem_start_ptr as isize + ptr as isize) as _
 }
 
 struct BuilderInfo<'instance> {
@@ -208,9 +188,10 @@ struct BuilderInfo<'instance> {
 
 fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> BuilderInfo<'a> {
     unsafe {
-        if cfg!(debug_assertions) {
+        #[cfg(feature = "trace")]
+        {
             let contract_mem = std::slice::from_raw_parts(mem.start_ptr, mem.size as usize);
-            eprintln!(
+            log::trace!(
                 "*mut BufferBuilder <- offset: {}; in mem: {:?}",
                 builder_ptr as usize,
                 &contract_mem[builder_ptr as usize
@@ -223,8 +204,9 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
 
         let builder_ptr = compute_ptr(builder_ptr, &mem);
         let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
-        if cfg!(debug_assertions) {
-            eprintln!("buf builder from FFI: {buf_builder:?}");
+        #[cfg(feature = "trace")]
+        {
+            log::trace!("buf builder from FFI: {buf_builder:?}");
         }
 
         let read_ptr = Box::leak(Box::from_raw(compute_ptr(
@@ -325,21 +307,22 @@ pub fn initiate_buffer(capacity: u32) -> i64 {
         last_read: last_read as _,
         last_write: last_write as _,
     }));
-    if cfg!(debug_assertions) {
-        eprintln!(
+    #[cfg(feature = "trace")]
+    {
+        log::trace!(
             "new buffer ptr: {:p} -> {} as i64 w/ cap: {capacity}",
             buf.as_ptr(),
             start
         );
-        eprintln!(
+        log::trace!(
             "last read ptr: {last_read:p} -> {} as i64",
             last_read as i64
         );
-        eprintln!(
+        log::trace!(
             "last write ptr: {last_write:p} -> {} as i64",
             last_write as i64
         );
-        eprintln!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
+        log::trace!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
     }
     std::mem::forget(buf);
     buffer as i64

@@ -2199,6 +2199,7 @@ dependencies = [
  "blake2 0.10.4",
  "bs58",
  "byteorder",
+ "env_logger",
  "locutus-macros",
  "log",
  "once_cell",
