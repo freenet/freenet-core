@@ -546,8 +546,7 @@ impl<'a> TryFrom<&'a rmpv::Value> for Parameters<'a> {
     type Error = String;
 
     fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
-        let contract_params = value.as_map().unwrap();
-        let params = contract_params.get(0).unwrap().1.as_slice().unwrap();
+        let params = value.as_slice().unwrap();
         Ok(Parameters::from(params))
     }
 }
@@ -848,8 +847,7 @@ impl<'a> TryFrom<&'a rmpv::Value> for ContractCode<'a> {
     type Error = String;
 
     fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
-        let contract_data = value.as_map().unwrap();
-        let data = contract_data.get(0).unwrap().1.as_slice().unwrap();
+        let data = value.as_slice().unwrap();
         Ok(ContractCode::from(data))
     }
 }
@@ -1069,9 +1067,7 @@ impl TryFrom<&rmpv::Value> for ContractKey {
     type Error = String;
 
     fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let contract_key = value.as_map().unwrap();
-        // let _code = contract_key.get(1).unwrap().clone().0;
-        let instance_id = contract_key.get(0).unwrap().1.as_slice().unwrap();
+        let instance_id = value.as_slice().unwrap();
         let instance_id = bs58::encode(&instance_id).into_string();
         Ok(ContractKey::from_id(instance_id).unwrap())
     }

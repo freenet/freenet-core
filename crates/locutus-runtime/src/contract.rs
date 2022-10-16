@@ -218,14 +218,7 @@ impl TryFrom<&rmpv::Value> for WrappedState {
     type Error = String;
 
     fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let contract_state = value.as_map().unwrap();
-        let state = contract_state
-            .get(0)
-            .unwrap()
-            .1
-            .as_slice()
-            .unwrap()
-            .to_vec();
+        let state = value.as_slice().unwrap().to_vec();
         Ok(WrappedState::from(state))
     }
 }
