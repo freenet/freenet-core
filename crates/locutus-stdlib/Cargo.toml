@@ -1,6 +1,6 @@
 [package]
 name = "locutus-stdlib"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.58.0"
 publish = true
@@ -27,7 +27,7 @@ thiserror = "1"
 xz2 = { version = "0.1", optional = true }
 
 # internal
-locutus-macros = { path = "../locutus-macros", version = "0.0.2" }
+locutus-macros = { path = "../locutus-macros", version = "0.0.3" }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }

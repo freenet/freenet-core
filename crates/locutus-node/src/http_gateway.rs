@@ -25,6 +25,12 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 /// Each request is unique so we don't keep track of a client session of any sort.
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
+/// A gateway to access and interact with contracts through an HTTP interface.
+///
+/// Contracts initially accessed through the gateway have to be compliant with the container contract
+/// [specification](https://docs.freenet.org/glossary.html#container-contract) for Locutus.
+///
+/// Check the Locutus book for [more information](https://docs.freenet.org/dev-guide.html).
 pub struct HttpGateway {
     server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,

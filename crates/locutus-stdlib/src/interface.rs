@@ -43,6 +43,7 @@ pub enum ContractError {
     Deser(String),
 }
 
+/// An update to a contract state or any required related contracts to update that state.
 #[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateModification<'a> {
@@ -52,6 +53,7 @@ pub struct UpdateModification<'a> {
 }
 
 impl<'a> UpdateModification<'a> {
+    /// Constructor for self when the state is valid.
     pub fn valid(new_state: State<'a>) -> Self {
         Self {
             new_state: Some(new_state),
@@ -59,6 +61,8 @@ impl<'a> UpdateModification<'a> {
         }
     }
 
+    /// Constructor for self when this contract still is missing some [`RelatedContract`]
+    /// to proceed with any verification or updates.
     pub fn requires(related: Vec<RelatedContract>) -> Self {
         Self {
             new_state: None,
@@ -66,6 +70,9 @@ impl<'a> UpdateModification<'a> {
         }
     }
 
+    /// Unwraps self returning a [`State`].
+    ///
+    /// Panics if self does not contain a state.
     pub fn unwrap_valid(self) -> State<'a> {
         match self.new_state {
             Some(s) => s,
@@ -73,11 +80,13 @@ impl<'a> UpdateModification<'a> {
         }
     }
 
+    /// Gets the pending related contracts.
     pub fn get_related(&self) -> &[RelatedContract] {
         &self.related
     }
 
-    pub fn owned(self) -> UpdateModification<'static> {
+    /// Copies the data if not owned and returns an owned version of self.
+    pub fn into_owned(self) -> UpdateModification<'static> {
         let Self { new_state, related } = self;
         UpdateModification {
             new_state: new_state.map(|s| State::from(s.into_bytes())),
@@ -86,6 +95,9 @@ impl<'a> UpdateModification<'a> {
     }
 }
 
+/// The contracts related to a parent or root contract. Tipically this means
+/// contracts which state requires to be verified or integrated in some way with
+/// the parent contract.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct RelatedContracts<'a> {
     #[serde(borrow)]
@@ -99,7 +111,8 @@ impl RelatedContracts<'_> {
         }
     }
 
-    pub fn owned(self) -> RelatedContracts<'static> {
+    /// Copies the data if not owned and returns an owned version of self.
+    pub fn into_owned(self) -> RelatedContracts<'static> {
         let mut map = HashMap::with_capacity(self.map.len());
         for (k, v) in self.map {
             map.insert(k, v.map(|s| State::from(s.into_bytes())));
@@ -130,12 +143,15 @@ impl<'a> From<HashMap<ContractInstanceId, Option<State<'a>>>> for RelatedContrac
     }
 }
 
+/// A contract related to an other contract and the specification
+/// of the kind of update notifications that should be received by this contract.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RelatedContract {
     pub contract_instance_id: ContractInstanceId,
     pub mode: RelatedMode,
 }
 
+/// Specification of the notifications of interest from a related contract.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RelatedMode {
     /// Retrieve the state once, not concerned with subsequent changes.
@@ -148,8 +164,8 @@ pub enum RelatedMode {
     StateThenStateAndDeltas,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// The result of calling the [`ContractInterface::validate_state`] function.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ValidateResult {
     Valid,
     Invalid,
@@ -158,6 +174,7 @@ pub enum ValidateResult {
     RequestRelated(Vec<ContractInstanceId>),
 }
 
+/// Update notifications for a contract or a related contract.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum UpdateData<'a> {
     State(#[serde(borrow)] State<'a>),
@@ -208,7 +225,8 @@ impl UpdateData<'_> {
         }
     }
 
-    pub fn owned(self) -> UpdateData<'static> {
+    /// Copies the data if not owned and returns an owned version of self.
+    pub fn into_owned(self) -> UpdateData<'static> {
         match self {
             UpdateData::State(s) => UpdateData::State(State::from(s.into_bytes())),
             UpdateData::Delta(d) => UpdateData::Delta(StateDelta::from(d.into_bytes())),
@@ -311,7 +329,6 @@ impl<'a> TryFrom<&'a rmpv::Value> for UpdateData<'a> {
     }
 }
 
-// ANCHOR: contractifce
 /// Trait to implement for the contract building.
 ///
 /// Contains all necessary methods to interact with the contract.
@@ -358,6 +375,7 @@ impl<'a> TryFrom<&'a rmpv::Value> for UpdateData<'a> {
 ///     }
 /// }
 /// ```
+// ANCHOR: contractifce
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(
@@ -520,12 +538,14 @@ impl<'a> Parameters<'a> {
         self.0.len()
     }
 
+    /// Returns the bytes of parameters.
     pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
     }
 
-    pub fn owned(self) -> Parameters<'static> {
-        let data: Cow<'static, _> = Cow::from(self.0.to_owned().to_vec());
+    /// Copies the data if not owned and returns an owned version of self.
+    pub fn into_owned(self) -> Parameters<'static> {
+        let data: Cow<'static, _> = Cow::from(self.0.into_owned());
         Parameters(data)
     }
 }
@@ -705,10 +725,15 @@ pub struct StateSummary<'a>(
     Cow<'a, [u8]>,
 );
 
-impl<'a> StateSummary<'a> {
+impl StateSummary<'_> {
     /// Extracts the owned data as a `Vec<u8>`.
     pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
+    }
+
+    /// Gets the number of bytes of data stored in the `StateSummary`.
+    pub fn size(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -721,13 +746,6 @@ impl<'a> From<Vec<u8>> for StateSummary<'a> {
 impl<'a> From<&'a [u8]> for StateSummary<'a> {
     fn from(state: &'a [u8]) -> Self {
         StateSummary(Cow::from(state))
-    }
-}
-
-impl<'a> StateSummary<'a> {
-    /// Gets the number of bytes of data stored in the `StateSummary`.
-    pub fn size(&self) -> usize {
-        self.0.len()
     }
 }
 
@@ -804,7 +822,8 @@ impl ContractCode<'_> {
             .into_string()
     }
 
-    pub fn owned(self) -> ContractCode<'static> {
+    /// Copies the data if not owned and returns an owned version of self.
+    pub fn into_owned(self) -> ContractCode<'static> {
         let data: Cow<'static, _> = Cow::from(self.data.to_owned().to_vec());
         ContractCode {
             data,
@@ -886,7 +905,7 @@ impl std::fmt::Display for ContractCode<'_> {
     }
 }
 
-/// The key representing the tuple of a `contract code` and a set of `parameters`.
+/// The key representing the hash of the contract executable code hash and a set of `parameters`.
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
@@ -992,7 +1011,7 @@ where
 }
 
 impl ContractKey {
-    /// Builds a partial `ContractKey`, the contract code part is unspecified.
+    /// Builds a partial [`ContractKey`](ContractKey), the contract code part is unspecified.
     pub fn from_id(instance: impl Into<String>) -> Result<Self, bs58::decode::Error> {
         let instance = ContractInstanceId::try_from(instance.into())?;
         Ok(Self {
@@ -1044,6 +1063,7 @@ impl ContractKey {
         })
     }
 
+    /// Returns the `Base58` encoded string of the [`ContractInstanceId`](ContractInstanceId).
     pub fn encoded_contract_id(&self) -> String {
         self.instance.encode()
     }
@@ -1193,7 +1213,7 @@ pub(crate) mod wasm_interface {
                     self.log_input(serialized, &value, ptr);
                     // TODO: it may be possible to not own this value while deserializing
                     //       under certain circumstances (e.g. when the cotnract mem is kept alive)
-                    value.map(|r| r.owned())
+                    value.map(|r| r.into_owned())
                 }
                 _ => unreachable!(),
             }

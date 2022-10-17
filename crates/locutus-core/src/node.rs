@@ -70,7 +70,7 @@ where
 /// - ip: IP associated to the initial node.
 /// - port: listening port of the initial node.
 ///
-/// If both are provided but also additional peers are added via the [`Self::add_provider()`] method, this node will
+/// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
 pub struct NodeConfig<const CLIENTS: usize> {
     /// local peer private key in

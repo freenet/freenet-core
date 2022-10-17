@@ -128,12 +128,12 @@ impl TryFrom<&rmpv::Value> for WrappedContract {
 
         let contract_data = contract_map.get("data").unwrap();
         let data = {
-            let contract = ContractCode::try_from(*contract_data).unwrap().owned();
+            let contract = ContractCode::try_from(*contract_data).unwrap().into_owned();
             Arc::new(contract)
         };
 
         let contract_params = contract_map.get("parameters").unwrap();
-        let params = Parameters::try_from(*contract_params).unwrap().owned();
+        let params = Parameters::try_from(*contract_params).unwrap().into_owned();
 
         Ok(Self { data, params, key })
     }

@@ -91,7 +91,7 @@ impl ContractStore {
                 self.contract_cache.get(code_hash).map(|data| {
                     Some(WrappedContract::new(
                         data.value().clone(),
-                        params.clone().owned(),
+                        params.clone().into_owned(),
                     ))
                 })
             })
@@ -108,7 +108,7 @@ impl ContractStore {
                 .to_lowercase();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
             let WrappedContract { data, params, .. } =
-                WrappedContract::try_from((&*key_path, params.clone().owned()))
+                WrappedContract::try_from((&*key_path, params.clone().into_owned()))
                     .map_err(|err| {
                         tracing::debug!("contract not found: {err}");
                         err

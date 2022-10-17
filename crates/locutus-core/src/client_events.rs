@@ -270,7 +270,7 @@ impl ClientRequest<'_> {
                 state,
                 related_contracts,
             } => {
-                let related_contracts = related_contracts.owned();
+                let related_contracts = related_contracts.into_owned();
                 ClientRequest::Put {
                     contract,
                     state,
@@ -278,7 +278,7 @@ impl ClientRequest<'_> {
                 }
             }
             ClientRequest::Update { key, data } => {
-                let data = data.owned();
+                let data = data.into_owned();
                 ClientRequest::Update { key, data }
             }
             ClientRequest::Get {
@@ -329,7 +329,7 @@ impl ClientRequest<'_> {
                                 *value_map.get("relatedContracts").unwrap(),
                             )
                             .map_err(ErrorKind::deserialization)?
-                            .owned(),
+                            .into_owned(),
                         }
                     }
                     ["data", "key"] => ClientRequest::Update {
@@ -337,7 +337,7 @@ impl ClientRequest<'_> {
                             .map_err(ErrorKind::deserialization)?,
                         data: UpdateData::try_from(*value_map.get("data").unwrap())
                             .map_err(ErrorKind::deserialization)?
-                            .owned(),
+                            .into_owned(),
                     },
                     ["fetch_contract", "key"] => ClientRequest::Get {
                         key: ContractKey::try_from(*value_map.get("key").unwrap())

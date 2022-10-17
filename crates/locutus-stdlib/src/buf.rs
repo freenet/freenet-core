@@ -63,11 +63,17 @@ impl BufferBuilder {
 /// Type of buffer errors.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    /// Insufficient memory while trying to write to the buffer.
     #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
-    InsufficientMemory { req: usize, free: usize },
+    InsufficientMemory {
+        /// Required memory available
+        req: usize,
+        /// Available memory.
+        free: usize,
+    },
 }
 
-/// Represents a mutable buffer in the wasm module.
+/// A live mutable buffer in the WASM linear memory.
 #[derive(Debug)]
 pub struct BufferMut<'instance> {
     buffer: &'instance mut [u8],
@@ -83,6 +89,8 @@ pub struct BufferMut<'instance> {
 
 impl<'instance> BufferMut<'instance> {
     /// Tries to write data into the buffer, after any unread bytes.
+    ///
+    /// Will return an error if there is insufficient space.
     pub fn write<T>(&mut self, obj: T) -> Result<(), Error>
     where
         T: AsRef<[u8]>,
@@ -112,7 +120,7 @@ impl<'instance> BufferMut<'instance> {
 
     /// Read bytes specified number of bytes from the buffer.
     ///
-    /// Always read from the beginning.
+    /// Always reads from the beginning.
     pub fn read_bytes(&self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         // don't update the read ptr
@@ -140,7 +148,7 @@ impl<'instance> BufferMut<'instance> {
     }
 
     /// Return the buffer capacity.
-    pub fn size(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         unsafe {
             let p = &*compute_ptr(self.builder_ptr, &self.mem);
             p.capacity as _
@@ -229,7 +237,7 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
 }
 
 #[derive(Debug)]
-/// Represents a buffer in the wasm module.
+/// A live buffer in the WASM linear memory.
 pub struct Buffer<'instance> {
     buffer: &'instance mut [u8],
     /// stores the last read in the buffer
@@ -252,7 +260,7 @@ impl<'instance> Buffer<'instance> {
         t
     }
 
-    /// Read bytes specified number of bytes from the buffer.
+    /// Read the specified number of bytes from the buffer.
     pub fn read_bytes(&mut self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         *self.read_ptr += len as u32;

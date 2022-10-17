@@ -6,10 +6,17 @@ const MIN_U8: number = 0;
 
 // base interface types:
 
-type ContractInstanceId = Uint8Array;
+/**
+ * The id of a live instance of a contract. This is effectively the tuple
+ * of the hash of the hash of the contract code and a set of parameters used to run
+ * the contract.
+ * @public
+ */
+export type ContractInstanceId = Uint8Array;
 
 /**
  * The key representing the tuple of a contract code and a set of parameters.
+ * See {@link ContractInstanceId} for more information.
  * @public
  */
 export class Key {
@@ -39,7 +46,7 @@ export class Key {
   }
 
   /**
-   * Gnerate key from base58 key spec representation
+   * Generates key from base58 key spec representation
    * @example
    * Here's a simple example:
    * ```
@@ -48,6 +55,7 @@ export class Key {
    * ```
    * @param spec - Base58 string representation of the key
    * @returns The key representation from given spec
+   * @constructor
    */
   static fromInstanceId(spec: string): Key {
     let encoded = base58.decode(spec);
@@ -55,14 +63,14 @@ export class Key {
   }
 
   /**
-   * @returns {Uint8Array} Hash of the full key specification (contract code + parameter).
+   * @returns {ContractInstanceId} Hash of the full key specification (contract code + parameter).
    */
-  bytes(): Uint8Array {
+  bytes(): ContractInstanceId {
     return this.instance;
   }
 
   /**
-   * @returns {Uint8Array | null} Hash of the contract code part of the full specification.
+   * @returns {Uint8Array | null} Hash of the contract code part of the full specification, if is available.
    */
   codePart(): Uint8Array | null {
     return this.code;
@@ -79,7 +87,7 @@ export class Key {
 }
 
 /**
- * The contract representing the tuple of a key, contract code and a set of parameters.
+ * A contract and its key. It includes the contract data/code and the parameters run along with it.
  * @public
  */
 export type Contract = {
@@ -93,17 +101,23 @@ export type Contract = {
  * @public
  */
 export type State = Uint8Array;
+
 /**
  * Representation of a contract state changes summary
  * @public
  */
 export type StateSummary = Uint8Array;
+
 /**
  * State delta representation
  * @public
  */
 export type StateDelta = Uint8Array;
 
+/** Update data from a notification for a contract which the client subscribed to.
+ * It can be either the main contract or any related contracts to that main contract.
+ * @public
+ */
 export type UpdateData =
   | { state: State }
   | { delta: StateDelta }
@@ -112,6 +126,10 @@ export type UpdateData =
   | { relatedTo: ContractInstanceId; delta: StateDelta }
   | { relatedTo: ContractInstanceId; state: State; delta: StateDelta };
 
+/**
+ * A map of contract id's to their respective states in case this have
+ * been successfully retrieved from the network.
+ */
 export type RelatedContracts = Map<ContractInstanceId, State | null>;
 
 // ops:
@@ -202,7 +220,7 @@ export interface ResponseHandler {
    */
   onErr: (response: HostError) => void;
   /**
-   * Tasks required after establishing connection with websocket
+   * Callback executed after successfully establishing connection with websocket
    */
   onOpen: () => void;
 }
@@ -220,9 +238,9 @@ export class LocutusWsApi {
   /**
    * Websocket object for creating and managing a WebSocket connection to a server,
    * as well as for sending and receiving data on the connection.
-   * @public
+   * @private
    */
-  public ws: WebSocket;
+  private ws: WebSocket;
   /**
    * @private
    */
@@ -317,7 +335,7 @@ export class LocutusWsApi {
   }
 
   /**
-   * Sends an disconnect request to the host through websocket
+   * Sends an disconnect notification to the host through websocket
    * @param disconnect - The `DisconnectRequest` object
    */
   async disconnect(disconnect: DisconnectRequest): Promise<void> {
@@ -348,7 +366,7 @@ export type HostError = {
 };
 
 /**
- * Interface to represent the response for a contract put operation
+ * The response for a contract put operation
  * @public
  */
 export interface PutResponse {
@@ -357,7 +375,7 @@ export interface PutResponse {
 }
 
 /**
- * Interface to represent the response for a contract update operation
+ * The response for a contract update operation
  * @public
  */
 export interface UpdateResponse {
@@ -367,7 +385,7 @@ export interface UpdateResponse {
 }
 
 /**
- * Interface to represent the response for a contract get operation
+ * The response for a contract get operation
  * @public
  */
 export interface GetResponse {
@@ -377,7 +395,7 @@ export interface GetResponse {
 }
 
 /**
- * Interface to represent the response for a state update notification
+ * The response for a state update notification
  * @public
  */
 export interface UpdateNotification {
@@ -397,10 +415,8 @@ function assert(condition: boolean, msg?: string) {
 }
 
 /**
- * Host response representation.
- * Checks the corresponding response type and returns it as a result.
+ * A typed response from the host HTTP gateway to requests made via the API.
  *
- * To construct a HostResponse, use the {@link constructor}.
  * @public
  */
 export class HostResponse {
@@ -410,7 +426,7 @@ export class HostResponse {
   private result: Ok | HostError;
 
   /**
-   * Builds the response from the bytes received from the host
+   * Builds the response from the bytes received via the websocket interface.
    * @param bytes - Response data
    * @returns The corresponding response type result
    * @constructor
@@ -506,8 +522,8 @@ export class HostResponse {
   }
 
   /**
-   * Check if the response contains "kind" as object key
-   * @returns True if contains the expected key otherwise False
+   * Check if the response is ok or an error.
+   * @returns True if contains the expected key otherwise false
    * @public
    */
   isOk(): boolean {
@@ -516,7 +532,7 @@ export class HostResponse {
   }
 
   /**
-   * Get the response content
+   * Try to get the response content.
    * @returns The specific response content
    * @public
    */
@@ -527,8 +543,8 @@ export class HostResponse {
   }
 
   /**
-   * Check if the response is an error
-   * @returns True if is an error otherwise False
+   * Check if the response is an error.
+   * @returns True if is an error otherwise false
    * @public
    */
   isErr(): boolean {
@@ -548,7 +564,7 @@ export class HostResponse {
 
   /**
    * Check if is a put response.
-   * @returns True if is a put response otherwise False
+   * @returns True if is a put response otherwise false
    * @public
    */
   isPut(): boolean {
@@ -556,7 +572,7 @@ export class HostResponse {
   }
 
   /**
-   * Try to get the response content as a PutResponse object
+   * Try to get the response content as a `PutResponse` object
    * @returns The PutResponse object
    * @public
    */
@@ -567,7 +583,7 @@ export class HostResponse {
 
   /**
    * Check if is an update response.
-   * @returns True if is an update response otherwise False
+   * @returns True if is an update response otherwise false
    * @public
    */
   isUpdate(): boolean {
@@ -575,7 +591,7 @@ export class HostResponse {
   }
 
   /**
-   * Try to get the response content as a UpdateResponse object
+   * Try to get the response content as an `UpdateResponse` object
    * @returns The UpdateResponse object
    * @public
    */
@@ -586,7 +602,7 @@ export class HostResponse {
 
   /**
    * Check if is a get response.
-   * @returns True if is a get response otherwise False
+   * @returns True if is a get response otherwise false
    * @public
    */
   isGet(): boolean {
@@ -605,7 +621,7 @@ export class HostResponse {
 
   /**
    * Check if is a update notification response.
-   * @returns True if is a update notification response otherwise False
+   * @returns True if is a update notification response otherwise false
    * @public
    */
   isUpdateNotification(): boolean {

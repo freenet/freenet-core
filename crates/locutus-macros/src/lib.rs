@@ -3,6 +3,7 @@ use syn::{AttributeArgs, ItemImpl};
 
 mod expand;
 
+/// Generate the necessary code for the WASM runtime to interact with your contract ergonomically and safely.
 #[proc_macro_attribute]
 pub fn contract(
     args: proc_macro::TokenStream,
