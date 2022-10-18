@@ -496,12 +496,16 @@ impl Runtime {
 mod test {
     use super::*;
     use crate::contract::WrappedContract;
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::atomic::AtomicUsize};
 
     const TEST_CONTRACT_1: &str = "test_contract_1";
+    static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
     fn test_dir() -> PathBuf {
-        let test_dir = std::env::temp_dir().join("locutus").join("contracts");
+        let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
+            "api-test-{}",
+            TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
         if !test_dir.exists() {
             std::fs::create_dir_all(&test_dir).unwrap();
         }
@@ -510,7 +514,6 @@ mod test {
 
     fn get_test_contract(name: &str) -> WrappedContract {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
-
         let contracts = PathBuf::from(CONTRACTS_DIR);
         let mut dirs = contracts.ancestors();
         let path = dirs.nth(2).unwrap();

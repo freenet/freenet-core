@@ -120,7 +120,7 @@ impl ContractInterface for PostsFeed {
         parameters: Parameters<'static>,
         state: State<'static>,
         delta: Vec<UpdateData>,
-    ) -> Result<UpdateModification, ContractError> {
+    ) -> Result<UpdateModification<'static>, ContractError> {
         let mut feed = PostsFeed::try_from(state)?;
         let verifier = Verification::try_from(parameters).ok();
         feed.messages.sort_by_cached_key(|m| m.hash());

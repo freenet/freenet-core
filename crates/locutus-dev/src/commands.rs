@@ -1,7 +1,7 @@
 use std::{fs::File, io::Read, sync::Arc};
 
 use locutus_core::{
-    locutus_runtime::StateDelta, ClientId, ClientRequest, ContractExecutor, SqlitePool,
+    locutus_runtime::StateDelta, ClientId, ClientRequest, Config, ContractExecutor, SqlitePool,
 };
 use locutus_runtime::{ContractInstanceId, ContractStore, Parameters, StateStore, WrappedContract};
 
@@ -70,10 +70,9 @@ async fn execute_command(
     other: BaseConfig,
 ) -> Result<(), DynError> {
     let data_path = other
-        .data_dir
-        .unwrap_or_else(|| std::env::temp_dir().join("locutus"));
-    let contract_store =
-        ContractStore::new(data_path.join("contracts"), DEFAULT_MAX_CONTRACT_SIZE)?;
+        .contract_data_dir
+        .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
+    let contract_store = ContractStore::new(data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut executor = ContractExecutor::new(contract_store, state_store, || {}).await?;
 

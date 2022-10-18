@@ -148,7 +148,11 @@ impl ContractStore {
         let mut f = File::create(KEY_FILE_PATH.get().unwrap())?;
         f.write_all(&serialized)?;
         // release the lock
-        fs::remove_file(LOCK_FILE_PATH.get().unwrap())?;
+        match fs::remove_file(LOCK_FILE_PATH.get().unwrap()) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(other) => return Err(other.into()),
+        }
 
         let key_path = bs58::encode(contract_hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -239,10 +243,9 @@ mod test {
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let mut store = ContractStore::new(
-            std::env::temp_dir().join("locutus_test").join("contracts"),
-            10_000,
-        )?;
+        let contract_dir = std::env::temp_dir().join("locutus-test").join("store-test");
+        std::fs::create_dir_all(&contract_dir)?;
+        let mut store = ContractStore::new(contract_dir, 10_000)?;
         let contract = WrappedContract::new(
             Arc::new(ContractCode::from(vec![0, 1, 2])),
             [0, 1].as_ref().into(),

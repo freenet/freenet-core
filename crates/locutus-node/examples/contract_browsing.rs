@@ -5,7 +5,7 @@ use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 use locutus_core::{
     libp2p::identity::ed25519::PublicKey,
     locutus_runtime::{ContractCode, StateStore, WrappedContract},
-    SqlitePool, WrappedState,
+    Config, SqlitePool, WrappedState,
 };
 use serde::Serialize;
 use tracing::metadata::LevelFilter;
@@ -87,8 +87,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         bundle.posts_contract.key().encoded_contract_id()
     );
 
-    let tmp_path = std::env::temp_dir().join("locutus");
-    let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE)?;
+    let contract_dir = Config::get_conf().config_paths.local_contracts_dir();
+    let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node = ContractExecutor::new(contract_store.clone(), state_store.clone(), || {
         locutus_core::util::set_cleanup_on_exit().unwrap();

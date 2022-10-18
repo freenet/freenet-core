@@ -339,10 +339,10 @@ impl ClientRequest<'_> {
                             .map_err(ErrorKind::deserialization)?
                             .into_owned(),
                     },
-                    ["fetch_contract", "key"] => ClientRequest::Get {
+                    ["fetchContract", "key"] => ClientRequest::Get {
                         key: ContractKey::try_from(*value_map.get("key").unwrap())
                             .map_err(ErrorKind::deserialization)?,
-                        fetch_contract: value_map.get("fetch_contract").unwrap().as_bool().unwrap(),
+                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
                     },
                     ["key"] => ClientRequest::Subscribe {
                         key: ContractKey::try_from(*value_map.get("key").unwrap())
@@ -651,10 +651,10 @@ pub(crate) mod test {
             fetch_contract: false,
         };
         let msg: Vec<u8> = vec![
-            130, 163, 107, 101, 121, 130, 164, 115, 112, 101, 99, 196, 32, 255, 17, 144, 159, 194,
-            187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151, 188, 167, 153, 197,
-            129, 25, 179, 198, 218, 99, 159, 139, 168, 99, 111, 110, 116, 114, 97, 99, 116, 192,
-            174, 102, 101, 116, 99, 104, 95, 99, 111, 110, 116, 114, 97, 99, 116, 194,
+            130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 255,
+            17, 144, 159, 194, 187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151,
+            188, 167, 153, 197, 129, 25, 179, 198, 218, 99, 159, 139, 164, 99, 111, 100, 101, 192,
+            173, 102, 101, 116, 99, 104, 67, 111, 110, 116, 114, 97, 99, 116, 194,
         ];
         let result_client_request = ClientRequest::decode_mp(&msg)?;
         assert_eq!(result_client_request, expected_client_request);

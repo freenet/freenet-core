@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['docs/**', 'README.md']
+    paths-ignore: ["docs/**", "README.md"]
   pull_request:
     branches: [main]
-    paths-ignore: ['docs/**', 'README.md']
+    paths-ignore: ["docs/**", "README.md"]
 
 jobs:
   test:
@@ -43,10 +43,19 @@ jobs:
       - uses: Swatinem/rust-cache@v1
 
       - name: Build
-        run: cargo build --locked
+        run: |
+          cargo build --locked 
+          cargo install --path ./crates/locutus-node
 
-      - name: Add wasm32-unknown-unknown
-        run: rustup target add wasm32-unknown-unknown
+      - name: Add compiler targets
+        run: |
+          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-wasi
+
+      - name: Compile test contracts
+        run: |
+          cd tests/test-contract-1
+          ldt build --wasi
 
       - name: Install stdlib packages
         working-directory: apps/stdlib

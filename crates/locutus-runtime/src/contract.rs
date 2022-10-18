@@ -115,16 +115,8 @@ impl TryFrom<&rmpv::Value> for WrappedContract {
                 .map(|(key, val)| (key.as_str().unwrap(), val)),
         );
 
-        let key_value = contract_map.get("key").unwrap();
-        let key_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-            key_value
-                .as_map()
-                .unwrap()
-                .iter()
-                .map(|(key, val)| (key.as_str().unwrap(), val)),
-        );
-        let key_instance = *key_map.get("instance").unwrap();
-        let key = ContractKey::try_from(key_instance).unwrap();
+        let key_value = *contract_map.get("key").unwrap();
+        let key = ContractKey::try_from(key_value).unwrap();
 
         let contract_data = contract_map.get("data").unwrap();
         let data = {

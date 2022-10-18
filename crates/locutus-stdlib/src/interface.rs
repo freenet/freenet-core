@@ -343,35 +343,42 @@ impl<'a> TryFrom<&'a rmpv::Value> for UpdateData<'a> {
 ///
 /// #[contract]
 /// impl ContractInterface for Contract {
-///     fn validate_state(_parameters: Parameters<'static>, _state: State<'static>) -> bool {
-///         true
+///     fn validate_state(
+///         _parameters: Parameters<'static>,
+///         _state: State<'static>,
+///         _related: RelatedContracts
+///     ) -> Result<ValidateResult, ContractError> {
+///         Ok(ValidateResult::Valid)
 ///     }
 ///
-///     fn validate_delta(_parameters: Parameters<'static>, _delta: StateDelta<'static>) -> bool {
-///         true
+///     fn validate_delta(
+///         _parameters: Parameters<'static>,
+///         _delta: StateDelta<'static>
+///     ) -> Result<bool, ContractError> {
+///         Ok(true)
 ///     }
 ///
 ///     fn update_state(
 ///         _parameters: Parameters<'static>,
 ///         state: State<'static>,
-///         _delta: StateDelta<'static>,
-///     ) -> Result<UpdateModification, ContractError> {
-///         Ok(UpdateModification::ValidUpdate(state))
+///         _data: Vec<UpdateData>,
+///     ) -> Result<UpdateModification<'static>, ContractError> {
+///         Ok(UpdateModification::valid(state))
 ///     }
 ///
 ///     fn summarize_state(
 ///         _parameters: Parameters<'static>,
 ///         _state: State<'static>,
-///     ) -> StateSummary<'static> {
-///         StateSummary::from(vec![])
+///     ) -> Result<StateSummary<'static>, ContractError> {
+///         Ok(StateSummary::from(vec![]))
 ///     }
 ///
 ///     fn get_state_delta(
 ///         _parameters: Parameters<'static>,
 ///         _state: State<'static>,
 ///         _summary: StateSummary<'static>,
-///     ) -> StateDelta<'static> {
-///         StateDelta::from(vec![])
+///     ) -> Result<StateDelta<'static>, ContractError> {
+///         Ok(StateDelta::from(vec![]))
 ///     }
 /// }
 /// ```
@@ -1087,7 +1094,15 @@ impl TryFrom<&rmpv::Value> for ContractKey {
     type Error = String;
 
     fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let instance_id = value.as_slice().unwrap();
+        let key_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
+            value
+                .as_map()
+                .unwrap()
+                .iter()
+                .map(|(key, val)| (key.as_str().unwrap(), val)),
+        );
+        let key_instance = *key_map.get("instance").unwrap();
+        let instance_id = key_instance.as_slice().unwrap();
         let instance_id = bs58::encode(&instance_id).into_string();
         Ok(ContractKey::from_id(instance_id).unwrap())
     }

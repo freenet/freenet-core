@@ -26,7 +26,7 @@ impl ContractInterface for Contract {
         _parameters: Parameters<'static>,
         state: State<'static>,
         _data: Vec<UpdateData>,
-    ) -> Result<UpdateModification, ContractError> {
+    ) -> Result<UpdateModification<'static>, ContractError> {
         Ok(UpdateModification::valid(state))
     }
 
