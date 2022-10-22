@@ -20,6 +20,7 @@ use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 32;
 
+/// Type of errors during interaction with a contract.
 #[derive(Debug, thiserror::Error)]
 pub enum ContractError {
     #[error("invalid contract update")]
@@ -59,6 +60,7 @@ impl TryFrom<i32> for UpdateResult {
     }
 }
 
+/// Result of a `State` update.
 pub enum UpdateModification {
     ValidUpdate(State<'static>),
     NoChange,
@@ -74,6 +76,53 @@ impl UpdateModification {
 }
 
 // ANCHOR: contractifce
+/// Trait to implement for the contract building.
+///
+/// Contains all necessary methods to interact with the contract.
+///
+/// # Examples
+///
+/// Implementing `ContractInterface` on a type:
+///
+/// ```
+/// use locutus_stdlib::prelude::*;
+///
+/// struct Contract;
+///
+/// #[contract]
+/// impl ContractInterface for Contract {
+///     fn validate_state(_parameters: Parameters<'static>, _state: State<'static>) -> bool {
+///         true
+///     }
+///
+///     fn validate_delta(_parameters: Parameters<'static>, _delta: StateDelta<'static>) -> bool {
+///         true
+///     }
+///
+///     fn update_state(
+///         _parameters: Parameters<'static>,
+///         state: State<'static>,
+///         _delta: StateDelta<'static>,
+///     ) -> Result<UpdateModification, ContractError> {
+///         Ok(UpdateModification::ValidUpdate(state))
+///     }
+///
+///     fn summarize_state(
+///         _parameters: Parameters<'static>,
+///         _state: State<'static>,
+///     ) -> StateSummary<'static> {
+///         StateSummary::from(vec![])
+///     }
+///
+///     fn get_state_delta(
+///         _parameters: Parameters<'static>,
+///         _state: State<'static>,
+///         _summary: StateSummary<'static>,
+///     ) -> StateDelta<'static> {
+///         StateDelta::from(vec![])
+///     }
+/// }
+/// ```
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(parameters: Parameters<'static>, state: State<'static>) -> bool;
@@ -117,6 +166,7 @@ pub struct Contract<'a> {
 }
 
 impl<'a> Contract<'a> {
+    /// Returns a contract from [contract code](ContractCode) and given [parameters](Parameters).
     pub fn new(contract: ContractCode<'a>, parameters: Parameters<'a>) -> Contract<'a> {
         let key = ContractKey::from((&parameters, &contract));
         Contract {
@@ -126,6 +176,7 @@ impl<'a> Contract<'a> {
         }
     }
 
+    /// Key portion of the specification.
     pub fn key(&self) -> &ContractKey {
         &self.key
     }
@@ -206,15 +257,21 @@ impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     }
 }
 
+/// Data that forms part of a contract along with the WebAssembly code.
+///
+/// This is supplied to the contract as a parameter to the contract's functions. Parameters are
+/// typically be used to configure a contract, much like the parameters of a constructor function.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct Parameters<'a>(Cow<'a, [u8]>);
 
 impl<'a> Parameters<'a> {
+    /// Gets the number of bytes of data stored in the `Parameters`.
     pub fn size(&self) -> usize {
         self.0.len()
     }
 
+    /// Extracts the owned data as a `Vec<u8>`.
     pub fn into_owned(self) -> Vec<u8> {
         self.0.into_owned()
     }
@@ -241,19 +298,25 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
+/// Data associated with a contract that can be retrieved by Applications and Components.
+///
+/// For efficiency and flexibility, contract state is represented as a simple [u8] byte array.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct State<'a>(Cow<'a, [u8]>);
 
 impl<'a> State<'a> {
+    /// Gets the number of bytes of data stored in the `State`.
     pub fn size(&self) -> usize {
         self.0.len()
     }
 
+    /// Extracts the owned data as a `Vec<u8>`.
     pub fn into_owned(self) -> Vec<u8> {
         self.0.into_owned()
     }
 
+    /// Acquires a mutable reference to the owned form of the `State` data.
     pub fn to_mut(&mut self) -> &mut Vec<u8> {
         self.0.to_mut()
     }
@@ -300,15 +363,23 @@ impl<'a> std::io::Read for State<'a> {
     }
 }
 
+/// Represents a modification to some state - similar to a diff in source code.
+///
+/// The exact format of a delta is determined by the contract. A [contract](Contract) implementation will determine whether
+/// a delta is valid - perhaps by verifying it is signed by someone authorized to modify the
+/// contract state. A delta may be created in response to a [State Summary](StateSummary) as part of the State
+/// Synchronization mechanism.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct StateDelta<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateDelta<'a> {
+    /// Gets the number of bytes of data stored in the `StateDelta`.
     pub fn size(&self) -> usize {
         self.0.len()
     }
 
+    /// Extracts the owned data as a `Vec<u8>`.
     pub fn into_owned(self) -> Vec<u8> {
         self.0.into_owned()
     }
@@ -349,10 +420,16 @@ impl<'a> DerefMut for StateDelta<'a> {
     }
 }
 
+/// Summary of `State` changes.
+///
+/// Given a contract state, this is a small piece of data that can be used to determine a delta
+/// between two contracts as part of the state synchronization mechanism. The format of a state
+/// summary is determined by the state's contract.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StateSummary<'a>(Cow<'a, [u8]>);
 
 impl<'a> StateSummary<'a> {
+    /// Extracts the owned data as a `Vec<u8>`.
     pub fn into_owned(self) -> Vec<u8> {
         self.0.into_owned()
     }
@@ -371,6 +448,7 @@ impl<'a> From<&'a [u8]> for StateSummary<'a> {
 }
 
 impl<'a> StateSummary<'a> {
+    /// Gets the number of bytes of data stored in the `StateSummary`.
     pub fn size(&self) -> usize {
         self.0.len()
     }
@@ -420,22 +498,27 @@ pub struct ContractCode<'a> {
 }
 
 impl ContractCode<'_> {
+    /// Contract key hash.
     pub fn hash(&self) -> &[u8; CONTRACT_KEY_SIZE] {
         &self.key
     }
 
+    /// Returns the `Base58` string representation of the contract key.
     pub fn hash_str(&self) -> String {
         Self::encode_hash(&self.key)
     }
 
+    /// Reference to contract code.
     pub fn data(&self) -> &[u8] {
         &*self.data
     }
 
+    /// Extracts the owned contract code data as a `Vec<u8>`.
     pub fn into_data(self) -> Vec<u8> {
         self.data.to_owned().to_vec()
     }
 
+    /// Returns the `Base58` string representation of a hash.
     pub fn encode_hash(hash: &[u8; CONTRACT_KEY_SIZE]) -> String {
         bs58::encode(hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -507,7 +590,7 @@ impl std::fmt::Display for ContractCode<'_> {
     }
 }
 
-/// The key representing the tuple of a contract code and a set of parameters.
+/// The key representing the tuple of a `contract code` and a set of `parameters`.
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
@@ -515,12 +598,14 @@ impl std::fmt::Display for ContractCode<'_> {
 pub struct ContractId(#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] [u8; CONTRACT_KEY_SIZE]);
 
 impl ContractId {
+    /// `Base58` string representation of the `contract id`.
     pub fn encode(&self) -> String {
         bs58::encode(self.0)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
     }
 
+    /// Build `ContractId` from the binary representation.
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, bs58::decode::Error> {
         let mut spec = [0; CONTRACT_KEY_SIZE];
         bs58::decode(bytes)
@@ -563,6 +648,7 @@ impl Display for ContractId {
     }
 }
 
+/// A complete key specification, that represents a cryptographic hash that identifies the contract.
 #[serde_as]
 #[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
@@ -632,6 +718,8 @@ impl ContractKey {
         })
     }
 
+    /// Returns the decoded contract key from encoded hash of the contract key and the given
+    /// parameters.
     pub fn decode(
         contract_key: impl Into<String>,
         parameters: Parameters,

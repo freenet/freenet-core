@@ -8,11 +8,17 @@ const MIN_U8: number = 0;
 
 /**
  * The key representing the tuple of a contract code and a set of parameters.
+ * @public
  */
 export class Key {
   private spec: Uint8Array;
   private contract: Uint8Array | null;
 
+  /**
+   * @constructor
+   * @param {Uint8Array} spec
+   * @param {Uint8Array} [contract]
+   */
   constructor(spec: Uint8Array, contract?: Uint8Array) {
     if (
       spec.length != 32 ||
@@ -30,6 +36,17 @@ export class Key {
     }
   }
 
+  /**
+   * Gnerate key rom base58 key spec representation
+   * @example
+   * Here's a simple example:
+   * ```
+   * const MODEL_CONTRACT = "DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1";
+   * const KEY = Key.fromSpec(MODEL_CONTRACT);
+   * ```
+   * @param spec - Base58 string representation of the key
+   * @returns The key representation from given spec
+   */
   static fromSpec(spec: string): Key {
     let encoded = base58.decode(spec);
     return new Key(encoded);
@@ -59,57 +76,154 @@ export class Key {
   }
 }
 
+/**
+ * The contract representing the tuple of a key, contract code and a set of parameters.
+ * @public
+ */
 export type Contract = {
   key: Key;
   data: Uint8Array;
   parameters: Uint8Array;
 };
 
+/**
+ * Representation of a contract state
+ * @public
+ */
 export type State = Uint8Array;
+/**
+ * Representation of a contract state changes summary
+ * @public
+ */
 export type StateSummary = Uint8Array;
+/**
+ * State delta representation
+ * @public
+ */
 export type StateDelta = Uint8Array;
 
 // ops:
 
+/**
+ * Representation of the client put request operation
+ * @public
+ */
 export type PutRequest = {
   contract: Contract;
   state: State;
 };
 
+/**
+ * Representation of the client update request operation
+ * @public
+ */
 export type UpdateRequest = {
   key: Key;
   delta: Uint8Array;
 };
 
+/**
+ * Representation of the client get request operation
+ * @public
+ */
 export type GetRequest = {
   key: Key;
   fetch_contract: boolean;
 };
 
+/**
+ * Representation of the client subscribe request operation
+ * @public
+ */
 export type SubscribeRequest = {
   key: Key;
 };
 
+/**
+ * Representation of the client disconnect request operation
+ * @public
+ */
 export type DisconnectRequest = {
   cause?: string;
 };
 
 // API
 
+/**
+ * Interface to handle responses from the host
+ * 
+ * @example
+ * Here's a simple implementation example:
+ * ```
+ * const handler = {
+ *  onPut: (_response: PutResponse) => {},
+ *  onGet: (_response: GetResponse) => {},
+ *  onUpdate: (_up: UpdateResponse) => {},
+ *  onUpdateNotification: (_notif: UpdateNotification) => {},
+ *  onErr: (err: HostError) => {},
+ *  onOpen: () => {},
+ * };
+ * ```
+ * 
+ * @public
+ */
 export interface ResponseHandler {
+  /**
+   * `Put` response handler
+   */
   onPut: (response: PutResponse) => void;
+  /**
+   * `Get` response handler
+   */
   onGet: (response: GetResponse) => void;
+  /**
+   * `Update` response handler
+   */
   onUpdate: (response: UpdateResponse) => void;
+  /**
+   * `Update` notification handler
+   */
   onUpdateNotification: (response: UpdateNotification) => void;
+  /**
+   * `Error` handler
+   */
   onErr: (response: HostError) => void;
+  /**
+   * Tasks required after establishing connection with websocket
+   */
   onOpen: () => void;
 }
 
+/**
+ * The `LocutusWsApi` provides the API to manage the connection to the host, handle responses, and send requests.
+ * @example
+ * Here's a simple example:
+ * ```
+ * const API_URL = new URL(`ws://${location.host}/contract/command/`);
+ * const locutusApi = new LocutusWsApi(API_URL, handler);
+ * ```
+ */
 export class LocutusWsApi {
+  /**
+   * Websocket object for creating and managing a WebSocket connection to a server,  
+   * as well as for sending and receiving data on the connection.
+   * @public
+   */
   public ws: WebSocket;
+  /**
+   * @private
+   */
   private encoder: Encoder;
+  /**
+   * @private
+   */
   private reponseHandler: ResponseHandler;
 
+  /**
+   * @constructor
+   * @param url - The websocket URL to which to connect
+   * @param handler - The ResponseHandler implementation
+   */
   constructor(url: URL, handler: ResponseHandler) {
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
@@ -123,6 +237,9 @@ export class LocutusWsApi {
     });
   }
 
+  /**
+   * @private
+   */
   private handleResponse(ev: MessageEvent<any>): void | Error {
     let response;
     try {
@@ -150,26 +267,46 @@ export class LocutusWsApi {
     }
   }
 
+  /**
+   * Sends a put request to the host through websocket
+   * @param put - The `PutRequest` object
+   */
   async put(put: PutRequest): Promise<void> {
     let encoded = this.encoder.encode(put);
     this.ws.send(encoded);
   }
 
+  /**
+   * Sends an update request to the host through websocket
+   * @param update - The `UpdateRequest` object
+   */
   async update(update: UpdateRequest): Promise<void> {
     let encoded = this.encoder.encode(update);
     this.ws.send(encoded);
   }
 
+  /**
+   * Sends a get request to the host through websocket
+   * @param get - The `GetRequest` object
+   */
   async get(get: GetRequest): Promise<void> {
     let encoded = this.encoder.encode(get);
     this.ws.send(encoded);
   }
 
+  /**
+   * Sends a subscribe request to the host through websocket
+   * @param subscribe - The `SubscribeRequest` object
+   */
   async subscribe(subscribe: SubscribeRequest): Promise<void> {
     let encoded = this.encoder.encode(subscribe);
     this.ws.send(encoded);
   }
 
+  /**
+   * Sends an disconnect request to the host through websocket
+   * @param disconnect - The `DisconnectRequest` object
+   */
   async disconnect(disconnect: DisconnectRequest): Promise<void> {
     let encoded = this.encoder.encode(disconnect);
     this.ws.send(encoded);
@@ -179,46 +316,93 @@ export class LocutusWsApi {
 
 // host replies:
 
+/**
+ * Host response types
+ * @public
+ */
 export type Ok =
   | PutResponse
   | UpdateResponse
   | GetResponse
   | UpdateNotification;
 
+/**
+ * Host reponse error type
+ * @public
+ */
 export type HostError = {
   cause: string;
 };
 
+/**
+ * Interface to represent the response for a contract put operation
+ * @public
+ */
 export interface PutResponse {
   readonly kind: "put";
   key: Key;
 }
 
+/**
+ * Interface to represent the response for a contract update operation
+ * @public
+ */
 export interface UpdateResponse {
   readonly kind: "update";
   key: Key;
   summary: State;
 }
 
+/**
+ * Interface to represent the response for a contract get operation
+ * @public
+ */
 export interface GetResponse {
   readonly kind: "get";
   contract?: Contract;
   state: State;
 }
 
+/**
+ * Interface to represent the response for a state update notification
+ * @public
+ */
 export interface UpdateNotification {
   readonly kind: "updateNotification";
   key: Key;
   update: StateDelta;
 }
 
+/**
+ * Check that the condition is met
+ * @param condition - Condition to check
+ * @param [msg] - Error message
+ * @public
+ */
 function assert(condition: boolean, msg?: string) {
   if (!condition) throw new TypeError(msg);
 }
 
+
+/**
+ * Host response representation.
+ * Checks the corresponding response type and returns it as a result.
+ * 
+ * To construct a HostResponse, use the {@link constructor}.
+ * @public
+ */
 export class HostResponse {
+  /**
+   * @private
+   */
   private result: Ok | HostError;
 
+  /**
+   * Builds the response from the bytes received from the host
+   * @param bytes - Response data
+   * @returns The corresponding response type result
+   * @constructor
+   */
   constructor(bytes: Uint8Array) {
     let decoded = decode(bytes) as object;
     if ("Ok" in decoded) {
@@ -306,74 +490,143 @@ export class HostResponse {
     throw new TypeError("bytes are not a valid HostResponse");
   }
 
+  /**
+   * Check if the response contains "kind" as object key
+   * @returns True if contains the expected key otherwise False
+   * @public
+   */
   isOk(): boolean {
     if ("kind" in this.result) return true;
     else return false;
   }
 
+  /**
+   * Get the response content
+   * @returns The specific response content
+   * @public
+   */
   unwrapOk(): Ok {
     if ("kind" in this.result) {
       return this.result;
     } else throw new TypeError();
   }
 
+  /**
+   * Check if the response is an error
+   * @returns True if is an error otherwise False
+   * @public
+   */
   isErr(): boolean {
     if (this.result instanceof Error) return true;
     else return false;
   }
 
+  /**
+   * Get the specific error object from the response content
+   * @returns The specific error
+   * @public
+   */
   unwrapErr(): HostError {
     if (this.result instanceof Error) return this.result as HostError;
     else throw new TypeError();
   }
 
+  /**
+   * Check if is a put response.
+   * @returns True if is a put response otherwise False
+   * @public
+   */
   isPut(): boolean {
     return this.isOfType("put");
   }
 
+  /**
+   * Try to get the response content as a PutResponse object
+   * @returns The PutResponse object
+   * @public
+   */
   unwrapPut(): PutResponse {
     if (this.isOfType("put")) return this.result as PutResponse;
     else throw new TypeError();
   }
 
+  /**
+   * Check if is an update response.
+   * @returns True if is an update response otherwise False
+   * @public
+   */
   isUpdate(): boolean {
     return this.isOfType("update");
   }
 
+  /**
+   * Try to get the response content as a UpdateResponse object
+   * @returns The UpdateResponse object
+   * @public
+   */
   unwrapUpdate(): UpdateResponse {
     if (this.isOfType("update")) return this.result as UpdateResponse;
     else throw new TypeError();
   }
 
+  /**
+   * Check if is a get response.
+   * @returns True if is a get response otherwise False
+   * @public
+   */
   isGet(): boolean {
     return this.isOfType("get");
   }
 
+  /**
+   * Try to get the response content as a GetResponse object
+   * @returns The GetResponse object
+   * @public
+   */
   unwrapGet(): GetResponse {
     if (this.isOfType("get")) return this.result as GetResponse;
     else throw new TypeError();
   }
 
+  /**
+   * Check if is a update notification response.
+   * @returns True if is a update notification response otherwise False
+   * @public
+   */
   isUpdateNotification(): boolean {
     return this.isOfType("updateNotification");
   }
 
+  /**
+   * Try to get the response content as a UpdateNotification object
+   * @returns The UpdateNotification object
+   * @public
+   */
   unwrapUpdateNotification(): UpdateNotification {
     if (this.isOfType("updateNotification"))
       return this.result as UpdateNotification;
     else throw new TypeError();
   }
 
+  /**
+   * @private
+   */
   private isOfType(ty: string): boolean {
     return "kind" in this.result && this.result.kind === ty;
   }
 
+  /**
+   * @private
+   */
   private static assertKey(key: any): Key {
     let bytes = HostResponse.assertBytes(key);
     assert(bytes.length === 32, "expected exactly 32 bytes");
     return new Key(bytes as Uint8Array);
   }
 
+  /**
+   * @private
+   */
   private static assertBytes(state: any): Uint8Array {
     assert(Array.isArray(state));
     assert(

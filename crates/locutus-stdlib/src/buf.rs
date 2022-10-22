@@ -11,10 +11,12 @@ pub struct BufferBuilder {
 }
 
 impl BufferBuilder {
+    /// Return the buffer capacity.
     pub fn size(&self) -> usize {
         self.size as _
     }
 
+    /// Returns the first byte of buffer.
     pub fn start(&self) -> *const u8 {
         self.start as _
     }
@@ -39,6 +41,7 @@ impl BufferBuilder {
         std::mem::forget(data);
     }
 
+    /// Returns a wrapped raw pointer to the buffer builder.
     pub fn to_ptr(self) -> *mut BufferBuilder {
         Box::into_raw(Box::new(self))
     }
@@ -60,13 +63,14 @@ impl From<Vec<u8>> for BufferBuilder {
     }
 }
 
+/// Type of buffer errors.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
     InsufficientMemory { req: usize, free: usize },
 }
 
-/// Represents a buffer in the wasm module.
+/// Represents a mutable buffer in the wasm module.
 #[derive(Debug)]
 pub struct BufferMut<'instance> {
     buffer: &'instance mut [u8],
@@ -81,6 +85,7 @@ pub struct BufferMut<'instance> {
 }
 
 impl<'instance> BufferMut<'instance> {
+    /// Tries to write data into the buffer, after any unread bytes.
     pub fn write<T>(&mut self, obj: T) -> Result<(), Error>
     where
         T: AsRef<[u8]>,
@@ -108,6 +113,9 @@ impl<'instance> BufferMut<'instance> {
         }
     }
 
+    /// Read bytes specified number of bytes from the buffer.
+    ///
+    /// Always read from the beginning.
     pub fn read_bytes(&self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         // don't update the read ptr
@@ -134,6 +142,7 @@ impl<'instance> BufferMut<'instance> {
         }
     }
 
+    /// Return the buffer capacity.
     pub fn size(&self) -> usize {
         unsafe {
             let end_ptr = self.mem.0.offset(self.mem.1 as isize);
@@ -239,12 +248,14 @@ impl<'instance> Buffer<'instance> {
         t
     }
 
+    /// Read bytes specified number of bytes from the buffer.
     pub fn read_bytes(&mut self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         *self.read_ptr += len as u32;
         &self.buffer[next_offset..next_offset + len]
     }
 
+    /// Reads all the bytes from the buffer.
     pub fn read_all(&mut self) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         *self.read_ptr += self.buffer.len() as u32;
