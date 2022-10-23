@@ -1,7 +1,7 @@
-use std::{net::Ipv4Addr, pin::Pin, sync::Arc, time::Duration};
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail};
-use futures::Future;
+use futures::future::BoxFuture;
 use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
@@ -53,6 +53,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: init_val,
             contract: contract.clone(),
+            related_contracts: Default::default(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;
@@ -74,6 +75,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .send(ClientRequest::Put {
             state: second_val,
             contract,
+            related_contracts: Default::default(),
         })
         .await
         .map_err(|_| anyhow!("channel closed"))?;
@@ -132,20 +134,18 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[derive(Clone)]
 struct EventManager {
-    tx_gw_ev: Sender<ClientRequest>,
-    tx_node_ev: Sender<ClientRequest>,
+    tx_gw_ev: Sender<ClientRequest<'static>>,
+    tx_node_ev: Sender<ClientRequest<'static>>,
 }
 
 struct UserEvents {
-    rx_ev: Receiver<ClientRequest>,
+    rx_ev: Receiver<ClientRequest<'static>>,
 }
 
 impl ClientEventsProxy for UserEvents {
     /// # Cancellation Safety
     /// This future must be safe to cancel.
-    fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
+    fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         Box::pin(async move {
             Ok(OpenRequest::new(
                 ClientId::FIRST,
@@ -159,7 +159,7 @@ impl ClientEventsProxy for UserEvents {
         &mut self,
         _id: ClientId,
         _response: Result<HostResponse, ClientError>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         Box::pin(async move {
             log::info!("received response");
             Ok(())

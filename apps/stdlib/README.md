@@ -4,7 +4,7 @@ Locutus Javascript/Typescript Standard Library contains utilities for developing
 
 The stdlib offers a series of facilities in which you will be able to communicate with the network ergonomically.
 
-Here is an example of how you could write your application to interact with the node:
+Here is a minimal example of how you could write your application to interact with the node:
 
 ```
 import { LocutusWsApi } from "@locutus/locutus-stdlib/webSocketInterface";

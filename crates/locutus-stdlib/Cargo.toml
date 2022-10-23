@@ -1,6 +1,6 @@
 [package]
 name = "locutus-stdlib"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.58.0"
 publish = true
@@ -11,18 +11,23 @@ repository = "https://github.com/freenet/locutus"
 [dependencies]
 arbitrary = { version = "1", optional = true, features = ["derive"] }
 arrayvec = { version = "0.7", features = ["serde"] }
+bincode = "1"
 byteorder = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
+env_logger = "0.9"
+log = "0.4"
 once_cell = "1"
+rmpv = { version = "1"}
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 serde_with = "2"
 tar = "0.4.38"
 thiserror = "1"
 xz2 = { version = "0.1", optional = true }
 
 # internal
-locutus-macros = { path = "../locutus-macros", version = "0.0.2" }
+locutus-macros = { path = "../locutus-macros", version = "0.0.3" }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
@@ -32,5 +37,6 @@ wasmer-wasi = "2.3"
 rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
-testing = ["arbitrary"]
 archive = ["xz2"]
+testing = ["arbitrary"]
+trace = []

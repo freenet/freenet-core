@@ -3,15 +3,10 @@ use std::{
     error::Error,
     future::Future,
     net::SocketAddr,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use futures::{stream::SplitSink, SinkExt, StreamExt};
-use rmp_serde as rmps;
+use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use warp::{filters::BoxedFilter, Filter, Reply};
 
@@ -21,7 +16,7 @@ use crate::{ClientRequest, HostResponse};
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 pub struct WebSocketProxy {
-    server_request: Receiver<OpenRequest>,
+    server_request: Receiver<StaticOpenRequest>,
     server_response: Sender<(ClientId, HostResult)>,
 }
 
@@ -29,35 +24,39 @@ type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
 
 impl WebSocketProxy {
     /// Starts this as an upgrade to an existing HTTP connection at the `/ws-api` URL
-    pub fn as_upgrade<T: Into<SocketAddr>>(
+    pub fn as_upgrade<T>(
         socket: T,
         server_config: BoxedFilter<(impl Reply + 'static,)>,
-    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>> {
-        Self::start_server_internal(socket, server_config)
+    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>>
+    where
+        T: Into<SocketAddr>,
+    {
+        Self::start_server_internal(socket.into(), server_config)
     }
 
     /// Starts the websocket connection at the default `/ws-api` URL
-    pub fn start_server<T: Into<SocketAddr>>(
+    pub fn start_server<T>(
         socket: T,
-    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>> {
+    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>>
+    where
+        T: Into<SocketAddr>,
+    {
         let filter = warp::filters::path::end().map(warp::reply::reply).boxed();
-        Self::start_server_internal(socket, filter)
+        Self::start_server_internal(socket.into(), filter)
     }
 
-    async fn start_server_internal<T: Into<SocketAddr>>(
-        socket: T,
+    async fn start_server_internal(
+        socket: SocketAddr,
         filter: BoxedFilter<(impl Reply + 'static,)>,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
         let (request_sender, server_request) = channel(PARALLELISM);
         let (server_response, response_receiver) = channel(PARALLELISM);
         let (new_client_up, new_clients) = channel(PARALLELISM);
-        tokio::spawn(serve(
-            Arc::new(request_sender),
-            Arc::new(new_client_up),
-            socket.into(),
-            filter,
-        ));
+
+        let server = serve(request_sender, new_client_up, socket, filter);
+        tokio::spawn(server);
         tokio::spawn(responses(new_clients, response_receiver));
+
         Ok(Self {
             server_request,
             server_response,
@@ -65,25 +64,33 @@ impl WebSocketProxy {
     }
 }
 
+// work around for rustc issue #64552
+struct StaticOpenRequest(OpenRequest<'static>);
+
+impl From<OpenRequest<'static>> for StaticOpenRequest {
+    fn from(val: OpenRequest<'static>) -> Self {
+        StaticOpenRequest(val)
+    }
+}
+
 impl ClientEventsProxy for WebSocketProxy {
-    fn recv<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + 'a>> {
+    fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
         Box::pin(async move {
             let req = self
                 .server_request
                 .recv()
                 .await
+                .map(|r| r.0)
                 .ok_or(ErrorKind::ChannelClosed)?;
             Ok(req)
         })
     }
 
-    fn send<'a>(
-        &'a mut self,
+    fn send(
+        &mut self,
         client: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + 'a>> {
+    ) -> BoxFuture<Result<(), ClientError>> {
         Box::pin(async move {
             self.server_response
                 .send((client, response))
@@ -95,8 +102,8 @@ impl ClientEventsProxy for WebSocketProxy {
 }
 
 async fn serve(
-    request_sender: Arc<Sender<OpenRequest>>,
-    new_responses: Arc<Sender<ClientHandling>>,
+    request_sender: Sender<StaticOpenRequest>,
+    new_responses: Sender<ClientHandling>,
     socket: SocketAddr,
     server_config: BoxedFilter<(impl Reply + 'static,)>,
 ) {
@@ -157,8 +164,8 @@ static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 async fn handle_socket(
     socket: warp::ws::WebSocket,
-    request_sender: Arc<Sender<OpenRequest>>,
-    client_handler: Arc<Sender<ClientHandling>>,
+    request_sender: Sender<StaticOpenRequest>,
+    client_handler: Sender<ClientHandling>,
 ) {
     let client_id = ClientId(CLIENT_ID.fetch_add(1, Ordering::SeqCst));
     let (mut client_tx, mut client_rx) = socket.split();
@@ -189,24 +196,27 @@ async fn handle_socket(
 }
 
 async fn new_request(
-    request_sender: &Arc<Sender<OpenRequest>>,
+    request_sender: &Sender<StaticOpenRequest>,
     id: ClientId,
     result: Option<Result<warp::ws::Message, warp::Error>>,
 ) -> Result<(), ()> {
     let msg = match result {
         Some(Ok(msg)) if msg.is_binary() => {
-            let data = std::io::Cursor::new(msg.into_bytes());
-            let deserialized: ClientRequest = match rmps::from_read(data) {
+            let data = msg.into_bytes();
+            let deserialized: ClientRequest = match ClientRequest::decode_mp(&*data) {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = request_sender
-                        .send(OpenRequest {
-                            id,
-                            request: ClientRequest::Disconnect {
-                                cause: Some(format!("{e}")),
-                            },
-                            notification_channel: None,
-                        })
+                        .send(
+                            OpenRequest {
+                                id,
+                                request: ClientRequest::Disconnect {
+                                    cause: Some(format!("{e}")),
+                                },
+                                notification_channel: None,
+                            }
+                            .into(),
+                        )
                         .await;
                     return Ok(());
                 }
@@ -216,24 +226,30 @@ async fn new_request(
         Some(Ok(_)) => return Ok(()),
         Some(Err(e)) => {
             let _ = request_sender
-                .send(OpenRequest {
-                    id,
-                    request: ClientRequest::Disconnect {
-                        cause: Some(format!("{e}")),
-                    },
-                    notification_channel: None,
-                })
+                .send(
+                    OpenRequest {
+                        id,
+                        request: ClientRequest::Disconnect {
+                            cause: Some(format!("{e}")),
+                        },
+                        notification_channel: None,
+                    }
+                    .into(),
+                )
                 .await;
             return Err(());
         }
         None => return Err(()),
     };
     if request_sender
-        .send(OpenRequest {
-            id,
-            request: msg,
-            notification_channel: None,
-        })
+        .send(
+            OpenRequest {
+                id,
+                request: msg,
+                notification_channel: None,
+            }
+            .into(),
+        )
         .await
         .is_err()
     {
@@ -246,7 +262,7 @@ async fn send_reponse_to_client(
     response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
     response: Result<HostResponse, ClientError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let serialize = rmps::to_vec(&response).unwrap();
+    let serialize = rmp_serde::to_vec(&response).unwrap();
     response_stream
         .send(warp::ws::Message::binary(serialize))
         .await?;

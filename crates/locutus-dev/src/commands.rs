@@ -1,7 +1,9 @@
 use std::{fs::File, io::Read, sync::Arc};
 
-use locutus_core::{ClientId, ClientRequest, ContractExecutor, SqlitePool};
-use locutus_runtime::{ContractId, ContractStore, Parameters, StateStore, WrappedContract};
+use locutus_core::{
+    locutus_runtime::StateDelta, ClientId, ClientRequest, Config, ContractExecutor, SqlitePool,
+};
+use locutus_runtime::{ContractInstanceId, ContractStore, Parameters, StateStore, WrappedContract};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},
@@ -33,8 +35,18 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         buf.into()
     };
     let contract = WrappedContract::new(Arc::new(code), params);
+    let related_contracts = if let Some(_related) = config.related_contracts {
+        todo!("use `related` contracts")
+    } else {
+        Default::default()
+    };
+
     println!("Putting contract {}", contract.key());
-    let request = ClientRequest::Put { contract, state };
+    let request = ClientRequest::Put {
+        contract,
+        state,
+        related_contracts,
+    };
     execute_command(request, other).await
 }
 
@@ -42,23 +54,25 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), DynEr
     if config.release {
         return Err("Cannot publish contracts in the network yet".into());
     }
-    let key = ContractId::try_from(config.key)?.into();
+    let key = ContractInstanceId::try_from(config.key)?.into();
     println!("Updating contract {key}");
-    let delta = {
+    let data = {
         let mut buf = vec![];
         File::open(&config.delta)?.read_to_end(&mut buf)?;
-        buf.into()
+        StateDelta::from(buf).into()
     };
-    let request = ClientRequest::Update { key, delta };
+    let request = ClientRequest::Update { key, data };
     execute_command(request, other).await
 }
 
-async fn execute_command(request: ClientRequest, other: BaseConfig) -> Result<(), DynError> {
+async fn execute_command(
+    request: ClientRequest<'static>,
+    other: BaseConfig,
+) -> Result<(), DynError> {
     let data_path = other
-        .data_dir
-        .unwrap_or_else(|| std::env::temp_dir().join("locutus"));
-    let contract_store =
-        ContractStore::new(data_path.join("contracts"), DEFAULT_MAX_CONTRACT_SIZE)?;
+        .contract_data_dir
+        .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
+    let contract_store = ContractStore::new(data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let mut executor = ContractExecutor::new(contract_store, state_store, || {}).await?;
 

@@ -74,11 +74,20 @@ impl ContractExecutor {
     pub async fn preload(
         &mut self,
         cli_id: ClientId,
-        contract: WrappedContract<'static>,
+        contract: WrappedContract,
         state: WrappedState,
+        related_contracts: RelatedContracts<'static>,
     ) {
         if let Err(err) = self
-            .handle_request(cli_id, ClientRequest::Put { contract, state }, None)
+            .handle_request(
+                cli_id,
+                ClientRequest::Put {
+                    contract,
+                    state,
+                    related_contracts,
+                },
+                None,
+            )
             .await
         {
             match err {
@@ -91,11 +100,15 @@ impl ContractExecutor {
     pub async fn handle_request(
         &mut self,
         id: ClientId,
-        req: ClientRequest,
+        req: ClientRequest<'static>,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
-            ClientRequest::Put { contract, state } => {
+            ClientRequest::Put {
+                contract,
+                state,
+                related_contracts,
+            } => {
                 // FIXME: in net node, we don't allow puts for existing contract states
                 //        if it hits a node which already has it it will get rejected
                 //        while we wait for confirmation for the state,
@@ -116,9 +129,11 @@ impl ContractExecutor {
                 log::debug!("executing with params: {:?}", contract.params());
                 let is_valid = self
                     .runtime
-                    .validate_state(key, contract.params(), &state)
+                    .validate_state(key, contract.params(), &state, related_contracts)
                     .map_err(Into::into)
-                    .map_err(Either::Right)?;
+                    .map_err(Either::Right)?
+                    == ValidateResult::Valid;
+                // FIXME: should deal with additional related contracts requested
                 let res = is_valid
                     .then(|| HostResponse::PutResponse { key: *key })
                     .ok_or_else(|| {
@@ -143,7 +158,7 @@ impl ContractExecutor {
                     })?;
                 Ok(res)
             }
-            ClientRequest::Update { key, delta } => {
+            ClientRequest::Update { key, data } => {
                 let parameters = {
                     self.contract_state
                         .get_params(&key)
@@ -159,23 +174,28 @@ impl ContractExecutor {
                         .map_err(Either::Right)?
                         .clone();
 
-                    let new_state = self
+                    let update_modification = self
                         .runtime
-                        .update_state(&key, &parameters, &state, &delta)
+                        .update_state(&key, &parameters, &state, &[data])
                         .map_err(|err| match err {
-                            ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
+                            ContractRuntimeError::ExecError(ExecError::ContractError(err)) => {
                                 Either::Left(RequestError::Update {
                                     key,
-                                    cause: "invalid update value".to_owned(),
+                                    cause: format!("{err}"),
                                 })
                             }
                             other => Either::Right(other.into()),
                         })?;
-                    self.contract_state
-                        .store(key, new_state.clone(), None)
-                        .await
-                        .map_err(|err| Either::Right(err.into()))?;
-                    new_state
+                    if let Some(new_state) = update_modification.new_state {
+                        let new_state = WrappedState::new(new_state.into_bytes());
+                        self.contract_state
+                            .store(key, new_state.clone(), None)
+                            .await
+                            .map_err(|err| Either::Right(err.into()))?;
+                        new_state
+                    } else {
+                        todo!()
+                    }
                 };
                 // in the network impl this would be sent over the network
                 let summary = self
@@ -223,18 +243,20 @@ impl ContractExecutor {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
+                // FIXME: here we are always sending an state_delta, but what we send back depends
                 let update = self
                     .runtime
                     .get_state_delta(key, params, new_state, &*peer_summary)
                     .map_err(|err| match err {
-                        ContractRuntimeError::ExecError(ExecError::InvalidPutValue) => {
+                        ContractRuntimeError::ExecError(ExecError::ContractError(_)) => {
                             Either::Left(RequestError::Put {
                                 key: *key,
                                 cause: "invalid put value".to_owned(),
                             })
                         }
                         other => Either::Right(other.into()),
-                    })?;
+                    })?
+                    .into();
                 notifier
                     .send(Ok(HostResponse::UpdateNotification { key: *key, update }))
                     .unwrap();
@@ -293,8 +315,8 @@ mod test {
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
-        let tmp_path = std::env::temp_dir().join("locutus");
-        let contract_store = ContractStore::new(tmp_path.join("contracts"), MAX_SIZE)?;
+        let tmp_path = std::env::temp_dir().join("locutus-test");
+        let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
         let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         ContractExecutor::new(contract_store.clone(), state_store.clone(), || {

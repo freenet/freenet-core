@@ -1,49 +1,51 @@
 //! This contract just checks that macros compile etc.
+// ANCHOR: contractifce
 use locutus_stdlib::prelude::*;
+
+pub const RANDOM_SIGNATURE: &[u8] = &[6, 8, 2, 5, 6, 9, 9, 10];
 
 struct Contract;
 
 #[contract]
 impl ContractInterface for Contract {
-    fn validate_state(_parameters: Parameters<'static>, state: State<'static>) -> bool {
-        let _state_bytes = state.as_ref();
+    fn validate_state(
+        _parameters: Parameters<'static>,
+        _state: State<'static>,
+        _related: RelatedContracts<'static>,
+    ) -> Result<ValidateResult, ContractError> {
         unimplemented!()
     }
 
-    fn validate_delta(_parameters: Parameters<'static>, _delta: StateDelta<'static>) -> bool {
+    fn validate_delta(
+        _parameters: Parameters<'static>,
+        _delta: StateDelta<'static>,
+    ) -> Result<bool, ContractError> {
         unimplemented!()
     }
 
     fn update_state(
         _parameters: Parameters<'static>,
-        mut state: State<'static>,
-        delta: StateDelta<'static>,
-    ) -> Result<UpdateModification, ContractError> {
-        let new_state = state.to_mut();
-        new_state.extend(delta.as_ref());
-        Ok(UpdateModification::ValidUpdate(state))
+        _state: State<'static>,
+        _data: Vec<UpdateData<'static>>,
+    ) -> Result<UpdateModification<'static>, ContractError> {
+        unimplemented!()
     }
 
     fn summarize_state(
         _parameters: Parameters<'static>,
-        state: State<'static>,
-    ) -> StateSummary<'static> {
-        let state = state.as_ref();
-        StateSummary::from(state[0..3].to_vec())
+        _state: State<'static>,
+    ) -> Result<StateSummary<'static>, ContractError> {
+        unimplemented!()
     }
 
     fn get_state_delta(
         _parameters: Parameters<'static>,
-        state: State<'static>,
-        summary: StateSummary<'static>,
-    ) -> StateDelta<'static> {
-        let state = state.as_ref();
-        assert!(state.len() == 4);
-        let summary = summary.as_ref();
-        assert!(summary.len() == 2);
-        assert!(&state[1..=2] == summary);
-        StateDelta::from(state[3..=3].to_vec())
+        _state: State<'static>,
+        _summary: StateSummary<'static>,
+    ) -> Result<StateDelta<'static>, ContractError> {
+        unimplemented!()
     }
 }
+// ANCHOR_END: contractifce
 
 fn main() {}

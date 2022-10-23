@@ -1,11 +1,9 @@
-use futures::{stream::SplitSink, SinkExt, StreamExt};
+use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
 use locutus_core::*;
 use locutus_runtime::ContractKey;
 use std::{
     collections::HashMap,
-    future::Future,
-    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -27,6 +25,12 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 /// Each request is unique so we don't keep track of a client session of any sort.
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
+/// A gateway to access and interact with contracts through an HTTP interface.
+///
+/// Contracts initially accessed through the gateway have to be compliant with the container contract
+/// [specification](https://docs.freenet.org/glossary.html#container-contract) for Locutus.
+///
+/// Check the Locutus book for [more information](https://docs.freenet.org/dev-guide.html).
 pub struct HttpGateway {
     server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
@@ -214,7 +218,7 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
     let req: ClientRequest = {
-        match ClientRequest::decode_mp(msg) {
+        match ClientRequest::decode_mp(&msg) {
             Ok(r) => r,
             Err(e) => {
                 let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
@@ -324,30 +328,28 @@ impl HttpGateway {
     }
 }
 
-#[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for HttpGateway {
-    fn recv<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<OpenRequest, ClientError>> + Send + Sync + '_>> {
-        Box::pin(async move {
+    fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
+        async move {
             loop {
                 let msg = self.server_request.recv().await;
                 if let Some(msg) = msg {
                     if let Some(reply) = self.internal_proxy_recv(msg).await? {
-                        break Ok(reply);
+                        break Ok(reply.owned());
                     }
                 } else {
                     todo!()
                 }
             }
-        })
+        }
+        .boxed()
     }
 
-    fn send<'a>(
-        &'a mut self,
+    fn send(
+        &mut self,
         id: ClientId,
         result: Result<HostResponse, ClientError>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         Box::pin(async move {
             if let Some(ch) = self.response_channels.remove(&id) {
                 let should_rm = result

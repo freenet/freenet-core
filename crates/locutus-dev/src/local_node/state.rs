@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use locutus_core::{ContractExecutor, SqlitePool};
+use locutus_core::{Config, ContractExecutor, SqlitePool};
 use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
@@ -18,10 +18,8 @@ impl AppState {
     const MAX_MEM_CACHE: u32 = 10_000_000;
 
     pub async fn new(config: &LocalNodeCliConfig) -> Result<Self, DynError> {
-        let tmp_path = std::env::temp_dir().join("locutus").join("contracts");
-        std::fs::create_dir_all(&tmp_path)?;
-        let contract_store =
-            ContractStore::new(tmp_path.join("contracts"), config.max_contract_size)?;
+        let contract_dir = Config::get_conf().config_paths.local_contracts_dir();
+        let contract_store = ContractStore::new(contract_dir, config.max_contract_size)?;
         let state_store = StateStore::new(SqlitePool::new().await?, Self::MAX_MEM_CACHE).unwrap();
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
