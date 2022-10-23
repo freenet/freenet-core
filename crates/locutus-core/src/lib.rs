@@ -10,7 +10,7 @@ mod operations;
 mod ring;
 pub mod util;
 
-pub(crate) type WrappedContract<'a> = locutus_runtime::prelude::WrappedContract<'a>;
+pub(crate) type WrappedContract = locutus_runtime::prelude::WrappedContract;
 pub type WrappedState = locutus_runtime::prelude::WrappedState;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;

@@ -1,6 +1,6 @@
 {
   "name": "@locutus/locutus-stdlib",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Locutus Standard Library and Utils",
   "main": "src/index.ts",
   "files": [
@@ -8,7 +8,6 @@
     "**/*.js"
   ],
   "dependencies": {
-    "@locutus/locutus-stdlib": "^0.0.1",
     "@msgpack/msgpack": "^2.7.2",
     "bs58": "^5.0.0"
   },

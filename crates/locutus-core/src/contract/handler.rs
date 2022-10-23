@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use locutus_runtime::{ContractStore, Parameters, StateStorage, StateStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -13,7 +14,6 @@ pub(crate) use sqlite::SqlDbError;
 
 const MAX_MEM_CACHE: i64 = 10_000_000;
 
-#[async_trait::async_trait]
 pub(crate) trait ContractHandler:
     From<ContractHandlerChannel<Self::Error, CHListenerHalve>>
 {
@@ -26,7 +26,10 @@ pub(crate) trait ContractHandler:
 
     fn state_store(&mut self) -> &mut StateStore<Self::Store>;
 
-    async fn handle_request(&mut self, req: ClientRequest) -> Result<HostResponse, Self::Error>;
+    fn handle_request<'a, 's: 'a>(
+        &'s mut self,
+        req: ClientRequest<'a>,
+    ) -> BoxFuture<'a, Result<HostResponse, Self::Error>>;
 }
 
 pub struct EventId(u64);
@@ -144,7 +147,7 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
     pub state: Option<WrappedState>,
-    pub contract: Option<WrappedContract<'static>>,
+    pub contract: Option<WrappedContract>,
 }
 
 struct InternalCHEvent<CErr> {
@@ -174,7 +177,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
         response: Result<StoreResponse, Err>,
     },
     /// Store a contract in the local store.
-    Cache(WrappedContract<'static>),
+    Cache(WrappedContract),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError<Err>>),
 }
@@ -182,10 +185,10 @@ pub(crate) enum ContractHandlerEvent<Err> {
 pub(in crate::contract) mod sqlite {
     use std::{collections::HashMap, pin::Pin, str::FromStr};
 
-    use futures::Future;
+    use futures::{Future, FutureExt};
     use locutus_runtime::{
         ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, StateStorage,
-        StateStoreError,
+        StateStoreError, ValidateResult,
     };
     use once_cell::sync::Lazy;
     use sqlx::{
@@ -363,7 +366,7 @@ pub(in crate::contract) mod sqlite {
             &self,
             key: &ContractKey,
             fetch_contract: bool,
-        ) -> Result<(WrappedState, Option<WrappedContract<'static>>), SqlDbError> {
+        ) -> Result<(WrappedState, Option<WrappedContract>), SqlDbError> {
             let state = self.state_store.get(key).await?;
             let contract = fetch_contract
                 .then(|| {
@@ -395,7 +398,6 @@ pub(in crate::contract) mod sqlite {
         }
     }
 
-    #[async_trait::async_trait]
     impl<R> ContractHandler for SQLiteContractHandler<R>
     where
         R: RuntimeInterface + Send + Sync + 'static,
@@ -414,43 +416,54 @@ pub(in crate::contract) mod sqlite {
             &mut self.store
         }
 
-        async fn handle_request(
-            &mut self,
-            req: ClientRequest,
-        ) -> Result<HostResponse, Self::Error> {
-            match req {
-                ClientRequest::Get {
-                    key,
-                    fetch_contract,
-                } => {
-                    let (state, contract) = self.get_contract(&key, fetch_contract).await?;
-                    Ok(HostResponse::GetResponse { contract, state })
-                }
-                ClientRequest::Put { contract, state } => {
-                    match self.get_contract(contract.key(), false).await {
-                        Ok((_old_state, _)) => {
-                            return Err(ContractRuntimeError::from(ExecError::DoublePut(
-                                *contract.key(),
-                            ))
-                            .into())
+        fn handle_request<'a, 's: 'a>(
+            &'s mut self,
+            req: ClientRequest<'a>,
+        ) -> BoxFuture<'a, Result<HostResponse, Self::Error>> {
+            async move {
+                match req {
+                    ClientRequest::Get {
+                        key,
+                        fetch_contract,
+                    } => {
+                        let (state, contract) = self.get_contract(&key, fetch_contract).await?;
+                        Ok(HostResponse::GetResponse { contract, state })
+                    }
+                    ClientRequest::Put {
+                        contract,
+                        state,
+                        related_contracts,
+                    } => {
+                        match self.get_contract(contract.key(), false).await {
+                            Ok((_old_state, _)) => {
+                                return Err(ContractRuntimeError::from(ExecError::DoublePut(
+                                    *contract.key(),
+                                ))
+                                .into())
+                            }
+                            Err(SqlDbError::ContractNotFound) => {}
+                            Err(other) => return Err(other),
                         }
-                        Err(SqlDbError::ContractNotFound) => {}
-                        Err(other) => return Err(other),
-                    }
 
-                    let is_valid =
-                        self.runtime
-                            .validate_state(contract.key(), contract.params(), &state)?;
-                    if !is_valid {
-                        todo!("return error");
+                        let result = self.runtime.validate_state(
+                            contract.key(),
+                            contract.params(),
+                            &state,
+                            related_contracts,
+                        )?;
+                        // FIXME: should deal with additional related contracts requested
+                        if result != ValidateResult::Valid {
+                            todo!("return error");
+                        }
+                        let _params: Parameters<'static> =
+                            contract.params().clone().into_bytes().into();
+                        self.state_store.store(*contract.key(), state, None).await?;
+                        todo!()
                     }
-                    let _params: Parameters<'static> =
-                        contract.params().clone().into_owned().into();
-                    self.state_store.store(*contract.key(), state, None).await?;
-                    todo!()
+                    _ => unimplemented!(),
                 }
-                _ => unimplemented!(),
             }
+            .boxed()
         }
 
         fn state_store(&mut self) -> &mut StateStore<Self::Store> {
@@ -496,6 +509,7 @@ pub(in crate::contract) mod sqlite {
                 .handle_request(ClientRequest::Put {
                     contract: contract.clone(),
                     state: state.clone(),
+                    related_contracts: Default::default(),
                 })
                 .await?
                 .unwrap_put();
@@ -513,7 +527,7 @@ pub(in crate::contract) mod sqlite {
             handler
                 .handle_request(ClientRequest::Update {
                     key: *contract.key(),
-                    delta,
+                    data: delta.into(),
                 })
                 .await?;
             // let (new_get_result_value, _) = handler
@@ -585,7 +599,6 @@ pub mod test {
         }
     }
 
-    #[async_trait::async_trait]
     impl ContractHandler for TestContractHandler {
         type Error = TestContractStoreError;
         type Store = MemKVStore;
@@ -600,10 +613,10 @@ pub mod test {
             &mut self.contract_store
         }
 
-        async fn handle_request(
-            &mut self,
-            _req: ClientRequest,
-        ) -> Result<HostResponse, Self::Error> {
+        fn handle_request<'a, 's: 'a>(
+            &'s mut self,
+            _req: ClientRequest<'a>,
+        ) -> BoxFuture<'a, Result<HostResponse, Self::Error>> {
             // async fn get_state(
             //     &self,
             //     contract: &ContractKey,

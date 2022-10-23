@@ -5,7 +5,7 @@ use crate::local_node::LocalNodeCliConfig;
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Locutus Development Tool")]
 #[clap(author = "The Freenet Project Inc.")]
-#[clap(version = "0.0.2")]
+#[clap(version = "0.0.3")]
 pub struct Config {
     #[clap(subcommand)]
     pub sub_command: SubCommand,
@@ -13,10 +13,21 @@ pub struct Config {
     pub additional: BaseConfig,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy)]
+pub enum OperationMode {
+    /// Run the node in local-only mode. Useful for development pourpouses.
+    Local,
+    /// Standard operation mode.
+    Network,
+}
+
 #[derive(clap::Parser, Clone)]
 pub struct BaseConfig {
-    /// Overrides the default data directory where Locutus files are stored.
-    pub(crate) data_dir: Option<PathBuf>,
+    /// Overrides the default data directory where Locutus contract files are stored.
+    pub(crate) contract_data_dir: Option<PathBuf>,
+    /// Node operation mode.
+    #[clap(value_enum, default_value_t=OperationMode::Local)]
+    mode: OperationMode,
 }
 
 #[derive(clap::Subcommand, Clone)]
@@ -74,13 +85,20 @@ pub struct PutConfig {
     /// to be executed in local mode only. By default puts are performed in local.
     #[clap(long)]
     pub(crate) release: bool,
+    /// A path to a JSON file listing the related contracts.
+    #[clap(long)]
+    pub(crate) related_contracts: Option<PathBuf>,
 }
 
 /// Builds and packages a contract.
 ///
 /// This tool will build the WASM contract and publish it to the network.
-#[derive(clap::Parser, Clone)]
-pub struct BuildToolCliConfig {}
+#[derive(clap::Parser, Clone, Default)]
+pub struct BuildToolCliConfig {
+    /// Compile the contract with WASI extension enabled (useful for debugging).
+    #[clap(long)]
+    pub(crate) wasi: bool,
+}
 
 /// Create a new Locutus contract and/or app.
 #[derive(clap::Parser, Clone)]

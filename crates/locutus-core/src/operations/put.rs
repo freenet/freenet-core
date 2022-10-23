@@ -411,7 +411,7 @@ fn build_op_result<CErr: std::error::Error>(
 
 async fn try_to_cache_contract<'a, CErr: std::error::Error>(
     op_storage: &'a OpManager<CErr>,
-    contract: &WrappedContract<'static>,
+    contract: &WrappedContract,
     key: ContractKey,
 ) -> Result<(), OpError<CErr>> {
     // this node does not have the contract, so instead store the contract and execute the put op.
@@ -482,7 +482,7 @@ async fn try_to_broadcast<CErr: std::error::Error>(
 }
 
 pub(crate) fn start_op(
-    contract: WrappedContract<'static>,
+    contract: WrappedContract,
     value: WrappedState,
     htl: usize,
     peer: &PeerKey,
@@ -513,7 +513,7 @@ enum PutState {
     ReceivedRequest,
     PrepareRequest {
         id: Transaction,
-        contract: WrappedContract<'static>,
+        contract: WrappedContract,
         value: WrappedState,
         htl: usize,
     },
@@ -619,7 +619,7 @@ where
 async fn forward_changes<CErr, CB>(
     op_storage: &OpManager<CErr>,
     conn_manager: &CB,
-    contract: &WrappedContract<'static>,
+    contract: &WrappedContract,
     new_value: WrappedState,
     id: Transaction,
     htl: usize,
@@ -675,7 +675,7 @@ mod messages {
         /// Internal node instruction to find a route to the target node.
         RequestPut {
             id: Transaction,
-            contract: WrappedContract<'static>,
+            contract: WrappedContract,
             value: WrappedState,
             /// max hops to live
             htl: usize,
@@ -686,7 +686,7 @@ mod messages {
         /// Forward a contract and it's latest value to an other node
         PutForward {
             id: Transaction,
-            contract: WrappedContract<'static>,
+            contract: WrappedContract,
             new_value: WrappedState,
             /// current htl, reduced by one at each hop
             htl: usize,
@@ -703,7 +703,7 @@ mod messages {
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
             value: WrappedState,
-            contract: WrappedContract<'static>,
+            contract: WrappedContract,
             /// max hops to live
             htl: usize,
             // FIXME: remove skip list once we deduplicate at top msg handling level
@@ -833,6 +833,7 @@ mod test {
         let put_event = ClientRequest::Put {
             contract: contract.clone(),
             state: new_value.clone(),
+            related_contracts: Default::default(),
         };
 
         let gw_0 = NodeSpecification {
