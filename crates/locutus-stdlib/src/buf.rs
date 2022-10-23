@@ -1,23 +1,36 @@
 //! Memory buffers to interact with the WASM contracts.
 
+use crate::prelude::WasmLinearMem;
+
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct BufferBuilder {
     start: i64,
-    size: u32,
+    capacity: u32,
     last_read: i64,
     last_write: i64,
 }
 
 impl BufferBuilder {
     /// Return the buffer capacity.
-    pub fn size(&self) -> usize {
-        self.size as _
+    pub fn capacity(&self) -> usize {
+        self.capacity as _
+    }
+
+    pub fn written(&self, mem: Option<&WasmLinearMem>) -> usize {
+        unsafe {
+            let ptr = if let Some(mem) = mem {
+                compute_ptr(self.last_write as *mut u32, mem)
+            } else {
+                self.last_write as *mut u32
+            };
+            *ptr as usize
+        }
     }
 
     /// Returns the first byte of buffer.
-    pub fn start(&self) -> *const u8 {
+    pub fn start(&self) -> *mut u8 {
         self.start as _
     }
 
@@ -29,13 +42,13 @@ impl BufferBuilder {
         let write_ptr = Box::leak(Box::from_raw(self.last_write as *mut u32));
 
         // drop previous buffer
-        let prev = Vec::from_raw_parts(self.start as *mut u8, *write_ptr as usize, self.size());
+        let prev = Vec::from_raw_parts(self.start as *mut u8, *write_ptr as usize, self.capacity());
         std::mem::drop(prev);
 
         // write the new buffer information
         let new_ptr = data.as_ptr();
         self.start = new_ptr as i64;
-        self.size = data.capacity() as _;
+        self.capacity = data.capacity() as _;
         *read_ptr = 0;
         *write_ptr = data.len().saturating_sub(1) as _; // []
         std::mem::forget(data);
@@ -47,30 +60,20 @@ impl BufferBuilder {
     }
 }
 
-impl From<Vec<u8>> for BufferBuilder {
-    fn from(data: Vec<u8>) -> Self {
-        let last_read = Box::into_raw(Box::new(0u32)) as i64;
-        let last_write = Box::into_raw(Box::new(data.len() as u32)) as i64;
-        let start = data.as_ptr() as _;
-        let size = data.capacity() as _;
-        std::mem::forget(data);
-        BufferBuilder {
-            start,
-            size,
-            last_read,
-            last_write,
-        }
-    }
-}
-
 /// Type of buffer errors.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    /// Insufficient memory while trying to write to the buffer.
     #[error("insufficient memory, needed {req} bytes but had {free} bytes")]
-    InsufficientMemory { req: usize, free: usize },
+    InsufficientMemory {
+        /// Required memory available
+        req: usize,
+        /// Available memory.
+        free: usize,
+    },
 }
 
-/// Represents a mutable buffer in the wasm module.
+/// A live mutable buffer in the WASM linear memory.
 #[derive(Debug)]
 pub struct BufferMut<'instance> {
     buffer: &'instance mut [u8],
@@ -81,11 +84,13 @@ pub struct BufferMut<'instance> {
     /// A pointer to the underlying builder
     builder_ptr: *mut BufferBuilder,
     /// Linear memory pointer and size in bytes
-    mem: (*const u8, u64),
+    mem: WasmLinearMem,
 }
 
 impl<'instance> BufferMut<'instance> {
     /// Tries to write data into the buffer, after any unread bytes.
+    ///
+    /// Will return an error if there is insufficient space.
     pub fn write<T>(&mut self, obj: T) -> Result<(), Error>
     where
         T: AsRef<[u8]>,
@@ -115,7 +120,7 @@ impl<'instance> BufferMut<'instance> {
 
     /// Read bytes specified number of bytes from the buffer.
     ///
-    /// Always read from the beginning.
+    /// Always reads from the beginning.
     pub fn read_bytes(&self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         // don't update the read ptr
@@ -143,11 +148,10 @@ impl<'instance> BufferMut<'instance> {
     }
 
     /// Return the buffer capacity.
-    pub fn size(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         unsafe {
-            let end_ptr = self.mem.0.offset(self.mem.1 as isize);
-            let p = &*compute_ptr(self.builder_ptr, self.mem.0, end_ptr);
-            p.size as _
+            let p = &*compute_ptr(self.builder_ptr, &self.mem);
+            p.capacity as _
         }
     }
 
@@ -156,7 +160,7 @@ impl<'instance> BufferMut<'instance> {
     /// The pointer passed come from a previous call to `initiate_buffer` exported function from the contract.
     pub unsafe fn from_ptr(
         builder_ptr: *mut BufferBuilder,
-        linear_mem_space: (*const u8, u64),
+        linear_mem_space: WasmLinearMem,
     ) -> Self {
         let BuilderInfo {
             buffer,
@@ -179,8 +183,9 @@ impl<'instance> BufferMut<'instance> {
 }
 
 #[inline(always)]
-unsafe fn compute_ptr<T>(ptr: *mut T, start_ptr: *const u8, _end_ptr: *const u8) -> *mut T {
-    (start_ptr as isize + ptr as isize) as _
+pub(crate) fn compute_ptr<T>(ptr: *mut T, linear_mem_space: &WasmLinearMem) -> *mut T {
+    let mem_start_ptr = linear_mem_space.start_ptr;
+    (mem_start_ptr as isize + ptr as isize) as _
 }
 
 struct BuilderInfo<'instance> {
@@ -189,33 +194,40 @@ struct BuilderInfo<'instance> {
     write_ptr: &'instance mut u32,
 }
 
-fn from_raw_builder<'a>(
-    builder_ptr: *mut BufferBuilder, // 0x01 <- 0x5FE436
-    linear_mem_space: (*const u8, u64),
-) -> BuilderInfo<'a> {
-    let (start_ptr, size) = linear_mem_space;
+fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> BuilderInfo<'a> {
     unsafe {
-        let end_ptr = start_ptr.offset(size as isize);
-        let builder_ptr = compute_ptr(builder_ptr, start_ptr, end_ptr);
+        #[cfg(feature = "trace")]
+        {
+            let contract_mem = std::slice::from_raw_parts(mem.start_ptr, mem.size as usize);
+            log::trace!(
+                "*mut BufferBuilder <- offset: {}; in mem: {:?}",
+                builder_ptr as usize,
+                &contract_mem[builder_ptr as usize
+                    ..builder_ptr as usize + std::mem::size_of::<BufferBuilder>()]
+            );
+            // use std::{fs::File, io::Write};
+            // let mut f = File::create(std::env::temp_dir().join("dump.mem")).unwrap();
+            // f.write_all(contract_mem).unwrap();
+        }
+
+        let builder_ptr = compute_ptr(builder_ptr, &mem);
         let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
+        #[cfg(feature = "trace")]
+        {
+            log::trace!("buf builder from FFI: {buf_builder:?}");
+        }
+
         let read_ptr = Box::leak(Box::from_raw(compute_ptr(
             buf_builder.last_read as *mut u32,
-            start_ptr,
-            end_ptr,
+            &mem,
         )));
         let write_ptr = Box::leak(Box::from_raw(compute_ptr(
             buf_builder.last_write as *mut u32,
-            start_ptr,
-            end_ptr,
+            &mem,
         )));
-        let buffer_ptr = compute_ptr(buf_builder.start as *mut u8, start_ptr, end_ptr);
+        let buffer_ptr = compute_ptr(buf_builder.start as *mut u8, &mem);
         let buffer =
-            &mut *std::ptr::slice_from_raw_parts_mut(buffer_ptr, buf_builder.size as usize);
-        // eprintln!(
-        //     "checking new ptr: {:p} -> {}; mem: {start_ptr:p} - {end_ptr:p};
-        //     buf ptr: {buffer_ptr:p}; buf size {}",
-        //     buf_builder.start as *mut u8, buf_builder.start, buf_builder.size
-        // );
+            &mut *std::ptr::slice_from_raw_parts_mut(buffer_ptr, buf_builder.capacity as usize);
         BuilderInfo {
             buffer,
             read_ptr,
@@ -225,14 +237,14 @@ fn from_raw_builder<'a>(
 }
 
 #[derive(Debug)]
-/// Represents a buffer in the wasm module.
+/// A live buffer in the WASM linear memory.
 pub struct Buffer<'instance> {
     buffer: &'instance mut [u8],
     /// stores the last read in the buffer
     read_ptr: &'instance mut u32,
     write_ptr: &'instance u32,
     builder_ptr: *mut BufferBuilder,
-    mem: (*const u8, u64),
+    mem: WasmLinearMem,
 }
 
 impl<'instance> Buffer<'instance> {
@@ -248,7 +260,7 @@ impl<'instance> Buffer<'instance> {
         t
     }
 
-    /// Read bytes specified number of bytes from the buffer.
+    /// Read the specified number of bytes from the buffer.
     pub fn read_bytes(&mut self, len: usize) -> &[u8] {
         let next_offset = *self.read_ptr as usize;
         *self.read_ptr += len as u32;
@@ -291,20 +303,36 @@ impl<'instance> Buffer<'instance> {
 /// This buffer leaks it's own memory and will only be freed by the runtime when a contract instance is dropped.
 #[doc(hidden)]
 #[no_mangle]
-pub fn initiate_buffer(size: u32) -> i64 {
-    let buf: Vec<u8> = Vec::with_capacity(size as usize);
+pub fn initiate_buffer(capacity: u32) -> i64 {
+    let buf: Vec<u8> = Vec::with_capacity(capacity as usize);
     let start = buf.as_ptr() as i64;
-    eprintln!("new buffer ptr: {:p} -> {} as i64", buf.as_ptr(), start);
-    std::mem::forget(buf);
 
-    let last_read = Box::into_raw(Box::new(0u32)) as i64;
-    let last_write = Box::into_raw(Box::new(0u32)) as i64;
+    let last_read = Box::into_raw(Box::new(0u32));
+    let last_write = Box::into_raw(Box::new(0u32));
     let buffer = Box::into_raw(Box::new(BufferBuilder {
         start,
-        size,
-        last_read,
-        last_write,
+        capacity,
+        last_read: last_read as _,
+        last_write: last_write as _,
     }));
+    #[cfg(feature = "trace")]
+    {
+        log::trace!(
+            "new buffer ptr: {:p} -> {} as i64 w/ cap: {capacity}",
+            buf.as_ptr(),
+            start
+        );
+        log::trace!(
+            "last read ptr: {last_read:p} -> {} as i64",
+            last_read as i64
+        );
+        log::trace!(
+            "last write ptr: {last_write:p} -> {} as i64",
+            last_write as i64
+        );
+        log::trace!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
+    }
+    std::mem::forget(buf);
     buffer as i64
 }
 
@@ -366,7 +394,10 @@ mod test {
     fn read_and_write() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
         let mem = instance.exports.get_memory("memory")?;
-        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+        let linear_mem = WasmLinearMem {
+            start_ptr: mem.data_ptr() as *const _,
+            size: mem.data_size(),
+        };
 
         let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
         writer.write(&[1u8, 2])?;
@@ -387,7 +418,10 @@ mod test {
     fn read_and_write_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
         let mem = instance.exports.get_memory("memory")?;
-        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+        let linear_mem = WasmLinearMem {
+            start_ptr: mem.data_ptr() as *const _,
+            size: mem.data_size(),
+        };
 
         let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
         writer.write(&[1u8, 2])?;
@@ -408,7 +442,10 @@ mod test {
     fn update() -> Result<(), Box<dyn std::error::Error>> {
         let (_store, instance) = build_test_mod()?;
         let mem = instance.exports.get_memory("memory")?;
-        let linear_mem = (mem.data_ptr() as *const _, mem.data_size());
+        let linear_mem = WasmLinearMem {
+            start_ptr: mem.data_ptr() as *const _,
+            size: mem.data_size(),
+        };
 
         let ptr = {
             let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };

@@ -7,6 +7,7 @@ This guide will walk through how to develop a simple distributed web application
 At the time of writing (September 2022) the Locutus network is not yet active. We've published this guide so that people can experiment with building and running Locutus applications locally, and provide [feedback](https://github.com/freenet/locutus/issues).
 
 You can see some examples of working applications and contracts in the `apps` directory of the locutus repository, e.g.:
+
 - [freenet-microblogging](https://github.com/freenet/locutus/tree/main/apps/freenet-microblogging) (WIP)
 
 ## Installation
@@ -108,51 +109,13 @@ In this case, and for simplicity's sake, the contract won't be performing any fu
 To make our contract unique so it doesn't collide with an existing contract, we can generate a random signature that will be embedded with the contract.
 
 <!--
-What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `locutus-stdlib`. 
+What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `locutus-stdlib`.
 -->
 
 For example in the `lib.rs` file we will write the following:
 
-```rust,noplayground
-use locutus_stdlib::prelude::*;
-
-pub const RANDOM_SIGNATURE: &[u8] = &[6, 8, 2, 5, 6, 9, 9, 10];
-
-struct Contract;
-
-#[contract]
-impl ContractInterface for Contract {
-    fn validate_state(_parameters: Parameters<'static>, _state: State<'static>) -> bool {
-        true
-    }
-
-    fn validate_delta(_parameters: Parameters<'static>, _delta: StateDelta<'static>) -> bool {
-        true
-    }
-
-    fn update_state(
-        _parameters: Parameters<'static>,
-        state: State<'static>,
-        _delta: StateDelta<'static>,
-    ) -> Result<UpdateModification, ContractError> {
-        Ok(UpdateModification::ValidUpdate(state))
-    }
-
-    fn summarize_state(
-        _parameters: Parameters<'static>,
-        _state: State<'static>,
-    ) -> StateSummary<'static> {
-        StateSummary::from(vec![])
-    }
-
-    fn get_state_delta(
-        _parameters: Parameters<'static>,
-        _state: State<'static>,
-        _summary: StateSummary<'static>,
-    ) -> StateDelta<'static> {
-        StateDelta::from(vec![])
-    }
-}
+```rust,no_run,noplayground
+{{#include ../../crates/locutus-runtime/examples/contract.rs:contractifce}}
 ```
 
 That's a lot of information, let's unpack it:
@@ -301,19 +264,23 @@ impl ContractInterface for Contract {
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        delta: StateDelta<'static>,
-    ) -> Result<UpdateModification, ContractError> {
+        data: Vec<UpdateData<'static>>,
+    ) -> Result<UpdateModification<'static>, ContractError> {
         let mut posts: Posts = serde_json::from_slice(&state).map_err(|_| ContractError::InvalidState)?;
-        let new_post: Posts = serde_json::from_slice(&delta).map_err(|_| ContractError::InvalidState);
-        posts.add_post(new_post)?;
-        Ok(UpdateModification::ValidUpdate(state))
+        if let Some(UpdateData::Delta(delta)) = data.pop() {
+          let new_post: Posts = serde_json::from_slice(&delta).map_err(|_| ContractError::InvalidState);
+          posts.add_post(new_post)?;
+        } else {
+            Err(ContractError::InvalidUpdate)
+        }
+        Ok(UpdateModification::valid(posts.into()))
     }
 
     ...
 }
 ```
 
-In this simple example, we convert a new incoming delta to a post and the state to a list of posts we maintain, and we append the post to the list of posts.
+In this simple example, we convert a new incoming delta to a post and the state to a list of posts we maintain, and we append the post to the list of posts. After that, we convert back the posts list to an state and return that.
 
 If we subscribe to the contract changes or our web app, we will receive a notification with the updates after they are successful, and we will be able to render them in our browser. We can do that, for example, using the API:
 
@@ -392,7 +359,7 @@ $ cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./
 $ cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
 ```
 
-In this case, we're not passing any parameters (so our parameters will be an empty byte array), and we are passing an initial state without the current backend contract. In typical use, both the parameters would have meaningful data, and the backend contract may be dynamically generated from the app and published from there. 
+In this case, we're not passing any parameters (so our parameters will be an empty byte array), and we are passing an initial state without the current backend contract. In typical use, both the parameters would have meaningful data, and the backend contract may be dynamically generated from the app and published from there.
 
 Once this is done, you can start your app just by pointing to it in the browser: `http://127.0.0.1:50509/contract/web/<CONTRACT KEY>`
 
@@ -404,7 +371,7 @@ Since the web is part of your state, you are always able to update it, pointing 
 
 ## Limitations
 
-* Publishing to the Locutus network is not yet supported.
-* Only Rust is currently supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
+- Publishing to the Locutus network is not yet supported.
+- Only Rust is currently supported for contract development, but we'll support more languages like [AssemblyScript](https://www.assemblyscript.org/) in the future.
 
-* Binaries for all the required tools are not yet available, they must be compiled from source
+- Binaries for all the required tools are not yet available, they must be compiled from source

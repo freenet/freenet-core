@@ -84,13 +84,16 @@ impl ContractStore {
         &self,
         key: &ContractKey,
         params: &Parameters<'a>,
-    ) -> Option<WrappedContract<'a>> {
+    ) -> Option<WrappedContract> {
         let result = key
             .code_hash()
             .and_then(|code_hash| {
-                self.contract_cache
-                    .get(code_hash)
-                    .map(|data| Some(WrappedContract::new(data.value().clone(), params.clone())))
+                self.contract_cache.get(code_hash).map(|data| {
+                    Some(WrappedContract::new(
+                        data.value().clone(),
+                        params.clone().into_owned(),
+                    ))
+                })
             })
             .flatten();
         if result.is_some() {
@@ -104,9 +107,8 @@ impl ContractStore {
                 .into_string()
                 .to_lowercase();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
-            let owned_params = Parameters::from(params.as_ref().to_owned());
             let WrappedContract { data, params, .. } =
-                WrappedContract::try_from((&*key_path, owned_params))
+                WrappedContract::try_from((&*key_path, params.clone().into_owned()))
                     .map_err(|err| {
                         tracing::debug!("contract not found: {err}");
                         err
@@ -132,12 +134,7 @@ impl ContractStore {
             return Ok(());
         }
 
-        // lock the map file to insert changes
-        let lock = LOCK_FILE_PATH.get().unwrap();
-        while lock.exists() {
-            thread::sleep(Duration::from_micros(5));
-        }
-        File::create(lock)?;
+        Self::acquire_contract_ls_lock()?;
         self.key_to_code_part
             .insert(*contract.key(), *contract_hash);
         let map = KeyToCodeMap::from(&*self.key_to_code_part);
@@ -145,8 +142,7 @@ impl ContractStore {
         // FIXME: make this more reliable, append to the file instead of truncating it
         let mut f = File::create(KEY_FILE_PATH.get().unwrap())?;
         f.write_all(&serialized)?;
-        // release the lock
-        fs::remove_file(LOCK_FILE_PATH.get().unwrap())?;
+        Self::release_contract_ls_lock()?;
 
         let key_path = bs58::encode(contract_hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -220,14 +216,33 @@ impl ContractStore {
 
     fn load_from_file() -> RuntimeResult<KeyToCodeMap> {
         let mut buf = vec![];
+        Self::acquire_contract_ls_lock()?;
         let mut f = File::open(KEY_FILE_PATH.get().unwrap())?;
         f.read_to_end(&mut buf)?;
+        Self::release_contract_ls_lock()?;
         let map = if buf.is_empty() {
             KeyToCodeMap(vec![])
         } else {
             bincode::deserialize(&buf).map_err(|e| ContractRuntimeError::Any(e))?
         };
         Ok(map)
+    }
+
+    fn acquire_contract_ls_lock() -> RuntimeResult<()> {
+        let lock = LOCK_FILE_PATH.get().unwrap();
+        while lock.exists() {
+            thread::sleep(Duration::from_micros(5));
+        }
+        File::create(lock)?;
+        Ok(())
+    }
+
+    fn release_contract_ls_lock() -> RuntimeResult<()> {
+        match fs::remove_file(LOCK_FILE_PATH.get().unwrap()) {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(other) => Err(other.into()),
+        }
     }
 }
 
@@ -237,16 +252,15 @@ mod test {
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let mut store = ContractStore::new(
-            std::env::temp_dir().join("locutus_test").join("contracts"),
-            10_000,
-        )?;
+        let contract_dir = std::env::temp_dir().join("locutus-test").join("store-test");
+        std::fs::create_dir_all(&contract_dir)?;
+        let mut store = ContractStore::new(contract_dir, 10_000)?;
         let contract = WrappedContract::new(
             Arc::new(ContractCode::from(vec![0, 1, 2])),
             [0, 1].as_ref().into(),
         );
         store.store_contract(contract.clone())?;
-        let f = store.fetch_contract(contract.key(), &([0, 1].as_ref().into()));
+        let f = store.fetch_contract(contract.key(), &[0, 1].as_ref().into());
         assert!(f.is_some());
         Ok(())
     }

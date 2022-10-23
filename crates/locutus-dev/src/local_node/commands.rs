@@ -20,7 +20,10 @@ pub(super) async fn wasm_runtime(
 }
 
 #[allow(unused, clippy::diverging_sub_expression)]
-async fn execute_command(req: ClientRequest, app: &mut AppState) -> Result<bool, DynError> {
+async fn execute_command(
+    req: ClientRequest<'static>,
+    app: &mut AppState,
+) -> Result<bool, DynError> {
     let node = &mut *app.local_node.write().await;
     match req {
         req @ ClientRequest::Put { .. } => {

@@ -4,7 +4,7 @@ use std::{
     future::Future,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     time::Duration,
@@ -34,8 +34,8 @@ pub struct Config {
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::Keypair>,
-    pub(crate) log_level: log::LevelFilter,
-    pub(crate) config_paths: ConfigPaths,
+    pub log_level: log::LevelFilter,
+    pub config_paths: ConfigPaths,
 
     #[cfg(feature = "websocket")]
     pub(crate) ws: WebSocketApiConfig,
@@ -76,9 +76,10 @@ impl WebSocketApiConfig {
 }
 
 #[derive(Debug)]
-pub(crate) struct ConfigPaths {
-    pub contracts_dir: PathBuf,
-    pub db_dir: PathBuf,
+pub struct ConfigPaths {
+    pub(crate) contracts_dir: PathBuf,
+    pub(crate) db_dir: PathBuf,
+    app_data_dir: PathBuf,
 }
 
 impl ConfigPaths {
@@ -95,6 +96,7 @@ impl ConfigPaths {
 
         if !contracts_dir.exists() {
             fs::create_dir_all(&contracts_dir)?;
+            fs::create_dir_all(contracts_dir.join("local"))?;
         }
 
         if !db_dir.exists() {
@@ -104,12 +106,25 @@ impl ConfigPaths {
         Ok(Self {
             contracts_dir,
             db_dir,
+            app_data_dir,
         })
+    }
+
+    pub fn local_contracts_dir(&self) -> PathBuf {
+        self.contracts_dir.join("local")
+    }
+
+    pub fn contracts_dir(&self) -> &Path {
+        &self.contracts_dir
     }
 }
 
 impl Config {
-    pub fn load_conf() -> std::io::Result<Config> {
+    pub fn get_conf() -> &'static Config {
+        &*CONFIG
+    }
+
+    fn load_conf() -> std::io::Result<Config> {
         let settings = config::Config::builder()
             .add_source(config::Environment::with_prefix("LOCUTUS"))
             .build()

@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use clap::Parser;
 use locutus_core::{
     locutus_runtime::{ContractStore, StateStore},
-    ContractExecutor, SqlitePool,
+    Config, ContractExecutor, SqlitePool,
 };
+use locutus_dev::config::OperationMode;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
@@ -21,10 +22,10 @@ async fn run(config: NodeConfig) -> Result<(), DynError> {
 }
 
 async fn run_local(config: NodeConfig) -> Result<(), DynError> {
-    let data_path = config
-        .data_dir
-        .unwrap_or_else(|| std::env::temp_dir().join("locutus"));
-    let contract_store = ContractStore::new(data_path.join("contracts"), MAX_SIZE)?;
+    let contract_dir = config
+        .contract_data_dir
+        .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
+    let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
     let executor = ContractExecutor::new(contract_store, state_store, || {
         locutus_core::util::set_cleanup_on_exit().unwrap();
@@ -52,19 +53,11 @@ fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-#[derive(clap::ValueEnum, Clone, Copy)]
-enum OperationMode {
-    /// Run the node in local-only mode. Useful for development pourpouses.
-    Local,
-    /// Standard operation mode.
-    Network,
-}
-
 #[derive(clap::Parser, Clone)]
 struct NodeConfig {
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]
     mode: OperationMode,
-    /// Overrides the default data directory where Locutus files are stored.
-    data_dir: Option<PathBuf>,
+    /// Overrides the default data directory where Locutus contract files are stored.
+    contract_data_dir: Option<PathBuf>,
 }

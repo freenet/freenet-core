@@ -1,13 +1,12 @@
 use std::{
     fmt::Display,
     fs::File,
-    future::Future,
     io::{Read, Seek},
-    pin::Pin,
     time::Duration,
 };
 
 use either::Either;
+use futures::future::BoxFuture;
 use locutus_core::{
     ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse, OpenRequest,
 };
@@ -27,7 +26,7 @@ SUBCOMMANDS:
     put         Puts the state for the contract for the first time
     exit        Exit from the TUI";
 
-type HostIncomingMsg = Result<OpenRequest, ClientError>;
+type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
 pub(super) async fn user_fn_handler(
     config: LocalNodeCliConfig,
@@ -50,7 +49,7 @@ pub(super) async fn user_fn_handler(
 
 struct StdInput {
     config: LocalNodeCliConfig,
-    contract: WrappedContract<'static>,
+    contract: WrappedContract,
     input: File,
     buf: Vec<u8>,
     app_state: AppState,
@@ -133,20 +132,26 @@ impl StdInput {
 
 #[derive(Serialize, Deserialize)]
 /// Data to be read from the input file after commands are issued.
-pub(super) enum CommandInput {
-    Put { state: State<'static> },
-    Update { delta: StateDelta<'static> },
+pub(super) enum CommandInput<'a> {
+    Put {
+        #[serde(borrow)]
+        state: State<'a>,
+    },
+    Update {
+        #[serde(borrow)]
+        delta: StateDelta<'a>,
+    },
 }
 
-impl CommandInput {
-    fn unwrap_put(self) -> State<'static> {
+impl<'a> CommandInput<'a> {
+    fn unwrap_put(self) -> State<'a> {
         match self {
             Self::Put { state } => state,
             _ => panic!("expected put"),
         }
     }
 
-    fn unwrap_delta(self) -> StateDelta<'static> {
+    fn unwrap_delta(self) -> StateDelta<'a> {
         match self {
             Self::Update { delta } => delta,
             _ => panic!("expected put"),
@@ -154,7 +159,7 @@ impl CommandInput {
     }
 }
 
-impl Display for CommandInput {
+impl Display for CommandInput<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Put { .. } => {
@@ -196,11 +201,11 @@ impl TryFrom<&[u8]> for Command {
 
 struct CommandInfo {
     cmd: Command,
-    contract: WrappedContract<'static>,
-    input: Option<CommandInput>,
+    contract: WrappedContract,
+    input: Option<CommandInput<'static>>,
 }
 
-impl From<CommandInfo> for OpenRequest {
+impl From<CommandInfo> for OpenRequest<'static> {
     fn from(cmd: CommandInfo) -> Self {
         let req = match cmd.cmd {
             Command::Get => ClientRequest::Get {
@@ -211,14 +216,15 @@ impl From<CommandInfo> for OpenRequest {
                 let state = cmd.input.unwrap().unwrap_put();
                 ClientRequest::Put {
                     contract: cmd.contract,
-                    state: WrappedState::new(state.into_owned()),
+                    state: WrappedState::new(state.into_bytes()),
+                    related_contracts: Default::default(),
                 }
             }
             Command::Update => {
-                let delta = cmd.input.unwrap().unwrap_delta();
+                let data = cmd.input.unwrap().unwrap_delta().into();
                 ClientRequest::Update {
                     key: *cmd.contract.key(),
-                    delta,
+                    data,
                 }
             }
             Command::Exit => ClientRequest::Disconnect {
@@ -232,7 +238,7 @@ impl From<CommandInfo> for OpenRequest {
 
 #[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for StdInput {
-    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = HostIncomingMsg> + Send + Sync + 'a>> {
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, HostIncomingMsg> {
         Box::pin(async {
             loop {
                 self.buf.clear();
@@ -329,7 +335,7 @@ impl ClientEventsProxy for StdInput {
         &'a mut self,
         _id: ClientId,
         _response: Result<HostResponse, ClientError>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + Sync + '_>> {
+    ) -> BoxFuture<'a, Result<(), ClientError>> {
         unimplemented!()
     }
 }

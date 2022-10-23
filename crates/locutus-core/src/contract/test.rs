@@ -1,5 +1,9 @@
 use dashmap::DashMap;
-use locutus_runtime::{ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore};
+use futures::future::BoxFuture;
+use locutus_runtime::{
+    ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore, UpdateModification,
+    ValidateResult,
+};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 use crate::{config::CONFIG, WrappedState};
@@ -13,7 +17,8 @@ impl RuntimeInterface for MockRuntime {
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'a>,
         state: &locutus_runtime::WrappedState,
-    ) -> locutus_runtime::RuntimeResult<bool> {
+        related: locutus_runtime::RelatedContracts,
+    ) -> locutus_runtime::RuntimeResult<ValidateResult> {
         todo!()
     }
 
@@ -31,8 +36,8 @@ impl RuntimeInterface for MockRuntime {
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'a>,
         state: &locutus_runtime::WrappedState,
-        delta: &locutus_runtime::StateDelta<'a>,
-    ) -> locutus_runtime::RuntimeResult<locutus_runtime::WrappedState> {
+        data: &[locutus_runtime::UpdateData<'a>],
+    ) -> locutus_runtime::RuntimeResult<UpdateModification> {
         todo!()
     }
 
@@ -152,7 +157,6 @@ impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHal
     }
 }
 
-#[async_trait::async_trait]
 impl ContractHandler for MemoryContractHandler {
     type Error = SimStoreError;
     type Store = MemKVStore;
@@ -167,10 +171,10 @@ impl ContractHandler for MemoryContractHandler {
         &mut self.contract_store
     }
 
-    async fn handle_request(
-        &mut self,
-        _req: crate::ClientRequest,
-    ) -> Result<crate::HostResponse, Self::Error> {
+    fn handle_request<'a, 's: 'a>(
+        &'s mut self,
+        _req: crate::ClientRequest<'a>,
+    ) -> BoxFuture<'static, Result<crate::HostResponse, Self::Error>> {
         // async fn get_state(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         //     Ok(self.kv_store.get(contract).cloned())
         // }

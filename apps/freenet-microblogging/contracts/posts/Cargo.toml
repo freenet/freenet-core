@@ -7,7 +7,7 @@ resolver = "2"
 publish = false
 
 [dependencies]
-locutus-stdlib = { path = "../../../../crates/locutus-stdlib" }
+locutus-stdlib = { workspace = true }
 serde = "1"
 serde_json = "1"
 serde_with = "1"
