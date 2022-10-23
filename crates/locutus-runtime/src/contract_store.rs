@@ -134,12 +134,7 @@ impl ContractStore {
             return Ok(());
         }
 
-        // lock the map file to insert changes
-        let lock = LOCK_FILE_PATH.get().unwrap();
-        while lock.exists() {
-            thread::sleep(Duration::from_micros(5));
-        }
-        File::create(lock)?;
+        Self::acquire_contract_ls_lock()?;
         self.key_to_code_part
             .insert(*contract.key(), *contract_hash);
         let map = KeyToCodeMap::from(&*self.key_to_code_part);
@@ -147,12 +142,7 @@ impl ContractStore {
         // FIXME: make this more reliable, append to the file instead of truncating it
         let mut f = File::create(KEY_FILE_PATH.get().unwrap())?;
         f.write_all(&serialized)?;
-        // release the lock
-        match fs::remove_file(LOCK_FILE_PATH.get().unwrap()) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(other) => return Err(other.into()),
-        }
+        Self::release_contract_ls_lock()?;
 
         let key_path = bs58::encode(contract_hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -226,14 +216,33 @@ impl ContractStore {
 
     fn load_from_file() -> RuntimeResult<KeyToCodeMap> {
         let mut buf = vec![];
+        Self::acquire_contract_ls_lock()?;
         let mut f = File::open(KEY_FILE_PATH.get().unwrap())?;
         f.read_to_end(&mut buf)?;
+        Self::release_contract_ls_lock()?;
         let map = if buf.is_empty() {
             KeyToCodeMap(vec![])
         } else {
             bincode::deserialize(&buf).map_err(|e| ContractRuntimeError::Any(e))?
         };
         Ok(map)
+    }
+
+    fn acquire_contract_ls_lock() -> RuntimeResult<()> {
+        let lock = LOCK_FILE_PATH.get().unwrap();
+        while lock.exists() {
+            thread::sleep(Duration::from_micros(5));
+        }
+        File::create(lock)?;
+        Ok(())
+    }
+
+    fn release_contract_ls_lock() -> RuntimeResult<()> {
+        match fs::remove_file(LOCK_FILE_PATH.get().unwrap()) {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(other) => Err(other.into()),
+        }
     }
 }
 
