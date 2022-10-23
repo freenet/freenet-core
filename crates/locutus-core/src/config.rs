@@ -292,7 +292,7 @@ pub(super) mod tracer {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Registry;
 
-        let tracer = opentelemetry_jaeger::new_pipeline().install_simple()?;
+        let tracer = opentelemetry_jaeger::new_agent_pipeline().install_simple()?;
         let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
         let subscriber = Registry::default().with(telemetry);
         global::set_text_map_propagator(TraceContextPropagator::new());
