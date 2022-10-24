@@ -35,7 +35,7 @@ pub async fn run_local_node_client(
     Ok(())
 }
 
-#[derive(clap::ArgEnum, Clone, Copy, Debug)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
 pub enum DeserializationFmt {
     Json,
     #[cfg(feature = "messagepack")]
@@ -56,19 +56,19 @@ pub struct LocalNodeCliConfig {
     #[clap(long, requires = "fmt")]
     pub(crate) clean_exit: bool,
     /// Path to the contract to be loaded.
-    #[clap(parse(from_os_str))]
+    #[clap(value_parser)]
     pub(crate) contract: PathBuf,
     /// Path to the file containing the parameters for this contract. If not set the default parameters will be empty.
-    #[clap(long = "parameters", parse(from_os_str))]
+    #[clap(long = "parameters", value_parser)]
     pub(crate) params: Option<PathBuf>,
     /// Path to the input file to read from on command.
-    #[clap(short, long, parse(from_os_str), value_name = "INPUT_FILE")]
+    #[clap(short, long, value_parser, value_name = "INPUT_FILE")]
     pub(crate) input_file: PathBuf,
     /// Deserialization format, requires feature flags enabled.
-    #[clap(
+    #[arg(
         short,
         long = "deserialization-format",
-        arg_enum,
+        value_enum,
         group = "fmt",
         value_name = "FORMAT"
     )]
@@ -77,7 +77,7 @@ pub struct LocalNodeCliConfig {
     #[clap(long)]
     pub(crate) disable_tui_mode: bool,
     /// Path to output file
-    #[clap(short, long, parse(from_os_str), value_name = "OUTPUT_FILE")]
+    #[clap(short, long, value_parser, value_name = "OUTPUT_FILE")]
     pub(crate) output_file: Option<PathBuf>,
     /// Terminal output
     #[clap(long, requires = "fmt")]
