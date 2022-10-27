@@ -972,7 +972,7 @@ impl Display for ContractInstanceId {
 
 /// A complete key specification, that represents a cryptographic hash that identifies the contract.
 #[serde_as]
-#[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 pub struct ContractKey {
     instance: ContractInstanceId,
@@ -1164,15 +1164,16 @@ pub(crate) mod wasm_interface {
         }
     }
 
+    #[doc(hidden)]
     #[repr(C)]
     #[derive(Debug, Clone, Copy)]
-    pub struct InterfaceResult {
+    pub struct ContractInterfaceResult {
         ptr: i64,
         kind: i32,
         size: u32,
     }
 
-    impl InterfaceResult {
+    impl ContractInterfaceResult {
         #![allow(clippy::let_and_return)]
         pub unsafe fn unwrap_validate_state_res(
             self,
@@ -1320,7 +1321,7 @@ pub(crate) mod wasm_interface {
 
     macro_rules! conversion {
         ($value:ty: $kind:expr) => {
-            impl From<$value> for InterfaceResult {
+            impl From<$value> for ContractInterfaceResult {
                 fn from(value: $value) -> Self {
                     let kind = $kind as i32;
                     // TODO: research if there is a safe way to just transmute the pointer in memory

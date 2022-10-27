@@ -44,7 +44,7 @@ impl ImplStruct {
                     .filter_module("locutus_stdlib", log::LevelFilter::Trace)
                     .try_init()
                 {
-                    return ::locutus_stdlib::prelude::InterfaceResult::from(
+                    return ::locutus_stdlib::prelude::ContractInterfaceResult::from(
                         Err::<::locutus_stdlib::prelude::ValidateResult, _>(
                             ::locutus_stdlib::prelude::ContractError::Other(format!("{}", err))
                         )
@@ -83,13 +83,13 @@ impl ImplStruct {
                     let bytes = &*std::ptr::slice_from_raw_parts(related.start(), related.written(None));
                     match ::locutus_stdlib::prelude::bincode::deserialize(bytes) {
                         Ok(v) => v,
-                        Err(err) => return ::locutus_stdlib::prelude::InterfaceResult::from(
+                        Err(err) => return ::locutus_stdlib::prelude::ContractInterfaceResult::from(
                             Err::<::core::primitive::bool, _>(::locutus_stdlib::prelude::ContractError::Deser(format!("{}", err)))
                         ).into_raw(),
                     }
                 };
                 let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::validate_state(parameters, state, related);
-                ::locutus_stdlib::prelude::InterfaceResult::from(result).into_raw()
+                ::locutus_stdlib::prelude::ContractInterfaceResult::from(result).into_raw()
             }
         }
     }
@@ -115,7 +115,7 @@ impl ImplStruct {
                     StateDelta::from(bytes)
                 };
                 let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::validate_delta(parameters, delta);
-                ::locutus_stdlib::prelude::InterfaceResult::from(result).into_raw()
+                ::locutus_stdlib::prelude::ContractInterfaceResult::from(result).into_raw()
             }
         }
     }
@@ -145,7 +145,7 @@ impl ImplStruct {
                     let bytes = &*std::ptr::slice_from_raw_parts(updates.start(), updates.written(None));
                     match ::locutus_stdlib::prelude::bincode::deserialize(bytes) {
                         Ok(v) => v,
-                        Err(err) => return ::locutus_stdlib::prelude::InterfaceResult::from(
+                        Err(err) => return ::locutus_stdlib::prelude::ContractInterfaceResult::from(
                             Err::<::locutus_stdlib::prelude::ValidateResult, _>(
                                 ::locutus_stdlib::prelude::ContractError::Deser(format!("{}", err))
                             )
@@ -155,7 +155,7 @@ impl ImplStruct {
                 let result = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::update_state(
                     parameters, state, updates,
                 );
-                ::locutus_stdlib::prelude::InterfaceResult::from(result).into_raw()
+                ::locutus_stdlib::prelude::ContractInterfaceResult::from(result).into_raw()
             }
         }
     }
@@ -179,7 +179,7 @@ impl ImplStruct {
                     ::locutus_stdlib::prelude::State::from(bytes)
                 };
                 let summary = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::summarize_state(parameters, state);
-                ::locutus_stdlib::prelude::InterfaceResult::from(summary).into_raw()
+                ::locutus_stdlib::prelude::ContractInterfaceResult::from(summary).into_raw()
             }
         }
     }
@@ -211,7 +211,7 @@ impl ImplStruct {
                     ::locutus_stdlib::prelude::StateSummary::from(bytes)
                 };
                 let new_delta = <#type_name as ::locutus_stdlib::prelude::ContractInterface>::get_state_delta(parameters, state, summary);
-                ::locutus_stdlib::prelude::InterfaceResult::from(new_delta).into_raw()
+                ::locutus_stdlib::prelude::ContractInterfaceResult::from(new_delta).into_raw()
             }
         }
     }

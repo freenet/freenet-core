@@ -209,7 +209,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
     fn from(cmd: CommandInfo) -> Self {
         let req = match cmd.cmd {
             Command::Get => ClientRequest::Get {
-                key: *cmd.contract.key(),
+                key: cmd.contract.key().clone(),
                 fetch_contract: false,
             },
             Command::Put => {
@@ -223,7 +223,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
             Command::Update => {
                 let data = cmd.input.unwrap().unwrap_delta().into();
                 ClientRequest::Update {
-                    key: *cmd.contract.key(),
+                    key: cmd.contract.key().clone(),
                     data,
                 }
             }

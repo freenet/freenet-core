@@ -27,14 +27,13 @@ impl From<&DashMap<ContractKey, ContractCodeKey>> for KeyToCodeMap {
     fn from(vals: &DashMap<ContractKey, ContractCodeKey>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
-            map.push((*r.key(), *r.value()));
+            map.push((r.key().clone(), *r.value()));
         }
         Self(map)
     }
 }
 
 /// Handle contract blob storage on the file system.
-#[derive(Clone)]
 pub struct ContractStore {
     contracts_dir: PathBuf,
     contract_cache: Cache<ContractCodeKey, Arc<ContractCode<'static>>>,
@@ -136,7 +135,7 @@ impl ContractStore {
 
         Self::acquire_contract_ls_lock()?;
         self.key_to_code_part
-            .insert(*contract.key(), *contract_hash);
+            .insert(contract.key().clone(), *contract_hash);
         let map = KeyToCodeMap::from(&*self.key_to_code_part);
         let serialized = bincode::serialize(&map).map_err(|e| ContractRuntimeError::Any(e))?;
         // FIXME: make this more reliable, append to the file instead of truncating it

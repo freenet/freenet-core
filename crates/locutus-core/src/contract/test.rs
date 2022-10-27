@@ -1,8 +1,8 @@
 use dashmap::DashMap;
 use futures::future::BoxFuture;
 use locutus_runtime::{
-    ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore, UpdateModification,
-    ValidateResult,
+    ContractKey, ContractRuntimeInterface, ContractStore, StateStorage, StateStore,
+    UpdateModification, ValidateResult,
 };
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
@@ -11,7 +11,7 @@ use crate::{config::CONFIG, WrappedState};
 pub(crate) struct MockRuntime {}
 
 #[allow(unused_variables)]
-impl RuntimeInterface for MockRuntime {
+impl ContractRuntimeInterface for MockRuntime {
     fn validate_state<'a>(
         &mut self,
         key: &ContractKey,

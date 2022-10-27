@@ -187,8 +187,8 @@ pub(in crate::contract) mod sqlite {
 
     use futures::{Future, FutureExt};
     use locutus_runtime::{
-        ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, StateStorage,
-        StateStoreError, ValidateResult,
+        ContractExecError, ContractRuntimeError, ContractRuntimeInterface, ContractStore,
+        StateStorage, StateStoreError, ValidateResult,
     };
     use once_cell::sync::Lazy;
     use sqlx::{
@@ -342,7 +342,7 @@ pub(in crate::contract) mod sqlite {
 
     impl<R> SQLiteContractHandler<R>
     where
-        R: RuntimeInterface + 'static,
+        R: ContractRuntimeInterface + 'static,
     {
         /// number of max bytes allowed to be stored in the cache
         const MEM_SIZE: u32 = 10_000_000;
@@ -400,7 +400,7 @@ pub(in crate::contract) mod sqlite {
 
     impl<R> ContractHandler for SQLiteContractHandler<R>
     where
-        R: RuntimeInterface + Send + Sync + 'static,
+        R: ContractRuntimeInterface + Send + Sync + 'static,
         Self: From<ContractHandlerChannel<SqlDbError, CHListenerHalve>>,
     {
         type Error = SqlDbError;
@@ -436,9 +436,9 @@ pub(in crate::contract) mod sqlite {
                     } => {
                         match self.get_contract(contract.key(), false).await {
                             Ok((_old_state, _)) => {
-                                return Err(ContractRuntimeError::from(ExecError::DoublePut(
-                                    *contract.key(),
-                                ))
+                                return Err(ContractRuntimeError::from(
+                                    ContractExecError::DoublePut(contract.key().clone()),
+                                )
                                 .into())
                             }
                             Err(SqlDbError::ContractNotFound) => {}
@@ -457,7 +457,9 @@ pub(in crate::contract) mod sqlite {
                         }
                         let _params: Parameters<'static> =
                             contract.params().clone().into_bytes().into();
-                        self.state_store.store(*contract.key(), state, None).await?;
+                        self.state_store
+                            .store(contract.key().clone(), state, None)
+                            .await?;
                         todo!()
                     }
                     _ => unimplemented!(),
@@ -515,7 +517,7 @@ pub(in crate::contract) mod sqlite {
                 .unwrap_put();
             let (get_result_value, _) = handler
                 .handle_request(ClientRequest::Get {
-                    key: *contract.key(),
+                    key: contract.key().clone(),
                     fetch_contract: false,
                 })
                 .await?
@@ -526,7 +528,7 @@ pub(in crate::contract) mod sqlite {
             let delta = StateDelta::from(b"New test contract value".to_vec());
             handler
                 .handle_request(ClientRequest::Update {
-                    key: *contract.key(),
+                    key: contract.key().clone(),
                     data: delta.into(),
                 })
                 .await?;
