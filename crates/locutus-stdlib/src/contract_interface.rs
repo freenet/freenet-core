@@ -21,16 +21,11 @@ use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 32;
 
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy)]
-pub struct WasmLinearMem {
-    pub start_ptr: *const u8,
-    pub size: u64,
-}
-
 /// Type of errors during interaction with a contract.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum ContractError {
+    #[error("de/serialization error: {0}")]
+    Deser(String),
     #[error("invalid contract update")]
     InvalidUpdate,
     #[error("trying to read an invalid state")]
@@ -39,8 +34,6 @@ pub enum ContractError {
     InvalidDelta,
     #[error("{0}")]
     Other(String),
-    #[error("de/serialization error: {0}")]
-    Deser(String),
 }
 
 /// An update to a contract state or any required related contracts to update that state.
@@ -1141,6 +1134,7 @@ pub(crate) mod wasm_interface {
     //! Contains all the types to interface between the host environment and
     //! the wasm module execution.
     use super::*;
+    use crate::WasmLinearMem;
 
     #[repr(i32)]
     enum ResultKind {

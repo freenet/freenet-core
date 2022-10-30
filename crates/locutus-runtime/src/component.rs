@@ -1,5 +1,5 @@
 use locutus_stdlib::prelude::{
-    ApplicationMessage, ComponentInterfaceResult, ComponentKey, GetSecretRequest,
+    ApplicationMessage, ComponentError, ComponentInterfaceResult, ComponentKey, GetSecretRequest,
     GetSecretResponse, InboundComponentMsg, OutboundComponentMsg, SetSecretRequest,
 };
 use wasmer::{Instance, NativeFunc};
@@ -8,6 +8,9 @@ use crate::{Runtime, RuntimeResult};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ComponentExecError {
+    #[error(transparent)]
+    ComponentError(#[from] ComponentError),
+
     #[error("Received an unexpected message from the client apps: {0}")]
     UnexpectedMessage(&'static str),
 }
@@ -26,7 +29,7 @@ impl Runtime {
         msg: &InboundComponentMsg,
         process_func: &NativeFunc<i64, i64>,
         instance: &Instance,
-    ) -> RuntimeResult<OutboundComponentMsg> {
+    ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
         let msg = bincode::serialize(msg)?;
         let mut msg_buf = self.init_buf(instance, &msg)?;
         msg_buf.write(msg)?;
@@ -36,7 +39,8 @@ impl Runtime {
                 process_func.call(msg_buf.ptr() as i64)?,
                 &linear_mem,
             )
-            .into()
+            .unwrap(linear_mem)
+            .map_err(Into::<ComponentExecError>::into)?
         };
         Ok(outbound)
     }
@@ -46,11 +50,11 @@ impl Runtime {
         component_key: &ComponentKey,
         instance: &Instance,
         process_func: &NativeFunc<i64, i64>,
-        mut outbound: OutboundComponentMsg,
+        outbound_msgs: Vec<OutboundComponentMsg>,
         results: &mut Vec<OutboundComponentMsg>,
     ) -> RuntimeResult<()> {
         let linear_mem = self.linear_mem(instance)?;
-        loop {
+        for outbound in outbound_msgs {
             match outbound {
                 OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
                     key, context, ..
@@ -64,13 +68,21 @@ impl Runtime {
                     let msg = bincode::serialize(&inbound)?;
                     let mut msg_buf = self.init_buf(instance, &msg)?;
                     msg_buf.write(msg)?;
-                    outbound = unsafe {
+                    let outbound_msgs = unsafe {
                         ComponentInterfaceResult::from_raw(
                             process_func.call(msg_buf.ptr() as i64)?,
                             &linear_mem,
                         )
-                        .into()
+                        .unwrap(linear_mem)
+                        .map_err(Into::<ComponentExecError>::into)?
                     };
+                    self.get_outbound(
+                        component_key,
+                        instance,
+                        process_func,
+                        outbound_msgs,
+                        results,
+                    )?;
                 }
                 OutboundComponentMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
                     if let Some(plaintext) = value {

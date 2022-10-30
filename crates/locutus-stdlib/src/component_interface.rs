@@ -4,10 +4,19 @@ use blake2::{Blake2s256, Digest};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::prelude::{ContractInstanceId, WasmLinearMem};
+use crate::prelude::ContractInstanceId;
 
 const APPLICATION_HASH_SIZE: usize = 32;
 const COMPONENT_HASH_LENGTH: usize = 32;
+
+/// Type of errors during interaction with a component.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
+pub enum ComponentError {
+    #[error("de/serialization error: {0}")]
+    Deser(String),
+    #[error("{0}")]
+    Other(String),
+}
 
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -35,10 +44,10 @@ impl SecretsId {
     }
 }
 
-pub trait Component {
-    /// Process inbound messages, producing zero or more outbound messages in response
+pub trait ComponentInterface {
+    /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the component must be stored using the secret mechanism.
-    fn process(&mut self, messages: Vec<InboundComponentMsg>) -> Vec<OutboundComponentMsg>;
+    fn process(messages: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError>;
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -67,7 +76,7 @@ impl Display for ComponentKey {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ComponentContext(#[serde(skip)] Vec<u8>);
 
 impl ComponentContext {
@@ -117,7 +126,7 @@ pub struct GetSecretResponse {
 }
 
 #[non_exhaustive]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ApplicationMessage {
     pub app: ContractInstanceId,
     pub payload: Vec<u8>,
@@ -141,7 +150,7 @@ pub struct UserInputResponse {
     context: ComponentContext,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum OutboundComponentMsg {
     // from the node
     GetSecretRequest(GetSecretRequest),
@@ -156,13 +165,13 @@ pub enum OutboundComponentMsg {
 }
 
 #[non_exhaustive]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GetSecretRequest {
     pub key: SecretsId,
     pub context: ComponentContext,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SetSecretRequest {
     pub key: SecretsId,
     /// Sets or unsets (if none) a value associated with the key.
@@ -170,14 +179,14 @@ pub struct SetSecretRequest {
 }
 
 #[serde_as]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct NotificationMessage(#[serde_as(as = "serde_with::Bytes")] Vec<u8>);
 
 #[serde_as]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ClientResponse(#[serde_as(as = "serde_with::Bytes")] Vec<u8>);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct UserInputRequest {
     request_id: u32,
     /// An interpretable message by the notification system.
@@ -188,22 +197,88 @@ pub struct UserInputRequest {
 }
 
 #[doc(hidden)]
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ComponentInterfaceResult {
-    ptr: i64,
-    kind: i32,
-    size: u32,
-}
+pub(crate) mod wasm_interface {
+    //! Contains all the types to interface between the host environment and
+    //! the wasm module execution.
+    use super::*;
+    use crate::WasmLinearMem;
 
-impl ComponentInterfaceResult {
-    pub unsafe fn from_raw(ptr: i64, mem: &WasmLinearMem) -> Self {
-        todo!()
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct ComponentInterfaceResult {
+        ptr: i64,
+        size: u32,
     }
-}
 
-impl From<ComponentInterfaceResult> for OutboundComponentMsg {
-    fn from(result: ComponentInterfaceResult) -> Self {
-        todo!()
+    impl ComponentInterfaceResult {
+        pub unsafe fn from_raw(ptr: i64, mem: &WasmLinearMem) -> Self {
+            let result = Box::leak(Box::from_raw(crate::buf::compute_ptr(
+                ptr as *mut Self,
+                mem,
+            )));
+            #[cfg(feature = "trace")]
+            {
+                log::trace!(
+                    "got FFI result @ {ptr} ({:p}) -> {result:?}",
+                    ptr as *mut Self
+                );
+            }
+            *result
+        }
+
+        pub fn into_raw(self) -> i64 {
+            #[cfg(feature = "trace")]
+            {
+                log::trace!("returning FFI -> {self:?}");
+            }
+            let ptr = Box::into_raw(Box::new(self));
+            #[cfg(feature = "trace")]
+            {
+                log::trace!("FFI result ptr: {ptr:p} ({}i64)", ptr as i64);
+            }
+            ptr as _
+        }
+
+        pub unsafe fn unwrap(
+            self,
+            mem: WasmLinearMem,
+        ) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
+            let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
+            let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
+            let value: Result<Vec<OutboundComponentMsg>, ComponentError> =
+                bincode::deserialize(serialized)
+                    .map_err(|e| ComponentError::Other(format!("{e}")))?;
+            #[cfg(feature = "trace")]
+            {
+                log::trace!(
+                    "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
+                     serialized: {serialized:?}
+                     value: {value:?}",
+                    self.ptr as *mut u8,
+                    self.ptr
+                );
+            }
+            value
+        }
+    }
+
+    impl From<Result<Vec<OutboundComponentMsg>, ComponentError>> for ComponentInterfaceResult {
+        fn from(value: Result<Vec<OutboundComponentMsg>, ComponentError>) -> Self {
+            let serialized = bincode::serialize(&value).unwrap();
+            let size = serialized.len() as _;
+            let ptr = serialized.as_ptr();
+            #[cfg(feature = "trace")]
+            {
+                log::trace!(
+                "sending result through FFI; addr: {ptr:p} ({}),\n  serialized: {serialized:?}\n  value: {value:?}",
+                ptr as i64
+            );
+            }
+            std::mem::forget(serialized);
+            Self {
+                ptr: ptr as i64,
+                size,
+            }
+        }
     }
 }
