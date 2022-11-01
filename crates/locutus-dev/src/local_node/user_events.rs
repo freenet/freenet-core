@@ -50,7 +50,7 @@ pub(super) async fn user_fn_handler(
 
 struct StdInput {
     config: LocalNodeCliConfig,
-    contract: WrappedContract,
+    contract: ContractContainer,
     input: File,
     buf: Vec<u8>,
     app_state: AppState,
@@ -70,7 +70,9 @@ impl StdInput {
             .transpose()?
             .unwrap_or_default();
 
-        let contract = WrappedContract::try_from((&*config.contract, params.into()))?;
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::try_from(
+            (&*config.contract, params.into()),
+        )?));
         Ok(StdInput {
             input: File::open(&config.input_file)?,
             config,
@@ -202,15 +204,20 @@ impl TryFrom<&[u8]> for Command {
 
 struct CommandInfo {
     cmd: Command,
-    contract: WrappedContract,
+    contract: ContractContainer,
     input: Option<CommandInput<'static>>,
 }
 
 impl From<CommandInfo> for OpenRequest<'static> {
     fn from(cmd: CommandInfo) -> Self {
+        let key = match cmd.contract.clone() {
+            ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract_v1)) => {
+                contract_v1.key().clone()
+            }
+        };
         let req = match cmd.cmd {
             Command::Get => ContractRequest::Get {
-                key: cmd.contract.key().clone(),
+                key,
                 fetch_contract: false,
             }
             .into(),
@@ -225,11 +232,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
             }
             Command::Update => {
                 let data = cmd.input.unwrap().unwrap_delta().into();
-                ContractRequest::Update {
-                    key: cmd.contract.key().clone(),
-                    data,
-                }
-                .into()
+                ContractRequest::Update { key, data }.into()
             }
             Command::Exit => ClientRequest::Disconnect {
                 cause: Some("shutdown".to_owned()),

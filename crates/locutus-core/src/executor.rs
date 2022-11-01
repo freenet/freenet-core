@@ -77,7 +77,7 @@ impl Executor {
     pub async fn preload(
         &mut self,
         cli_id: ClientId,
-        contract: WrappedContract,
+        contract: ContractContainer,
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
     ) {
@@ -141,17 +141,18 @@ impl Executor {
                 //          1. through the arbitraur mechanism
                 //          2. a new func which compared two summaries and gives the most fresh
                 //        you can request to several nodes and determine which node has a fresher ver
+                let key = contract.get_key();
+                let params = contract.get_params();
                 self.runtime
                     .contract_store
                     .store_contract(contract.clone())
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
 
-                let key = contract.key();
-                log::debug!("executing with params: {:?}", contract.params());
+                log::debug!("executing with params: {:?}", params);
                 let is_valid = self
                     .runtime
-                    .validate_state(key, contract.params(), &state, related_contracts)
+                    .validate_state(&key, &params, &state, related_contracts)
                     .map_err(Into::into)
                     .map_err(Either::Right)?
                     == ValidateResult::Valid;
@@ -169,11 +170,11 @@ impl Executor {
                     })?;
 
                 self.contract_state
-                    .store(key.clone(), state.clone(), Some(contract.params().clone()))
+                    .store(key.clone(), state.clone(), Some(params.clone()))
                     .await
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                self.send_update_notification(key, contract.params(), &state)
+                self.send_update_notification(&key, &params, &state)
                     .await
                     .map_err(|_| {
                         Either::Left(

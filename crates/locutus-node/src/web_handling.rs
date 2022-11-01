@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use locutus_runtime::{
     locutus_stdlib::web::{WebApp, WebContractError},
-    ContractKey, State, WrappedContract,
+    ContractContainer, ContractKey, State,
 };
 
 use locutus_core::*;
@@ -56,7 +56,8 @@ pub(crate) async fn contract_home(
             ..
         }) => match contract {
             Some(contract) => {
-                let path = contract_web_path(contract.key());
+                let key = contract.get_key();
+                let path = contract_web_path(&key);
                 let web_body = match get_web_body(&path).await {
                     Ok(b) => b,
                     Err(err) => {
@@ -67,13 +68,11 @@ pub(crate) async fn contract_home(
 
                                 fn err(
                                     err: WebContractError,
-                                    contract: &WrappedContract,
+                                    contract: &ContractContainer,
                                 ) -> InvalidParam {
+                                    let key = contract.get_key();
                                     log::error!("{err}");
-                                    InvalidParam(format!(
-                                        "failed unpacking contract: {}",
-                                        contract.key()
-                                    ))
+                                    InvalidParam(format!("failed unpacking contract: {}", key))
                                 }
 
                                 let mut web = WebApp::try_from(state.as_ref())

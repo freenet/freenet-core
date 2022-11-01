@@ -4,7 +4,10 @@ use locutus_core::{
     locutus_runtime::StateDelta, ClientId, ClientRequest, Config, ContractRequest, Executor,
     SqlitePool,
 };
-use locutus_runtime::{ContractInstanceId, ContractStore, Parameters, StateStore, WrappedContract};
+use locutus_runtime::{
+    ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore, WasmAPIVersion,
+    WrappedContract,
+};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},
@@ -35,14 +38,16 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         File::open(&config.state)?.read_to_end(&mut buf)?;
         buf.into()
     };
-    let contract = WrappedContract::new(Arc::new(code), params);
+    let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(
+        WrappedContract::new(Arc::new(code), params))
+    );
     let related_contracts = if let Some(_related) = config.related_contracts {
         todo!("use `related` contracts")
     } else {
         Default::default()
     };
 
-    println!("Putting contract {}", contract.key());
+    println!("Putting contract {}", contract.get_key());
     let request = ContractRequest::Put {
         contract,
         state,

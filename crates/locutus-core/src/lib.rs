@@ -1,3 +1,5 @@
+extern crate core;
+
 pub(crate) mod client_events;
 mod config;
 mod contract;

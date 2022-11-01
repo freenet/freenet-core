@@ -10,7 +10,7 @@ use wasmer::{
 
 use crate::{
     component_store::ComponentStore, contract_store::ContractStore, secrets_store::SecretsStore,
-    RuntimeInnerError, RuntimeResult,
+    RuntimeInnerError, RuntimeResult, ContractContainer, WasmAPIVersion
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -130,7 +130,11 @@ impl Runtime {
                 .contract_store
                 .fetch_contract(key, parameters)
                 .ok_or_else(|| RuntimeInnerError::ContractNotFound(key.clone()))?;
-            let module = Module::new(&self.wasm_store, contract.code().data())?;
+            let module = match contract {
+                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract_v1)) => {
+                    Module::new(&self.wasm_store, contract_v1.code().data())?
+                }
+            };
             self.contract_modules.insert(key.clone(), module);
             self.contract_modules.get(key).unwrap()
         };
