@@ -43,7 +43,10 @@ impl SecretsStore {
         plaintext: Vec<u8>,
     ) -> Result<(), SecretStoreError> {
         let secret_path = self.base_path.join(component.encode()).join(key.encode());
-        let encryption = self.ciphers.get(component).ok_or(SecretStoreError::MissingCipher)?;
+        let encryption = self
+            .ciphers
+            .get(component)
+            .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = encryption
             .cipher
             .encrypt(&encryption.nonce, plaintext.as_ref())
@@ -65,9 +68,16 @@ impl SecretsStore {
         }
     }
 
-    pub fn get_secret(&self, component: &ComponentKey, key: &SecretsId) -> Result<Vec<u8>, SecretStoreError> {
+    pub fn get_secret(
+        &self,
+        component: &ComponentKey,
+        key: &SecretsId,
+    ) -> Result<Vec<u8>, SecretStoreError> {
         let secret_path = self.base_path.join(component.encode()).join(key.encode());
-        let encryption = self.ciphers.get(component).ok_or(SecretStoreError::MissingCipher)?;
+        let encryption = self
+            .ciphers
+            .get(component)
+            .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = fs::read(secret_path)?;
         let plaintext = encryption
             .cipher
