@@ -10,7 +10,7 @@ use wasmer::{
 
 use crate::{
     component_store::ComponentStore, contract_store::ContractStore, secrets_store::SecretsStore,
-    ContractRuntimeError, RuntimeResult,
+    ContractRtInnerError, RuntimeResult,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -58,7 +58,7 @@ impl Runtime {
         contract_store: ContractStore,
         secret_store: SecretsStore,
         host_mem: bool,
-    ) -> Result<Self, ContractRuntimeError> {
+    ) -> RuntimeResult<Self> {
         let store = Self::instance_store();
         let (host_memory, top_level_imports) = if host_mem {
             let mem = Self::instance_host_mem(&store)?;
@@ -129,7 +129,7 @@ impl Runtime {
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
-                .ok_or_else(|| ContractRuntimeError::ContractNotFound(key.clone()))?;
+                .ok_or_else(|| ContractRtInnerError::ContractNotFound(key.clone()))?;
             let module = Module::new(&self.wasm_store, contract.code().data())?;
             self.contract_modules.insert(key.clone(), module);
             self.contract_modules.get(key).unwrap()
@@ -150,7 +150,7 @@ impl Runtime {
             let contract = self
                 .component_store
                 .fetch_component(key)
-                .ok_or_else(|| ContractRuntimeError::ComponentNotFound(key.clone()))?;
+                .ok_or_else(|| ContractRtInnerError::ComponentNotFound(key.clone()))?;
             let module = Module::new(&self.wasm_store, contract)?;
             self.component_modules.insert(key.clone(), module);
             self.component_modules.get(key).unwrap()

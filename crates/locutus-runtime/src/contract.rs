@@ -7,17 +7,17 @@ use std::collections::HashMap;
 use std::{borrow::Borrow, fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 use wasmer::NativeFunc;
 
-use crate::{ContractExecError, ContractRuntimeError, RuntimeResult};
+use crate::{ContractError, ContractExecError, ContractRtInnerError, RuntimeResult};
 
 type FfiReturnTy = i64;
 
 pub trait ContractRuntimeInterface {
     /// Verify that the state is valid, given the parameters. This will be used before a peer
     /// caches a new state.
-    fn validate_state<'a>(
+    fn validate_state(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
         related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult>;
@@ -25,11 +25,11 @@ pub trait ContractRuntimeInterface {
     /// Verify that a delta is valid - at least as much as possible. The goal is to prevent DDoS of
     /// a contract by sending a large number of invalid delta updates. This allows peers
     /// to verify a delta before forwarding it.
-    fn validate_delta<'a>(
+    fn validate_delta(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
-        delta: &StateDelta<'a>,
+        parameters: &Parameters<'_>,
+        delta: &StateDelta<'_>,
     ) -> RuntimeResult<bool>;
 
     /// Determine whether this delta is a valid update for this contract. If it is, return the modified state,
@@ -39,34 +39,34 @@ pub trait ContractRuntimeInterface {
     /// - If the same `update_state` is applied twice to a value, then the second will be ignored.
     /// - Application of `update_state` is "order invariant", no matter what the order in which the values are
     ///   applied, the resulting value must be exactly the same.
-    fn update_state<'a>(
+    fn update_state(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
-        update_data: &[UpdateData<'a>],
-    ) -> RuntimeResult<UpdateModification>;
+        update_data: &[UpdateData<'_>],
+    ) -> RuntimeResult<UpdateModification<'static>>;
 
     /// Generate a concise summary of a state that can be used to create deltas relative to this state.
     ///
     /// This allows flexible and efficient state synchronization between peers.
-    fn summarize_state<'a>(
-        &'a mut self,
+    fn summarize_state(
+        &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
-    ) -> RuntimeResult<StateSummary<'a>>;
+    ) -> RuntimeResult<StateSummary<'static>>;
 
     /// Generate a state delta using a summary from the current state.
     /// This along with [`Self::summarize_state`] allows flexible and efficient
     /// state synchronization between peers.
-    fn get_state_delta<'a>(
+    fn get_state_delta(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
-        delta_to: &StateSummary<'a>,
-    ) -> RuntimeResult<StateDelta<'a>>;
+        delta_to: &StateSummary<'_>,
+    ) -> RuntimeResult<StateDelta<'static>>;
 }
 
 /// Just as `locutus_stdlib::Contract` but with some convenience impl.
@@ -196,11 +196,12 @@ impl TryFrom<&rmpv::Value> for WrappedContract {
 }
 
 impl TryInto<Vec<u8>> for WrappedContract {
-    type Error = ContractRuntimeError;
+    type Error = ContractError;
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
         Arc::try_unwrap(self.data)
             .map(|r| r.into_bytes())
-            .map_err(|_| ContractRuntimeError::UnwrapContract)
+            .map_err(|_| ContractRtInnerError::UnwrapContract)
+            .map_err(Into::into)
     }
 }
 
@@ -289,13 +290,13 @@ impl Deref for WrappedState {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
 impl Borrow<[u8]> for WrappedState {
     fn borrow(&self) -> &[u8] {
-        &*self.0
+        &self.0
     }
 }
 
@@ -364,9 +365,9 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, &parameters)?;
+        let mut param_buf = self.init_buf(&instance, parameters)?;
         param_buf.write(parameters)?;
-        let mut delta_buf = self.init_buf(&instance, &delta)?;
+        let mut delta_buf = self.init_buf(&instance, delta)?;
         delta_buf.write(delta)?;
 
         let validate_func: NativeFunc<(i64, i64), FfiReturnTy> =
@@ -382,13 +383,13 @@ impl ContractRuntimeInterface for crate::Runtime {
         Ok(is_valid)
     }
 
-    fn update_state<'a>(
+    fn update_state(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
-        update_data: &[UpdateData<'a>],
-    ) -> RuntimeResult<UpdateModification> {
+        update_data: &[UpdateData<'_>],
+    ) -> RuntimeResult<UpdateModification<'static>> {
         // todo: if we keep this hot in memory some things to take into account:
         //       - over subsequent requests state size may change
         //       - the delta may not be necessarily the same size
@@ -397,9 +398,9 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, &parameters)?;
+        let mut param_buf = self.init_buf(&instance, parameters)?;
         param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, &state)?;
+        let mut state_buf = self.init_buf(&instance, state)?;
         state_buf.write(state.clone())?;
         let serialized = bincode::serialize(update_data)?;
         let mut update_data_buf = self.init_buf(&instance, &serialized)?;
@@ -422,10 +423,10 @@ impl ContractRuntimeInterface for crate::Runtime {
         Ok(update_res)
     }
 
-    fn summarize_state<'a>(
+    fn summarize_state(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
@@ -463,11 +464,11 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, &parameters)?;
+        let mut param_buf = self.init_buf(&instance, parameters)?;
         param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, &state)?;
+        let mut state_buf = self.init_buf(&instance, state)?;
         state_buf.write(state.clone())?;
-        let mut summary_buf = self.init_buf(&instance, &summary)?;
+        let mut summary_buf = self.init_buf(&instance, summary)?;
         summary_buf.write(summary)?;
 
         let get_state_delta_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =

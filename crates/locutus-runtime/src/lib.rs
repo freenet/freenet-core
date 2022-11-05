@@ -8,6 +8,8 @@ mod state_store;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
+use std::fmt::Display;
+
 pub use locutus_stdlib;
 pub use prelude::*;
 
@@ -21,10 +23,60 @@ pub mod prelude {
     pub use locutus_stdlib::prelude::*;
 }
 
-pub type RuntimeResult<T> = std::result::Result<T, ContractRuntimeError>;
+pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
+
+#[derive(Debug)]
+pub struct ContractError(Box<ContractRtInnerError>);
+
+impl ContractError {
+    pub fn is_contract_error(&self) -> bool {
+        matches!(&*self.0, ContractRtInnerError::ContractExecError(_))
+    }
+}
+
+impl Display for ContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ContractError {}
+
+impl From<ContractRtInnerError> for ContractError {
+    fn from(err: ContractRtInnerError) -> Self {
+        Self(Box::new(err))
+    }
+}
+
+macro_rules! impl_err {
+    ($type:ty) => {
+        impl From<$type> for ContractError {
+            fn from(err: $type) -> Self {
+                Self(Box::new(ContractRtInnerError::from(err)))
+            }
+        }
+    };
+}
+
+impl_err!(Box<dyn std::error::Error + Send + Sync>);
+impl_err!(locutus_stdlib::buf::Error);
+impl_err!(std::io::Error);
+impl_err!(secrets_store::SecretStoreError);
+impl_err!(bincode::Error);
+impl_err!(component::ComponentExecError);
+impl_err!(runtime::ContractExecError);
+#[cfg(test)]
+impl_err!(wasmer_wasi::WasiStateCreationError);
+#[cfg(test)]
+impl_err!(wasmer_wasi::WasiError);
+impl_err!(wasmer::CompileError);
+impl_err!(wasmer::ExportError);
+impl_err!(wasmer::InstantiationError);
+impl_err!(wasmer::MemoryError);
+impl_err!(wasmer::RuntimeError);
 
 #[derive(thiserror::Error, Debug)]
-pub enum ContractRuntimeError {
+enum ContractRtInnerError {
     #[error(transparent)]
     Any(#[from] Box<dyn std::error::Error + Send + Sync>),
 

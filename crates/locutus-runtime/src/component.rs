@@ -1,6 +1,7 @@
 use locutus_stdlib::prelude::{
-    ApplicationMessage, ComponentError, ComponentInterfaceResult, ComponentKey, GetSecretRequest,
-    GetSecretResponse, InboundComponentMsg, OutboundComponentMsg, SetSecretRequest,
+    ApplicationMessage, Component, ComponentError, ComponentInterfaceResult, ComponentKey,
+    GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
+    SetSecretRequest,
 };
 use wasmer::{Instance, NativeFunc};
 
@@ -18,9 +19,13 @@ pub enum ComponentExecError {
 pub trait ComponentRuntimeInterface {
     fn inbound_app_message(
         &mut self,
-        component_key: &ComponentKey,
+        key: &ComponentKey,
         inbound: Vec<InboundComponentMsg>,
     ) -> RuntimeResult<Vec<OutboundComponentMsg>>;
+
+    fn register_component(&mut self, component: Component<'_>) -> RuntimeResult<()>;
+
+    fn deregister_component(&mut self, key: &ComponentKey) -> RuntimeResult<()>;
 }
 
 impl Runtime {
@@ -110,14 +115,14 @@ impl Runtime {
 impl ComponentRuntimeInterface for Runtime {
     fn inbound_app_message(
         &mut self,
-        component_key: &ComponentKey,
+        key: &ComponentKey,
         inbound: Vec<InboundComponentMsg>,
     ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
             return Ok(results);
         }
-        let instance = self.prepare_component_call(component_key, 4096)?;
+        let instance = self.prepare_component_call(key, 4096)?;
         let process_func: NativeFunc<i64, i64> = instance.exports.get_native_function("process")?;
         for msg in inbound {
             match msg {
@@ -134,13 +139,7 @@ impl ComponentRuntimeInterface for Runtime {
                         &process_func,
                         &instance,
                     )?;
-                    self.get_outbound(
-                        component_key,
-                        &instance,
-                        &process_func,
-                        outbound,
-                        &mut results,
-                    )?;
+                    self.get_outbound(key, &instance, &process_func, outbound, &mut results)?;
                 }
                 InboundComponentMsg::UserResponse(response) => {
                     let outbound = self.exec_inbound(
@@ -148,13 +147,7 @@ impl ComponentRuntimeInterface for Runtime {
                         &process_func,
                         &instance,
                     )?;
-                    self.get_outbound(
-                        component_key,
-                        &instance,
-                        &process_func,
-                        outbound,
-                        &mut results,
-                    )?;
+                    self.get_outbound(key, &instance, &process_func, outbound, &mut results)?;
                 }
                 InboundComponentMsg::GetSecretResponse(_) => {
                     return Err(ComponentExecError::UnexpectedMessage("get secret response").into())
@@ -162,5 +155,15 @@ impl ComponentRuntimeInterface for Runtime {
             }
         }
         Ok(results)
+    }
+
+    #[inline]
+    fn register_component(&mut self, component: Component<'_>) -> RuntimeResult<()> {
+        self.component_store.store_component(component)
+    }
+
+    #[inline]
+    fn deregister_component(&mut self, key: &ComponentKey) -> RuntimeResult<()> {
+        self.component_store.remove_component(key)
     }
 }

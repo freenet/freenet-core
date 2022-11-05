@@ -108,7 +108,7 @@ impl RelatedContracts<'_> {
     pub fn into_owned(self) -> RelatedContracts<'static> {
         let mut map = HashMap::with_capacity(self.map.len());
         for (k, v) in self.map {
-            map.insert(k, v.map(|s| State::from(s.into_bytes())));
+            map.insert(k, v.map(|s| s.into_owned()));
         }
         RelatedContracts { map }
     }
@@ -592,10 +592,14 @@ pub struct State<'a>(
     Cow<'a, [u8]>,
 );
 
-impl<'a> State<'a> {
+impl State<'_> {
     /// Gets the number of bytes of data stored in the `State`.
     pub fn size(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn into_owned(self) -> State<'static> {
+        State(self.0.into_owned().into())
     }
 
     /// Extracts the owned data as a `Vec<u8>`.
@@ -675,6 +679,10 @@ impl<'a> StateDelta<'a> {
     pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
     }
+
+    pub fn into_owned(self) -> StateDelta<'static> {
+        StateDelta(self.0.into_owned().into())
+    }
 }
 
 impl<'a> From<Vec<u8>> for StateDelta<'a> {
@@ -734,6 +742,10 @@ impl StateSummary<'_> {
     /// Gets the number of bytes of data stored in the `StateSummary`.
     pub fn size(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn into_owned(self) -> StateSummary<'static> {
+        StateSummary(self.0.into_owned().into())
     }
 }
 
@@ -807,12 +819,12 @@ impl ContractCode<'_> {
 
     /// Reference to contract code.
     pub fn data(&self) -> &[u8] {
-        &*self.data
+        &self.data
     }
 
     /// Extracts the owned contract code data as a `Vec<u8>`.
     pub fn into_bytes(self) -> Vec<u8> {
-        self.data.to_owned().to_vec()
+        self.data.to_vec()
     }
 
     /// Returns the `Base58` string representation of a hash.
@@ -824,16 +836,15 @@ impl ContractCode<'_> {
 
     /// Copies the data if not owned and returns an owned version of self.
     pub fn into_owned(self) -> ContractCode<'static> {
-        let data: Cow<'static, _> = Cow::from(self.data.to_owned().to_vec());
         ContractCode {
-            data,
+            data: self.data.into_owned().into(),
             key: self.key,
         }
     }
 
     fn gen_key(data: &[u8]) -> [u8; CONTRACT_KEY_SIZE] {
         let mut hasher = Blake2s256::new();
-        hasher.update(&data);
+        hasher.update(data);
         let key_arr = hasher.finalize();
         debug_assert_eq!(key_arr[..].len(), CONTRACT_KEY_SIZE);
         let mut key = [0; CONTRACT_KEY_SIZE];
@@ -1051,7 +1062,7 @@ impl ContractKey {
             .into(&mut contract)?;
 
         let mut hasher = Blake2s256::new();
-        hasher.update(&contract);
+        hasher.update(contract);
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
 

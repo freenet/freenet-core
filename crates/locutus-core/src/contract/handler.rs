@@ -187,8 +187,8 @@ pub(in crate::contract) mod sqlite {
 
     use futures::{Future, FutureExt};
     use locutus_runtime::{
-        ContractExecError, ContractRuntimeError, ContractRuntimeInterface, ContractStore,
-        StateStorage, StateStoreError, ValidateResult,
+        ContractError, ContractExecError, ContractRuntimeInterface, ContractStore, StateStorage,
+        StateStoreError, ValidateResult,
     };
     use once_cell::sync::Lazy;
     use sqlx::{
@@ -325,7 +325,7 @@ pub(in crate::contract) mod sqlite {
         #[error(transparent)]
         SqliteError(#[from] sqlx::Error),
         #[error(transparent)]
-        RuntimeError(#[from] ContractRuntimeError),
+        RuntimeError(#[from] ContractError),
         #[error(transparent)]
         IOError(#[from] std::io::Error),
         #[error(transparent)]
@@ -436,9 +436,9 @@ pub(in crate::contract) mod sqlite {
                     } => {
                         match self.get_contract(contract.key(), false).await {
                             Ok((_old_state, _)) => {
-                                return Err(ContractRuntimeError::from(
-                                    ContractExecError::DoublePut(contract.key().clone()),
-                                )
+                                return Err(ContractError::from(ContractExecError::DoublePut(
+                                    contract.key().clone(),
+                                ))
                                 .into())
                             }
                             Err(SqlDbError::ContractNotFound) => {}

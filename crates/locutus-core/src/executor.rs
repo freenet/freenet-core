@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use locutus_runtime::{prelude::*, ContractRuntimeError};
+use locutus_runtime::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -177,9 +177,7 @@ impl ContractExecutor {
                         .runtime
                         .update_state(&key, &parameters, &state, &[data])
                         .map_err(|err| match err {
-                            ContractRuntimeError::ContractExecError(
-                                ContractExecError::ContractError(err),
-                            ) => Either::Left(RequestError::Update {
+                            err if err.is_contract_error() => Either::Left(RequestError::Update {
                                 key: key.clone(),
                                 cause: format!("{err}"),
                             }),
@@ -188,7 +186,7 @@ impl ContractExecutor {
                     if let Some(new_state) = update_modification.new_state {
                         let new_state = WrappedState::new(new_state.into_bytes());
                         self.contract_state
-                            .store(key, new_state.clone(), None)
+                            .store(key.clone(), new_state.clone(), None)
                             .await
                             .map_err(|err| Either::Right(err.into()))?;
                         new_state
@@ -197,19 +195,17 @@ impl ContractExecutor {
                     }
                 };
                 // in the network impl this would be sent over the network
-                // let summary = self
-                //     .runtime
-                //     .summarize_state(&key, &parameters, &new_state)
-                //     .map_err(Into::into)
-                //     .map_err(Either::Right)?;
-                // self.send_update_notification(&key, &parameters, &new_state)
-                //     .await?;
-                // // TODO: in network mode, wait at least for one confirmation
-                // //       when a node receives a delta from updates, run the update themselves
-                // //       and send back confirmation
-                // Ok(HostResponse::UpdateResponse { key, summary })ç
-                //FIXME
-                todo!()
+                let summary = self
+                    .runtime
+                    .summarize_state(&key, &parameters, &new_state)
+                    .map_err(Into::into)
+                    .map_err(Either::Right)?;
+                self.send_update_notification(&key, &parameters, &new_state)
+                    .await?;
+                // TODO: in network mode, wait at least for one confirmation
+                //       when a node receives a delta from updates, run the update themselves
+                //       and send back confirmation
+                Ok(HostResponse::UpdateResponse { key, summary })
             }
             ClientRequest::Get {
                 key,
@@ -246,24 +242,22 @@ impl ContractExecutor {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
                 // FIXME: here we are always sending an state_delta,
                 //        but what we send back depends on the kind of subscription
-                // let update = self
-                //     .runtime
-                //     .get_state_delta(key, params, new_state, &*peer_summary)
-                //     .map_err(|err| match err {
-                //         ContractRuntimeError::ExecError(ExecError::ContractError(_)) => {
-                //             Either::Left(RequestError::Put {
-                //                 key: *key,
-                //                 cause: "invalid put value".to_owned(),
-                //             })
-                //         }
-                //         other => Either::Right(other.into()),
-                //     })?
-                //     .into();
-                // notifier
-                //     .send(Ok(HostResponse::UpdateNotification { key: *key, update }))
-                //     .unwrap();
-                //FIXME
-                todo!()
+                let update = self
+                    .runtime
+                    .get_state_delta(key, params, new_state, &*peer_summary)
+                    .map_err(|err| match err {
+                        err if err.is_contract_error() => Either::Left(RequestError::Put {
+                            key: key.clone(),
+                            cause: "invalid put value".to_owned(),
+                        }),
+                        other => Either::Right(other.into()),
+                    })?;
+                notifier
+                    .send(Ok(HostResponse::UpdateNotification {
+                        key: key.clone(),
+                        update: update.to_owned().into(),
+                    }))
+                    .unwrap();
             }
         }
         Ok(())

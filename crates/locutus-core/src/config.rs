@@ -121,7 +121,7 @@ impl ConfigPaths {
 
 impl Config {
     pub fn get_conf() -> &'static Config {
-        &*CONFIG
+        &CONFIG
     }
 
     fn load_conf() -> std::io::Result<Config> {

@@ -134,7 +134,7 @@ where
                             .within_caching_distance(&Location::from(key))
                     {
                         log::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
-                        match try_to_cache_contract(op_storage, &contract, &key).await {
+                        match try_to_cache_contract(op_storage, &contract, key).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -349,7 +349,7 @@ where
                         .ring
                         .within_caching_distance(&Location::from(key));
                     if !cached_contract && within_caching_dist {
-                        match try_to_cache_contract(op_storage, &contract, &key).await {
+                        match try_to_cache_contract(op_storage, &contract, key).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }

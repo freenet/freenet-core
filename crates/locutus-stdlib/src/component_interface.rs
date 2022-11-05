@@ -1,4 +1,8 @@
-use std::fmt::Display;
+use std::{
+    borrow::{Borrow, Cow},
+    fmt::Display,
+    path::Path,
+};
 
 use blake2::{Blake2s256, Digest};
 use serde::{Deserialize, Serialize};
@@ -8,6 +12,44 @@ use crate::prelude::ContractInstanceId;
 
 const APPLICATION_HASH_SIZE: usize = 32;
 const COMPONENT_HASH_LENGTH: usize = 32;
+
+/// Executable component
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde_as]
+pub struct Component<'a> {
+    #[serde_as(as = "serde_with::Bytes")]
+    #[serde(borrow)]
+    code: Cow<'a, [u8]>,
+    key: ComponentKey,
+}
+
+impl Component<'_> {
+    pub fn key(&self) -> &ComponentKey {
+        &self.key
+    }
+
+    pub fn into_owned(self) -> Component<'static> {
+        Component {
+            key: self.key,
+            code: Cow::from(self.code.into_owned()),
+        }
+    }
+}
+
+impl AsRef<[u8]> for Component<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.code.borrow()
+    }
+}
+
+impl TryFrom<&Path> for Component<'static> {
+    type Error = std::io::Error;
+    fn try_from(path: &Path) -> Result<Self, Self::Error> {
+        let code = Cow::from(std::fs::read(path)?);
+        let key = ComponentKey::new(code.borrow());
+        Ok(Self { code, key })
+    }
+}
 
 /// Type of errors during interaction with a component.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
@@ -50,13 +92,14 @@ pub trait ComponentInterface {
     fn process(messages: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError>;
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ComponentKey([u8; COMPONENT_HASH_LENGTH]);
+#[serde_as]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub struct ComponentKey(#[serde_as(as = "[_; COMPONENT_HASH_LENGTH]")] [u8; COMPONENT_HASH_LENGTH]);
 
 impl ComponentKey {
     pub fn new(wasm_code: &[u8]) -> Self {
         let mut hasher = Blake2s256::new();
-        hasher.update(&wasm_code);
+        hasher.update(wasm_code);
         let hashed = hasher.finalize();
         let mut component_key = [0; COMPONENT_HASH_LENGTH];
         component_key.copy_from_slice(&hashed);

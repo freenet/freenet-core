@@ -495,7 +495,7 @@ pub(crate) mod test {
                             // self.non_owned_contracts[contract_no]
                             todo!() // fixme
                         };
-                        break ClientRequest::Subscribe { key: key.clone() };
+                        break ClientRequest::Subscribe { key };
                     }
                     0 => {}
                     1 => {}
