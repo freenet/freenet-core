@@ -46,14 +46,14 @@ impl AppState {
             Some(DeserializationFmt::Json) => {
                 let deser: serde_json::Value = serde_json::from_slice(data.as_ref())?;
                 let pp = serde_json::to_string_pretty(&deser)?;
-                write_res(&self.config, &*pp)?;
+                write_res(&self.config, &pp)?;
             }
             #[cfg(feature = "messagepack")]
             Some(DeserializationFmt::MessagePack) => {
                 let deser = rmpv::decode::read_value(&mut data.as_ref())
                     .map_err(|_err| std::io::ErrorKind::InvalidData)?;
                 let pp = format!("{deser}");
-                write_res(&self.config, &*pp)?;
+                write_res(&self.config, &pp)?;
             }
             _ => {}
         }

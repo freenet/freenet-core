@@ -96,26 +96,29 @@ where
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, state) in contracts {
-            let key = *contract.key();
+            let key = contract.key().clone();
             self.op_storage
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                 .await?;
             self.op_storage
-                .notify_contract_handler(ContractHandlerEvent::PushQuery { key, state })
+                .notify_contract_handler(ContractHandlerEvent::PushQuery {
+                    key: key.clone(),
+                    state,
+                })
                 .await?;
             log::debug!(
                 "Appended contract {} to peer {}",
                 key,
                 self.op_storage.ring.peer_key
             );
-            self.op_storage.ring.contract_cached(key);
+            self.op_storage.ring.contract_cached(&key);
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers
                 for subscriber in subscribers {
                     if self
                         .op_storage
                         .ring
-                        .add_subscriber(key, *subscriber)
+                        .add_subscriber(&key, *subscriber)
                         .is_err()
                     {
                         log::warn!("Max subscribers for contract {} reached", key);

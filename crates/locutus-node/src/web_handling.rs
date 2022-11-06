@@ -38,7 +38,7 @@ pub(crate) async fn contract_home(
         .send(ClientConnection::Request {
             client_id,
             req: ClientRequest::Get {
-                key,
+                key: key.clone(),
                 fetch_contract: true,
             },
         })

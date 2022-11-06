@@ -1,4 +1,4 @@
-use locutus_runtime::{prelude::ContractKey, ContractRuntimeError, Parameters};
+use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError, Parameters};
 
 mod handler;
 mod test;
@@ -125,7 +125,7 @@ pub(crate) enum ContractError<CErr> {
     #[error("contract {0} not found in storage")]
     ContractNotFound(ContractKey),
     #[error("")]
-    ContractRuntimeError(ContractRuntimeError),
+    ContractRuntimeError(ContractRtError),
     #[error(transparent)]
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]

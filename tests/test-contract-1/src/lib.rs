@@ -42,7 +42,7 @@ impl ContractInterface for Contract {
         _parameters: Parameters<'static>,
         state: State<'static>,
         mut data: Vec<UpdateData<'static>>,
-    ) -> Result<UpdateModification, ContractError> {
+    ) -> Result<UpdateModification<'static>, ContractError> {
         if let Some(UpdateData::Delta(delta)) = data.pop() {
             if delta.as_ref() == [4] && state.as_ref() == [5, 2, 3] {
                 Ok(UpdateModification::valid(State::from(vec![5, 2, 3, 4])))

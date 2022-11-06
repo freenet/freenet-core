@@ -44,7 +44,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         Arc::new(ContractCode::from(vec![7, 3, 9, 5])),
         Parameters::from(vec![]),
     );
-    let key = *contract.key();
+    let key = contract.key().clone();
     let init_val = WrappedState::new(vec![1, 2, 3, 4]);
 
     tokio::time::sleep(Duration::from_secs(10)).await;
