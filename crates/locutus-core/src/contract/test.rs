@@ -1,8 +1,8 @@
 use dashmap::DashMap;
 use futures::future::BoxFuture;
 use locutus_runtime::{
-    ContractKey, ContractStore, RuntimeInterface, StateStorage, StateStore, UpdateModification,
-    ValidateResult,
+    ContractKey, ContractRuntimeInterface, ContractStore, StateStorage, StateStore,
+    UpdateModification, ValidateResult,
 };
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
@@ -11,52 +11,52 @@ use crate::{config::CONFIG, WrappedState};
 pub(crate) struct MockRuntime {}
 
 #[allow(unused_variables)]
-impl RuntimeInterface for MockRuntime {
-    fn validate_state<'a>(
+impl ContractRuntimeInterface for MockRuntime {
+    fn validate_state(
         &mut self,
         key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'a>,
+        parameters: &locutus_runtime::Parameters<'_>,
         state: &locutus_runtime::WrappedState,
         related: locutus_runtime::RelatedContracts,
     ) -> locutus_runtime::RuntimeResult<ValidateResult> {
         todo!()
     }
 
-    fn validate_delta<'a>(
+    fn validate_delta(
         &mut self,
         key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'a>,
-        delta: &locutus_runtime::StateDelta<'a>,
+        parameters: &locutus_runtime::Parameters<'_>,
+        delta: &locutus_runtime::StateDelta<'_>,
     ) -> locutus_runtime::RuntimeResult<bool> {
         todo!()
     }
 
-    fn update_state<'a>(
+    fn update_state(
         &mut self,
         key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'a>,
+        parameters: &locutus_runtime::Parameters<'_>,
         state: &locutus_runtime::WrappedState,
-        data: &[locutus_runtime::UpdateData<'a>],
-    ) -> locutus_runtime::RuntimeResult<UpdateModification> {
+        data: &[locutus_runtime::UpdateData<'_>],
+    ) -> locutus_runtime::RuntimeResult<UpdateModification<'static>> {
         todo!()
     }
 
-    fn summarize_state<'a>(
+    fn summarize_state(
         &mut self,
         key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'a>,
+        parameters: &locutus_runtime::Parameters<'_>,
         state: &locutus_runtime::WrappedState,
-    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateSummary<'a>> {
+    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateSummary<'static>> {
         todo!()
     }
 
-    fn get_state_delta<'a>(
+    fn get_state_delta(
         &mut self,
         key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'a>,
+        parameters: &locutus_runtime::Parameters<'_>,
         state: &locutus_runtime::WrappedState,
-        delta_to: &locutus_runtime::StateSummary<'a>,
-    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateDelta<'a>> {
+        delta_to: &locutus_runtime::StateSummary<'_>,
+    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateDelta<'static>> {
         todo!()
     }
 }

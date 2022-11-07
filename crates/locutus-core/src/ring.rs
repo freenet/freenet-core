@@ -184,8 +184,8 @@ impl Ring {
     }
 
     #[inline]
-    pub fn contract_cached(&self, key: ContractKey) {
-        self.cached_contracts.insert(key);
+    pub fn contract_cached(&self, key: &ContractKey) {
+        self.cached_contracts.insert(key.clone());
     }
 
     /// Update this node location.
@@ -327,12 +327,12 @@ impl Ring {
     /// Will return an error in case the max number of subscribers has been added.
     pub fn add_subscriber(
         &self,
-        contract: ContractKey,
+        contract: &ContractKey,
         subscriber: PeerKeyLocation,
     ) -> Result<(), ()> {
         let mut subs = self
             .subscribers
-            .entry(contract)
+            .entry(contract.clone())
             .or_insert(Vec::with_capacity(Self::MAX_SUBSCRIBERS));
         if subs.len() >= Self::MAX_SUBSCRIBERS {
             return Err(());

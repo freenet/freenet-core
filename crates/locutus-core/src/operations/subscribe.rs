@@ -112,7 +112,7 @@ where
                     let return_err = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(Message::from(SubscribeMsg::ReturnSub {
-                                key,
+                                key: key.clone(),
                                 id,
                                 subscribed: false,
                                 sender,
@@ -143,7 +143,7 @@ where
                                 &new_target.peer,
                                 (SubscribeMsg::SeekNode {
                                     id,
-                                    key,
+                                    key: key.clone(),
                                     subscriber,
                                     target: new_target,
                                     skip_list: new_skip_list.clone(),
@@ -152,7 +152,7 @@ where
                                 .into(),
                             )
                             .await?;
-                    } else if op_storage.ring.add_subscriber(key, subscriber).is_err() {
+                    } else if op_storage.ring.add_subscriber(&key, subscriber).is_err() {
                         // max number of subscribers for this contract reached
                         return Ok(return_err());
                     }
@@ -459,9 +459,11 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
-        let contract_key: ContractKey = *contract.key();
+        let contract_key: ContractKey = contract.key().clone();
 
-        let event = ClientRequest::Subscribe { key: contract_key };
+        let event = ClientRequest::Subscribe {
+            key: contract_key.clone(),
+        };
         let first_node = NodeSpecification {
             owned_contracts: Vec::new(),
             non_owned_contracts: vec![contract_key],

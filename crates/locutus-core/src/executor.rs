@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use locutus_runtime::{prelude::*, ContractRuntimeError};
+use locutus_runtime::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -18,7 +18,6 @@ type Response = Result<HostResponse, Either<RequestError, DynError>>;
 /// This node will monitor the store directories and databases to detect state changes.
 /// Consumers of the node are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
-#[derive(Clone)]
 pub struct ContractExecutor {
     runtime: Runtime,
     contract_state: StateStore<SqlitePool>,
@@ -35,7 +34,7 @@ impl ContractExecutor {
         ctrl_handler();
 
         Ok(Self {
-            runtime: Runtime::build(store, false).unwrap(),
+            runtime: Runtime::build(store, SecretsStore::default(), false).unwrap(),
             contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
@@ -49,7 +48,7 @@ impl ContractExecutor {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: StateSummary<'static>,
     ) -> Result<(), DynError> {
-        let channels = self.update_notifications.entry(key).or_default();
+        let channels = self.update_notifications.entry(key.clone()).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
@@ -61,7 +60,7 @@ impl ContractExecutor {
 
         if self
             .subscriber_summaries
-            .entry(key)
+            .entry(key.clone())
             .or_default()
             .insert(cli_id, summary)
             .is_some()
@@ -120,7 +119,7 @@ impl ContractExecutor {
                 //          2. a new func which compared two summaries and gives the most fresh
                 //        you can request to several nodes and determine which node has a fresher ver
                 self.runtime
-                    .contracts
+                    .contract_store
                     .store_contract(contract.clone())
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
@@ -135,16 +134,16 @@ impl ContractExecutor {
                     == ValidateResult::Valid;
                 // FIXME: should deal with additional related contracts requested
                 let res = is_valid
-                    .then(|| HostResponse::PutResponse { key: *key })
+                    .then(|| HostResponse::PutResponse { key: key.clone() })
                     .ok_or_else(|| {
                         Either::Left(RequestError::Put {
-                            key: *key,
+                            key: key.clone(),
                             cause: "not valid".to_owned(),
                         })
                     })?;
 
                 self.contract_state
-                    .store(*key, state.clone(), Some(contract.params().clone()))
+                    .store(key.clone(), state.clone(), Some(contract.params().clone()))
                     .await
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
@@ -152,7 +151,7 @@ impl ContractExecutor {
                     .await
                     .map_err(|_| {
                         Either::Left(RequestError::Put {
-                            key: *key,
+                            key: key.clone(),
                             cause: "failed while sending notifications".to_owned(),
                         })
                     })?;
@@ -178,18 +177,16 @@ impl ContractExecutor {
                         .runtime
                         .update_state(&key, &parameters, &state, &[data])
                         .map_err(|err| match err {
-                            ContractRuntimeError::ExecError(ExecError::ContractError(err)) => {
-                                Either::Left(RequestError::Update {
-                                    key,
-                                    cause: format!("{err}"),
-                                })
-                            }
+                            err if err.is_contract_error() => Either::Left(RequestError::Update {
+                                key: key.clone(),
+                                cause: format!("{err}"),
+                            }),
                             other => Either::Right(other.into()),
                         })?;
                     if let Some(new_state) = update_modification.new_state {
                         let new_state = WrappedState::new(new_state.into_bytes());
                         self.contract_state
-                            .store(key, new_state.clone(), None)
+                            .store(key.clone(), new_state.clone(), None)
                             .await
                             .map_err(|err| Either::Right(err.into()))?;
                         new_state
@@ -217,7 +214,7 @@ impl ContractExecutor {
             ClientRequest::Subscribe { key } => {
                 let updates =
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
-                self.register_contract_notifier(key, id, updates, [].as_ref().into())
+                self.register_contract_notifier(key.clone(), id, updates, [].as_ref().into())
                     .unwrap();
                 log::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
@@ -234,7 +231,7 @@ impl ContractExecutor {
     }
 
     async fn send_update_notification<'a>(
-        &'a mut self,
+        &mut self,
         key: &ContractKey,
         params: &Parameters<'a>,
         new_state: &WrappedState,
@@ -243,22 +240,23 @@ impl ContractExecutor {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
-                // FIXME: here we are always sending an state_delta, but what we send back depends
+                // FIXME: here we are always sending an state_delta,
+                //        but what we send back depends on the kind of subscription
                 let update = self
                     .runtime
                     .get_state_delta(key, params, new_state, &*peer_summary)
                     .map_err(|err| match err {
-                        ContractRuntimeError::ExecError(ExecError::ContractError(_)) => {
-                            Either::Left(RequestError::Put {
-                                key: *key,
-                                cause: "invalid put value".to_owned(),
-                            })
-                        }
+                        err if err.is_contract_error() => Either::Left(RequestError::Put {
+                            key: key.clone(),
+                            cause: "invalid put value".to_owned(),
+                        }),
                         other => Either::Right(other.into()),
-                    })?
-                    .into();
+                    })?;
                 notifier
-                    .send(Ok(HostResponse::UpdateNotification { key: *key, update }))
+                    .send(Ok(HostResponse::UpdateNotification {
+                        key: key.clone(),
+                        update: update.to_owned().into(),
+                    }))
                     .unwrap();
             }
         }
@@ -275,16 +273,16 @@ impl ContractExecutor {
             let parameters = self.contract_state.get_params(&key).await.map_err(|e| {
                 log::error!("{e}");
                 RequestError::Get {
-                    key,
+                    key: key.clone(),
                     cause: "missing contract".to_owned(),
                 }
             })?;
             let contract = self
                 .runtime
-                .contracts
+                .contract_store
                 .fetch_contract(&key, &parameters)
                 .ok_or_else(|| RequestError::Get {
-                    key,
+                    key: key.clone(),
                     cause: "Missing contract".into(),
                 })?;
             got_contract = Some(contract);
@@ -319,7 +317,7 @@ mod test {
         let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
         let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
-        ContractExecutor::new(contract_store.clone(), state_store.clone(), || {
+        ContractExecutor::new(contract_store, state_store, || {
             counter += 1;
         })
         .await

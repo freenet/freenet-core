@@ -51,7 +51,7 @@ impl<'a> EventLog<'a> {
             }) => EventKind::Put(
                 PutEvent::Request {
                     performer: target.peer,
-                    key: *contract.key(),
+                    key: contract.key().clone(),
                 },
                 *msg.id(),
             ),
@@ -70,7 +70,7 @@ impl<'a> EventLog<'a> {
             }) => EventKind::Put(
                 PutEvent::BroadcastEmitted {
                     broadcast_to: broadcast_to.clone(),
-                    key: *key,
+                    key: key.clone(),
                     value: new_value.clone(),
                 },
                 *msg.id(),
@@ -83,7 +83,7 @@ impl<'a> EventLog<'a> {
             }) => EventKind::Put(
                 PutEvent::BroadcastReceived {
                     requester: sender.peer,
-                    key: *key,
+                    key: key.clone(),
                     value: new_value.clone(),
                 },
                 *msg.id(),
@@ -92,7 +92,7 @@ impl<'a> EventLog<'a> {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
-            }) => EventKind::Get { key: *key },
+            }) => EventKind::Get { key: key.clone() },
             _ => EventKind::Unknown,
         };
         EventLog {

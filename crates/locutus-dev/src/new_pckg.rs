@@ -99,7 +99,7 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
 
     // add the stdlib dependency
     let child = Command::new("cargo")
-        .args(&["add", "locutus-stdlib"])
+        .args(["add", "locutus-stdlib"])
         .current_dir(&dest_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -130,7 +130,7 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
 
 fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
     let child = Command::new("npm")
-        .args(&["init", "--force"])
+        .args(["init", "--force"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(cwd)
@@ -144,7 +144,7 @@ fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
     // - include dependencies: locutus-stdlib
 
     let child = Command::new("tsc")
-        .args(&["--init", "--pretty"])
+        .args(["--init", "--pretty"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(cwd)
