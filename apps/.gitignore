@@ -3,7 +3,6 @@
 **/dist/**/*.js*
 **/target/*
 **/build/*
-docs
 
 jest.config.js
 **/apps/**/*.js
