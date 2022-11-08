@@ -19,7 +19,7 @@
   </a>
 </div>
 
-# Locutus 
+# Locutus
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
@@ -55,10 +55,9 @@ Locutus is implemented in Rust and will be available across all major operating 
 
 ## Status
 
-We're working hard and expect an early prototype in August 2022. 
+We're working hard and expect an early prototype in August 2022.
 
 You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
-
 
 ## Stay up to date
 
@@ -74,7 +73,7 @@ Many developers are active in [r/freenet](https://www.reddit.com/r/Freenet/), bu
 
 ### Protocol Labs
 
-In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has 
+In addition to creating the excellent [libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level transport, Protocol Labs has
 generously supported our work with a grant.
 
 ### FUTO
@@ -83,14 +82,34 @@ FUTO has generously awarded Freenet a Legendary Grant to support Locutus develop
 
 ### Supporting Locutus
 
-If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at 
+If you are in a position to fund our continued efforts please contact us on [twitter](https://twitter.com/FreenetOrg) or by email at
 *ian at freenet dot org*.
 
 ## License
 
 This project is licensed under either of:
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-  http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  http://opensource.org/licenses/MIT)
+* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+## Building with Docker Images
+
+### Build the base docker image of Locutus
+
+Requires that Docker be installed and working.  Then, in the root directory of the repo:
+
+```sh
+docker build -t locutus .
+```
+
+### Running Locutus Node from the docker image
+
+```sh
+ docker run -it locutus
+```
+
+### Running the `ldt` tool from the docker image
+
+* TODO
