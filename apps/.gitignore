@@ -3,4 +3,9 @@
 **/dist/**/*.js*
 **/target/*
 **/build/*
+
+jest.config.js
+**/apps/**/*.js
+**/web/src/**/*.js
+**/stdlib/**/*.js
 docs

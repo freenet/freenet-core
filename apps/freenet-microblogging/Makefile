@@ -5,6 +5,8 @@
 WEB_DIR =./web
 POSTS_DIR =./contracts/posts
 LOCUTUS_DIR=$(shell cd ../.. && pwd)
+CARGO_TARGET_DIR ?= ${LOCUTUS_DIR}/target
+export CARGO_TARGET_DIR
 
 build-tool:
 	cd $(LOCUTUS_DIR)
