@@ -1179,11 +1179,11 @@ pub(crate) mod wasm_interface {
     }
 
     impl ContractInterfaceResult {
-        #![allow(clippy::let_and_return)]
         pub unsafe fn unwrap_validate_state_res(
             self,
             mem: WasmLinearMem,
         ) -> Result<ValidateResult, ContractError> {
+            #![allow(clippy::let_and_return)]
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateState => {
@@ -1203,6 +1203,7 @@ pub(crate) mod wasm_interface {
             self,
             mem: WasmLinearMem,
         ) -> Result<bool, ContractError> {
+            #![allow(clippy::let_and_return)]
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateDelta => {

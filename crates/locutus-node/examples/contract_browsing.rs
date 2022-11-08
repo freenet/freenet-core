@@ -73,7 +73,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use locutus::HttpGateway;
     use locutus_core::{
-        libp2p::identity::ed25519::Keypair, locutus_runtime::ContractStore, ContractExecutor,
+        libp2p::identity::ed25519::Keypair, locutus_runtime::ContractStore, Executor,
     };
 
     let keypair = Keypair::generate();
@@ -90,7 +90,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let contract_dir = Config::get_conf().config_paths.local_contracts_dir();
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
-    let mut local_node = ContractExecutor::new(contract_store, state_store, || {
+    let mut local_node = Executor::new(contract_store, state_store, || {
         locutus_core::util::set_cleanup_on_exit().unwrap();
     })
     .await?;
@@ -123,7 +123,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .from_env_lossy(),
         )
         .init();
-    #[allow(unused_variables)]
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::{borrow::Borrow, fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 use wasmer::NativeFunc;
 
-use crate::{ContractError, ContractExecError, ContractRtInnerError, RuntimeResult};
+use crate::{ContractError, ContractExecError, RuntimeInnerError, RuntimeResult};
 
 type FfiReturnTy = i64;
 
@@ -200,7 +200,7 @@ impl TryInto<Vec<u8>> for WrappedContract {
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
         Arc::try_unwrap(self.data)
             .map(|r| r.into_bytes())
-            .map_err(|_| ContractRtInnerError::UnwrapContract)
+            .map_err(|_| RuntimeInnerError::UnwrapContract)
             .map_err(Into::into)
     }
 }
