@@ -57,7 +57,7 @@ async fn execute_command(
                 .handle_request(
                     ClientId::FIRST,
                     ClientRequest::Get {
-                        key,
+                        key: key.clone(),
                         fetch_contract: contract,
                     },
                     None,

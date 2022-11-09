@@ -306,7 +306,7 @@ impl HttpGateway {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 if let Some(ch) = self.response_channels.get(&client_id) {
                     ch.send(HostCallbackResult::SubscriptionChannel {
-                        key,
+                        key: key.clone(),
                         id: client_id,
                         callback: rx,
                     })

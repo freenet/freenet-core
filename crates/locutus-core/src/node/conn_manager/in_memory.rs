@@ -164,7 +164,7 @@ impl InMemoryTransport {
                     for (_, msgs) in delayed.drain() {
                         queue.extend(msgs);
                     }
-                    Self::shuffle(&mut *queue);
+                    Self::shuffle(&mut queue);
                 }
             }
             log::error!("Stopped receiving messages in {}", interface_peer);

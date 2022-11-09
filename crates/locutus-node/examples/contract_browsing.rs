@@ -90,7 +90,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let contract_dir = Config::get_conf().config_paths.local_contracts_dir();
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
-    let mut local_node = ContractExecutor::new(contract_store.clone(), state_store.clone(), || {
+    let mut local_node = ContractExecutor::new(contract_store, state_store, || {
         locutus_core::util::set_cleanup_on_exit().unwrap();
     })
     .await?;

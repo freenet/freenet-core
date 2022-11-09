@@ -469,7 +469,7 @@ pub(crate) mod test {
                     }
                     1 if !self.non_owned_contracts.is_empty() => {
                         let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
-                        let key = self.non_owned_contracts[contract_no];
+                        let key = self.non_owned_contracts[contract_no].clone();
                         break ClientRequest::Get {
                             key,
                             fetch_contract: rng.gen_bool(0.5),
@@ -489,7 +489,7 @@ pub(crate) mod test {
                         };
                         let key = if get_owned {
                             let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                            *self.owned_contracts[contract_no].0.key()
+                            self.owned_contracts[contract_no].0.key().clone()
                         } else {
                             // let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
                             // self.non_owned_contracts[contract_no]
