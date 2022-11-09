@@ -29,7 +29,7 @@ To learn more about Locutus as a developer read [The Locutus Book](https://docs.
 
 ## Status
 
-Locutus is currently under development. Using our [development guide](https://docs.freenet.org/dev-guide.html), developers can experiment with building decentralized applications using our SDK and testing them locally. We expect the Locutus network to go live in November 2022.
+Locutus is currently under development. Using our [development guide](https://docs.freenet.org/dev-guide.html), developers can experiment with building decentralized applications using our SDK and testing them locally. We expect the Locutus network to go live in January 2023.
 
 ## Applications
 
@@ -52,13 +52,6 @@ Locutus is a decentralized key-value database. It uses the same [small world](ht
 A very simple contract might require that the state is a list of messages, each signed with a specific cryptographic keypair. The state can be updated to add new messages if appropriately signed. Something like this could serve as the basis for a blog or Twitter feed.
 
 Locutus is implemented in Rust and will be available across all major operating systems, desktop and mobile.
-
-## Status
-
-We're working hard and expect an early prototype in August 2022. 
-
-You can support our work through a [donation](https://freenetproject.org/pages/donate.html).
-
 
 ## Stay up to date
 
