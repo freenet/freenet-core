@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -258,9 +259,19 @@ impl Executor {
 
     fn component_op<'a>(&mut self, req: ComponentRequest<'a>) -> Response<'a> {
         match req {
-            ComponentRequest::RegisterComponent(component) => {
+            ComponentRequest::RegisterComponent {
+                component,
+                cipher,
+                nonce,
+            } => {
+                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
                 let key = component.key().clone();
-                match self.runtime.register_component(component) {
+
+                let arr = GenericArray::from_slice(&cipher);
+                let cipher = XChaCha20Poly1305::new(arr);
+                let nonce = GenericArray::from_slice(&nonce).to_owned();
+
+                match self.runtime.register_component(component, cipher, nonce) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
                         log::error!("failed registering component `{key}`: {err}");

@@ -466,7 +466,12 @@ pub enum ComponentRequest<'a> {
         key: ComponentKey,
         inbound: Vec<InboundComponentMsg<'a>>,
     },
-    RegisterComponent(#[serde(borrow)] locutus_runtime::Component<'a>),
+    RegisterComponent {
+        #[serde(borrow)]
+        component: locutus_runtime::Component<'a>,
+        cipher: [u8; 24],
+        nonce: [u8; 24],
+    },
     UnregisterComponent(ComponentKey),
 }
 
@@ -479,9 +484,17 @@ impl ComponentRequest<'_> {
                     inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
                 }
             }
-            ComponentRequest::RegisterComponent(cmp) => {
-                let cmp = cmp.into_owned();
-                ComponentRequest::RegisterComponent(cmp)
+            ComponentRequest::RegisterComponent {
+                component,
+                cipher,
+                nonce,
+            } => {
+                let component = component.into_owned();
+                ComponentRequest::RegisterComponent {
+                    component,
+                    cipher,
+                    nonce,
+                }
             }
             ComponentRequest::UnregisterComponent(key) => {
                 ComponentRequest::UnregisterComponent(key)

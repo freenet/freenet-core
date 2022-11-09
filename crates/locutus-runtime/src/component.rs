@@ -1,3 +1,4 @@
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use locutus_stdlib::prelude::{
     ApplicationMessage, Component, ComponentError, ComponentInterfaceResult, ComponentKey,
     GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
@@ -23,7 +24,12 @@ pub trait ComponentRuntimeInterface {
         inbound: Vec<InboundComponentMsg<'a>>,
     ) -> RuntimeResult<Vec<OutboundComponentMsg<'a>>>;
 
-    fn register_component(&mut self, component: Component<'_>) -> RuntimeResult<()>;
+    fn register_component(
+        &mut self,
+        component: Component<'_>,
+        cipher: XChaCha20Poly1305,
+        nonce: XNonce,
+    ) -> RuntimeResult<()>;
 
     fn unregister_component(&mut self, key: &ComponentKey) -> RuntimeResult<()>;
 }
@@ -158,7 +164,14 @@ impl ComponentRuntimeInterface for Runtime {
     }
 
     #[inline]
-    fn register_component(&mut self, component: Component<'_>) -> RuntimeResult<()> {
+    fn register_component(
+        &mut self,
+        component: Component<'_>,
+        cipher: XChaCha20Poly1305,
+        nonce: XNonce,
+    ) -> RuntimeResult<()> {
+        self.secret_store
+            .register_component(component.key().clone(), cipher, nonce)?;
         self.component_store.store_component(component)
     }
 

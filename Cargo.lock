@@ -2184,6 +2184,7 @@ dependencies = [
  "bincode",
  "blake2 0.10.4",
  "bs58",
+ "chacha20poly1305 0.10.1",
  "config",
  "crossbeam",
  "ctrlc",
