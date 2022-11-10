@@ -3,7 +3,6 @@ use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError, Pa
 mod handler;
 mod test;
 
-use crate::WrappedState;
 pub use handler::sqlite::{Pool as SqlitePool, SQLiteContractHandler};
 #[cfg(test)]
 pub(crate) use handler::test::{TestContractHandler, TestContractStoreError};
@@ -40,32 +39,29 @@ where
                 } else {
                     None
                 };
-                let _response = {
-                    let _contract = if fetch_contract {
-                        let params = Parameters::from(vec![]); // FIXME
-                        contract_handler
-                            .contract_store()
-                            .fetch_contract(&key, &params)
-                    } else {
-                        None
-                    };
-                    todo!("get state from state store");
-                    Ok(StoreResponse {
-                        state: None,
-                        contract: _contract,
-                    })
+                let _contract = if fetch_contract {
+                    let params = Parameters::from(vec![]); // FIXME
+                    contract_handler
+                        .contract_store()
+                        .fetch_contract(&key, &params)
+                } else {
+                    None
                 };
-
-                contract_handler
-                    .channel()
-                    .send_to_listener(
-                        _id,
-                        ContractHandlerEvent::FetchResponse {
-                            key,
-                            response: _response,
-                        },
-                    )
-                    .await?;
+                todo!("get state from state store");
+                // let response = Ok(StoreResponse {
+                //     state: None,
+                //     contract: _contract,
+                // });
+                // contract_handler
+                //     .channel()
+                //     .send_to_listener(
+                //         _id,
+                //         ContractHandlerEvent::FetchResponse {
+                //             key,
+                //             response: _response,
+                //         },
+                //     )
+                //     .await?;
             }
             (id, ContractHandlerEvent::Cache(contract)) => {
                 match contract_handler.contract_store().store_contract(contract) {
@@ -91,27 +87,26 @@ where
                     state: _state,
                 },
             ) => {
-                // TODO: Perform put request
-                let put_result = Ok(WrappedState::from(vec![]));
                 // let _put_result = contract_handler
                 //     .handle_request(ClientRequest::Put {
                 //         contract: todo!(),
                 //         state: _state,
-                //     })
+                //     }.into())
                 //     .await
                 //     .map(|r| {
                 //         let _r = r.unwrap_put();
                 //         unimplemented!();
                 //     });
-                contract_handler
-                    .channel()
-                    .send_to_listener(
-                        _id,
-                        ContractHandlerEvent::PushResponse {
-                            new_value: put_result,
-                        },
-                    )
-                    .await?;
+                // contract_handler
+                //     .channel()
+                //     .send_to_listener(
+                //         _id,
+                //         ContractHandlerEvent::PushResponse {
+                //             new_value: put_result,
+                //         },
+                //     )
+                //     .await?;
+                todo!("perform put request");
             }
             _ => unreachable!(),
         }

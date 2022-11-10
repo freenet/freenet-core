@@ -37,19 +37,22 @@ pub(crate) async fn contract_home(
     request_sender
         .send(ClientConnection::Request {
             client_id,
-            req: ClientRequest::Get {
+            req: ContractRequest::Get {
                 key: key.clone(),
                 fetch_contract: true,
-            },
+            }
+            .into(),
         })
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let response = match response_recv.recv().await {
         Some(HostCallbackResult::Result {
             result:
-                Ok(HostResponse::GetResponse {
-                    contract, state, ..
-                }),
+                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    contract,
+                    state,
+                    ..
+                })),
             ..
         }) => match contract {
             Some(contract) => {

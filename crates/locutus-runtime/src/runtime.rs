@@ -10,7 +10,7 @@ use wasmer::{
 
 use crate::{
     component_store::ComponentStore, contract_store::ContractStore, secrets_store::SecretsStore,
-    ContractRtInnerError, RuntimeResult,
+    RuntimeInnerError, RuntimeResult,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -129,7 +129,7 @@ impl Runtime {
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
-                .ok_or_else(|| ContractRtInnerError::ContractNotFound(key.clone()))?;
+                .ok_or_else(|| RuntimeInnerError::ContractNotFound(key.clone()))?;
             let module = Module::new(&self.wasm_store, contract.code().data())?;
             self.contract_modules.insert(key.clone(), module);
             self.contract_modules.get(key).unwrap()
@@ -150,7 +150,7 @@ impl Runtime {
             let contract = self
                 .component_store
                 .fetch_component(key)
-                .ok_or_else(|| ContractRtInnerError::ComponentNotFound(key.clone()))?;
+                .ok_or_else(|| RuntimeInnerError::ComponentNotFound(key.clone()))?;
             let module = Module::new(&self.wasm_store, contract)?;
             self.component_modules.insert(key.clone(), module);
             self.component_modules.get(key).unwrap()

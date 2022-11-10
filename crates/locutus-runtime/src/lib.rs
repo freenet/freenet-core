@@ -14,6 +14,7 @@ pub use locutus_stdlib;
 pub use prelude::*;
 
 pub mod prelude {
+    pub use super::component::{ComponentExecError, ComponentRuntimeInterface};
     pub use super::contract::{ContractRuntimeInterface, WrappedContract, WrappedState};
     pub use super::contract_store::ContractStore;
     pub use super::runtime::{ContractExecError, Runtime};
@@ -26,11 +27,15 @@ pub mod prelude {
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
 #[derive(Debug)]
-pub struct ContractError(Box<ContractRtInnerError>);
+pub struct ContractError(Box<RuntimeInnerError>);
 
 impl ContractError {
-    pub fn is_contract_error(&self) -> bool {
-        matches!(&*self.0, ContractRtInnerError::ContractExecError(_))
+    pub fn is_contract_exec_error(&self) -> bool {
+        matches!(&*self.0, RuntimeInnerError::ContractExecError(_))
+    }
+
+    pub fn is_component_exec_error(&self) -> bool {
+        matches!(&*self.0, RuntimeInnerError::ComponentExecError(_))
     }
 }
 
@@ -42,8 +47,8 @@ impl Display for ContractError {
 
 impl std::error::Error for ContractError {}
 
-impl From<ContractRtInnerError> for ContractError {
-    fn from(err: ContractRtInnerError) -> Self {
+impl From<RuntimeInnerError> for ContractError {
+    fn from(err: RuntimeInnerError) -> Self {
         Self(Box::new(err))
     }
 }
@@ -52,7 +57,7 @@ macro_rules! impl_err {
     ($type:ty) => {
         impl From<$type> for ContractError {
             fn from(err: $type) -> Self {
-                Self(Box::new(ContractRtInnerError::from(err)))
+                Self(Box::new(RuntimeInnerError::from(err)))
             }
         }
     };
@@ -76,7 +81,7 @@ impl_err!(wasmer::MemoryError);
 impl_err!(wasmer::RuntimeError);
 
 #[derive(thiserror::Error, Debug)]
-enum ContractRtInnerError {
+enum RuntimeInnerError {
     #[error(transparent)]
     Any(#[from] Box<dyn std::error::Error + Send + Sync>),
 

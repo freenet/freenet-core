@@ -8,7 +8,8 @@ use std::{
 use either::Either;
 use futures::future::BoxFuture;
 use locutus_core::{
-    ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse, OpenRequest,
+    ClientError, ClientEventsProxy, ClientId, ClientRequest, ContractRequest, ErrorKind,
+    HostResponse, OpenRequest,
 };
 use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -208,24 +209,27 @@ struct CommandInfo {
 impl From<CommandInfo> for OpenRequest<'static> {
     fn from(cmd: CommandInfo) -> Self {
         let req = match cmd.cmd {
-            Command::Get => ClientRequest::Get {
+            Command::Get => ContractRequest::Get {
                 key: cmd.contract.key().clone(),
                 fetch_contract: false,
-            },
+            }
+            .into(),
             Command::Put => {
                 let state = cmd.input.unwrap().unwrap_put();
-                ClientRequest::Put {
+                ContractRequest::Put {
                     contract: cmd.contract,
                     state: WrappedState::new(state.into_bytes()),
                     related_contracts: Default::default(),
                 }
+                .into()
             }
             Command::Update => {
                 let data = cmd.input.unwrap().unwrap_delta().into();
-                ClientRequest::Update {
+                ContractRequest::Update {
                     key: cmd.contract.key().clone(),
                     data,
                 }
+                .into()
             }
             Command::Exit => ClientRequest::Disconnect {
                 cause: Some("shutdown".to_owned()),
@@ -236,9 +240,8 @@ impl From<CommandInfo> for OpenRequest<'static> {
     }
 }
 
-#[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for StdInput {
-    fn recv<'a>(&'a mut self) -> BoxFuture<'a, HostIncomingMsg> {
+    fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg> {
         Box::pin(async {
             loop {
                 self.buf.clear();
@@ -331,11 +334,11 @@ impl ClientEventsProxy for StdInput {
         })
     }
 
-    fn send<'a>(
-        &'a mut self,
+    fn send(
+        &mut self,
         _id: ClientId,
         _response: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<'a, Result<(), ClientError>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         unimplemented!()
     }
 }

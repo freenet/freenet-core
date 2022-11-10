@@ -1,3 +1,5 @@
+#![allow(unused)] // FIXME: remove this
+
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -197,7 +199,11 @@ pub(in crate::contract) mod sqlite {
     };
 
     use super::*;
-    use crate::{config::CONFIG, contract::test::MockRuntime};
+    use crate::{
+        client_events::{ContractRequest, ContractResponse},
+        config::CONFIG,
+        contract::test::MockRuntime,
+    };
 
     // Is fine to clone this as it wraps by an Arc.
     static POOL: Lazy<SqlitePool> = Lazy::new(|| {
@@ -422,47 +428,51 @@ pub(in crate::contract) mod sqlite {
         ) -> BoxFuture<'a, Result<HostResponse, Self::Error>> {
             async move {
                 match req {
-                    ClientRequest::Get {
-                        key,
-                        fetch_contract,
-                    } => {
-                        let (state, contract) = self.get_contract(&key, fetch_contract).await?;
-                        Ok(HostResponse::GetResponse { contract, state })
-                    }
-                    ClientRequest::Put {
-                        contract,
-                        state,
-                        related_contracts,
-                    } => {
-                        match self.get_contract(contract.key(), false).await {
-                            Ok((_old_state, _)) => {
-                                return Err(ContractError::from(ContractExecError::DoublePut(
-                                    contract.key().clone(),
-                                ))
-                                .into())
-                            }
-                            Err(SqlDbError::ContractNotFound) => {}
-                            Err(other) => return Err(other),
+                    ClientRequest::ContractOp(ops) => match ops {
+                        ContractRequest::Get {
+                            key,
+                            fetch_contract,
+                        } => {
+                            let (state, contract) = self.get_contract(&key, fetch_contract).await?;
+                            Ok(ContractResponse::GetResponse { contract, state }.into())
                         }
-
-                        let result = self.runtime.validate_state(
-                            contract.key(),
-                            contract.params(),
-                            &state,
+                        ContractRequest::Put {
+                            contract,
+                            state,
                             related_contracts,
-                        )?;
-                        // FIXME: should deal with additional related contracts requested
-                        if result != ValidateResult::Valid {
-                            todo!("return error");
+                        } => {
+                            match self.get_contract(contract.key(), false).await {
+                                Ok((_old_state, _)) => {
+                                    return Err(ContractError::from(ContractExecError::DoublePut(
+                                        contract.key().clone(),
+                                    ))
+                                    .into())
+                                }
+                                Err(SqlDbError::ContractNotFound) => {}
+                                Err(other) => return Err(other),
+                            }
+
+                            let result = self.runtime.validate_state(
+                                contract.key(),
+                                contract.params(),
+                                &state,
+                                related_contracts,
+                            )?;
+                            // FIXME: should deal with additional related contracts requested
+                            if result != ValidateResult::Valid {
+                                todo!("return error");
+                            }
+                            let _params: Parameters<'static> =
+                                contract.params().clone().into_bytes().into();
+                            self.state_store
+                                .store(contract.key().clone(), state, None)
+                                .await?;
+                            todo!()
                         }
-                        let _params: Parameters<'static> =
-                            contract.params().clone().into_bytes().into();
-                        self.state_store
-                            .store(contract.key().clone(), state, None)
-                            .await?;
-                        todo!()
-                    }
-                    _ => unimplemented!(),
+                        _ => unreachable!(),
+                    },
+                    ClientRequest::ComponentOp(_op) => todo!("FIXME: component op"),
+                    ClientRequest::Disconnect { .. } => unreachable!(),
                 }
             }
             .boxed()
@@ -479,6 +489,8 @@ pub(in crate::contract) mod sqlite {
 
         use locutus_runtime::StateDelta;
         use locutus_stdlib::prelude::ContractCode;
+
+        use crate::client_events::ContractRequest;
 
         use super::sqlite::SQLiteContractHandler;
         use super::*;
@@ -508,18 +520,24 @@ pub(in crate::contract) mod sqlite {
             // Get contract parts
             let state = WrappedState::new(contract_bytes.clone());
             handler
-                .handle_request(ClientRequest::Put {
-                    contract: contract.clone(),
-                    state: state.clone(),
-                    related_contracts: Default::default(),
-                })
+                .handle_request(
+                    ContractRequest::Put {
+                        contract: contract.clone(),
+                        state: state.clone(),
+                        related_contracts: Default::default(),
+                    }
+                    .into(),
+                )
                 .await?
                 .unwrap_put();
             let (get_result_value, _) = handler
-                .handle_request(ClientRequest::Get {
-                    key: contract.key().clone(),
-                    fetch_contract: false,
-                })
+                .handle_request(
+                    ContractRequest::Get {
+                        key: contract.key().clone(),
+                        fetch_contract: false,
+                    }
+                    .into(),
+                )
                 .await?
                 .unwrap_get();
             assert_eq!(state, get_result_value);
@@ -527,13 +545,16 @@ pub(in crate::contract) mod sqlite {
             // Update the contract state with a new delta
             let delta = StateDelta::from(b"New test contract value".to_vec());
             handler
-                .handle_request(ClientRequest::Update {
-                    key: contract.key().clone(),
-                    data: delta.into(),
-                })
+                .handle_request(
+                    ContractRequest::Update {
+                        key: contract.key().clone(),
+                        data: delta.into(),
+                    }
+                    .into(),
+                )
                 .await?;
             // let (new_get_result_value, _) = handler
-            //     .handle_request(ClientRequest::Get {
+            //     .handle_request(ContractOps::Get {
             //         key: *contract.key(),
             //         contract: false,
             //     })

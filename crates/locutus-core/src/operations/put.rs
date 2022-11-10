@@ -789,7 +789,7 @@ mod test {
     use std::collections::HashMap;
 
     use crate::{
-        client_events::ClientRequest,
+        client_events::ContractRequest,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
     };
 
@@ -828,11 +828,12 @@ mod test {
             contract_subscribers: HashMap::from_iter([(key.clone(), vec![node0_loc])]),
         };
 
-        let put_event = ClientRequest::Put {
+        let put_event = ContractRequest::Put {
             contract: contract.clone(),
             state: new_value.clone(),
             related_contracts: Default::default(),
-        };
+        }
+        .into();
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(contract, contract_val)],

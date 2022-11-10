@@ -1,4 +1,4 @@
-use locutus_core::{ClientId, ClientRequest, HostResponse};
+use locutus_core::{ClientId, ClientRequest, ContractRequest, ContractResponse, HostResponse};
 
 use crate::{CommandReceiver, DynError};
 
@@ -19,65 +19,83 @@ pub(super) async fn wasm_runtime(
     Ok(())
 }
 
-#[allow(unused, clippy::diverging_sub_expression)]
 async fn execute_command(
     req: ClientRequest<'static>,
     app: &mut AppState,
 ) -> Result<bool, DynError> {
     let node = &mut *app.local_node.write().await;
     match req {
-        req @ ClientRequest::Put { .. } => {
-            match node.handle_request(ClientId::FIRST, req, None).await {
-                Ok(HostResponse::PutResponse { key }) => {
-                    println!("valid put for {key}");
+        ClientRequest::ContractOp(op) => match op {
+            req @ ContractRequest::Put { .. } => {
+                match node.handle_request(ClientId::FIRST, req.into(), None).await {
+                    Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key })) => {
+                        println!("valid put for {key}");
+                    }
+                    Err(err) => {
+                        println!("error: {err}");
+                    }
+                    _ => unreachable!(),
                 }
-                Err(err) => {
-                    println!("error: {err}");
-                }
-                _ => unreachable!(),
             }
-        }
-        req @ ClientRequest::Update { .. } => {
-            match node.handle_request(ClientId::FIRST, req, None).await {
-                Ok(HostResponse::UpdateResponse { key, summary }) => {
-                    println!("valid update for {key}, state summary:");
-                    app.printout_deser(summary.as_ref())?;
+            req @ ContractRequest::Update { .. } => {
+                match node.handle_request(ClientId::FIRST, req.into(), None).await {
+                    Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                        key,
+                        summary,
+                    })) => {
+                        println!("valid update for {key}, state summary:");
+                        app.printout_deser(summary.as_ref())?;
+                    }
+                    Err(err) => {
+                        println!("error: {err}");
+                    }
+                    _ => unreachable!(),
                 }
-                Err(err) => {
-                    println!("error: {err}");
-                }
-                _ => unreachable!(),
             }
-        }
-        ClientRequest::Get {
-            key,
-            fetch_contract: contract,
-        } => {
-            match node
-                .handle_request(
-                    ClientId::FIRST,
-                    ClientRequest::Get {
-                        key: key.clone(),
-                        fetch_contract: contract,
-                    },
-                    None,
-                )
-                .await
-            {
-                Ok(HostResponse::GetResponse {
-                    contract, state, ..
-                }) => {
-                    println!("current state for {key}:");
-                    app.printout_deser(state.as_ref())?;
+            ContractRequest::Get {
+                key,
+                fetch_contract: contract,
+            } => {
+                match node
+                    .handle_request(
+                        ClientId::FIRST,
+                        ContractRequest::Get {
+                            key: key.clone(),
+                            fetch_contract: contract,
+                        }
+                        .into(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                        state,
+                        ..
+                    })) => {
+                        println!("current state for {key}:");
+                        app.printout_deser(state.as_ref())?;
+                        todo!()
+                    }
+                    Err(err) => {
+                        println!("error: {err}");
+                    }
+                    _ => unreachable!(),
                 }
-                Err(err) => {
+            }
+            _ => unreachable!(),
+        },
+        ClientRequest::ComponentOp(op) => {
+            match node.handle_request(ClientId::FIRST, op.into(), None).await {
+                Ok(_res) => todo!(),
+                Err(either::Either::Left(err)) => {
                     println!("error: {err}");
                 }
-                _ => unreachable!(),
+                Err(either::Either::Right(err)) => {
+                    println!("error: {err}");
+                }
             }
         }
         ClientRequest::Disconnect { .. } => return Ok(true),
-        _ => unreachable!(),
     }
     Ok(false)
 }

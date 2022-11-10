@@ -126,11 +126,12 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
         })
     }
 
-    fn send(
+    fn send<'a>(
         &mut self,
         internal: ClientId,
-        response: Result<HostResponse, ClientError>,
+        response: Result<HostResponse<'a>, ClientError>,
     ) -> BoxFuture<'_, Result<(), ClientError>> {
+        let response: Result<HostResponse<'static>, _> = response.map(HostResponse::into_owned);
         Box::pin(async move {
             let (idx, external) = self
                 .internal_clients
