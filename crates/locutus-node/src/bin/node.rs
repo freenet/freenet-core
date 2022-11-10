@@ -46,7 +46,6 @@ fn main() -> Result<(), DynError> {
         )
         .init();
     let config = NodeConfig::parse();
-    println!("{:?}", config);    
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
