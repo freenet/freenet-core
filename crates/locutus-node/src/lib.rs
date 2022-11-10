@@ -23,7 +23,7 @@ enum HostCallbackResult {
     NewId(ClientId),
     Result {
         id: ClientId,
-        result: Result<HostResponse, ClientError>,
+        result: Result<HostResponse<'static>, ClientError>,
     },
     SubscriptionChannel {
         key: ContractKey,
@@ -36,14 +36,14 @@ pub mod local_node {
     use std::net::SocketAddr;
 
     use locutus_core::{
-        either, ClientError, ClientEventsProxy, ContractExecutor, ErrorKind, OpenRequest,
-        RequestError, WebSocketProxy,
+        either, ClientError, ClientEventsProxy, ErrorKind, Executor, OpenRequest, RequestError,
+        WebSocketProxy,
     };
 
     use crate::{DynError, HttpGateway};
 
     pub async fn run_local_node(
-        mut executor: ContractExecutor,
+        mut executor: Executor,
         socket: SocketAddr,
     ) -> Result<(), DynError> {
         let (mut http_handle, filter) = HttpGateway::as_filter();

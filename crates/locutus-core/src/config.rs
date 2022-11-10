@@ -1,3 +1,4 @@
+#![allow(unused)] // FIXME: remove unused
 use std::{
     convert::TryFrom,
     fs::{self, File},
@@ -226,22 +227,6 @@ impl GlobalExecutor {
             handle.spawn(f)
         } else if let Some(rt) = &*ASYNC_RT {
             rt.spawn(f)
-        } else {
-            unreachable!("the executor must have been initialized")
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(f)
-        } else if let Some(rt) = &*ASYNC_RT {
-            rt.spawn_blocking(f)
         } else {
             unreachable!("the executor must have been initialized")
         }

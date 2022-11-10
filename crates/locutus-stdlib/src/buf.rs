@@ -365,6 +365,7 @@ mod test {
         Ok((store, instance))
     }
 
+    // FIXME
     #[allow(dead_code)]
     fn build_test_mod_with_wasi() -> Result<(Store, Instance), Box<dyn std::error::Error>> {
         let wasm_bytes = wat2wasm(TEST_MODULE.as_bytes())?;

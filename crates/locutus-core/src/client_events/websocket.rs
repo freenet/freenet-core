@@ -20,7 +20,7 @@ pub struct WebSocketProxy {
     server_response: Sender<(ClientId, HostResult)>,
 }
 
-type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
+type NewResponseSender = Sender<Result<HostResponse<'static>, ClientError>>;
 
 impl WebSocketProxy {
     /// Starts this as an upgrade to an existing HTTP connection at the `/ws-api` URL
@@ -86,11 +86,12 @@ impl ClientEventsProxy for WebSocketProxy {
         })
     }
 
-    fn send(
+    fn send<'a>(
         &mut self,
         client: ClientId,
-        response: Result<HostResponse, ClientError>,
+        response: Result<HostResponse<'a>, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>> {
+        let response: Result<HostResponse<'static>, _> = response.map(HostResponse::into_owned);
         Box::pin(async move {
             self.server_response
                 .send((client, response))
@@ -260,7 +261,7 @@ async fn new_request(
 
 async fn send_reponse_to_client(
     response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
-    response: Result<HostResponse, ClientError>,
+    response: Result<HostResponse<'static>, ClientError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serialize = rmp_serde::to_vec(&response).unwrap();
     response_stream

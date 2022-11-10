@@ -50,21 +50,27 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     tokio::time::sleep(Duration::from_secs(10)).await;
     manager
         .tx_gw_ev
-        .send(ClientRequest::Put {
-            state: init_val,
-            contract: contract.clone(),
-            related_contracts: Default::default(),
-        })
+        .send(
+            ContractRequest::Put {
+                state: init_val,
+                contract: contract.clone(),
+                related_contracts: Default::default(),
+            }
+            .into(),
+        )
         .await
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     manager
         .tx_gw_ev
-        .send(ClientRequest::Get {
-            key,
-            fetch_contract: false,
-        })
+        .send(
+            ContractRequest::Get {
+                key,
+                fetch_contract: false,
+            }
+            .into(),
+        )
         .await
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -72,11 +78,14 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     let second_val = WrappedState::new(vec![2, 3, 1, 4]);
     manager
         .tx_node_ev
-        .send(ClientRequest::Put {
-            state: second_val,
-            contract,
-            related_contracts: Default::default(),
-        })
+        .send(
+            ContractRequest::Put {
+                state: second_val,
+                contract,
+                related_contracts: Default::default(),
+            }
+            .into(),
+        )
         .await
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(300)).await;
