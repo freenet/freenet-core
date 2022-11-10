@@ -19,6 +19,7 @@ ENV PATH="/usr/lib/llvm-13/bin/:${PATH}"
 # Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add wasm32-unknown-unknown
 
 # Go to a non-root Work directory so npm install works.
 WORKDIR /src/locutus
@@ -37,4 +38,4 @@ COPY . .
 WORKDIR /src/locutus/crates/locutus-node
 RUN cargo install --path . 
  
-CMD ["locutus-node"]
+CMD ["locutus-node","-b","0.0.0.0"]
