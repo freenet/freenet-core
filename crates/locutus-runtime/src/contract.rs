@@ -1,6 +1,6 @@
 use locutus_stdlib::prelude::{
     ContractCode, ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta,
-    StateSummary, UpdateData, UpdateModification, ValidateResult, TryFromTsStd
+    StateSummary, TryFromTsStd, UpdateData, UpdateModification, ValidateResult,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
@@ -177,40 +177,38 @@ impl TryFromTsStd<&rmpv::Value> for WrappedContract {
             ),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding WrappedContract, input value is not a map"),
+                    cause: "Failed decoding WrappedContract, input value is not a map".to_string(),
                 })
             }
         };
 
         let key = match contract_map.get("key") {
-            Some(key_value) => ContractKey::try_decode(key_value.clone()).unwrap(),
+            Some(key_value) => ContractKey::try_decode(*key_value).unwrap(),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding WrappedContract, key not found"),
+                    cause: "Failed decoding WrappedContract, key not found".to_string(),
                 })
             }
         };
 
         let data = match contract_map.get("data") {
             Some(contract_data_value) => Arc::new(
-                ContractCode::try_decode(contract_data_value.clone())
+                ContractCode::try_decode(*contract_data_value)
                     .unwrap()
                     .into_owned(),
             ),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding WrappedContract, data not found"),
+                    cause: "Failed decoding WrappedContract, data not found".to_string(),
                 })
             }
         };
 
         let params = match contract_map.get("parameters") {
-            Some(params_value) => Parameters::try_decode(params_value.clone())
-                .unwrap()
-                .into_owned(),
+            Some(params_value) => Parameters::try_decode(*params_value).unwrap().into_owned(),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding WrappedContract, parameters not found"),
+                    cause: "Failed decoding WrappedContract, parameters not found".to_string(),
                 })
             }
         };

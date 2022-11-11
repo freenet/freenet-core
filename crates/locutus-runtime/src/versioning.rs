@@ -113,16 +113,17 @@ impl TryFromTsStd<&rmpv::Value> for ContractContainer {
             ),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding ContractContainer, input value is not a map"),
+                    cause: "Failed decoding ContractContainer, input value is not a map"
+                        .to_string(),
                 })
             }
         };
 
         let container_version = match container_map.get("version") {
-            Some(version_value) => version_value.clone().as_str().unwrap(),
+            Some(version_value) => (*version_value).as_str().unwrap(),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding ContractContainer, version not found"),
+                    cause: "Failed decoding ContractContainer, version not found".to_string(),
                 })
             }
         };

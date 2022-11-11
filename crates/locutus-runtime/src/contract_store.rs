@@ -16,7 +16,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
-use crate::{contract::WrappedContract, DynError, RuntimeInnerError, RuntimeResult, ContractContainer, WasmAPIVersion};
+use crate::{
+    contract::WrappedContract, ContractContainer, DynError, RuntimeInnerError, RuntimeResult,
+    WasmAPIVersion,
+};
 
 use super::ContractKey;
 
@@ -168,7 +171,7 @@ impl ContractStore {
         self.contract_cache
             .insert(*contract_hash, Arc::new(ContractCode::from(data)), size);
 
-        let version: Version = Version::from(contract.clone());
+        let version: Version = Version::from(contract);
         let mut serialized_version =
             serde_json::to_vec(&version).map_err(|e| RuntimeInnerError::Any(Box::new(e)))?;
 

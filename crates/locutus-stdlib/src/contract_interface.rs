@@ -1130,7 +1130,7 @@ impl TryFromTsStd<&rmpv::Value> for ContractKey {
             ),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding ContractKey, input value is not a map"),
+                    cause: "Failed decoding ContractKey, input value is not a map".to_string(),
                 })
             }
         };
@@ -1139,7 +1139,7 @@ impl TryFromTsStd<&rmpv::Value> for ContractKey {
             Some(instance_value) => bs58::encode(&instance_value.as_slice().unwrap()).into_string(),
             _ => {
                 return Err(WsApiError::MsgpackDecodeError {
-                    cause: format!("Failed decoding WrappedContract, instance not found"),
+                    cause: "Failed decoding WrappedContract, instance not found".to_string(),
                 })
             }
         };

@@ -10,7 +10,7 @@ use wasmer::{
 
 use crate::{
     component_store::ComponentStore, contract_store::ContractStore, secrets_store::SecretsStore,
-    RuntimeInnerError, RuntimeResult, ContractContainer, WasmAPIVersion
+    ContractContainer, RuntimeInnerError, RuntimeResult, WasmAPIVersion,
 };
 
 #[derive(thiserror::Error, Debug)]

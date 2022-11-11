@@ -38,9 +38,10 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         File::open(&config.state)?.read_to_end(&mut buf)?;
         buf.into()
     };
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(
-        WrappedContract::new(Arc::new(code), params))
-    );
+    let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+        Arc::new(code),
+        params,
+    )));
     let related_contracts = if let Some(_related) = config.related_contracts {
         todo!("use `related` contracts")
     } else {

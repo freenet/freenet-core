@@ -1,6 +1,7 @@
 use futures::future::BoxFuture;
 use locutus_runtime::{
-    ContractContainer, ComponentKey, InboundComponentMsg, OutboundComponentMsg, RelatedContracts, UpdateData,
+    ComponentKey, ContractContainer, InboundComponentMsg, OutboundComponentMsg, RelatedContracts,
+    UpdateData,
 };
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ use locutus_runtime::prelude::{TryFromTsStd, WsApiError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{WrappedState};
+use crate::WrappedState;
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -80,6 +81,7 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    #[allow(dead_code)]
     fn deserialization(cause: String) -> Self {
         Self::DeserializationError { cause }
     }
@@ -179,8 +181,8 @@ impl HostResponse<'_> {
 
     pub fn unwrap_get(self) -> (WrappedState, Option<ContractContainer>) {
         if let Self::ContractResponse(ContractResponse::GetResponse {
-                                          contract, state, ..
-                                      }) = self
+            contract, state, ..
+        }) = self
         {
             (state, contract)
         } else {
@@ -397,11 +399,13 @@ impl ClientRequest<'_> {
                         key: ContractKey::try_decode(*value_map.get("key").unwrap())
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
                         fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
-                    }.into(),
+                    }
+                    .into(),
                     ["key"] => ContractRequest::Subscribe {
                         key: ContractKey::try_decode(*value_map.get("key").unwrap())
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                    }.into(),
+                    }
+                    .into(),
                     _ => unreachable!(),
                 }
             } else {
@@ -763,7 +767,7 @@ pub(crate) mod test {
 
         let result_client_request: ContractRequest = match ClientRequest::decode_mp(&msg)? {
             ClientRequest::ContractOp(contract_request) => contract_request,
-            _ => panic!()
+            _ => panic!(),
         };
         assert_eq!(result_client_request, expected_client_request);
         Ok(())
@@ -786,7 +790,7 @@ pub(crate) mod test {
 
         let result_client_request: ContractRequest = match ClientRequest::decode_mp(&msg)? {
             ClientRequest::ContractOp(contract_request) => contract_request,
-            _ => panic!()
+            _ => panic!(),
         };
         assert_eq!(result_client_request, expected_client_request);
         Ok(())
@@ -815,7 +819,7 @@ pub(crate) mod test {
 
         let result_client_request: ContractRequest = match ClientRequest::decode_mp(&msg)? {
             ClientRequest::ContractOp(contract_request) => contract_request,
-            _ => panic!()
+            _ => panic!(),
         };
         assert_eq!(result_client_request, expected_client_request);
         Ok(())
