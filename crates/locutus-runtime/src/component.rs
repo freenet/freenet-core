@@ -17,15 +17,15 @@ pub enum ComponentExecError {
 }
 
 pub trait ComponentRuntimeInterface {
-    fn inbound_app_message(
+    fn inbound_app_message<'a>(
         &mut self,
         key: &ComponentKey,
-        inbound: Vec<InboundComponentMsg>,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg>>;
+        inbound: Vec<InboundComponentMsg<'a>>,
+    ) -> RuntimeResult<Vec<OutboundComponentMsg<'a>>>;
 
     fn register_component(&mut self, component: Component<'_>) -> RuntimeResult<()>;
 
-    fn deregister_component(&mut self, key: &ComponentKey) -> RuntimeResult<()>;
+    fn unregister_component(&mut self, key: &ComponentKey) -> RuntimeResult<()>;
 }
 
 impl Runtime {
@@ -34,7 +34,7 @@ impl Runtime {
         msg: &InboundComponentMsg,
         process_func: &NativeFunc<i64, i64>,
         instance: &Instance,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
+    ) -> RuntimeResult<Vec<OutboundComponentMsg<'static>>> {
         let msg = bincode::serialize(msg)?;
         let mut msg_buf = self.init_buf(instance, &msg)?;
         msg_buf.write(msg)?;
@@ -50,13 +50,13 @@ impl Runtime {
         Ok(outbound)
     }
 
-    fn get_outbound(
+    fn get_outbound<'a>(
         &mut self,
         component_key: &ComponentKey,
         instance: &Instance,
         process_func: &NativeFunc<i64, i64>,
-        outbound_msgs: Vec<OutboundComponentMsg>,
-        results: &mut Vec<OutboundComponentMsg>,
+        outbound_msgs: Vec<OutboundComponentMsg<'a>>,
+        results: &mut Vec<OutboundComponentMsg<'a>>,
     ) -> RuntimeResult<()> {
         let linear_mem = self.linear_mem(instance)?;
         for outbound in outbound_msgs {
@@ -113,11 +113,11 @@ impl Runtime {
 }
 
 impl ComponentRuntimeInterface for Runtime {
-    fn inbound_app_message(
+    fn inbound_app_message<'a>(
         &mut self,
         key: &ComponentKey,
-        inbound: Vec<InboundComponentMsg>,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
+        inbound: Vec<InboundComponentMsg<'a>>,
+    ) -> RuntimeResult<Vec<OutboundComponentMsg<'a>>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
             return Ok(results);
@@ -163,7 +163,7 @@ impl ComponentRuntimeInterface for Runtime {
     }
 
     #[inline]
-    fn deregister_component(&mut self, key: &ComponentKey) -> RuntimeResult<()> {
+    fn unregister_component(&mut self, key: &ComponentKey) -> RuntimeResult<()> {
         self.component_store.remove_component(key)
     }
 }

@@ -444,7 +444,7 @@ mod test {
 
     use super::*;
     use crate::{
-        client_events::ClientRequest,
+        client_events::ContractRequest,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         WrappedContract, WrappedState,
     };
@@ -461,9 +461,10 @@ mod test {
         let contract_val: WrappedState = gen.arbitrary()?;
         let contract_key: ContractKey = contract.key().clone();
 
-        let event = ClientRequest::Subscribe {
+        let event = ContractRequest::Subscribe {
             key: contract_key.clone(),
-        };
+        }
+        .into();
         let first_node = NodeSpecification {
             owned_contracts: Vec::new(),
             non_owned_contracts: vec![contract_key],
