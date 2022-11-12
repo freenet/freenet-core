@@ -470,8 +470,9 @@ pub(in crate::contract) mod sqlite {
                         }
                         _ => unreachable!(),
                     },
-                    ClientRequest::ComponentOp(_op) => todo!("FIXME: component op"),
+                    ClientRequest::ComponentOp(_op) => unreachable!(),
                     ClientRequest::Disconnect { .. } => unreachable!(),
+                    ClientRequest::GenerateRandData { bytes } => unreachable!(),
                 }
             }
             .boxed()

@@ -31,9 +31,11 @@ impl SecretsStore {
         component: ComponentKey,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
-    ) {
+    ) -> Result<(), SecretStoreError> {
+        // FIXME: store/initialize the cyphers from disc
         let encryption = Encryption { cipher, nonce };
         self.ciphers.insert(component, encryption);
+        Ok(())
     }
 
     pub fn store_secret(

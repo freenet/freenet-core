@@ -557,7 +557,7 @@ mod test {
         let _ = env_logger::try_init();
         let mut store = ContractStore::new(test_dir(), 10_000)?;
         let contract = ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name)));
-        let key = contract.key().clone();
+        let key = contract.key();
         store.store_contract(contract)?;
         Ok((store, key))
     }

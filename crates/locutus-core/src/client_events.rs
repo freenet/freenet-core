@@ -3,7 +3,7 @@ use locutus_runtime::{
     ComponentKey, ContractContainer, InboundComponentMsg, OutboundComponentMsg, RelatedContracts,
     UpdateData,
 };
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -136,7 +136,11 @@ pub trait ClientEventsProxy {
 
 /// A response to a previous [`ClientRequest`]
 #[derive(Serialize, Deserialize, Debug)]
-pub enum HostResponse<'a, T: Borrow<[u8]> = WrappedState> {
+pub enum HostResponse<'a, T = WrappedState, U = Vec<u8>>
+where
+    T: Borrow<[u8]>,
+    U: Borrow<[u8]>,
+{
     ContractResponse(
         #[serde(bound(deserialize = "ContractResponse<T>: Deserialize<'de>"))] ContractResponse<T>,
     ),
@@ -145,9 +149,12 @@ pub enum HostResponse<'a, T: Borrow<[u8]> = WrappedState> {
         #[serde(borrow)]
         values: Vec<OutboundComponentMsg<'a>>,
     },
+    GenerateRandData(U),
     /// A requested action which doesn't require an answer was performed successfully.
     Ok,
 }
+
+impl<T> HostResponse<'_, T> where T: Borrow<[u8]> {}
 
 impl HostResponse<'_> {
     pub fn into_owned(self) -> HostResponse<'static> {
@@ -160,6 +167,7 @@ impl HostResponse<'_> {
                     .map(OutboundComponentMsg::into_owned)
                     .collect(),
             },
+            HostResponse::GenerateRandData(val) => HostResponse::GenerateRandData(val),
             HostResponse::Ok => HostResponse::Ok,
         }
     }
@@ -203,32 +211,7 @@ impl std::fmt::Display for HostResponse<'_> {
             },
             HostResponse::ComponentResponse { .. } => write!(f, "component responses"),
             HostResponse::Ok => write!(f, "ok response"),
-        }
-    }
-}
-
-impl<'a> TryFrom<HostResponse<'a>> for HostResponse<'a, Cow<'a, [u8]>> {
-    type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
-    fn try_from(owned: HostResponse<'a>) -> Result<Self, Self::Error> {
-        match owned {
-            HostResponse::ContractResponse(res) => match res {
-                ContractResponse::PutResponse { key } => {
-                    Ok(ContractResponse::PutResponse { key }.into())
-                }
-                ContractResponse::UpdateResponse { key, summary } => {
-                    Ok(ContractResponse::UpdateResponse { key, summary }.into())
-                }
-                ContractResponse::GetResponse { .. } => {
-                    Err("self outlives borrowed content".into())
-                }
-                ContractResponse::UpdateNotification { key, update } => {
-                    Ok(ContractResponse::UpdateNotification { key, update }.into())
-                }
-            },
-            HostResponse::ComponentResponse { key, values } => {
-                Ok(HostResponse::ComponentResponse { key, values })
-            }
-            HostResponse::Ok => Ok(HostResponse::Ok),
+            HostResponse::GenerateRandData(_) => write!(f, "random bytes"),
         }
     }
 }
@@ -297,6 +280,7 @@ pub enum ContractError {
 pub enum ClientRequest<'a> {
     ComponentOp(#[serde(borrow)] ComponentRequest<'a>),
     ContractOp(#[serde(borrow)] ContractRequest<'a>),
+    GenerateRandData { bytes: usize },
     Disconnect { cause: Option<String> },
 }
 
@@ -336,6 +320,7 @@ impl ClientRequest<'_> {
                 let op = op.into_owned();
                 ClientRequest::ComponentOp(op)
             }
+            ClientRequest::GenerateRandData { bytes } => ClientRequest::GenerateRandData { bytes },
             ClientRequest::Disconnect { cause } => ClientRequest::Disconnect { cause },
         }
     }
@@ -457,7 +442,12 @@ pub enum ComponentRequest<'a> {
         key: ComponentKey,
         inbound: Vec<InboundComponentMsg<'a>>,
     },
-    RegisterComponent(#[serde(borrow)] locutus_runtime::Component<'a>),
+    RegisterComponent {
+        #[serde(borrow)]
+        component: locutus_runtime::Component<'a>,
+        cipher: [u8; 24],
+        nonce: [u8; 24],
+    },
     UnregisterComponent(ComponentKey),
 }
 
@@ -470,9 +460,17 @@ impl ComponentRequest<'_> {
                     inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
                 }
             }
-            ComponentRequest::RegisterComponent(cmp) => {
-                let cmp = cmp.into_owned();
-                ComponentRequest::RegisterComponent(cmp)
+            ComponentRequest::RegisterComponent {
+                component,
+                cipher,
+                nonce,
+            } => {
+                let component = component.into_owned();
+                ComponentRequest::RegisterComponent {
+                    component,
+                    cipher,
+                    nonce,
+                }
             }
             ComponentRequest::UnregisterComponent(key) => {
                 ComponentRequest::UnregisterComponent(key)
@@ -502,6 +500,7 @@ impl Display for ClientRequest<'_> {
             },
             ClientRequest::ComponentOp(_op) => write!(f, "component request"),
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
+            ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }
     }
 }
@@ -767,8 +766,7 @@ pub(crate) mod test {
             key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
                 .unwrap(),
             fetch_contract: false,
-        }
-        .into();
+        };
         let msg: Vec<u8> = vec![
             130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 255,
             17, 144, 159, 194, 187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151,

@@ -5,6 +5,7 @@ mod contract_store;
 mod runtime;
 mod secrets_store;
 mod state_store;
+pub mod util;
 mod versioning;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
