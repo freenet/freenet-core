@@ -766,8 +766,7 @@ pub(crate) mod test {
             key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
                 .unwrap(),
             fetch_contract: false,
-        }
-        .into();
+        };
         let msg: Vec<u8> = vec![
             130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 255,
             17, 144, 159, 194, 187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151,

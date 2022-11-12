@@ -278,7 +278,7 @@ mod test {
             [0, 1].as_ref().into(),
         );
         let container = ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone()));
-        store.store_contract(container.clone())?;
+        store.store_contract(container)?;
         let f = store.fetch_contract(contract.key(), &[0, 1].as_ref().into());
         assert!(f.is_some());
         Ok(())

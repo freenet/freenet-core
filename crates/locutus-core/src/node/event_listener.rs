@@ -246,8 +246,8 @@ mod test_utils {
                 let mut is_expected_peer = false;
                 for ev in events {
                     match ev {
-                        PutEvent::Request { key, .. } if key.clone() != *for_key => break,
-                        PutEvent::Request { key, .. } if key.clone() == *for_key => {
+                        PutEvent::Request { key, .. } if key != for_key => break,
+                        PutEvent::Request { key, .. } if key == for_key => {
                             is_expected_key = true;
                         }
                         PutEvent::PutSuccess { requester, value }
