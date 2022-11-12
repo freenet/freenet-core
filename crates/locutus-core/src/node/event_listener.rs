@@ -49,7 +49,7 @@ impl<'a> EventLog<'a> {
             Message::Put(PutMsg::RequestPut {
                 contract, target, ..
             }) => {
-                let key = contract.get_key();
+                let key = contract.key();
                 EventKind::Put(
                     PutEvent::Request {
                         performer: target.peer,

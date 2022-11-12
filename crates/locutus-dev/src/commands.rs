@@ -38,7 +38,7 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         File::open(&config.state)?.read_to_end(&mut buf)?;
         buf.into()
     };
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
         Arc::new(code),
         params,
     )));
@@ -48,7 +48,7 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         Default::default()
     };
 
-    println!("Putting contract {}", contract.get_key());
+    println!("Putting contract {}", contract.key());
     let request = ContractRequest::Put {
         contract,
         state,

@@ -35,25 +35,23 @@ impl ContractContainer {
     }
 
     /// Return the `ContractKey` from the specific contract version.
-    pub fn get_key(&self) -> ContractKey {
+    pub fn key(&self) -> ContractKey {
         match self {
-            Self::Wasm(WasmAPIVersion::V0_0_1(contract_v1)) => contract_v1.key().clone(),
+            Self::Wasm(WasmAPIVersion::V1(contract_v1)) => contract_v1.key().clone(),
         }
     }
 
     /// Return the `Parameters` from the specific contract version.
-    pub fn get_params(&self) -> Parameters<'static> {
+    pub fn params(&self) -> Parameters<'static> {
         match self {
-            Self::Wasm(WasmAPIVersion::V0_0_1(contract_v1)) => contract_v1.params().clone(),
+            Self::Wasm(WasmAPIVersion::V1(contract_v1)) => contract_v1.params().clone(),
         }
     }
 
     /// Return the contract code from the specific contract version as `Vec<u8>`.
-    pub fn get_data(&self) -> Vec<u8> {
+    pub fn data(&self) -> Vec<u8> {
         match self {
-            Self::Wasm(WasmAPIVersion::V0_0_1(contract_v1)) => {
-                contract_v1.clone().try_into().unwrap()
-            }
+            Self::Wasm(WasmAPIVersion::V1(contract_v1)) => contract_v1.clone().try_into().unwrap(),
         }
     }
 }
@@ -69,7 +67,7 @@ impl Display for ContractContainer {
 }
 
 impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
-    type Error = WsApiError;
+    type Error = std::io::Error;
 
     fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
         let (path, params) = data;
@@ -79,26 +77,26 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
         // Get contract version
         let version_size = contract_data
             .read_u32::<BigEndian>()
-            .map_err(|e| WsApiError::UnpackingContractContainerError(Box::new(e)))?;
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
         let mut version_data = vec![0; version_size as usize];
         contract_data
             .read_exact(&mut version_data)
-            .map_err(|e| WsApiError::UnpackingContractContainerError(Box::new(e)))?;
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
         let version: Version = serde_json::from_slice(version_data.as_slice())
-            .map_err(|e| WsApiError::UnpackingContractContainerError(Box::new(e)))?;
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
 
         // Get Contract code
         let mut code_data: Vec<u8> = vec![];
         contract_data
             .read_to_end(&mut code_data)
-            .map_err(|e| WsApiError::UnpackingContractContainerError(Box::new(e)))?;
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
         let contract_code = Arc::new(ContractCode::from(code_data));
 
         match version.to_string().as_str() {
-            "0.0.1" => Ok(ContractContainer::Wasm(WasmAPIVersion::V0_0_1(
+            "0.0.1" => Ok(ContractContainer::Wasm(WasmAPIVersion::V1(
                 WrappedContract::new(contract_code, params),
             ))),
-            _ => Err(WsApiError::UnsupportedContractVersion),
+            _ => Err(std::io::ErrorKind::InvalidData.into()),
         }
     }
 }
@@ -135,7 +133,7 @@ impl TryFromTsStd<&rmpv::Value> for ContractContainer {
                         cause: format!("{e}"),
                     }
                 })?;
-                Ok(ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract)))
+                Ok(ContractContainer::Wasm(WasmAPIVersion::V1(contract)))
             }
             _ => unreachable!(),
         }
@@ -145,13 +143,13 @@ impl TryFromTsStd<&rmpv::Value> for ContractContainer {
 /// Contains the different versions available for wasm contracts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WasmAPIVersion {
-    V0_0_1(WrappedContract),
+    V1(WrappedContract),
 }
 
 impl Display for WasmAPIVersion {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            WasmAPIVersion::V0_0_1(contract_v1) => {
+            WasmAPIVersion::V1(contract_v1) => {
                 write!(f, "version 0.0.1 of contract {}", contract_v1)
             }
         }
@@ -161,7 +159,7 @@ impl Display for WasmAPIVersion {
 impl From<ContractContainer> for Version {
     fn from(contract: ContractContainer) -> Version {
         match contract {
-            ContractContainer::Wasm(WasmAPIVersion::V0_0_1(_)) => Version::new(0, 0, 1),
+            ContractContainer::Wasm(WasmAPIVersion::V1(_)) => Version::new(0, 0, 1),
         }
     }
 }

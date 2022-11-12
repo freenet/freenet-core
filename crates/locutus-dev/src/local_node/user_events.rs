@@ -70,9 +70,10 @@ impl StdInput {
             .transpose()?
             .unwrap_or_default();
 
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::try_from(
-            (&*config.contract, params.into()),
-        )?));
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::try_from((
+            &*config.contract,
+            params.into(),
+        ))?));
         Ok(StdInput {
             input: File::open(&config.input_file)?,
             config,
@@ -210,7 +211,7 @@ struct CommandInfo {
 
 impl From<CommandInfo> for OpenRequest<'static> {
     fn from(cmd: CommandInfo) -> Self {
-        let key = cmd.contract.get_key();
+        let key = cmd.contract.key();
         let req = match cmd.cmd {
             Command::Get => ContractRequest::Get {
                 key,

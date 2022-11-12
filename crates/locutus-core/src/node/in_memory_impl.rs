@@ -97,7 +97,7 @@ where
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError<CErr>> {
         for (contract, state) in contracts {
-            let key = contract.get_key();
+            let key = contract.key();
             self.op_storage
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                 .await?;

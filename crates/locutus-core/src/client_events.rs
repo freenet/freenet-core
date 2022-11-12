@@ -80,13 +80,6 @@ pub enum ErrorKind {
     UnknownClient(ClientId),
 }
 
-impl ErrorKind {
-    #[allow(dead_code)]
-    fn deserialization(cause: String) -> Self {
-        Self::DeserializationError { cause }
-    }
-}
-
 impl warp::reject::Reject for ErrorKind {}
 
 impl Display for ClientError {
@@ -350,73 +343,6 @@ impl ClientRequest<'_> {
     pub fn is_disconnect(&self) -> bool {
         matches!(self, Self::Disconnect { .. })
     }
-
-    /// Deserializes a `ClientRequest` from a MessagePack encoded request.  
-    pub fn decode_mp(msg: &[u8]) -> Result<Self, WsApiError> {
-        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
-            WsApiError::MsgpackDecodeError {
-                cause: format!("{e}"),
-            }
-        })?;
-
-        let req: ClientRequest = {
-            if value.is_map() {
-                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-                    value
-                        .as_map()
-                        .unwrap()
-                        .iter()
-                        .map(|(key, val)| (key.as_str().unwrap(), val)),
-                );
-
-                let mut map_keys = Vec::from_iter(value_map.keys().copied());
-                map_keys.sort();
-                match map_keys.as_slice() {
-                    ["container", "relatedContracts", "state"] => {
-                        let contract = value_map.get("container").unwrap();
-                        ContractRequest::Put {
-                            contract: ContractContainer::try_decode(*contract)
-                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            state: WrappedState::try_decode(*value_map.get("state").unwrap())
-                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            related_contracts: RelatedContracts::try_decode(
-                                *value_map.get("relatedContracts").unwrap(),
-                            )
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
-                            .into_owned(),
-                        }
-                        .into()
-                    }
-                    ["data", "key"] => ContractRequest::Update {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        data: UpdateData::try_decode(*value_map.get("data").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
-                            .into_owned(),
-                    }
-                    .into(),
-                    ["fetchContract", "key"] => ContractRequest::Get {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
-                    }
-                    .into(),
-                    ["key"] => ContractRequest::Subscribe {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                    }
-                    .into(),
-                    _ => unreachable!(),
-                }
-            } else {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "value is not a map".into(),
-                });
-            }
-        };
-
-        Ok(req)
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -451,6 +377,71 @@ pub enum ContractRequest<'a> {
 impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
     fn from(op: ContractRequest<'a>) -> Self {
         ClientRequest::ContractOp(op)
+    }
+}
+
+/// Deserializes a `ContractRequest` from a MessagePack encoded request.
+impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
+    fn try_decode(msg: &[u8]) -> Result<Self, WsApiError> {
+        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
+            WsApiError::MsgpackDecodeError {
+                cause: format!("{e}"),
+            }
+        })?;
+
+        let req: ContractRequest = {
+            if value.is_map() {
+                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
+                    value
+                        .as_map()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, val)| (key.as_str().unwrap(), val)),
+                );
+
+                let mut map_keys = Vec::from_iter(value_map.keys().copied());
+                map_keys.sort();
+                match map_keys.as_slice() {
+                    ["container", "relatedContracts", "state"] => {
+                        let contract = value_map.get("container").unwrap();
+                        ContractRequest::Put {
+                            contract: ContractContainer::try_decode(*contract)
+                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                            state: WrappedState::try_decode(*value_map.get("state").unwrap())
+                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                            related_contracts: RelatedContracts::try_decode(
+                                *value_map.get("relatedContracts").unwrap(),
+                            )
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
+                            .into_owned(),
+                        }
+                    }
+                    ["data", "key"] => ContractRequest::Update {
+                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                        data: UpdateData::try_decode(*value_map.get("data").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
+                            .into_owned(),
+                    },
+                    ["fetchContract", "key"] => ContractRequest::Get {
+                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
+                    },
+                    ["key"] => ContractRequest::Subscribe {
+                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                    },
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "value is not a map".into(),
+                });
+            }
+        };
+
+        Ok(req)
     }
 }
 
@@ -616,7 +607,7 @@ pub(crate) mod test {
                         };
                         let key = if get_owned {
                             let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                            self.owned_contracts[contract_no].0.clone().get_key()
+                            self.owned_contracts[contract_no].0.clone().key()
                         } else {
                             // let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
                             // self.non_owned_contracts[contract_no]
@@ -765,10 +756,7 @@ pub(crate) mod test {
             164, 100, 97, 116, 97, 129, 165, 100, 101, 108, 116, 97, 196, 3, 0, 1, 2,
         ];
 
-        let result_client_request: ContractRequest = match ClientRequest::decode_mp(&msg)? {
-            ClientRequest::ContractOp(contract_request) => contract_request,
-            _ => panic!(),
-        };
+        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
         assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }
@@ -788,10 +776,7 @@ pub(crate) mod test {
             173, 102, 101, 116, 99, 104, 67, 111, 110, 116, 114, 97, 99, 116, 194,
         ];
 
-        let result_client_request: ContractRequest = match ClientRequest::decode_mp(&msg)? {
-            ClientRequest::ContractOp(contract_request) => contract_request,
-            _ => panic!(),
-        };
+        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
         assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }
@@ -799,7 +784,7 @@ pub(crate) mod test {
     #[test]
     fn test_handle_put_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request: ContractRequest = ContractRequest::Put {
-            contract: ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+            contract: ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
                 Arc::new(ContractCode::from(vec![1])),
                 Parameters::from(vec![2]),
             ))),
@@ -817,10 +802,7 @@ pub(crate) mod test {
             97, 116, 101, 100, 67, 111, 110, 116, 114, 97, 99, 116, 115, 128,
         ];
 
-        let result_client_request: ContractRequest = match ClientRequest::decode_mp(&msg)? {
-            ClientRequest::ContractOp(contract_request) => contract_request,
-            _ => panic!(),
-        };
+        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
         assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }

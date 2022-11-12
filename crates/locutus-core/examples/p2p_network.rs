@@ -41,11 +41,11 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
         Arc::new(ContractCode::from(vec![7, 3, 9, 5])),
         Parameters::from(vec![]),
     )));
-    let key = contract.get_key().clone();
+    let key = contract.key().clone();
     let init_val = WrappedState::new(vec![1, 2, 3, 4]);
 
     tokio::time::sleep(Duration::from_secs(10)).await;

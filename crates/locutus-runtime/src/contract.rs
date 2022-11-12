@@ -556,8 +556,8 @@ mod test {
     fn set_up_test_contract(name: &str) -> RuntimeResult<(ContractStore, ContractKey)> {
         let _ = env_logger::try_init();
         let mut store = ContractStore::new(test_dir(), 10_000)?;
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(get_test_contract(name)));
-        let key = contract.get_key().clone();
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name)));
+        let key = contract.key().clone();
         store.store_contract(contract)?;
         Ok((store, key))
     }

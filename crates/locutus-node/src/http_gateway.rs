@@ -1,5 +1,6 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
+use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
 use std::{
@@ -218,8 +219,8 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
     let req: ClientRequest = {
-        match ClientRequest::decode_mp(&msg) {
-            Ok(r) => r,
+        match ContractRequest::try_decode(&msg) {
+            Ok(r) => r.into(),
             Err(e) => {
                 let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
                     ErrorKind::DeserializationError {
