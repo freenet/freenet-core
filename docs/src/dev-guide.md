@@ -298,23 +298,7 @@ function getUpdateNotification(notification: UpdateNotification) {
 
 Now that we have the front end and the back end of our web app, we can package the contracts and run them in the node to test them out.
 
-In order to do that, we can again use the development tool to help us out with the process, in each contract directory we run the following commands:
-
-```bash
-$ ldt build
-```
-
-This command will read your contract manifest file (`locutus.toml`) and take care of building the contract and packaging it, ready for the node and the network to consume it.
-
-<!--
-TODO: Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the use-case doesn't fit with the current tooling, so they know the necessary steeps to interact with the node at a lower level.
--->
-
-Under the `./build/locutus` directory, you will see both a `*.wasm` file, which is the contract file, and `contract-state`, in case it applies, which is the initial state that will be uploaded when initially putting the contract.
-
-Web applications can access the code of backend contracts directly in their applications and put new contracts (that is, assigning a new location for the code, plus any parameters that may be generated dynamically by the web app, and the initial state for that combination of contract code + parameters) dynamically.
-
-Let's take a look at the manifest for our web app container contract:
+In order to do that, we can again use the development tool to help us out with the process. But before doing that, let's take a look at the manifesto format and understand the different parameters that allow us to specify how this contract should be compiled (check the [manifest](./manifest.md) details for more information). In the web app directory, we have a `locutus.toml` file which contains something similar to:
 
 ```toml
 [contract]
@@ -341,6 +325,68 @@ The WASM code from the `backend` contract will be embedded in our web applicatio
 <!--
 TODO: Publishing to the real functioning Locutus network is not yet supported.
 -->
+
+Currently, wep applications follow a standarized build procedure in case you use `ldt` and assumptions about your system. For example, in the case of a `type = "webapp"` contract, if nothing is specified, it will assume you have `npm` and the `tsc` compiler available at the directory level, as well as `webpack` installed.
+
+This means that you have installed either globally or at the directory level, e.g. globally:
+
+```
+$ npm install -g typescript
+$ npm install -g webpack
+$ npm install -g webpack-cli
+```
+
+or locally (make sure your `package.json` file has the required dependencies):
+
+```
+$ npm install typescript --save-dev
+$ npm install webpack --save-dev
+$ npm install webpack-cli --save-dev
+```
+
+If, however, you prefer to follow a different workflow, you can write your own by enabling/disabling certain parameters or using a blank template. For example:
+
+```
+[contract]
+lang = "rust"
+
+[state]
+files = ["my_packaged_web.tar.xz"]
+```
+
+Would just delegate the work of building the packaged `tar` to the developer. Or:
+
+```
+[contract]
+type = "webapp"
+lang = "rust"
+
+[webapp]
+lang = "typescript"
+
+[webapp.typescript]
+webpack =  false
+```
+
+would disable usign `webpack` at all.
+
+Now that we understand the details, and after making any necessary changes, in each contract directory we run the following commands:
+
+```bash
+$ ldt build
+```
+
+This command will read your contract manifest file (`locutus.toml`) and take care of building the contract and packaging it, ready for the node and the network to consume it.
+
+<!--
+TODO: Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the use-case doesn't fit with the current tooling, so they know the necessary steeps to interact with the node at a lower level.
+-->
+
+Under the `./build/locutus` directory, you will see both a `*.wasm` file, which is the contract file, and `contract-state`, in case it applies, which is the initial state that will be uploaded when initially putting the contract.
+
+Web applications can access the code of backend contracts directly in their applications and put new contracts (that is, assigning a new location for the code, plus any parameters that may be generated dynamically by the web app, and the initial state for that combination of contract code + parameters) dynamically.
+
+Let's take a look at the manifest for our web app container contract:
 
 ## Testing out contracts in the local node
 
