@@ -210,11 +210,7 @@ struct CommandInfo {
 
 impl From<CommandInfo> for OpenRequest<'static> {
     fn from(cmd: CommandInfo) -> Self {
-        let key = match cmd.contract.clone() {
-            ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract_v1)) => {
-                contract_v1.key().clone()
-            }
-        };
+        let key = cmd.contract.get_key();
         let req = match cmd.cmd {
             Command::Get => ContractRequest::Get {
                 key,

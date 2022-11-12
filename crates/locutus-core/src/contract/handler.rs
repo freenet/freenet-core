@@ -672,12 +672,12 @@ pub mod test {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
         let h = GlobalExecutor::spawn(async move {
-            let container = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+            let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
                 Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
                 Parameters::from(vec![]),
             )));
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(container))
+                .send_to_handler(ContractHandlerEvent::Cache(contract))
                 .await
         });
 
