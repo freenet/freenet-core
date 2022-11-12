@@ -8,13 +8,18 @@ use std::{
     time::Duration,
 };
 
+use byteorder::{BigEndian, WriteBytesExt};
 use dashmap::DashMap;
 use locutus_stdlib::prelude::{ContractCode, Parameters};
 use notify::Watcher;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
-use crate::{contract::WrappedContract, DynError, RuntimeInnerError, RuntimeResult};
+use crate::{
+    contract::WrappedContract, ContractContainer, DynError, RuntimeInnerError, RuntimeResult,
+    WasmAPIVersion,
+};
 
 use super::ContractKey;
 
@@ -83,15 +88,14 @@ impl ContractStore {
         &self,
         key: &ContractKey,
         params: &Parameters<'a>,
-    ) -> Option<WrappedContract> {
+    ) -> Option<ContractContainer> {
         let result = key
             .code_hash()
             .and_then(|code_hash| {
                 self.contract_cache.get(code_hash).map(|data| {
-                    Some(WrappedContract::new(
-                        data.value().clone(),
-                        params.clone().into_owned(),
-                    ))
+                    Some(ContractContainer::Wasm(WasmAPIVersion::V1(
+                        WrappedContract::new(data.value().clone(), params.clone().into_owned()),
+                    )))
                 })
             })
             .flatten();
@@ -106,27 +110,32 @@ impl ContractStore {
                 .into_string()
                 .to_lowercase();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
-            let WrappedContract { data, params, .. } =
-                WrappedContract::try_from((&*key_path, params.clone().into_owned()))
-                    .map_err(|err| {
-                        tracing::debug!("contract not found: {err}");
-                        err
-                    })
-                    .ok()?;
+            let ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract {
+                data, params, ..
+            })) = ContractContainer::try_from((&*key_path, params.clone().into_owned()))
+                .map_err(|err| {
+                    tracing::debug!("contract not found: {err}");
+                    err
+                })
+                .ok()?;
             // add back the contract part to the mem store
             let size = data.data().len() as i64;
             self.contract_cache.insert(*code_hash, data.clone(), size);
-            Some(WrappedContract::new(data, params))
+            Some(ContractContainer::Wasm(WasmAPIVersion::V1(
+                WrappedContract::new(data, params),
+            )))
         })
     }
 
     /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
-    pub fn store_contract(&mut self, contract: WrappedContract) -> RuntimeResult<()> {
-        let contract_hash = contract.key().code_hash().ok_or_else(|| {
-            tracing::warn!(
-                "trying to store partially unspecified contract `{}`",
-                contract.key()
-            );
+    pub fn store_contract(&mut self, contract: ContractContainer) -> RuntimeResult<()> {
+        let (key, code) = match contract.clone() {
+            ContractContainer::Wasm(WasmAPIVersion::V1(contract_v1)) => {
+                (contract_v1.key().clone(), contract_v1.code().clone())
+            }
+        };
+        let contract_hash = key.code_hash().ok_or_else(|| {
+            tracing::warn!("trying to store partially unspecified contract `{}`", key);
             RuntimeInnerError::UnwrapContract
         })?;
         if self.contract_cache.get(contract_hash).is_some() {
@@ -134,8 +143,7 @@ impl ContractStore {
         }
 
         Self::acquire_contract_ls_lock()?;
-        self.key_to_code_part
-            .insert(contract.key().clone(), *contract_hash);
+        self.key_to_code_part.insert(key.clone(), *contract_hash);
         let map = KeyToCodeMap::from(&*self.key_to_code_part);
         let serialized = bincode::serialize(&map).map_err(|e| RuntimeInnerError::Any(e))?;
         // FIXME: make this more reliable, append to the file instead of truncating it
@@ -156,13 +164,24 @@ impl ContractStore {
         }
 
         // insert in the memory cache
-        let size = contract.code().data().len() as i64;
-        let data = contract.code().data().to_vec();
+        let size = code.data().len() as i64;
+        let data = code.data().to_vec();
         self.contract_cache
             .insert(*contract_hash, Arc::new(ContractCode::from(data)), size);
 
+        let version: Version = Version::from(contract);
+        let mut serialized_version =
+            serde_json::to_vec(&version).map_err(|e| RuntimeInnerError::Any(Box::new(e)))?;
+
+        let mut output: Vec<u8> = Vec::with_capacity(
+            std::mem::size_of::<u32>() + serialized_version.len() + code.data().len(),
+        );
+        output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
+        output.append(&mut serialized_version);
+        output.append(&mut code.data().to_vec());
+
         let mut file = File::create(key_path)?;
-        file.write_all(contract.code().data())?;
+        file.write_all(output.as_slice())?;
 
         Ok(())
     }
@@ -258,7 +277,8 @@ mod test {
             Arc::new(ContractCode::from(vec![0, 1, 2])),
             [0, 1].as_ref().into(),
         );
-        store.store_contract(contract.clone())?;
+        let container = ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone()));
+        store.store_contract(container.clone())?;
         let f = store.fetch_contract(contract.key(), &[0, 1].as_ref().into());
         assert!(f.is_some());
         Ok(())

@@ -48,13 +48,16 @@ impl<'a> EventLog<'a> {
             }
             Message::Put(PutMsg::RequestPut {
                 contract, target, ..
-            }) => EventKind::Put(
-                PutEvent::Request {
-                    performer: target.peer,
-                    key: contract.key().clone(),
-                },
-                *msg.id(),
-            ),
+            }) => {
+                let key = contract.key();
+                EventKind::Put(
+                    PutEvent::Request {
+                        performer: target.peer,
+                        key,
+                    },
+                    *msg.id(),
+                )
+            }
             Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => EventKind::Put(
                 PutEvent::PutSuccess {
                     requester: op_storage.ring.peer_key,
@@ -243,8 +246,8 @@ mod test_utils {
                 let mut is_expected_peer = false;
                 for ev in events {
                     match ev {
-                        PutEvent::Request { key, .. } if key != for_key => break,
-                        PutEvent::Request { key, .. } if key == for_key => {
+                        PutEvent::Request { key, .. } if key.clone() != *for_key => break,
+                        PutEvent::Request { key, .. } if key.clone() == *for_key => {
                             is_expected_key = true;
                         }
                         PutEvent::PutSuccess { requester, value }
@@ -281,10 +284,10 @@ mod test_utils {
                 let mut was_received = false;
                 for ev in events {
                     match ev {
-                        PutEvent::BroadcastEmitted { key, .. } if key == for_key => {
+                        PutEvent::BroadcastEmitted { key, .. } if key.clone() == *for_key => {
                             was_emitted = true;
                         }
-                        PutEvent::BroadcastReceived { key, .. } if key == for_key => {
+                        PutEvent::BroadcastReceived { key, .. } if key.clone() == *for_key => {
                             was_received = true;
                         }
                         _ => {}

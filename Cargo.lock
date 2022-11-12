@@ -2268,6 +2268,7 @@ dependencies = [
  "bincode",
  "blake2 0.10.4",
  "bs58",
+ "byteorder",
  "chacha20poly1305 0.10.1",
  "dashmap",
  "either",
@@ -2278,12 +2279,15 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rmpv",
+ "semver 1.0.14",
  "serde",
  "serde_bytes",
+ "serde_json",
  "stretto",
  "thiserror",
  "tokio",
  "tracing",
+ "varuint",
  "walkdir",
  "wasmer",
  "wasmer-compiler-llvm",
@@ -3701,6 +3705,9 @@ name = "semver"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e25dfac463d778e353db5be2449d1cce89bd6fd23c9f1ea21310ce6e5a1b29c4"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "semver-parser"
@@ -4774,6 +4781,12 @@ name = "valuable"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
+
+[[package]]
+name = "varuint"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "896414bb0f21aba00ff26b0a8a3679331b5a86886f217c9d9396b919a7bf4ac6"
 
 [[package]]
 name = "vcpkg"

@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use locutus_runtime::{ContractStore, Parameters, StateStorage, StateStore};
+use locutus_runtime::{ContractContainer, ContractStore, Parameters, StateStorage, StateStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
-use crate::{ClientRequest, HostResponse, WrappedContract, WrappedState};
+use crate::{ClientRequest, HostResponse, WrappedState};
 pub(crate) use sqlite::SqlDbError;
 
 const MAX_MEM_CACHE: i64 = 10_000_000;
@@ -149,7 +149,7 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
     pub state: Option<WrappedState>,
-    pub contract: Option<WrappedContract>,
+    pub contract: Option<ContractContainer>,
 }
 
 struct InternalCHEvent<CErr> {
@@ -179,7 +179,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
         response: Result<StoreResponse, Err>,
     },
     /// Store a contract in the local store.
-    Cache(WrappedContract),
+    Cache(ContractContainer),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError<Err>>),
 }
@@ -372,7 +372,7 @@ pub(in crate::contract) mod sqlite {
             &self,
             key: &ContractKey,
             fetch_contract: bool,
-        ) -> Result<(WrappedState, Option<WrappedContract>), SqlDbError> {
+        ) -> Result<(WrappedState, Option<ContractContainer>), SqlDbError> {
             let state = self.state_store.get(key).await?;
             let contract = fetch_contract
                 .then(|| {
@@ -441,10 +441,12 @@ pub(in crate::contract) mod sqlite {
                             state,
                             related_contracts,
                         } => {
-                            match self.get_contract(contract.key(), false).await {
+                            let key = contract.key();
+                            let params = contract.params();
+                            match self.get_contract(&key, false).await {
                                 Ok((_old_state, _)) => {
                                     return Err(ContractError::from(ContractExecError::DoublePut(
-                                        contract.key().clone(),
+                                        key,
                                     ))
                                     .into())
                                 }
@@ -453,8 +455,8 @@ pub(in crate::contract) mod sqlite {
                             }
 
                             let result = self.runtime.validate_state(
-                                contract.key(),
-                                contract.params(),
+                                &key,
+                                &params,
                                 &state,
                                 related_contracts,
                             )?;
@@ -462,11 +464,8 @@ pub(in crate::contract) mod sqlite {
                             if result != ValidateResult::Valid {
                                 todo!("return error");
                             }
-                            let _params: Parameters<'static> =
-                                contract.params().clone().into_bytes().into();
-                            self.state_store
-                                .store(contract.key().clone(), state, None)
-                                .await?;
+                            let _params: Parameters<'static> = params.clone().into_bytes().into();
+                            self.state_store.store(key, state, None).await?;
                             todo!()
                         }
                         _ => unreachable!(),
@@ -487,7 +486,8 @@ pub(in crate::contract) mod sqlite {
     mod test {
         use std::sync::Arc;
 
-        use locutus_runtime::StateDelta;
+        use crate::WrappedContract;
+        use locutus_runtime::{StateDelta, WasmAPIVersion};
         use locutus_stdlib::prelude::ContractCode;
 
         use crate::client_events::ContractRequest;
@@ -512,10 +512,11 @@ pub(in crate::contract) mod sqlite {
 
             // Generate a contract
             let contract_bytes = b"Test contract value".to_vec();
-            let contract: WrappedContract = WrappedContract::new(
-                Arc::new(ContractCode::from(contract_bytes.clone())),
-                Parameters::from(vec![]),
-            );
+            let contract: ContractContainer =
+                ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+                    Arc::new(ContractCode::from(contract_bytes.clone())),
+                    Parameters::from(vec![]),
+                )));
 
             // Get contract parts
             let state = WrappedState::new(contract_bytes.clone());
@@ -570,7 +571,7 @@ pub(in crate::contract) mod sqlite {
 pub mod test {
     use std::sync::Arc;
 
-    use locutus_runtime::ContractStore;
+    use locutus_runtime::{ContractStore, WasmAPIVersion};
     use locutus_stdlib::prelude::ContractCode;
 
     use super::*;
@@ -580,6 +581,7 @@ pub mod test {
             test::{MemKVStore, SimStoreError},
             MockRuntime,
         },
+        WrappedContract,
     };
 
     #[derive(Debug, thiserror::Error)]
@@ -670,11 +672,12 @@ pub mod test {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
         let h = GlobalExecutor::spawn(async move {
+            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
+                Parameters::from(vec![]),
+            )));
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(
-                    Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
-                    Parameters::from(vec![]),
-                )))
+                .send_to_handler(ContractHandlerEvent::Cache(contract))
                 .await
         });
 
@@ -683,17 +686,15 @@ pub mod test {
                 .await??;
 
         if let ContractHandlerEvent::Cache(contract) = ev {
-            let data: Vec<u8> = contract.try_into()?;
+            let data: Vec<u8> = contract.data();
             assert_eq!(data, vec![0, 1, 2, 3]);
+            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(data)),
+                Parameters::from(vec![]),
+            )));
             tokio::time::timeout(
                 Duration::from_millis(100),
-                rcv_halve.send_to_listener(
-                    id,
-                    ContractHandlerEvent::Cache(WrappedContract::new(
-                        Arc::new(ContractCode::from(data)),
-                        Parameters::from(vec![]),
-                    )),
-                ),
+                rcv_halve.send_to_listener(id, ContractHandlerEvent::Cache(contract)),
             )
             .await??;
         } else {
@@ -701,7 +702,7 @@ pub mod test {
         }
 
         if let ContractHandlerEvent::Cache(contract) = h.await?? {
-            let data: Vec<u8> = contract.try_into()?;
+            let data: Vec<u8> = contract.data();
             assert_eq!(data, vec![0, 1, 2, 3]);
         } else {
             anyhow::bail!("invalid event!");
