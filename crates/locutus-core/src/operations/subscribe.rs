@@ -474,7 +474,7 @@ mod test {
 
         let second_node = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract)),
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
                 contract_val,
             )],
             non_owned_contracts: Vec::new(),

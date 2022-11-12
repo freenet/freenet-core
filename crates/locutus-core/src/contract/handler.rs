@@ -441,8 +441,8 @@ pub(in crate::contract) mod sqlite {
                             state,
                             related_contracts,
                         } => {
-                            let key = contract.get_key();
-                            let params = contract.get_params();
+                            let key = contract.key();
+                            let params = contract.params();
                             match self.get_contract(&key, false).await {
                                 Ok((_old_state, _)) => {
                                     return Err(ContractError::from(ContractExecError::DoublePut(
@@ -514,7 +514,7 @@ pub(in crate::contract) mod sqlite {
             // Generate a contract
             let contract_bytes = b"Test contract value".to_vec();
             let contract: ContractContainer =
-                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+                ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
                     Arc::new(ContractCode::from(contract_bytes.clone())),
                     Parameters::from(vec![]),
                 )));
@@ -535,7 +535,7 @@ pub(in crate::contract) mod sqlite {
             let (get_result_value, _) = handler
                 .handle_request(
                     ContractRequest::Get {
-                        key: contract.get_key().clone(),
+                        key: contract.key().clone(),
                         fetch_contract: false,
                     }
                     .into(),
@@ -549,7 +549,7 @@ pub(in crate::contract) mod sqlite {
             handler
                 .handle_request(
                     ContractRequest::Update {
-                        key: contract.get_key().clone(),
+                        key: contract.key().clone(),
                         data: delta.into(),
                     }
                     .into(),
@@ -673,7 +673,7 @@ pub mod test {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
         let h = GlobalExecutor::spawn(async move {
-            let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
                 Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
                 Parameters::from(vec![]),
             )));
@@ -687,9 +687,9 @@ pub mod test {
                 .await??;
 
         if let ContractHandlerEvent::Cache(contract) = ev {
-            let data: Vec<u8> = contract.get_data();
+            let data: Vec<u8> = contract.data();
             assert_eq!(data, vec![0, 1, 2, 3]);
-            let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
                 Arc::new(ContractCode::from(data)),
                 Parameters::from(vec![]),
             )));
@@ -703,7 +703,7 @@ pub mod test {
         }
 
         if let ContractHandlerEvent::Cache(contract) = h.await?? {
-            let data: Vec<u8> = contract.get_data();
+            let data: Vec<u8> = contract.data();
             assert_eq!(data, vec![0, 1, 2, 3]);
         } else {
             anyhow::bail!("invalid event!");

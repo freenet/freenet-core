@@ -56,7 +56,7 @@ pub(crate) async fn contract_home(
             ..
         }) => match contract {
             Some(contract) => {
-                let key = contract.get_key();
+                let key = contract.key();
                 let path = contract_web_path(&key);
                 let web_body = match get_web_body(&path).await {
                     Ok(b) => b,
@@ -70,7 +70,7 @@ pub(crate) async fn contract_home(
                                     err: WebContractError,
                                     contract: &ContractContainer,
                                 ) -> InvalidParam {
-                                    let key = contract.get_key();
+                                    let key = contract.key();
                                     log::error!("{err}");
                                     InvalidParam(format!("failed unpacking contract: {}", key))
                                 }

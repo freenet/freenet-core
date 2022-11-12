@@ -36,7 +36,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
             public_key: Vec<u8>,
         }
         let params = serde_json::to_vec(&Verification { public_key: vec![] }).unwrap();
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
             Arc::new(ContractCode::from(bytes)),
             params.into(),
         )));
@@ -53,7 +53,7 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V0_0_1(WrappedContract::new(
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
             Arc::new(ContractCode::from(bytes)),
             [].as_ref().into(),
         )));
@@ -86,11 +86,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bundle = test_web(keypair.public())?;
     log::info!(
         "loading web contract {} in local node",
-        bundle.web_contract.get_key().encoded_contract_id()
+        bundle.web_contract.key().encoded_contract_id()
     );
     log::info!(
         "loading posts contract {} in local node",
-        bundle.posts_contract.get_key().encoded_contract_id()
+        bundle.posts_contract.key().encoded_contract_id()
     );
 
     let contract_dir = Config::get_conf().config_paths.local_contracts_dir();

@@ -1,5 +1,3 @@
-extern crate core;
-
 pub(crate) mod client_events;
 mod config;
 mod contract;
@@ -10,8 +8,7 @@ mod operations;
 mod ring;
 pub mod util;
 
-#[allow(dead_code)]
-pub(crate) type WrappedContract = locutus_runtime::prelude::WrappedContract;
+pub type WrappedContract = locutus_runtime::prelude::WrappedContract;
 pub type WrappedState = locutus_runtime::prelude::WrappedState;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;

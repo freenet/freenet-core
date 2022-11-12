@@ -324,7 +324,7 @@ where
                                     contract.clone(),
                                 ))
                                 .await?;
-                            let key = contract.get_key();
+                            let key = contract.key();
                             log::debug!("Contract `{}` successfully put", key);
                         } else {
                             // no contract, consider this like an error ignoring the incoming update value
@@ -693,7 +693,7 @@ mod test {
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract)),
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
                 contract_val,
             )],
             non_owned_contracts: vec![],
@@ -785,7 +785,7 @@ mod test {
 
         let node_1 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract)),
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
                 contract_val,
             )],
             non_owned_contracts: vec![key.clone()],

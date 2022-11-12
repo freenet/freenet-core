@@ -147,8 +147,8 @@ impl Executor {
                 //          1. through the arbitraur mechanism
                 //          2. a new func which compared two summaries and gives the most fresh
                 //        you can request to several nodes and determine which node has a fresher ver
-                let key = contract.get_key();
-                let params = contract.get_params();
+                let key = contract.key();
+                let params = contract.params();
                 self.runtime
                     .contract_store
                     .store_contract(contract.clone())

@@ -90,7 +90,7 @@ where
                 } => {
                     let sender = op_storage.ring.own_location();
 
-                    let key = contract.get_key();
+                    let key = contract.key();
                     log::debug!(
                         "Performing a RequestPut for contract {} from {} to {}",
                         key,
@@ -120,7 +120,7 @@ where
                     target,
                     mut skip_list,
                 } => {
-                    let key = contract.get_key();
+                    let key = contract.key();
                     let is_cached_contract = op_storage.ring.is_contract_cached(&key);
 
                     log::debug!(
@@ -336,7 +336,7 @@ where
                     htl,
                     mut skip_list,
                 } => {
-                    let key = contract.get_key();
+                    let key = contract.key();
                     let peer_loc = op_storage.ring.own_location();
 
                     log::debug!(
@@ -486,7 +486,7 @@ pub(crate) fn start_op(
     htl: usize,
     peer: &PeerKey,
 ) -> PutOp {
-    let key = contract.get_key();
+    let key = contract.key();
     log::debug!(
         "Requesting put to contract {} @ loc({})",
         key,
@@ -532,7 +532,7 @@ where
     CErr: std::error::Error,
 {
     let key = if let Some(PutState::PrepareRequest { contract, .. }) = put_op.state.clone() {
-        contract.get_key()
+        contract.key()
     } else {
         return Err(OpError::UnexpectedOpState);
     };
@@ -558,7 +558,7 @@ where
             htl,
             ..
         }) => {
-            let key = contract.get_key();
+            let key = contract.key();
             let new_state = Some(PutState::AwaitingResponse { contract: key });
             let msg = Some(PutMsg::RequestPut {
                 id,
@@ -627,7 +627,7 @@ async fn forward_changes<CErr, CB>(
     CErr: std::error::Error,
     CB: ConnectionBridge,
 {
-    let key = contract.get_key();
+    let key = contract.key();
     let contract_loc = Location::from(&key);
     let forward_to = op_storage.ring.closest_caching(&key, 1, skip_list);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
@@ -818,7 +818,7 @@ mod test {
         // both own the contract, and one triggers an update
         let node_0 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract.clone())),
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
             )],
             non_owned_contracts: vec![],
@@ -828,7 +828,7 @@ mod test {
 
         let node_1 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract.clone())),
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
             )],
             non_owned_contracts: vec![],
@@ -837,7 +837,7 @@ mod test {
         };
 
         let put_event = ContractRequest::Put {
-            contract: ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract.clone())),
+            contract: ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
             state: new_value.clone(),
             related_contracts: Default::default(),
         }
@@ -845,7 +845,7 @@ mod test {
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V0_0_1(contract.clone())),
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
                 contract_val,
             )],
             non_owned_contracts: vec![],
