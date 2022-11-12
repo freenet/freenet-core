@@ -117,6 +117,11 @@ impl Executor {
                 }
                 Err(Either::Left(RequestError::Disconnect))
             }
+            ClientRequest::GenerateRandData { bytes } => {
+                let mut output = vec![0; bytes];
+                locutus_runtime::util::generate_random_bytes(&mut output);
+                Ok(HostResponse::GenerateRandData(output))
+            }
         }
     }
 

@@ -5,7 +5,11 @@ mod contract_store;
 mod runtime;
 mod secrets_store;
 mod state_store;
+<<<<<<< HEAD
 mod versioning;
+=======
+pub mod util;
+>>>>>>> 2df89ff (Add API calls for requesting random bytes)
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 

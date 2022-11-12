@@ -6,7 +6,7 @@ use locutus_stdlib::prelude::{
 };
 use wasmer::{Instance, NativeFunc};
 
-use crate::{Runtime, RuntimeResult};
+use crate::{util, Runtime, RuntimeResult};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ComponentExecError {
@@ -56,6 +56,7 @@ impl Runtime {
         Ok(outbound)
     }
 
+    // FIXME: control the use of recurssion here since is a potential exploit for malicious components
     fn get_outbound<'a>(
         &mut self,
         component_key: &ComponentKey,
@@ -64,7 +65,6 @@ impl Runtime {
         outbound_msgs: Vec<OutboundComponentMsg<'a>>,
         results: &mut Vec<OutboundComponentMsg<'a>>,
     ) -> RuntimeResult<()> {
-        let linear_mem = self.linear_mem(instance)?;
         for outbound in outbound_msgs {
             match outbound {
                 OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
@@ -76,17 +76,7 @@ impl Runtime {
                         value: Some(secret),
                         context,
                     });
-                    let msg = bincode::serialize(&inbound)?;
-                    let mut msg_buf = self.init_buf(instance, &msg)?;
-                    msg_buf.write(msg)?;
-                    let outbound_msgs = unsafe {
-                        ComponentInterfaceResult::from_raw(
-                            process_func.call(msg_buf.ptr() as i64)?,
-                            &linear_mem,
-                        )
-                        .unwrap(linear_mem)
-                        .map_err(Into::<ComponentExecError>::into)?
-                    };
+                    let outbound_msgs = self.exec_inbound(&inbound, process_func, instance)?;
                     self.get_outbound(
                         component_key,
                         instance,
@@ -111,6 +101,19 @@ impl Runtime {
                 OutboundComponentMsg::RequestUserInput(req) => {
                     results.push(OutboundComponentMsg::RequestUserInput(req));
                     break;
+                }
+                OutboundComponentMsg::RandomBytesRequest(bytes) => {
+                    let mut bytes = vec![0; bytes];
+                    util::generate_random_bytes(&mut bytes);
+                    let inbound = InboundComponentMsg::RandomBytes(bytes);
+                    let outbound_msgs = self.exec_inbound(&inbound, process_func, instance)?;
+                    self.get_outbound(
+                        component_key,
+                        instance,
+                        process_func,
+                        outbound_msgs,
+                        results,
+                    )?;
                 }
             }
         }
@@ -157,6 +160,14 @@ impl ComponentRuntimeInterface for Runtime {
                 }
                 InboundComponentMsg::GetSecretResponse(_) => {
                     return Err(ComponentExecError::UnexpectedMessage("get secret response").into())
+                }
+                InboundComponentMsg::RandomBytes(bytes) => {
+                    let outbound = self.exec_inbound(
+                        &InboundComponentMsg::RandomBytes(bytes),
+                        &process_func,
+                        &instance,
+                    )?;
+                    self.get_outbound(key, &instance, &process_func, outbound, &mut results)?;
                 }
             }
         }

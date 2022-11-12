@@ -155,8 +155,9 @@ pub struct ContractHash(#[serde_as(as = "[_; APPLICATION_HASH_SIZE]")] [u8; APPL
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum InboundComponentMsg<'a> {
-    GetSecretResponse(GetSecretResponse),
     ApplicationMessage(ApplicationMessage),
+    GetSecretResponse(GetSecretResponse),
+    RandomBytes(Vec<u8>),
     UserResponse(#[serde(borrow)] UserInputResponse<'a>),
     // GetContractResponse {
     //     contract_id: ContractInstanceId,
@@ -169,10 +170,11 @@ pub enum InboundComponentMsg<'a> {
 impl InboundComponentMsg<'_> {
     pub fn into_owned(self) -> InboundComponentMsg<'static> {
         match self {
-            InboundComponentMsg::GetSecretResponse(r) => InboundComponentMsg::GetSecretResponse(r),
             InboundComponentMsg::ApplicationMessage(r) => {
                 InboundComponentMsg::ApplicationMessage(r)
             }
+            InboundComponentMsg::GetSecretResponse(r) => InboundComponentMsg::GetSecretResponse(r),
+            InboundComponentMsg::RandomBytes(b) => InboundComponentMsg::RandomBytes(b),
             InboundComponentMsg::UserResponse(r) => {
                 InboundComponentMsg::UserResponse(r.into_owned())
             }
@@ -225,12 +227,13 @@ impl UserInputResponse<'_> {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum OutboundComponentMsg<'a> {
-    // from the node
-    GetSecretRequest(GetSecretRequest),
-    SetSecretRequest(SetSecretRequest),
     // from the apps
     ApplicationMessage(ApplicationMessage),
     RequestUserInput(#[serde(borrow)] UserInputRequest<'a>),
+    // from the node
+    GetSecretRequest(GetSecretRequest),
+    SetSecretRequest(SetSecretRequest),
+    RandomBytesRequest(usize),
     // GetContractRequest {
     //     mode: RelatedMode,
     //     contract_id: ContractInstanceId,
@@ -240,13 +243,16 @@ pub enum OutboundComponentMsg<'a> {
 impl OutboundComponentMsg<'_> {
     pub fn into_owned(self) -> OutboundComponentMsg<'static> {
         match self {
+            OutboundComponentMsg::ApplicationMessage(r) => {
+                OutboundComponentMsg::ApplicationMessage(r)
+            }
             OutboundComponentMsg::RequestUserInput(r) => {
                 OutboundComponentMsg::RequestUserInput(r.into_owned())
             }
             OutboundComponentMsg::GetSecretRequest(r) => OutboundComponentMsg::GetSecretRequest(r),
             OutboundComponentMsg::SetSecretRequest(r) => OutboundComponentMsg::SetSecretRequest(r),
-            OutboundComponentMsg::ApplicationMessage(r) => {
-                OutboundComponentMsg::ApplicationMessage(r)
+            OutboundComponentMsg::RandomBytesRequest(bytes) => {
+                OutboundComponentMsg::RandomBytesRequest(bytes)
             }
         }
     }

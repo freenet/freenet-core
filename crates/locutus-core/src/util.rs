@@ -151,26 +151,27 @@ where
 
 impl<T> IterExt for T where T: Iterator {}
 
-#[test]
-fn randomize_iter() {
-    let iter = [0, 1, 2, 3, 4, 5];
-    let mut times_equal = 0;
-    for _ in 0..100 {
-        let shuffled: Vec<_> = iter.into_iter().shuffle().collect();
-        assert_eq!(shuffled.len(), iter.len());
-        //     println!("shuffled: {:?}", shuffled);
-        if iter.as_ref() == shuffled {
-            times_equal += 1;
-        }
-    }
-    // probability of being equal are 1/720
-    // for 100 iterations the probability that it happens more than twice is slim
-    assert!(times_equal < 3);
-}
-
 #[cfg(test)]
 pub(crate) mod test {
+    use super::*;
     use rand::Rng;
+
+    #[test]
+    fn randomize_iter() {
+        let iter = [0, 1, 2, 3, 4, 5];
+        let mut times_equal = 0;
+        for _ in 0..100 {
+            let shuffled: Vec<_> = iter.into_iter().shuffle().collect();
+            assert_eq!(shuffled.len(), iter.len());
+            //     println!("shuffled: {:?}", shuffled);
+            if iter.as_ref() == shuffled {
+                times_equal += 1;
+            }
+        }
+        // probability of being equal are 1/720
+        // for 100 iterations the probability that it happens more than twice is slim
+        assert!(times_equal < 3);
+    }
 
     // Would be nice to use const generics for this but there is a bound for the allowed
     // array size parameter which cannot be expressed with current version of const generics.
