@@ -15,4 +15,4 @@ jobs:
         token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
         channel: ${{ secrets.MATRIX_ROOM_ID }}
         message: |
-          Issue #${{ github.event.issue.id }} ${{ github.event.action }} : [${{ github.event.issue.title }}](${{ github.event.issue.html_url }})
+          Issue #${{ github.event.issue.number }}: ${{ github.event.action }} : [${{ github.event.issue.title }}](${{ github.event.issue.html_url }})
