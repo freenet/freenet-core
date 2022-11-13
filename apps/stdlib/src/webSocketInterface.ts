@@ -436,56 +436,56 @@ export class HostResponse {
     let decoded = decode(bytes) as object;
     if ("Ok" in decoded) {
       let ok = decoded as { Ok: any };
-      if ("PutResponse" in ok.Ok) {
-        ok.Ok as { PutResponse: any };
-        assert(Array.isArray(ok.Ok.PutResponse));
-        let key = HostResponse.assertKey(ok.Ok.PutResponse[0][0]);
-        this.result = { kind: "put", key };
-        return;
-      } else if ("UpdateResponse" in ok.Ok) {
-        ok.Ok as { UpdateResponse: any };
-        assert(Array.isArray(ok.Ok.UpdateResponse));
-        assert(ok.Ok.UpdateResponse.length == 2);
-        let key = HostResponse.assertKey(ok.Ok.UpdateResponse[0][0]);
-        let summary = HostResponse.assertBytes(ok.Ok.UpdateResponse[1]);
-        this.result = { kind: "update", key, summary };
-        return;
-      } else if ("GetResponse" in ok.Ok) {
-        ok.Ok as { GetResponse: any };
-        assert(Array.isArray(ok.Ok.GetResponse));
-        assert(ok.Ok.GetResponse.length == 2);
-        let contract;
-        if (ok.Ok.GetResponse[0] !== null) {
-          contract = {
-            data: new Uint8Array(ok.Ok.GetResponse[0][0][1]),
-            parameters: new Uint8Array(ok.Ok.GetResponse[0][1]),
-            key: new Key(ok.Ok.GetResponse[0][2][0]),
+      if ("ContractResponse" in ok.Ok) {
+        let response = ok.Ok as { ContractResponse: any };
+        if ("PutResponse" in response.ContractResponse) {
+          response.ContractResponse as { PutResponse: any };
+          assert(Array.isArray(response.ContractResponse.PutResponse));
+          let key = HostResponse.assertKey(response.ContractResponse.PutResponse[0][0]);
+          this.result = { kind: "put", key };
+          return;
+        } else if ("UpdateResponse" in response.ContractResponse) {
+          response.ContractResponse as { UpdateResponse: any };
+          assert(Array.isArray(response.ContractResponse.UpdateResponse));
+          assert(response.ContractResponse.UpdateResponse.length == 2);
+          let key = HostResponse.assertKey(response.ContractResponse.UpdateResponse[0][0]);
+          let summary = HostResponse.assertBytes(response.ContractResponse.UpdateResponse[1]);
+          this.result = { kind: "update", key, summary };
+          return;
+        } else if ("GetResponse" in response.ContractResponse) {
+          response.ContractResponse as { GetResponse: any };
+          assert(Array.isArray(response.ContractResponse.GetResponse));
+          assert(response.ContractResponse.GetResponse.length == 2);
+          let contract;
+          if (response.ContractResponse.GetResponse[0] !== null) {
+            contract = {
+              data: new Uint8Array(response.ContractResponse.GetResponse[0][0][1]),
+              parameters: new Uint8Array(response.ContractResponse.GetResponse[0][1]),
+              key: new Key(response.ContractResponse.GetResponse[0][2][0]),
+            };
+          } else {
+            contract = null;
+          }
+          let get = {
+            kind: "get",
+            contract,
+            state: response.ContractResponse.GetResponse[1],
           };
-        } else {
-          contract = null;
+          this.result = get as GetResponse;
+          return;
+        } else if ("UpdateNotification" in response.ContractResponse) {
+          response.ContractResponse as { UpdateNotification: any };
+          assert(Array.isArray(response.ContractResponse.UpdateNotification));
+          assert(response.ContractResponse.UpdateNotification.length == 2);
+          let key = HostResponse.assertKey(response.ContractResponse.UpdateNotification[0][0]);
+          let update = HostResponse.getUpdateData(response.ContractResponse.UpdateNotification[1]);
+          this.result = {
+            kind: "updateNotification",
+            key,
+            update,
+          } as UpdateNotification;
+          return;
         }
-        let get = {
-          kind: "get",
-          contract,
-          state: ok.Ok.GetResponse[1],
-        };
-        this.result = get as GetResponse;
-        return;
-      } else if ("UpdateNotification" in ok.Ok) {
-        ok.Ok as { UpdateNotification: any };
-        assert(Array.isArray(ok.Ok.UpdateNotification));
-        assert(ok.Ok.UpdateNotification.length == 2);
-        let key = HostResponse.assertKey(ok.Ok.UpdateNotification[0][0]);
-        // FIXME:
-        let update = {
-          delta: HostResponse.assertBytes(ok.Ok.UpdateNotification[1]),
-        };
-        this.result = {
-          kind: "updateNotification",
-          key,
-          update,
-        } as UpdateNotification;
-        return;
       }
     } else if ("Err" in decoded) {
       let err = decoded as { Err: Array<any> };
@@ -670,6 +670,17 @@ export class HostResponse {
       "expected an array of bytes"
     );
     return state as Uint8Array;
+  }
+
+  private static getUpdateData(update: UpdateData): UpdateData {
+    if ("Delta" in update) {
+      let delta = Array.from(update["Delta"]);
+      return {
+        delta: HostResponse.assertBytes(delta),
+      };
+    } else {
+      throw new TypeError("Invalid update data while building HostResponse")
+    }
   }
 }
 
