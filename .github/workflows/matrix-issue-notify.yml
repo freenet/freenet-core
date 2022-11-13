@@ -1,3 +1,5 @@
+name: Notify Matrix channel of Issue change
+
 on:
   issues:
     types: [opened, closed]
@@ -15,4 +17,4 @@ jobs:
         token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
         channel: ${{ secrets.MATRIX_ROOM_ID }}
         message: |
-          Issue #${{ github.event.issue.number }} ${{ github.event.action }} by [${{ github.actor }}](https://github.com/${{ github.actor }}): [${{ github.event.issue.title }}](${{ github.event.issue.html_url }})
+          [Issue #${{ github.event.issue.number }}](${{ github.event.issue.html_url }}) ${{ github.event.action }} by [${{ github.actor }}](https://github.com/${{ github.actor }}): **${{ github.event.issue.title }}**
