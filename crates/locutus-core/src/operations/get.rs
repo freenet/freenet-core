@@ -175,23 +175,28 @@ where
                         key: returned_key,
                     } = op_storage
                         .notify_contract_handler(ContractHandlerEvent::FetchQuery {
-                            key,
+                            key: key.clone(),
                             fetch_contract,
                         })
                         .await?
                     {
-                        match check_contract_found(key, id, fetch_contract, &value, returned_key) {
+                        match check_contract_found(
+                            key.clone(),
+                            id,
+                            fetch_contract,
+                            &value,
+                            returned_key.clone(),
+                        ) {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
 
-                        log::debug!("Contract {} found @ peer {}", returned_key, target.peer);
+                        log::debug!("Contract {returned_key} found @ peer {}", target.peer);
 
                         match self.state {
                             Some(GetState::AwaitingResponse { .. }) => {
                                 log::debug!(
-                                    "Completed operation, Get response received for contract {}",
-                                    key
+                                    "Completed operation, Get response received for contract {key}"
                                 );
                                 // Completed op
                                 new_state = None;
@@ -319,7 +324,8 @@ where
                                     contract.clone(),
                                 ))
                                 .await?;
-                            log::debug!("Contract `{}` successfully put", contract.key());
+                            let key = contract.key();
+                            log::debug!("Contract `{}` successfully put", key);
                         } else {
                             // no contract, consider this like an error ignoring the incoming update value
                             log::warn!(
@@ -354,7 +360,7 @@ where
 
                     op_storage
                         .notify_contract_handler(ContractHandlerEvent::PushQuery {
-                            key,
+                            key: key.clone(),
                             state: value.clone(),
                         })
                         .await?;
@@ -363,8 +369,7 @@ where
                         Some(GetState::AwaitingResponse { fetch_contract, .. }) => {
                             if fetch_contract && contract.is_none() {
                                 log::error!(
-                                    "Get response received for contract {}, but the contract wasn't returned",
-                                    key
+                                    "Get response received for contract {key}, but the contract wasn't returned"
                                 );
                                 new_state = None;
                                 return_msg = None;
@@ -653,11 +658,12 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use locutus_runtime::{ContractContainer, WasmAPIVersion};
     use std::collections::HashMap;
 
     use super::*;
     use crate::{
-        client_events::ClientRequest,
+        client_events::ContractRequest,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         WrappedContract, WrappedState,
     };
@@ -672,21 +678,24 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
-        let key = *contract.key();
-
-        let get_event = ClientRequest::Get {
-            key,
+        let key = contract.key().clone();
+        let get_event = ContractRequest::Get {
+            key: key.clone(),
             fetch_contract: true,
-        };
+        }
+        .into();
         let node_0 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key],
+            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
 
         let gw_0 = NodeSpecification {
-            owned_contracts: vec![(contract, contract_val)],
+            owned_contracts: vec![(
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
+                contract_val,
+            )],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
@@ -720,15 +729,16 @@ mod test {
         let bytes = crate::util::test::random_bytes_1024();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
-        let key = *contract.key();
+        let key = contract.key().clone();
 
-        let get_event = ClientRequest::Get {
-            key,
+        let get_event = ContractRequest::Get {
+            key: key.clone(),
             fetch_contract: false,
-        };
+        }
+        .into();
         let node_1 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key],
+            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
@@ -758,23 +768,27 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
-        let key = *contract.key();
+        let key = contract.key().clone();
 
-        let get_event = ClientRequest::Get {
-            key,
+        let get_event = ContractRequest::Get {
+            key: key.clone(),
             fetch_contract: false,
-        };
+        }
+        .into();
 
         let node_0 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key],
+            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
 
         let node_1 = NodeSpecification {
-            owned_contracts: vec![(contract, contract_val)],
-            non_owned_contracts: vec![key],
+            owned_contracts: vec![(
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
+                contract_val,
+            )],
+            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };

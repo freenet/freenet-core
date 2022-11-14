@@ -23,7 +23,7 @@ use self::{
     p2p_impl::NodeP2P,
 };
 use crate::{
-    client_events::{BoxedClient, ClientEventsProxy, ClientRequest, OpenRequest},
+    client_events::{BoxedClient, ClientEventsProxy, ClientRequest, ContractRequest, OpenRequest},
     config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
@@ -308,71 +308,82 @@ async fn client_event_handling<ClientEv, CErr>(
         let op_storage_cp = op_storage.clone();
         GlobalExecutor::spawn(async move {
             match request {
-                ClientRequest::Put {
-                    state,
-                    contract,
-                    related_contracts,
-                } => {
-                    // Initialize a put op.
-                    log::debug!(
-                        "Received put from user event @ {}",
-                        &op_storage_cp.ring.peer_key
-                    );
-                    let op = put::start_op(
-                        contract,
+                ClientRequest::ContractOp(ops) => match ops {
+                    ContractRequest::Put {
                         state,
-                        op_storage_cp.ring.max_hops_to_live,
-                        &op_storage_cp.ring.peer_key,
-                    );
-                    if let Err(err) = put::request_put(&op_storage_cp, op).await {
-                        log::error!("{}", err);
+                        contract,
+                        related_contracts,
+                    } => {
+                        // Initialize a put op.
+                        log::debug!(
+                            "Received put from user event @ {}",
+                            &op_storage_cp.ring.peer_key
+                        );
+                        let op = put::start_op(
+                            contract,
+                            state,
+                            op_storage_cp.ring.max_hops_to_live,
+                            &op_storage_cp.ring.peer_key,
+                        );
+                        if let Err(err) = put::request_put(&op_storage_cp, op).await {
+                            log::error!("{}", err);
+                        }
+                        todo!("use `related_contracts`: {related_contracts:?}")
                     }
-                    todo!("use `related_contracts`: {related_contracts:?}")
-                }
-                ClientRequest::Update {
-                    key: _key,
-                    data: _delta,
-                } => {
-                    todo!()
-                }
-                ClientRequest::Get {
-                    key,
-                    fetch_contract: contract,
-                } => {
-                    // Initialize a get op.
-                    log::debug!(
-                        "Received get from user event @ {}",
-                        &op_storage_cp.ring.peer_key
-                    );
-                    let op = get::start_op(key, contract, &op_storage_cp.ring.peer_key);
-                    if let Err(err) = get::request_get(&op_storage_cp, op).await {
-                        log::error!("{}", err);
+                    ContractRequest::Update {
+                        key: _key,
+                        data: _delta,
+                    } => {
+                        todo!()
                     }
-                }
-                ClientRequest::Subscribe { key, .. } => {
-                    // Initialize a subscribe op.
-                    loop {
-                        // FIXME: this will block the event loop until the subscribe op succeeds
-                        //        instead the op should be deferred for later execution
-                        let op = subscribe::start_op(key, &op_storage_cp.ring.peer_key);
-                        match subscribe::request_subscribe(&op_storage_cp, op).await {
-                            Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
-                                log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
-                                let get_op = get::start_op(key, true, &op_storage_cp.ring.peer_key);
-                                if let Err(err) = get::request_get(&op_storage_cp, get_op).await {
-                                    log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
-                                }
-                            }
-                            Err(err) => {
-                                log::error!("{}", err);
-                                break;
-                            }
-                            Ok(()) => break,
+                    ContractRequest::Get {
+                        key,
+                        fetch_contract: contract,
+                    } => {
+                        // Initialize a get op.
+                        log::debug!(
+                            "Received get from user event @ {}",
+                            &op_storage_cp.ring.peer_key
+                        );
+                        let op = get::start_op(key, contract, &op_storage_cp.ring.peer_key);
+                        if let Err(err) = get::request_get(&op_storage_cp, op).await {
+                            log::error!("{}", err);
                         }
                     }
-                    todo!()
-                }
+                    ContractRequest::Subscribe { key, .. } => {
+                        // Initialize a subscribe op.
+                        loop {
+                            // FIXME: this will block the event loop until the subscribe op succeeds
+                            //        instead the op should be deferred for later execution
+                            let op = subscribe::start_op(key.clone(), &op_storage_cp.ring.peer_key);
+                            match subscribe::request_subscribe(&op_storage_cp, op).await {
+                                Err(OpError::ContractError(ContractError::ContractNotFound(
+                                    key,
+                                ))) => {
+                                    log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
+                                    let get_op = get::start_op(
+                                        key.clone(),
+                                        true,
+                                        &op_storage_cp.ring.peer_key,
+                                    );
+                                    if let Err(err) = get::request_get(&op_storage_cp, get_op).await
+                                    {
+                                        log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                    }
+                                }
+                                Err(err) => {
+                                    log::error!("{}", err);
+                                    break;
+                                }
+                                Ok(()) => break,
+                            }
+                        }
+                        todo!()
+                    }
+                },
+                ClientRequest::ComponentOp(_op) => todo!("FIXME: component op"),
+                ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
                 ClientRequest::Disconnect { .. } => unreachable!(),
             }
         });

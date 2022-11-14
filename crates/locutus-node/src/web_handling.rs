@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use locutus_runtime::{
     locutus_stdlib::web::{WebApp, WebContractError},
-    ContractKey, State, WrappedContract,
+    ContractContainer, ContractKey, State,
 };
 
 use locutus_core::*;
@@ -37,23 +37,27 @@ pub(crate) async fn contract_home(
     request_sender
         .send(ClientConnection::Request {
             client_id,
-            req: ClientRequest::Get {
-                key,
+            req: ContractRequest::Get {
+                key: key.clone(),
                 fetch_contract: true,
-            },
+            }
+            .into(),
         })
         .await
         .map_err(|_| reject::custom(errors::NodeError))?;
     let response = match response_recv.recv().await {
         Some(HostCallbackResult::Result {
             result:
-                Ok(HostResponse::GetResponse {
-                    contract, state, ..
-                }),
+                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    contract,
+                    state,
+                    ..
+                })),
             ..
         }) => match contract {
             Some(contract) => {
-                let path = contract_web_path(contract.key());
+                let key = contract.key();
+                let path = contract_web_path(&key);
                 let web_body = match get_web_body(&path).await {
                     Ok(b) => b,
                     Err(err) => {
@@ -64,13 +68,11 @@ pub(crate) async fn contract_home(
 
                                 fn err(
                                     err: WebContractError,
-                                    contract: &WrappedContract,
+                                    contract: &ContractContainer,
                                 ) -> InvalidParam {
+                                    let key = contract.key();
                                     log::error!("{err}");
-                                    InvalidParam(format!(
-                                        "failed unpacking contract: {}",
-                                        contract.key()
-                                    ))
+                                    InvalidParam(format!("failed unpacking contract: {}", key))
                                 }
 
                                 let mut web = WebApp::try_from(state.as_ref())

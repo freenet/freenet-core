@@ -1,5 +1,6 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
+use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
 use std::{
@@ -218,8 +219,8 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
     let req: ClientRequest = {
-        match ClientRequest::decode_mp(&msg) {
-            Ok(r) => r,
+        match ContractRequest::try_decode(&msg) {
+            Ok(r) => r.into(),
             Err(e) => {
                 let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
                     ErrorKind::DeserializationError {
@@ -252,9 +253,10 @@ async fn process_host_response(
                 Ok(res) => {
                     tracing::debug!(response = %res, cli_id = %id, "sending response");
                     match res {
-                        HostResponse::GetResponse { contract, state } => {
-                            Ok(HostResponse::GetResponse { contract, state })
-                        }
+                        HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            contract,
+                            state,
+                        }) => Ok(ContractResponse::GetResponse { contract, state }.into()),
                         other => Ok(other),
                     }
                 }
@@ -300,19 +302,19 @@ impl HttpGateway {
             }
             ClientConnection::Request {
                 client_id,
-                req: ClientRequest::Subscribe { key },
+                req: ClientRequest::ContractOp(ContractRequest::Subscribe { key }),
             } => {
                 // intercept subscription messages because they require a callback subscription channel
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 if let Some(ch) = self.response_channels.get(&client_id) {
                     ch.send(HostCallbackResult::SubscriptionChannel {
-                        key,
+                        key: key.clone(),
                         id: client_id,
                         callback: rx,
                     })
                     .map_err(|_| ErrorKind::ChannelClosed)?;
                     Ok(Some(
-                        OpenRequest::new(client_id, ClientRequest::Subscribe { key })
+                        OpenRequest::new(client_id, ContractRequest::Subscribe { key }.into())
                             .with_notification(tx),
                     ))
                 } else {
@@ -335,7 +337,7 @@ impl ClientEventsProxy for HttpGateway {
                 let msg = self.server_request.recv().await;
                 if let Some(msg) = msg {
                     if let Some(reply) = self.internal_proxy_recv(msg).await? {
-                        break Ok(reply.owned());
+                        break Ok(reply.into_owned());
                     }
                 } else {
                     todo!()
@@ -345,12 +347,13 @@ impl ClientEventsProxy for HttpGateway {
         .boxed()
     }
 
-    fn send(
+    fn send<'a>(
         &mut self,
         id: ClientId,
-        result: Result<HostResponse, ClientError>,
+        result: Result<HostResponse<'a>, ClientError>,
     ) -> BoxFuture<'_, Result<(), ClientError>> {
-        Box::pin(async move {
+        let result: Result<HostResponse<'static>, _> = result.map(HostResponse::into_owned);
+        async move {
             if let Some(ch) = self.response_channels.remove(&id) {
                 let should_rm = result
                     .as_ref()
@@ -365,6 +368,7 @@ impl ClientEventsProxy for HttpGateway {
                 log::warn!("client: {id} not found");
             }
             Ok(())
-        })
+        }
+        .boxed()
     }
 }

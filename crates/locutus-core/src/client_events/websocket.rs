@@ -7,11 +7,12 @@ use std::{
 };
 
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
+use locutus_runtime::prelude::TryFromTsStd;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use warp::{filters::BoxedFilter, Filter, Reply};
 
 use super::{ClientError, ClientEventsProxy, ClientId, ErrorKind, HostResult, OpenRequest};
-use crate::{ClientRequest, HostResponse};
+use crate::{ClientRequest, ContractRequest, HostResponse};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
@@ -20,7 +21,7 @@ pub struct WebSocketProxy {
     server_response: Sender<(ClientId, HostResult)>,
 }
 
-type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
+type NewResponseSender = Sender<Result<HostResponse<'static>, ClientError>>;
 
 impl WebSocketProxy {
     /// Starts this as an upgrade to an existing HTTP connection at the `/ws-api` URL
@@ -86,11 +87,12 @@ impl ClientEventsProxy for WebSocketProxy {
         })
     }
 
-    fn send(
+    fn send<'a>(
         &mut self,
         client: ClientId,
-        response: Result<HostResponse, ClientError>,
+        response: Result<HostResponse<'a>, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>> {
+        let response: Result<HostResponse<'static>, _> = response.map(HostResponse::into_owned);
         Box::pin(async move {
             self.server_response
                 .send((client, response))
@@ -203,8 +205,8 @@ async fn new_request(
     let msg = match result {
         Some(Ok(msg)) if msg.is_binary() => {
             let data = msg.into_bytes();
-            let deserialized: ClientRequest = match ClientRequest::decode_mp(&*data) {
-                Ok(m) => m,
+            let deserialized: ClientRequest = match ContractRequest::try_decode(&data) {
+                Ok(m) => m.into(),
                 Err(e) => {
                     let _ = request_sender
                         .send(
@@ -260,7 +262,7 @@ async fn new_request(
 
 async fn send_reponse_to_client(
     response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
-    response: Result<HostResponse, ClientError>,
+    response: Result<HostResponse<'static>, ClientError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serialize = rmp_serde::to_vec(&response).unwrap();
     response_stream

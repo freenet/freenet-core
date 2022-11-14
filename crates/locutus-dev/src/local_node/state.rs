@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use locutus_core::{Config, ContractExecutor, SqlitePool};
+use locutus_core::{Config, Executor, SqlitePool};
 use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
@@ -10,7 +10,7 @@ use super::LocalNodeCliConfig;
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    pub(crate) local_node: Arc<RwLock<ContractExecutor>>,
+    pub(crate) local_node: Arc<RwLock<Executor>>,
     config: LocalNodeCliConfig,
 }
 
@@ -23,7 +23,7 @@ impl AppState {
         let state_store = StateStore::new(SqlitePool::new().await?, Self::MAX_MEM_CACHE).unwrap();
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
-                ContractExecutor::new(contract_store, state_store, || {
+                Executor::new(contract_store, state_store, || {
                     locutus_core::util::set_cleanup_on_exit().unwrap();
                 })
                 .await?,
@@ -46,14 +46,14 @@ impl AppState {
             Some(DeserializationFmt::Json) => {
                 let deser: serde_json::Value = serde_json::from_slice(data.as_ref())?;
                 let pp = serde_json::to_string_pretty(&deser)?;
-                write_res(&self.config, &*pp)?;
+                write_res(&self.config, &pp)?;
             }
             #[cfg(feature = "messagepack")]
             Some(DeserializationFmt::MessagePack) => {
                 let deser = rmpv::decode::read_value(&mut data.as_ref())
                     .map_err(|_err| std::io::ErrorKind::InvalidData)?;
                 let pp = format!("{deser}");
-                write_res(&self.config, &*pp)?;
+                write_res(&self.config, &pp)?;
             }
             _ => {}
         }

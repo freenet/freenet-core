@@ -113,7 +113,7 @@ fn build_web_state(
         match &web_config.lang {
             SupportedWebLangs::Typescript => {
                 let child = Command::new("npm")
-                    .args(&["install"])
+                    .args(["install"])
                     .current_dir(cwd)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -290,7 +290,7 @@ fn get_default_ouput_dir(cwd: &Path) -> std::io::Result<PathBuf> {
 
 fn output_artifact(output: &Option<PathBuf>, packed: &[u8], cwd: &Path) -> Result<(), DynError> {
     if let Some(path) = output {
-        File::create(&path)?.write_all(packed)?;
+        File::create(path)?.write_all(packed)?;
     } else {
         let default_out_dir = get_default_ouput_dir(cwd)?;
         fs::create_dir_all(&default_out_dir)?;
@@ -540,7 +540,7 @@ mod test {
         let mut buf = vec![];
         File::open(cwd.join("build").join("locutus").join(DEFAULT_OUTPUT_NAME))?
             .read_to_end(&mut buf)?;
-        let state = locutus_runtime::locutus_stdlib::interface::State::from(buf);
+        let state = locutus_runtime::locutus_stdlib::contract_interface::State::from(buf);
         let mut web = WebApp::try_from(state.as_ref()).unwrap();
 
         let target = env::temp_dir().join("locutus-unpack-state");

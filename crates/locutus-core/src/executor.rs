@@ -2,31 +2,35 @@
 
 use std::collections::HashMap;
 
-use locutus_runtime::{prelude::*, ContractRuntimeError};
+use blake2::digest::generic_array::GenericArray;
+use locutus_runtime::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    either::Either, ClientError, ClientId, ClientRequest, DynError, HostResponse, HostResult,
-    RequestError, SqlitePool,
+    client_events::{
+        ComponentError as CoreComponentError, ComponentRequest, ContractError as CoreContractError,
+        ContractRequest, ContractResponse,
+    },
+    either::Either,
+    ClientError, ClientId, ClientRequest, DynError, HostResponse, HostResult, RequestError,
+    SqlitePool,
 };
 
-type Response = Result<HostResponse, Either<RequestError, DynError>>;
+type Response<'a> = Result<HostResponse<'a>, Either<RequestError, DynError>>;
 
-/// A node which only functions on the local host without any network.
-/// Use for testing pourpouses.
+/// A WASM executor which will run any contracts, components, etc. registered.
 ///
-/// This node will monitor the store directories and databases to detect state changes.
-/// Consumers of the node are required to poll for new changes in order to be notified
+/// This executor will monitor the store directories and databases to detect state changes.
+/// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
-#[derive(Clone)]
-pub struct ContractExecutor {
+pub struct Executor {
     runtime: Runtime,
     contract_state: StateStore<SqlitePool>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, StateSummary<'static>>>,
 }
 
-impl ContractExecutor {
+impl Executor {
     pub async fn new(
         store: ContractStore,
         contract_state: StateStore<SqlitePool>,
@@ -35,7 +39,7 @@ impl ContractExecutor {
         ctrl_handler();
 
         Ok(Self {
-            runtime: Runtime::build(store, false).unwrap(),
+            runtime: Runtime::build(store, SecretsStore::default(), false).unwrap(),
             contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
@@ -49,7 +53,7 @@ impl ContractExecutor {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: StateSummary<'static>,
     ) -> Result<(), DynError> {
-        let channels = self.update_notifications.entry(key).or_default();
+        let channels = self.update_notifications.entry(key.clone()).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
@@ -61,7 +65,7 @@ impl ContractExecutor {
 
         if self
             .subscriber_summaries
-            .entry(key)
+            .entry(key.clone())
             .or_default()
             .insert(cli_id, summary)
             .is_some()
@@ -74,18 +78,19 @@ impl ContractExecutor {
     pub async fn preload(
         &mut self,
         cli_id: ClientId,
-        contract: WrappedContract,
+        contract: ContractContainer,
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
     ) {
         if let Err(err) = self
             .handle_request(
                 cli_id,
-                ClientRequest::Put {
+                ContractRequest::Put {
                     contract,
                     state,
                     related_contracts,
-                },
+                }
+                .into(),
                 None,
             )
             .await
@@ -101,10 +106,33 @@ impl ContractExecutor {
         &mut self,
         id: ClientId,
         req: ClientRequest<'static>,
-        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
+        updates: Option<UnboundedSender<Result<HostResponse<'static>, ClientError>>>,
     ) -> Response {
         match req {
-            ClientRequest::Put {
+            ClientRequest::ContractOp(op) => self.contract_op(op, id, updates).await,
+            ClientRequest::ComponentOp(op) => self.component_op(op),
+            ClientRequest::Disconnect { cause } => {
+                if let Some(cause) = cause {
+                    log::info!("disconnecting cause: {cause}");
+                }
+                Err(Either::Left(RequestError::Disconnect))
+            }
+            ClientRequest::GenerateRandData { bytes } => {
+                let mut output = vec![0; bytes];
+                locutus_runtime::util::generate_random_bytes(&mut output);
+                Ok(HostResponse::GenerateRandData(output))
+            }
+        }
+    }
+
+    async fn contract_op(
+        &mut self,
+        req: ContractRequest<'_>,
+        id: ClientId,
+        updates: Option<UnboundedSender<Result<HostResponse<'static>, ClientError>>>,
+    ) -> Response {
+        match req {
+            ContractRequest::Put {
                 contract,
                 state,
                 related_contracts,
@@ -119,46 +147,53 @@ impl ContractExecutor {
                 //          1. through the arbitraur mechanism
                 //          2. a new func which compared two summaries and gives the most fresh
                 //        you can request to several nodes and determine which node has a fresher ver
+                let key = contract.key();
+                let params = contract.params();
                 self.runtime
-                    .contracts
+                    .contract_store
                     .store_contract(contract.clone())
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
 
-                let key = contract.key();
-                log::debug!("executing with params: {:?}", contract.params());
+                log::debug!("executing with params: {:?}", params);
                 let is_valid = self
                     .runtime
-                    .validate_state(key, contract.params(), &state, related_contracts)
+                    .validate_state(&key, &params, &state, related_contracts)
                     .map_err(Into::into)
                     .map_err(Either::Right)?
                     == ValidateResult::Valid;
                 // FIXME: should deal with additional related contracts requested
                 let res = is_valid
-                    .then(|| HostResponse::PutResponse { key: *key })
+                    .then(|| ContractResponse::PutResponse { key: key.clone() }.into())
                     .ok_or_else(|| {
-                        Either::Left(RequestError::Put {
-                            key: *key,
-                            cause: "not valid".to_owned(),
-                        })
+                        Either::Left(
+                            CoreContractError::Put {
+                                key: key.clone(),
+                                cause: "not valid".to_owned(),
+                            }
+                            .into(),
+                        )
                     })?;
 
                 self.contract_state
-                    .store(*key, state.clone(), Some(contract.params().clone()))
+                    .store(key.clone(), state.clone(), Some(params.clone()))
                     .await
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                self.send_update_notification(key, contract.params(), &state)
+                self.send_update_notification(&key, &params, &state)
                     .await
                     .map_err(|_| {
-                        Either::Left(RequestError::Put {
-                            key: *key,
-                            cause: "failed while sending notifications".to_owned(),
-                        })
+                        Either::Left(
+                            CoreContractError::Put {
+                                key: key.clone(),
+                                cause: "failed while sending notifications".to_owned(),
+                            }
+                            .into(),
+                        )
                     })?;
                 Ok(res)
             }
-            ClientRequest::Update { key, data } => {
+            ContractRequest::Update { key, data } => {
                 let parameters = {
                     self.contract_state
                         .get_params(&key)
@@ -173,23 +208,23 @@ impl ContractExecutor {
                         .map_err(Into::into)
                         .map_err(Either::Right)?
                         .clone();
-
                     let update_modification = self
                         .runtime
                         .update_state(&key, &parameters, &state, &[data])
                         .map_err(|err| match err {
-                            ContractRuntimeError::ExecError(ExecError::ContractError(err)) => {
-                                Either::Left(RequestError::Update {
-                                    key,
+                            err if err.is_contract_exec_error() => Either::Left(
+                                CoreContractError::Update {
+                                    key: key.clone(),
                                     cause: format!("{err}"),
-                                })
-                            }
+                                }
+                                .into(),
+                            ),
                             other => Either::Right(other.into()),
                         })?;
                     if let Some(new_state) = update_modification.new_state {
                         let new_state = WrappedState::new(new_state.into_bytes());
                         self.contract_state
-                            .store(key, new_state.clone(), None)
+                            .store(key.clone(), new_state.clone(), None)
                             .await
                             .map_err(|err| Either::Right(err.into()))?;
                         new_state
@@ -208,33 +243,76 @@ impl ContractExecutor {
                 // TODO: in network mode, wait at least for one confirmation
                 //       when a node receives a delta from updates, run the update themselves
                 //       and send back confirmation
-                Ok(HostResponse::UpdateResponse { key, summary })
+                Ok(ContractResponse::UpdateResponse { key, summary }.into())
             }
-            ClientRequest::Get {
+            ContractRequest::Get {
                 key,
                 fetch_contract: contract,
             } => self.perform_get(contract, key).await.map_err(Either::Left),
-            ClientRequest::Subscribe { key } => {
+            ContractRequest::Subscribe { key } => {
                 let updates =
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
-                self.register_contract_notifier(key, id, updates, [].as_ref().into())
+                self.register_contract_notifier(key.clone(), id, updates, [].as_ref().into())
                     .unwrap();
                 log::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)
                 // todo: in network mode, also send a subscribe to keep up to date
             }
-            ClientRequest::Disconnect { cause } => {
-                if let Some(cause) = cause {
-                    log::info!("disconnecting cause: {cause}");
+        }
+    }
+
+    fn component_op<'a>(&mut self, req: ComponentRequest<'a>) -> Response<'a> {
+        match req {
+            ComponentRequest::RegisterComponent {
+                component,
+                cipher,
+                nonce,
+            } => {
+                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+                let key = component.key().clone();
+
+                let arr = GenericArray::from_slice(&cipher);
+                let cipher = XChaCha20Poly1305::new(arr);
+                let nonce = GenericArray::from_slice(&nonce).to_owned();
+
+                match self.runtime.register_component(component, cipher, nonce) {
+                    Ok(_) => Ok(HostResponse::Ok),
+                    Err(err) => {
+                        log::error!("failed registering component `{key}`: {err}");
+                        Err(Either::Left(CoreComponentError::RegisterError(key).into()))
+                    }
                 }
-                Err(Either::Left(RequestError::Disconnect))
+            }
+            ComponentRequest::UnregisterComponent(key) => {
+                match self.runtime.unregister_component(&key) {
+                    Ok(_) => Ok(HostResponse::Ok),
+                    Err(err) => {
+                        log::error!("failed unregistering component `{key}`: {err}");
+                        Ok(HostResponse::Ok)
+                    }
+                }
+            }
+            ComponentRequest::ApplicationMessages { key, inbound } => {
+                match self.runtime.inbound_app_message(&key, inbound) {
+                    Ok(values) => Ok(HostResponse::ComponentResponse { key, values }),
+                    Err(err) if err.is_component_exec_error() => {
+                        log::error!("failed processing messages for component `{key}`: {err}");
+                        Err(Either::Left(
+                            CoreComponentError::ExecutionError(format!("{err}")).into(),
+                        ))
+                    }
+                    Err(err) => {
+                        log::error!("failed executing component `{key}`: {err}");
+                        Ok(HostResponse::Ok)
+                    }
+                }
             }
         }
     }
 
     async fn send_update_notification<'a>(
-        &'a mut self,
+        &mut self,
         key: &ContractKey,
         params: &Parameters<'a>,
         new_state: &WrappedState,
@@ -243,22 +321,27 @@ impl ContractExecutor {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
-                // FIXME: here we are always sending an state_delta, but what we send back depends
+                // FIXME: here we are always sending an state_delta,
+                //        but what we send back depends on the kind of subscription
                 let update = self
                     .runtime
                     .get_state_delta(key, params, new_state, &*peer_summary)
                     .map_err(|err| match err {
-                        ContractRuntimeError::ExecError(ExecError::ContractError(_)) => {
-                            Either::Left(RequestError::Put {
-                                key: *key,
-                                cause: "invalid put value".to_owned(),
-                            })
-                        }
+                        err if err.is_contract_exec_error() => Either::Left(
+                            CoreContractError::Put {
+                                key: key.clone(),
+                                cause: format!("{err}"),
+                            }
+                            .into(),
+                        ),
                         other => Either::Right(other.into()),
-                    })?
-                    .into();
+                    })?;
                 notifier
-                    .send(Ok(HostResponse::UpdateNotification { key: *key, update }))
+                    .send(Ok(ContractResponse::UpdateNotification {
+                        key: key.clone(),
+                        update: update.to_owned().into(),
+                    }
+                    .into()))
                     .unwrap();
             }
         }
@@ -269,39 +352,44 @@ impl ContractExecutor {
         &mut self,
         contract: bool,
         key: ContractKey,
-    ) -> Result<HostResponse, RequestError> {
+    ) -> Result<HostResponse<'static>, RequestError> {
         let mut got_contract = None;
         if contract {
             let parameters = self.contract_state.get_params(&key).await.map_err(|e| {
                 log::error!("{e}");
-                RequestError::Get {
-                    key,
+                RequestError::from(CoreContractError::Get {
+                    key: key.clone(),
                     cause: "missing contract".to_owned(),
-                }
+                })
             })?;
             let contract = self
                 .runtime
-                .contracts
+                .contract_store
                 .fetch_contract(&key, &parameters)
-                .ok_or_else(|| RequestError::Get {
-                    key,
-                    cause: "Missing contract".into(),
+                .ok_or_else(|| {
+                    RequestError::from(CoreContractError::Get {
+                        key: key.clone(),
+                        cause: "Missing contract".into(),
+                    })
                 })?;
             got_contract = Some(contract);
         }
         match self.contract_state.get(&key).await {
-            Ok(state) => Ok(HostResponse::GetResponse {
+            Ok(state) => Ok(ContractResponse::GetResponse {
                 contract: got_contract,
                 state,
-            }),
-            Err(StateStoreError::MissingContract) => Err(RequestError::Get {
+            }
+            .into()),
+            Err(StateStoreError::MissingContract) => Err(CoreContractError::Get {
                 key,
                 cause: "missing contract state".into(),
-            }),
-            Err(err) => Err(RequestError::Get {
+            }
+            .into()),
+            Err(err) => Err(CoreContractError::Get {
                 key,
                 cause: format!("{err}"),
-            }),
+            }
+            .into()),
         }
     }
 }
@@ -319,7 +407,7 @@ mod test {
         let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
         let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
-        ContractExecutor::new(contract_store.clone(), state_store.clone(), || {
+        Executor::new(contract_store, state_store, || {
             counter += 1;
         })
         .await

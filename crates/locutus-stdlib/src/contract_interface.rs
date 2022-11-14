@@ -21,16 +21,11 @@ use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 32;
 
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy)]
-pub struct WasmLinearMem {
-    pub start_ptr: *const u8,
-    pub size: u64,
-}
-
 /// Type of errors during interaction with a contract.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum ContractError {
+    #[error("de/serialization error: {0}")]
+    Deser(String),
     #[error("invalid contract update")]
     InvalidUpdate,
     #[error("trying to read an invalid state")]
@@ -39,8 +34,26 @@ pub enum ContractError {
     InvalidDelta,
     #[error("{0}")]
     Other(String),
-    #[error("de/serialization error: {0}")]
-    Deser(String),
+}
+
+pub trait TryFromTsStd<T>: Sized {
+    fn try_decode(value: T) -> Result<Self, WsApiError>;
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum WsApiError {
+    #[error("Failed decoding msgpack message from client request: {cause}")]
+    MsgpackDecodeError { cause: String },
+    #[error("Unsupported contract version")]
+    UnsupportedContractVersion,
+    #[error("Failed unpacking contract container")]
+    UnpackingContractContainerError(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl WsApiError {
+    pub fn deserialization(cause: String) -> Self {
+        Self::MsgpackDecodeError { cause }
+    }
 }
 
 /// An update to a contract state or any required related contracts to update that state.
@@ -115,7 +128,7 @@ impl RelatedContracts<'_> {
     pub fn into_owned(self) -> RelatedContracts<'static> {
         let mut map = HashMap::with_capacity(self.map.len());
         for (k, v) in self.map {
-            map.insert(k, v.map(|s| State::from(s.into_bytes())));
+            map.insert(k, v.map(|s| s.into_owned()));
         }
         RelatedContracts { map }
     }
@@ -125,6 +138,18 @@ impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
     type Error = String;
 
     fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+        let related_contracts: HashMap<ContractInstanceId, Option<State<'a>>> =
+            HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
+                let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
+                let state = State::from(val.as_slice().unwrap());
+                (id, Some(state))
+            }));
+        Ok(RelatedContracts::from(related_contracts))
+    }
+}
+
+impl<'a> TryFromTsStd<&'a rmpv::Value> for RelatedContracts<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let related_contracts: HashMap<ContractInstanceId, Option<State<'a>>> =
             HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
                 let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
@@ -261,10 +286,8 @@ impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
     }
 }
 
-impl<'a> TryFrom<&'a rmpv::Value> for UpdateData<'a> {
-    type Error = String;
-
-    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+impl<'a> TryFromTsStd<&'a rmpv::Value> for UpdateData<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let value_map: HashMap<_, _> = HashMap::from_iter(
             value
                 .as_map()
@@ -569,10 +592,8 @@ impl<'a> From<&'a [u8]> for Parameters<'a> {
     }
 }
 
-impl<'a> TryFrom<&'a rmpv::Value> for Parameters<'a> {
-    type Error = String;
-
-    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+impl<'a> TryFromTsStd<&'a rmpv::Value> for Parameters<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let params = value.as_slice().unwrap();
         Ok(Parameters::from(params))
     }
@@ -599,10 +620,14 @@ pub struct State<'a>(
     Cow<'a, [u8]>,
 );
 
-impl<'a> State<'a> {
+impl State<'_> {
     /// Gets the number of bytes of data stored in the `State`.
     pub fn size(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn into_owned(self) -> State<'static> {
+        State(self.0.into_owned().into())
     }
 
     /// Extracts the owned data as a `Vec<u8>`.
@@ -682,6 +707,10 @@ impl<'a> StateDelta<'a> {
     pub fn into_bytes(self) -> Vec<u8> {
         self.0.into_owned()
     }
+
+    pub fn into_owned(self) -> StateDelta<'static> {
+        StateDelta(self.0.into_owned().into())
+    }
 }
 
 impl<'a> From<Vec<u8>> for StateDelta<'a> {
@@ -741,6 +770,10 @@ impl StateSummary<'_> {
     /// Gets the number of bytes of data stored in the `StateSummary`.
     pub fn size(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn into_owned(self) -> StateSummary<'static> {
+        StateSummary(self.0.into_owned().into())
     }
 }
 
@@ -814,12 +847,12 @@ impl ContractCode<'_> {
 
     /// Reference to contract code.
     pub fn data(&self) -> &[u8] {
-        &*self.data
+        &self.data
     }
 
     /// Extracts the owned contract code data as a `Vec<u8>`.
     pub fn into_bytes(self) -> Vec<u8> {
-        self.data.to_owned().to_vec()
+        self.data.to_vec()
     }
 
     /// Returns the `Base58` string representation of a hash.
@@ -831,16 +864,15 @@ impl ContractCode<'_> {
 
     /// Copies the data if not owned and returns an owned version of self.
     pub fn into_owned(self) -> ContractCode<'static> {
-        let data: Cow<'static, _> = Cow::from(self.data.to_owned().to_vec());
         ContractCode {
-            data,
+            data: self.data.into_owned().into(),
             key: self.key,
         }
     }
 
     fn gen_key(data: &[u8]) -> [u8; CONTRACT_KEY_SIZE] {
         let mut hasher = Blake2s256::new();
-        hasher.update(&data);
+        hasher.update(data);
         let key_arr = hasher.finalize();
         debug_assert_eq!(key_arr[..].len(), CONTRACT_KEY_SIZE);
         let mut key = [0; CONTRACT_KEY_SIZE];
@@ -869,10 +901,8 @@ impl<'a> From<&'a [u8]> for ContractCode<'a> {
     }
 }
 
-impl<'a> TryFrom<&'a rmpv::Value> for ContractCode<'a> {
-    type Error = String;
-
-    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+impl<'a> TryFromTsStd<&'a rmpv::Value> for ContractCode<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let data = value.as_slice().unwrap();
         Ok(ContractCode::from(data))
     }
@@ -972,7 +1002,7 @@ impl Display for ContractInstanceId {
 
 /// A complete key specification, that represents a cryptographic hash that identifies the contract.
 #[serde_as]
-#[derive(Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
 pub struct ContractKey {
     instance: ContractInstanceId,
@@ -1058,7 +1088,7 @@ impl ContractKey {
             .into(&mut contract)?;
 
         let mut hasher = Blake2s256::new();
-        hasher.update(&contract);
+        hasher.update(contract);
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
 
@@ -1090,20 +1120,30 @@ impl std::fmt::Display for ContractKey {
     }
 }
 
-impl TryFrom<&rmpv::Value> for ContractKey {
-    type Error = String;
+impl TryFromTsStd<&rmpv::Value> for ContractKey {
+    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
+        let key_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
+            Some(map_value) => HashMap::from_iter(
+                map_value
+                    .iter()
+                    .map(|(key, val)| (key.as_str().unwrap(), val)),
+            ),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding ContractKey, input value is not a map".to_string(),
+                })
+            }
+        };
 
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let key_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-            value
-                .as_map()
-                .unwrap()
-                .iter()
-                .map(|(key, val)| (key.as_str().unwrap(), val)),
-        );
-        let key_instance = *key_map.get("instance").unwrap();
-        let instance_id = key_instance.as_slice().unwrap();
-        let instance_id = bs58::encode(&instance_id).into_string();
+        let instance_id = match key_map.get("instance") {
+            Some(instance_value) => bs58::encode(&instance_value.as_slice().unwrap()).into_string(),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding WrappedContract, instance not found".to_string(),
+                })
+            }
+        };
+
         Ok(ContractKey::from_id(instance_id).unwrap())
     }
 }
@@ -1141,6 +1181,7 @@ pub(crate) mod wasm_interface {
     //! Contains all the types to interface between the host environment and
     //! the wasm module execution.
     use super::*;
+    use crate::WasmLinearMem;
 
     #[repr(i32)]
     enum ResultKind {
@@ -1164,20 +1205,21 @@ pub(crate) mod wasm_interface {
         }
     }
 
+    #[doc(hidden)]
     #[repr(C)]
     #[derive(Debug, Clone, Copy)]
-    pub struct InterfaceResult {
+    pub struct ContractInterfaceResult {
         ptr: i64,
         kind: i32,
         size: u32,
     }
 
-    impl InterfaceResult {
-        #![allow(clippy::let_and_return)]
+    impl ContractInterfaceResult {
         pub unsafe fn unwrap_validate_state_res(
             self,
             mem: WasmLinearMem,
         ) -> Result<ValidateResult, ContractError> {
+            #![allow(clippy::let_and_return)]
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateState => {
@@ -1197,6 +1239,7 @@ pub(crate) mod wasm_interface {
             self,
             mem: WasmLinearMem,
         ) -> Result<bool, ContractError> {
+            #![allow(clippy::let_and_return)]
             let kind = ResultKind::from(self.kind);
             match kind {
                 ResultKind::ValidateDelta => {
@@ -1320,7 +1363,7 @@ pub(crate) mod wasm_interface {
 
     macro_rules! conversion {
         ($value:ty: $kind:expr) => {
-            impl From<$value> for InterfaceResult {
+            impl From<$value> for ContractInterfaceResult {
                 fn from(value: $value) -> Self {
                     let kind = $kind as i32;
                     // TODO: research if there is a safe way to just transmute the pointer in memory

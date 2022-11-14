@@ -590,7 +590,10 @@ enum ProtocolStatus {
 enum SubstreamState {
     /// We haven't started opening the outgoing substream yet.
     /// Contains the initial request we want to send.
-    OutPendingOpen { msg: Message, conn_id: UniqConnId },
+    OutPendingOpen {
+        msg: Box<Message>,
+        conn_id: UniqConnId,
+    },
     /// Waiting for the first message after requesting an outbound open connection.
     AwaitingFirst { conn_id: UniqConnId },
     FreeStream {
@@ -747,8 +750,10 @@ impl ProtocolsHandler for Handler {
                     let conn_id = self.uniq_conn_id;
                     self.uniq_conn_id += 1;
                     // is the first request initiated and/or there are no free substreams, open a new one
-                    self.substreams
-                        .push(SubstreamState::OutPendingOpen { msg, conn_id });
+                    self.substreams.push(SubstreamState::OutPendingOpen {
+                        msg: Box::new(msg),
+                        conn_id,
+                    });
                 }
             }
             HandlerEvent::Outbound(Right(node_ev)) => {
@@ -796,7 +801,7 @@ impl ProtocolsHandler for Handler {
                         };
                         self.substreams
                             .push(SubstreamState::AwaitingFirst { conn_id });
-                        self.pending.push(msg);
+                        self.pending.push(*msg);
                         if self.substreams.is_empty() {
                             self.keep_alive =
                                 KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);

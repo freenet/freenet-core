@@ -8,7 +8,8 @@ use std::{
 use either::Either;
 use futures::future::BoxFuture;
 use locutus_core::{
-    ClientError, ClientEventsProxy, ClientId, ClientRequest, ErrorKind, HostResponse, OpenRequest,
+    ClientError, ClientEventsProxy, ClientId, ClientRequest, ContractRequest, ErrorKind,
+    HostResponse, OpenRequest,
 };
 use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -49,7 +50,7 @@ pub(super) async fn user_fn_handler(
 
 struct StdInput {
     config: LocalNodeCliConfig,
-    contract: WrappedContract,
+    contract: ContractContainer,
     input: File,
     buf: Vec<u8>,
     app_state: AppState,
@@ -69,7 +70,10 @@ impl StdInput {
             .transpose()?
             .unwrap_or_default();
 
-        let contract = WrappedContract::try_from((&*config.contract, params.into()))?;
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::try_from((
+            &*config.contract,
+            params.into(),
+        ))?));
         Ok(StdInput {
             input: File::open(&config.input_file)?,
             config,
@@ -201,31 +205,31 @@ impl TryFrom<&[u8]> for Command {
 
 struct CommandInfo {
     cmd: Command,
-    contract: WrappedContract,
+    contract: ContractContainer,
     input: Option<CommandInput<'static>>,
 }
 
 impl From<CommandInfo> for OpenRequest<'static> {
     fn from(cmd: CommandInfo) -> Self {
+        let key = cmd.contract.key();
         let req = match cmd.cmd {
-            Command::Get => ClientRequest::Get {
-                key: *cmd.contract.key(),
+            Command::Get => ContractRequest::Get {
+                key,
                 fetch_contract: false,
-            },
+            }
+            .into(),
             Command::Put => {
                 let state = cmd.input.unwrap().unwrap_put();
-                ClientRequest::Put {
+                ContractRequest::Put {
                     contract: cmd.contract,
                     state: WrappedState::new(state.into_bytes()),
                     related_contracts: Default::default(),
                 }
+                .into()
             }
             Command::Update => {
                 let data = cmd.input.unwrap().unwrap_delta().into();
-                ClientRequest::Update {
-                    key: *cmd.contract.key(),
-                    data,
-                }
+                ContractRequest::Update { key, data }.into()
             }
             Command::Exit => ClientRequest::Disconnect {
                 cause: Some("shutdown".to_owned()),
@@ -236,9 +240,8 @@ impl From<CommandInfo> for OpenRequest<'static> {
     }
 }
 
-#[allow(clippy::needless_lifetimes)]
 impl ClientEventsProxy for StdInput {
-    fn recv<'a>(&'a mut self) -> BoxFuture<'a, HostIncomingMsg> {
+    fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg> {
         Box::pin(async {
             loop {
                 self.buf.clear();
@@ -331,11 +334,11 @@ impl ClientEventsProxy for StdInput {
         })
     }
 
-    fn send<'a>(
-        &'a mut self,
+    fn send(
+        &mut self,
         _id: ClientId,
         _response: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<'a, Result<(), ClientError>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         unimplemented!()
     }
 }

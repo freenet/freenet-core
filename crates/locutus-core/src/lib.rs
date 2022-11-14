@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(unreachable_code)]
 pub(crate) mod client_events;
 mod config;
 mod contract;
@@ -10,7 +8,7 @@ mod operations;
 mod ring;
 pub mod util;
 
-pub(crate) type WrappedContract = locutus_runtime::prelude::WrappedContract;
+pub type WrappedContract = locutus_runtime::prelude::WrappedContract;
 pub type WrappedState = locutus_runtime::prelude::WrappedState;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -21,11 +19,12 @@ pub use crate::config::Config;
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
-    ClientRequest, ErrorKind, HostResponse, HostResult, OpenRequest, RequestError,
+    ClientRequest, ComponentRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+    HostResult, OpenRequest, RequestError,
 };
 pub use contract::{SQLiteContractHandler, SqlitePool};
 pub use either;
-pub use executor::ContractExecutor;
+pub use executor::Executor;
 pub use libp2p;
 pub use locutus_runtime;
 pub use node::PeerKey;

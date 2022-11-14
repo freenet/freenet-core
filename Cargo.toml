@@ -2,6 +2,14 @@
 resolver = "2"
 members = ["crates/*"]
 
+[workspace.dependencies]
+chacha20poly1305 = "0.10"
+either = "1.8"
+rand = { version = "0.8" }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_with = "2"
+
 [profile.dev.package."*"]
 opt-level = 3
 

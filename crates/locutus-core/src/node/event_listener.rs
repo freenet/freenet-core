@@ -48,13 +48,16 @@ impl<'a> EventLog<'a> {
             }
             Message::Put(PutMsg::RequestPut {
                 contract, target, ..
-            }) => EventKind::Put(
-                PutEvent::Request {
-                    performer: target.peer,
-                    key: *contract.key(),
-                },
-                *msg.id(),
-            ),
+            }) => {
+                let key = contract.key();
+                EventKind::Put(
+                    PutEvent::Request {
+                        performer: target.peer,
+                        key,
+                    },
+                    *msg.id(),
+                )
+            }
             Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => EventKind::Put(
                 PutEvent::PutSuccess {
                     requester: op_storage.ring.peer_key,
@@ -70,7 +73,7 @@ impl<'a> EventLog<'a> {
             }) => EventKind::Put(
                 PutEvent::BroadcastEmitted {
                     broadcast_to: broadcast_to.clone(),
-                    key: *key,
+                    key: key.clone(),
                     value: new_value.clone(),
                 },
                 *msg.id(),
@@ -83,7 +86,7 @@ impl<'a> EventLog<'a> {
             }) => EventKind::Put(
                 PutEvent::BroadcastReceived {
                     requester: sender.peer,
-                    key: *key,
+                    key: key.clone(),
                     value: new_value.clone(),
                 },
                 *msg.id(),
@@ -92,7 +95,7 @@ impl<'a> EventLog<'a> {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
-            }) => EventKind::Get { key: *key },
+            }) => EventKind::Get { key: key.clone() },
             _ => EventKind::Unknown,
         };
         EventLog {
@@ -281,10 +284,10 @@ mod test_utils {
                 let mut was_received = false;
                 for ev in events {
                     match ev {
-                        PutEvent::BroadcastEmitted { key, .. } if key == for_key => {
+                        PutEvent::BroadcastEmitted { key, .. } if key.clone() == *for_key => {
                             was_emitted = true;
                         }
-                        PutEvent::BroadcastReceived { key, .. } if key == for_key => {
+                        PutEvent::BroadcastReceived { key, .. } if key.clone() == *for_key => {
                             was_received = true;
                         }
                         _ => {}

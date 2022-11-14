@@ -16,7 +16,7 @@ pub enum StateStoreError {
 
 #[async_trait::async_trait]
 #[allow(clippy::type_complexity)]
-pub trait StateStorage: Clone {
+pub trait StateStorage {
     type Error;
     async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error>;
     async fn store_params(
@@ -31,7 +31,6 @@ pub trait StateStorage: Clone {
     ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>;
 }
 
-#[derive(Clone)]
 pub struct StateStore<S: StateStorage> {
     state_mem_cache: AsyncCache<ContractKey, WrappedState>,
     // params_mem_cache: AsyncCache<ContractKey, Parameters<'static>>,
@@ -65,12 +64,11 @@ where
         params: Option<Parameters<'static>>,
     ) -> Result<(), StateStoreError> {
         self.store
-            .store(key, state.clone())
+            .store(key.clone(), state.clone())
             .await
             .map_err(Into::into)?;
         let cost = state.size() as i64;
-        self.state_mem_cache.insert(key, state, cost).await;
-
+        self.state_mem_cache.insert(key.clone(), state, cost).await;
         if let Some(params) = params {
             self.store
                 .store_params(key, params.clone())
@@ -79,7 +77,6 @@ where
             // let cost = params.size();
             // self.params_mem_cache.insert(key, params, cost as i64).await;
         }
-
         Ok(())
     }
 

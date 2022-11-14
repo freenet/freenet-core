@@ -1,9 +1,13 @@
 use std::{fs::File, io::Read, sync::Arc};
 
 use locutus_core::{
-    locutus_runtime::StateDelta, ClientId, ClientRequest, Config, ContractExecutor, SqlitePool,
+    locutus_runtime::StateDelta, ClientId, ClientRequest, Config, ContractRequest, Executor,
+    SqlitePool,
 };
-use locutus_runtime::{ContractInstanceId, ContractStore, Parameters, StateStore, WrappedContract};
+use locutus_runtime::{
+    ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore, WasmAPIVersion,
+    WrappedContract,
+};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},
@@ -34,7 +38,10 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
         File::open(&config.state)?.read_to_end(&mut buf)?;
         buf.into()
     };
-    let contract = WrappedContract::new(Arc::new(code), params);
+    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+        Arc::new(code),
+        params,
+    )));
     let related_contracts = if let Some(_related) = config.related_contracts {
         todo!("use `related` contracts")
     } else {
@@ -42,11 +49,12 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
     };
 
     println!("Putting contract {}", contract.key());
-    let request = ClientRequest::Put {
+    let request = ContractRequest::Put {
         contract,
         state,
         related_contracts,
-    };
+    }
+    .into();
     execute_command(request, other).await
 }
 
@@ -61,7 +69,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), DynEr
         File::open(&config.delta)?.read_to_end(&mut buf)?;
         StateDelta::from(buf).into()
     };
-    let request = ClientRequest::Update { key, data };
+    let request = ContractRequest::Update { key, data }.into();
     execute_command(request, other).await
 }
 
@@ -74,7 +82,7 @@ async fn execute_command(
         .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
     let contract_store = ContractStore::new(data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
-    let mut executor = ContractExecutor::new(contract_store, state_store, || {}).await?;
+    let mut executor = Executor::new(contract_store, state_store, || {}).await?;
 
     executor
         .handle_request(ClientId::new(0), request, None)

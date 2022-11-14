@@ -365,6 +365,7 @@ mod test {
         Ok((store, instance))
     }
 
+    // FIXME
     #[allow(dead_code)]
     fn build_test_mod_with_wasi() -> Result<(Store, Instance), Box<dyn std::error::Error>> {
         let wasm_bytes = wat2wasm(TEST_MODULE.as_bytes())?;
@@ -400,13 +401,13 @@ mod test {
         };
 
         let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
-        writer.write(&[1u8, 2])?;
+        writer.write([1u8, 2])?;
         let mut reader = writer.shared();
         let r: [u8; 2] = unsafe { reader.read() };
         assert_eq!(r, [1, 2]);
 
         let mut writer = unsafe { reader.exclusive() };
-        writer.write(&[3u8, 4])?;
+        writer.write([3u8, 4])?;
         let mut reader = writer.shared();
         let r: [u8; 2] = unsafe { reader.read() };
         assert_eq!(r, [3, 4]);
@@ -424,13 +425,13 @@ mod test {
         };
 
         let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
-        writer.write(&[1u8, 2])?;
+        writer.write([1u8, 2])?;
         let mut reader = writer.shared();
         let r = reader.read_bytes(2);
         assert_eq!(r, &[1, 2]);
 
         let mut writer = unsafe { reader.exclusive() };
-        writer.write(&[3u8, 4])?;
+        writer.write([3u8, 4])?;
         let mut reader = writer.shared();
         let r = reader.read_bytes(2);
         assert_eq!(r, &[3, 4]);
@@ -449,7 +450,7 @@ mod test {
 
         let ptr = {
             let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
-            writer.write(&[1u8, 2])?;
+            writer.write([1u8, 2])?;
             writer.ptr()
         };
 

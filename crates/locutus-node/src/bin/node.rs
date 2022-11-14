@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use locutus_core::{
     locutus_runtime::{ContractStore, StateStore},
-    Config, ContractExecutor, SqlitePool,
+    Config, Executor, SqlitePool,
 };
 use locutus_dev::config::OperationMode;
 use tracing::metadata::LevelFilter;
@@ -27,7 +27,7 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
         .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
-    let executor = ContractExecutor::new(contract_store, state_store, || {
+    let executor = Executor::new(contract_store, state_store, || {
         locutus_core::util::set_cleanup_on_exit().unwrap();
     })
     .await?;

@@ -1,15 +1,17 @@
+#![allow(unused)] // FIXME: remove this
+
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use locutus_runtime::{ContractStore, Parameters, StateStorage, StateStore};
+use locutus_runtime::{ContractContainer, ContractStore, Parameters, StateStorage, StateStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
-use crate::{ClientRequest, HostResponse, WrappedContract, WrappedState};
+use crate::{ClientRequest, HostResponse, WrappedState};
 pub(crate) use sqlite::SqlDbError;
 
 const MAX_MEM_CACHE: i64 = 10_000_000;
@@ -147,7 +149,7 @@ impl<CErr> ContractHandlerChannel<CErr, CHListenerHalve> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreResponse {
     pub state: Option<WrappedState>,
-    pub contract: Option<WrappedContract>,
+    pub contract: Option<ContractContainer>,
 }
 
 struct InternalCHEvent<CErr> {
@@ -177,7 +179,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
         response: Result<StoreResponse, Err>,
     },
     /// Store a contract in the local store.
-    Cache(WrappedContract),
+    Cache(ContractContainer),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError<Err>>),
 }
@@ -187,7 +189,7 @@ pub(in crate::contract) mod sqlite {
 
     use futures::{Future, FutureExt};
     use locutus_runtime::{
-        ContractRuntimeError, ContractStore, ExecError, RuntimeInterface, StateStorage,
+        ContractError, ContractExecError, ContractRuntimeInterface, ContractStore, StateStorage,
         StateStoreError, ValidateResult,
     };
     use once_cell::sync::Lazy;
@@ -197,7 +199,11 @@ pub(in crate::contract) mod sqlite {
     };
 
     use super::*;
-    use crate::{config::CONFIG, contract::test::MockRuntime};
+    use crate::{
+        client_events::{ContractRequest, ContractResponse},
+        config::CONFIG,
+        contract::test::MockRuntime,
+    };
 
     // Is fine to clone this as it wraps by an Arc.
     static POOL: Lazy<SqlitePool> = Lazy::new(|| {
@@ -325,7 +331,7 @@ pub(in crate::contract) mod sqlite {
         #[error(transparent)]
         SqliteError(#[from] sqlx::Error),
         #[error(transparent)]
-        RuntimeError(#[from] ContractRuntimeError),
+        RuntimeError(#[from] ContractError),
         #[error(transparent)]
         IOError(#[from] std::io::Error),
         #[error(transparent)]
@@ -342,7 +348,7 @@ pub(in crate::contract) mod sqlite {
 
     impl<R> SQLiteContractHandler<R>
     where
-        R: RuntimeInterface + 'static,
+        R: ContractRuntimeInterface + 'static,
     {
         /// number of max bytes allowed to be stored in the cache
         const MEM_SIZE: u32 = 10_000_000;
@@ -366,7 +372,7 @@ pub(in crate::contract) mod sqlite {
             &self,
             key: &ContractKey,
             fetch_contract: bool,
-        ) -> Result<(WrappedState, Option<WrappedContract>), SqlDbError> {
+        ) -> Result<(WrappedState, Option<ContractContainer>), SqlDbError> {
             let state = self.state_store.get(key).await?;
             let contract = fetch_contract
                 .then(|| {
@@ -400,7 +406,7 @@ pub(in crate::contract) mod sqlite {
 
     impl<R> ContractHandler for SQLiteContractHandler<R>
     where
-        R: RuntimeInterface + Send + Sync + 'static,
+        R: ContractRuntimeInterface + Send + Sync + 'static,
         Self: From<ContractHandlerChannel<SqlDbError, CHListenerHalve>>,
     {
         type Error = SqlDbError;
@@ -422,45 +428,51 @@ pub(in crate::contract) mod sqlite {
         ) -> BoxFuture<'a, Result<HostResponse, Self::Error>> {
             async move {
                 match req {
-                    ClientRequest::Get {
-                        key,
-                        fetch_contract,
-                    } => {
-                        let (state, contract) = self.get_contract(&key, fetch_contract).await?;
-                        Ok(HostResponse::GetResponse { contract, state })
-                    }
-                    ClientRequest::Put {
-                        contract,
-                        state,
-                        related_contracts,
-                    } => {
-                        match self.get_contract(contract.key(), false).await {
-                            Ok((_old_state, _)) => {
-                                return Err(ContractRuntimeError::from(ExecError::DoublePut(
-                                    *contract.key(),
-                                ))
-                                .into())
-                            }
-                            Err(SqlDbError::ContractNotFound) => {}
-                            Err(other) => return Err(other),
+                    ClientRequest::ContractOp(ops) => match ops {
+                        ContractRequest::Get {
+                            key,
+                            fetch_contract,
+                        } => {
+                            let (state, contract) = self.get_contract(&key, fetch_contract).await?;
+                            Ok(ContractResponse::GetResponse { contract, state }.into())
                         }
-
-                        let result = self.runtime.validate_state(
-                            contract.key(),
-                            contract.params(),
-                            &state,
+                        ContractRequest::Put {
+                            contract,
+                            state,
                             related_contracts,
-                        )?;
-                        // FIXME: should deal with additional related contracts requested
-                        if result != ValidateResult::Valid {
-                            todo!("return error");
+                        } => {
+                            let key = contract.key();
+                            let params = contract.params();
+                            match self.get_contract(&key, false).await {
+                                Ok((_old_state, _)) => {
+                                    return Err(ContractError::from(ContractExecError::DoublePut(
+                                        key,
+                                    ))
+                                    .into())
+                                }
+                                Err(SqlDbError::ContractNotFound) => {}
+                                Err(other) => return Err(other),
+                            }
+
+                            let result = self.runtime.validate_state(
+                                &key,
+                                &params,
+                                &state,
+                                related_contracts,
+                            )?;
+                            // FIXME: should deal with additional related contracts requested
+                            if result != ValidateResult::Valid {
+                                todo!("return error");
+                            }
+                            let _params: Parameters<'static> = params.clone().into_bytes().into();
+                            self.state_store.store(key, state, None).await?;
+                            todo!()
                         }
-                        let _params: Parameters<'static> =
-                            contract.params().clone().into_bytes().into();
-                        self.state_store.store(*contract.key(), state, None).await?;
-                        todo!()
-                    }
-                    _ => unimplemented!(),
+                        _ => unreachable!(),
+                    },
+                    ClientRequest::ComponentOp(_op) => unreachable!(),
+                    ClientRequest::Disconnect { .. } => unreachable!(),
+                    ClientRequest::GenerateRandData { bytes } => unreachable!(),
                 }
             }
             .boxed()
@@ -475,8 +487,11 @@ pub(in crate::contract) mod sqlite {
     mod test {
         use std::sync::Arc;
 
-        use locutus_runtime::StateDelta;
+        use crate::WrappedContract;
+        use locutus_runtime::{StateDelta, WasmAPIVersion};
         use locutus_stdlib::prelude::ContractCode;
+
+        use crate::client_events::ContractRequest;
 
         use super::sqlite::SQLiteContractHandler;
         use super::*;
@@ -498,26 +513,33 @@ pub(in crate::contract) mod sqlite {
 
             // Generate a contract
             let contract_bytes = b"Test contract value".to_vec();
-            let contract: WrappedContract = WrappedContract::new(
-                Arc::new(ContractCode::from(contract_bytes.clone())),
-                Parameters::from(vec![]),
-            );
+            let contract: ContractContainer =
+                ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+                    Arc::new(ContractCode::from(contract_bytes.clone())),
+                    Parameters::from(vec![]),
+                )));
 
             // Get contract parts
             let state = WrappedState::new(contract_bytes.clone());
             handler
-                .handle_request(ClientRequest::Put {
-                    contract: contract.clone(),
-                    state: state.clone(),
-                    related_contracts: Default::default(),
-                })
+                .handle_request(
+                    ContractRequest::Put {
+                        contract: contract.clone(),
+                        state: state.clone(),
+                        related_contracts: Default::default(),
+                    }
+                    .into(),
+                )
                 .await?
                 .unwrap_put();
             let (get_result_value, _) = handler
-                .handle_request(ClientRequest::Get {
-                    key: *contract.key(),
-                    fetch_contract: false,
-                })
+                .handle_request(
+                    ContractRequest::Get {
+                        key: contract.key().clone(),
+                        fetch_contract: false,
+                    }
+                    .into(),
+                )
                 .await?
                 .unwrap_get();
             assert_eq!(state, get_result_value);
@@ -525,13 +547,16 @@ pub(in crate::contract) mod sqlite {
             // Update the contract state with a new delta
             let delta = StateDelta::from(b"New test contract value".to_vec());
             handler
-                .handle_request(ClientRequest::Update {
-                    key: *contract.key(),
-                    data: delta.into(),
-                })
+                .handle_request(
+                    ContractRequest::Update {
+                        key: contract.key().clone(),
+                        data: delta.into(),
+                    }
+                    .into(),
+                )
                 .await?;
             // let (new_get_result_value, _) = handler
-            //     .handle_request(ClientRequest::Get {
+            //     .handle_request(ContractOps::Get {
             //         key: *contract.key(),
             //         contract: false,
             //     })
@@ -547,7 +572,7 @@ pub(in crate::contract) mod sqlite {
 pub mod test {
     use std::sync::Arc;
 
-    use locutus_runtime::ContractStore;
+    use locutus_runtime::{ContractStore, WasmAPIVersion};
     use locutus_stdlib::prelude::ContractCode;
 
     use super::*;
@@ -557,6 +582,7 @@ pub mod test {
             test::{MemKVStore, SimStoreError},
             MockRuntime,
         },
+        WrappedContract,
     };
 
     #[derive(Debug, thiserror::Error)]
@@ -647,11 +673,12 @@ pub mod test {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
         let h = GlobalExecutor::spawn(async move {
+            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
+                Parameters::from(vec![]),
+            )));
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(WrappedContract::new(
-                    Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
-                    Parameters::from(vec![]),
-                )))
+                .send_to_handler(ContractHandlerEvent::Cache(contract))
                 .await
         });
 
@@ -660,17 +687,15 @@ pub mod test {
                 .await??;
 
         if let ContractHandlerEvent::Cache(contract) = ev {
-            let data: Vec<u8> = contract.try_into()?;
+            let data: Vec<u8> = contract.data();
             assert_eq!(data, vec![0, 1, 2, 3]);
+            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(data)),
+                Parameters::from(vec![]),
+            )));
             tokio::time::timeout(
                 Duration::from_millis(100),
-                rcv_halve.send_to_listener(
-                    id,
-                    ContractHandlerEvent::Cache(WrappedContract::new(
-                        Arc::new(ContractCode::from(data)),
-                        Parameters::from(vec![]),
-                    )),
-                ),
+                rcv_halve.send_to_listener(id, ContractHandlerEvent::Cache(contract)),
             )
             .await??;
         } else {
@@ -678,7 +703,7 @@ pub mod test {
         }
 
         if let ContractHandlerEvent::Cache(contract) = h.await?? {
-            let data: Vec<u8> = contract.try_into()?;
+            let data: Vec<u8> = contract.data();
             assert_eq!(data, vec![0, 1, 2, 3]);
         } else {
             anyhow::bail!("invalid event!");

@@ -8,6 +8,7 @@ use libp2p::{
 };
 use locutus_core::*;
 use locutus_runtime::prelude::{WrappedContract, WrappedState};
+use locutus_runtime::{ContractContainer, WasmAPIVersion};
 use locutus_stdlib::prelude::{ContractCode, Parameters};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -40,31 +41,37 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    let contract = WrappedContract::new(
+    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
         Arc::new(ContractCode::from(vec![7, 3, 9, 5])),
         Parameters::from(vec![]),
-    );
-    let key = *contract.key();
+    )));
+    let key = contract.key().clone();
     let init_val = WrappedState::new(vec![1, 2, 3, 4]);
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     manager
         .tx_gw_ev
-        .send(ClientRequest::Put {
-            state: init_val,
-            contract: contract.clone(),
-            related_contracts: Default::default(),
-        })
+        .send(
+            ContractRequest::Put {
+                state: init_val,
+                contract: contract.clone(),
+                related_contracts: Default::default(),
+            }
+            .into(),
+        )
         .await
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     manager
         .tx_gw_ev
-        .send(ClientRequest::Get {
-            key,
-            fetch_contract: false,
-        })
+        .send(
+            ContractRequest::Get {
+                key,
+                fetch_contract: false,
+            }
+            .into(),
+        )
         .await
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -72,11 +79,14 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
     let second_val = WrappedState::new(vec![2, 3, 1, 4]);
     manager
         .tx_node_ev
-        .send(ClientRequest::Put {
-            state: second_val,
-            contract,
-            related_contracts: Default::default(),
-        })
+        .send(
+            ContractRequest::Put {
+                state: second_val,
+                contract,
+                related_contracts: Default::default(),
+            }
+            .into(),
+        )
         .await
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(300)).await;
