@@ -64,12 +64,10 @@ struct NodeConfig {
     contract_data_dir: Option<PathBuf>,
 
     /// Address to bind to
-    #[clap(short, long)]
-    #[arg(default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    #[arg(long, short, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     bind: IpAddr,
 
     /// Port to expose api on
-    #[clap(short, long)]
-    #[arg(default_value_t = 50509)]
+    #[arg(long, short, default_value_t = 50509)]
     port: u16,
 }
