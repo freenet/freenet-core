@@ -324,7 +324,8 @@ where
                                     contract.clone(),
                                 ))
                                 .await?;
-                            log::debug!("Contract `{}` successfully put", contract.key());
+                            let key = contract.key();
+                            log::debug!("Contract `{}` successfully put", key);
                         } else {
                             // no contract, consider this like an error ignoring the incoming update value
                             log::warn!(
@@ -657,6 +658,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use locutus_runtime::{ContractContainer, WasmAPIVersion};
     use std::collections::HashMap;
 
     use super::*;
@@ -690,7 +692,10 @@ mod test {
         };
 
         let gw_0 = NodeSpecification {
-            owned_contracts: vec![(contract, contract_val)],
+            owned_contracts: vec![(
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
+                contract_val,
+            )],
             non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
@@ -779,7 +784,10 @@ mod test {
         };
 
         let node_1 = NodeSpecification {
-            owned_contracts: vec![(contract, contract_val)],
+            owned_contracts: vec![(
+                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
+                contract_val,
+            )],
             non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),

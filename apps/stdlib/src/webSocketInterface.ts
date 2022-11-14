@@ -90,10 +90,11 @@ export class Key {
  * A contract and its key. It includes the contract data/code and the parameters run along with it.
  * @public
  */
-export type Contract = {
+export type ContractV1 = {
   key: Key;
   data: Uint8Array;
   parameters: Uint8Array;
+  version: String
 };
 
 /**
@@ -139,7 +140,7 @@ export type RelatedContracts = Map<ContractInstanceId, State | null>;
  * @public
  */
 export type PutRequest = {
-  contract: Contract;
+  container: ContractContainer;
   state: State;
   relatedContracts: RelatedContracts;
 };
@@ -390,7 +391,7 @@ export interface UpdateResponse {
  */
 export interface GetResponse {
   readonly kind: "get";
-  contract?: Contract;
+  contract?: ContractV1;
   state: State;
 }
 
@@ -671,3 +672,8 @@ export class HostResponse {
     return state as Uint8Array;
   }
 }
+
+// Versioning:
+type WasmContract = ContractV1
+
+type ContractContainer = WasmContract;

@@ -96,6 +96,7 @@ async fn execute_command(
             }
         }
         ClientRequest::Disconnect { .. } => return Ok(true),
+        ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
     }
     Ok(false)
 }

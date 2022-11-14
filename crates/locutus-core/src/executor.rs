@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -77,7 +78,7 @@ impl Executor {
     pub async fn preload(
         &mut self,
         cli_id: ClientId,
-        contract: WrappedContract,
+        contract: ContractContainer,
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
     ) {
@@ -116,6 +117,11 @@ impl Executor {
                 }
                 Err(Either::Left(RequestError::Disconnect))
             }
+            ClientRequest::GenerateRandData { bytes } => {
+                let mut output = vec![0; bytes];
+                locutus_runtime::util::generate_random_bytes(&mut output);
+                Ok(HostResponse::GenerateRandData(output))
+            }
         }
     }
 
@@ -141,17 +147,18 @@ impl Executor {
                 //          1. through the arbitraur mechanism
                 //          2. a new func which compared two summaries and gives the most fresh
                 //        you can request to several nodes and determine which node has a fresher ver
+                let key = contract.key();
+                let params = contract.params();
                 self.runtime
                     .contract_store
                     .store_contract(contract.clone())
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
 
-                let key = contract.key();
-                log::debug!("executing with params: {:?}", contract.params());
+                log::debug!("executing with params: {:?}", params);
                 let is_valid = self
                     .runtime
-                    .validate_state(key, contract.params(), &state, related_contracts)
+                    .validate_state(&key, &params, &state, related_contracts)
                     .map_err(Into::into)
                     .map_err(Either::Right)?
                     == ValidateResult::Valid;
@@ -169,11 +176,11 @@ impl Executor {
                     })?;
 
                 self.contract_state
-                    .store(key.clone(), state.clone(), Some(contract.params().clone()))
+                    .store(key.clone(), state.clone(), Some(params.clone()))
                     .await
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-                self.send_update_notification(key, contract.params(), &state)
+                self.send_update_notification(&key, &params, &state)
                     .await
                     .map_err(|_| {
                         Either::Left(
@@ -257,9 +264,19 @@ impl Executor {
 
     fn component_op<'a>(&mut self, req: ComponentRequest<'a>) -> Response<'a> {
         match req {
-            ComponentRequest::RegisterComponent(component) => {
+            ComponentRequest::RegisterComponent {
+                component,
+                cipher,
+                nonce,
+            } => {
+                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
                 let key = component.key().clone();
-                match self.runtime.register_component(component) {
+
+                let arr = GenericArray::from_slice(&cipher);
+                let cipher = XChaCha20Poly1305::new(arr);
+                let nonce = GenericArray::from_slice(&nonce).to_owned();
+
+                match self.runtime.register_component(component, cipher, nonce) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
                         log::error!("failed registering component `{key}`: {err}");

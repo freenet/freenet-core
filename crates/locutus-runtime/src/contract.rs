@@ -1,13 +1,13 @@
 use locutus_stdlib::prelude::{
     ContractCode, ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta,
-    StateSummary, UpdateData, UpdateModification, ValidateResult,
+    StateSummary, TryFromTsStd, UpdateData, UpdateModification, ValidateResult,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::{borrow::Borrow, fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
 use wasmer::NativeFunc;
 
-use crate::{ContractError, ContractExecError, RuntimeInnerError, RuntimeResult};
+use crate::{ContractError, ContractExecError, RuntimeInnerError, RuntimeResult, WsApiError};
 
 type FfiReturnTy = i64;
 
@@ -167,29 +167,51 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for WrappedContract {
     }
 }
 
-impl TryFrom<&rmpv::Value> for WrappedContract {
-    type Error = String;
-
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let contract_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-            value
-                .as_map()
-                .unwrap()
-                .iter()
-                .map(|(key, val)| (key.as_str().unwrap(), val)),
-        );
-
-        let key_value = *contract_map.get("key").unwrap();
-        let key = ContractKey::try_from(key_value).unwrap();
-
-        let contract_data = contract_map.get("data").unwrap();
-        let data = {
-            let contract = ContractCode::try_from(*contract_data).unwrap().into_owned();
-            Arc::new(contract)
+impl TryFromTsStd<&rmpv::Value> for WrappedContract {
+    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
+        let contract_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
+            Some(map_value) => HashMap::from_iter(
+                map_value
+                    .iter()
+                    .map(|(key, val)| (key.as_str().unwrap(), val)),
+            ),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding WrappedContract, input value is not a map".to_string(),
+                })
+            }
         };
 
-        let contract_params = contract_map.get("parameters").unwrap();
-        let params = Parameters::try_from(*contract_params).unwrap().into_owned();
+        let key = match contract_map.get("key") {
+            Some(key_value) => ContractKey::try_decode(*key_value).unwrap(),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding WrappedContract, key not found".to_string(),
+                })
+            }
+        };
+
+        let data = match contract_map.get("data") {
+            Some(contract_data_value) => Arc::new(
+                ContractCode::try_decode(*contract_data_value)
+                    .unwrap()
+                    .into_owned(),
+            ),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding WrappedContract, data not found".to_string(),
+                })
+            }
+        };
+
+        let params = match contract_map.get("parameters") {
+            Some(params_value) => Parameters::try_decode(*params_value).unwrap().into_owned(),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding WrappedContract, parameters not found".to_string(),
+                })
+            }
+        };
 
         Ok(Self { data, params, key })
     }
@@ -271,10 +293,8 @@ impl From<Vec<u8>> for WrappedState {
     }
 }
 
-impl TryFrom<&rmpv::Value> for WrappedState {
-    type Error = String;
-
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
+impl TryFromTsStd<&rmpv::Value> for WrappedState {
+    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
         let state = value.as_slice().unwrap().to_vec();
         Ok(WrappedState::from(state))
     }
@@ -498,7 +518,10 @@ mod test {
     use locutus_stdlib::prelude::env_logger;
 
     use super::*;
-    use crate::{contract::WrappedContract, secrets_store::SecretsStore, ContractStore, Runtime};
+    use crate::{
+        contract::WrappedContract, secrets_store::SecretsStore, ContractContainer, ContractStore,
+        Runtime, WasmAPIVersion,
+    };
     use std::{path::PathBuf, sync::atomic::AtomicUsize};
 
     const TEST_CONTRACT_1: &str = "test_contract_1";
@@ -533,8 +556,8 @@ mod test {
     fn set_up_test_contract(name: &str) -> RuntimeResult<(ContractStore, ContractKey)> {
         let _ = env_logger::try_init();
         let mut store = ContractStore::new(test_dir(), 10_000)?;
-        let contract = get_test_contract(name);
-        let key = contract.key().clone();
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name)));
+        let key = contract.key();
         store.store_contract(contract)?;
         Ok((store, key))
     }

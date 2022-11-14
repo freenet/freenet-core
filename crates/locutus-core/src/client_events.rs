@@ -1,18 +1,20 @@
 use futures::future::BoxFuture;
 use locutus_runtime::{
-    ComponentKey, InboundComponentMsg, OutboundComponentMsg, RelatedContracts, UpdateData,
+    ComponentKey, ContractContainer, InboundComponentMsg, OutboundComponentMsg, RelatedContracts,
+    UpdateData,
 };
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::{error::Error as StdError, fmt::Display};
 
 use locutus_runtime::prelude::{ContractKey, StateSummary};
+use locutus_runtime::prelude::{TryFromTsStd, WsApiError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{WrappedContract, WrappedState};
+use crate::WrappedState;
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -78,12 +80,6 @@ pub enum ErrorKind {
     UnknownClient(ClientId),
 }
 
-impl ErrorKind {
-    fn deserialization(cause: String) -> Self {
-        Self::DeserializationError { cause }
-    }
-}
-
 impl warp::reject::Reject for ErrorKind {}
 
 impl Display for ClientError {
@@ -140,7 +136,11 @@ pub trait ClientEventsProxy {
 
 /// A response to a previous [`ClientRequest`]
 #[derive(Serialize, Deserialize, Debug)]
-pub enum HostResponse<'a, T: Borrow<[u8]> = WrappedState> {
+pub enum HostResponse<'a, T = WrappedState, U = Vec<u8>>
+where
+    T: Borrow<[u8]>,
+    U: Borrow<[u8]>,
+{
     ContractResponse(
         #[serde(bound(deserialize = "ContractResponse<T>: Deserialize<'de>"))] ContractResponse<T>,
     ),
@@ -149,9 +149,12 @@ pub enum HostResponse<'a, T: Borrow<[u8]> = WrappedState> {
         #[serde(borrow)]
         values: Vec<OutboundComponentMsg<'a>>,
     },
+    GenerateRandData(U),
     /// A requested action which doesn't require an answer was performed successfully.
     Ok,
 }
+
+impl<T> HostResponse<'_, T> where T: Borrow<[u8]> {}
 
 impl HostResponse<'_> {
     pub fn into_owned(self) -> HostResponse<'static> {
@@ -164,6 +167,7 @@ impl HostResponse<'_> {
                     .map(OutboundComponentMsg::into_owned)
                     .collect(),
             },
+            HostResponse::GenerateRandData(val) => HostResponse::GenerateRandData(val),
             HostResponse::Ok => HostResponse::Ok,
         }
     }
@@ -176,7 +180,7 @@ impl HostResponse<'_> {
         }
     }
 
-    pub fn unwrap_get(self) -> (WrappedState, Option<WrappedContract>) {
+    pub fn unwrap_get(self) -> (WrappedState, Option<ContractContainer>) {
         if let Self::ContractResponse(ContractResponse::GetResponse {
             contract, state, ..
         }) = self
@@ -207,32 +211,7 @@ impl std::fmt::Display for HostResponse<'_> {
             },
             HostResponse::ComponentResponse { .. } => write!(f, "component responses"),
             HostResponse::Ok => write!(f, "ok response"),
-        }
-    }
-}
-
-impl<'a> TryFrom<HostResponse<'a>> for HostResponse<'a, Cow<'a, [u8]>> {
-    type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
-    fn try_from(owned: HostResponse<'a>) -> Result<Self, Self::Error> {
-        match owned {
-            HostResponse::ContractResponse(res) => match res {
-                ContractResponse::PutResponse { key } => {
-                    Ok(ContractResponse::PutResponse { key }.into())
-                }
-                ContractResponse::UpdateResponse { key, summary } => {
-                    Ok(ContractResponse::UpdateResponse { key, summary }.into())
-                }
-                ContractResponse::GetResponse { .. } => {
-                    Err("self outlives borrowed content".into())
-                }
-                ContractResponse::UpdateNotification { key, update } => {
-                    Ok(ContractResponse::UpdateNotification { key, update }.into())
-                }
-            },
-            HostResponse::ComponentResponse { key, values } => {
-                Ok(HostResponse::ComponentResponse { key, values })
-            }
-            HostResponse::Ok => Ok(HostResponse::Ok),
+            HostResponse::GenerateRandData(_) => write!(f, "random bytes"),
         }
     }
 }
@@ -241,7 +220,7 @@ impl<'a> TryFrom<HostResponse<'a>> for HostResponse<'a, Cow<'a, [u8]>> {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum ContractResponse<T: Borrow<[u8]> = WrappedState> {
     GetResponse {
-        contract: Option<WrappedContract>,
+        contract: Option<ContractContainer>,
         state: T,
     },
     PutResponse {
@@ -301,6 +280,7 @@ pub enum ContractError {
 pub enum ClientRequest<'a> {
     ComponentOp(#[serde(borrow)] ComponentRequest<'a>),
     ContractOp(#[serde(borrow)] ContractRequest<'a>),
+    GenerateRandData { bytes: usize },
     Disconnect { cause: Option<String> },
 }
 
@@ -340,6 +320,7 @@ impl ClientRequest<'_> {
                 let op = op.into_owned();
                 ClientRequest::ComponentOp(op)
             }
+            ClientRequest::GenerateRandData { bytes } => ClientRequest::GenerateRandData { bytes },
             ClientRequest::Disconnect { cause } => ClientRequest::Disconnect { cause },
         }
     }
@@ -347,90 +328,13 @@ impl ClientRequest<'_> {
     pub fn is_disconnect(&self) -> bool {
         matches!(self, Self::Disconnect { .. })
     }
-
-    /// Deserializes a `ClientRequest` from a MessagePack encoded request.  
-    pub fn decode_mp(msg: &[u8]) -> Result<Self, ErrorKind> {
-        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
-            ErrorKind::DeserializationError {
-                cause: format!("{e}"),
-            }
-        })?;
-
-        let req: ClientRequest = {
-            if value.is_map() {
-                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-                    value
-                        .as_map()
-                        .unwrap()
-                        .iter()
-                        .map(|(key, val)| (key.as_str().unwrap(), val)),
-                );
-
-                let mut map_keys = Vec::from_iter(value_map.keys().copied());
-                map_keys.sort();
-                match map_keys.as_slice() {
-                    ["contract", "relatedContracts", "state"] => {
-                        let contract = value_map.get("contract").unwrap();
-                        ContractRequest::Put {
-                            contract: WrappedContract::try_from(*contract)
-                                .map_err(ErrorKind::deserialization)?,
-                            state: WrappedState::try_from(*value_map.get("state").unwrap())
-                                .map_err(ErrorKind::deserialization)?,
-                            related_contracts: RelatedContracts::try_from(
-                                *value_map.get("relatedContracts").unwrap(),
-                            )
-                            .map_err(ErrorKind::deserialization)?
-                            .into_owned(),
-                        }
-                        .into()
-                    }
-                    ["data", "key"] => ContractRequest::Update {
-                        key: ContractKey::try_from(*value_map.get("key").unwrap())
-                            .map_err(ErrorKind::deserialization)?,
-                        data: UpdateData::try_from(*value_map.get("data").unwrap())
-                            .map_err(ErrorKind::deserialization)?
-                            .into_owned(),
-                    }
-                    .into(),
-                    ["fetchContract", "key"] => ContractRequest::Get {
-                        key: ContractKey::try_from(*value_map.get("key").unwrap())
-                            .map_err(ErrorKind::deserialization)?,
-                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
-                    }
-                    .into(),
-                    ["key"] => ContractRequest::Subscribe {
-                        key: ContractKey::try_from(*value_map.get("key").unwrap())
-                            .map_err(ErrorKind::deserialization)?,
-                    }
-                    .into(),
-                    ["cause"] => ClientRequest::Disconnect {
-                        cause: Some(
-                            value_map
-                                .get("cause")
-                                .unwrap()
-                                .as_str()
-                                .unwrap()
-                                .to_string(),
-                        ),
-                    },
-                    _ => unreachable!(),
-                }
-            } else {
-                return Err(ErrorKind::DeserializationError {
-                    cause: "value is not a map".into(),
-                });
-            }
-        };
-
-        Ok(req)
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum ContractRequest<'a> {
     /// Insert a new value in a contract corresponding with the provided key.
     Put {
-        contract: WrappedContract,
+        contract: ContractContainer,
         /// Value to upsert in the contract.
         state: WrappedState,
         /// Related contracts.
@@ -461,6 +365,71 @@ impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
     }
 }
 
+/// Deserializes a `ContractRequest` from a MessagePack encoded request.
+impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
+    fn try_decode(msg: &[u8]) -> Result<Self, WsApiError> {
+        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
+            WsApiError::MsgpackDecodeError {
+                cause: format!("{e}"),
+            }
+        })?;
+
+        let req: ContractRequest = {
+            if value.is_map() {
+                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
+                    value
+                        .as_map()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, val)| (key.as_str().unwrap(), val)),
+                );
+
+                let mut map_keys = Vec::from_iter(value_map.keys().copied());
+                map_keys.sort();
+                match map_keys.as_slice() {
+                    ["container", "relatedContracts", "state"] => {
+                        let contract = value_map.get("container").unwrap();
+                        ContractRequest::Put {
+                            contract: ContractContainer::try_decode(*contract)
+                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                            state: WrappedState::try_decode(*value_map.get("state").unwrap())
+                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                            related_contracts: RelatedContracts::try_decode(
+                                *value_map.get("relatedContracts").unwrap(),
+                            )
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
+                            .into_owned(),
+                        }
+                    }
+                    ["data", "key"] => ContractRequest::Update {
+                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                        data: UpdateData::try_decode(*value_map.get("data").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
+                            .into_owned(),
+                    },
+                    ["fetchContract", "key"] => ContractRequest::Get {
+                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
+                    },
+                    ["key"] => ContractRequest::Subscribe {
+                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                    },
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "value is not a map".into(),
+                });
+            }
+        };
+
+        Ok(req)
+    }
+}
+
 impl<'a> From<ComponentRequest<'a>> for ClientRequest<'a> {
     fn from(op: ComponentRequest<'a>) -> Self {
         ClientRequest::ComponentOp(op)
@@ -473,7 +442,12 @@ pub enum ComponentRequest<'a> {
         key: ComponentKey,
         inbound: Vec<InboundComponentMsg<'a>>,
     },
-    RegisterComponent(#[serde(borrow)] locutus_runtime::Component<'a>),
+    RegisterComponent {
+        #[serde(borrow)]
+        component: locutus_runtime::Component<'a>,
+        cipher: [u8; 24],
+        nonce: [u8; 24],
+    },
     UnregisterComponent(ComponentKey),
 }
 
@@ -486,9 +460,17 @@ impl ComponentRequest<'_> {
                     inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
                 }
             }
-            ComponentRequest::RegisterComponent(cmp) => {
-                let cmp = cmp.into_owned();
-                ComponentRequest::RegisterComponent(cmp)
+            ComponentRequest::RegisterComponent {
+                component,
+                cipher,
+                nonce,
+            } => {
+                let component = component.into_owned();
+                ComponentRequest::RegisterComponent {
+                    component,
+                    cipher,
+                    nonce,
+                }
             }
             ComponentRequest::UnregisterComponent(key) => {
                 ComponentRequest::UnregisterComponent(key)
@@ -518,22 +500,26 @@ impl Display for ClientRequest<'_> {
             },
             ClientRequest::ComponentOp(_op) => write!(f, "component request"),
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
+            ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) mod test {
-    #![allow(unused)] // FIXME: remove unused
+    #![allow(unused)]
+
+    // FIXME: remove unused
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use futures::FutureExt;
-    use locutus_runtime::{ContractCode, Parameters};
+    use locutus_runtime::{ContractCode, ContractContainer, Parameters, WasmAPIVersion};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
     use crate::node::{test::EventId, PeerKey};
+    use crate::WrappedContract;
 
     use super::*;
 
@@ -541,7 +527,7 @@ pub(crate) mod test {
         id: PeerKey,
         signal: Receiver<(EventId, PeerKey)>,
         non_owned_contracts: Vec<ContractKey>,
-        owned_contracts: Vec<(WrappedContract, WrappedState)>,
+        owned_contracts: Vec<(ContractContainer, WrappedState)>,
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         random: bool,
     }
@@ -566,7 +552,7 @@ pub(crate) mod test {
         /// Contracts that the user updates.
         pub fn has_contract(
             &mut self,
-            contracts: impl IntoIterator<Item = (WrappedContract, WrappedState)>,
+            contracts: impl IntoIterator<Item = (ContractContainer, WrappedState)>,
         ) {
             self.owned_contracts.extend(contracts);
         }
@@ -620,7 +606,7 @@ pub(crate) mod test {
                         };
                         let key = if get_owned {
                             let contract_no = rng.gen_range(0..self.owned_contracts.len());
-                            self.owned_contracts[contract_no].0.key().clone()
+                            self.owned_contracts[contract_no].0.clone().key()
                         } else {
                             // let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
                             // self.non_owned_contracts[contract_no]
@@ -757,12 +743,11 @@ pub(crate) mod test {
 
     #[test]
     fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
-        let expected_client_request: ClientRequest = ContractRequest::Update {
+        let expected_client_request: ContractRequest = ContractRequest::Update {
             key: ContractKey::from_id("DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1".to_string())
                 .unwrap(),
             data: locutus_runtime::StateDelta::from(vec![0, 1, 2]).into(),
-        }
-        .into();
+        };
         let msg: Vec<u8> = vec![
             130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 181,
             41, 189, 142, 103, 137, 251, 46, 133, 213, 21, 255, 179, 17, 3, 17, 240, 208, 191, 5,
@@ -770,56 +755,53 @@ pub(crate) mod test {
             164, 100, 97, 116, 97, 129, 165, 100, 101, 108, 116, 97, 196, 3, 0, 1, 2,
         ];
 
-        let result_client_request = ClientRequest::decode_mp(&msg)?;
-        // FIXME
-        // assert_eq!(result_client_request, expected_client_request);
+        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
+        assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }
 
     #[test]
     fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
-        let expected_client_request: ClientRequest = ContractRequest::Get {
+        let expected_client_request: ContractRequest = ContractRequest::Get {
             key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
                 .unwrap(),
             fetch_contract: false,
-        }
-        .into();
+        };
         let msg: Vec<u8> = vec![
             130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 255,
             17, 144, 159, 194, 187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151,
             188, 167, 153, 197, 129, 25, 179, 198, 218, 99, 159, 139, 164, 99, 111, 100, 101, 192,
             173, 102, 101, 116, 99, 104, 67, 111, 110, 116, 114, 97, 99, 116, 194,
         ];
-        let result_client_request = ClientRequest::decode_mp(&msg)?;
-        // FIXME
-        // assert_eq!(result_client_request, expected_client_request);
+
+        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
+        assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }
 
     #[test]
     fn test_handle_put_request() -> Result<(), Box<dyn std::error::Error>> {
-        let expected_client_request: ClientRequest = ContractRequest::Put {
-            contract: WrappedContract::new(
-                Arc::new(ContractCode::from(vec![1, 2])),
-                Parameters::from(vec![1]),
-            ),
-            state: WrappedState::new(vec![1, 2, 3]),
+        let expected_client_request: ContractRequest = ContractRequest::Put {
+            contract: ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(vec![1])),
+                Parameters::from(vec![2]),
+            ))),
+            state: WrappedState::new(vec![3]),
             related_contracts: RelatedContracts::from(HashMap::new()),
-        }
-        .into();
+        };
 
         let msg: Vec<u8> = vec![
-            131, 168, 99, 111, 110, 116, 114, 97, 99, 116, 131, 163, 107, 101, 121, 130, 168, 105,
-            110, 115, 116, 97, 110, 99, 101, 196, 32, 134, 45, 238, 89, 98, 97, 23, 42, 41, 139,
-            236, 124, 160, 124, 173, 244, 156, 101, 173, 15, 232, 177, 142, 63, 142, 236, 82, 221,
-            116, 188, 234, 129, 164, 99, 111, 100, 101, 192, 164, 100, 97, 116, 97, 196, 2, 1, 2,
-            170, 112, 97, 114, 97, 109, 101, 116, 101, 114, 115, 196, 1, 1, 165, 115, 116, 97, 116,
-            101, 196, 3, 1, 2, 3, 176, 114, 101, 108, 97, 116, 101, 100, 67, 111, 110, 116, 114,
-            97, 99, 116, 115, 128,
+            131, 169, 99, 111, 110, 116, 97, 105, 110, 101, 114, 132, 163, 107, 101, 121, 130, 168,
+            105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 135, 191, 81, 248, 20, 212, 21, 0, 62,
+            82, 40, 7, 217, 52, 41, 65, 33, 245, 251, 131, 23, 147, 59, 124, 134, 129, 218, 158,
+            113, 132, 235, 85, 164, 99, 111, 100, 101, 192, 164, 100, 97, 116, 97, 196, 1, 1, 170,
+            112, 97, 114, 97, 109, 101, 116, 101, 114, 115, 196, 1, 2, 167, 118, 101, 114, 115,
+            105, 111, 110, 162, 86, 49, 165, 115, 116, 97, 116, 101, 196, 1, 3, 176, 114, 101, 108,
+            97, 116, 101, 100, 67, 111, 110, 116, 114, 97, 99, 116, 115, 128,
         ];
-        let result_client_request = ClientRequest::decode_mp(&msg)?;
-        // FIXME
-        // assert_eq!(result_client_request, expected_client_request);
+
+        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
+        assert_eq!(result_client_request, expected_client_request);
         Ok(())
     }
 }

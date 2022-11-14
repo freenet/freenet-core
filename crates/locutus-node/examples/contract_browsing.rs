@@ -2,6 +2,7 @@
 
 use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
 
+use locutus_core::locutus_runtime::{ContractContainer, WasmAPIVersion};
 use locutus_core::{
     libp2p::identity::ed25519::PublicKey,
     locutus_runtime::{ContractCode, StateStore, WrappedContract},
@@ -16,16 +17,16 @@ const MAX_MEM_CACHE: u32 = 10_000_000;
 const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 struct WebBundle {
-    posts_contract: WrappedContract,
+    posts_contract: ContractContainer,
     posts_state: WrappedState,
-    web_contract: WrappedContract,
+    web_contract: ContractContainer,
     web_state: WrappedState,
 }
 
 fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
     fn get_posts_contract(
         _public_key: PublicKey,
-    ) -> std::io::Result<(WrappedContract, WrappedState)> {
+    ) -> std::io::Result<(ContractContainer, WrappedState)> {
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts.wasm");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
@@ -35,7 +36,10 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
             public_key: Vec<u8>,
         }
         let params = serde_json::to_vec(&Verification { public_key: vec![] }).unwrap();
-        let contract = WrappedContract::new(Arc::new(ContractCode::from(bytes)), params.into());
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(bytes)),
+            params.into(),
+        )));
 
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts");
         let mut bytes = Vec::new();
@@ -44,13 +48,15 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
         Ok((contract, bytes.into()))
     }
 
-    fn get_web_contract() -> std::io::Result<(WrappedContract, WrappedState)> {
+    fn get_web_contract() -> std::io::Result<(ContractContainer, WrappedState)> {
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web.wasm");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
-        let contract =
-            WrappedContract::new(Arc::new(ContractCode::from(bytes)), [].as_ref().into());
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(bytes)),
+            [].as_ref().into(),
+        )));
 
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web");
         let mut bytes = Vec::new();

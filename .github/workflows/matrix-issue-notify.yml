@@ -1,0 +1,20 @@
+name: Notify Matrix channel of Issue change
+
+on:
+  issues:
+    types: [opened, closed]
+
+jobs:
+  send-message:
+    runs-on: ubuntu-latest
+    name: Send message via Matrix
+    steps:
+    - name: Send message to test channel
+      id: matrix-chat-message
+      uses: fadenb/matrix-chat-message@v0.0.6
+      with:
+        homeserver: 'matrix.org'
+        token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+        channel: ${{ secrets.MATRIX_ROOM_ID }}
+        message: |
+          [Issue #${{ github.event.issue.number }}](${{ github.event.issue.html_url }}) ${{ github.event.action }} by [${{ github.actor }}](https://github.com/${{ github.actor }}): **${{ github.event.issue.title }}**

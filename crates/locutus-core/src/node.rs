@@ -383,6 +383,7 @@ async fn client_event_handling<ClientEv, CErr>(
                     }
                 },
                 ClientRequest::ComponentOp(_op) => todo!("FIXME: component op"),
+                ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
                 ClientRequest::Disconnect { .. } => unreachable!(),
             }
         });

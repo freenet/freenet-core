@@ -8,6 +8,7 @@ use std::{
 use itertools::Itertools;
 use libp2p::{identity, PeerId};
 use locutus_runtime::prelude::ContractKey;
+use locutus_runtime::ContractContainer;
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, instrument};
@@ -18,7 +19,7 @@ use crate::{
     contract::{MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
-    NodeConfig, WrappedContract, WrappedState,
+    NodeConfig, WrappedState,
 };
 
 use super::PeerKey;
@@ -61,7 +62,7 @@ pub(crate) type EventId = usize;
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
     /// Pair of contract and the initial value
-    pub owned_contracts: Vec<(WrappedContract, WrappedState)>,
+    pub owned_contracts: Vec<(ContractContainer, WrappedState)>,
     pub non_owned_contracts: Vec<ContractKey>,
     pub events_to_generate: HashMap<EventId, ClientRequest<'static>>,
     pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,

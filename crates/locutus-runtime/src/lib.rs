@@ -5,6 +5,8 @@ mod contract_store;
 mod runtime;
 mod secrets_store;
 mod state_store;
+pub mod util;
+mod versioning;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -20,6 +22,7 @@ pub mod prelude {
     pub use super::runtime::{ContractExecError, Runtime};
     pub use super::secrets_store::SecretsStore;
     pub use super::state_store::{StateStorage, StateStore, StateStoreError};
+    pub use super::versioning::{ContractContainer, WasmAPIVersion};
     pub use super::RuntimeResult;
     pub use locutus_stdlib::prelude::*;
 }

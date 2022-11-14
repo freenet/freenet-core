@@ -36,6 +36,26 @@ pub enum ContractError {
     Other(String),
 }
 
+pub trait TryFromTsStd<T>: Sized {
+    fn try_decode(value: T) -> Result<Self, WsApiError>;
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum WsApiError {
+    #[error("Failed decoding msgpack message from client request: {cause}")]
+    MsgpackDecodeError { cause: String },
+    #[error("Unsupported contract version")]
+    UnsupportedContractVersion,
+    #[error("Failed unpacking contract container")]
+    UnpackingContractContainerError(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl WsApiError {
+    pub fn deserialization(cause: String) -> Self {
+        Self::MsgpackDecodeError { cause }
+    }
+}
+
 /// An update to a contract state or any required related contracts to update that state.
 #[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,6 +138,18 @@ impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
     type Error = String;
 
     fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+        let related_contracts: HashMap<ContractInstanceId, Option<State<'a>>> =
+            HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
+                let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
+                let state = State::from(val.as_slice().unwrap());
+                (id, Some(state))
+            }));
+        Ok(RelatedContracts::from(related_contracts))
+    }
+}
+
+impl<'a> TryFromTsStd<&'a rmpv::Value> for RelatedContracts<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let related_contracts: HashMap<ContractInstanceId, Option<State<'a>>> =
             HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
                 let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
@@ -254,10 +286,8 @@ impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
     }
 }
 
-impl<'a> TryFrom<&'a rmpv::Value> for UpdateData<'a> {
-    type Error = String;
-
-    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+impl<'a> TryFromTsStd<&'a rmpv::Value> for UpdateData<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let value_map: HashMap<_, _> = HashMap::from_iter(
             value
                 .as_map()
@@ -562,10 +592,8 @@ impl<'a> From<&'a [u8]> for Parameters<'a> {
     }
 }
 
-impl<'a> TryFrom<&'a rmpv::Value> for Parameters<'a> {
-    type Error = String;
-
-    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+impl<'a> TryFromTsStd<&'a rmpv::Value> for Parameters<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let params = value.as_slice().unwrap();
         Ok(Parameters::from(params))
     }
@@ -873,10 +901,8 @@ impl<'a> From<&'a [u8]> for ContractCode<'a> {
     }
 }
 
-impl<'a> TryFrom<&'a rmpv::Value> for ContractCode<'a> {
-    type Error = String;
-
-    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
+impl<'a> TryFromTsStd<&'a rmpv::Value> for ContractCode<'a> {
+    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
         let data = value.as_slice().unwrap();
         Ok(ContractCode::from(data))
     }
@@ -1094,20 +1120,30 @@ impl std::fmt::Display for ContractKey {
     }
 }
 
-impl TryFrom<&rmpv::Value> for ContractKey {
-    type Error = String;
+impl TryFromTsStd<&rmpv::Value> for ContractKey {
+    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
+        let key_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
+            Some(map_value) => HashMap::from_iter(
+                map_value
+                    .iter()
+                    .map(|(key, val)| (key.as_str().unwrap(), val)),
+            ),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding ContractKey, input value is not a map".to_string(),
+                })
+            }
+        };
 
-    fn try_from(value: &rmpv::Value) -> Result<Self, Self::Error> {
-        let key_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-            value
-                .as_map()
-                .unwrap()
-                .iter()
-                .map(|(key, val)| (key.as_str().unwrap(), val)),
-        );
-        let key_instance = *key_map.get("instance").unwrap();
-        let instance_id = key_instance.as_slice().unwrap();
-        let instance_id = bs58::encode(&instance_id).into_string();
+        let instance_id = match key_map.get("instance") {
+            Some(instance_value) => bs58::encode(&instance_value.as_slice().unwrap()).into_string(),
+            _ => {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "Failed decoding WrappedContract, instance not found".to_string(),
+                })
+            }
+        };
+
         Ok(ContractKey::from_id(instance_id).unwrap())
     }
 }
