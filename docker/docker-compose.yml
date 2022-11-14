@@ -7,7 +7,7 @@ services:
     image: locutus:docker
     ports:
       - target: 50509
-        published: 50509
+        published: 50599
         protocol: tcp
         mode: host    
     volumes:
