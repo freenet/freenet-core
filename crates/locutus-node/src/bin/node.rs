@@ -1,11 +1,12 @@
-use std::path::PathBuf;
-
 use clap::Parser;
 use locutus_core::{
     locutus_runtime::{ContractStore, StateStore},
     Config, Executor, SqlitePool,
 };
 use locutus_dev::config::OperationMode;
+use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
@@ -31,7 +32,8 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
         locutus_core::util::set_cleanup_on_exit().unwrap();
     })
     .await?;
-    locutus::local_node::run_local_node(executor).await
+    let socket: SocketAddr = (config.bind, config.port).into();
+    locutus::local_node::run_local_node(executor, socket).await
 }
 
 fn main() -> Result<(), DynError> {
@@ -53,11 +55,19 @@ fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-#[derive(clap::Parser, Clone)]
+#[derive(clap::Parser, Clone, Debug)]
 struct NodeConfig {
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]
     mode: OperationMode,
     /// Overrides the default data directory where Locutus contract files are stored.
     contract_data_dir: Option<PathBuf>,
+
+    /// Address to bind to
+    #[arg(long, short, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    bind: IpAddr,
+
+    /// Port to expose api on
+    #[arg(long, short, default_value_t = 50509)]
+    port: u16,
 }

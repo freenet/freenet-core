@@ -1,0 +1,14 @@
+version: "3"
+services:
+  locutus:
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile
+    image: locutus:docker
+    ports:
+      - target: 50509
+        published: 50599
+        protocol: tcp
+        mode: host    
+    volumes:
+      - /tmp/locutus-docker:/root/.local/share/locutus

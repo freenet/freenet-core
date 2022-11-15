@@ -33,7 +33,7 @@ enum HostCallbackResult {
 }
 
 pub mod local_node {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::SocketAddr;
 
     use locutus_core::{
         either, ClientError, ClientEventsProxy, ErrorKind, Executor, OpenRequest, RequestError,
@@ -42,9 +42,11 @@ pub mod local_node {
 
     use crate::{DynError, HttpGateway};
 
-    pub async fn run_local_node(mut executor: Executor) -> Result<(), DynError> {
+    pub async fn run_local_node(
+        mut executor: Executor,
+        socket: SocketAddr,
+    ) -> Result<(), DynError> {
         let (mut http_handle, filter) = HttpGateway::as_filter();
-        let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 50509).into();
         let _ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;
         // FIXME: use combinator
         // let mut all_clients =
