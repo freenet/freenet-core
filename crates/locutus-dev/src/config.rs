@@ -13,7 +13,7 @@ pub struct Config {
     pub additional: BaseConfig,
 }
 
-#[derive(clap::ValueEnum, Clone, Copy)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
 pub enum OperationMode {
     /// Run the node in local-only mode. Useful for development pourpouses.
     Local,
