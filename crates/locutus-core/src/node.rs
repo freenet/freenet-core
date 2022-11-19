@@ -15,6 +15,7 @@ use libp2p::{
     multiaddr::Protocol,
     Multiaddr, PeerId,
 };
+use locutus_stdlib::api::{ClientRequest, ContractRequest};
 
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;
@@ -23,7 +24,7 @@ use self::{
     p2p_impl::NodeP2P,
 };
 use crate::{
-    client_events::{BoxedClient, ClientEventsProxy, ClientRequest, ContractRequest, OpenRequest},
+    client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
     config::{tracer::Logger, GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},

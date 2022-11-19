@@ -1,6 +1,7 @@
 use quote::quote;
 use syn::{AttributeArgs, ItemImpl};
 
+pub(crate) mod common;
 mod component_impl;
 mod contract_impl;
 

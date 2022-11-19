@@ -3,9 +3,8 @@ mod http_gateway;
 pub(crate) mod web_handling;
 
 pub use http_gateway::HttpGateway;
-use locutus_core::{
-    locutus_runtime::ContractKey, ClientError, ClientId, ClientRequest, HostResponse, HostResult,
-};
+use locutus_core::{locutus_runtime::ContractKey, ClientId, HostResult};
+use locutus_stdlib::api::{ClientError, ClientRequest, HostResponse};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -23,7 +22,7 @@ enum HostCallbackResult {
     NewId(ClientId),
     Result {
         id: ClientId,
-        result: Result<HostResponse<'static>, ClientError>,
+        result: Result<HostResponse, ClientError>,
     },
     SubscriptionChannel {
         key: ContractKey,
@@ -36,9 +35,9 @@ pub mod local_node {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use locutus_core::{
-        either, ClientError, ClientEventsProxy, ErrorKind, Executor, OpenRequest, RequestError,
-        WebSocketProxy,
+        either, ClientEventsProxy, Executor, OpenRequest, RequestError, WebSocketProxy,
     };
+    use locutus_stdlib::api::{ClientError, ErrorKind};
 
     use crate::{DynError, HttpGateway};
 
@@ -68,7 +67,7 @@ pub mod local_node {
                 Err(either::Left(err)) => {
                     log::error!("{err}");
                     http_handle
-                        .send(id, Err(ClientError::from(ErrorKind::from(err))))
+                        .send(id, Err(ClientError::from(ErrorKind::Other(format!("{err}")))))
                         .await?;
                 }
                 Err(either::Right(err)) => {

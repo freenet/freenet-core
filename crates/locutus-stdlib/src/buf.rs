@@ -199,7 +199,7 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
         #[cfg(feature = "trace")]
         {
             let contract_mem = std::slice::from_raw_parts(mem.start_ptr, mem.size as usize);
-            log::trace!(
+            tracing::trace!(
                 "*mut BufferBuilder <- offset: {}; in mem: {:?}",
                 builder_ptr as usize,
                 &contract_mem[builder_ptr as usize
@@ -214,7 +214,7 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
         let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
         #[cfg(feature = "trace")]
         {
-            log::trace!("buf builder from FFI: {buf_builder:?}");
+            tracing::trace!("buf builder from FFI: {buf_builder:?}");
         }
 
         let read_ptr = Box::leak(Box::from_raw(compute_ptr(
@@ -317,20 +317,20 @@ pub fn initiate_buffer(capacity: u32) -> i64 {
     }));
     #[cfg(feature = "trace")]
     {
-        log::trace!(
+        tracing::trace!(
             "new buffer ptr: {:p} -> {} as i64 w/ cap: {capacity}",
             buf.as_ptr(),
             start
         );
-        log::trace!(
+        tracing::trace!(
             "last read ptr: {last_read:p} -> {} as i64",
             last_read as i64
         );
-        log::trace!(
+        tracing::trace!(
             "last write ptr: {last_write:p} -> {} as i64",
             last_write as i64
         );
-        log::trace!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
+        tracing::trace!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
     }
     std::mem::forget(buf);
     buffer as i64

@@ -4,6 +4,7 @@ use locutus_runtime::{
     ContractKey, ContractRuntimeInterface, ContractStore, StateStorage, StateStore,
     UpdateModification, ValidateResult,
 };
+use locutus_stdlib::api::{ClientRequest, HostResponse};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 use crate::{config::CONFIG, WrappedState};
@@ -173,8 +174,8 @@ impl ContractHandler for MemoryContractHandler {
 
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
-        _req: crate::ClientRequest<'a>,
-    ) -> BoxFuture<'static, Result<crate::HostResponse, Self::Error>> {
+        _req: ClientRequest<'a>,
+    ) -> BoxFuture<'static, Result<HostResponse, Self::Error>> {
         // async fn get_state(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         //     Ok(self.kv_store.get(contract).cloned())
         // }

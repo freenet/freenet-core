@@ -36,3 +36,4 @@ warp = { version = "0.3", default-features = false, features = ["multipart", "tl
 # internal:
 locutus-core = { path = "../locutus-core", features = ["websocket"], version = "0.0.3" }
 locutus-dev = { path = "../locutus-dev", version = "0.0.3" }
+locutus-stdlib = { path = "../locutus-stdlib", version = "0.0.3" }

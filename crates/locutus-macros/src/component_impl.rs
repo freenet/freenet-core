@@ -21,31 +21,10 @@ impl ImplStruct {
         quote!(i64)
     }
 
-    fn set_logger(&self) -> TokenStream {
-        // TODO: add log level as a parameter to the macro
-        quote! {
-            #[cfg(feature = "trace")]
-            {
-                use ::locutus_stdlib::prelude::log;
-                if let Err(err) = ::locutus_stdlib::prelude::env_logger::builder()
-                    .filter_level(log::LevelFilter::Info)
-                    .filter_module("locutus_stdlib", log::LevelFilter::Trace)
-                    .try_init()
-                {
-                    return ::locutus_stdlib::prelude::ContractInterfaceResult::from(
-                        Err::<::locutus_stdlib::prelude::ValidateResult, _>(
-                            ::locutus_stdlib::prelude::ContractError::Other(format!("{}", err))
-                        )
-                    ).into_raw();
-                }
-            }
-        }
-    }
-
     fn gen_process_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = self.ffi_ret_type();
-        let set_logger = self.set_logger();
+        let set_logger = crate::common::set_logger();
         quote! {
             #[no_mangle]
             pub extern "C" fn process(inbound: i64) -> #ret {

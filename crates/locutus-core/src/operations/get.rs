@@ -659,11 +659,11 @@ mod messages {
 #[cfg(test)]
 mod test {
     use locutus_runtime::{ContractContainer, WasmAPIVersion};
+    use locutus_stdlib::api::ContractRequest;
     use std::collections::HashMap;
 
     use super::*;
     use crate::{
-        client_events::ContractRequest,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         WrappedContract, WrappedState,
     };

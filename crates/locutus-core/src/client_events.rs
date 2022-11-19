@@ -1,31 +1,30 @@
 use futures::future::BoxFuture;
-use locutus_runtime::{
-    ComponentKey, ContractContainer, InboundComponentMsg, OutboundComponentMsg, RelatedContracts,
-    UpdateData,
-};
-use std::borrow::Borrow;
-use std::collections::HashMap;
+use locutus_runtime::ComponentKey;
+use locutus_stdlib::api::ClientRequest;
+use locutus_stdlib::api::{ClientError, HostResponse};
 use std::fmt::Debug;
-use std::io::Cursor;
-use std::{error::Error as StdError, fmt::Display};
+use std::fmt::Display;
 
-use locutus_runtime::prelude::{ContractKey, StateSummary};
-use locutus_runtime::prelude::{TryFromTsStd, WsApiError};
+use locutus_runtime::prelude::ContractKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
-
-use crate::WrappedState;
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
 
 pub type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
-pub type HostResult = Result<HostResponse<'static>, ClientError>;
+pub type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct ClientId(pub(crate) usize);
+
+impl Into<usize> for ClientId {
+    fn into(self) -> usize {
+        self.0
+    }
+}
 
 impl ClientId {
     pub const FIRST: Self = ClientId(0);
@@ -40,55 +39,6 @@ impl Display for ClientId {
         write!(f, "{}", self.0)
     }
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClientError {
-    kind: ErrorKind,
-}
-
-impl ClientError {
-    pub fn kind(&self) -> ErrorKind {
-        self.kind.clone()
-    }
-}
-
-impl From<ErrorKind> for ClientError {
-    fn from(kind: ErrorKind) -> Self {
-        ClientError { kind }
-    }
-}
-
-#[derive(thiserror::Error, Debug, Serialize, Deserialize, Clone)]
-pub enum ErrorKind {
-    #[error("comm channel between client/host closed")]
-    ChannelClosed,
-    #[error("failed while trying to unpack state for {0}")]
-    IncorrectState(ContractKey),
-    #[error("error while deserializing: {cause}")]
-    DeserializationError { cause: String },
-    #[error("client disconnected")]
-    Disconnect,
-    #[error("node not available")]
-    NodeUnavailable,
-    #[error(transparent)]
-    RequestError(#[from] RequestError),
-    #[error("lost the connection with the protocol hanling connections")]
-    TransportProtocolDisconnect,
-    #[error("unhandled error: {cause}")]
-    Unhandled { cause: String },
-    #[error("unknown client id: {0}")]
-    UnknownClient(ClientId),
-}
-
-impl warp::reject::Reject for ErrorKind {}
-
-impl Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "client error: {}", self.kind)
-    }
-}
-
-impl StdError for ClientError {}
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
@@ -127,123 +77,11 @@ pub trait ClientEventsProxy {
     fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg>;
 
     /// Sends a response from the host to the client application.
-    fn send<'a>(
+    fn send(
         &mut self,
         id: ClientId,
-        response: Result<HostResponse<'a>, ClientError>,
-    ) -> BoxFuture<'_, Result<(), ClientError>>;
-}
-
-/// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize, Debug)]
-pub enum HostResponse<'a, T = WrappedState, U = Vec<u8>>
-where
-    T: Borrow<[u8]>,
-    U: Borrow<[u8]>,
-{
-    ContractResponse(
-        #[serde(bound(deserialize = "ContractResponse<T>: Deserialize<'de>"))] ContractResponse<T>,
-    ),
-    ComponentResponse {
-        key: ComponentKey,
-        #[serde(borrow)]
-        values: Vec<OutboundComponentMsg<'a>>,
-    },
-    GenerateRandData(U),
-    /// A requested action which doesn't require an answer was performed successfully.
-    Ok,
-}
-
-impl<T> HostResponse<'_, T> where T: Borrow<[u8]> {}
-
-impl HostResponse<'_> {
-    pub fn into_owned(self) -> HostResponse<'static> {
-        match self {
-            HostResponse::ContractResponse(r) => HostResponse::ContractResponse(r),
-            HostResponse::ComponentResponse { key, values } => HostResponse::ComponentResponse {
-                key,
-                values: values
-                    .into_iter()
-                    .map(OutboundComponentMsg::into_owned)
-                    .collect(),
-            },
-            HostResponse::GenerateRandData(val) => HostResponse::GenerateRandData(val),
-            HostResponse::Ok => HostResponse::Ok,
-        }
-    }
-
-    pub fn unwrap_put(self) -> ContractKey {
-        if let Self::ContractResponse(ContractResponse::PutResponse { key }) = self {
-            key
-        } else {
-            panic!("called `HostResponse::unwrap_put()` on other than `PutResponse` value")
-        }
-    }
-
-    pub fn unwrap_get(self) -> (WrappedState, Option<ContractContainer>) {
-        if let Self::ContractResponse(ContractResponse::GetResponse {
-            contract, state, ..
-        }) = self
-        {
-            (state, contract)
-        } else {
-            panic!("called `HostResponse::unwrap_put()` on other than `PutResponse` value")
-        }
-    }
-}
-
-impl std::fmt::Display for HostResponse<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HostResponse::ContractResponse(res) => match res {
-                ContractResponse::PutResponse { key } => {
-                    f.write_fmt(format_args!("put response: {key}"))
-                }
-                ContractResponse::UpdateResponse { key, .. } => {
-                    f.write_fmt(format_args!("update response ({key})"))
-                }
-                ContractResponse::GetResponse { state, .. } => {
-                    f.write_fmt(format_args!("get response: {state}"))
-                }
-                ContractResponse::UpdateNotification { key, .. } => {
-                    f.write_fmt(format_args!("update notification (key: {key})"))
-                }
-            },
-            HostResponse::ComponentResponse { .. } => write!(f, "component responses"),
-            HostResponse::Ok => write!(f, "ok response"),
-            HostResponse::GenerateRandData(_) => write!(f, "random bytes"),
-        }
-    }
-}
-
-// todo: add a `AsBytes` trait for state representations
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum ContractResponse<T: Borrow<[u8]> = WrappedState> {
-    GetResponse {
-        contract: Option<ContractContainer>,
-        state: T,
-    },
-    PutResponse {
-        key: ContractKey,
-    },
-    /// Message sent when there is an update to a subscribed contract.
-    UpdateNotification {
-        key: ContractKey,
-        #[serde(borrow)]
-        update: UpdateData<'static>,
-    },
-    /// Successful update
-    UpdateResponse {
-        key: ContractKey,
-        #[serde(borrow)]
-        summary: StateSummary<'static>,
-    },
-}
-
-impl<T: Borrow<[u8]>> From<ContractResponse<T>> for HostResponse<'static, T> {
-    fn from(value: ContractResponse<T>) -> HostResponse<'static, T> {
-        HostResponse::ContractResponse(value)
-    }
+        response: Result<HostResponse, ClientError>,
+    ) -> BoxFuture<Result<(), ClientError>>;
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
@@ -274,237 +112,6 @@ pub enum ContractError {
     Update { key: ContractKey, cause: String },
 }
 
-/// A request from a client application to the host.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-// #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub enum ClientRequest<'a> {
-    ComponentOp(#[serde(borrow)] ComponentRequest<'a>),
-    ContractOp(#[serde(borrow)] ContractRequest<'a>),
-    GenerateRandData { bytes: usize },
-    Disconnect { cause: Option<String> },
-}
-
-impl ClientRequest<'_> {
-    pub fn into_owned(self) -> ClientRequest<'static> {
-        match self {
-            ClientRequest::ContractOp(op) => {
-                let owned = match op {
-                    ContractRequest::Put {
-                        contract,
-                        state,
-                        related_contracts,
-                    } => {
-                        let related_contracts = related_contracts.into_owned();
-                        ContractRequest::Put {
-                            contract,
-                            state,
-                            related_contracts,
-                        }
-                    }
-                    ContractRequest::Update { key, data } => {
-                        let data = data.into_owned();
-                        ContractRequest::Update { key, data }
-                    }
-                    ContractRequest::Get {
-                        key,
-                        fetch_contract,
-                    } => ContractRequest::Get {
-                        key,
-                        fetch_contract,
-                    },
-                    ContractRequest::Subscribe { key } => ContractRequest::Subscribe { key },
-                };
-                owned.into()
-            }
-            ClientRequest::ComponentOp(op) => {
-                let op = op.into_owned();
-                ClientRequest::ComponentOp(op)
-            }
-            ClientRequest::GenerateRandData { bytes } => ClientRequest::GenerateRandData { bytes },
-            ClientRequest::Disconnect { cause } => ClientRequest::Disconnect { cause },
-        }
-    }
-
-    pub fn is_disconnect(&self) -> bool {
-        matches!(self, Self::Disconnect { .. })
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub enum ContractRequest<'a> {
-    /// Insert a new value in a contract corresponding with the provided key.
-    Put {
-        contract: ContractContainer,
-        /// Value to upsert in the contract.
-        state: WrappedState,
-        /// Related contracts.
-        #[serde(borrow)]
-        related_contracts: RelatedContracts<'a>,
-    },
-    /// Update an existing contract corresponding with the provided key.
-    Update {
-        key: ContractKey,
-        #[serde(borrow)]
-        data: UpdateData<'a>,
-    },
-    /// Fetch the current state from a contract corresponding to the provided key.
-    Get {
-        /// Key of the contract.
-        key: ContractKey,
-        /// If this flag is set then fetch also the contract itself.
-        fetch_contract: bool,
-    },
-    /// Subscribe to the changes in a given contract. Implicitly starts a get operation
-    /// if the contract is not present yet.
-    Subscribe { key: ContractKey },
-}
-
-impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
-    fn from(op: ContractRequest<'a>) -> Self {
-        ClientRequest::ContractOp(op)
-    }
-}
-
-/// Deserializes a `ContractRequest` from a MessagePack encoded request.
-impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
-    fn try_decode(msg: &[u8]) -> Result<Self, WsApiError> {
-        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
-            WsApiError::MsgpackDecodeError {
-                cause: format!("{e}"),
-            }
-        })?;
-
-        let req: ContractRequest = {
-            if value.is_map() {
-                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-                    value
-                        .as_map()
-                        .unwrap()
-                        .iter()
-                        .map(|(key, val)| (key.as_str().unwrap(), val)),
-                );
-
-                let mut map_keys = Vec::from_iter(value_map.keys().copied());
-                map_keys.sort();
-                match map_keys.as_slice() {
-                    ["container", "relatedContracts", "state"] => {
-                        let contract = value_map.get("container").unwrap();
-                        ContractRequest::Put {
-                            contract: ContractContainer::try_decode(*contract)
-                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            state: WrappedState::try_decode(*value_map.get("state").unwrap())
-                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            related_contracts: RelatedContracts::try_decode(
-                                *value_map.get("relatedContracts").unwrap(),
-                            )
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
-                            .into_owned(),
-                        }
-                    }
-                    ["data", "key"] => ContractRequest::Update {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        data: UpdateData::try_decode(*value_map.get("data").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
-                            .into_owned(),
-                    },
-                    ["fetchContract", "key"] => ContractRequest::Get {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
-                    },
-                    ["key"] => ContractRequest::Subscribe {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                    },
-                    _ => unreachable!(),
-                }
-            } else {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "value is not a map".into(),
-                });
-            }
-        };
-
-        Ok(req)
-    }
-}
-
-impl<'a> From<ComponentRequest<'a>> for ClientRequest<'a> {
-    fn from(op: ComponentRequest<'a>) -> Self {
-        ClientRequest::ComponentOp(op)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ComponentRequest<'a> {
-    ApplicationMessages {
-        key: ComponentKey,
-        inbound: Vec<InboundComponentMsg<'a>>,
-    },
-    RegisterComponent {
-        #[serde(borrow)]
-        component: locutus_runtime::Component<'a>,
-        cipher: [u8; 24],
-        nonce: [u8; 24],
-    },
-    UnregisterComponent(ComponentKey),
-}
-
-impl ComponentRequest<'_> {
-    pub fn into_owned(self) -> ComponentRequest<'static> {
-        match self {
-            ComponentRequest::ApplicationMessages { key, inbound } => {
-                ComponentRequest::ApplicationMessages {
-                    key,
-                    inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
-                }
-            }
-            ComponentRequest::RegisterComponent {
-                component,
-                cipher,
-                nonce,
-            } => {
-                let component = component.into_owned();
-                ComponentRequest::RegisterComponent {
-                    component,
-                    cipher,
-                    nonce,
-                }
-            }
-            ComponentRequest::UnregisterComponent(key) => {
-                ComponentRequest::UnregisterComponent(key)
-            }
-        }
-    }
-}
-
-impl Display for ClientRequest<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientRequest::ContractOp(ops) => match ops {
-                ContractRequest::Put {
-                    contract, state, ..
-                } => {
-                    write!(f, "put request for contract {contract} with state {state}")
-                }
-                ContractRequest::Update { key, .. } => write!(f, "Update request for {key}"),
-                ContractRequest::Get {
-                    key,
-                    fetch_contract: contract,
-                    ..
-                } => {
-                    write!(f, "get request for {key} (fetch full contract: {contract})")
-                }
-                ContractRequest::Subscribe { key, .. } => write!(f, "subscribe request for {key}"),
-            },
-            ClientRequest::ComponentOp(_op) => write!(f, "component request"),
-            ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
-            ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     #![allow(unused)]
@@ -514,12 +121,15 @@ pub(crate) mod test {
     use std::sync::Arc;
 
     use futures::FutureExt;
-    use locutus_runtime::{ContractCode, ContractContainer, Parameters, WasmAPIVersion};
+    use locutus_runtime::{
+        ContractCode, ContractContainer, Parameters, RelatedContracts, TryFromTsStd, WasmAPIVersion,
+    };
+    use locutus_stdlib::api::ContractRequest;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
     use crate::node::{test::EventId, PeerKey};
-    use crate::WrappedContract;
+    use crate::{WrappedContract, WrappedState};
 
     use super::*;
 
