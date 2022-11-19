@@ -26,7 +26,8 @@ serde_bytes = "0.11"
 rand = { workspace = true }
 rmpv = "1"
 rmp-serde = { version = "1" }
-serde_json = "1"
+semver = { workspace = true }
+serde_json = { workspace = true }
 stretto = { version = "0.7", features = ["async", "sync"], default-features = false }
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
@@ -37,7 +38,6 @@ wasmer = { version = "^2.0", default-features = false, features = [
 ]}
 wasmer-compiler-llvm = { version="^2.0", optional = true }
 varuint = "0.6"
-semver = { version = "1.0.14",  features = ["serde"]}
 byteorder = "1"
 
 # internal

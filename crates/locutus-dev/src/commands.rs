@@ -1,13 +1,11 @@
 use std::{fs::File, io::Read, sync::Arc};
 
-use locutus_core::{
-    locutus_runtime::StateDelta, ClientId, ClientRequest, Config, ContractRequest, Executor,
-    SqlitePool,
-};
+use locutus_core::{locutus_runtime::StateDelta, ClientId, Config, Executor, SqlitePool};
 use locutus_runtime::{
     ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore, WasmAPIVersion,
     WrappedContract,
 };
+use locutus_stdlib::api::{ClientRequest, ContractRequest};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},

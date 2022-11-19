@@ -7,9 +7,18 @@ use locutus_runtime::{
     ContractContainer, ContractKey, State,
 };
 
-use locutus_core::*;
+use locutus_core::{
+    locutus_runtime::locutus_stdlib::api::{
+        ClientRequest, ContractRequest, ContractResponse, HostResponse,
+    },
+    *,
+};
+use locutus_stdlib::api::ErrorKind;
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
-use warp::{reject, reply, Rejection, Reply};
+use warp::{
+    reject::{self, Reject},
+    reply, Rejection, Reply,
+};
 
 use crate::{
     errors::{self, InvalidParam, NodeError},
@@ -102,7 +111,7 @@ pub(crate) async fn contract_home(
             result: Err(err), ..
         }) => {
             log::error!("error getting contract `{key}`: {err}");
-            return Err(err.kind().into());
+            return Err(WrapErr(err.kind()).into());
         }
         None => {
             return Err(NodeError.into());
@@ -118,6 +127,11 @@ pub(crate) async fn contract_home(
         .map_err(|_| NodeError)?;
     response
 }
+
+#[derive(Debug)]
+struct WrapErr(ErrorKind);
+
+impl Reject for WrapErr {}
 
 pub async fn variable_content(
     key: String,

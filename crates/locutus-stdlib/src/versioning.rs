@@ -6,13 +6,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use byteorder::{BigEndian, ReadBytesExt};
-use locutus_stdlib::contract_interface::ContractKey;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::WrappedContract;
-use locutus_stdlib::prelude::{ContractCode, Parameters, TryFromTsStd, WsApiError};
+use crate::prelude::WrappedContract;
+use crate::{
+    contract_interface::ContractKey,
+    prelude::{ContractCode, Parameters, TryFromTsStd, WsApiError},
+};
 
 /// Wrapper that allows contract versioning. This enum maintains the types of contracts that are
 /// allowed and their corresponding version.

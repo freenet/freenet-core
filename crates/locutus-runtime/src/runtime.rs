@@ -9,8 +9,8 @@ use wasmer::{
 };
 
 use crate::{
-    component_store::ComponentStore, contract_store::ContractStore, secrets_store::SecretsStore,
-    ContractContainer, RuntimeInnerError, RuntimeResult, WasmAPIVersion,
+    component_store::ComponentStore, contract_store::ContractStore, error::RuntimeInnerError,
+    secrets_store::SecretsStore, RuntimeResult,
 };
 
 #[derive(thiserror::Error, Debug)]

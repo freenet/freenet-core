@@ -18,11 +18,11 @@ pub enum ComponentExecError {
 }
 
 pub trait ComponentRuntimeInterface {
-    fn inbound_app_message<'a>(
+    fn inbound_app_message(
         &mut self,
         key: &ComponentKey,
-        inbound: Vec<InboundComponentMsg<'a>>,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg<'a>>>;
+        inbound: Vec<InboundComponentMsg>,
+    ) -> RuntimeResult<Vec<OutboundComponentMsg>>;
 
     fn register_component(
         &mut self,
@@ -40,7 +40,7 @@ impl Runtime {
         msg: &InboundComponentMsg,
         process_func: &NativeFunc<i64, i64>,
         instance: &Instance,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg<'static>>> {
+    ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
         let msg = bincode::serialize(msg)?;
         let mut msg_buf = self.init_buf(instance, &msg)?;
         msg_buf.write(msg)?;
@@ -57,13 +57,13 @@ impl Runtime {
     }
 
     // FIXME: control the use of recurssion here since is a potential exploit for malicious components
-    fn get_outbound<'a>(
+    fn get_outbound(
         &mut self,
         component_key: &ComponentKey,
         instance: &Instance,
         process_func: &NativeFunc<i64, i64>,
-        outbound_msgs: Vec<OutboundComponentMsg<'a>>,
-        results: &mut Vec<OutboundComponentMsg<'a>>,
+        outbound_msgs: Vec<OutboundComponentMsg>,
+        results: &mut Vec<OutboundComponentMsg>,
     ) -> RuntimeResult<()> {
         for outbound in outbound_msgs {
             match outbound {
@@ -122,11 +122,11 @@ impl Runtime {
 }
 
 impl ComponentRuntimeInterface for Runtime {
-    fn inbound_app_message<'a>(
+    fn inbound_app_message(
         &mut self,
         key: &ComponentKey,
-        inbound: Vec<InboundComponentMsg<'a>>,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg<'a>>> {
+        inbound: Vec<InboundComponentMsg>,
+    ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
             return Ok(results);

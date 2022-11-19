@@ -18,9 +18,8 @@ pub use crate::config::Config;
 #[cfg(feature = "websocket")]
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
-    combinator::ClientEventsCombinator, BoxedClient, ClientError, ClientEventsProxy, ClientId,
-    ClientRequest, ComponentRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
-    HostResult, OpenRequest, RequestError,
+    combinator::ClientEventsCombinator, BoxedClient, ClientEventsProxy, ClientId, HostResult,
+    OpenRequest, RequestError,
 };
 pub use contract::{SQLiteContractHandler, SqlitePool};
 pub use either;

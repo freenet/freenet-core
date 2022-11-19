@@ -61,6 +61,7 @@ tracing-opentelemetry = { version = "0.18.0", optional = true }
 tracing-subscriber = { version = "0.3.16", optional = true }
 
 # internal deps
+locutus-stdlib = { path = "../locutus-stdlib", version = "0.0.3" }
 locutus-runtime = { path = "../locutus-runtime", version = "0.0.3" }
 
 [dev-dependencies]
