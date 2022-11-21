@@ -35,7 +35,7 @@ walkdir = "2.3.2"
 wasmer = { version = "^2.0", default-features = false, features = [ 
 	"sys"
 ]}
-wasmer-compiler-llvm = { version="^2.0", optional = true }
+wasmer-compiler-llvm = { version="^3.0", optional = true }
 varuint = "0.6"
 semver = { version = "1.0.14",  features = ["serde"]}
 byteorder = "1"
