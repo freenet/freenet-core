@@ -197,13 +197,29 @@ impl ComponentRuntimeInterface for Runtime {
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::prelude::env_logger;
+    use locutus_stdlib::prelude::{env_logger, ComponentContext, ContractInstanceId, Parameters};
 
     use super::*;
+    use crate::{ContractStore, SecretsStore, WrappedContract};
+    use locutus_stdlib::contract_interface::ContractCode;
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
     use std::{path::PathBuf, sync::atomic::AtomicUsize};
 
     const TEST_COMPONENT_1: &str = "test_ccomponent_1";
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum InboundAppMessage {
+        CreateInboxRequest,
+        PleaseSignMessage(Vec<u8>),
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum OutboundAppMessage {
+        CreateInboxResponse(Vec<u8>),
+        MessageSigned(Vec<u8>),
+    }
 
     fn test_dir() -> PathBuf {
         let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
@@ -228,5 +244,32 @@ mod test {
             .join(name)
             .with_extension("wasm");
         Component::try_from(contract_path.as_path()).unwrap()
+    }
+
+    fn set_up_runtime(name: &str) -> (Component, Runtime) {
+        let _ = env_logger::try_init();
+        let component = get_test_component(name);
+        let contract_store = ContractStore::new(test_dir(), 10_000).unwrap();
+        let mut runtime = Runtime::build(contract_store, SecretsStore::default(), false).unwrap();
+        let _ = runtime.component_store.store_component(component.clone());
+        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
+        (component, runtime)
+    }
+
+    #[test]
+    fn validate_process() -> Result<(), Box<dyn std::error::Error>> {
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (component, mut runtime) = set_up_runtime(TEST_COMPONENT_1);
+        let msg: ApplicationMessage = ApplicationMessage {
+            app: ContractInstanceId::try_from(contract.key.to_string()).unwrap(),
+            payload: serde_json::to_vec(&InboundAppMessage::CreateInboxRequest).unwrap(),
+            context: ComponentContext(vec![]),
+        };
+        let inbound_app_msg = InboundComponentMsg::ApplicationMessage(msg);
+        let outbound = runtime.inbound_app_message(component.key(), vec![inbound_app_msg]);
+        Ok(())
     }
 }
