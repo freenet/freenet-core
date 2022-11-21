@@ -1,0 +1,19 @@
+[package]
+name = "test-component-1"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+serde = "1"
+serde_json = "1"
+
+[features]
+trace = ["locutus-stdlib/trace"]

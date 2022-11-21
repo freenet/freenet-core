@@ -194,3 +194,39 @@ impl ComponentRuntimeInterface for Runtime {
         self.component_store.remove_component(key)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use locutus_stdlib::prelude::env_logger;
+
+    use super::*;
+    use std::{path::PathBuf, sync::atomic::AtomicUsize};
+
+    const TEST_COMPONENT_1: &str = "test_ccomponent_1";
+    static TEST_NO: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_dir() -> PathBuf {
+        let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
+            "api-test-{}",
+            TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        if !test_dir.exists() {
+            std::fs::create_dir_all(&test_dir).unwrap();
+        }
+        test_dir
+    }
+
+    fn get_test_component(name: &str) -> Component {
+        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
+        let contracts = PathBuf::from(CONTRACTS_DIR);
+        let mut dirs = contracts.ancestors();
+        let path = dirs.nth(2).unwrap();
+        let contract_path = path
+            .join("tests")
+            .join(name.replace('_', "-"))
+            .join("build/locutus")
+            .join(name)
+            .with_extension("wasm");
+        Component::try_from(contract_path.as_path()).unwrap()
+    }
+}
