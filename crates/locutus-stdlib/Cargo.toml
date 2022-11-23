@@ -33,7 +33,7 @@ locutus-macros = { path = "../locutus-macros", version = "0.0.3" }
 arbitrary = { version = "1", features = ["derive"] }
 bincode = "1"
 wasmer = { version = "^2.0", features = [ "sys-default", "wat"] }
-wasmer-wasi = "2.3"
+wasmer-wasi = "3.0"
 rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
