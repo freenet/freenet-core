@@ -244,7 +244,8 @@ fn deser_func<'de, D>(deser: D) -> Result<UserInputRequest<'static>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    todo!()
+    let value = <UserInputRequest<'de> as Deserialize>::deserialize(deser)?;
+    Ok(value.into_owned())
 }
 
 #[non_exhaustive]

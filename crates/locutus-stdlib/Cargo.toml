@@ -30,7 +30,6 @@ thiserror = "1"
 tracing = {workspace = true }
 tracing-subscriber = { workspace = true, features = ["default", "env-filter"] }
 xz2 = { version = "0.1", optional = true }
-
 # internal
 locutus-macros = { path = "../locutus-macros", version = "0.0.3" }
 
@@ -39,7 +38,9 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync",
 tokio-tungstenite = { version = "0.17", optional = true } 
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-web-sys = { version = "0.3", features = ["WebSocket"], optional = true }
+serde-wasm-bindgen = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["BinaryType", "ErrorEvent", "MessageEvent", "WebSocket"], optional = true }
+wasm-bindgen = { version = "0.2", features = ["serde-serialize"], optional = true }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
@@ -49,7 +50,8 @@ wasmer-wasi = "2.3"
 rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
+default = ["net"]
 archive = ["xz2"]
-net = ["web-sys", "tokio", "tokio-tungstenite"]
+net = ["serde-wasm-bindgen", "tokio", "tokio-tungstenite", "wasm-bindgen", "web-sys"]
 testing = ["arbitrary"]
 trace = []

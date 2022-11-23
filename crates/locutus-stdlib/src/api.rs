@@ -15,16 +15,21 @@ pub use client_events::*;
 type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(thiserror::Error, Debug)]
-enum Error {
+pub enum Error {
     #[error(transparent)]
     Deserialization(#[from] rmp_serde::decode::Error),
     #[error(transparent)]
     Serialization(#[from] rmp_serde::encode::Error),
     #[error("channel closed")]
     ChannelClosed,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(target_family = "unix")]
     #[error(transparent)]
     ConnectionError(#[from] tokio_tungstenite::tungstenite::Error),
+    #[cfg(target_family = "wasm")]
+    #[error("request error: {0}")]
+    ConnectionError(serde_json::Value),
     #[error("connection closed")]
     ConnectionClosed,
+    #[error("unhandled error: {0}")]
+    OtherError(Box<dyn std::error::Error + Send + Sync>),
 }
