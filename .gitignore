@@ -17,7 +17,7 @@ target/
 
 # IDEs
 .idea/*
-.vscode/*
+**/.vscode/*
 
 config.toml
 .rustc*

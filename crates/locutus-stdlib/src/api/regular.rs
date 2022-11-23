@@ -101,7 +101,7 @@ impl WebApi {
     }
 
     #[inline]
-    pub async fn request(
+    pub async fn send(
         &mut self,
         request: ClientRequest<'static>,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<ClientRequest<'static>>> {
@@ -109,7 +109,7 @@ impl WebApi {
     }
 
     #[inline]
-    pub async fn response(&mut self) -> HostResult {
+    pub async fn recv(&mut self) -> HostResult {
         let res = self.response_rx.recv().await;
         res.ok_or_else(|| ClientError::from(ErrorKind::ChannelClosed))?
     }
