@@ -57,7 +57,7 @@ impl ComponentInterface for Component {
                     }
                 }
             }
-            _InboundComponentMsg => {
+            _inbound_component_msg => {
                 return Err(ComponentError::Other(format!(
                     "Unexpected app inbound message"
                 )))

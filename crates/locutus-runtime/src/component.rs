@@ -1,4 +1,7 @@
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{
+    aead::{AeadCore, KeyInit, OsRng},
+    XChaCha20Poly1305, XNonce,
+};
 use locutus_stdlib::prelude::{
     ApplicationMessage, Component, ComponentError, ComponentInterfaceResult, ComponentKey,
     GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
@@ -200,13 +203,14 @@ mod test {
     use locutus_stdlib::prelude::{env_logger, ComponentContext, ContractInstanceId, Parameters};
 
     use super::*;
+    use crate::component_store::ComponentStore;
     use crate::{ContractStore, SecretsStore, WrappedContract};
     use locutus_stdlib::contract_interface::ContractCode;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::{path::PathBuf, sync::atomic::AtomicUsize};
 
-    const TEST_COMPONENT_1: &str = "test_ccomponent_1";
+    const TEST_COMPONENT_1: &str = "test_component_1";
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -248,10 +252,27 @@ mod test {
 
     fn set_up_runtime(name: &str) -> (Component, Runtime) {
         let _ = env_logger::try_init();
+        let contracts_dir = test_dir();
+        let components_dir = test_dir();
+        // let secrets_dir = test_dir();
+
+        let contract_store = ContractStore::new(contracts_dir, 10_000).unwrap();
+        let component_store = ComponentStore::new(components_dir.clone(), 10_000).unwrap();
+        let secret_store = SecretsStore::from_dir(components_dir);
+
+        let mut runtime =
+            Runtime::build(contract_store, component_store, secret_store, false).unwrap();
+
         let component = get_test_component(name);
-        let contract_store = ContractStore::new(test_dir(), 10_000).unwrap();
-        let mut runtime = Runtime::build(contract_store, SecretsStore::default(), false).unwrap();
         let _ = runtime.component_store.store_component(component.clone());
+
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let _ = runtime
+            .secret_store
+            .register_component(component.key().clone(), cipher, nonce);
+
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
         (component, runtime)
     }
@@ -262,14 +283,17 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
+
         let (component, mut runtime) = set_up_runtime(TEST_COMPONENT_1);
-        let msg: ApplicationMessage = ApplicationMessage {
-            app: ContractInstanceId::try_from(contract.key.to_string()).unwrap(),
-            payload: serde_json::to_vec(&InboundAppMessage::CreateInboxRequest).unwrap(),
-            context: ComponentContext(vec![]),
-        };
+
+        let payload: Vec<u8> = serde_json::to_vec(&InboundAppMessage::CreateInboxRequest).unwrap();
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let context = ComponentContext::new(vec![]);
+        let msg: ApplicationMessage = ApplicationMessage::new(app, payload, context);
+
         let inbound_app_msg = InboundComponentMsg::ApplicationMessage(msg);
         let outbound = runtime.inbound_app_message(component.key(), vec![inbound_app_msg]);
+        println!("{:?}", outbound);
         Ok(())
     }
 }

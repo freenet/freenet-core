@@ -26,6 +26,13 @@ pub struct SecretsStore {
 }
 
 impl SecretsStore {
+    pub fn from_dir(base_path: PathBuf) -> Self {
+        Self {
+            base_path,
+            ciphers: HashMap::new(),
+        }
+    }
+
     pub fn register_component(
         &mut self,
         component: ComponentKey,

@@ -53,6 +53,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn build(
         contract_store: ContractStore,
+        component_store: ComponentStore,
         secret_store: SecretsStore,
         host_mem: bool,
     ) -> RuntimeResult<Self> {
@@ -77,7 +78,7 @@ impl Runtime {
             enable_wasi: false,
 
             secret_store,
-            component_store: ComponentStore::default(),
+            component_store,
             contract_modules: HashMap::new(),
 
             contract_store,
@@ -155,7 +156,7 @@ impl Runtime {
                 .component_store
                 .fetch_component(key)
                 .ok_or_else(|| RuntimeInnerError::ComponentNotFound(key.clone()))?;
-            let module = Module::new(&self.wasm_store, contract)?;
+            let module = Module::new(&self.wasm_store, contract.as_ref())?;
             self.component_modules.insert(key.clone(), module);
             self.component_modules.get(key).unwrap()
         }

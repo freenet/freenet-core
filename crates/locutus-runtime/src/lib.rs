@@ -6,6 +6,7 @@ pub(crate) mod error;
 mod runtime;
 mod secrets_store;
 mod state_store;
+mod store;
 pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;

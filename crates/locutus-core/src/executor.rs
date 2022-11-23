@@ -38,7 +38,13 @@ impl Executor {
         ctrl_handler();
 
         Ok(Self {
-            runtime: Runtime::build(store, SecretsStore::default(), false).unwrap(),
+            runtime: Runtime::build(
+                store,
+                ComponentStore::default(),
+                SecretsStore::default(),
+                false,
+            )
+            .unwrap(),
             contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),

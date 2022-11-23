@@ -119,6 +119,11 @@ impl ComponentKey {
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
     }
+
+    /// Returns the hash of the contract key only.
+    pub fn code_hash(&self) -> &[u8; COMPONENT_HASH_LENGTH] {
+        &self.0
+    }
 }
 
 impl Display for ComponentKey {
