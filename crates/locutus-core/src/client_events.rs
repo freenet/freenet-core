@@ -20,9 +20,9 @@ pub type HostResult = Result<HostResponse, ClientError>;
 #[repr(transparent)]
 pub struct ClientId(pub(crate) usize);
 
-impl Into<usize> for ClientId {
-    fn into(self) -> usize {
-        self.0
+impl From<ClientId> for usize {
+    fn from(val: ClientId) -> Self {
+        val.0
     }
 }
 

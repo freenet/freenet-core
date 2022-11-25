@@ -39,8 +39,20 @@ tokio-tungstenite = { version = "0.17", optional = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 serde-wasm-bindgen = { version = "0.4", optional = true }
-web-sys = { version = "0.3", features = ["BinaryType", "ErrorEvent", "MessageEvent", "WebSocket"], optional = true }
 wasm-bindgen = { version = "0.2", features = ["serde-serialize"], optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  "BinaryType",
+  "Blob",
+  "ErrorEvent",
+  "FileReader",
+  "MessageEvent",
+  "ProgressEvent",
+  "WebSocket",
+]
+optional = true
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
