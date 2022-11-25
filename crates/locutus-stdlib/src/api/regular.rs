@@ -189,31 +189,85 @@ async fn process_response(
 
 #[cfg(test)]
 mod test {
+    use crate::api::HostResponse;
+
     use super::*;
-    use std::{net::Ipv4Addr, sync::atomic::AtomicU16};
+    use std::{net::Ipv4Addr, sync::atomic::AtomicU16, time::Duration};
     use tokio::net::TcpListener;
 
     static PORT: AtomicU16 = AtomicU16::new(65495);
 
     struct Server {
+        recv: bool,
         listener: TcpListener,
     }
 
     impl Server {
-        async fn new() -> Self {
-            let listener = tokio::net::TcpListener::bind((
-                Ipv4Addr::LOCALHOST,
-                PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            ))
-            .await
-            .unwrap();
-            Server { listener }
+        async fn new(port: u16, recv: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap();
+            Server { recv, listener }
+        }
+
+        async fn listen(
+            self,
+            tx: tokio::sync::oneshot::Sender<()>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let (stream, _) =
+                tokio::time::timeout(Duration::from_millis(10), self.listener.accept()).await??;
+            let mut stream = tokio_tungstenite::accept_async(stream).await?;
+
+            if !self.recv {
+                let res: HostResult = Ok(HostResponse::Ok);
+                let req = rmp_serde::to_vec(&res)?;
+                stream.send(Message::Binary(req)).await?;
+            }
+
+            let Message::Binary(msg) = stream.next().await.ok_or_else(|| "no msg".to_owned())?? else {
+                        return Err("wrong msg".to_owned().into());
+                };
+
+            let _req: ClientRequest = rmp_serde::from_slice(&msg)?;
+            tx.send(()).map_err(|_| "couldn't error".to_owned())?;
+            Ok(())
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_send() {
-        // let test_conn = WebSocketStream
-        todo!();
+    async fn test_send() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let server = Server::new(port, true).await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server_result = tokio::task::spawn(server.listen(tx));
+        let (ws_conn, _) =
+            tokio_tungstenite::connect_async(format!("ws://localhost:{port}/")).await?;
+        let mut client = WebApi::start(ws_conn);
+
+        client
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::timeout(Duration::from_millis(10), rx).await??;
+        tokio::time::timeout(Duration::from_millis(10), server_result).await???;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_recv() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let server = Server::new(port, false).await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server_result = tokio::task::spawn(server.listen(tx));
+        let (ws_conn, _) =
+            tokio_tungstenite::connect_async(format!("ws://localhost:{port}/")).await?;
+        let mut client = WebApi::start(ws_conn);
+
+        let _res = client.recv().await;
+        client
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::timeout(Duration::from_millis(10), rx).await??;
+        tokio::time::timeout(Duration::from_millis(10), server_result).await???;
+        Ok(())
     }
 }

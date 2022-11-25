@@ -225,6 +225,11 @@ impl UserInputResponse<'_> {
     }
 }
 
+/*
+contracts/web/9809fvnmbgbgf
+freenet.com/components/784r3nbvmfd/
+*/
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum OutboundComponentMsg {
     // from the apps

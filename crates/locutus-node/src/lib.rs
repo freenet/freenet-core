@@ -67,7 +67,10 @@ pub mod local_node {
                 Err(either::Left(err)) => {
                     log::error!("{err}");
                     http_handle
-                        .send(id, Err(ClientError::from(ErrorKind::Other(format!("{err}")))))
+                        .send(
+                            id,
+                            Err(ClientError::from(ErrorKind::Other(format!("{err}")))),
+                        )
                         .await?;
                 }
                 Err(either::Right(err)) => {
