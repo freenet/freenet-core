@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display, io::Cursor};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
     component_interface::{Component, ComponentKey, InboundComponentMsg, OutboundComponentMsg},
@@ -300,7 +300,7 @@ impl Display for ClientRequest<'_> {
 /// A response to a previous [`ClientRequest`]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HostResponse<T = WrappedState, U = Vec<u8>> {
-    ContractResponse(#[serde(bound(deserialize = "T: Deserialize<'de>"))] ContractResponse<T>),
+    ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),
     ComponentResponse {
         key: ComponentKey,
         values: Vec<OutboundComponentMsg>,
@@ -356,11 +356,11 @@ impl std::fmt::Display for HostResponse {
 }
 
 // todo: add a `AsBytes` trait for state representations
-#[derive(Clone, Serialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum ContractResponse<T = WrappedState> {
     GetResponse {
         contract: Option<ContractContainer>,
-        #[serde(bound(deserialize = "T: Deserialize<'de>"))]
+        #[serde(bound(deserialize = "T: DeserializeOwned"))]
         state: T,
     },
     PutResponse {
@@ -369,28 +369,32 @@ pub enum ContractResponse<T = WrappedState> {
     /// Message sent when there is an update to a subscribed contract.
     UpdateNotification {
         key: ContractKey,
-        #[serde(bound(deserialize = "UpdateData<'static>: Deserialize<'de>"))]
+        #[serde(deserialize_with = "ContractResponse::<T>::deser_update_data")]
         update: UpdateData<'static>,
     },
     /// Successful update
     UpdateResponse {
         key: ContractKey,
-        #[serde(bound(deserialize = "StateSummary<'static>: Deserialize<'de>"))]
+        #[serde(deserialize_with = "ContractResponse::<T>::deser_state")]
         summary: StateSummary<'static>,
     },
 }
 
-impl<'de, T> Deserialize<'de> for ContractResponse<T>
-where
-    T: Deserialize<'de>,
-{
-    fn deserialize<D>(deser: D) -> Result<Self, D::Error>
+impl<T> ContractResponse<T> {
+    fn deser_update_data<'de, D>(deser: D) -> Result<UpdateData<'static>, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        // let value = <ContractResponse<T> as Deserialize>::deserialize(deser)?;
-        // Ok(res.into_owned())
-        todo!()
+        let value = <UpdateData as Deserialize>::deserialize(deser)?;
+        Ok(value.into_owned())
+    }
+
+    fn deser_state<'de, D>(deser: D) -> Result<StateSummary<'static>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <StateSummary as Deserialize>::deserialize(deser)?;
+        Ok(value.into_owned())
     }
 }
 
