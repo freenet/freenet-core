@@ -535,7 +535,7 @@ impl std::fmt::Display for Contract<'_> {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
 impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let contract: ContractCode = u.arbitrary()?;
@@ -815,7 +815,7 @@ impl<'a> DerefMut for StateSummary<'a> {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
 impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
@@ -919,7 +919,7 @@ impl PartialEq for ContractCode<'_> {
 
 impl Eq for ContractCode<'_> {}
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
 impl<'a> arbitrary::Arbitrary<'a> for ContractCode<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
@@ -948,7 +948,10 @@ impl std::fmt::Display for ContractCode<'_> {
 /// The key representing the hash of the contract executable code hash and a set of `parameters`.
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
-#[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
+#[cfg_attr(
+    all(any(test, feature = "testing"), target_family = "unix"),
+    derive(arbitrary::Arbitrary)
+)]
 #[repr(transparent)]
 pub struct ContractInstanceId(#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] [u8; CONTRACT_KEY_SIZE]);
 
@@ -1006,7 +1009,10 @@ impl Display for ContractInstanceId {
 /// A complete key specification, that represents a cryptographic hash that identifies the contract.
 #[serde_as]
 #[derive(Debug, Eq, Clone, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(arbitrary::Arbitrary))]
+#[cfg_attr(
+    all(any(test, feature = "testing"), target_family = "unix"),
+    derive(arbitrary::Arbitrary)
+)]
 pub struct ContractKey {
     instance: ContractInstanceId,
     #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
@@ -1663,7 +1669,7 @@ pub(crate) mod wasm_interface {
     conversion!(Result<StateDelta<'static>, ContractError>: ResultKind::StateDelta);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "unix"))]
 mod test {
     use super::*;
     use once_cell::sync::Lazy;
