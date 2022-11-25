@@ -51,7 +51,7 @@ jobs:
 
       - name: Install stdlib packages
         working-directory: apps/stdlib
-        run: npm Install
+        run: npm install
 
       - name: Test - default
         run: cargo test
@@ -92,7 +92,7 @@ jobs:
           rustup target add wasm32-unknown-unknown
           rustup target add wasm32-wasi
 
-      - name: Test - locutus-stdlib
+      - name: Build  - locutus-stdlib
         working-directory: crates/locutus-stdlib
         run: cargo build --target ${{ matrix.targets }}
 

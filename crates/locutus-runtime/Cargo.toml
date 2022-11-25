@@ -36,7 +36,7 @@ walkdir = "2.3.2"
 wasmer = { version = "^2.0", default-features = false, features = [ 
 	"sys"
 ]}
-wasmer-compiler-llvm = { version="^2.0", optional = true }
+# wasmer-compiler-llvm = { version="^2.0", optional = true }
 varuint = "0.6"
 byteorder = "1"
 
@@ -46,8 +46,8 @@ locutus-stdlib = { path = "../locutus-stdlib", features = ["archive"], version =
 [features]
 default = [ "wasmer-default" ]
 wasmer-default = [ 	
-	"wasmer/llvm",
-	"wasmer-compiler-llvm",
+	# "wasmer/llvm",
+	# "wasmer-compiler-llvm",
 	"wasmer/default-cranelift",
 	# "wasmer/dylib"
 	"wasmer/universal"
