@@ -1,6 +1,12 @@
 //! Serves a new contract so is available for browsing.
 
-use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
+use std::{
+    fs::File,
+    io::Read,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use locutus_core::locutus_runtime::{ContractContainer, WasmAPIVersion};
 use locutus_core::{
@@ -117,7 +123,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Default::default(),
         )
         .await;
-    locutus::local_node::run_local_node(local_node).await
+    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50509);
+    locutus::local_node::run_local_node(local_node, socket).await
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
