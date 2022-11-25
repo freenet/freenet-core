@@ -1,0 +1,10 @@
+[package]
+name = "antiflood-tokens"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+locutus-stdlib = { workspace = true }
+
+[lib]
+crate-type = ["cdylib"]

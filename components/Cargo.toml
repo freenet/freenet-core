@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["antiflood-tokens"]
+
+[workspace.dependencies]
+locutus-stdlib = { version = "0.0.3", path = "../crates/locutus-stdlib" }
