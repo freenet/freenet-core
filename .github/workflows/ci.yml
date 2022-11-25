@@ -15,12 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        args:
-          [
-            "--no-default-features",
-            "--all-features",
-            "--benches --all-features",
-          ]
+        args: ["--no-default-features", "--all-features"]
         targets: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
     env:
       LOCUTUS_LOG: error
@@ -57,11 +52,14 @@ jobs:
 
       - name: Install stdlib packages
         working-directory: apps/stdlib
-        run: npm install
+        run: npm Install
 
-      - name: Test - all
+      - name: Test - default
+        run: cargo test
+
+      - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
-      
+
       - name: Test - locutus-stdlib
         working-directory: crates/locutus-stdlib
         run: cargo test --target ${{ matrix.target }}
