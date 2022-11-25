@@ -9,14 +9,13 @@ on:
     paths-ignore: ["docs/**", "README.md"]
 
 jobs:
-  test:
-    name: Test
+  test_all:
+    name: Test features
 
     runs-on: ubuntu-latest
     strategy:
       matrix:
         args: ["--no-default-features", "--all-features"]
-        targets: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
     env:
       LOCUTUS_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target"
@@ -60,9 +59,42 @@ jobs:
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
 
+  build_target:
+    name: Build targets
+
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        targets: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
+    env:
+      LOCUTUS_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target"
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.11.0
+        with:
+          access_token: ${{ github.token }}
+
+      - uses: actions/checkout@v3
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: "true"
+          default: "true"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add dependencies
+        run: |
+          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-wasi
+
       - name: Test - locutus-stdlib
         working-directory: crates/locutus-stdlib
-        run: cargo test --target ${{ matrix.target }}
+        run: cargo build --target ${{ matrix.targets }}
 
   clippy_check:
     name: Clippy
@@ -89,6 +121,11 @@ jobs:
           default: "true"
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Add dependencies
+        run: |
+          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-wasi
 
       - name: clippy
         run: cargo clippy -- -D warnings

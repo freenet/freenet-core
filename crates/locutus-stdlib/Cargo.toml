@@ -54,7 +54,7 @@ features = [
 ]
 optional = true
 
-[dev-dependencies]
+[target.'cfg(target_family = "unix")'.dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 bincode = "1"
 wasmer = { version = "^2.0", features = [ "sys-default", "wat"] }
