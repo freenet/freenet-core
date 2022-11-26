@@ -2,9 +2,8 @@ use locutus_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
-use wasmer::TypedFunction;
 
-use crate::{ContractExecError, RuntimeResult};
+use crate::{ContractExecError, RuntimeResult, TypedFunction};
 
 type FfiReturnTy = i64;
 
@@ -188,7 +187,7 @@ impl ContractRuntimeInterface for crate::Runtime {
 
         let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
             .exports
-            .get_typed_function(&mut self.wasm_store, "update_state")?;
+            .get_typed_function(&self.wasm_store, "update_state")?;
         let update_res = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
