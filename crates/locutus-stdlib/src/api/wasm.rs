@@ -32,7 +32,7 @@ impl WebApi {
 
         let onerror_callback = Closure::<dyn FnMut(_)>::new(move |e: ErrorEvent| {
             let error = format!(
-                "{file}:{lineno}: {msg}",
+                "error: {file}:{lineno}: {msg}",
                 file = e.filename(),
                 lineno = e.lineno(),
                 msg = e.message()
@@ -63,7 +63,7 @@ impl WebApi {
         Ok(())
     }
 
-    pub fn disconnect(&mut self, cause: impl AsRef<str>) {
+    pub fn disconnect(self, cause: impl AsRef<str>) {
         let _ = self.conn.close_with_code_and_reason(1000, cause.as_ref());
     }
 }
