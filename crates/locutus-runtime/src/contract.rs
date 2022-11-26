@@ -2,7 +2,7 @@ use locutus_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
-use wasmer::NativeFunc;
+use wasmer::TypedFunction;
 
 use crate::{ContractExecError, RuntimeResult};
 
@@ -78,22 +78,33 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state)?;
-        let serialized = bincode::serialize(&related)?;
-        let mut related_buf = self.init_buf(&instance, &serialized)?;
-        related_buf.write(serialized)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state)?;
+            state_buf.ptr()
+        };
+        let related_buf_ptr = {
+            let serialized = bincode::serialize(&related)?;
+            let mut related_buf = self.init_buf(&instance, &serialized)?;
+            related_buf.write(serialized)?;
+            related_buf.ptr()
+        };
 
-        let validate_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("validate_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "validate_state")?;
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
-                    param_buf.ptr() as i64,
-                    state_buf.ptr() as i64,
-                    related_buf.ptr() as i64,
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    state_buf_ptr as i64,
+                    related_buf_ptr as i64,
                 )?,
                 &linear_mem,
             )
@@ -114,16 +125,27 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut delta_buf = self.init_buf(&instance, delta)?;
-        delta_buf.write(delta)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let delta_buf_ptr = {
+            let mut delta_buf = self.init_buf(&instance, delta)?;
+            delta_buf.write(delta)?;
+            delta_buf.ptr()
+        };
 
-        let validate_func: NativeFunc<(i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("validate_delta")?;
+        let validate_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "validate_delta")?;
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(
-                validate_func.call(param_buf.ptr() as i64, delta_buf.ptr() as i64)?,
+                validate_func.call(
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    delta_buf_ptr as i64,
+                )?,
                 &linear_mem,
             )
             .unwrap_validate_delta_res(linear_mem)
@@ -147,22 +169,33 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state.clone())?;
-        let serialized = bincode::serialize(update_data)?;
-        let mut update_data_buf = self.init_buf(&instance, &serialized)?;
-        update_data_buf.write(serialized)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state.clone())?;
+            state_buf.ptr()
+        };
+        let update_data_buf_ptr = {
+            let serialized = bincode::serialize(update_data)?;
+            let mut update_data_buf = self.init_buf(&instance, &serialized)?;
+            update_data_buf.write(serialized)?;
+            update_data_buf.ptr()
+        };
 
-        let validate_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("update_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&mut self.wasm_store, "update_state")?;
         let update_res = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
-                    param_buf.ptr() as i64,
-                    state_buf.ptr() as i64,
-                    update_data_buf.ptr() as i64,
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    state_buf_ptr as i64,
+                    update_data_buf_ptr as i64,
                 )?,
                 &linear_mem,
             )
@@ -182,17 +215,28 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state.clone())?;
+            state_buf.ptr()
+        };
 
-        let summary_func: NativeFunc<(i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("summarize_state")?;
+        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "summarize_state")?;
 
         let result = unsafe {
             let int_res = ContractInterfaceResult::from_raw(
-                summary_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?,
+                summary_func.call(
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    state_buf_ptr as i64,
+                )?,
                 &linear_mem,
             );
             int_res
@@ -213,23 +257,34 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state.clone())?;
-        let mut summary_buf = self.init_buf(&instance, summary)?;
-        summary_buf.write(summary)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state.clone())?;
+            state_buf.ptr()
+        };
+        let summary_buf_ptr = {
+            let mut summary_buf = self.init_buf(&instance, summary)?;
+            summary_buf.write(summary)?;
+            summary_buf.ptr()
+        };
 
-        let get_state_delta_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("get_state_delta")?;
+        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "get_state_delta")?;
 
         let result = unsafe {
             let int_res = {
                 ContractInterfaceResult::from_raw(
                     get_state_delta_func.call(
-                        param_buf.ptr() as i64,
-                        state_buf.ptr() as i64,
-                        summary_buf.ptr() as i64,
+                        &mut self.wasm_store,
+                        param_buf_ptr as i64,
+                        state_buf_ptr as i64,
+                        summary_buf_ptr as i64,
                     )?,
                     &linear_mem,
                 )
