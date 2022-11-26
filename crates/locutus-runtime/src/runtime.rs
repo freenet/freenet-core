@@ -213,7 +213,7 @@ impl Runtime {
                 &self.top_level_imports,
             )?);
         }
-        let wasi_env = WasiState::new("locutus").finalize(&mut self.wasm_store)?;
+        let mut wasi_env = WasiState::new("locutus").finalize(&mut self.wasm_store)?;
         let mut imports = wasi_env.import_object(&mut self.wasm_store, module)?;
         if let Some(mem) = &self.host_memory {
             imports.register_namespace("env", namespace!("memory" => mem.clone()));
@@ -229,6 +229,8 @@ impl Runtime {
         }
 
         let instance = Instance::new(&mut self.wasm_store, module, &imports)?;
+        let _ = wasi_env.initialize(&mut self.wasm_store, &instance)?;
+
         Ok(instance)
     }
 
