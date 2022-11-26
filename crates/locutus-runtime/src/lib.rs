@@ -10,8 +10,6 @@ pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
-use wasmer::TypedFunction;
-
 pub use locutus_stdlib;
 pub use prelude::*;
 

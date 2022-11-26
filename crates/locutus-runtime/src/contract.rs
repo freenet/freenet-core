@@ -2,8 +2,9 @@ use locutus_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
+use wasmer::TypedFunction;
 
-use crate::{ContractExecError, RuntimeResult, TypedFunction};
+use crate::{ContractExecError, RuntimeResult};
 
 type FfiReturnTy = i64;
 
