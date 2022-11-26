@@ -674,7 +674,7 @@ export class HostResponse {
    * @private
    */
   private static assertBytes(state: any): Uint8Array {
-    assert(Array.isArray(state));
+    assert(Array.isArray(state) || ArrayBuffer.isView(state));
     assert(
       state.every((value: any) => {
         if (typeof value === "number" && value >= MIN_U8 && value <= MAX_U8)
@@ -687,9 +687,8 @@ export class HostResponse {
   }
 
   private static getUpdateData(update: UpdateData): UpdateData {
-    if ("delta" in update) {
-      let data = update["delta"];
-      let delta = Array.from(data);
+    if ("Delta" in update) {
+      let delta = update["Delta"];
       return {
         delta: HostResponse.assertBytes(delta),
       };
