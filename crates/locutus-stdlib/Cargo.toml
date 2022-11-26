@@ -62,7 +62,7 @@ wasmer-wasi = { workspace = true }
 rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
-default = ["net"]
+default = []
 archive = ["xz2"]
 net = ["serde-wasm-bindgen", "tokio", "tokio-tungstenite", "wasm-bindgen", "web-sys"]
 testing = ["arbitrary"]
