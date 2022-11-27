@@ -1,5 +1,15 @@
 //! Standard library provided by the Freenet project to be able to write Locutus-compatible contracts.
-#[cfg(feature = "net")]
+#[cfg(and(
+    feature = "net",
+    any(
+        all(
+            target_arch = "wasm32",
+            target_vendor = "unknown",
+            target_os = "unknown"
+        ),
+        target_family = "unix"
+    )
+))]
 pub mod api;
 pub mod buf;
 mod component_interface;
