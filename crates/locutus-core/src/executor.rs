@@ -4,19 +4,18 @@ use std::collections::HashMap;
 
 use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
+use locutus_stdlib::api::{
+    ClientError, ClientRequest, ComponentRequest, ContractRequest, ContractResponse, HostResponse,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    client_events::{
-        ComponentError as CoreComponentError, ComponentRequest, ContractError as CoreContractError,
-        ContractRequest, ContractResponse,
-    },
+    client_events::{ComponentError as CoreComponentError, ContractError as CoreContractError},
     either::Either,
-    ClientError, ClientId, ClientRequest, DynError, HostResponse, HostResult, RequestError,
-    SqlitePool,
+    ClientId, DynError, HostResult, RequestError, SqlitePool,
 };
 
-type Response<'a> = Result<HostResponse<'a>, Either<RequestError, DynError>>;
+type Response = Result<HostResponse, Either<RequestError, DynError>>;
 
 /// A WASM executor which will run any contracts, components, etc. registered.
 ///
@@ -106,7 +105,7 @@ impl Executor {
         &mut self,
         id: ClientId,
         req: ClientRequest<'static>,
-        updates: Option<UnboundedSender<Result<HostResponse<'static>, ClientError>>>,
+        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_op(op, id, updates).await,
@@ -129,7 +128,7 @@ impl Executor {
         &mut self,
         req: ContractRequest<'_>,
         id: ClientId,
-        updates: Option<UnboundedSender<Result<HostResponse<'static>, ClientError>>>,
+        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
             ContractRequest::Put {
@@ -262,7 +261,7 @@ impl Executor {
         }
     }
 
-    fn component_op<'a>(&mut self, req: ComponentRequest<'a>) -> Response<'a> {
+    fn component_op(&mut self, req: ComponentRequest<'_>) -> Response {
         match req {
             ComponentRequest::RegisterComponent {
                 component,
@@ -294,7 +293,13 @@ impl Executor {
                 }
             }
             ComponentRequest::ApplicationMessages { key, inbound } => {
-                match self.runtime.inbound_app_message(&key, inbound) {
+                match self.runtime.inbound_app_message(
+                    &key,
+                    inbound
+                        .into_iter()
+                        .map(InboundComponentMsg::into_owned)
+                        .collect(),
+                ) {
                     Ok(values) => Ok(HostResponse::ComponentResponse { key, values }),
                     Err(err) if err.is_component_exec_error() => {
                         log::error!("failed processing messages for component `{key}`: {err}");
@@ -352,7 +357,7 @@ impl Executor {
         &mut self,
         contract: bool,
         key: ContractKey,
-    ) -> Result<HostResponse<'static>, RequestError> {
+    ) -> Result<HostResponse, RequestError> {
         let mut got_contract = None;
         if contract {
             let parameters = self.contract_state.get_params(&key).await.map_err(|e| {

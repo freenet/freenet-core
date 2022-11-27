@@ -199,7 +199,7 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
         #[cfg(feature = "trace")]
         {
             let contract_mem = std::slice::from_raw_parts(mem.start_ptr, mem.size as usize);
-            log::trace!(
+            tracing::trace!(
                 "*mut BufferBuilder <- offset: {}; in mem: {:?}",
                 builder_ptr as usize,
                 &contract_mem[builder_ptr as usize
@@ -214,7 +214,7 @@ fn from_raw_builder<'a>(builder_ptr: *mut BufferBuilder, mem: WasmLinearMem) -> 
         let buf_builder: &'static mut BufferBuilder = Box::leak(Box::from_raw(builder_ptr));
         #[cfg(feature = "trace")]
         {
-            log::trace!("buf builder from FFI: {buf_builder:?}");
+            tracing::trace!("buf builder from FFI: {buf_builder:?}");
         }
 
         let read_ptr = Box::leak(Box::from_raw(compute_ptr(
@@ -317,31 +317,31 @@ pub fn initiate_buffer(capacity: u32) -> i64 {
     }));
     #[cfg(feature = "trace")]
     {
-        log::trace!(
+        tracing::trace!(
             "new buffer ptr: {:p} -> {} as i64 w/ cap: {capacity}",
             buf.as_ptr(),
             start
         );
-        log::trace!(
+        tracing::trace!(
             "last read ptr: {last_read:p} -> {} as i64",
             last_read as i64
         );
-        log::trace!(
+        tracing::trace!(
             "last write ptr: {last_write:p} -> {} as i64",
             last_write as i64
         );
-        log::trace!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
+        tracing::trace!("buffer ptr: {buffer:p} -> {} as i64", buffer as i64);
     }
     std::mem::forget(buf);
     buffer as i64
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "unix"))]
 mod test {
     use super::*;
     use wasmer::{
-        imports, namespace, wat2wasm, Cranelift, Function, Instance, Module, NativeFunc, Store,
-        Universal,
+        imports, namespace, wat2wasm, AsStoreMut, Cranelift, Function, Instance, Module, Store,
+        TypedFunction,
     };
     use wasmer_wasi::WasiState;
 
@@ -354,14 +354,14 @@ mod test {
 
     fn build_test_mod() -> Result<(Store, Instance), Box<dyn std::error::Error>> {
         let wasm_bytes = wat2wasm(TEST_MODULE.as_bytes())?;
-        let store = Store::new(&Universal::new(Cranelift::new()).engine());
+        let mut store = Store::new(Cranelift::new());
         let module = Module::new(&store, wasm_bytes)?;
 
-        let init_buf_fn = Function::new_native(&store, initiate_buffer);
+        let init_buf_fn = Function::new_typed(&mut store, initiate_buffer);
         let imports = imports! {
             "locutus" => { "initiate_buffer" => init_buf_fn }
         };
-        let instance = Instance::new(&module, &imports).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
         Ok((store, instance))
     }
 
@@ -369,38 +369,39 @@ mod test {
     #[allow(dead_code)]
     fn build_test_mod_with_wasi() -> Result<(Store, Instance), Box<dyn std::error::Error>> {
         let wasm_bytes = wat2wasm(TEST_MODULE.as_bytes())?;
-        let store = Store::new(&Universal::new(Cranelift::new()).engine());
+        let mut store = Store::new(Cranelift::new());
         let module = Module::new(&store, wasm_bytes)?;
 
-        let init_buf_fn = Function::new_native(&store, initiate_buffer);
+        let init_buf_fn = Function::new_typed(&mut store, initiate_buffer);
         let funcs = namespace!("initiate_buffer" => init_buf_fn );
-        let mut wasi_env = WasiState::new("locutus").finalize()?;
-        let mut imports = wasi_env.import_object(&module)?;
-        imports.register("locutus", funcs);
+        let wasi_env = WasiState::new("locutus").finalize(&mut store)?;
+        let mut imports = wasi_env.import_object(&mut store, &module)?;
+        imports.register_namespace("locutus", funcs);
 
-        let instance = Instance::new(&module, &imports).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
         Ok((store, instance))
     }
 
-    fn init_buf(instance: &Instance, size: u32) -> *mut BufferBuilder {
-        let initiate_buffer: NativeFunc<u32, i64> = instance
+    fn init_buf(store: &mut impl AsStoreMut, instance: &Instance, size: u32) -> *mut BufferBuilder {
+        let initiate_buffer: TypedFunction<u32, i64> = instance
             .exports
-            .get_native_function("initiate_buffer")
+            .get_typed_function(&store, "initiate_buffer")
             .unwrap();
-        initiate_buffer.call(size).unwrap() as *mut BufferBuilder
+        initiate_buffer.call(store, size).unwrap() as *mut BufferBuilder
     }
 
     #[test]
     #[ignore]
     fn read_and_write() -> Result<(), Box<dyn std::error::Error>> {
-        let (_store, instance) = build_test_mod()?;
-        let mem = instance.exports.get_memory("memory")?;
+        let (mut store, instance) = build_test_mod()?;
+        let mem = instance.exports.get_memory("memory")?.view(&store);
         let linear_mem = WasmLinearMem {
             start_ptr: mem.data_ptr() as *const _,
             size: mem.data_size(),
         };
 
-        let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
+        let mut writer =
+            unsafe { BufferMut::from_ptr(init_buf(&mut store, &instance, 10), linear_mem) };
         writer.write([1u8, 2])?;
         let mut reader = writer.shared();
         let r: [u8; 2] = unsafe { reader.read() };
@@ -417,14 +418,15 @@ mod test {
     #[test]
     #[ignore]
     fn read_and_write_bytes() -> Result<(), Box<dyn std::error::Error>> {
-        let (_store, instance) = build_test_mod()?;
-        let mem = instance.exports.get_memory("memory")?;
+        let (mut store, instance) = build_test_mod()?;
+        let mem = instance.exports.get_memory("memory")?.view(&store);
         let linear_mem = WasmLinearMem {
             start_ptr: mem.data_ptr() as *const _,
             size: mem.data_size(),
         };
 
-        let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
+        let mut writer =
+            unsafe { BufferMut::from_ptr(init_buf(&mut store, &instance, 10), linear_mem) };
         writer.write([1u8, 2])?;
         let mut reader = writer.shared();
         let r = reader.read_bytes(2);
@@ -441,15 +443,16 @@ mod test {
     #[test]
     #[ignore]
     fn update() -> Result<(), Box<dyn std::error::Error>> {
-        let (_store, instance) = build_test_mod()?;
-        let mem = instance.exports.get_memory("memory")?;
+        let (mut store, instance) = build_test_mod()?;
+        let mem = instance.exports.get_memory("memory")?.view(&store);
         let linear_mem = WasmLinearMem {
             start_ptr: mem.data_ptr() as *const _,
             size: mem.data_size(),
         };
 
         let ptr = {
-            let mut writer = unsafe { BufferMut::from_ptr(init_buf(&instance, 10), linear_mem) };
+            let mut writer =
+                unsafe { BufferMut::from_ptr(init_buf(&mut store, &instance, 10), linear_mem) };
             writer.write([1u8, 2])?;
             writer.ptr()
         };

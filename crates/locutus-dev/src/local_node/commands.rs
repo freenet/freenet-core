@@ -1,4 +1,5 @@
-use locutus_core::{ClientId, ClientRequest, ContractRequest, ContractResponse, HostResponse};
+use locutus_core::ClientId;
+use locutus_stdlib::api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 
 use crate::{CommandReceiver, DynError};
 

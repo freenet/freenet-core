@@ -33,31 +33,10 @@ impl ImplStruct {
         quote!(i64)
     }
 
-    fn set_logger(&self) -> TokenStream {
-        // TODO: add log level as a parameter to the macro
-        quote! {
-            #[cfg(feature = "trace")]
-            {
-                use ::locutus_stdlib::prelude::log;
-                if let Err(err) = ::locutus_stdlib::prelude::env_logger::builder()
-                    .filter_level(log::LevelFilter::Info)
-                    .filter_module("locutus_stdlib", log::LevelFilter::Trace)
-                    .try_init()
-                {
-                    return ::locutus_stdlib::prelude::ContractInterfaceResult::from(
-                        Err::<::locutus_stdlib::prelude::ValidateResult, _>(
-                            ::locutus_stdlib::prelude::ContractError::Other(format!("{}", err))
-                        )
-                    ).into_raw();
-                }
-            }
-        }
-    }
-
     fn gen_validate_state_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = self.ffi_ret_type();
-        let set_logger = self.set_logger();
+        let set_logger = crate::common::set_logger();
         quote! {
             #[no_mangle]
             pub extern "C" fn validate_state(parameters: i64, state: i64, related: i64) -> #ret {
@@ -97,7 +76,7 @@ impl ImplStruct {
     fn gen_validate_delta_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = self.ffi_ret_type();
-        let set_logger = self.set_logger();
+        let set_logger = crate::common::set_logger();
         quote! {
             #[no_mangle]
             pub extern "C" fn validate_delta(parameters: i64, delta: i64) -> #ret {
@@ -123,7 +102,7 @@ impl ImplStruct {
     fn gen_update_state_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = self.ffi_ret_type();
-        let set_logger = self.set_logger();
+        let set_logger = crate::common::set_logger();
         quote! {
             #[no_mangle]
             pub extern "C" fn update_state(parameters: i64, state: i64, delta: i64) -> #ret {
@@ -163,7 +142,7 @@ impl ImplStruct {
     fn gen_summarize_state_fn(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = self.ffi_ret_type();
-        let set_logger = self.set_logger();
+        let set_logger = crate::common::set_logger();
         quote! {
             #[no_mangle]
             pub extern "C" fn summarize_state(parameters: i64, state: i64) -> #ret {
@@ -187,7 +166,7 @@ impl ImplStruct {
     fn gen_get_state_delta(&self) -> TokenStream {
         let type_name = &self.type_name;
         let ret = self.ffi_ret_type();
-        let set_logger = self.set_logger();
+        let set_logger = crate::common::set_logger();
         quote! {
             #[no_mangle]
             pub extern "C" fn get_state_delta(parameters: i64, state: i64, summary: i64) -> #ret {

@@ -1,7 +1,20 @@
 //! Standard library provided by the Freenet project to be able to write Locutus-compatible contracts.
+#[cfg(all(
+    feature = "net",
+    any(
+        all(
+            target_arch = "wasm32",
+            target_vendor = "unknown",
+            target_os = "unknown"
+        ),
+        target_family = "unix"
+    )
+))]
+pub mod api;
 pub mod buf;
 mod component_interface;
 pub mod contract_interface;
+mod versioning;
 #[cfg(feature = "xz2")]
 pub mod web;
 
@@ -12,12 +25,14 @@ pub mod prelude {
     pub use crate::component_interface::*;
     pub use crate::contract_interface::wasm_interface::*;
     pub use crate::contract_interface::*;
+    pub use crate::versioning::*;
     pub use locutus_macros::{component, contract};
 
     pub use bincode;
     pub use blake2;
     pub use env_logger;
-    pub use log;
+    pub use tracing;
+    pub use tracing_subscriber;
 }
 
 #[doc(hidden)]

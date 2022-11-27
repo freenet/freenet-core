@@ -10,16 +10,13 @@ use std::{
 
 use byteorder::{BigEndian, WriteBytesExt};
 use dashmap::DashMap;
-use locutus_stdlib::prelude::{ContractCode, Parameters};
+use locutus_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
 use notify::Watcher;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
-use crate::{
-    contract::WrappedContract, ContractContainer, DynError, RuntimeInnerError, RuntimeResult,
-    WasmAPIVersion,
-};
+use crate::{error::RuntimeInnerError, ContractContainer, DynError, RuntimeResult, WasmAPIVersion};
 
 use super::ContractKey;
 

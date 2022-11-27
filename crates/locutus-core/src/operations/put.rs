@@ -788,12 +788,10 @@ mod messages {
 #[cfg(test)]
 mod test {
     use locutus_runtime::{WasmAPIVersion, WrappedContract};
+    use locutus_stdlib::api::ContractRequest;
     use std::collections::HashMap;
 
-    use crate::{
-        client_events::ContractRequest,
-        node::test::{check_connectivity, NodeSpecification, SimNetwork},
-    };
+    use crate::node::test::{check_connectivity, NodeSpecification, SimNetwork};
 
     use super::*;
 

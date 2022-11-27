@@ -225,11 +225,16 @@ impl UserInputResponse<'_> {
     }
 }
 
+/*
+contracts/web/9809fvnmbgbgf
+freenet.com/components/784r3nbvmfd/
+*/
+
 #[derive(Serialize, Deserialize, Debug)]
-pub enum OutboundComponentMsg<'a> {
+pub enum OutboundComponentMsg {
     // from the apps
     ApplicationMessage(ApplicationMessage),
-    RequestUserInput(#[serde(borrow)] UserInputRequest<'a>),
+    RequestUserInput(#[serde(deserialize_with = "deser_func")] UserInputRequest<'static>),
     // from the node
     GetSecretRequest(GetSecretRequest),
     SetSecretRequest(SetSecretRequest),
@@ -240,22 +245,12 @@ pub enum OutboundComponentMsg<'a> {
     // },
 }
 
-impl OutboundComponentMsg<'_> {
-    pub fn into_owned(self) -> OutboundComponentMsg<'static> {
-        match self {
-            OutboundComponentMsg::ApplicationMessage(r) => {
-                OutboundComponentMsg::ApplicationMessage(r)
-            }
-            OutboundComponentMsg::RequestUserInput(r) => {
-                OutboundComponentMsg::RequestUserInput(r.into_owned())
-            }
-            OutboundComponentMsg::GetSecretRequest(r) => OutboundComponentMsg::GetSecretRequest(r),
-            OutboundComponentMsg::SetSecretRequest(r) => OutboundComponentMsg::SetSecretRequest(r),
-            OutboundComponentMsg::RandomBytesRequest(bytes) => {
-                OutboundComponentMsg::RandomBytesRequest(bytes)
-            }
-        }
-    }
+fn deser_func<'de, D>(deser: D) -> Result<UserInputRequest<'static>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <UserInputRequest<'de> as Deserialize>::deserialize(deser)?;
+    Ok(value.into_owned())
 }
 
 #[non_exhaustive]
@@ -343,7 +338,7 @@ pub(crate) mod wasm_interface {
             )));
             #[cfg(feature = "trace")]
             {
-                log::trace!(
+                tracing::trace!(
                     "got FFI result @ {ptr} ({:p}) -> {result:?}",
                     ptr as *mut Self
                 );
@@ -354,12 +349,12 @@ pub(crate) mod wasm_interface {
         pub fn into_raw(self) -> i64 {
             #[cfg(feature = "trace")]
             {
-                log::trace!("returning FFI -> {self:?}");
+                tracing::trace!("returning FFI -> {self:?}");
             }
             let ptr = Box::into_raw(Box::new(self));
             #[cfg(feature = "trace")]
             {
-                log::trace!("FFI result ptr: {ptr:p} ({}i64)", ptr as i64);
+                tracing::trace!("FFI result ptr: {ptr:p} ({}i64)", ptr as i64);
             }
             ptr as _
         }
@@ -367,7 +362,7 @@ pub(crate) mod wasm_interface {
         pub unsafe fn unwrap(
             self,
             mem: WasmLinearMem,
-        ) -> Result<Vec<OutboundComponentMsg<'static>>, ComponentError> {
+        ) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
             let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
             let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
             let value: Result<Vec<OutboundComponentMsg>, ComponentError> =
@@ -375,7 +370,7 @@ pub(crate) mod wasm_interface {
                     .map_err(|e| ComponentError::Other(format!("{e}")))?;
             #[cfg(feature = "trace")]
             {
-                log::trace!(
+                tracing::trace!(
                     "got result through FFI; addr: {:p} ({}i64, mapped: {ptr:p})
                      serialized: {serialized:?}
                      value: {value:?}",
@@ -387,14 +382,14 @@ pub(crate) mod wasm_interface {
         }
     }
 
-    impl From<Result<Vec<OutboundComponentMsg<'static>>, ComponentError>> for ComponentInterfaceResult {
+    impl From<Result<Vec<OutboundComponentMsg>, ComponentError>> for ComponentInterfaceResult {
         fn from(value: Result<Vec<OutboundComponentMsg>, ComponentError>) -> Self {
             let serialized = bincode::serialize(&value).unwrap();
             let size = serialized.len() as _;
             let ptr = serialized.as_ptr();
             #[cfg(feature = "trace")]
             {
-                log::trace!(
+                tracing::trace!(
                 "sending result through FFI; addr: {ptr:p} ({}),\n  serialized: {serialized:?}\n  value: {value:?}",
                 ptr as i64
             );

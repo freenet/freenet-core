@@ -3,6 +3,9 @@ use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamEx
 use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
+use locutus_stdlib::api::{
+    ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+};
 use std::{
     collections::HashMap,
     sync::{
@@ -319,7 +322,7 @@ impl HttpGateway {
                     ))
                 } else {
                     log::warn!("client: {client_id} not found");
-                    Err(ErrorKind::UnknownClient(client_id).into())
+                    Err(ErrorKind::UnknownClient(client_id.into()).into())
                 }
             }
             ClientConnection::Request { client_id, req } => {
@@ -347,12 +350,11 @@ impl ClientEventsProxy for HttpGateway {
         .boxed()
     }
 
-    fn send<'a>(
+    fn send(
         &mut self,
         id: ClientId,
-        result: Result<HostResponse<'a>, ClientError>,
-    ) -> BoxFuture<'_, Result<(), ClientError>> {
-        let result: Result<HostResponse<'static>, _> = result.map(HostResponse::into_owned);
+        result: Result<HostResponse, ClientError>,
+    ) -> BoxFuture<Result<(), ClientError>> {
         async move {
             if let Some(ch) = self.response_channels.remove(&id) {
                 let should_rm = result

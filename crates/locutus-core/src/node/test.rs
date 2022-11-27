@@ -9,12 +9,13 @@ use itertools::Itertools;
 use libp2p::{identity, PeerId};
 use locutus_runtime::prelude::ContractKey;
 use locutus_runtime::ContractContainer;
+use locutus_stdlib::api::ClientRequest;
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, instrument};
 
 use crate::{
-    client_events::{test::MemoryEventsGen, ClientRequest},
+    client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
     contract::{MemoryContractHandler, SimStoreError},
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},

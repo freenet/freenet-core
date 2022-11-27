@@ -7,11 +7,12 @@ use std::{collections::HashMap, task::Poll};
 use futures::future::BoxFuture;
 use futures::task::AtomicWaker;
 use futures::FutureExt;
+use locutus_stdlib::api::{ErrorKind, HostResponse};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, HostResult};
-use crate::client_events::{ErrorKind, OpenRequest};
-use crate::{ClientEventsProxy, ClientId, HostResponse};
+use crate::client_events::OpenRequest;
+use crate::{ClientEventsProxy, ClientId};
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
@@ -129,14 +130,13 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
     fn send<'a>(
         &mut self,
         internal: ClientId,
-        response: Result<HostResponse<'a>, ClientError>,
+        response: Result<HostResponse, ClientError>,
     ) -> BoxFuture<'_, Result<(), ClientError>> {
-        let response: Result<HostResponse<'static>, _> = response.map(HostResponse::into_owned);
         Box::pin(async move {
             let (idx, external) = self
                 .internal_clients
                 .get(&internal)
-                .ok_or(ErrorKind::UnknownClient(internal))?;
+                .ok_or(ErrorKind::UnknownClient(internal.0))?;
             self.clients[*idx]
                 .send((*external, response))
                 .await
@@ -244,8 +244,9 @@ where
 
 #[cfg(test)]
 mod test {
+    use locutus_stdlib::api::ClientRequest;
+
     use super::*;
-    use crate::ClientRequest;
 
     struct SampleProxy {
         id: usize,

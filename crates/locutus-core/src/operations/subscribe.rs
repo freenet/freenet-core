@@ -442,9 +442,10 @@ mod messages {
 mod test {
     use std::collections::HashMap;
 
+    use locutus_stdlib::api::ContractRequest;
+
     use super::*;
     use crate::{
-        client_events::ContractRequest,
         node::test::{check_connectivity, NodeSpecification, SimNetwork},
         WrappedContract, WrappedState,
     };

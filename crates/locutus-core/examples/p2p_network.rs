@@ -7,9 +7,11 @@ use libp2p::{
     PeerId,
 };
 use locutus_core::*;
-use locutus_runtime::prelude::{WrappedContract, WrappedState};
-use locutus_runtime::{ContractContainer, WasmAPIVersion};
-use locutus_stdlib::prelude::{ContractCode, Parameters};
+use locutus_runtime::prelude::{ContractContainer, WasmAPIVersion, WrappedContract, WrappedState};
+use locutus_stdlib::{
+    api::{ClientError, ClientRequest, ContractRequest, HostResponse},
+    prelude::{ContractCode, Parameters},
+};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 const ENCODED_GW_KEY: &[u8] = include_bytes!("gw_key");

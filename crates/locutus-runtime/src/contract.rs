@@ -1,13 +1,10 @@
 use locutus_stdlib::prelude::{
-    ContractCode, ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta,
-    StateSummary, TryFromTsStd, UpdateData, UpdateModification, ValidateResult,
+    ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
+    UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
-use std::{borrow::Borrow, fmt::Display, fs::File, io::Read, ops::Deref, path::Path, sync::Arc};
-use wasmer::NativeFunc;
+use wasmer::TypedFunction;
 
-use crate::{ContractError, ContractExecError, RuntimeInnerError, RuntimeResult, WsApiError};
+use crate::{ContractExecError, RuntimeResult};
 
 type FfiReturnTy = i64;
 
@@ -69,274 +66,6 @@ pub trait ContractRuntimeInterface {
     ) -> RuntimeResult<StateDelta<'static>>;
 }
 
-/// Just as `locutus_stdlib::Contract` but with some convenience impl.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WrappedContract {
-    #[serde(
-        serialize_with = "WrappedContract::ser_contract_data",
-        deserialize_with = "WrappedContract::deser_contract_data"
-    )]
-    pub(crate) data: Arc<ContractCode<'static>>,
-    #[serde(
-        serialize_with = "WrappedContract::ser_params",
-        deserialize_with = "WrappedContract::deser_params"
-    )]
-    pub(crate) params: Parameters<'static>,
-    pub(crate) key: ContractKey,
-}
-
-impl PartialEq for WrappedContract {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for WrappedContract {}
-
-impl WrappedContract {
-    pub fn new(data: Arc<ContractCode<'static>>, params: Parameters<'static>) -> WrappedContract {
-        let key = ContractKey::from((&params, &*data));
-        WrappedContract { data, params, key }
-    }
-
-    #[inline]
-    pub fn key(&self) -> &ContractKey {
-        &self.key
-    }
-
-    #[inline]
-    pub fn code(&self) -> &Arc<ContractCode<'static>> {
-        &self.data
-    }
-
-    #[inline]
-    pub fn params(&self) -> &Parameters<'static> {
-        &self.params
-    }
-
-    pub(crate) fn get_data_from_fs(path: &Path) -> Result<ContractCode<'static>, std::io::Error> {
-        let mut contract_file = File::open(path)?;
-        let mut contract_data = if let Ok(md) = contract_file.metadata() {
-            Vec::with_capacity(md.len() as usize)
-        } else {
-            Vec::new()
-        };
-        contract_file.read_to_end(&mut contract_data)?;
-        Ok(ContractCode::from(contract_data))
-    }
-
-    fn ser_contract_data<S>(data: &Arc<ContractCode<'_>>, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        data.serialize(ser)
-    }
-
-    fn deser_contract_data<'de, D>(_deser: D) -> Result<Arc<ContractCode<'static>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
-        // Ok(Arc::new(data))
-        todo!()
-    }
-
-    fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        data.serialize(ser)
-    }
-
-    fn deser_params<'de, D>(_deser: D) -> Result<Parameters<'static>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
-        // Ok(Arc::new(data))
-        todo!()
-    }
-}
-
-impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for WrappedContract {
-    type Error = std::io::Error;
-    fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        let (path, params) = data;
-        let data = Arc::new(Self::get_data_from_fs(path)?);
-        Ok(WrappedContract::new(data, params))
-    }
-}
-
-impl TryFromTsStd<&rmpv::Value> for WrappedContract {
-    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
-        let contract_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
-            Some(map_value) => HashMap::from_iter(
-                map_value
-                    .iter()
-                    .map(|(key, val)| (key.as_str().unwrap(), val)),
-            ),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, input value is not a map".to_string(),
-                })
-            }
-        };
-
-        let key = match contract_map.get("key") {
-            Some(key_value) => ContractKey::try_decode(*key_value).unwrap(),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, key not found".to_string(),
-                })
-            }
-        };
-
-        let data = match contract_map.get("data") {
-            Some(contract_data_value) => Arc::new(
-                ContractCode::try_decode(*contract_data_value)
-                    .unwrap()
-                    .into_owned(),
-            ),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, data not found".to_string(),
-                })
-            }
-        };
-
-        let params = match contract_map.get("parameters") {
-            Some(params_value) => Parameters::try_decode(*params_value).unwrap().into_owned(),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, parameters not found".to_string(),
-                })
-            }
-        };
-
-        Ok(Self { data, params, key })
-    }
-}
-
-impl TryInto<Vec<u8>> for WrappedContract {
-    type Error = ContractError;
-    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
-        Arc::try_unwrap(self.data)
-            .map(|r| r.into_bytes())
-            .map_err(|_| RuntimeInnerError::UnwrapContract)
-            .map_err(Into::into)
-    }
-}
-
-impl Display for WrappedContract {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Contract(")?;
-        self.key.fmt(f)?;
-        write!(f, ")")
-    }
-}
-
-#[cfg(feature = "testing")]
-impl<'a> arbitrary::Arbitrary<'a> for WrappedContract {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        use arbitrary::Arbitrary;
-        let data: ContractCode = Arbitrary::arbitrary(u)?;
-        let param_bytes: Vec<u8> = Arbitrary::arbitrary(u)?;
-        let params = Parameters::from(param_bytes);
-        let key = ContractKey::from((&params, &data));
-        Ok(Self {
-            data: Arc::new(data),
-            params,
-            key,
-        })
-    }
-}
-
-/// The state for a contract.
-#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct WrappedState(
-    #[serde(
-        serialize_with = "WrappedState::ser_state",
-        deserialize_with = "WrappedState::deser_state"
-    )]
-    Arc<Vec<u8>>,
-);
-
-impl WrappedState {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        WrappedState(Arc::new(bytes))
-    }
-
-    pub fn size(&self) -> usize {
-        self.0.len()
-    }
-
-    fn ser_state<S>(data: &Arc<Vec<u8>>, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serde_bytes::serialize(&**data, ser)
-    }
-
-    fn deser_state<'de, D>(deser: D) -> Result<Arc<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let data: Vec<u8> = serde_bytes::deserialize(deser)?;
-        Ok(Arc::new(data))
-    }
-}
-
-impl From<Vec<u8>> for WrappedState {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self::new(bytes)
-    }
-}
-
-impl TryFromTsStd<&rmpv::Value> for WrappedState {
-    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
-        let state = value.as_slice().unwrap().to_vec();
-        Ok(WrappedState::from(state))
-    }
-}
-
-impl AsRef<[u8]> for WrappedState {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl Deref for WrappedState {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Borrow<[u8]> for WrappedState {
-    fn borrow(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for WrappedState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let data: String = if self.0.len() > 8 {
-            let last_4 = self.0.len() - 4;
-            self.0[..4]
-                .iter()
-                .map(|b| char::from(*b))
-                .chain("...".chars())
-                .chain(self.0[last_4..].iter().map(|b| char::from(*b)))
-                .collect()
-        } else {
-            self.0.iter().copied().map(char::from).collect()
-        };
-        write!(f, "ContractState(data: [{}])", data)
-    }
-}
-
 impl ContractRuntimeInterface for crate::Runtime {
     fn validate_state<'a>(
         &mut self,
@@ -349,22 +78,33 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state)?;
-        let serialized = bincode::serialize(&related)?;
-        let mut related_buf = self.init_buf(&instance, &serialized)?;
-        related_buf.write(serialized)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state)?;
+            state_buf.ptr()
+        };
+        let related_buf_ptr = {
+            let serialized = bincode::serialize(&related)?;
+            let mut related_buf = self.init_buf(&instance, &serialized)?;
+            related_buf.write(serialized)?;
+            related_buf.ptr()
+        };
 
-        let validate_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("validate_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "validate_state")?;
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
-                    param_buf.ptr() as i64,
-                    state_buf.ptr() as i64,
-                    related_buf.ptr() as i64,
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    state_buf_ptr as i64,
+                    related_buf_ptr as i64,
                 )?,
                 &linear_mem,
             )
@@ -385,16 +125,27 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut delta_buf = self.init_buf(&instance, delta)?;
-        delta_buf.write(delta)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let delta_buf_ptr = {
+            let mut delta_buf = self.init_buf(&instance, delta)?;
+            delta_buf.write(delta)?;
+            delta_buf.ptr()
+        };
 
-        let validate_func: NativeFunc<(i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("validate_delta")?;
+        let validate_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "validate_delta")?;
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(
-                validate_func.call(param_buf.ptr() as i64, delta_buf.ptr() as i64)?,
+                validate_func.call(
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    delta_buf_ptr as i64,
+                )?,
                 &linear_mem,
             )
             .unwrap_validate_delta_res(linear_mem)
@@ -418,22 +169,33 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state.clone())?;
-        let serialized = bincode::serialize(update_data)?;
-        let mut update_data_buf = self.init_buf(&instance, &serialized)?;
-        update_data_buf.write(serialized)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state.clone())?;
+            state_buf.ptr()
+        };
+        let update_data_buf_ptr = {
+            let serialized = bincode::serialize(update_data)?;
+            let mut update_data_buf = self.init_buf(&instance, &serialized)?;
+            update_data_buf.write(serialized)?;
+            update_data_buf.ptr()
+        };
 
-        let validate_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("update_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "update_state")?;
         let update_res = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
-                    param_buf.ptr() as i64,
-                    state_buf.ptr() as i64,
-                    update_data_buf.ptr() as i64,
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    state_buf_ptr as i64,
+                    update_data_buf_ptr as i64,
                 )?,
                 &linear_mem,
             )
@@ -453,17 +215,28 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state.clone())?;
+            state_buf.ptr()
+        };
 
-        let summary_func: NativeFunc<(i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("summarize_state")?;
+        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "summarize_state")?;
 
         let result = unsafe {
             let int_res = ContractInterfaceResult::from_raw(
-                summary_func.call(param_buf.ptr() as i64, state_buf.ptr() as i64)?,
+                summary_func.call(
+                    &mut self.wasm_store,
+                    param_buf_ptr as i64,
+                    state_buf_ptr as i64,
+                )?,
                 &linear_mem,
             );
             int_res
@@ -484,23 +257,34 @@ impl ContractRuntimeInterface for crate::Runtime {
         let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
         let linear_mem = self.linear_mem(&instance)?;
 
-        let mut param_buf = self.init_buf(&instance, parameters)?;
-        param_buf.write(parameters)?;
-        let mut state_buf = self.init_buf(&instance, state)?;
-        state_buf.write(state.clone())?;
-        let mut summary_buf = self.init_buf(&instance, summary)?;
-        summary_buf.write(summary)?;
+        let param_buf_ptr = {
+            let mut param_buf = self.init_buf(&instance, parameters)?;
+            param_buf.write(parameters)?;
+            param_buf.ptr()
+        };
+        let state_buf_ptr = {
+            let mut state_buf = self.init_buf(&instance, state)?;
+            state_buf.write(state.clone())?;
+            state_buf.ptr()
+        };
+        let summary_buf_ptr = {
+            let mut summary_buf = self.init_buf(&instance, summary)?;
+            summary_buf.write(summary)?;
+            summary_buf.ptr()
+        };
 
-        let get_state_delta_func: NativeFunc<(i64, i64, i64), FfiReturnTy> =
-            instance.exports.get_native_function("get_state_delta")?;
+        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "get_state_delta")?;
 
         let result = unsafe {
             let int_res = {
                 ContractInterfaceResult::from_raw(
                     get_state_delta_func.call(
-                        param_buf.ptr() as i64,
-                        state_buf.ptr() as i64,
-                        summary_buf.ptr() as i64,
+                        &mut self.wasm_store,
+                        param_buf_ptr as i64,
+                        state_buf_ptr as i64,
+                        summary_buf_ptr as i64,
                     )?,
                     &linear_mem,
                 )
@@ -515,12 +299,11 @@ impl ContractRuntimeInterface for crate::Runtime {
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::prelude::env_logger;
+    use locutus_stdlib::prelude::{env_logger, WrappedContract};
 
     use super::*;
     use crate::{
-        contract::WrappedContract, secrets_store::SecretsStore, ContractContainer, ContractStore,
-        Runtime, WasmAPIVersion,
+        secrets_store::SecretsStore, ContractContainer, ContractStore, Runtime, WasmAPIVersion,
     };
     use std::{path::PathBuf, sync::atomic::AtomicUsize};
 

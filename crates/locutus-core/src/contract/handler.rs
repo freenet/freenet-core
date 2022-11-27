@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use locutus_runtime::{ContractContainer, ContractStore, Parameters, StateStorage, StateStore};
+use locutus_stdlib::api::{ClientRequest, HostResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
-use crate::{ClientRequest, HostResponse, WrappedState};
+use crate::WrappedState;
 pub(crate) use sqlite::SqlDbError;
 
 const MAX_MEM_CACHE: i64 = 10_000_000;
@@ -192,6 +193,7 @@ pub(in crate::contract) mod sqlite {
         ContractError, ContractExecError, ContractRuntimeInterface, ContractStore, StateStorage,
         StateStoreError, ValidateResult,
     };
+    use locutus_stdlib::api::{ContractRequest, ContractResponse};
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},
@@ -199,11 +201,7 @@ pub(in crate::contract) mod sqlite {
     };
 
     use super::*;
-    use crate::{
-        client_events::{ContractRequest, ContractResponse},
-        config::CONFIG,
-        contract::test::MockRuntime,
-    };
+    use crate::{config::CONFIG, contract::test::MockRuntime};
 
     // Is fine to clone this as it wraps by an Arc.
     static POOL: Lazy<SqlitePool> = Lazy::new(|| {
@@ -491,8 +489,6 @@ pub(in crate::contract) mod sqlite {
         use locutus_runtime::{StateDelta, WasmAPIVersion};
         use locutus_stdlib::prelude::ContractCode;
 
-        use crate::client_events::ContractRequest;
-
         use super::sqlite::SQLiteContractHandler;
         use super::*;
 
@@ -573,7 +569,10 @@ pub mod test {
     use std::sync::Arc;
 
     use locutus_runtime::{ContractStore, WasmAPIVersion};
-    use locutus_stdlib::prelude::ContractCode;
+    use locutus_stdlib::{
+        api::{ClientRequest, HostResponse},
+        prelude::ContractCode,
+    };
 
     use super::*;
     use crate::{

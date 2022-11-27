@@ -4,7 +4,7 @@ use locutus_stdlib::prelude::{
     GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
     SetSecretRequest,
 };
-use wasmer::{Instance, NativeFunc};
+use wasmer::{Instance, TypedFunction};
 
 use crate::{util, Runtime, RuntimeResult};
 
@@ -18,11 +18,11 @@ pub enum ComponentExecError {
 }
 
 pub trait ComponentRuntimeInterface {
-    fn inbound_app_message<'a>(
+    fn inbound_app_message(
         &mut self,
         key: &ComponentKey,
-        inbound: Vec<InboundComponentMsg<'a>>,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg<'a>>>;
+        inbound: Vec<InboundComponentMsg>,
+    ) -> RuntimeResult<Vec<OutboundComponentMsg>>;
 
     fn register_component(
         &mut self,
@@ -36,34 +36,35 @@ pub trait ComponentRuntimeInterface {
 
 impl Runtime {
     fn exec_inbound(
-        &self,
+        &mut self,
         msg: &InboundComponentMsg,
-        process_func: &NativeFunc<i64, i64>,
+        process_func: &TypedFunction<i64, i64>,
         instance: &Instance,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg<'static>>> {
-        let msg = bincode::serialize(msg)?;
-        let mut msg_buf = self.init_buf(instance, &msg)?;
-        msg_buf.write(msg)?;
+    ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
+        let msg_ptr = {
+            let msg = bincode::serialize(msg)?;
+            let mut msg_buf = self.init_buf(instance, &msg)?;
+            msg_buf.write(msg)?;
+            msg_buf.ptr()
+        };
+        let res = process_func.call(&mut self.wasm_store, msg_ptr as i64)?;
         let linear_mem = self.linear_mem(instance)?;
         let outbound = unsafe {
-            ComponentInterfaceResult::from_raw(
-                process_func.call(msg_buf.ptr() as i64)?,
-                &linear_mem,
-            )
-            .unwrap(linear_mem)
-            .map_err(Into::<ComponentExecError>::into)?
+            ComponentInterfaceResult::from_raw(res, &linear_mem)
+                .unwrap(linear_mem)
+                .map_err(Into::<ComponentExecError>::into)?
         };
         Ok(outbound)
     }
 
     // FIXME: control the use of recurssion here since is a potential exploit for malicious components
-    fn get_outbound<'a>(
+    fn get_outbound(
         &mut self,
         component_key: &ComponentKey,
         instance: &Instance,
-        process_func: &NativeFunc<i64, i64>,
-        outbound_msgs: Vec<OutboundComponentMsg<'a>>,
-        results: &mut Vec<OutboundComponentMsg<'a>>,
+        process_func: &TypedFunction<i64, i64>,
+        outbound_msgs: Vec<OutboundComponentMsg>,
+        results: &mut Vec<OutboundComponentMsg>,
     ) -> RuntimeResult<()> {
         for outbound in outbound_msgs {
             match outbound {
@@ -122,17 +123,19 @@ impl Runtime {
 }
 
 impl ComponentRuntimeInterface for Runtime {
-    fn inbound_app_message<'a>(
+    fn inbound_app_message(
         &mut self,
         key: &ComponentKey,
-        inbound: Vec<InboundComponentMsg<'a>>,
-    ) -> RuntimeResult<Vec<OutboundComponentMsg<'a>>> {
+        inbound: Vec<InboundComponentMsg>,
+    ) -> RuntimeResult<Vec<OutboundComponentMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
             return Ok(results);
         }
         let instance = self.prepare_component_call(key, 4096)?;
-        let process_func: NativeFunc<i64, i64> = instance.exports.get_native_function("process")?;
+        let process_func: TypedFunction<i64, i64> = instance
+            .exports
+            .get_typed_function(&self.wasm_store, "process")?;
         for msg in inbound {
             match msg {
                 InboundComponentMsg::ApplicationMessage(ApplicationMessage {
