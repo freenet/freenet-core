@@ -1,5 +1,5 @@
 //! Standard library provided by the Freenet project to be able to write Locutus-compatible contracts.
-#[cfg(and(
+#[cfg(all(
     feature = "net",
     any(
         all(
