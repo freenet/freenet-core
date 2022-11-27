@@ -29,5 +29,3 @@ pub use locutus_runtime;
 pub use node::PeerKey;
 pub use node::{InitPeerNode, NodeConfig};
 pub use ring::Location;
-pub use rmp;
-pub use rmp_serde;
