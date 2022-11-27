@@ -5,9 +5,17 @@ mod regular;
 #[cfg(target_family = "unix")]
 pub use regular::*;
 
-#[cfg(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_vendor = "unknown",
+    target_os = "unknown"
+))]
 mod browser;
-#[cfg(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_vendor = "unknown",
+    target_os = "unknown"
+))]
 pub use browser::*;
 
 pub use client_events::*;
