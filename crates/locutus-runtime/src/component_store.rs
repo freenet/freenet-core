@@ -1,11 +1,9 @@
 use dashmap::DashMap;
-use notify::Watcher;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     io::Read,
-    iter::FromIterator,
     path::PathBuf,
     sync::Arc,
     thread,
@@ -13,7 +11,7 @@ use std::{
 };
 use stretto::Cache;
 
-use crate::{DynError, error::RuntimeInnerError, RuntimeResult};
+use crate::{error::RuntimeInnerError, DynError, RuntimeResult};
 use locutus_stdlib::prelude::{Component, ComponentKey};
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
