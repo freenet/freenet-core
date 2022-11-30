@@ -13,7 +13,7 @@ use std::{
 };
 use stretto::Cache;
 
-use crate::{DynError, RuntimeInnerError, RuntimeResult};
+use crate::{DynError, error::RuntimeInnerError, RuntimeResult};
 use locutus_stdlib::prelude::{Component, ComponentKey};
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
@@ -46,33 +46,34 @@ impl ComponentStore {
     /// # Arguments
     /// - max_size: max size in bytes of the components being cached
     pub fn new(components_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
-        const ERR: &str = "failed to build mem cache";
-        let key_to_component_part;
-        let _ = LOCK_FILE_PATH.try_insert(components_dir.join("__LOCK"));
-        let key_file = match KEY_FILE_PATH
-            .try_insert(components_dir.join("KEY_DATA"))
-            .map_err(|(e, _)| e)
-        {
-            Ok(f) => f,
-            Err(f) => f,
-        };
-        if !key_file.exists() {
-            std::fs::create_dir_all(&components_dir).map_err(|err| {
-                tracing::error!("error creating component dir: {err}");
-                err
-            })?;
-            key_to_component_part = Arc::new(DashMap::new());
-            File::create(components_dir.join("KEY_DATA"))?;
-        } else {
-            let map = Self::load_from_file()?;
-            key_to_component_part = Arc::new(DashMap::from_iter(map.0));
-        }
-        Self::watch_changes(key_to_component_part.clone())?;
-        Ok(Self {
-            component_cache: Cache::new(100, max_size).expect(ERR),
-            components_dir,
-            key_to_component_part,
-        })
+        // const ERR: &str = "failed to build mem cache";
+        // let key_to_component_part;
+        // let _ = LOCK_FILE_PATH.try_insert(components_dir.join("__LOCK"));
+        // let key_file = match KEY_FILE_PATH
+        //     .try_insert(components_dir.join("KEY_DATA"))
+        //     .map_err(|(e, _)| e)
+        // {
+        //     Ok(f) => f,
+        //     Err(f) => f,
+        // };
+        // if !key_file.exists() {
+        //     std::fs::create_dir_all(&components_dir).map_err(|err| {
+        //         tracing::error!("error creating component dir: {err}");
+        //         err
+        //     })?;
+        //     key_to_component_part = Arc::new(DashMap::new());
+        //     File::create(components_dir.join("KEY_DATA"))?;
+        // } else {
+        //     let map = Self::load_from_file::<KeyToCodeMap>()?;
+        //     key_to_component_part = Arc::new(DashMap::from_iter(map.0));
+        // }
+        // Self::watch_changes(key_to_component_part.clone())?;
+        // Ok(Self {
+        //     component_cache: Cache::new(100, max_size).expect(ERR),
+        //     components_dir,
+        //     key_to_component_part,
+        // })
+        todo!()
     }
 
     // Returns a copy of the component bytes if available, none otherwise.
@@ -129,28 +130,28 @@ impl ComponentStore {
     fn watch_changes(
         ori_map: Arc<DashMap<ComponentKey, ComponentCodeKey>>,
     ) -> Result<(), DynError> {
-        let mut watcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| match res {
-                Ok(ev) => {
-                    if let notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) = ev.kind {
-                        match Self::load_from_file() {
-                            Err(err) => tracing::error!("{err}"),
-                            Ok(map) => {
-                                for (k, v) in map.0 {
-                                    ori_map.insert(k, v);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::error!("{e}"),
-            },
-        )?;
-
-        watcher.watch(
-            KEY_FILE_PATH.get().unwrap(),
-            notify::RecursiveMode::NonRecursive,
-        )?;
+        // let mut watcher = notify::recommended_watcher(
+        //     move |res: Result<notify::Event, notify::Error>| match res {
+        //         Ok(ev) => {
+        //             if let notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) = ev.kind {
+        //                 match Self::load_from_file() {
+        //                     Err(err) => tracing::error!("{err}"),
+        //                     Ok(map) => {
+        //                         for (k, v) in map.0 {
+        //                             ori_map.insert(k, v);
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //         Err(e) => tracing::error!("{e}"),
+        //     },
+        // )?;
+        //
+        // watcher.watch(
+        //     KEY_FILE_PATH.get().unwrap(),
+        //     notify::RecursiveMode::NonRecursive,
+        // )?;
         Ok(())
     }
 
