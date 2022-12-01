@@ -242,13 +242,13 @@ mod test {
         let contracts = PathBuf::from(CONTRACTS_DIR);
         let mut dirs = contracts.ancestors();
         let path = dirs.nth(2).unwrap();
-        let contract_path = path
+        let component_path = path
             .join("tests")
             .join(name.replace('_', "-"))
             .join("build/locutus")
             .join(name)
             .with_extension("wasm");
-        Component::try_from(contract_path.as_path()).unwrap()
+        Component::try_from(component_path.as_path()).unwrap()
     }
 
     fn set_up_runtime(name: &str) -> (Component, Runtime) {

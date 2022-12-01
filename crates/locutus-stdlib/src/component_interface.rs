@@ -59,6 +59,16 @@ impl TryFrom<&Path> for Component<'static> {
     }
 }
 
+impl From<Vec<u8>> for Component<'static> {
+    fn from(data: Vec<u8>) -> Self {
+        let key = ComponentKey::new(data.as_slice());
+        Component {
+            code: Cow::from(data),
+            key,
+        }
+    }
+}
+
 /// Type of errors during interaction with a component.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum ComponentError {
