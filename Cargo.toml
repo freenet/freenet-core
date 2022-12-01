@@ -8,7 +8,9 @@ chacha20poly1305 = "0.10"
 either = "1.8"
 futures = "0.3"
 rand = { version = "0.8" }
-rmp-serde = {  version = "1" }
+rmp = { version = "0.8" }
+rmpv = { version = "1"}
+rmp-serde = { version = "1" } 
 semver = { version = "1.0.14",  features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
@@ -16,6 +18,8 @@ serde_json = "1"
 serde_with = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+wasmer = "3"
+wasmer-wasi = "3"
 
 [profile.dev.package."*"]
 opt-level = 3

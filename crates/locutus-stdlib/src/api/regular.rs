@@ -100,18 +100,27 @@ impl WebApi {
         }
     }
 
-    #[inline]
-    pub async fn send(
-        &mut self,
-        request: ClientRequest<'static>,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<ClientRequest<'static>>> {
-        self.request_tx.send(request).await
+    pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
+        self.request_tx
+            .send(request)
+            .await
+            .map_err(|_| ClientError::from(ErrorKind::ChannelClosed).into())
+            .map_err(Error::OtherError)?;
+        Ok(())
     }
 
-    #[inline]
     pub async fn recv(&mut self) -> HostResult {
         let res = self.response_rx.recv().await;
         res.ok_or_else(|| ClientError::from(ErrorKind::ChannelClosed))?
+    }
+
+    pub async fn disconnect(self, cause: impl Into<String>) {
+        let _ = self
+            .request_tx
+            .send(ClientRequest::Disconnect {
+                cause: Some(cause.into()),
+            })
+            .await;
     }
 }
 

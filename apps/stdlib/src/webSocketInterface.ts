@@ -94,7 +94,7 @@ export type ContractV1 = {
   key: Key;
   data: Uint8Array;
   parameters: Uint8Array;
-  version: String
+  version: String;
 };
 
 /**
@@ -441,15 +441,21 @@ export class HostResponse {
         if ("PutResponse" in response.ContractResponse) {
           response.ContractResponse as { PutResponse: any };
           assert(Array.isArray(response.ContractResponse.PutResponse));
-          let key = HostResponse.assertKey(response.ContractResponse.PutResponse[0][0]);
+          let key = HostResponse.assertKey(
+            response.ContractResponse.PutResponse[0][0]
+          );
           this.result = { kind: "put", key };
           return;
         } else if ("UpdateResponse" in response.ContractResponse) {
           response.ContractResponse as { UpdateResponse: any };
           assert(Array.isArray(response.ContractResponse.UpdateResponse));
           assert(response.ContractResponse.UpdateResponse.length == 2);
-          let key = HostResponse.assertKey(response.ContractResponse.UpdateResponse[0][0]);
-          let summary = HostResponse.assertBytes(response.ContractResponse.UpdateResponse[1]);
+          let key = HostResponse.assertKey(
+            response.ContractResponse.UpdateResponse[0][0]
+          );
+          let summary = HostResponse.assertBytes(
+            response.ContractResponse.UpdateResponse[1]
+          );
           this.result = { kind: "update", key, summary };
           return;
         } else if ("GetResponse" in response.ContractResponse) {
@@ -459,8 +465,12 @@ export class HostResponse {
           let contract;
           if (response.ContractResponse.GetResponse[0] !== null) {
             contract = {
-              data: new Uint8Array(response.ContractResponse.GetResponse[0][0][1]),
-              parameters: new Uint8Array(response.ContractResponse.GetResponse[0][1]),
+              data: new Uint8Array(
+                response.ContractResponse.GetResponse[0][0][1]
+              ),
+              parameters: new Uint8Array(
+                response.ContractResponse.GetResponse[0][1]
+              ),
               key: new Key(response.ContractResponse.GetResponse[0][2][0]),
             };
           } else {
@@ -477,8 +487,12 @@ export class HostResponse {
           response.ContractResponse as { UpdateNotification: any };
           assert(Array.isArray(response.ContractResponse.UpdateNotification));
           assert(response.ContractResponse.UpdateNotification.length == 2);
-          let key = HostResponse.assertKey(response.ContractResponse.UpdateNotification[0][0]);
-          let update = HostResponse.getUpdateData(response.ContractResponse.UpdateNotification[1]);
+          let key = HostResponse.assertKey(
+            response.ContractResponse.UpdateNotification[0][0]
+          );
+          let update = HostResponse.getUpdateData(
+            response.ContractResponse.UpdateNotification[1]
+          );
           this.result = {
             kind: "updateNotification",
             key,
@@ -660,7 +674,7 @@ export class HostResponse {
    * @private
    */
   private static assertBytes(state: any): Uint8Array {
-    assert(Array.isArray(state));
+    assert(Array.isArray(state) || ArrayBuffer.isView(state));
     assert(
       state.every((value: any) => {
         if (typeof value === "number" && value >= MIN_U8 && value <= MAX_U8)
@@ -674,17 +688,17 @@ export class HostResponse {
 
   private static getUpdateData(update: UpdateData): UpdateData {
     if ("Delta" in update) {
-      let delta = Array.from(update["Delta"]);
+      let delta = update["Delta"];
       return {
         delta: HostResponse.assertBytes(delta),
       };
     } else {
-      throw new TypeError("Invalid update data while building HostResponse")
+      throw new TypeError("Invalid update data while building HostResponse");
     }
   }
 }
 
 // Versioning:
-type WasmContract = ContractV1
+type WasmContract = ContractV1;
 
 type ContractContainer = WasmContract;
