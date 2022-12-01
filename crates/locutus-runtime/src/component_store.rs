@@ -152,40 +152,6 @@ impl ComponentStore {
         // )?;
         Ok(())
     }
-
-    fn load_from_file<T>() -> RuntimeResult<T>
-    where
-        T: DeserializeOwned + Default,
-    {
-        let mut buf = vec![];
-        Self::acquire_component_ls_lock()?;
-        let mut f = File::open(KEY_FILE_PATH.get().unwrap())?;
-        f.read_to_end(&mut buf)?;
-        Self::release_component_ls_lock()?;
-        let value = if buf.is_empty() {
-            T::default()
-        } else {
-            bincode::deserialize(&buf).map_err(|e| RuntimeInnerError::Any(e))?
-        };
-        Ok(value)
-    }
-
-    fn acquire_component_ls_lock() -> RuntimeResult<()> {
-        let lock = LOCK_FILE_PATH.get().unwrap();
-        while lock.exists() {
-            thread::sleep(Duration::from_micros(5));
-        }
-        File::create(lock)?;
-        Ok(())
-    }
-
-    fn release_component_ls_lock() -> RuntimeResult<()> {
-        match fs::remove_file(LOCK_FILE_PATH.get().unwrap()) {
-            Ok(_) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(other) => Err(other.into()),
-        }
-    }
 }
 
 impl Default for ComponentStore {

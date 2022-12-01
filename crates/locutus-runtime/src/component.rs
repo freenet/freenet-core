@@ -1,7 +1,4 @@
-use chacha20poly1305::{
-    aead::{AeadCore, KeyInit, OsRng},
-    XChaCha20Poly1305, XNonce,
-};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use locutus_stdlib::prelude::{
     ApplicationMessage, Component, ComponentError, ComponentInterfaceResult, ComponentKey,
     GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
@@ -200,15 +197,19 @@ impl ComponentRuntimeInterface for Runtime {
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::prelude::{env_logger, ComponentContext, ContractInstanceId, Parameters};
+    use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
+    use locutus_stdlib::{
+        contract_interface::ContractCode,
+        prelude::{env_logger, ComponentContext, ContractInstanceId, Parameters},
+    };
+    use serde::{Deserialize, Serialize};
+    use std::{
+        path::PathBuf,
+        sync::{atomic::AtomicUsize, Arc},
+    };
 
     use super::*;
-    use crate::component_store::ComponentStore;
-    use crate::{ContractStore, SecretsStore, WrappedContract};
-    use locutus_stdlib::contract_interface::ContractCode;
-    use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
-    use std::{path::PathBuf, sync::atomic::AtomicUsize};
+    use crate::{component_store::ComponentStore, ContractStore, SecretsStore, WrappedContract};
 
     const TEST_COMPONENT_1: &str = "test_component_1";
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);

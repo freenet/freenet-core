@@ -1,5 +1,7 @@
 use notify::Watcher;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::io::Write;
 use std::path::Path;
 use std::{
     fs::{self, File},
@@ -10,23 +12,27 @@ use std::{
 
 use crate::{error::RuntimeInnerError, DynError, RuntimeResult};
 
-pub(crate) trait StoreContainer: DeserializeOwned + Default {
-    type Container: Clone + Send + Sync + 'static;
-    fn update(self, container: &Self::Container);
+pub(crate) trait StoreEntriesContainer: Serialize + DeserializeOwned + Default {
+    type MemContainer: Send + Sync + 'static;
+    type Key;
+    type Value;
+
+    fn update(self, container: &mut Self::MemContainer);
+    fn replace(container: &Self::MemContainer) -> Self;
+    fn insert(container: &mut Self::MemContainer, key: Self::Key, value: Self::Value);
 }
 
-pub(crate) trait StoreManagement<C>
+pub(crate) trait StoreFsManagement<C>
 where
-    C: StoreContainer,
+    C: StoreEntriesContainer,
 {
     fn watch_changes(
-        container: &C::Container,
+        mut container: C::MemContainer,
         key_file_path: &Path,
         lock_file_path: &Path,
     ) -> Result<(), DynError> {
         let key_path = key_file_path.to_path_buf();
         let lock_path = lock_file_path.to_path_buf();
-        let container_2 = container.clone();
         let mut watcher = notify::recommended_watcher(
             move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(ev) => {
@@ -34,7 +40,7 @@ where
                         match Self::load_from_file(key_path.as_path(), lock_path.as_path()) {
                             Err(err) => tracing::error!("{err}"),
                             Ok(map) => {
-                                map.update(&container_2);
+                                map.update(&mut container);
                             }
                         }
                     }
@@ -43,6 +49,24 @@ where
             },
         )?;
         watcher.watch(key_file_path, notify::RecursiveMode::NonRecursive)?;
+        Ok(())
+    }
+
+    fn update(
+        mem_containter: &mut C::MemContainer,
+        key: C::Key,
+        value: C::Value,
+        key_file_path: &Path,
+        lock_file_path: &Path,
+    ) -> RuntimeResult<()> {
+        Self::acquire_ls_lock(lock_file_path)?;
+        C::insert(mem_containter, key, value);
+        let container = C::replace(mem_containter);
+        let serialized = bincode::serialize(&container).map_err(|e| RuntimeInnerError::Any(e))?;
+        // FIXME: make this more reliable, append to the file instead of truncating it
+        let mut f = File::create(key_file_path)?;
+        f.write_all(&serialized)?;
+        Self::release_ls_lock(lock_file_path)?;
         Ok(())
     }
 

@@ -7,7 +7,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
-use crate::store::{StoreContainer, StoreManagement};
+use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::{error::RuntimeInnerError, ContractContainer, RuntimeResult, WasmAPIVersion};
 
 use super::ContractKey;
@@ -17,12 +17,23 @@ type ContractCodeKey = [u8; 32];
 #[derive(Serialize, Deserialize, Default)]
 struct KeyToCodeMap(Vec<(ContractKey, ContractCodeKey)>);
 
-impl StoreContainer for KeyToCodeMap {
-    type Container = Arc<DashMap<ContractKey, ContractCodeKey>>;
-    fn update(self, container: &Self::Container) {
+impl StoreEntriesContainer for KeyToCodeMap {
+    type MemContainer = Arc<DashMap<ContractKey, ContractCodeKey>>;
+    type Key = ContractKey;
+    type Value = ContractCodeKey;
+
+    fn update(self, container: &mut Self::MemContainer) {
         for (k, v) in self.0 {
             container.insert(k, v);
         }
+    }
+
+    fn replace(container: &Self::MemContainer) -> Self {
+        KeyToCodeMap::from(&**container)
+    }
+
+    fn insert(container: &mut Self::MemContainer, key: Self::Key, value: Self::Value) {
+        container.insert(key, value);
     }
 }
 
@@ -48,7 +59,7 @@ pub struct ContractStore {
 static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
-impl StoreManagement<KeyToCodeMap> for ContractStore {}
+impl StoreFsManagement<KeyToCodeMap> for ContractStore {}
 
 impl ContractStore {
     /// # Arguments
@@ -73,13 +84,13 @@ impl ContractStore {
             File::create(contracts_dir.join("KEY_DATA"))?;
         } else {
             let map = Self::load_from_file(
-                &KEY_FILE_PATH.get().unwrap().as_path(),
-                &LOCK_FILE_PATH.get().unwrap().as_path(),
+                KEY_FILE_PATH.get().unwrap().as_path(),
+                LOCK_FILE_PATH.get().unwrap().as_path(),
             )?;
             key_to_code_part = Arc::new(DashMap::from_iter(map.0));
         }
         Self::watch_changes(
-            &key_to_code_part,
+            key_to_code_part.clone(),
             KEY_FILE_PATH.get().unwrap().as_path(),
             LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
@@ -149,14 +160,13 @@ impl ContractStore {
             return Ok(());
         }
 
-        Self::acquire_ls_lock(&LOCK_FILE_PATH.get().unwrap().as_path())?;
-        self.key_to_code_part.insert(key.clone(), *contract_hash);
-        let map = KeyToCodeMap::from(&*self.key_to_code_part);
-        let serialized = bincode::serialize(&map).map_err(|e| RuntimeInnerError::Any(e))?;
-        // FIXME: make this more reliable, append to the file instead of truncating it
-        let mut f = File::create(KEY_FILE_PATH.get().unwrap())?;
-        f.write_all(&serialized)?;
-        Self::release_ls_lock(&LOCK_FILE_PATH.get().unwrap().as_path())?;
+        Self::update(
+            &mut self.key_to_code_part,
+            key.clone(),
+            *contract_hash,
+            KEY_FILE_PATH.get().unwrap(),
+            LOCK_FILE_PATH.get().unwrap().as_path(),
+        )?;
 
         let key_path = bs58::encode(contract_hash)
             .with_alphabet(bs58::Alphabet::BITCOIN)

@@ -230,7 +230,7 @@ impl Runtime {
         }
 
         let instance = Instance::new(&mut self.wasm_store, module, &imports)?;
-        let _ = wasi_env.initialize(&mut self.wasm_store, &instance)?;
+        wasi_env.initialize(&mut self.wasm_store, &instance)?;
 
         Ok(instance)
     }
