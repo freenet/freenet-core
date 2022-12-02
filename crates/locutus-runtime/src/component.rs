@@ -255,11 +255,11 @@ mod test {
         let _ = env_logger::try_init();
         let contracts_dir = test_dir();
         let components_dir = test_dir();
-        // let secrets_dir = test_dir();
+        let secrets_dir = test_dir();
 
         let contract_store = ContractStore::new(contracts_dir, 10_000).unwrap();
         let component_store = ComponentStore::new(components_dir.clone(), 10_000).unwrap();
-        let secret_store = SecretsStore::from_dir(components_dir);
+        let secret_store = SecretsStore::new(secrets_dir).unwrap();
 
         let mut runtime =
             Runtime::build(contract_store, component_store, secret_store, false).unwrap();
@@ -287,14 +287,27 @@ mod test {
 
         let (component, mut runtime) = set_up_runtime(TEST_COMPONENT_1);
 
+        // CreateInboxRequest message parts
         let payload: Vec<u8> = serde_json::to_vec(&InboundAppMessage::CreateInboxRequest).unwrap();
         let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
         let context = ComponentContext::new(vec![]);
-        let msg: ApplicationMessage = ApplicationMessage::new(app, payload, context);
 
-        let inbound_app_msg = InboundComponentMsg::ApplicationMessage(msg);
-        let outbound = runtime.inbound_app_message(component.key(), vec![inbound_app_msg]);
-        println!("{:?}", outbound);
+        let create_inbox_request_msg: ApplicationMessage = ApplicationMessage::new(app, payload, context);
+
+        let inbound = InboundComponentMsg::ApplicationMessage(create_inbox_request_msg);
+        let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
+        assert!(outbound.unwrap().is_empty());
+
+        // CreateInboxRequest message parts
+        // let payload: Vec<u8> = serde_json::to_vec(&InboundAppMessage::PleaseSignMessage(vec![1,2,3])).unwrap();
+        // let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        // let context = ComponentContext::new(vec![]);
+        //
+        // let pleaseSignMessageMsg: ApplicationMessage = ApplicationMessage::new(app, payload, context);
+        //
+        // let inbound = InboundComponentMsg::ApplicationMessage(pleaseSignMessageMsg);
+        // let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
+        // assert!(outbound.unwrap().is_empty());
         Ok(())
     }
 }

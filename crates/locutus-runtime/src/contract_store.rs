@@ -191,7 +191,7 @@ impl ContractStore {
             serde_json::to_vec(&version).map_err(|e| RuntimeInnerError::Any(Box::new(e)))?;
 
         let mut output: Vec<u8> = Vec::with_capacity(
-            std::mem::size_of::<u32>() + serialized_version.len() + code.data().len(),
+            std::mem::size_of::<u32>() + serialized_version.len()  + code.data().len(),
         );
         output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
         output.append(&mut serialized_version);

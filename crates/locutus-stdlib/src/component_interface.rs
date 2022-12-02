@@ -268,7 +268,6 @@ where
     Ok(value.into_owned())
 }
 
-#[non_exhaustive]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetSecretRequest {
     pub key: SecretsId,
