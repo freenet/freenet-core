@@ -1,12 +1,14 @@
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
-    ApplicationMessage, Component, ComponentError, ComponentInterfaceResult, ComponentKey,
-    GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
+    ApplicationMessage, Component, ComponentContext, ComponentError, ComponentInterfaceResult,
+    ComponentKey, GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
     SetSecretRequest,
 };
-use wasmer::{Instance, TypedFunction};
 
-use crate::{util, Runtime, RuntimeResult};
+use crate::error::RuntimeInnerError;
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use std::collections::VecDeque;
+use wasmer::{Instance, TypedFunction};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ComponentExecError {
@@ -57,34 +59,46 @@ impl Runtime {
         Ok(outbound)
     }
 
-    // FIXME: control the use of recurssion here since is a potential exploit for malicious components
+    // FIXME: modify the context atomically from the components, requires some changes to handle function calls with envs
     fn get_outbound(
         &mut self,
         component_key: &ComponentKey,
         instance: &Instance,
         process_func: &TypedFunction<i64, i64>,
-        outbound_msgs: Vec<OutboundComponentMsg>,
+        outbound_msgs: &mut VecDeque<OutboundComponentMsg>,
         results: &mut Vec<OutboundComponentMsg>,
-    ) -> RuntimeResult<()> {
-        for outbound in outbound_msgs {
+    ) -> RuntimeResult<ComponentContext> {
+        let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned()) else {
+            return Ok(ComponentContext::default());
+        };
+        while let Some(outbound) = outbound_msgs.pop_front() {
             match outbound {
                 OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
-                    key, context, ..
-                }) => {
+                    key,
+                    context,
+                    processed,
+                }) if !processed => {
                     let secret = self.secret_store.get_secret(component_key, &key)?;
                     let inbound = InboundComponentMsg::GetSecretResponse(GetSecretResponse {
                         key,
                         value: Some(secret),
                         context,
                     });
-                    let outbound_msgs = self.exec_inbound(&inbound, process_func, instance)?;
-                    self.get_outbound(
-                        component_key,
-                        instance,
-                        process_func,
-                        outbound_msgs,
-                        results,
-                    )?;
+                    let new_msgs = self.exec_inbound(&inbound, process_func, instance)?;
+                    let Some(last_msg) = new_msgs.last() else {
+                        return Err(ContractError::from(RuntimeInnerError::ComponentExecError(ComponentError::Other("Error trying to update the context from the secret".to_string()).into())));
+                    };
+                    let Some(last_context) = last_msg.get_context() else {
+                        return Err(ContractError::from(RuntimeInnerError::ComponentExecError(ComponentError::Other("Last messsage ".to_string()).into())));
+                    };
+                    for pending in outbound_msgs.iter_mut() {
+                        if let Some(ctx) = pending.get_mut_context() {
+                            *ctx = last_context.clone();
+                        };
+                    }
+                }
+                OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
+                    last_context = context;
                 }
                 OutboundComponentMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
                     if let Some(plaintext) = value {
@@ -93,7 +107,19 @@ impl Runtime {
                     } else {
                         self.secret_store.remove_secret(component_key, &key)?;
                     }
-                    break;
+                }
+                OutboundComponentMsg::ApplicationMessage(msg) if !msg.processed => {
+                    let outbound = self.exec_inbound(
+                        &InboundComponentMsg::ApplicationMessage(
+                            ApplicationMessage::new(msg.app, msg.payload, msg.processed)
+                                .with_context(last_context.clone()),
+                        ),
+                        process_func,
+                        instance,
+                    )?;
+                    for m in outbound {
+                        outbound_msgs.push_back(m);
+                    }
                 }
                 OutboundComponentMsg::ApplicationMessage(msg) => {
                     results.push(OutboundComponentMsg::ApplicationMessage(msg));
@@ -107,18 +133,14 @@ impl Runtime {
                     let mut bytes = vec![0; bytes];
                     util::generate_random_bytes(&mut bytes);
                     let inbound = InboundComponentMsg::RandomBytes(bytes);
-                    let outbound_msgs = self.exec_inbound(&inbound, process_func, instance)?;
-                    self.get_outbound(
-                        component_key,
-                        instance,
-                        process_func,
-                        outbound_msgs,
-                        results,
-                    )?;
+                    let new_outbound_msgs = self.exec_inbound(&inbound, process_func, instance)?;
+                    for msg in new_outbound_msgs.into_iter().rev() {
+                        outbound_msgs.push_front(msg);
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(last_context)
     }
 }
 
@@ -136,41 +158,65 @@ impl ComponentRuntimeInterface for Runtime {
         let process_func: TypedFunction<i64, i64> = instance
             .exports
             .get_typed_function(&self.wasm_store, "process")?;
+
+        // Initialize the shared context with the first message context
+        let mut last_context = match inbound.first() {
+            Some(msg) => {
+                if let Some(context) = msg.get_context() {
+                    context.clone()
+                } else {
+                    ComponentContext::default()
+                }
+            }
+            _ => ComponentContext::default(),
+        };
+
         for msg in inbound {
             match msg {
                 InboundComponentMsg::ApplicationMessage(ApplicationMessage {
                     app,
                     payload,
-                    context,
+                    processed,
                     ..
                 }) => {
-                    let outbound = self.exec_inbound(
-                        &InboundComponentMsg::ApplicationMessage(ApplicationMessage::new(
-                            app, payload, context,
-                        )),
-                        &process_func,
+                    let mut outbound = VecDeque::from(
+                        self.exec_inbound(
+                            &InboundComponentMsg::ApplicationMessage(
+                                ApplicationMessage::new(app, payload, processed)
+                                    .with_context(last_context.clone()),
+                            ),
+                            &process_func,
+                            &instance,
+                        )?,
+                    );
+
+                    // Update the shared context for next messages
+                    last_context = self.get_outbound(
+                        key,
                         &instance,
+                        &process_func,
+                        &mut outbound,
+                        &mut results,
                     )?;
-                    self.get_outbound(key, &instance, &process_func, outbound, &mut results)?;
                 }
                 InboundComponentMsg::UserResponse(response) => {
-                    let outbound = self.exec_inbound(
+                    let mut outbound = VecDeque::from(self.exec_inbound(
                         &InboundComponentMsg::UserResponse(response),
                         &process_func,
                         &instance,
-                    )?;
-                    self.get_outbound(key, &instance, &process_func, outbound, &mut results)?;
+                    )?);
+                    self.get_outbound(key, &instance, &process_func, &mut outbound, &mut results)?;
                 }
                 InboundComponentMsg::GetSecretResponse(_) => {
                     return Err(ComponentExecError::UnexpectedMessage("get secret response").into())
                 }
                 InboundComponentMsg::RandomBytes(bytes) => {
-                    let outbound = self.exec_inbound(
+                    let mut outbound = VecDeque::from(self.exec_inbound(
                         &InboundComponentMsg::RandomBytes(bytes),
                         &process_func,
                         &instance,
-                    )?;
-                    self.get_outbound(key, &instance, &process_func, outbound, &mut results)?;
+                    )?);
+                    self.get_outbound(key, &instance, &process_func, &mut outbound, &mut results)?;
                 }
             }
         }
@@ -204,7 +250,8 @@ mod test {
     };
     use serde::{Deserialize, Serialize};
     use std::{
-        path::PathBuf,
+        path::{Path, PathBuf},
+        process::Command,
         sync::{atomic::AtomicUsize, Arc},
     };
 
@@ -213,6 +260,11 @@ mod test {
 
     const TEST_COMPONENT_1: &str = "test_component_1";
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SecretsContext {
+        private_key: Option<Vec<u8>>,
+    }
 
     #[derive(Debug, Serialize, Deserialize)]
     enum InboundAppMessage {
@@ -228,7 +280,7 @@ mod test {
 
     fn test_dir() -> PathBuf {
         let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
-            "api-test-{}",
+            "component-api-test-{}",
             TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         if !test_dir.exists() {
@@ -237,34 +289,59 @@ mod test {
         test_dir
     }
 
-    fn get_test_component(name: &str) -> Component {
+    fn get_test_component(name: &str) -> Result<Component, Box<dyn std::error::Error>> {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let contracts = PathBuf::from(CONTRACTS_DIR);
         let mut dirs = contracts.ancestors();
         let path = dirs.nth(2).unwrap();
-        let component_path = path
-            .join("tests")
-            .join(name.replace('_', "-"))
+        let component_dir = path.join("tests").join(name.replace('_', "-"));
+        let mut component_build = component_dir
             .join("build/locutus")
             .join(name)
             .with_extension("wasm");
-        Component::try_from(component_path.as_path()).unwrap()
+        if !component_build.exists() {
+            const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
+            std::env::set_var(TARGET_DIR_VAR, "/home/nachod/.cargo/target/");
+            let target = std::env::var(TARGET_DIR_VAR)?;
+            println!("trying to compile the test contract, target: {target}");
+            // attempt to compile it
+            const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
+            const WASI_TARGET: &str = "wasm32-wasi";
+            let cmd_args = RUST_TARGET_ARGS
+                .iter()
+                .copied()
+                .chain([WASI_TARGET])
+                .collect::<Vec<_>>();
+            let mut child = Command::new("cargo")
+                .args(&cmd_args)
+                .current_dir(&component_dir)
+                .spawn()?;
+            child.wait()?;
+            let output_file = Path::new(&target)
+                .join("wasm32-wasi")
+                .join("debug")
+                .join(name)
+                .with_extension("wasm");
+            println!("output file: {output_file:?}");
+            component_build = output_file;
+        }
+        Ok(Component::try_from(component_build.as_path())?)
     }
 
-    fn set_up_runtime(name: &str) -> (Component, Runtime) {
+    fn set_up_runtime(name: &str) -> Result<(Component, Runtime), Box<dyn std::error::Error>> {
         let _ = env_logger::try_init();
         let contracts_dir = test_dir();
         let components_dir = test_dir();
         let secrets_dir = test_dir();
 
-        let contract_store = ContractStore::new(contracts_dir, 10_000).unwrap();
-        let component_store = ComponentStore::new(components_dir.clone(), 10_000).unwrap();
-        let secret_store = SecretsStore::new(secrets_dir).unwrap();
+        let contract_store = ContractStore::new(contracts_dir, 10_000)?;
+        let component_store = ComponentStore::new(components_dir, 10_000)?;
+        let secret_store = SecretsStore::new(secrets_dir)?;
 
         let mut runtime =
             Runtime::build(contract_store, component_store, secret_store, false).unwrap();
 
-        let component = get_test_component(name);
+        let component = get_test_component(name).unwrap();
         let _ = runtime.component_store.store_component(component.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
@@ -275,7 +352,7 @@ mod test {
             .register_component(component.key().clone(), cipher, nonce);
 
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
-        (component, runtime)
+        Ok((component, runtime))
     }
 
     #[test]
@@ -284,30 +361,29 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-
-        let (component, mut runtime) = set_up_runtime(TEST_COMPONENT_1);
+        let (component, mut runtime) = set_up_runtime(TEST_COMPONENT_1)?;
+        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // CreateInboxRequest message parts
-        let payload: Vec<u8> = serde_json::to_vec(&InboundAppMessage::CreateInboxRequest).unwrap();
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
-        let context = ComponentContext::new(vec![]);
-
-        let create_inbox_request_msg: ApplicationMessage = ApplicationMessage::new(app, payload, context);
+        let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
+        let create_inbox_request_msg = ApplicationMessage::new(app, payload, false);
 
         let inbound = InboundComponentMsg::ApplicationMessage(create_inbox_request_msg);
         let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
-        assert!(outbound.unwrap().is_empty());
+        assert!(outbound.is_ok());
+        assert!(matches!(
+            outbound.unwrap().get(0),
+            Some(OutboundComponentMsg::ApplicationMessage(..))
+        ));
 
         // CreateInboxRequest message parts
-        // let payload: Vec<u8> = serde_json::to_vec(&InboundAppMessage::PleaseSignMessage(vec![1,2,3])).unwrap();
-        // let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
-        // let context = ComponentContext::new(vec![]);
-        //
-        // let pleaseSignMessageMsg: ApplicationMessage = ApplicationMessage::new(app, payload, context);
-        //
-        // let inbound = InboundComponentMsg::ApplicationMessage(pleaseSignMessageMsg);
-        // let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
-        // assert!(outbound.unwrap().is_empty());
+        let payload: Vec<u8> =
+            bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
+        let please_sign_message_msg = ApplicationMessage::new(app, payload, false);
+
+        let inbound = InboundComponentMsg::ApplicationMessage(please_sign_message_msg);
+        let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
+        assert!(outbound.unwrap().is_empty());
         Ok(())
     }
 }

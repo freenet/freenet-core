@@ -1,6 +1,23 @@
 use locutus_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct SecretsContext {
+    private_key: Option<Vec<u8>>,
+}
+
+impl SecretsContext {
+    fn serialized(self) -> Vec<u8> {
+        bincode::serialize(&self).unwrap()
+    }
+}
+
+impl From<SecretsContext> for ComponentContext {
+    fn from(val: SecretsContext) -> Self {
+        ComponentContext(val.serialized())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum InboundAppMessage {
     CreateInboxRequest,
@@ -22,7 +39,7 @@ impl ComponentInterface for Component {
         match messages {
             InboundComponentMsg::ApplicationMessage(incoming_app) => {
                 let message: InboundAppMessage =
-                    serde_json::from_slice::<InboundAppMessage>(incoming_app.payload.as_slice())
+                    bincode::deserialize(incoming_app.payload.as_slice())
                         .map_err(|err| ComponentError::Other(format!("{err}")))?;
 
                 match message {
@@ -41,48 +58,103 @@ impl ComponentInterface for Component {
                         // Response with public key to the application
                         let response_msg_content: OutboundAppMessage =
                             OutboundAppMessage::CreateInboxResponse(public_key);
-                        let payload: Vec<u8> = serde_json::to_vec(&response_msg_content)
+                        let payload: Vec<u8> = bincode::serialize(&response_msg_content)
                             .map_err(|err| ComponentError::Other(format!("{err}")))?;
-                        let response_app_msg = ApplicationMessage::new(
-                            incoming_app.app,
-                            payload,
-                            incoming_app.context,
-                        );
+                        let response_app_msg =
+                            ApplicationMessage::new(incoming_app.app, payload, true)
+                                .with_context(incoming_app.context);
                         outbound.push(OutboundComponentMsg::ApplicationMessage(response_app_msg));
                     }
                     InboundAppMessage::PleaseSignMessage(_) => {
-                        let inbox_key = vec![1];
-                        let key = SecretsId::new(inbox_key.clone());
-                        let context = ComponentContext::new(vec![1]);
-                        let get_secret_request_msg =
-                            OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
+                        let inbox_key = vec![1, 2, 3];
+                        let key = SecretsId::new(inbox_key);
+
+                        if incoming_app.context.0.is_empty() {
+                            // FIXME: this msg should be added to the context so it can be signed later on
+                            let request_secret = GetSecretRequest {
                                 key,
-                                context,
-                            });
-                        outbound.push(get_secret_request_msg);
+                                context: SecretsContext::default().into(),
+                                processed: false,
+                            }
+                            .into();
+                            return Ok(vec![request_secret]);
+                        }
+
+                        let secrets_context: SecretsContext =
+                            bincode::deserialize(incoming_app.context.0.as_slice())
+                                .map_err(|err| ComponentError::Other(format!("{err}")))?;
+
+                        if let Some(_private_key) = secrets_context.private_key {
+                            // Response with signature to the application
+                            let signature = vec![1, 2, 3];
+                            let response_msg_content: OutboundAppMessage =
+                                OutboundAppMessage::MessageSigned(signature);
+                            let payload: Vec<u8> = bincode::serialize(&response_msg_content)
+                                .map_err(|err| ComponentError::Other(format!("{err}")))?;
+                            let response_app_msg =
+                                ApplicationMessage::new(incoming_app.app, payload, true)
+                                    .with_context(incoming_app.context);
+                            outbound
+                                .push(OutboundComponentMsg::ApplicationMessage(response_app_msg));
+                        } else {
+                            // Secret request
+                            let get_secret_request_msg =
+                                OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
+                                    key,
+                                    context: incoming_app.context.clone(),
+                                    processed: false,
+                                });
+                            outbound.push(get_secret_request_msg);
+
+                            // Retry sign message after secret request
+                            let payload = incoming_app.payload;
+                            let app = incoming_app.app;
+                            let context = incoming_app.context;
+                            let please_sign_message_content: ApplicationMessage =
+                                ApplicationMessage::new(app, payload, false).with_context(context);
+                            outbound.push(OutboundComponentMsg::ApplicationMessage(
+                                please_sign_message_content,
+                            ))
+                        }
                     }
                 }
             }
-            InboundComponentMsg::GetSecretResponse(_) => {
+            InboundComponentMsg::GetSecretResponse(secret_response) => {
                 // Response with signature to the application
-                let signature = vec![1,2,3];
-                let response_msg_content: OutboundAppMessage =
-                    OutboundAppMessage::MessageSigned(signature);
-                let payload: Vec<u8> = serde_json::to_vec(&response_msg_content)
-                    .map_err(|err| ComponentError::Other(format!("{err}")))?;
-                let response_app_msg = ApplicationMessage::new(
-                    ContractInstanceId::try_from(String::from("123")).unwrap(),
-                    payload,
-                    ComponentContext::new(vec![1]),
-                );
-                outbound.push(OutboundComponentMsg::ApplicationMessage(response_app_msg));
+                let serialized_key_value: Vec<u8> =
+                    bincode::serialize(&secret_response.value.unwrap())
+                        .map_err(|err| ComponentError::Other(format!("{err}")))?;
+
+                let serialized_context: Vec<u8> = bincode::serialize(&SecretsContext {
+                    private_key: Some(serialized_key_value),
+                })
+                .map_err(|err| ComponentError::Other(format!("{err}")))?;
+
+                // Secret request
+                let get_secret_request_msg =
+                    OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
+                        key: secret_response.key,
+                        context: ComponentContext::new(serialized_context),
+                        processed: true,
+                    });
+                outbound.push(get_secret_request_msg);
             }
             _inbound_component_msg => {
-                return Err(ComponentError::Other(format!(
-                    "Unexpected app inbound message"
-                )))
+                return Err(ComponentError::Other(
+                    "Unexpected app inbound message".to_string(),
+                ))
             }
         }
         Ok(outbound)
     }
+}
+
+#[test]
+fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
+    let payload: Vec<u8> =
+        bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
+    let id = ContractInstanceId::try_from(['a'; 32].into_iter().collect::<String>()).unwrap();
+    let sign_msg = ApplicationMessage::new(id, payload, false);
+    let _out = Component::process(InboundComponentMsg::ApplicationMessage(sign_msg))?;
+    Ok(())
 }

@@ -1,22 +1,22 @@
 use chacha20poly1305::{aead::Aead, Error as EncryptionError, XChaCha20Poly1305, XNonce};
-use serde::{Deserialize, Serialize};
-use std::{fs::File, iter::FromIterator, path::PathBuf, sync::Arc, collections::HashMap, fs};
-use std::io::Write;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::{collections::HashMap, fs, fs::File, iter::FromIterator, path::PathBuf, sync::Arc};
 
-use locutus_stdlib::prelude::*;
-use crate::RuntimeResult;
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
+use crate::RuntimeResult;
+use locutus_stdlib::prelude::*;
 
 type SecretKey = [u8; 32];
 
 #[derive(Serialize, Deserialize, Default)]
-struct KeyToEncryptionMap(Vec<(ComponentKey, SecretKey)>);
+struct KeyToEncryptionMap(Vec<(ComponentKey, Vec<SecretKey>)>);
 
 impl StoreEntriesContainer for KeyToEncryptionMap {
-    type MemContainer = Arc<DashMap<ComponentKey, SecretKey>>;
+    type MemContainer = Arc<DashMap<ComponentKey, Vec<SecretKey>>>;
     type Key = ComponentKey;
-    type Value = SecretKey;
+    type Value = Vec<SecretKey>;
 
     fn update(self, container: &mut Self::MemContainer) {
         for (k, v) in self.0 {
@@ -29,7 +29,13 @@ impl StoreEntriesContainer for KeyToEncryptionMap {
     }
 
     fn insert(container: &mut Self::MemContainer, key: Self::Key, value: Self::Value) {
-        container.insert(key, value);
+        if let Some(element) = container.get(&key.clone()) {
+            let mut secrets = element.value().clone();
+            secrets.extend(value);
+            container.insert(key, secrets);
+        } else {
+            container.insert(key, value);
+        }
     }
 }
 
@@ -43,8 +49,8 @@ pub enum SecretStoreError {
     MissingCipher,
 }
 
-impl From<&DashMap<ComponentKey, SecretKey>> for KeyToEncryptionMap {
-    fn from(vals: &DashMap<ComponentKey, SecretKey>) -> Self {
+impl From<&DashMap<ComponentKey, Vec<SecretKey>>> for KeyToEncryptionMap {
+    fn from(vals: &DashMap<ComponentKey, Vec<SecretKey>>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
             map.push((r.key().clone(), r.value().clone()));
@@ -62,8 +68,8 @@ struct Encryption {
 #[derive(Default)]
 pub struct SecretsStore {
     base_path: PathBuf,
-    ciphers: HashMap<SecretKey, Encryption>,
-    key_to_secret_part: Arc<DashMap<ComponentKey, SecretKey>>,
+    ciphers: HashMap<ComponentKey, Encryption>,
+    key_to_secret_part: Arc<DashMap<ComponentKey, Vec<SecretKey>>>,
 }
 
 static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
@@ -72,7 +78,6 @@ static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::Once
 impl StoreFsManagement<KeyToEncryptionMap> for SecretsStore {}
 
 impl SecretsStore {
-
     pub fn new(secrets_dir: PathBuf) -> RuntimeResult<Self> {
         let key_to_secret_part;
         let _ = LOCK_FILE_PATH.try_insert(secrets_dir.join("__LOCK"));
@@ -105,7 +110,7 @@ impl SecretsStore {
         Ok(Self {
             base_path: secrets_dir,
             ciphers: HashMap::new(),
-            key_to_secret_part
+            key_to_secret_part,
         })
     }
 
@@ -117,7 +122,7 @@ impl SecretsStore {
     ) -> Result<(), SecretStoreError> {
         // FIXME: store/initialize the cyphers from disc
         let encryption = Encryption { cipher, nonce };
-        self.ciphers.insert(*component.code_hash(), encryption);
+        self.ciphers.insert(component, encryption);
         Ok(())
     }
 
@@ -127,18 +132,24 @@ impl SecretsStore {
         key: &SecretsId,
         plaintext: Vec<u8>,
     ) -> RuntimeResult<()> {
-        let component_path = self.base_path.join(component.encode()).join(key.encode());
-        let secret_path = component_path.join(key.encode());
+        let component_path = self.base_path.join(component.encode());
+        let secret_file_path = component_path.join(key.encode());
+        let secret_key = *key.code_hash();
+
         let encryption = self
             .ciphers
-            .get(component.code_hash())
+            .get(component)
             .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = encryption
             .cipher
             .encrypt(&encryption.nonce, plaintext.as_ref())
             .map_err(SecretStoreError::Encryption)?;
+
+        self.key_to_secret_part
+            .insert(component.clone(), vec![secret_key]);
+
         fs::create_dir_all(&component_path)?;
-        let mut file = File::create(secret_path)?;
+        let mut file = File::create(secret_file_path)?;
         file.write_all(&ciphertext)?;
         Ok(())
     }
@@ -164,7 +175,7 @@ impl SecretsStore {
         let secret_path = self.base_path.join(component.encode()).join(key.encode());
         let encryption = self
             .ciphers
-            .get(component.code_hash())
+            .get(component)
             .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = fs::read(secret_path)?;
         let plaintext = encryption
@@ -177,12 +188,14 @@ impl SecretsStore {
 
 #[cfg(test)]
 mod test {
-    use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
     use super::*;
+    use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let secrets_dir = std::env::temp_dir().join("locutus-test").join("store-test");
+        let secrets_dir = std::env::temp_dir()
+            .join("locutus-test")
+            .join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
         let mut store = SecretsStore::new(secrets_dir)?;

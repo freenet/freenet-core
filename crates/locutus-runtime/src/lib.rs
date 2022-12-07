@@ -1,3 +1,5 @@
+extern crate core;
+
 mod component;
 mod component_store;
 mod contract;
@@ -16,6 +18,7 @@ pub use prelude::*;
 
 pub mod prelude {
     pub use super::component::{ComponentExecError, ComponentRuntimeInterface};
+    pub use super::component_store::ComponentStore;
     pub use super::contract::ContractRuntimeInterface;
     pub use super::contract_store::ContractStore;
     pub use super::error::ContractError;

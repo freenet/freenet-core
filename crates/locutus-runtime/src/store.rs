@@ -72,7 +72,7 @@ where
 
     fn load_from_file(key_file_path: &Path, lock_file_path: &Path) -> RuntimeResult<C> {
         let mut buf = vec![];
-        Self::acquire_ls_lock(key_file_path)?;
+        Self::acquire_ls_lock(lock_file_path)?;
         let mut f = File::open(key_file_path)?;
         f.read_to_end(&mut buf)?;
         Self::release_ls_lock(lock_file_path)?;

@@ -1,16 +1,11 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io::Write,
-    path::PathBuf,
-    sync::Arc
-};
+use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 use stretto::Cache;
 
+use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
 use locutus_stdlib::prelude::{Component, ComponentKey};
-use crate::store::{StoreEntriesContainer, StoreFsManagement};
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
 
@@ -105,7 +100,7 @@ impl ComponentStore {
         if let Some(component) = self.component_cache.get(key.code_hash()) {
             return Some(component.value().clone());
         }
-        self.key_to_component_part.get(key).and_then(|_|{
+        self.key_to_component_part.get(key).and_then(|_| {
             let component_path = self
                 .components_dir
                 .join(key.encode())
@@ -151,9 +146,7 @@ impl ComponentStore {
         self.component_cache
             .insert(*component_hash, Component::from(data.to_vec()), code_size);
 
-        let mut output: Vec<u8> = Vec::with_capacity(
-            code_size as usize,
-        );
+        let mut output: Vec<u8> = Vec::with_capacity(code_size as usize);
         output.append(&mut component.as_ref().to_vec());
         let mut file = File::create(component_path)?;
         file.write_all(output.as_slice())?;
@@ -200,7 +193,9 @@ mod test {
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let component_dir = std::env::temp_dir().join("locutus-test").join("store-test");
+        let component_dir = std::env::temp_dir()
+            .join("locutus-test")
+            .join("component-store-test");
         std::fs::create_dir_all(&component_dir)?;
         let mut store = ComponentStore::new(component_dir, 10_000)?;
         let component = Component::from(vec![0, 1, 2]);

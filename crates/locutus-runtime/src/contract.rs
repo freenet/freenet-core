@@ -313,7 +313,7 @@ mod test {
 
     fn test_dir() -> PathBuf {
         let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
-            "api-test-{}",
+            "contract-api-test-{}",
             TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         if !test_dir.exists() {

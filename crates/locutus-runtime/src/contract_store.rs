@@ -68,6 +68,8 @@ impl ContractStore {
         const ERR: &str = "failed to build mem cache";
         let key_to_code_part;
         let _ = LOCK_FILE_PATH.try_insert(contracts_dir.join("__LOCK"));
+        // if the lock file exists is from a previous execution so is safe to delete it
+        let _ = std::fs::remove_file(LOCK_FILE_PATH.get().unwrap().as_path());
         let key_file = match KEY_FILE_PATH
             .try_insert(contracts_dir.join("KEY_DATA"))
             .map_err(|(e, _)| e)
@@ -191,7 +193,7 @@ impl ContractStore {
             serde_json::to_vec(&version).map_err(|e| RuntimeInnerError::Any(Box::new(e)))?;
 
         let mut output: Vec<u8> = Vec::with_capacity(
-            std::mem::size_of::<u32>() + serialized_version.len()  + code.data().len(),
+            std::mem::size_of::<u32>() + serialized_version.len() + code.data().len(),
         );
         output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
         output.append(&mut serialized_version);
@@ -230,7 +232,9 @@ mod test {
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let contract_dir = std::env::temp_dir().join("locutus-test").join("store-test");
+        let contract_dir = std::env::temp_dir()
+            .join("locutus-test")
+            .join("contract-store-test");
         std::fs::create_dir_all(&contract_dir)?;
         let mut store = ContractStore::new(contract_dir, 10_000)?;
         let contract = WrappedContract::new(
