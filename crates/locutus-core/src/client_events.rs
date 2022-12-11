@@ -1,7 +1,7 @@
 use futures::future::BoxFuture;
 use locutus_runtime::ComponentKey;
-use locutus_stdlib::api::ClientRequest;
-use locutus_stdlib::api::{ClientError, HostResponse};
+use locutus_stdlib::client_api::ClientRequest;
+use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
 use std::fmt::Display;
 
@@ -124,7 +124,7 @@ pub(crate) mod test {
     use locutus_runtime::{
         ContractCode, ContractContainer, Parameters, RelatedContracts, TryFromTsStd, WasmAPIVersion,
     };
-    use locutus_stdlib::api::ContractRequest;
+    use locutus_stdlib::client_api::ContractRequest;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 

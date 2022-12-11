@@ -3,9 +3,12 @@ mod component_store;
 mod contract;
 mod contract_store;
 pub(crate) mod error;
+mod native_api;
 mod runtime;
 mod secrets_store;
 mod state_store;
+#[cfg(test)]
+pub(crate) mod tests;
 pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;

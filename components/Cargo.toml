@@ -3,4 +3,7 @@ resolver = "2"
 members = ["antiflood-tokens"]
 
 [workspace.dependencies]
+bincode = { version = "1" }
+ed25519-dalek = { version = "1", no-default-features = true }
 locutus-stdlib = { version = "0.0.3", path = "../crates/locutus-stdlib" }
+serde = { version = "1", features = ["derive"] }

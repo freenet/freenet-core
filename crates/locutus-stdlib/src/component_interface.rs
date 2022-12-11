@@ -13,6 +13,8 @@ use crate::prelude::ContractInstanceId;
 const APPLICATION_HASH_SIZE: usize = 32;
 const COMPONENT_HASH_LENGTH: usize = 32;
 
+type Secret = Vec<u8>;
+
 /// Executable component
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde_as]
@@ -185,7 +187,7 @@ impl InboundComponentMsg<'_> {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetSecretResponse {
     pub key: SecretsId,
-    pub value: Option<Vec<u8>>,
+    pub value: Option<Secret>,
     #[serde(skip)]
     pub context: ComponentContext,
 }
@@ -225,11 +227,6 @@ impl UserInputResponse<'_> {
     }
 }
 
-/*
-contracts/web/9809fvnmbgbgf
-freenet.com/components/784r3nbvmfd/
-*/
-
 #[derive(Serialize, Deserialize, Debug)]
 pub enum OutboundComponentMsg {
     // from the apps
@@ -265,7 +262,7 @@ pub struct GetSecretRequest {
 pub struct SetSecretRequest {
     pub key: SecretsId,
     /// Sets or unsets (if none) a value associated with the key.
-    pub value: Option<Vec<u8>>,
+    pub value: Option<Secret>,
 }
 
 #[serde_as]

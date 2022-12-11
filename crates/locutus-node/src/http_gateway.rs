@@ -3,7 +3,7 @@ use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamEx
 use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
-use locutus_stdlib::api::{
+use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
 };
 use std::{

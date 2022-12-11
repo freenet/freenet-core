@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use locutus_stdlib::api::ClientRequest;
+use locutus_stdlib::client_api::ClientRequest;
 
 pub mod build;
 pub mod commands;

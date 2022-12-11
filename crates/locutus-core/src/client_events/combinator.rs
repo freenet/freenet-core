@@ -7,7 +7,7 @@ use std::{collections::HashMap, task::Poll};
 use futures::future::BoxFuture;
 use futures::task::AtomicWaker;
 use futures::FutureExt;
-use locutus_stdlib::api::{ErrorKind, HostResponse};
+use locutus_stdlib::client_api::{ErrorKind, HostResponse};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, HostResult};
@@ -244,7 +244,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::api::ClientRequest;
+    use locutus_stdlib::client_api::ClientRequest;
 
     use super::*;
 

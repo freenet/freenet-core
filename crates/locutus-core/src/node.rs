@@ -15,7 +15,7 @@ use libp2p::{
     multiaddr::Protocol,
     Multiaddr, PeerId,
 };
-use locutus_stdlib::api::{ClientRequest, ContractRequest};
+use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;

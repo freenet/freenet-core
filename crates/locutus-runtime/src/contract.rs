@@ -299,55 +299,14 @@ impl ContractRuntimeInterface for crate::Runtime {
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::prelude::{env_logger, WrappedContract};
-
     use super::*;
-    use crate::{
-        secrets_store::SecretsStore, ContractContainer, ContractStore, Runtime, WasmAPIVersion,
-    };
-    use std::{path::PathBuf, sync::atomic::AtomicUsize};
+    use crate::{secrets_store::SecretsStore, tests::setup_test_contract, Runtime};
 
     const TEST_CONTRACT_1: &str = "test_contract_1";
-    static TEST_NO: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_dir() -> PathBuf {
-        let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
-            "api-test-{}",
-            TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        if !test_dir.exists() {
-            std::fs::create_dir_all(&test_dir).unwrap();
-        }
-        test_dir
-    }
-
-    fn get_test_contract(name: &str) -> WrappedContract {
-        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
-        let contracts = PathBuf::from(CONTRACTS_DIR);
-        let mut dirs = contracts.ancestors();
-        let path = dirs.nth(2).unwrap();
-        let contract_path = path
-            .join("tests")
-            .join(name.replace('_', "-"))
-            .join("build/locutus")
-            .join(name)
-            .with_extension("wasm");
-        WrappedContract::try_from((&*contract_path, Parameters::from(vec![])))
-            .expect("contract found")
-    }
-
-    fn set_up_test_contract(name: &str) -> RuntimeResult<(ContractStore, ContractKey)> {
-        let _ = env_logger::try_init();
-        let mut store = ContractStore::new(test_dir(), 10_000)?;
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name)));
-        let key = contract.key();
-        store.store_contract(contract)?;
-        Ok((store, key))
-    }
 
     #[test]
     fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
@@ -372,7 +331,7 @@ mod test {
 
     #[test]
     fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
@@ -395,7 +354,7 @@ mod test {
 
     #[test]
     fn update_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
@@ -414,7 +373,7 @@ mod test {
 
     #[test]
     fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
@@ -429,7 +388,7 @@ mod test {
 
     #[test]
     fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 

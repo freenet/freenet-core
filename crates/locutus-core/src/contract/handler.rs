@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use locutus_runtime::{ContractContainer, ContractStore, Parameters, StateStorage, StateStore};
-use locutus_stdlib::api::{ClientRequest, HostResponse};
+use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -193,7 +193,7 @@ pub(in crate::contract) mod sqlite {
         ContractError, ContractExecError, ContractRuntimeInterface, ContractStore, StateStorage,
         StateStoreError, ValidateResult,
     };
-    use locutus_stdlib::api::{ContractRequest, ContractResponse};
+    use locutus_stdlib::client_api::{ContractRequest, ContractResponse};
     use once_cell::sync::Lazy;
     use sqlx::{
         sqlite::{SqliteConnectOptions, SqliteRow},
@@ -570,7 +570,7 @@ pub mod test {
 
     use locutus_runtime::{ContractStore, WasmAPIVersion};
     use locutus_stdlib::{
-        api::{ClientRequest, HostResponse},
+        client_api::{ClientRequest, HostResponse},
         prelude::ContractCode,
     };
 

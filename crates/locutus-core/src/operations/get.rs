@@ -659,7 +659,7 @@ mod messages {
 #[cfg(test)]
 mod test {
     use locutus_runtime::{ContractContainer, WasmAPIVersion};
-    use locutus_stdlib::api::ContractRequest;
+    use locutus_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
     use super::*;

@@ -5,7 +5,7 @@ use locutus_runtime::{
     ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore, WasmAPIVersion,
     WrappedContract,
 };
-use locutus_stdlib::api::{ClientRequest, ContractRequest};
+use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},

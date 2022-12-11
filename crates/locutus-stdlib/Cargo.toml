@@ -15,6 +15,7 @@ bincode = "1"
 byteorder = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
+chrono = { workspace = true, default-features = false, features = ["alloc", "serde"] }
 env_logger = "0.9"
 futures = { workspace = true }
 once_cell = "1"
@@ -62,7 +63,7 @@ wasmer-wasi = { workspace = true }
 rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
-default = ["net"]
+default = []
 archive = ["xz2"]
 net = ["serde-wasm-bindgen", "tokio", "tokio-tungstenite", "wasm-bindgen", "web-sys"]
 testing = ["arbitrary"]

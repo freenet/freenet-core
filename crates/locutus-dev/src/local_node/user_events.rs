@@ -9,7 +9,9 @@ use either::Either;
 use futures::future::BoxFuture;
 use locutus_core::{ClientEventsProxy, ClientId, OpenRequest};
 use locutus_runtime::prelude::*;
-use locutus_stdlib::api::{ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse};
+use locutus_stdlib::client_api::{
+    ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{util, CommandSender, DynError};

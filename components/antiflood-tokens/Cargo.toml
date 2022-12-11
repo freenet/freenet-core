@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bincode = { workspace = true }
+hashbrown = { version = "0.13", features = ["serde"] }
 locutus-stdlib = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
 
 [lib]
 crate-type = ["cdylib"]

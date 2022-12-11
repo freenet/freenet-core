@@ -1,4 +1,6 @@
 //! Standard library provided by the Freenet project to be able to write Locutus-compatible contracts.
+#[doc(hidden)]
+pub mod buf;
 #[cfg(all(
     feature = "net",
     any(
@@ -10,10 +12,10 @@
         target_family = "unix"
     )
 ))]
-pub mod api;
-pub mod buf;
+pub mod client_api;
 mod component_interface;
-pub mod contract_interface;
+mod contract_interface;
+pub mod time;
 mod versioning;
 #[cfg(feature = "xz2")]
 pub mod web;

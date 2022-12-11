@@ -8,7 +8,7 @@ use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Stor
 
 use crate::{
     component_store::ComponentStore, contract_store::ContractStore, error::RuntimeInnerError,
-    secrets_store::SecretsStore, RuntimeResult,
+    native_api, secrets_store::SecretsStore, RuntimeResult,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -57,7 +57,7 @@ impl Runtime {
         host_mem: bool,
     ) -> RuntimeResult<Self> {
         let mut store = Self::instance_store();
-        let (host_memory, top_level_imports) = if host_mem {
+        let (host_memory, mut top_level_imports) = if host_mem {
             let mem = Self::instance_host_mem(&mut store)?;
             let imports = imports! {
                 "env" => {
@@ -68,6 +68,7 @@ impl Runtime {
         } else {
             (None, imports! {})
         };
+        native_api::time::prepare_export(&mut store, &mut top_level_imports);
 
         Ok(Self {
             wasm_store: store,
@@ -242,17 +243,13 @@ impl Runtime {
     // #[cfg(not(test))]
     // fn instance_store() -> Store {
     //     use wasmer::Universal;
-
     //     if cfg!(target_arch = "aarch64") {
     //         use wasmer::Cranelift;
-
     //         Store::new(&Universal::new(Cranelift::new()).engine())
     //     } else {
     //         use wasmer_compiler_llvm::LLVM;
-
     //         Store::new(&Universal::new(LLVM::new()).engine())
     //     }
-
     //     // use wasmer::Dylib;
     //     // Store::new(&Dylib::headless().engine())
     // }

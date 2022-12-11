@@ -8,7 +8,7 @@ use std::{
 
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
 use locutus_runtime::prelude::TryFromTsStd;
-use locutus_stdlib::api::{ClientRequest, ContractRequest, ErrorKind, HostResponse};
+use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind, HostResponse};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use warp::{filters::BoxedFilter, Filter, Reply};
 
