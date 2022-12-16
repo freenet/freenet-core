@@ -88,9 +88,8 @@ impl Runtime {
                         context,
                     });
                     if retries >= MAX_ITERATIONS {
-                        panic!();
+                        return Err(ContractError::from(RuntimeInnerError::ComponentExecError(ComponentError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
-                    // OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. })
                     let new_msgs = self.exec_inbound(&inbound, process_func, instance)?;
                     retries += 1;
                     let Some(last_msg) = new_msgs.last() else {
@@ -317,9 +316,8 @@ mod test {
             .join(name)
             .with_extension("wasm");
         if !component_build.exists() {
-            const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
-            std::env::set_var(TARGET_DIR_VAR, "/home/nachod/.cargo/target/");
-            let target = std::env::var(TARGET_DIR_VAR)?;
+            let target =
+                std::env::var("CARGO_TARGET_DIR").map_err(|_| "CARGO_TARGET_DIR should be set")?;
             println!("trying to compile the test contract, target: {target}");
             // attempt to compile it
             const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
@@ -387,10 +385,13 @@ mod test {
 
         let inbound = InboundComponentMsg::ApplicationMessage(create_inbox_request_msg);
         let outbound = runtime.inbound_app_message(component.key(), vec![inbound])?;
+        let expected_payload =
+            bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
+
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
             outbound.get(0),
-            Some(OutboundComponentMsg::ApplicationMessage(..))
+            Some(OutboundComponentMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
 
         // CreateInboxRequest message parts
@@ -399,8 +400,14 @@ mod test {
         let please_sign_message_msg = ApplicationMessage::new(app, payload, false);
 
         let inbound = InboundComponentMsg::ApplicationMessage(please_sign_message_msg);
-        let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
-        assert_eq!(outbound.unwrap().len(), 1);
+        let outbound = runtime.inbound_app_message(component.key(), vec![inbound])?;
+        let expected_payload =
+            bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
+        assert_eq!(outbound.len(), 1);
+        assert!(matches!(
+            outbound.get(0),
+            Some(OutboundComponentMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
+        ));
         Ok(())
     }
 }

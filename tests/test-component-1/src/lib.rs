@@ -71,7 +71,6 @@ impl ComponentInterface for Component {
                     InboundAppMessage::PleaseSignMessage(inbox_priv_key) => {
                         let key = SecretsId::new(inbox_priv_key);
                         if incoming_app.context.0.is_empty() {
-                            // FIXME: this msg should be added to the context so it can be signed later on
                             let request_secret = GetSecretRequest {
                                 key,
                                 context: SecretsContext::default().into(),

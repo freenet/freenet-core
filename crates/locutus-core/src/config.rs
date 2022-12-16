@@ -263,7 +263,7 @@ pub(super) mod tracer {
             .target(env_logger::Target::Stdout)
             .filter(None, CONFIG.log_level);
         if let Err(err) = builder.try_init() {
-            eprintln!("Failed to initialize logger with error: {}", err);
+            eprintln!("Failed to initialize logger with error: {err}");
         };
 
         if CONFIG.log_level == log::LevelFilter::Debug {

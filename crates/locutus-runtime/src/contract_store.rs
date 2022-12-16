@@ -104,10 +104,10 @@ impl ContractStore {
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
-    pub fn fetch_contract<'a>(
+    pub fn fetch_contract(
         &self,
         key: &ContractKey,
-        params: &Parameters<'a>,
+        params: &Parameters<'_>,
     ) -> Option<ContractContainer> {
         let result = key
             .code_hash()
