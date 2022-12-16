@@ -68,6 +68,9 @@ impl Runtime {
         outbound_msgs: &mut VecDeque<OutboundComponentMsg>,
         results: &mut Vec<OutboundComponentMsg>,
     ) -> RuntimeResult<ComponentContext> {
+        const MAX_ITERATIONS: usize = 100;
+
+        let mut retries = 0;
         let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned()) else {
             return Ok(ComponentContext::default());
         };
@@ -84,17 +87,26 @@ impl Runtime {
                         value: Some(secret),
                         context,
                     });
+                    if retries >= MAX_ITERATIONS {
+                        panic!();
+                    }
+                    // OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. })
                     let new_msgs = self.exec_inbound(&inbound, process_func, instance)?;
+                    retries += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::ComponentExecError(ComponentError::Other("Error trying to update the context from the secret".to_string()).into())));
                     };
-                    let Some(last_context) = last_msg.get_context() else {
+                    let Some(new_last_context) = last_msg.get_context() else {
                         return Err(ContractError::from(RuntimeInnerError::ComponentExecError(ComponentError::Other("Last messsage ".to_string()).into())));
                     };
-                    for pending in outbound_msgs.iter_mut() {
+                    last_context = new_last_context.clone();
+                    for mut pending in new_msgs {
                         if let Some(ctx) = pending.get_mut_context() {
                             *ctx = last_context.clone();
                         };
+                        if !pending.processed() {
+                            outbound_msgs.push_back(pending);
+                        }
                     }
                 }
                 OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
@@ -109,6 +121,9 @@ impl Runtime {
                     }
                 }
                 OutboundComponentMsg::ApplicationMessage(msg) if !msg.processed => {
+                    if retries >= MAX_ITERATIONS {
+                        panic!();
+                    }
                     let outbound = self.exec_inbound(
                         &InboundComponentMsg::ApplicationMessage(
                             ApplicationMessage::new(msg.app, msg.payload, msg.processed)
@@ -117,6 +132,7 @@ impl Runtime {
                         process_func,
                         instance,
                     )?;
+                    retries += 1;
                     for m in outbound {
                         outbound_msgs.push_back(m);
                     }
@@ -134,8 +150,8 @@ impl Runtime {
                     util::generate_random_bytes(&mut bytes);
                     let inbound = InboundComponentMsg::RandomBytes(bytes);
                     let new_outbound_msgs = self.exec_inbound(&inbound, process_func, instance)?;
-                    for msg in new_outbound_msgs.into_iter().rev() {
-                        outbound_msgs.push_front(msg);
+                    for msg in new_outbound_msgs.into_iter() {
+                        outbound_msgs.push_back(msg);
                     }
                 }
             }
@@ -246,7 +262,7 @@ mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
     use locutus_stdlib::{
         contract_interface::ContractCode,
-        prelude::{env_logger, ComponentContext, ContractInstanceId, Parameters},
+        prelude::{env_logger, ContractInstanceId, Parameters},
     };
     use serde::{Deserialize, Serialize};
     use std::{

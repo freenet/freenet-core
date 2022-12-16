@@ -295,7 +295,23 @@ impl From<GetSecretRequest> for OutboundComponentMsg {
     }
 }
 
+impl From<ApplicationMessage> for OutboundComponentMsg {
+    fn from(req: ApplicationMessage) -> Self {
+        Self::ApplicationMessage(req)
+    }
+}
+
 impl OutboundComponentMsg {
+    pub fn processed(&self) -> bool {
+        match self {
+            OutboundComponentMsg::ApplicationMessage(msg) => msg.processed,
+            OutboundComponentMsg::GetSecretRequest(msg) => msg.processed,
+            OutboundComponentMsg::RandomBytesRequest(_) => false,
+            OutboundComponentMsg::SetSecretRequest(_) => false,
+            OutboundComponentMsg::RequestUserInput(_) => true,
+        }
+    }
+
     pub fn get_context(&self) -> Option<&ComponentContext> {
         match self {
             OutboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
