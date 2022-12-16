@@ -137,7 +137,8 @@ impl Runtime {
                         outbound_msgs.push_back(m);
                     }
                 }
-                OutboundComponentMsg::ApplicationMessage(msg) => {
+                OutboundComponentMsg::ApplicationMessage(mut msg) => {
+                    msg.context = ComponentContext::default();
                     results.push(OutboundComponentMsg::ApplicationMessage(msg));
                     break;
                 }
@@ -385,10 +386,10 @@ mod test {
         let create_inbox_request_msg = ApplicationMessage::new(app, payload, false);
 
         let inbound = InboundComponentMsg::ApplicationMessage(create_inbox_request_msg);
-        let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
-        assert!(outbound.is_ok());
+        let outbound = runtime.inbound_app_message(component.key(), vec![inbound])?;
+        assert_eq!(outbound.len(), 1);
         assert!(matches!(
-            outbound.unwrap().get(0),
+            outbound.get(0),
             Some(OutboundComponentMsg::ApplicationMessage(..))
         ));
 
@@ -399,7 +400,7 @@ mod test {
 
         let inbound = InboundComponentMsg::ApplicationMessage(please_sign_message_msg);
         let outbound = runtime.inbound_app_message(component.key(), vec![inbound]);
-        assert!(outbound.unwrap().is_empty());
+        assert_eq!(outbound.unwrap().len(), 1);
         Ok(())
     }
 }
