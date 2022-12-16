@@ -1052,6 +1052,7 @@ dependencies = [
 name = "test-component-1"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "locutus-stdlib",
  "serde",
  "serde_json",

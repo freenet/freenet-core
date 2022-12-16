@@ -1,5 +1,7 @@
 use locutus_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::{atomic::AtomicUsize, Arc};
+
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct SecretsContext {
@@ -137,6 +139,7 @@ impl ComponentInterface for Component {
                         context: ComponentContext::new(serialized_context),
                         processed: true,
                     });
+                println!("{:?}", get_secret_request_msg);
                 outbound.push(get_secret_request_msg);
             }
             _inbound_component_msg => {
@@ -151,10 +154,49 @@ impl ComponentInterface for Component {
 
 #[test]
 fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
+    let contract = WrappedContract::new(
+        Arc::new(ContractCode::from(vec![1])),
+        Parameters::from(vec![]),
+    );
+    let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+    let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
+    let create_inbox_request_msg = ApplicationMessage::new(app, payload, false);
+
+    let inbound = InboundComponentMsg::ApplicationMessage(create_inbox_request_msg);
+    let output = Component::process(inbound)?;
+
     let payload: Vec<u8> =
         bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
     let id = ContractInstanceId::try_from(['a'; 32].into_iter().collect::<String>()).unwrap();
     let sign_msg = ApplicationMessage::new(id, payload, false);
-    let _out = Component::process(InboundComponentMsg::ApplicationMessage(sign_msg))?;
+    let output = Component::process(InboundComponentMsg::ApplicationMessage(sign_msg))?;
+
+    let private_key = vec![1, 2, 3];
+    let inbound = match output.first().unwrap() {
+        OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
+            key,
+            context,
+            processed,
+        }) => {
+            InboundComponentMsg::GetSecretResponse(GetSecretResponse {
+                key: key.clone(),
+                value: Some(private_key.clone()),
+                context: context.clone(),
+            })
+        },
+        _ => return Err("Not expected output".into())
+    };
+    let output = Component::process(inbound)?;
+    match output.first().unwrap() {
+        OutboundComponentMsg::GetSecretRequest(GetSecretRequest {
+           key,
+           context,
+           processed,
+        }) => {
+            let ctx: SecretsContext = bincode::deserialize(&context.0.as_slice())?;
+            println!("{:?}", ctx);
+        },
+        _ => return Err("Not expected output".into())
+    };
     Ok(())
 }
