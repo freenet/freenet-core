@@ -21,7 +21,7 @@ response = requests.get(url, headers=headers)
 if response.status_code == 200:
     print(f"Found {len(response.json()['items'])} issues to sync")
 else:
-    print(f"Failed to search for issues: {response.content}", file=sys.stderr)
+    print(f"Failed to search for issues: {response.content}")
     exit(1)
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
@@ -46,7 +46,7 @@ for issue in response.json()["items"]:
     }
     story_response = requests.post(story_url, headers=story_headers, json=story_data)
     if story_response.status_code != 201:
-        print(f"Failed to create story in Pivotal Tracker: {story_response.content}", file=sys.stderr)
+        print(f"Failed to create story in Pivotal Tracker: {story_response.content}")
         continue
 
     story_json = story_response.json()
@@ -70,5 +70,5 @@ for issue in response.json()["items"]:
         }
     comment_response = requests.post(comment_url, headers=comment_headers, json=comment_data)
     if comment_response.status_code != 201:
-        print(f"Failed to add comment to Github issue: {comment_response.content}", file=sys.stderr)
+        print(f"Failed to add comment to Github issue: {comment_response.content}")
         continue
