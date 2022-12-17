@@ -20,7 +20,7 @@ print(f"URL: {url}\nHeaders: {headers}\n")
 
 response = requests.get(url, headers=headers)
 
-print(f"Response: {response.status_code}\t{response.content}\n"
+print(f"Response: {response.status_code}\t{response.content}\n")
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
 for issue in response.json()["items"]:
