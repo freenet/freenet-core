@@ -263,16 +263,12 @@ mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
     use locutus_stdlib::prelude::{env_logger, ContractCode, ContractInstanceId, Parameters};
     use serde::{Deserialize, Serialize};
-    use std::{
-        path::PathBuf,
-        sync::{atomic::AtomicUsize, Arc},
-    };
+    use std::sync::Arc;
 
     use super::*;
     use crate::{component_store::ComponentStore, ContractStore, SecretsStore, WrappedContract};
 
     const TEST_COMPONENT_1: &str = "test_component_1";
-    static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Serialize, Deserialize)]
     struct SecretsContext {
@@ -291,27 +287,12 @@ mod test {
         MessageSigned(Vec<u8>),
     }
 
-    fn test_dir() -> PathBuf {
-        let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
-            "component-api-test-{}",
-            TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        if !test_dir.exists() {
-            std::fs::create_dir_all(&test_dir).unwrap();
-        }
-        test_dir
-    }
-
-    fn get_test_component(name: &str) -> Result<Component, Box<dyn std::error::Error>> {
-        let bytes = crate::tests::get_test_contract(name)?;
-        Ok(Component::from(bytes))
-    }
-
-    fn set_up_runtime(name: &str) -> Result<(Component, Runtime), Box<dyn std::error::Error>> {
+    fn setup_runtime(name: &str) -> Result<(Component, Runtime), Box<dyn std::error::Error>> {
+        const TEST_PREFIX: &str = "component-api";
         let _ = env_logger::try_init();
-        let contracts_dir = test_dir();
-        let components_dir = test_dir();
-        let secrets_dir = test_dir();
+        let contracts_dir = crate::tests::test_dir(TEST_PREFIX);
+        let components_dir = crate::tests::test_dir(TEST_PREFIX);
+        let secrets_dir = crate::tests::test_dir(TEST_PREFIX);
 
         let contract_store = ContractStore::new(contracts_dir, 10_000)?;
         let component_store = ComponentStore::new(components_dir, 10_000)?;
@@ -320,7 +301,10 @@ mod test {
         let mut runtime =
             Runtime::build(contract_store, component_store, secret_store, false).unwrap();
 
-        let component = get_test_component(name).unwrap();
+        let component = {
+            let bytes = crate::tests::get_test_module(name)?;
+            Component::from(bytes)
+        };
         let _ = runtime.component_store.store_component(component.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
@@ -340,7 +324,7 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let (component, mut runtime) = set_up_runtime(TEST_COMPONENT_1)?;
+        let (component, mut runtime) = setup_runtime(TEST_COMPONENT_1)?;
         let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // CreateInboxRequest message parts

@@ -25,15 +25,15 @@ pub(crate) fn test_dir(prefix: &str) -> PathBuf {
     test_dir
 }
 
-pub(crate) fn get_test_contract(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let contract_path = {
+pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let module_path = {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let contracts = PathBuf::from(CONTRACTS_DIR);
         let mut dirs = contracts.ancestors();
         let path = dirs.nth(2).unwrap();
         path.join("tests").join(name.replace('_', "-"))
     };
-    let mut contract_build_path = contract_path
+    let mut contract_build_path = module_path
         .join("build/locutus")
         .join(name)
         .with_extension("wasm");
@@ -51,7 +51,7 @@ pub(crate) fn get_test_contract(name: &str) -> Result<Vec<u8>, Box<dyn std::erro
             .collect::<Vec<_>>();
         let mut child = Command::new("cargo")
             .args(&cmd_args)
-            .current_dir(&contract_path)
+            .current_dir(&module_path)
             .spawn()?;
         child.wait()?;
         let output_file = Path::new(&target)
@@ -71,7 +71,7 @@ pub fn setup_test_contract(
     let _ = env_logger::try_init();
     let mut store = ContractStore::new(crate::tests::test_dir("contract"), 10_000)?;
     let contract_bytes = WrappedContract::new(
-        Arc::new(ContractCode::from(get_test_contract(name)?)),
+        Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),
     );
     let contract = ContractContainer::Wasm(WasmAPIVersion::V1(contract_bytes));
