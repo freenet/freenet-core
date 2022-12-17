@@ -1,0 +1,20 @@
+name: Sync Issues with Pivotal Tracker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Sync Issues
+        env:
+          PT_API_KEY: ${{ secrets.PT_API_KEY }}
+          PT_PROJECT_ID: ${{ secrets.PT_PROJECT_ID }}
+          GH_OWNER: ${{ secrets.GH_OWNER }}
+          GH_REPO: ${{ secrets.GH_REPO }}
+          GH_ACCESS_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: python .github/scripts/pt_sync.py
