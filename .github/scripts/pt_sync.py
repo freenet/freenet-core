@@ -58,6 +58,9 @@ for issue in response.json()["items"]:
 
     # Add a comment to the source Github issue with the Pivotal Tracker story URL
     comment_url = f"https://api.github.com/repos/{GH_REPO}/issues/{issue_id}/comments"
+
+    print("Comment URL: " + comment_url + "\n")
+
     comment_headers = {
         "Authorization": f"Bearer {GH_ACCESS_TOKEN}",
         "Accept": "application/vnd.github+json",
