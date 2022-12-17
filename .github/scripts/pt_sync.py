@@ -4,12 +4,11 @@ import os
 # Get the necessary parameters from environment variables
 PT_API_KEY = os.environ['PT_API_KEY']
 PT_PROJECT_ID = os.environ['PT_PROJECT_ID']
-GH_OWNER = os.environ['GH_OWNER']
-GH_REPO = os.environ['GH_REPO']
+GH_REPO = os.environ['GITHUB_REPOSITORY']
 GH_ACCESS_TOKEN = os.environ['GH_ACCESS_TOKEN']
 
 # Search for issues with the "pt" tag on GitHub
-url = f"https://api.github.com/search/issues?q=repo:{GH_OWNER}/{GH_REPO}+label:planned"
+url = f"https://api.github.com/search/issues?q=repo:{GITHUB_REPOSITORY}+label:planned"
 headers = {
     "Authorization": f"Bearer {GH_ACCESS_TOKEN}",
     "Accept": "application/vnd.github+json",
