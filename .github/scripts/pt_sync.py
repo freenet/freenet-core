@@ -41,7 +41,7 @@ for issue in response.json()["items"]:
     story_data = {
         "name": title,
         "description": f"Original issue: {url}\n\n{body}",
-        "external_id": issue_id
+        "external_id": str(issue_id)
     }
     story_response = requests.post(story_url, headers=story_headers, json=story_data)
 
