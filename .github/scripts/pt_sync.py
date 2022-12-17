@@ -18,7 +18,7 @@ headers = {
 response = requests.get(url, headers=headers)
 
 # Report how many issues were found or the error if the request failed
-if response.status_code == 200:
+if response.status_code >= 200 and response.status_code <= 299:
     print(f"Found {len(response.json()['items'])} issues to sync")
 else:
     print(f"Failed to search for issues: {response.content}")
@@ -45,7 +45,8 @@ for issue in response.json()["items"]:
         "description": f"Original issue: {url}\n\nOriginal description (may be out of date):\n{body}"
     }
     story_response = requests.post(story_url, headers=story_headers, json=story_data)
-    if story_response.status_code != 201:
+    # Verify status code is between 200 and 299 inclusive
+    if story_response.status_code < 200 or story_response.status_code > 299:
         print(f"Failed to create story in Pivotal Tracker: {story_response}")
         exit(1)
 
