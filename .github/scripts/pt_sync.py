@@ -15,11 +15,12 @@ headers = {
     "X-GitHub-Api-Version": "2022-11-28"
 }
 
+print("Get Github Issues")
 print(f"URL: {url}\nHeaders: {headers}\n")
 
 response = requests.get(url, headers=headers)
 
-print(f"Response: {response.status_code}\t{response.content}\n")
+print(f"Retrieved issues from Github API\n")
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
 for issue in response.json()["items"]:
@@ -43,6 +44,9 @@ for issue in response.json()["items"]:
         "external_id": issue_id
     }
     story_response = requests.post(story_url, headers=story_headers, json=story_data)
+
+    print(f"Created story in Pivotal Tracker\n")
+    print(f"Response: {story_response.content}\n")
 
     # Set the ID of the new story as the external ID of the original issue
     story_id = story_response.json()["id"]
