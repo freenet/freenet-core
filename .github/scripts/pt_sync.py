@@ -8,7 +8,7 @@ GH_REPO = os.environ['GITHUB_REPOSITORY']
 GH_ACCESS_TOKEN = os.environ['GH_ACCESS_TOKEN']
 
 # Search for issues with the "pt" tag on GitHub
-url = f"https://api.github.com/search/issues?q=repo:{GITHUB_REPOSITORY}+label:planned"
+url = f"https://api.github.com/search/issues?q=repo:{GH_REPO}+label:planned"
 headers = {
     "Authorization": f"Bearer {GH_ACCESS_TOKEN}",
     "Accept": "application/vnd.github+json",
