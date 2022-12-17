@@ -46,13 +46,10 @@ for issue in response.json()["items"]:
     }
     story_response = requests.post(story_url, headers=story_headers, json=story_data)
     if story_response.status_code != 201:
-        print(f"Failed to create story in Pivotal Tracker: {story_response.content}")
-        continue
+        print(f"Failed to create story in Pivotal Tracker: {story_response}")
+        exit(1)
 
     story_json = story_response.json()
-
-    print(f"Created story in Pivotal Tracker\n")
-    print(f"Response: {story_response.content}\n")
 
     # Extract the Pivotal Tracker story ID and URL from the response
     pt_story_id = story_json["id"]
@@ -70,5 +67,5 @@ for issue in response.json()["items"]:
         }
     comment_response = requests.post(comment_url, headers=comment_headers, json=comment_data)
     if comment_response.status_code != 201:
-        print(f"Failed to add comment to Github issue: {comment_response.content}")
-        continue
+        print(f"Failed to add comment to Github issue: {comment_response}")
+        exit(1)
