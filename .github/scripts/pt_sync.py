@@ -11,7 +11,9 @@ GH_ACCESS_TOKEN = os.environ['GH_ACCESS_TOKEN']
 # Search for issues with the "pt" tag on GitHub
 url = f"https://api.github.com/search/issues?q=repo:{GH_OWNER}/{GH_REPO}+label:planned"
 headers = {
-    "Authorization": f"Bearer {GH_ACCESS_TOKEN}"
+    "Authorization": f"Bearer {GH_ACCESS_TOKEN}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28"
 }
 
 response = requests.get(url, headers=headers)
