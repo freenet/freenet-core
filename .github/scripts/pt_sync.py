@@ -46,7 +46,7 @@ for issue in response.json()["items"]:
 
     # Set the ID of the new story as the external ID of the original issue
     story_id = story_response.json()["id"]
-    issue_url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/issues/{issue['number']}"
+    issue_url = f"https://api.github.com/repos/{GH_REPO}/issues/{issue['number']}"
     issue_headers = {
         "Authorization": f"Bearer {GH_ACCESS_TOKEN}"
     }
