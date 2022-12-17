@@ -16,6 +16,8 @@ headers = {
     "X-GitHub-Api-Version": "2022-11-28"
 }
 
+print(f"URL: {url}\nHeaders: {headers}\n")
+
 response = requests.get(url, headers=headers)
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
