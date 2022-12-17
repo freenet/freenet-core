@@ -40,21 +40,10 @@ for issue in response.json()["items"]:
     }
     story_data = {
         "name": title,
-        "description": f"Original issue: {url}\n\n{body}",
-        "external_id": str(issue_id)
+        "description": f"Original issue: {url}\n\n{body}"
     }
     story_response = requests.post(story_url, headers=story_headers, json=story_data)
 
     print(f"Created story in Pivotal Tracker\n")
     print(f"Response: {story_response.content}\n")
 
-    # Set the ID of the new story as the external ID of the original issue
-    story_id = story_response.json()["id"]
-    issue_url = f"https://api.github.com/repos/{GH_REPO}/issues/{issue['number']}"
-    issue_headers = {
-        "Authorization": f"Bearer {GH_ACCESS_TOKEN}"
-    }
-    issue_data = {
-        "external_id": story_id
-    }
-    requests.patch(issue_url, headers=issue_headers, json=issue_data)
