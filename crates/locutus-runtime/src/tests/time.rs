@@ -2,12 +2,18 @@
 
 use wasmer::TypedFunction;
 
-use crate::{Runtime, SecretsStore};
+use crate::{ComponentStore, Runtime, SecretsStore};
 
 #[test]
 fn now() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = super::setup_test_contract("test_contract_2")?;
-    let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
+    let mut runtime = Runtime::build(
+        store,
+        ComponentStore::default(),
+        SecretsStore::default(),
+        false,
+    )
+    .unwrap();
     runtime.enable_wasi = true;
 
     let module = runtime.prepare_contract_call(&key, &vec![].into(), 1_000)?;

@@ -1,3 +1,5 @@
+extern crate core;
+
 mod component;
 mod component_store;
 mod contract;
@@ -9,6 +11,7 @@ mod secrets_store;
 mod state_store;
 #[cfg(test)]
 pub(crate) mod tests;
+mod store;
 pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -18,6 +21,7 @@ pub use prelude::*;
 
 pub mod prelude {
     pub use super::component::{ComponentExecError, ComponentRuntimeInterface};
+    pub use super::component_store::ComponentStore;
     pub use super::contract::ContractRuntimeInterface;
     pub use super::contract_store::ContractStore;
     pub use super::error::ContractError;

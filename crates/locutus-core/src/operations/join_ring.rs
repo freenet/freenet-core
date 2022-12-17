@@ -766,25 +766,14 @@ where
             "Selecting close peer to forward request (requester: {})",
             req_peer.peer
         );
-        match ring
+        ring
             .routing(
                 &new_peer_loc.location.unwrap(),
                 Some(&req_peer.peer),
                 1,
                 &[],
             )
-            .pop()
-        {
-            Some(pkl) => {
-                if pkl.peer == new_peer_loc.peer {
-                    // concurrently this peer was connected already
-                    None
-                } else {
-                    Some(pkl)
-                }
-            }
-            None => None,
-        }
+            .pop().filter(|&pkl| pkl.peer != new_peer_loc.peer)
     };
 
     if let Some(forward_to) = forward_to {

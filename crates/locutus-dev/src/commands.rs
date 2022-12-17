@@ -26,7 +26,7 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
     };
     let params = if let Some(params) = config.parameters {
         let mut buf = vec![];
-        File::open(&params)?.read_to_end(&mut buf)?;
+        File::open(params)?.read_to_end(&mut buf)?;
         Parameters::from(buf)
     } else {
         Parameters::from(&[] as &[u8])

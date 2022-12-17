@@ -61,6 +61,16 @@ impl TryFrom<&Path> for Component<'static> {
     }
 }
 
+impl From<Vec<u8>> for Component<'static> {
+    fn from(data: Vec<u8>) -> Self {
+        let key = ComponentKey::new(data.as_slice());
+        Component {
+            code: Cow::from(data),
+            key,
+        }
+    }
+}
+
 /// Type of errors during interaction with a component.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum ComponentError {
@@ -94,6 +104,11 @@ impl SecretsId {
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
     }
+
+    /// Returns the hash of the contract key only.
+    pub fn code_hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
 }
 
 pub trait ComponentInterface {
@@ -121,6 +136,11 @@ impl ComponentKey {
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
     }
+
+    /// Returns the hash of the contract key only.
+    pub fn code_hash(&self) -> &[u8; COMPONENT_HASH_LENGTH] {
+        &self.0
+    }
 }
 
 impl Display for ComponentKey {
@@ -129,8 +149,8 @@ impl Display for ComponentKey {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ComponentContext(Vec<u8>);
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ComponentContext(pub Vec<u8>);
 
 impl ComponentContext {
     pub const MAX_SIZE: usize = 4096 * 10 * 10;
@@ -182,6 +202,30 @@ impl InboundComponentMsg<'_> {
             }
         }
     }
+
+    pub fn get_context(&self) -> Option<&ComponentContext> {
+        match self {
+            InboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+                Some(context)
+            }
+            InboundComponentMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
+                Some(context)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn get_mut_context(&mut self) -> Option<&mut ComponentContext> {
+        match self {
+            InboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+                Some(context)
+            }
+            InboundComponentMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
+                Some(context)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -197,17 +241,23 @@ pub struct GetSecretResponse {
 pub struct ApplicationMessage {
     pub app: ContractInstanceId,
     pub payload: Vec<u8>,
-    #[serde(skip)]
     pub context: ComponentContext,
+    pub processed: bool,
 }
 
 impl ApplicationMessage {
-    pub fn new(app: ContractInstanceId, payload: Vec<u8>, context: ComponentContext) -> Self {
+    pub fn new(app: ContractInstanceId, payload: Vec<u8>, processed: bool) -> Self {
         Self {
             app,
             payload,
-            context,
+            context: ComponentContext::default(),
+            processed,
         }
+    }
+
+    pub fn with_context(mut self, context: ComponentContext) -> Self {
+        self.context = context;
+        self
     }
 }
 
@@ -242,6 +292,54 @@ pub enum OutboundComponentMsg {
     // },
 }
 
+impl From<GetSecretRequest> for OutboundComponentMsg {
+    fn from(req: GetSecretRequest) -> Self {
+        Self::GetSecretRequest(req)
+    }
+}
+
+impl From<ApplicationMessage> for OutboundComponentMsg {
+    fn from(req: ApplicationMessage) -> Self {
+        Self::ApplicationMessage(req)
+    }
+}
+
+impl OutboundComponentMsg {
+    pub fn processed(&self) -> bool {
+        match self {
+            OutboundComponentMsg::ApplicationMessage(msg) => msg.processed,
+            OutboundComponentMsg::GetSecretRequest(msg) => msg.processed,
+            OutboundComponentMsg::RandomBytesRequest(_) => false,
+            OutboundComponentMsg::SetSecretRequest(_) => false,
+            OutboundComponentMsg::RequestUserInput(_) => true,
+        }
+    }
+
+    pub fn get_context(&self) -> Option<&ComponentContext> {
+        match self {
+            OutboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+                Some(context)
+            }
+            OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
+                Some(context)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn get_mut_context(&mut self) -> Option<&mut ComponentContext> {
+        match self {
+            OutboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+                Some(context)
+            }
+            OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
+                Some(context)
+            }
+            _ => None,
+        }
+    }
+}
+
 fn deser_func<'de, D>(deser: D) -> Result<UserInputRequest<'static>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -250,12 +348,11 @@ where
     Ok(value.into_owned())
 }
 
-#[non_exhaustive]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetSecretRequest {
     pub key: SecretsId,
-    #[serde(skip)]
     pub context: ComponentContext,
+    pub processed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -276,7 +276,7 @@ fn build_generic_state(config: &mut BuildToolConfig, cwd: &Path) -> Result<(), D
         .then(|| sources.pop().unwrap())
         .ok_or_else(|| Error::MissConfiguration(REQ_ONE_FILE_ERR.into()))?
         .into();
-    std::fs::copy(cwd.join(state), &output_path)?;
+    std::fs::copy(cwd.join(state), output_path)?;
     println!("Finished bundling state");
     Ok(())
 }

@@ -360,7 +360,7 @@ fn group_locations_in_buckets(
     }
     distances
         .into_iter()
-        .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)) as f64, v))
+        .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)), v))
 }
 
 pub(crate) async fn check_connectivity(

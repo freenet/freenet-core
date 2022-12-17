@@ -44,7 +44,7 @@ impl HttpGateway {
     /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
     pub fn as_filter() -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
         let contract_web_path = std::env::temp_dir().join("locutus").join("webs");
-        std::fs::create_dir_all(&contract_web_path).unwrap();
+        std::fs::create_dir_all(contract_web_path).unwrap();
 
         let (request_sender, server_request) = mpsc::channel(PARALLELISM);
         let gateway = Self {

@@ -25,7 +25,7 @@ pub(crate) fn test_dir(prefix: &str) -> PathBuf {
     test_dir
 }
 
-fn get_test_contract(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub(crate) fn get_test_contract(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let contract_path = {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let contracts = PathBuf::from(CONTRACTS_DIR);
@@ -39,7 +39,6 @@ fn get_test_contract(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
         .with_extension("wasm");
     if !contract_build_path.exists() {
         const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
-        std::env::set_var(TARGET_DIR_VAR, "/home/nachod/.cargo/target/");
         let target = std::env::var(TARGET_DIR_VAR)?;
         println!("trying to compile the test contract, target: {target}");
         // attempt to compile it
