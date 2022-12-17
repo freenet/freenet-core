@@ -16,5 +16,5 @@ jobs:
           PT_PROJECT_ID: ${{ secrets.PT_PROJECT_ID }}
           GH_OWNER: ${{ secrets.GH_OWNER }}
           GH_REPO: ${{ secrets.GH_REPO }}
-          GH_ACCESS_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+          GH_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python .github/scripts/pt_sync.py
