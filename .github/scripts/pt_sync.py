@@ -38,12 +38,13 @@ for issue in response.json()["items"]:
         if continue_outer:
             continue
 
-
     title = issue["title"]
     body = issue["body"]
     url = issue["html_url"]
     issue_id = issue["id"]
     issue_number = issue["number"]
+
+    print(f"Syncing issue {issue_number} to Pivotal Tracker: {title}")
 
     # Create a new story in the Pivotal Tracker project
     story_url = f"https://www.pivotaltracker.com/services/v5/projects/{PT_PROJECT_ID}/stories"
