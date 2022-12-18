@@ -25,18 +25,18 @@ else:
     exit(1)
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
-break_outer = False
 for issue in response.json()["items"]:
-    if break_outer:
-        break
     # Check if there is already a comment containing a Pivotal Tracker story URL
     comments_url = issue["comments_url"]
     comments_response = requests.get(comments_url, headers=headers)
     if comments_response.status_code >= 200 and comments_response.status_code <= 299:
+        continue_outer = False
         for comment in comments_response.json():
             if "Pivotal Tracker story" in comment["body"]:
-                break_outer = True
+                continue_outer = True
                 break
+        if continue_outer:
+            continue
 
 
     title = issue["title"]
