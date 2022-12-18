@@ -34,6 +34,7 @@ for issue in response.json()["items"]:
     body = issue["body"]
     url = issue["html_url"]
     issue_id = issue["id"]
+    issue_number = issue["number"]
 
     # Create a new story in the Pivotal Tracker project
     story_url = f"https://www.pivotaltracker.com/services/v5/projects/{PT_PROJECT_ID}/stories"
@@ -57,7 +58,7 @@ for issue in response.json()["items"]:
     pt_story_url = story_json["url"]
 
     # Add a comment to the source Github issue with the Pivotal Tracker story URL
-    comment_url = f"https://api.github.com/repos/{GH_REPO}/issues/{issue_id}/comments"
+    comment_url = f"https://api.github.com/repos/{GH_REPO}/issues/{issue_number}/comments"
 
     print("Comment URL: " + comment_url + "\n")
 
