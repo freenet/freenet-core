@@ -26,9 +26,14 @@ else:
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
 for issue in response.json()["items"]:
-    # Check if the issue has already been synced to Pivotal Tracker
-    if "external_id" in issue:
-        continue
+    # Check if there is already a comment containing a Pivotal Tracker story URL
+    comments_url = issue["comments_url"]
+    comments_response = requests.get(comments_url, headers=headers)
+    if comments_response.status_code >= 200 and comments_response.status_code <= 299:
+        for comment in comments_response.json():
+            if "Pivotal Tracker story" in comment["body"]:
+                print(f"Skipping issue {issue['number']} because it already has a Pivotal Tracker story")
+                continue
 
     title = issue["title"]
     body = issue["body"]
