@@ -429,10 +429,10 @@ mod messages {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let id = self.id();
             match self {
-                Self::SeekNode { .. } => write!(f, "SeekNode(id: {})", id),
-                Self::FetchRouting { .. } => write!(f, "FetchRouting(id: {})", id),
-                Self::RequestSub { .. } => write!(f, "RequestSub(id: {})", id),
-                Self::ReturnSub { .. } => write!(f, "ReturnSub(id: {})", id),
+                Self::SeekNode { .. } => write!(f, "SeekNode(id: {id})"),
+                Self::FetchRouting { .. } => write!(f, "FetchRouting(id: {id})"),
+                Self::RequestSub { .. } => write!(f, "RequestSub(id: {id})"),
+                Self::ReturnSub { .. } => write!(f, "ReturnSub(id: {id})"),
             }
         }
     }

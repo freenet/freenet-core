@@ -78,6 +78,7 @@ impl WebSocketApiConfig {
 
 #[derive(Debug)]
 pub struct ConfigPaths {
+    // TODO: Add secrets and components dir
     pub(crate) contracts_dir: PathBuf,
     pub(crate) db_dir: PathBuf,
     app_data_dir: PathBuf,
@@ -92,6 +93,7 @@ impl ConfigPaths {
         } else {
             project_dir.data_dir().into()
         };
+        // FIXME: Add dirs for components and secrets
         let contracts_dir = app_data_dir.join("contracts");
         let db_dir = app_data_dir.join("db");
 
@@ -261,7 +263,7 @@ pub(super) mod tracer {
             .target(env_logger::Target::Stdout)
             .filter(None, CONFIG.log_level);
         if let Err(err) = builder.try_init() {
-            eprintln!("Failed to initialize logger with error: {}", err);
+            eprintln!("Failed to initialize logger with error: {err}");
         };
 
         if CONFIG.log_level == log::LevelFilter::Debug {

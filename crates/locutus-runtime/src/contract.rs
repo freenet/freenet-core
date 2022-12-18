@@ -67,10 +67,10 @@ pub trait ContractRuntimeInterface {
 }
 
 impl ContractRuntimeInterface for crate::Runtime {
-    fn validate_state<'a>(
+    fn validate_state(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
         related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult> {
@@ -302,6 +302,7 @@ mod test {
     use locutus_stdlib::prelude::{env_logger, WrappedContract};
 
     use super::*;
+    use crate::component_store::ComponentStore;
     use crate::{
         secrets_store::SecretsStore, ContractContainer, ContractStore, Runtime, WasmAPIVersion,
     };
@@ -312,7 +313,7 @@ mod test {
 
     fn test_dir() -> PathBuf {
         let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
-            "api-test-{}",
+            "contract-api-test-{}",
             TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         if !test_dir.exists() {
@@ -348,7 +349,13 @@ mod test {
     #[test]
     fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
-        let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
+        let mut runtime = Runtime::build(
+            store,
+            ComponentStore::default(),
+            SecretsStore::default(),
+            false,
+        )
+        .unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
         let is_valid = runtime.validate_state(
@@ -373,7 +380,13 @@ mod test {
     #[test]
     fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
-        let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
+        let mut runtime = Runtime::build(
+            store,
+            ComponentStore::default(),
+            SecretsStore::default(),
+            false,
+        )
+        .unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
         let is_valid = runtime.validate_delta(
@@ -396,7 +409,13 @@ mod test {
     #[test]
     fn update_state() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
-        let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
+        let mut runtime = Runtime::build(
+            store,
+            ComponentStore::default(),
+            SecretsStore::default(),
+            false,
+        )
+        .unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
         let new_state = runtime
@@ -415,7 +434,13 @@ mod test {
     #[test]
     fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
-        let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
+        let mut runtime = Runtime::build(
+            store,
+            ComponentStore::default(),
+            SecretsStore::default(),
+            false,
+        )
+        .unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
         let summary = runtime.summarize_state(
@@ -430,7 +455,13 @@ mod test {
     #[test]
     fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
         let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
-        let mut runtime = Runtime::build(store, SecretsStore::default(), false).unwrap();
+        let mut runtime = Runtime::build(
+            store,
+            ComponentStore::default(),
+            SecretsStore::default(),
+            false,
+        )
+        .unwrap();
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
         let delta = runtime.get_state_delta(

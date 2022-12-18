@@ -766,25 +766,14 @@ where
             "Selecting close peer to forward request (requester: {})",
             req_peer.peer
         );
-        match ring
-            .routing(
-                &new_peer_loc.location.unwrap(),
-                Some(&req_peer.peer),
-                1,
-                &[],
-            )
-            .pop()
-        {
-            Some(pkl) => {
-                if pkl.peer == new_peer_loc.peer {
-                    // concurrently this peer was connected already
-                    None
-                } else {
-                    Some(pkl)
-                }
-            }
-            None => None,
-        }
+        ring.routing(
+            &new_peer_loc.location.unwrap(),
+            Some(&req_peer.peer),
+            1,
+            &[],
+        )
+        .pop()
+        .filter(|&pkl| pkl.peer != new_peer_loc.peer)
     };
 
     if let Some(forward_to) = forward_to {
@@ -907,28 +896,28 @@ mod messages {
                 Self::Request {
                     msg: JoinRequest::StartReq { .. },
                     ..
-                } => write!(f, "StartRequest(id: {})", id),
+                } => write!(f, "StartRequest(id: {id})"),
                 Self::Request {
                     msg: JoinRequest::Accepted { .. },
                     ..
-                } => write!(f, "RequestAccepted(id: {})", id),
+                } => write!(f, "RequestAccepted(id: {id})"),
                 Self::Request {
                     msg: JoinRequest::Proxy { .. },
                     ..
-                } => write!(f, "ProxyRequest(id: {})", id),
+                } => write!(f, "ProxyRequest(id: {id})"),
                 Self::Response {
                     msg: JoinResponse::AcceptedBy { .. },
                     ..
-                } => write!(f, "RouteValue(id: {})", id),
+                } => write!(f, "RouteValue(id: {id})"),
                 Self::Response {
                     msg: JoinResponse::ReceivedOC { .. },
                     ..
-                } => write!(f, "RouteValue(id: {})", id),
+                } => write!(f, "RouteValue(id: {id})"),
                 Self::Response {
                     msg: JoinResponse::Proxy { .. },
                     ..
-                } => write!(f, "RouteValue(id: {})", id),
-                Self::Connected { .. } => write!(f, "Connected(id: {})", id),
+                } => write!(f, "RouteValue(id: {id})"),
+                Self::Connected { .. } => write!(f, "Connected(id: {id})"),
                 _ => todo!(),
             }
         }

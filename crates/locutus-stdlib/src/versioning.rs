@@ -62,7 +62,7 @@ impl Display for ContractContainer {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             ContractContainer::Wasm(wasm_version) => {
-                write!(f, "Wasm container {}", wasm_version)
+                write!(f, "Wasm container {wasm_version}")
             }
         }
     }
@@ -152,7 +152,7 @@ impl Display for WasmAPIVersion {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             WasmAPIVersion::V1(contract_v1) => {
-                write!(f, "version 0.0.1 of contract {}", contract_v1)
+                write!(f, "version 0.0.1 of contract {contract_v1}")
             }
         }
     }

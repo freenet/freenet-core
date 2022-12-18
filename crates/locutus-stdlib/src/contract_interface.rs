@@ -531,7 +531,7 @@ impl std::fmt::Display for Contract<'_> {
         } else {
             self.data.data.iter().copied().map(char::from).collect()
         };
-        write!(f, ", data: [{}])", data)
+        write!(f, ", data: [{data}])")
     }
 }
 
@@ -941,7 +941,7 @@ impl std::fmt::Display for ContractCode<'_> {
         } else {
             self.data.iter().copied().map(char::from).collect()
         };
-        write!(f, ", data: [{}])", data)
+        write!(f, ", data: [{data}])")
     }
 }
 
@@ -1267,7 +1267,7 @@ impl std::fmt::Display for WrappedState {
         } else {
             self.0.iter().copied().map(char::from).collect()
         };
-        write!(f, "ContractState(data: [{}])", data)
+        write!(f, "ContractState(data: [{data}])")
     }
 }
 

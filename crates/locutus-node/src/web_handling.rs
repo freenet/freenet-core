@@ -81,7 +81,7 @@ pub(crate) async fn contract_home(
                                 ) -> InvalidParam {
                                     let key = contract.key();
                                     log::error!("{err}");
-                                    InvalidParam(format!("failed unpacking contract: {}", key))
+                                    InvalidParam(format!("failed unpacking contract: {key}"))
                                 }
 
                                 let mut web = WebApp::try_from(state.as_ref())
