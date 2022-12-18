@@ -34,6 +34,8 @@ for issue in response.json()["items"]:
             if "Pivotal Tracker story" in comment["body"]:
                 print(f"Skipping issue {issue['number']} because it already has a Pivotal Tracker story")
                 continue
+            else:
+                print(f"Found issue {issue['number']} without a Pivotal Tracker story, body: {comment['body']}")
     else:
         print(f"Failed to search for comments: {comments_response.content}")
         exit(1)
