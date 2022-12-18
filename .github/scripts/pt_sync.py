@@ -19,10 +19,12 @@ response = requests.get(url, headers=headers)
 
 # Report how many issues were found or the error if the request failed
 if response.status_code >= 200 and response.status_code <= 299:
-    print(f"Found {len(response.json()['items'])} issues to sync")
+    print(f"Found {len(response.json()['items'])} issues with planned label on Github. Synchronizing to Pivotal Tracker")
 else:
     print(f"Failed to search for issues: {response.content}")
     exit(1)
+
+synchronized_count = 0
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
 for issue in response.json()["items"]:
@@ -84,3 +86,7 @@ for issue in response.json()["items"]:
     if comment_response.status_code != 201:
         print(f"Failed to add comment to Github issue: {comment_response}")
         exit(1)
+    
+    synchronized_count += 1
+
+print(f"Synchronized {synchronized_count} issues to Pivotal Tracker")
