@@ -2316,7 +2316,7 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rmpv",
- "semver 1.0.15",
+ "semver 1.0.16",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -2347,7 +2347,7 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rmpv",
- "semver 1.0.15",
+ "semver 1.0.16",
  "serde",
  "serde-wasm-bindgen",
  "serde_bytes",
@@ -3719,9 +3719,9 @@ dependencies = [
 
 [[package]]
 name = "semver"
-version = "1.0.15"
+version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bfa246f936730408c0abee392cc1a50b118ece708c7f630516defd64480c7d8"
+checksum = "58bc9567378fc7690d6b2addae4e60ac2eeea07becb2c64b9f218b53865cba2a"
 dependencies = [
  "serde",
 ]
