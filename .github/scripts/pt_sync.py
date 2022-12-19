@@ -28,6 +28,8 @@ synchronized_count = 0
 
 # Iterate over the issues and synchronize them to Pivotal Tracker
 for issue in response.json()["items"]:
+    # Try to avoid hitting any API call rate limits
+    time.sleep(1)
     # Check if there is already a comment containing a Pivotal Tracker story URL
     comments_url = issue["comments_url"]
     comments_response = requests.get(comments_url, headers=headers)
@@ -82,6 +84,8 @@ for issue in response.json()["items"]:
     comment_data = {
         "body": f"Pivotal Tracker story: {pt_story_url}"
         }
+    # Try to avoid hitting any API rate limits
+    time.sleep(1)
     comment_response = requests.post(comment_url, headers=comment_headers, json=comment_data)
     if comment_response.status_code != 201:
         print(f"Failed to add comment to Github issue: {comment_response}")
