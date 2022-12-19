@@ -27,7 +27,7 @@ pub struct BaseConfig {
     pub(crate) contract_data_dir: Option<PathBuf>,
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]
-    mode: OperationMode,
+    pub(crate) mode: OperationMode,
 }
 
 #[derive(clap::Subcommand, Clone)]
