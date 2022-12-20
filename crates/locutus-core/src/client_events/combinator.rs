@@ -61,7 +61,7 @@ impl<const N: usize> ClientEventsCombinator<N> {
 }
 
 impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
-    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<OpenRequest<'static>, ClientError>> {
+    fn recv<'a>(&'_ mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
             let pend_futs = &mut self.pend_futs;

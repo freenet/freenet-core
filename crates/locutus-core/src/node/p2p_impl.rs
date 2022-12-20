@@ -143,7 +143,7 @@ mod test {
     use super::*;
     use crate::{
         client_events::test::MemoryEventsGen,
-        config::{tracer::Logger, GlobalExecutor},
+        config::GlobalExecutor,
         contract::{TestContractHandler, TestContractStoreError},
         node::{test::get_free_port, InitPeerNode},
         ring::Location,
@@ -182,7 +182,6 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping() -> Result<(), ()> {
-        Logger::init_logger();
         let peer1_port = get_free_port().unwrap();
         let peer1_key = Keypair::generate_ed25519();
         let peer1_id: PeerId = peer1_key.public().into();

@@ -90,7 +90,6 @@ impl Runtime {
                     if retries >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::ComponentExecError(ComponentError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
-                    // OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. })
                     let new_msgs = self.exec_inbound(&inbound, process_func, instance)?;
                     retries += 1;
                     let Some(last_msg) = new_msgs.last() else {

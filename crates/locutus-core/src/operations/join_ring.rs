@@ -896,28 +896,28 @@ mod messages {
                 Self::Request {
                     msg: JoinRequest::StartReq { .. },
                     ..
-                } => write!(f, "StartRequest(id: {})", id),
+                } => write!(f, "StartRequest(id: {id})"),
                 Self::Request {
                     msg: JoinRequest::Accepted { .. },
                     ..
-                } => write!(f, "RequestAccepted(id: {})", id),
+                } => write!(f, "RequestAccepted(id: {id})"),
                 Self::Request {
                     msg: JoinRequest::Proxy { .. },
                     ..
-                } => write!(f, "ProxyRequest(id: {})", id),
+                } => write!(f, "ProxyRequest(id: {id})"),
                 Self::Response {
                     msg: JoinResponse::AcceptedBy { .. },
                     ..
-                } => write!(f, "RouteValue(id: {})", id),
+                } => write!(f, "RouteValue(id: {id})"),
                 Self::Response {
                     msg: JoinResponse::ReceivedOC { .. },
                     ..
-                } => write!(f, "RouteValue(id: {})", id),
+                } => write!(f, "RouteValue(id: {id})"),
                 Self::Response {
                     msg: JoinResponse::Proxy { .. },
                     ..
-                } => write!(f, "RouteValue(id: {})", id),
-                Self::Connected { .. } => write!(f, "Connected(id: {})", id),
+                } => write!(f, "RouteValue(id: {id})"),
+                Self::Connected { .. } => write!(f, "Connected(id: {id})"),
                 _ => todo!(),
             }
         }

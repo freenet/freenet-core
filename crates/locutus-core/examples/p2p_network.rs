@@ -97,7 +97,6 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<(), anyhow::Error> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = Args::parse_args()?;
 
     let gw_port = 64510;

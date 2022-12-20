@@ -67,10 +67,10 @@ pub trait ContractRuntimeInterface {
 }
 
 impl ContractRuntimeInterface for crate::Runtime {
-    fn validate_state<'a>(
+    fn validate_state(
         &mut self,
         key: &ContractKey,
-        parameters: &Parameters<'a>,
+        parameters: &Parameters<'_>,
         state: &WrappedState,
         related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult> {
