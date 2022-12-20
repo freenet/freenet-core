@@ -299,7 +299,7 @@ impl ContractRuntimeInterface for crate::Runtime {
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::prelude::{env_logger, WrappedContract};
+    use locutus_stdlib::prelude::WrappedContract;
 
     use super::*;
     use crate::component_store::ComponentStore;
@@ -338,7 +338,6 @@ mod test {
     }
 
     fn set_up_test_contract(name: &str) -> RuntimeResult<(ContractStore, ContractKey)> {
-        let _ = env_logger::try_init();
         let mut store = ContractStore::new(test_dir(), 10_000)?;
         let contract = ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name)));
         let key = contract.key();

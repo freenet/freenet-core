@@ -25,7 +25,7 @@ use self::{
 };
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
-    config::{tracer::Logger, GlobalExecutor, CONFIG},
+    config::{GlobalExecutor, CONFIG},
     contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
@@ -57,7 +57,7 @@ where
     CErr: std::error::Error + Send + Sync + 'static,
 {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-        Logger::init_logger();
+        //TODO: Initialize tracer
         self.0.run_node().await?;
         Ok(())
     }

@@ -262,7 +262,7 @@ mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
     use locutus_stdlib::{
         contract_interface::ContractCode,
-        prelude::{env_logger, ContractInstanceId, Parameters},
+        prelude::{ContractInstanceId, Parameters},
     };
     use serde::{Deserialize, Serialize};
     use std::{
@@ -344,7 +344,6 @@ mod test {
     }
 
     fn set_up_runtime(name: &str) -> Result<(Component, Runtime), Box<dyn std::error::Error>> {
-        let _ = env_logger::try_init();
         let contracts_dir = test_dir();
         let components_dir = test_dir();
         let secrets_dir = test_dir();
