@@ -21,7 +21,6 @@ async-trait = "0.1"
 bytes = "1"
 byteorder = "1"
 clap = { version = "4", features = ["derive", "env"] }
-env_logger = "0.9.0"
 futures = "0.3.21"
 log = "0.4"
 serde = "1"

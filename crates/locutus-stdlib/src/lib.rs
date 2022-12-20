@@ -30,7 +30,6 @@ pub mod prelude {
 
     pub use bincode;
     pub use blake2;
-    pub use env_logger;
     pub use tracing;
     pub use tracing_subscriber;
 }

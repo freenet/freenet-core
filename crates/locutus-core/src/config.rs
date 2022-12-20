@@ -244,35 +244,6 @@ impl libp2p::core::Executor for GlobalExecutor {
 pub(super) mod tracer {
     use super::*;
 
-    #[derive(Clone, Copy)]
-    pub struct Logger;
-
-    impl Logger {
-        /// Get or initialize a logger
-        pub fn init_logger() {
-            Lazy::force(&LOGGER);
-        }
-    }
-
-    static LOGGER: Lazy<Logger> = Lazy::new(|| {
-        let mut builder = env_logger::builder();
-        builder
-            .format_indent(Some(4))
-            .format_module_path(false)
-            .format_timestamp_nanos()
-            .target(env_logger::Target::Stdout)
-            .filter(None, CONFIG.log_level);
-        if let Err(err) = builder.try_init() {
-            eprintln!("Failed to initialize logger with error: {err}");
-        };
-
-        if CONFIG.log_level == log::LevelFilter::Debug {
-            log::debug!("Configuration settings: {:?}", CONFIG.config_paths);
-        }
-
-        Logger
-    });
-
     #[cfg(feature = "trace")]
     pub fn init_tracer() -> Result<(), opentelemetry::trace::TraceError> {
         use opentelemetry::{global, sdk::propagation::TraceContextPropagator};

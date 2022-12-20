@@ -12,10 +12,7 @@ use parking_lot::Mutex;
 use rand::{prelude::StdRng, thread_rng, Rng, SeedableRng};
 
 use super::{ConnectionBridge, ConnectionError, PeerKey};
-use crate::{
-    config::{tracer::Logger, GlobalExecutor},
-    message::Message,
-};
+use crate::{config::GlobalExecutor, message::Message};
 
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
     OnceCell::new();
@@ -28,7 +25,6 @@ pub(in crate::node) struct MemoryConnManager {
 
 impl MemoryConnManager {
     pub fn new(peer: PeerKey) -> Self {
-        Logger::init_logger();
         let transport = InMemoryTransport::new(peer);
         let msg_queue = Arc::new(Mutex::new(Vec::new()));
 
