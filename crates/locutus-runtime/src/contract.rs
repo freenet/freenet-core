@@ -306,7 +306,11 @@ mod test {
     use crate::{
         secrets_store::SecretsStore, ContractContainer, ContractStore, Runtime, WasmAPIVersion,
     };
-    use std::{path::PathBuf, sync::atomic::AtomicUsize};
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+        sync::atomic::AtomicUsize,
+    };
 
     const TEST_CONTRACT_1: &str = "test_contract_1";
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
@@ -322,24 +326,53 @@ mod test {
         test_dir
     }
 
-    fn get_test_contract(name: &str) -> WrappedContract {
+    fn get_test_contract(name: &str) -> Result<WrappedContract, Box<dyn std::error::Error>> {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let contracts = PathBuf::from(CONTRACTS_DIR);
         let mut dirs = contracts.ancestors();
         let path = dirs.nth(2).unwrap();
-        let contract_path = path
-            .join("tests")
-            .join(name.replace('_', "-"))
+        let contract_dir = path.join("tests").join(name.replace('_', "-"));
+        let mut contract_build = contract_dir
             .join("build/locutus")
             .join(name)
             .with_extension("wasm");
-        WrappedContract::try_from((&*contract_path, Parameters::from(vec![])))
-            .expect("contract found")
+
+        if !contract_build.exists() {
+            let target =
+                std::env::var("CARGO_TARGET_DIR").map_err(|_| "CARGO_TARGET_DIR should be set")?;
+            println!("trying to compile the test contract, target: {target}");
+            // attempt to compile it
+            const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
+            const WASI_TARGET: &str = "wasm32-wasi";
+            let cmd_args = RUST_TARGET_ARGS
+                .iter()
+                .copied()
+                .chain([WASI_TARGET])
+                .collect::<Vec<_>>();
+            let mut child = Command::new("cargo")
+                .args(&cmd_args)
+                .current_dir(&contract_dir)
+                .spawn()?;
+            child.wait()?;
+            let output_file = Path::new(&target)
+                .join("wasm32-wasi")
+                .join("debug")
+                .join(name)
+                .with_extension("wasm");
+            println!("output file: {output_file:?}");
+            contract_build = output_file;
+        }
+
+        Ok(
+            WrappedContract::try_from((contract_build.as_path(), Parameters::from(vec![])))
+                .expect("contract found"),
+        )
     }
 
     fn set_up_test_contract(name: &str) -> RuntimeResult<(ContractStore, ContractKey)> {
         let mut store = ContractStore::new(test_dir(), 10_000)?;
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name)));
+        let contract =
+            ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name).unwrap()));
         let key = contract.key();
         store.store_contract(contract)?;
         Ok((store, key))
