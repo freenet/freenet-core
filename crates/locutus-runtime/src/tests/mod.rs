@@ -5,7 +5,7 @@ use std::{
 };
 
 use locutus_stdlib::prelude::{
-    env_logger, ContractCode, ContractContainer, ContractKey, WasmAPIVersion, WrappedContract,
+    ContractCode, ContractContainer, ContractKey, WasmAPIVersion, WrappedContract,
 };
 
 use crate::ContractStore;
@@ -39,6 +39,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .with_extension("wasm");
     if !contract_build_path.exists() {
         const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
+        std::env::set_var(TARGET_DIR_VAR, "/home/nachod/.cargo");
         let target = std::env::var(TARGET_DIR_VAR)?;
         println!("trying to compile the test contract, target: {target}");
         // attempt to compile it
@@ -68,7 +69,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
 pub fn setup_test_contract(
     name: &str,
 ) -> Result<(ContractStore, ContractKey), Box<dyn std::error::Error>> {
-    let _ = env_logger::try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let mut store = ContractStore::new(crate::tests::test_dir("contract"), 10_000)?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),

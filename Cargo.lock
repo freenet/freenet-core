@@ -2307,6 +2307,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "varuint",
  "walkdir",
  "wasmer",

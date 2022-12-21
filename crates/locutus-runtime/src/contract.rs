@@ -75,29 +75,31 @@ impl ContractRuntimeInterface for crate::Runtime {
         related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state)?;
             state_buf.ptr()
         };
         let related_buf_ptr = {
             let serialized = bincode::serialize(&related)?;
-            let mut related_buf = self.init_buf(&instance, &serialized)?;
+            let mut related_buf = self.init_buf(&running.instance, &serialized)?;
             related_buf.write(serialized)?;
             related_buf.ptr()
         };
 
-        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
-            .exports
-            .get_typed_function(&self.wasm_store, "validate_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> =
+            running
+                .instance
+                .exports
+                .get_typed_function(&self.wasm_store, "validate_state")?;
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
@@ -122,21 +124,22 @@ impl ContractRuntimeInterface for crate::Runtime {
     ) -> RuntimeResult<bool> {
         // todo: if we keep this hot in memory on next calls overwrite the buffer with new delta
         let req_bytes = parameters.size() + delta.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let delta_buf_ptr = {
-            let mut delta_buf = self.init_buf(&instance, delta)?;
+            let mut delta_buf = self.init_buf(&running.instance, delta)?;
             delta_buf.write(delta)?;
             delta_buf.ptr()
         };
 
-        let validate_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+        let validate_func: TypedFunction<(i64, i64), FfiReturnTy> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "validate_delta")?;
         let is_valid = unsafe {
@@ -166,29 +169,31 @@ impl ContractRuntimeInterface for crate::Runtime {
         //       - the delta may not be necessarily the same size
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
         let update_data_buf_ptr = {
             let serialized = bincode::serialize(update_data)?;
-            let mut update_data_buf = self.init_buf(&instance, &serialized)?;
+            let mut update_data_buf = self.init_buf(&running.instance, &serialized)?;
             update_data_buf.write(serialized)?;
             update_data_buf.ptr()
         };
 
-        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
-            .exports
-            .get_typed_function(&self.wasm_store, "update_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> =
+            running
+                .instance
+                .exports
+                .get_typed_function(&self.wasm_store, "update_state")?;
         let update_res = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
@@ -212,21 +217,22 @@ impl ContractRuntimeInterface for crate::Runtime {
         state: &WrappedState,
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
 
-        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "summarize_state")?;
 
@@ -254,26 +260,27 @@ impl ContractRuntimeInterface for crate::Runtime {
         summary: &StateSummary<'a>,
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
         let summary_buf_ptr = {
-            let mut summary_buf = self.init_buf(&instance, summary)?;
+            let mut summary_buf = self.init_buf(&running.instance, summary)?;
             summary_buf.write(summary)?;
             summary_buf.ptr()
         };
 
-        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "get_state_delta")?;
 

@@ -18,6 +18,7 @@ fn now() -> Result<(), Box<dyn std::error::Error>> {
 
     let module = runtime.prepare_contract_call(&key, &vec![].into(), 1_000)?;
     let f: TypedFunction<(), ()> = module
+        .instance
         .exports
         .get_function("time_func")?
         .typed(&runtime.wasm_store)?;

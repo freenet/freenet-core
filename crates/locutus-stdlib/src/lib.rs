@@ -15,6 +15,7 @@ pub mod buf;
 pub mod client_api;
 mod component_interface;
 mod contract_interface;
+pub(crate) mod global;
 pub mod time;
 mod versioning;
 #[cfg(feature = "xz2")]

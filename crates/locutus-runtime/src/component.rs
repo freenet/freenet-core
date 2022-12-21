@@ -170,8 +170,9 @@ impl ComponentRuntimeInterface for Runtime {
         if inbound.is_empty() {
             return Ok(results);
         }
-        let instance = self.prepare_component_call(key, 4096)?;
-        let process_func: TypedFunction<i64, i64> = instance
+        let running = self.prepare_component_call(key, 4096)?;
+        let process_func: TypedFunction<i64, i64> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "process")?;
 
@@ -202,14 +203,14 @@ impl ComponentRuntimeInterface for Runtime {
                                     .with_context(last_context.clone()),
                             ),
                             &process_func,
-                            &instance,
+                            &running.instance,
                         )?,
                     );
 
                     // Update the shared context for next messages
                     last_context = self.get_outbound(
                         key,
-                        &instance,
+                        &running.instance,
                         &process_func,
                         &mut outbound,
                         &mut results,
@@ -219,9 +220,15 @@ impl ComponentRuntimeInterface for Runtime {
                     let mut outbound = VecDeque::from(self.exec_inbound(
                         &InboundComponentMsg::UserResponse(response),
                         &process_func,
-                        &instance,
+                        &running.instance,
                     )?);
-                    self.get_outbound(key, &instance, &process_func, &mut outbound, &mut results)?;
+                    self.get_outbound(
+                        key,
+                        &running.instance,
+                        &process_func,
+                        &mut outbound,
+                        &mut results,
+                    )?;
                 }
                 InboundComponentMsg::GetSecretResponse(_) => {
                     return Err(ComponentExecError::UnexpectedMessage("get secret response").into())
@@ -230,9 +237,15 @@ impl ComponentRuntimeInterface for Runtime {
                     let mut outbound = VecDeque::from(self.exec_inbound(
                         &InboundComponentMsg::RandomBytes(bytes),
                         &process_func,
-                        &instance,
+                        &running.instance,
                     )?);
-                    self.get_outbound(key, &instance, &process_func, &mut outbound, &mut results)?;
+                    self.get_outbound(
+                        key,
+                        &running.instance,
+                        &process_func,
+                        &mut outbound,
+                        &mut results,
+                    )?;
                 }
             }
         }
@@ -260,7 +273,7 @@ impl ComponentRuntimeInterface for Runtime {
 #[cfg(test)]
 mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
-    use locutus_stdlib::prelude::{env_logger, ContractCode, ContractInstanceId, Parameters};
+    use locutus_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
@@ -288,7 +301,7 @@ mod test {
 
     fn setup_runtime(name: &str) -> Result<(Component, Runtime), Box<dyn std::error::Error>> {
         const TEST_PREFIX: &str = "component-api";
-        let _ = env_logger::try_init();
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let contracts_dir = crate::tests::test_dir(TEST_PREFIX);
         let components_dir = crate::tests::test_dir(TEST_PREFIX);
         let secrets_dir = crate::tests::test_dir(TEST_PREFIX);

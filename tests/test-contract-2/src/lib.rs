@@ -10,6 +10,5 @@ pub extern "C" fn time_func() {
     set_tra();
     tracing::info!("trying to get time");
     let now = locutus_stdlib::time::now();
-    tracing::info!(%now, "time now");
-    tracing::info!("done");
+    tracing::info!(%now, "current time");
 }

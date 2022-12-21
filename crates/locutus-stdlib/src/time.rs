@@ -1,30 +1,21 @@
 //! Temporal quantification.
 
+use std::mem::MaybeUninit;
+
 use chrono::{DateTime, Utc};
 
-#[derive(Debug)]
-#[repr(C)]
-struct Bytes {
-    ptr: i64,
-    length: i64,
-    capacity: i64,
-}
-
 pub fn now() -> DateTime<Utc> {
-    let Bytes {
-        ptr,
-        length,
-        capacity,
-    } = unsafe { &*(utc_now() as *mut Bytes) };
-    dbg!(length);
-    dbg!(capacity);
-    dbg!(ptr);
-    // tracing::info!("got ptr: {ptr}, l: {length}, cap: {capacity}");
-    let bytes = unsafe { Vec::from_raw_parts(*ptr as _, *length as usize, *capacity as usize) };
-    bincode::deserialize(&bytes).unwrap()
+    let mut uninit = MaybeUninit::<chrono::DateTime<Utc>>::uninit();
+    let ptr = uninit.as_mut_ptr() as usize as i64;
+    // eprintln!("{ptr} inside");
+    unsafe {
+        utc_now(crate::global::INSTANCE_ID, ptr);
+        uninit.assume_init();
+        std::mem::transmute(uninit)
+    }
 }
 
 #[link(wasm_import_module = "locutus_time")]
 extern "C" {
-    fn utc_now() -> i64;
+    fn utc_now(id: i64, ptr: i64);
 }

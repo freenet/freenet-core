@@ -51,6 +51,7 @@ trace = ["locutus-stdlib/trace"]
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wasmer = { workspace = true, features = [ "sys-default"] }
 bincode = "1"
 once_cell = "1"

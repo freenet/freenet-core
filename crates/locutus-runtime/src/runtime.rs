@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::atomic::AtomicI64};
 
 use locutus_stdlib::{
     buf::{BufferBuilder, BufferMut},
@@ -10,6 +10,38 @@ use crate::{
     component_store::ComponentStore, contract_store::ContractStore, error::RuntimeInnerError,
     native_api, secrets_store::SecretsStore, RuntimeResult,
 };
+
+static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
+
+pub(crate) struct RunningInstance {
+    pub id: i64,
+    pub instance: Instance,
+}
+
+impl Drop for RunningInstance {
+    fn drop(&mut self) {
+        let _ = native_api::MEM_ADDR.remove(&self.id);
+    }
+}
+
+impl RunningInstance {
+    fn new(rt: &mut Runtime, instance: Instance) -> RuntimeResult<Self> {
+        let memory = rt
+            .host_memory
+            .as_ref()
+            .map(Ok)
+            .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
+        let set_id: TypedFunction<i64, ()> = instance
+            .exports
+            .get_typed_function(&rt.wasm_store, "__locutus_set_id")
+            .unwrap();
+        let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        set_id.call(&mut rt.wasm_store, id).unwrap();
+        let ptr = memory.view(&rt.wasm_store).data_ptr() as i64;
+        native_api::MEM_ADDR.insert(id, ptr);
+        Ok(Self { instance, id })
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ContractExecError {
@@ -123,7 +155,7 @@ impl Runtime {
         key: &ContractKey,
         parameters: &Parameters,
         req_bytes: usize,
-    ) -> RuntimeResult<Instance> {
+    ) -> RuntimeResult<RunningInstance> {
         let module = if let Some(module) = self.contract_modules.get(key) {
             module
         } else {
@@ -142,14 +174,14 @@ impl Runtime {
         .clone();
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
-        Ok(instance)
+        RunningInstance::new(self, instance)
     }
 
     pub(crate) fn prepare_component_call(
         &mut self,
         key: &ComponentKey,
         req_bytes: usize,
-    ) -> RuntimeResult<Instance> {
+    ) -> RuntimeResult<RunningInstance> {
         let module = if let Some(module) = self.component_modules.get(key) {
             module
         } else {
@@ -164,7 +196,7 @@ impl Runtime {
         .clone();
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
-        Ok(instance)
+        RunningInstance::new(self, instance)
     }
 
     fn set_instance_mem(&mut self, req_bytes: usize, instance: &Instance) -> RuntimeResult<()> {

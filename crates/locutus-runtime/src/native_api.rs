@@ -1,55 +1,45 @@
 //! Implementation of native API's exported and available in the WASM modules.
 
-struct Env {
-    /// Untyped data passed from host to guest.
-    data: Vec<u8>,
-    ptr: Bytes,
-}
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 
-impl Env {
-    fn new() -> Self {
-        Self {
-            data: vec![0; 1000],
-            ptr: Bytes::default(),
-        }
-    }
-}
+/// This is a map of starting addresses of the instance memory space.
+///
+/// A hackish way of having the information necessary to compute the address
+/// at which bytes must be written when calling host functions from the WASM modules.
+pub(crate) static MEM_ADDR: Lazy<DashMap<InstanceId, i64>> = Lazy::new(DashMap::default);
 
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct Bytes {
-    ptr: i64,
-    length: i64,
-    capacity: i64,
+type InstanceId = i64;
+
+#[inline(always)]
+fn compute_ptr<T>(ptr: i64, start_ptr: i64) -> *mut T {
+    (start_ptr + ptr) as _
 }
 
 pub(crate) mod time {
-    use chrono::Utc as UtcOriginal;
-    use wasmer::{Function, FunctionEnv, FunctionEnvMut, Imports};
-
     use super::*;
+    use chrono::{DateTime, Utc as UtcOriginal};
+    use wasmer::{Function, Imports};
 
     pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
-        let env = FunctionEnv::new(store, Env::new());
-        let utc_now = Function::new_typed_with_env(store, &env, utc_now);
+        let utc_now = Function::new_typed(store, utc_now);
         imports.register_namespace("locutus_time", [("utc_now".to_owned(), utc_now.into())]);
-        // imports.define("env", "__locutus__time__utc_now", utc_now);
     }
 
-    fn utc_now(mut env: FunctionEnvMut<Env>) -> i64 {
-        let env = env.data_mut();
-        let data = &mut env.data;
-        data.clear();
+    fn utc_now(id: i64, ptr: i64) {
+        if id == -1 {
+            panic!("unset module id");
+        }
+        let start_ptr = *MEM_ADDR
+            .get(&id)
+            .expect("instance mem space not recorded")
+            .value();
         let now = UtcOriginal::now();
-        let mut ser = bincode::serialize(&now).unwrap();
-        data.append(&mut ser);
-
-        let length = ser.len() as i64;
-        let capacity = ser.capacity() as i64;
-        let ptr = data.as_ptr() as i64;
-        env.ptr.ptr = ptr;
-        env.ptr.length = length;
-        env.ptr.capacity = capacity;
-        &mut env.ptr as *mut _ as i64
+        let ptr = compute_ptr::<DateTime<UtcOriginal>>(ptr, start_ptr);
+        // eprintln!("{ptr:p} ({}) outside", ptr as i64);
+        unsafe {
+            let ptr = ptr as *mut DateTime<UtcOriginal>;
+            ptr.write(now);
+        };
     }
 }
