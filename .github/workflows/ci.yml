@@ -46,8 +46,6 @@ jobs:
         run: |
           rustup target add wasm32-unknown-unknown
           rustup target add wasm32-wasi
-          cd tests/test-contract-1
-          ldt build --wasi
 
       - name: Install stdlib packages
         working-directory: apps/stdlib

@@ -1,3 +1,6 @@
+use byteorder::{BigEndian, WriteBytesExt};
+use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use std::{
     collections::HashMap,
     env,
@@ -6,11 +9,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+use tar::Builder;
 
 use locutus_runtime::{locutus_stdlib::web::WebApp, ContractCode};
-use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
-use tar::Builder;
+use locutus_stdlib::prelude::WrappedContract;
 
 use crate::{config::BuildToolCliConfig, util::pipe_std_streams, DynError, Error};
 
@@ -361,13 +363,14 @@ fn compile_contract(
                 )
                 .into());
             }
-            let mut out_file = if let Some(output) = &config.contract.output_dir {
+            let out_file = if let Some(output) = &config.contract.output_dir {
                 output.join(package_name)
             } else {
                 get_default_ouput_dir(cwd)?.join(package_name)
             };
-            out_file.set_extension("wasm");
-            fs::copy(output_lib, out_file)?;
+            let output = get_contract_with_version(&output_lib, cli_config)?;
+            let mut file = File::create(out_file)?;
+            file.write_all(output.as_slice())?;
         }
         None => println!("no lang specified, skipping contract compilation"),
     }
@@ -409,6 +412,25 @@ fn get_out_lib(
         .join(&package_name)
         .with_extension("wasm");
     Ok((package_name, output_lib))
+}
+
+fn get_contract_with_version(
+    contract_path: &Path,
+    cli_config: &BuildToolCliConfig,
+) -> Result<Vec<u8>, DynError> {
+    let code = WrappedContract::get_data_from_fs(contract_path)?;
+    let mut serialized_version = serde_json::to_vec(&cli_config.version).map_err(|e| {
+        Error::MissConfiguration(format!("couldn't serialize contract version: {e}").into())
+    })?;
+
+    let mut output: Vec<u8> = Vec::with_capacity(
+        std::mem::size_of::<u32>() + serialized_version.len() + code.data().len(),
+    );
+    output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
+    output.append(&mut serialized_version);
+    output.append(&mut code.data().to_vec());
+
+    Ok(output)
 }
 
 #[skip_serializing_none]

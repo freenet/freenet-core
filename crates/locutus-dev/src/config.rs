@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::local_node::LocalNodeCliConfig;
+use locutus_stdlib::prelude::Version;
 
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Locutus Development Tool")]
@@ -27,7 +28,7 @@ pub struct BaseConfig {
     pub(crate) contract_data_dir: Option<PathBuf>,
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]
-    mode: OperationMode,
+    pub(crate) mode: OperationMode,
 }
 
 #[derive(clap::Subcommand, Clone)]
@@ -93,11 +94,28 @@ pub struct PutConfig {
 /// Builds and packages a contract.
 ///
 /// This tool will build the WASM contract and publish it to the network.
-#[derive(clap::Parser, Clone, Default)]
+#[derive(clap::Parser, Clone)]
 pub struct BuildToolCliConfig {
     /// Compile the contract with WASI extension enabled (useful for debugging).
     #[clap(long)]
     pub(crate) wasi: bool,
+
+    /// Compile the contract with a specific version.
+    #[clap(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
+    pub(crate) version: Version,
+}
+
+impl Default for BuildToolCliConfig {
+    fn default() -> Self {
+        Self {
+            wasi: false,
+            version: Version::new(0, 0, 1),
+        }
+    }
+}
+
+fn parse_version(src: &str) -> Result<Version, String> {
+    Version::parse(src).map_err(|e| e.to_string())
 }
 
 /// Create a new Locutus contract and/or app.

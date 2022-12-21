@@ -71,8 +71,7 @@ impl Display for ContractContainer {
 impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
     type Error = std::io::Error;
 
-    fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        let (path, params) = data;
+    fn try_from((path, params): (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
         let mut contract_data =
             Cursor::new(ContractContainer::get_contract_data_from_fs(path).unwrap());
 
