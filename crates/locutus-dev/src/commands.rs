@@ -84,19 +84,3 @@ async fn execute_command(
 
     Ok(())
 }
-
-#[tokio::test]
-async fn test() {
-    let config = PutConfig {
-        code: "/home/nachod/projects/locutus/apps/freenet-microblogging/contracts/posts/freenet_microblogging_posts.wasm".into(),
-        parameters: None,
-        state: "/home/nachod/projects/locutus/apps/freenet-microblogging/contracts/posts/initial_state.json".into(),
-        release: false,
-        related_contracts: None,
-    };
-    let other = BaseConfig {
-        contract_data_dir: None,
-        mode: crate::config::OperationMode::Local,
-    };
-    put(config, other).await.unwrap();
-}
