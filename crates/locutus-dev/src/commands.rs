@@ -1,9 +1,8 @@
-use std::{fs::File, io::Read, sync::Arc};
+use std::{fs::File, io::Read};
 
 use locutus_core::{locutus_runtime::StateDelta, ClientId, Config, Executor, SqlitePool};
 use locutus_runtime::{
-    ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore, WasmAPIVersion,
-    WrappedContract,
+    ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore,
 };
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
@@ -15,15 +14,11 @@ use crate::{
 const MAX_MEM_CACHE: u32 = 10_000_000;
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
+// #[track_caller]
 pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
     if config.release {
         return Err("Cannot publish contracts in the network yet".into());
     }
-    let code = {
-        let mut buf = vec![];
-        File::open(&config.code)?.read_to_end(&mut buf)?;
-        buf.into()
-    };
     let params = if let Some(params) = config.parameters {
         let mut buf = vec![];
         File::open(params)?.read_to_end(&mut buf)?;
@@ -31,15 +26,12 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
     } else {
         Parameters::from(&[] as &[u8])
     };
+    let contract = ContractContainer::try_from((config.code.as_path(), params))?;
     let state = {
         let mut buf = vec![];
         File::open(&config.state)?.read_to_end(&mut buf)?;
         buf.into()
     };
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
-        Arc::new(code),
-        params,
-    )));
     let related_contracts = if let Some(_related) = config.related_contracts {
         todo!("use `related` contracts")
     } else {
