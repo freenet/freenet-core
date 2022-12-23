@@ -22,15 +22,7 @@ Locutus is developed in [Rust](https://www.rust-lang.org/), on Linux/Mac this wi
 $ curl https://sh.rustup.rs -sSf | sh
 ```
 
-### 2. LLVM
-
-- The [LLVM](https://llvm.org) compiler backend core libraries. Usually available at most OS package managers for Linux distributions and Mac OS.
-
-```bash
-$ sudo apt install llvm # For Ubuntu
-```
-
-### 3. Locutus Dev Tool (LTD)
+### 2. Locutus Dev Tool (LTD)
 
 Once you have a working installation of Cargo you can install the Locutus dev tools:
 
@@ -40,7 +32,7 @@ $ cargo install locutus
 
 This command will install `ldt` (Locutus Dev Tool) and a working node that can be used for local development.
 
-#### 3.1 Usage
+#### 2.1 Usage
 
 You can find more information about the available commands by executing `ldt` with the `--help` argument:
 
