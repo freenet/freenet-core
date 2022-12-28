@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bincode = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
 hashbrown = { version = "0.13", features = ["serde"] }
 locutus-stdlib = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["serde"] }
