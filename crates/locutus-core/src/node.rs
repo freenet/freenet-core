@@ -5,7 +5,7 @@
 //! Node comes with different underlying implementations that can be used upon construction.
 //! Those implementations are:
 //! - libp2p: all the connection is handled by libp2p.
-//! - In memory: a simplifying node used for emulation pourpouses mainly.
+//! - In memory: a simplifying node used for emulation purposes mainly.
 
 use std::{fmt::Display, net::IpAddr, sync::Arc, time::Duration};
 

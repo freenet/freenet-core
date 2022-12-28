@@ -1,4 +1,4 @@
-//! A in-memory connection manager and transport implementation. Used for testing pourpouses.
+//! A in-memory connection manager and transport implementation. Used for testing purposes.
 use std::{
     collections::HashMap,
     io::Cursor,
