@@ -3,9 +3,7 @@ name: Sync Issues with Pivotal Tracker
 on:
   issues:
     types: [labeled]
-  schedule:
-    - cron: '48 3 * * *'
-
+    
 jobs:
   sync:
     runs-on: ubuntu-latest
