@@ -5,15 +5,14 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
 };
 
-use locutus_core::locutus_runtime::{ContractContainer, WasmAPIVersion};
+use locutus_core::locutus_runtime::ContractContainer;
 use locutus_core::{
-    libp2p::identity::ed25519::PublicKey,
-    locutus_runtime::{ContractCode, StateStore, WrappedContract},
-    Config, SqlitePool, WrappedState,
+    libp2p::identity::ed25519::PublicKey, locutus_runtime::StateStore, Config, SqlitePool,
+    WrappedState,
 };
+use locutus_stdlib::prelude::Parameters;
 use serde::Serialize;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -33,21 +32,16 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
     fn get_posts_contract(
         _public_key: PublicKey,
     ) -> std::io::Result<(ContractContainer, WrappedState)> {
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts.wasm");
-        let mut bytes = Vec::new();
-        File::open(path)?.read_to_end(&mut bytes)?;
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts");
 
         #[derive(Serialize)]
         struct Verification {
             public_key: Vec<u8>,
         }
-        let params = serde_json::to_vec(&Verification { public_key: vec![] }).unwrap();
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
-            Arc::new(ContractCode::from(bytes)),
-            params.into(),
-        )));
+        let params = Parameters::from(&[] as &[u8]);
+        let contract = ContractContainer::try_from((path.as_path(), params))?;
 
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts");
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_posts_state");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
@@ -55,16 +49,11 @@ fn test_web(public_key: PublicKey) -> Result<WebBundle, std::io::Error> {
     }
 
     fn get_web_contract() -> std::io::Result<(ContractContainer, WrappedState)> {
-        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web.wasm");
-        let mut bytes = Vec::new();
-        File::open(path)?.read_to_end(&mut bytes)?;
-
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
-            Arc::new(ContractCode::from(bytes)),
-            [].as_ref().into(),
-        )));
-
         let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web");
+        let params = Parameters::from(&[] as &[u8]);
+        let contract = ContractContainer::try_from((path.as_path(), params))?;
+
+        let path = PathBuf::from(CRATE_DIR).join("examples/freenet_microblogging_web_state");
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
 
