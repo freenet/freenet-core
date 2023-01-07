@@ -19,8 +19,8 @@ webapp:
 	cd $(WEB_DIR)
 
 	${CARGO_TARGET_DIR}/debug/ldt build
-	mv ./build/locutus/freenet_microblogging_web.wasm ../../../crates/locutus-node/examples/
-	mv ./build/locutus/contract-state ../../../crates/locutus-node/examples/freenet_microblogging_web
+	mv ./build/locutus/freenet_microblogging_web ../../../crates/locutus-node/examples/
+	mv ./build/locutus/contract-state ../../../crates/locutus-node/examples/freenet_microblogging_web_state
 
 posts:
 	cd $(LOCUTUS_DIR)
@@ -28,8 +28,8 @@ posts:
 	cd $(POSTS_DIR)
 
 	${CARGO_TARGET_DIR}/debug/ldt build
-	mv ./build/locutus/freenet_microblogging_posts.wasm ../../../../crates/locutus-node/examples/
-	mv ./build/locutus/contract-state ../../../../crates/locutus-node/examples/freenet_microblogging_posts
+	mv ./build/locutus/freenet_microblogging_posts ../../../../crates/locutus-node/examples/
+	mv ./build/locutus/contract-state ../../../../crates/locutus-node/examples/freenet_microblogging_posts_state
 
 build: build-tool webapp posts
 
