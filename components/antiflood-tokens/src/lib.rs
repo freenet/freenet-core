@@ -3,14 +3,8 @@ use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
 use locutus_stdlib::{prelude::*, time};
 use serde::{Deserialize, Serialize};
 
-struct TokenComponent;
-
-#[component]
-impl ComponentInterface for TokenComponent {
-    fn process(messages: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
-        todo!()
-    }
-}
+mod component;
+mod contract;
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -136,39 +130,6 @@ pub struct TokenAssignmentLedger {
     tokens_by_tier: hashbrown::HashMap<Tier, Vec<TokenAssignment>>,
 }
 
-/// Conflicting assignments for the same time slot are not permitted and indicate that the generator is broken or malicious.
-impl TokenAssignmentLedger {
-    /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
-    /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
-    pub fn assign(&mut self, assignee: Assignment, tier: Tier, private_key: Keypair) {
-        let next = self.next_free_assignment(tier);
-        let assignment = TokenAssignment::assign(private_key, tier, assignee, next);
-    }
-
-    fn next_free_assignment(&self, tier: Tier) -> DateTime<Utc> {
-        let now = Utc::now();
-        match self.tokens_by_tier.get(&tier) {
-            Some(_others) => {
-                //
-                todo!()
-            }
-            None => tier.next_assignment(now),
-        }
-    }
-
-    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), ContractError> {
-        Ok(())
-    }
-
-    fn append(
-        &mut self,
-        other: TokenAssignment,
-        params: &TokenParameters,
-    ) -> Result<(), ContractError> {
-        Ok(())
-    }
-}
-
 impl TryFrom<State<'_>> for TokenAssignmentLedger {
     type Error = ContractError;
 
@@ -190,47 +151,34 @@ struct TokenAssignment {
     signature: Signature,
 }
 
+impl PartialEq for TokenAssignment {
+    fn eq(&self, other: &Self) -> bool {
+        self.tier == other.tier && self.time_slot == other.time_slot
+    }
+}
+
+impl Eq for TokenAssignment {}
+
+impl PartialOrd for TokenAssignment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.time_slot.cmp(&other.time_slot))
+    }
+}
+
+impl Ord for TokenAssignment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.time_slot.cmp(&other.time_slot)
+    }
+}
+
 impl TokenAssignment {
-    /// This function should be used by applications to get a new assigment.
-    pub fn assign(
-        private_key: Keypair,
-        tier: Tier,
-        assignee: Assignment,
-        time_slot: DateTime<Utc>,
-    ) -> Self {
-        let msg = Self::to_be_signed(&time_slot, &assignee, tier);
-        let signature = private_key.sign(&msg);
-        TokenAssignment {
-            tier,
-            time_slot,
-            assignee,
-            signature,
-        }
-    }
-
     /// The `(tier, issue_time, assigned_to)` tuple that has to be verified as bytes.
-    fn to_be_signed(issue_time: &DateTime<Utc>, assigned_to: &Assignment, tier: Tier) -> Vec<u8> {
+    pub fn to_be_signed(
+        issue_time: &DateTime<Utc>,
+        assigned_to: &Assignment,
+        tier: Tier,
+    ) -> Vec<u8> {
         todo!()
-    }
-
-    fn validate(&self, params: &TokenParameters) -> bool {
-        if !self.tier.is_valid_slot(self.time_slot) {
-            return false;
-        }
-        let pk = PublicKey::from_bytes(&self.assignee).unwrap();
-        if pk != params.generator_public_key {
-            return false;
-        }
-        let msg = Self::to_be_signed(&self.time_slot, &self.assignee, self.tier);
-        if params
-            .generator_public_key
-            .verify(&msg, &self.signature)
-            .is_err()
-        {
-            // not signed by the privte key of this contract
-            return false;
-        }
-        true
     }
 }
 
@@ -241,94 +189,5 @@ impl TryFrom<StateDelta<'_>> for TokenAssignment {
         let this = bincode::deserialize_from(state.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)
-    }
-}
-
-impl ContractInterface for TokenAssignmentLedger {
-    // TODO: only can validate that the slot is valid, nothing else?
-    fn validate_state(
-        parameters: Parameters<'static>,
-        state: State<'static>,
-        _related: RelatedContracts<'static>,
-    ) -> Result<ValidateResult, ContractError> {
-        let assigned_tokens = TokenAssignmentLedger::try_from(state)?;
-        let params = TokenParameters::try_from(parameters)?;
-        for (_tier, assignments) in assigned_tokens.tokens_by_tier.iter() {
-            for assignment in assignments {
-                if !assignment.validate(&params) {
-                    return Ok(ValidateResult::Invalid);
-                }
-            }
-        }
-        Ok(ValidateResult::Valid)
-    }
-
-    /// The contract verifies that the release times for a tier matches the tier.
-    ///
-    /// For example, a 15:30 UTC release time isn't permitted for hour_1 tier, but 15:00 UTC is permitted.
-    // TODO: only can validate that the slot is valid, nothing else?
-    fn validate_delta(
-        parameters: Parameters<'static>,
-        delta: StateDelta<'static>,
-    ) -> Result<bool, ContractError> {
-        let assigned_token = TokenAssignment::try_from(delta)?;
-        let params = TokenParameters::try_from(parameters)?;
-        Ok(assigned_token.validate(&params))
-    }
-
-    fn update_state(
-        parameters: Parameters<'static>,
-        state: State<'static>,
-        data: Vec<UpdateData<'static>>,
-    ) -> Result<UpdateModification<'static>, ContractError> {
-        let mut assigned_tokens = TokenAssignmentLedger::try_from(state)?;
-        let params = TokenParameters::try_from(parameters)?;
-        for update in data {
-            match update {
-                UpdateData::State(s) => {
-                    let new_assigned_tokens = TokenAssignmentLedger::try_from(s)?;
-                    assigned_tokens.merge(new_assigned_tokens, &params)?;
-                }
-                UpdateData::Delta(d) => {
-                    let new_assigned_token = TokenAssignment::try_from(d)?;
-                    assigned_tokens.append(new_assigned_token, &params)?;
-                }
-                // does this send the prev state + new delta?
-                UpdateData::StateAndDelta { state, delta } => {
-                    let new_assigned_tokens = TokenAssignmentLedger::try_from(state)?;
-                    assigned_tokens.merge(new_assigned_tokens, &params)?;
-                    let new_assigned_token = TokenAssignment::try_from(delta)?;
-                    assigned_tokens.append(new_assigned_token, &params)?;
-                }
-                // UpdateData::RelatedState { related_to, state } => {
-                //     todo!()
-                // }
-                // UpdateData::RelatedDelta { related_to, delta } => todo!(),
-                // UpdateData::RelatedStateAndDelta {
-                //     related_to,
-                //     state,
-                //     delta,
-                // } => todo!(),
-                _ => unreachable!(),
-            }
-        }
-        todo!()
-    }
-
-    fn summarize_state(
-        parameters: Parameters<'static>,
-        state: State<'static>,
-    ) -> Result<StateSummary<'static>, ContractError> {
-        // FIXME: the state summary must be a summary of tokens assigned per tier
-        todo!()
-    }
-
-    fn get_state_delta(
-        parameters: Parameters<'static>,
-        state: State<'static>,
-        summary: StateSummary<'static>,
-    ) -> Result<StateDelta<'static>, ContractError> {
-        // FIXME: return only the assignments not present in the summary
-        todo!()
     }
 }
