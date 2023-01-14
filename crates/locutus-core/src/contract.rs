@@ -1,14 +1,14 @@
 use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError, Parameters};
 
 mod handler;
+pub mod storages;
 mod test;
 
-pub use handler::sqlite::{Pool as SqlitePool, SQLiteContractHandler};
 #[cfg(test)]
 pub(crate) use handler::test::{TestContractHandler, TestContractStoreError};
 pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, SqlDbError, StoreResponse,
+    ContractHandlerEvent, StoreResponse,
 };
 pub(crate) use test::MockRuntime;
 #[cfg(test)]
@@ -127,10 +127,4 @@ pub(crate) enum ContractError<CErr> {
     NoEvHandlerResponse,
     #[error("failed while storing a contract")]
     StorageError(CErr),
-}
-
-impl From<SqlDbError> for ContractError<SqlDbError> {
-    fn from(err: SqlDbError) -> Self {
-        Self::StorageError(err)
-    }
 }
