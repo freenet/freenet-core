@@ -1,10 +1,9 @@
 name: Sync Issues with Pivotal Tracker
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 * * * *'
-
+  issues:
+    types: [labeled]
+    
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -16,4 +15,5 @@ jobs:
           PT_PROJECT_ID: ${{ secrets.PT_PROJECT_ID }}
           GH_REPOSITORY: ${{ github.repository }}
           GH_ACCESS_TOKEN: ${{ github.token }}
+        if: github.event.label.name == 'planned'
         run: python .github/scripts/pt_sync.py

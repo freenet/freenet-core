@@ -16,7 +16,7 @@ pub struct Config {
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 pub enum OperationMode {
-    /// Run the node in local-only mode. Useful for development pourpouses.
+    /// Run the node in local-only mode. Useful for development purposes.
     Local,
     /// Standard operation mode.
     Network,
