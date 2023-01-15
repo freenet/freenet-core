@@ -152,7 +152,7 @@ impl ComponentInterface for Component {
 
 #[test]
 fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
-    // 1- create inbox message parts
+    // 1. create inbox message parts
     let contract = WrappedContract::new(
         Arc::new(ContractCode::from(vec![1])),
         Parameters::from(vec![]),

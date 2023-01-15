@@ -1,12 +1,11 @@
 use chrono::{DateTime, Duration, SubsecRound, Timelike, Utc};
-use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
-use locutus_stdlib::{prelude::*, time};
+use ed25519_dalek::{PublicKey, Signature};
+use locutus_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
-mod component;
-mod contract;
+type Assignment = Vec<u8>;
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Tier {
     Min1,
     Min5,
@@ -26,7 +25,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn is_valid_slot(&self, dt: DateTime<Utc>) -> bool {
+    pub fn is_valid_slot(&self, dt: DateTime<Utc>) -> bool {
         match self {
             Tier::Min1 => {
                 let vns = dt.nanosecond() == 0;
@@ -56,7 +55,7 @@ impl Tier {
     }
 
     /// Given a datetime, get the next closest free slot for this tier.
-    fn next_assignment(&self, mut date: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn next_assignment(&self, mut date: DateTime<Utc>) -> DateTime<Utc> {
         match self {
             Tier::Min1 => {
                 date += Duration::minutes(1);
@@ -106,9 +105,10 @@ impl Tier {
     }
 }
 
+#[non_exhaustive]
 #[derive(Serialize, Deserialize)]
-struct TokenParameters {
-    generator_public_key: PublicKey,
+pub struct TokenParameters {
+    pub generator_public_key: PublicKey,
 }
 
 impl TryFrom<Parameters<'_>> for TokenParameters {
@@ -120,17 +120,31 @@ impl TryFrom<Parameters<'_>> for TokenParameters {
     }
 }
 
-type Assignment = Vec<u8>;
+#[non_exhaustive]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AllocationCriteria {
+    pub frequency: Tier,
+    pub time_to_live: std::time::Duration,
+}
 
-#[derive(Serialize, Deserialize)]
-pub struct TokenAssignmentLedger {
+#[non_exhaustive]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenAllocationRecord {
     /// A list of issued tokens.
     ///
     /// This is categorized by tiers and then sorted by time slot.
-    tokens_by_tier: hashbrown::HashMap<Tier, Vec<TokenAssignment>>,
+    pub tokens_by_tier: hashbrown::HashMap<Tier, Vec<TokenAssignment>>,
 }
 
-impl TryFrom<State<'_>> for TokenAssignmentLedger {
+impl TokenAllocationRecord {
+    /// Gets the criteria to allocate tokens for this contract
+    // TODO: how this should be consulted? should be appended to the record? or form part of the contract params?
+    pub fn get_criteria(&self) -> AllocationCriteria {
+        todo!()
+    }
+}
+
+impl TryFrom<State<'_>> for TokenAllocationRecord {
     type Error = ContractError;
 
     fn try_from(state: State<'_>) -> Result<Self, Self::Error> {
@@ -140,15 +154,15 @@ impl TryFrom<State<'_>> for TokenAssignmentLedger {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct TokenAssignment {
-    tier: Tier,
-    time_slot: DateTime<Utc>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenAssignment {
+    pub tier: Tier,
+    pub time_slot: DateTime<Utc>,
     /// The assignment, the recipient decides whether this assignment is valid based on this field.
     /// This will often be a PublicKey.
-    assignee: Assignment,
+    pub assignee: Assignment,
     /// `(tier, issue_time, assigned_to)` must be signed by `generator_public_key`
-    signature: Signature,
+    pub signature: Signature,
 }
 
 impl PartialEq for TokenAssignment {

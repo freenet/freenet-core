@@ -114,7 +114,7 @@ impl SecretsId {
 pub trait ComponentInterface {
     /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the component must be stored using the secret mechanism.
-    fn process(messages: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError>;
+    fn process(message: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError>;
 }
 
 #[serde_as]
@@ -149,6 +149,7 @@ impl Display for ComponentKey {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ComponentContext(pub Vec<u8>);
 

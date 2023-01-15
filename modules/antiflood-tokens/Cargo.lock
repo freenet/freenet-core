@@ -23,18 +23,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "antiflood-tokens"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "chrono",
- "ed25519-dalek",
- "hashbrown 0.13.1",
- "locutus-stdlib",
- "serde",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -540,6 +528,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9272ab7b96c9046fbc5bc56c06c117cb639fe2d509df0c421cad82d2915cf369"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "locutus-aft-allocation-record"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "chrono",
+ "ed25519-dalek",
+ "hashbrown 0.13.1",
+ "locutus-aft-interface",
+ "locutus-stdlib",
+ "serde",
+]
+
+[[package]]
+name = "locutus-aft-generator"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "chrono",
+ "ed25519-dalek",
+ "hashbrown 0.13.1",
+ "locutus-aft-interface",
+ "locutus-stdlib",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "locutus-aft-interface"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "chrono",
+ "ed25519-dalek",
+ "hashbrown 0.13.1",
+ "locutus-stdlib",
+ "serde",
 ]
 
 [[package]]

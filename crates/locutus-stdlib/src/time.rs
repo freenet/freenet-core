@@ -17,5 +17,6 @@ pub fn now() -> DateTime<Utc> {
 
 #[link(wasm_import_module = "locutus_time")]
 extern "C" {
+    #[doc(hidden)]
     fn utc_now(id: i64, ptr: i64);
 }
