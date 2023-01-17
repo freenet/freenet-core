@@ -172,7 +172,7 @@ impl ClientEventsProxy for UserEvents {
         _response: Result<HostResponse, ClientError>,
     ) -> BoxFuture<'_, Result<(), ClientError>> {
         Box::pin(async move {
-            log::info!("received response");
+            tracing::info!("received response");
             Ok(())
         })
     }

@@ -79,11 +79,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let keypair = Keypair::generate();
     let bundle = test_web(keypair.public())?;
-    log::info!(
+    tracing::info!(
         "loading web contract {} in local node",
         bundle.web_contract.key().encoded_contract_id()
     );
-    log::info!(
+    tracing::info!(
         "loading posts contract {} in local node",
         bundle.posts_contract.key().encoded_contract_id()
     );

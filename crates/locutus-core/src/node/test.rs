@@ -386,22 +386,22 @@ pub(crate) async fn check_connectivity(
 
     let node_connectivity = sim_nodes.node_connectivity();
     let connections = pretty_print_connections(&node_connectivity);
-    log::info!("{connections}");
+    tracing::info!("{connections}");
 
     if !missing.is_empty() {
         missing.sort();
-        log::error!("Nodes without connection: {:?}", missing);
-        log::error!("Total nodes without connection: {:?}", missing.len());
+        tracing::error!("Nodes without connection: {:?}", missing);
+        tracing::error!("Total nodes without connection: {:?}", missing.len());
         anyhow::bail!("found disconnected nodes");
     }
 
-    log::info!(
+    tracing::info!(
         "Required time for connecting all peers: {} secs",
         elapsed.elapsed().as_secs()
     );
 
     let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
-    log::info!("Ring distribution: {:?}", hist);
+    tracing::info!("Ring distribution: {:?}", hist);
 
     let mut connections_per_peer: Vec<_> = node_connectivity
         .iter()
@@ -423,7 +423,7 @@ pub(crate) async fn check_connectivity(
 
     // ensure the average number of connections per peer is above N
     let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
-    log::info!("Average connections: {}", avg_connections);
+    tracing::info!("Average connections: {}", avg_connections);
     if avg_connections < 1 {
         anyhow::bail!("average number of connections is low");
     }

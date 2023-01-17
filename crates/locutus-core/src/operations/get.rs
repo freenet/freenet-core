@@ -98,7 +98,7 @@ where
                         self.state,
                         Some(GetState::AwaitingResponse { .. })
                     ));
-                    log::debug!("Seek contract {} @ {} (tx: {})", key, target.peer, id);
+                    tracing::debug!("Seek contract {} @ {} (tx: {})", key, target.peer, id);
                     new_state = self.state;
                     return_msg = Some(GetMsg::SeekNode {
                         key,
@@ -119,14 +119,14 @@ where
                 } => {
                     let is_cached_contract = op_storage.ring.is_contract_cached(&key);
                     if !is_cached_contract {
-                        log::warn!(
+                        tracing::warn!(
                             "Contract `{}` not found while processing a get request at node @ {}",
                             key,
                             target.peer
                         );
 
                         if htl == 0 {
-                            log::warn!(
+                            tracing::warn!(
                                 "The maximum HOPS number has been exceeded, sending the error \
                                  back to the node @ {}",
                                 sender.peer
@@ -191,11 +191,11 @@ where
                             Err(err) => return Err(err),
                         }
 
-                        log::debug!("Contract {returned_key} found @ peer {}", target.peer);
+                        tracing::debug!("Contract {returned_key} found @ peer {}", target.peer);
 
                         match self.state {
                             Some(GetState::AwaitingResponse { .. }) => {
-                                log::debug!(
+                                tracing::debug!(
                                     "Completed operation, Get response received for contract {key}"
                                 );
                                 // Completed op
@@ -203,7 +203,7 @@ where
                                 return_msg = None;
                             }
                             Some(GetState::ReceivedRequest) => {
-                                log::debug!("Returning contract {} to {}", key, sender.peer);
+                                tracing::debug!("Returning contract {} to {}", key, sender.peer);
                                 new_state = None;
                                 return_msg = Some(GetMsg::ReturnGet {
                                     id,
@@ -232,7 +232,7 @@ where
                     ..
                 } => {
                     let this_loc = target;
-                    log::warn!(
+                    tracing::warn!(
                         "Neither contract or contract value for contract `{}` found at peer {}, \
                         retrying with other peers",
                         key,
@@ -272,7 +272,7 @@ where
                                     fetch_contract,
                                 });
                             } else {
-                                log::error!(
+                                tracing::error!(
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
@@ -280,7 +280,7 @@ where
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
-                            log::debug!("Returning contract {} to {}", key, sender.peer);
+                            tracing::debug!("Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
@@ -325,10 +325,10 @@ where
                                 ))
                                 .await?;
                             let key = contract.key();
-                            log::debug!("Contract `{}` successfully put", key);
+                            tracing::debug!("Contract `{}` successfully put", key);
                         } else {
                             // no contract, consider this like an error ignoring the incoming update value
-                            log::warn!(
+                            tracing::warn!(
                                 "Contract not received from peer {} while requested",
                                 sender.peer
                             );
@@ -368,19 +368,19 @@ where
                     match self.state {
                         Some(GetState::AwaitingResponse { fetch_contract, .. }) => {
                             if fetch_contract && contract.is_none() {
-                                log::error!(
+                                tracing::error!(
                                     "Get response received for contract {key}, but the contract wasn't returned"
                                 );
                                 new_state = None;
                                 return_msg = None;
                             } else {
-                                log::debug!("Get response received for contract {}", key);
+                                tracing::debug!("Get response received for contract {}", key);
                                 new_state = None;
                                 return_msg = None;
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
-                            log::debug!("Returning contract {} to {}", key, sender.peer);
+                            tracing::debug!("Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
@@ -426,7 +426,7 @@ async fn continue_seeking<CErr: std::error::Error, CB: ConnectionBridge>(
     new_target: &PeerKeyLocation,
     retry_msg: Message,
 ) -> Result<(), OpError<CErr>> {
-    log::info!(
+    tracing::info!(
         "Retrying to get the contract from node @ {}",
         new_target.peer
     );
@@ -445,7 +445,7 @@ fn check_contract_found<CErr: std::error::Error>(
 ) -> Result<(), OpError<CErr>> {
     if returned_key != key {
         // shouldn't be a reachable path
-        log::error!(
+        tracing::error!(
             "contract retrieved ({}) and asked ({}) are not the same",
             returned_key,
             key
@@ -467,7 +467,7 @@ fn check_contract_found<CErr: std::error::Error>(
 }
 
 pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> GetOp {
-    log::debug!(
+    tracing::debug!(
         "Requesting get contract {} @ loc({})",
         key,
         Location::from(&key)
@@ -529,7 +529,7 @@ where
     } else {
         return Err(OpError::UnexpectedOpState);
     };
-    log::debug!(
+    tracing::debug!(
         "Preparing get contract request to {} (tx: {})",
         target.peer,
         id

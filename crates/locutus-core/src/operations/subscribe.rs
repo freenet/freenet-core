@@ -123,8 +123,8 @@ where
                     };
 
                     if !op_storage.ring.is_contract_cached(&key) {
-                        log::info!("Contract {} not found while processing info", key);
-                        log::info!("Trying to found the contract from another node");
+                        tracing::info!("Contract {} not found while processing info", key);
+                        tracing::info!("Trying to found the contract from another node");
 
                         let new_target =
                             op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
@@ -159,7 +159,7 @@ where
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
-                            log::info!(
+                            tracing::info!(
                                 "Peer {} successfully subscribed to contract {}",
                                 subscriber.peer,
                                 key
@@ -184,7 +184,7 @@ where
                     target: _,
                     id,
                 } => {
-                    log::warn!(
+                    tracing::warn!(
                         "Contract `{}` not found at potential subscription provider {}",
                         key,
                         sender.peer
@@ -234,7 +234,7 @@ where
                     target: _,
                     id: _,
                 } => {
-                    log::warn!(
+                    tracing::warn!(
                         "Subscribed to `{}` not found at potential subscription provider {}",
                         key,
                         sender.peer

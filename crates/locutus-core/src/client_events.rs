@@ -228,7 +228,7 @@ pub(crate) mod test {
                     1 => {}
                     2 => {
                         let msg = "the joint set of owned and non-owned contracts is empty!";
-                        log::error!("{}", msg);
+                        tracing::error!("{}", msg);
                         panic!("{}", msg)
                     }
                     _ => unreachable!(),

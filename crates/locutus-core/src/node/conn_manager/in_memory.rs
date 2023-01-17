@@ -128,7 +128,7 @@ impl InMemoryTransport {
             loop {
                 match rx.try_recv() {
                     Ok(msg) if msg.target == interface_peer => {
-                        log::trace!(
+                        tracing::trace!(
                             "Inbound message received for peer {} from {}",
                             interface_peer,
                             msg.origin
@@ -163,7 +163,7 @@ impl InMemoryTransport {
                     Self::shuffle(&mut queue);
                 }
             }
-            log::error!("Stopped receiving messages in {}", interface_peer);
+            tracing::error!("Stopped receiving messages in {}", interface_peer);
         });
 
         let network = tx.clone();
@@ -181,7 +181,7 @@ impl InMemoryTransport {
             data: message,
         });
         if let Err(channel::SendError(_)) = send_res {
-            log::error!("Network shutdown")
+            tracing::error!("Network shutdown")
         }
     }
 

@@ -209,12 +209,12 @@ pub(in crate::contract) mod sqlite {
             SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
         } else {
             let conn_str = CONFIG.config_paths.db_dir.join("locutus.db");
-            log::info!("loading contract store from {conn_str:?}");
+            tracing::info!("loading contract store from {conn_str:?}");
             SqliteConnectOptions::new()
                 .create_if_missing(true)
                 .filename(conn_str)
         };
-        opts.log_statements(log::LevelFilter::Debug);
+        opts.log_statements(tracing::log::LevelFilter::Debug);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async move { SqlitePool::connect_with(opts).await })

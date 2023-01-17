@@ -67,7 +67,7 @@ pub mod local_node {
                 }
                 Err(either::Left(RequestError::Disconnect)) => {}
                 Err(either::Left(err)) => {
-                    log::error!("{err}");
+                    tracing::error!("{err}");
                     http_handle
                         .send(
                             id,
@@ -76,7 +76,7 @@ pub mod local_node {
                         .await?;
                 }
                 Err(either::Right(err)) => {
-                    log::error!("{err}");
+                    tracing::error!("{err}");
                     http_handle
                         .send(
                             id,
