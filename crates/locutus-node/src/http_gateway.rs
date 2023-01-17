@@ -63,7 +63,7 @@ impl HttpGateway {
             .map(|rs, ws: warp::ws::Ws| {
                 ws.on_upgrade(|ws: WebSocket| async {
                     if let Err(e) = websocket_interface(rs, ws).await {
-                        log::error!("{e}");
+                        tracing::error!("{e}");
                     }
                 })
             });
@@ -282,7 +282,7 @@ async fn process_host_response(
             ))?;
             tx.send(Message::binary(result_error)).await?;
             tx.send(Message::close()).await?;
-            log::warn!("node shut down while handling responses for {client_id}");
+            tracing::warn!("node shut down while handling responses for {client_id}");
             Err(format!("node shut down while handling responses for {client_id}").into())
         }
     }
@@ -321,7 +321,7 @@ impl HttpGateway {
                             .with_notification(tx),
                     ))
                 } else {
-                    log::warn!("client: {client_id} not found");
+                    tracing::warn!("client: {client_id} not found");
                     Err(ErrorKind::UnknownClient(client_id.into()).into())
                 }
             }
@@ -367,7 +367,7 @@ impl ClientEventsProxy for HttpGateway {
                     self.response_channels.insert(id, ch);
                 }
             } else {
-                log::warn!("client: {id} not found");
+                tracing::warn!("client: {id} not found");
             }
             Ok(())
         }

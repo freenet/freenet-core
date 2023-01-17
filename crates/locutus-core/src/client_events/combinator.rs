@@ -93,7 +93,9 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                             request,
                             notification_channel,
                         }) => {
-                            log::debug!("received request; internal_id={external}; req={request}");
+                            tracing::debug!(
+                                "received request; internal_id={external}; req={request}"
+                            );
                             let id =
                                 *self.external_clients[idx]
                                     .entry(external)
@@ -159,20 +161,20 @@ async fn client_fn(
                         break;
                     }
                 } else {
-                    log::debug!("disconnected host");
+                    tracing::debug!("disconnected host");
                     break;
                 }
             }
             client_msg = client.recv() => {
                 match client_msg {
                     Ok(OpenRequest {id,  request, notification_channel}) => {
-                        log::debug!("received msg @ combinator from external id {id}, msg: {request}");
+                        tracing::debug!("received msg @ combinator from external id {id}, msg: {request}");
                         if tx_host.send(Ok(OpenRequest { id,  request, notification_channel })).await.is_err() {
                             break;
                         }
                     }
                     Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) =>{
-                        log::debug!("disconnected client");
+                        tracing::debug!("disconnected client");
                         let _ = tx_host.send(Err(err)).await;
                         break;
                     }
@@ -183,7 +185,7 @@ async fn client_fn(
             }
         }
     }
-    log::error!("client shut down");
+    tracing::error!("client shut down");
 }
 
 /// An optimized for the use case version of `futures::select_all` which keeps ordering.

@@ -35,7 +35,7 @@ pub struct Config {
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::Keypair>,
-    pub log_level: log::LevelFilter,
+    pub log_level: tracing::log::LevelFilter,
     pub config_paths: ConfigPaths,
 
     #[cfg(feature = "websocket")]
@@ -156,7 +156,7 @@ impl Config {
             .map(|lvl| lvl.parse().ok())
             .ok()
             .flatten()
-            .unwrap_or(log::LevelFilter::Info);
+            .unwrap_or(tracing::log::LevelFilter::Info);
         let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
         let config_paths = ConfigPaths::new()?;
 
