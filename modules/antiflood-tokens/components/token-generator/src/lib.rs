@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Keypair, Signer};
+use hashbrown::{HashMap, HashSet};
 use locutus_aft_interface::{AllocationCriteria, Tier, TokenAllocationRecord, TokenAssignment};
 use locutus_stdlib::{prelude::*, time};
 use serde::{Deserialize, Serialize};
@@ -8,38 +9,218 @@ type Assignee = Vec<u8>;
 
 struct TokenComponent;
 
-#[derive(Debug, Serialize, Deserialize)]
-enum TokenComponentMessage {
-    RequestNewToken {
-        component_id: SecretsId,
-        criteria: AllocationCriteria,
-        records: TokenAllocationRecord,
-        assignee: Assignee,
-        context: Option<Context>,
-    },
-}
-
-impl TokenComponentMessage {
-    fn add_context(&mut self, new_context: Context) {
-        match self {
-            TokenComponentMessage::RequestNewToken { context, .. } => {
-                context.replace(new_context);
+impl ComponentInterface for TokenComponent {
+    fn process(message: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
+        match message {
+            InboundComponentMsg::ApplicationMessage(ApplicationMessage {
+                app,
+                payload,
+                context,
+                processed,
+                ..
+            }) => {
+                if processed {
+                    return Err(ComponentError::Other(
+                        "cannot process an already processed message".into(),
+                    ));
+                }
+                let mut context = Context::try_from(context)?;
+                let msg = TokenComponentMessage::try_from(&*payload)?;
+                match msg {
+                    TokenComponentMessage::RequestNewToken(req) => {
+                        allocate_token(&mut context, app, req)
+                    }
+                    TokenComponentMessage::ReturnNewToken {
+                        component_id,
+                        records,
+                    } => {
+                        todo!()
+                    }
+                    TokenComponentMessage::Failure => todo!(),
+                }
+            }
+            InboundComponentMsg::GetSecretResponse(_) => todo!(),
+            InboundComponentMsg::RandomBytes(_) => todo!(),
+            InboundComponentMsg::UserResponse(UserInputResponse {
+                request_id,
+                response,
+                context,
+            }) => {
+                let mut context = Context::try_from(context)?;
+                context.waiting_for_user_input.remove(&request_id);
+                let response = serde_json::from_slice(&*response)
+                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                context.user_response.insert(request_id, response);
+                // let msg = ApplicationMessage {
+                //     app: todo!(),
+                //     payload: todo!(),
+                //     context: todo!(),
+                //     processed: todo!(),
+                // };
+                Ok(vec![])
             }
         }
     }
 }
 
-impl TryFrom<TokenComponentMessage> for OutboundComponentMsg {
-    type Error = ComponentError;
-    fn try_from(msg: TokenComponentMessage) -> Result<Self, Self::Error> {
-        todo!()
+const RESPONSES: &[&str] = &["true", "false"];
+
+fn user_input() -> NotificationMessage<'static> {
+    todo!()
+}
+
+fn allocate_token(
+    context: &mut Context,
+    app: ContractInstanceId,
+    req: RequestNewToken,
+) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
+    let RequestNewToken {
+        request_id,
+        component_id,
+        criteria,
+        mut records,
+        assignee,
+    } = req;
+    let request = context
+        .waiting_for_user_input
+        .iter()
+        .find(|p| **p == request_id)
+        .copied();
+    let response = context.user_response.get(&request_id);
+    match (&context.key_pair, request, response) {
+        (None, _, _) => {
+            // lacks keys; ask for keys
+            let context: ComponentContext = (&*context).try_into()?;
+            let request_secret = {
+                GetSecretRequest {
+                    key: component_id.clone(),
+                    context: context.clone(),
+                    processed: false,
+                }
+                .into()
+            };
+            let req_allocation = {
+                let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
+                    request_id,
+                    component_id,
+                    criteria,
+                    records,
+                    assignee,
+                });
+                let serialized = bincode::serialize(&msg)
+                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                OutboundComponentMsg::ApplicationMessage(
+                    ApplicationMessage::new(app, serialized, false).with_context(context),
+                )
+            };
+            Ok(vec![request_secret, req_allocation])
+        }
+        (Some(_), None, None) => {
+            // request user input and add to waiting queue
+            context.waiting_for_user_input.insert(request_id);
+            let context: ComponentContext = (&*context).try_into()?;
+            let req_allocation = {
+                let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
+                    request_id,
+                    component_id,
+                    criteria,
+                    records,
+                    assignee,
+                });
+                let serialized = bincode::serialize(&msg)
+                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                OutboundComponentMsg::ApplicationMessage(
+                    ApplicationMessage::new(app, serialized, false).with_context(context),
+                )
+            };
+            let request_user_input = OutboundComponentMsg::RequestUserInput(UserInputRequest {
+                request_id,
+                responses: RESPONSES
+                    .iter()
+                    .map(|s| ClientResponse::new(s.as_bytes().to_vec()))
+                    .collect(),
+                message: user_input(),
+            });
+            Ok(vec![request_user_input, req_allocation])
+        }
+        (Some(_), Some(_), _) => {
+            // waiting for response
+            let context: ComponentContext = (&*context).try_into()?;
+            let req_allocation = {
+                let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
+                    request_id,
+                    component_id,
+                    criteria,
+                    records,
+                    assignee,
+                });
+                let serialized = bincode::serialize(&msg)
+                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                OutboundComponentMsg::ApplicationMessage(
+                    ApplicationMessage::new(app, serialized, false).with_context(context),
+                )
+            };
+            Ok(vec![req_allocation])
+        }
+        (Some(keypair), _, Some(response)) => {
+            // got response, check if allocation is allowed and return to application
+            let application_response = match response {
+                Response::Allowed => {
+                    records.assign(assignee, criteria.frequency, keypair);
+                    let context: ComponentContext = (&*context).try_into()?;
+                    // TODO: fix response type
+                    let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
+                        request_id,
+                        component_id,
+                        criteria,
+                        records,
+                        assignee: vec![],
+                    });
+                    let serialized = bincode::serialize(&msg)
+                        .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                    OutboundComponentMsg::ApplicationMessage(
+                        ApplicationMessage::new(app, serialized, false).with_context(context),
+                    )
+                }
+                Response::NotAllowed => todo!("return to application communicating the denial"),
+            };
+            context.user_response.remove(&request_id);
+            Ok(vec![application_response])
+        }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum TokenComponentMessage {
+    RequestNewToken(RequestNewToken),
+    ReturnNewToken {
+        component_id: SecretsId,
+        records: TokenAllocationRecord,
+    },
+    Failure,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RequestNewToken {
+    request_id: u32,
+    component_id: SecretsId,
+    criteria: AllocationCriteria,
+    records: TokenAllocationRecord,
+    assignee: Assignee,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct Context {
+    waiting_for_user_input: HashSet<u32>,
+    user_response: HashMap<u32, Response>,
     /// The token generator instance key pair (pub + secret key).
     key_pair: Option<Keypair>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Response {
+    Allowed,
+    NotAllowed,
 }
 
 impl TryFrom<ComponentContext> for Context {
@@ -60,86 +241,12 @@ impl TryFrom<&Context> for ComponentContext {
     }
 }
 
-impl<'a> TryFrom<InboundComponentMsg<'a>> for TokenComponentMessage {
+impl TryFrom<&[u8]> for TokenComponentMessage {
     type Error = ComponentError;
 
-    fn try_from(msg: InboundComponentMsg) -> Result<Self, Self::Error> {
-        match msg {
-            InboundComponentMsg::ApplicationMessage(ApplicationMessage {
-                app,
-                payload,
-                processed,
-                context,
-                ..
-            }) => {
-                // todo: check that the contract instance id is matching?
-                if processed {
-                    return Err(ComponentError::Other(
-                        "message should have not been previously processed".into(),
-                    ));
-                }
-                let context = Context::try_from(context)?;
-                let mut msg: TokenComponentMessage = bincode::deserialize(&payload)
-                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
-                msg.add_context(context);
-                Ok(msg)
-            }
-            InboundComponentMsg::GetSecretResponse(_) => todo!(),
-            InboundComponentMsg::RandomBytes(_) => todo!(),
-            InboundComponentMsg::UserResponse(_) => todo!(),
-        }
+    fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
+        bincode::deserialize(payload).map_err(|err| ComponentError::Deser(format!("{err}")))
     }
-}
-
-#[component]
-impl ComponentInterface for TokenComponent {
-    fn process(message: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
-        let msg = TokenComponentMessage::try_from(message)?;
-        match msg {
-            TokenComponentMessage::RequestNewToken {
-                component_id,
-                criteria,
-                records,
-                assignee,
-                context,
-            } => {
-                let ctx = context.as_ref().unwrap();
-                if let Some(keys) = &ctx.key_pair {
-                    request_allocation(criteria, assignee, records, keys);
-                } else {
-                    let request_secret = {
-                        let context = (&Context::default()).try_into()?;
-                        GetSecretRequest {
-                            key: component_id.clone(),
-                            context,
-                            processed: false,
-                        }
-                        .into()
-                    };
-                    let allocate_msg = TokenComponentMessage::RequestNewToken {
-                        component_id,
-                        criteria,
-                        records,
-                        assignee,
-                        context,
-                    };
-                    return Ok(vec![request_secret, allocate_msg.try_into()?]);
-                }
-            }
-        }
-        todo!()
-    }
-}
-
-fn request_allocation(
-    criteria: AllocationCriteria,
-    assignee: Assignee,
-    mut records: TokenAllocationRecord,
-    keys: &Keypair,
-) {
-    let tier = criteria.frequency;
-    records.assign(assignee, tier, keys);
-    todo!()
 }
 
 // TODO: clarify where this functionality would be called, e.g.:

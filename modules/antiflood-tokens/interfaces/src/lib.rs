@@ -5,6 +5,23 @@ use serde::{Deserialize, Serialize};
 
 type Assignment = Vec<u8>;
 
+/*
+1. Alice has Bob pub key
+2. Bob inbox contract specifies the token assignment criteria (tier, recency, etc.). 
+IMPORTANT: Bob must be able to change that setting and that setting must be accesible publically
+must keep track of when changes are done to not invalidate old messages;
+messages should be indexed, and we can use that to keep track of what seetings should apply to each message
+---
+* Tokens are "generated" (or available) by the component all the time.
+* Tokens max allowed age are specified by the inbox contract of the receiver.
+---
+3. Component verifies that Allice agrees with allocating tokens for Bob's messages (or all messages).
+...
+4. Bob's inbox uses the related contract mechanism to verify that Alice's token assignment is present on Alice's
+5. The anti-flood token generator contract and its signature match the message.
+6. Bob periodically reads his inbox and clears his inbox contract once the messages are downloaded/read.
+*/
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Tier {
     Min1,
@@ -134,14 +151,6 @@ pub struct TokenAllocationRecord {
     ///
     /// This is categorized by tiers and then sorted by time slot.
     pub tokens_by_tier: hashbrown::HashMap<Tier, Vec<TokenAssignment>>,
-}
-
-impl TokenAllocationRecord {
-    /// Gets the criteria to allocate tokens for this contract
-    // TODO: how this should be consulted? should be appended to the record? or form part of the contract params?
-    pub fn get_criteria(&self) -> AllocationCriteria {
-        todo!()
-    }
 }
 
 impl TryFrom<State<'_>> for TokenAllocationRecord {

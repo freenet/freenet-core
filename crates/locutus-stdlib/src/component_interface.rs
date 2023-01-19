@@ -1,6 +1,7 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt::Display,
+    ops::Deref,
     path::Path,
 };
 
@@ -264,9 +265,10 @@ impl ApplicationMessage {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UserInputResponse<'a> {
-    request_id: u32,
+    pub request_id: u32,
     #[serde(borrow)]
-    response: ClientResponse<'a>,
+    pub response: ClientResponse<'a>,
+    pub context: ComponentContext,
 }
 
 impl UserInputResponse<'_> {
@@ -274,6 +276,7 @@ impl UserInputResponse<'_> {
         UserInputResponse {
             request_id: self.request_id,
             response: self.response.into_owned(),
+            context: self.context,
         }
     }
 }
@@ -385,7 +388,18 @@ pub struct ClientResponse<'a>(
     Cow<'a, [u8]>,
 );
 
+impl Deref for ClientResponse<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
 impl ClientResponse<'_> {
+    pub fn new(response: Vec<u8>) -> Self {
+        Self(response.into())
+    }
     pub fn into_owned(self) -> ClientResponse<'static> {
         ClientResponse(self.0.into_owned().into())
     }
@@ -393,12 +407,12 @@ impl ClientResponse<'_> {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UserInputRequest<'a> {
-    request_id: u32,
+    pub request_id: u32,
     #[serde(borrow)]
     /// An interpretable message by the notification system.
-    message: NotificationMessage<'a>,
+    pub message: NotificationMessage<'a>,
     /// If a response is required from the user they can be chosen from this list.
-    responses: Vec<ClientResponse<'a>>,
+    pub responses: Vec<ClientResponse<'a>>,
 }
 
 impl UserInputRequest<'_> {
