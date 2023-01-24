@@ -91,7 +91,7 @@ where
                     let sender = op_storage.ring.own_location();
 
                     let key = contract.key();
-                    log::debug!(
+                    tracing::debug!(
                         "Performing a RequestPut for contract {} from {} to {}",
                         key,
                         sender.peer,
@@ -123,7 +123,7 @@ where
                     let key = contract.key();
                     let is_cached_contract = op_storage.ring.is_contract_cached(&key);
 
-                    log::debug!(
+                    tracing::debug!(
                         "Performing a SeekNode at {}, trying put the contract {}",
                         target.peer,
                         key
@@ -134,7 +134,7 @@ where
                             .ring
                             .within_caching_distance(&Location::from(&key))
                     {
-                        log::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
+                        tracing::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
                         match try_to_cache_contract(op_storage, &contract, &key).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
@@ -143,16 +143,16 @@ where
                         // in this case forward to a closer node to the target location and just wait for a response
                         // to give back to requesting peer
                         // FIXME
-                        log::warn!(
+                        tracing::warn!(
                             "Contract {} not found while processing info, forwarding",
                             key
                         );
                     }
 
                     // after the contract has been cached, push the update query
-                    log::debug!("Attempting contract value update");
+                    tracing::debug!("Attempting contract value update");
                     let new_value = put_contract(op_storage, key.clone(), value).await?;
-                    log::debug!("Contract successfully updated");
+                    tracing::debug!("Contract successfully updated");
                     // if the change was successful, communicate this back to the requestor and broadcast the change
                     conn_manager
                         .send(
@@ -185,7 +185,7 @@ where
                         .subscribers_of(&key)
                         .map(|i| i.value().to_vec())
                         .unwrap_or_default();
-                    log::debug!(
+                    tracing::debug!(
                         "Successfully updated a value for contract {} @ {:?}",
                         key,
                         target.location
@@ -218,9 +218,9 @@ where
                 } => {
                     let target = op_storage.ring.own_location();
 
-                    log::debug!("Attempting contract value update");
+                    tracing::debug!("Attempting contract value update");
                     let new_value = put_contract(op_storage, key.clone(), new_value).await?;
-                    log::debug!("Contract successfully updated");
+                    tracing::debug!("Contract successfully updated");
 
                     let broadcast_to = op_storage
                         .ring
@@ -235,7 +235,7 @@ where
                             subscribers
                         })
                         .unwrap_or_default();
-                    log::debug!(
+                    tracing::debug!(
                         "Successfully updated a value for contract {} @ {:?}",
                         key,
                         target.location
@@ -297,7 +297,7 @@ where
                     for (peer_num, err) in error_futures {
                         // remove the failed peers in reverse order
                         let peer = broadcast_to.remove(peer_num);
-                        log::warn!(
+                        tracing::warn!(
                             "failed broadcasting put change to {} with error {}; dropping connection",
                             peer.peer,
                             err
@@ -307,7 +307,7 @@ where
                     }
 
                     broadcasted_to += broadcast_to.len() - incorrect_results;
-                    log::debug!(
+                    tracing::debug!(
                         "successfully broadcasted put into contract {key} to {broadcasted_to} peers"
                     );
 
@@ -318,13 +318,13 @@ where
                 PutMsg::SuccessfulUpdate { .. } => {
                     match self.state {
                         Some(PutState::AwaitingResponse { contract, .. }) => {
-                            log::debug!("Successfully updated value for {}", contract,);
+                            tracing::debug!("Successfully updated value for {}", contract,);
                             new_state = None;
                             return_msg = None;
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     };
-                    log::debug!(
+                    tracing::debug!(
                         "Peer {} completed contract value put",
                         op_storage.ring.peer_key
                     );
@@ -339,7 +339,7 @@ where
                     let key = contract.key();
                     let peer_loc = op_storage.ring.own_location();
 
-                    log::debug!(
+                    tracing::debug!(
                         "Forwarding changes at {}, trying put the contract {}",
                         peer_loc.peer,
                         key
@@ -419,10 +419,10 @@ async fn try_to_cache_contract<'a, CErr: std::error::Error>(
         .await?;
     if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
         op_storage.ring.contract_cached(key);
-        log::debug!("Contract successfully cached");
+        tracing::debug!("Contract successfully cached");
         Ok(())
     } else {
-        log::error!(
+        tracing::error!(
             "Contract handler returned wrong event when trying to cache contract, this should not happen!"
         );
         Err(OpError::UnexpectedOpState)
@@ -445,7 +445,7 @@ async fn try_to_broadcast<CErr: std::error::Error>(
         Some(PutState::ReceivedRequest | PutState::BroadcastOngoing { .. }) => {
             if broadcast_to.is_empty() {
                 // broadcast complete
-                log::debug!(
+                tracing::debug!(
                     "Empty broadcast list while updating value for contract {}",
                     key
                 );
@@ -453,7 +453,7 @@ async fn try_to_broadcast<CErr: std::error::Error>(
                 new_state = None;
                 return_msg = Some(PutMsg::SuccessfulUpdate { id, new_value });
             } else {
-                log::debug!("Callback to start broadcasting to other nodes");
+                tracing::debug!("Callback to start broadcasting to other nodes");
                 new_state = Some(PutState::BroadcastOngoing);
                 return_msg = Some(PutMsg::Broadcasting {
                     id,
@@ -487,7 +487,7 @@ pub(crate) fn start_op(
     peer: &PeerKey,
 ) -> PutOp {
     let key = contract.key();
-    log::debug!(
+    tracing::debug!(
         "Requesting put to contract {} @ loc({})",
         key,
         Location::from(&key)

@@ -232,7 +232,7 @@ impl P2pConnManager {
         loop {
             let net_msg = self.swarm.select_next_some().map(|event| match event {
                 SwarmEvent::Behaviour(NetEvent::Locutus(msg)) => {
-                    log::debug!("Message inbound: {:?}", msg);
+                    tracing::debug!("Message inbound: {:?}", msg);
                     Ok(Left(*msg))
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -241,7 +241,7 @@ impl P2pConnManager {
                     }))
                 }
                 SwarmEvent::Dialing(peer_id) => {
-                    log::debug!("Attempting connection to {}", peer_id);
+                    tracing::debug!("Attempting connection to {}", peer_id);
                     Ok(Right(ConnMngrActions::NoAction))
                 }
                 SwarmEvent::Behaviour(NetEvent::Identify(id)) => {
@@ -252,7 +252,7 @@ impl P2pConnManager {
                                 address: info.observed_addr,
                             }))
                         } else {
-                            log::warn!("Incompatible peer: {}, disconnecting", peer_id);
+                            tracing::warn!("Incompatible peer: {}, disconnecting", peer_id);
                             Ok(Right(ConnMngrActions::ConnectionClosed {
                                 peer: PeerKey::from(peer_id),
                             }))
@@ -267,7 +267,7 @@ impl P2pConnManager {
                         peer,
                         ..
                     }) => {
-                        log::debug!(
+                        tracing::debug!(
                             "Successful autonat probe, established conn with {peer} @ {address}"
                         );
                         Ok(Right(ConnMngrActions::ConnectionEstablished {
@@ -289,13 +289,13 @@ impl P2pConnManager {
                         new: autonat::NatStatus::Public(address),
                         ..
                     } => {
-                        log::debug!("NAT status: public @ {address}");
+                        tracing::debug!("NAT status: public @ {address}");
                         Ok(Right(ConnMngrActions::UpdatePublicAddr(address)))
                     }
                     _ => Ok(Right(ConnMngrActions::NoAction)),
                 },
                 other_event => {
-                    log::debug!("Received other swarm event: {:?}", other_event);
+                    tracing::debug!("Received other swarm event: {:?}", other_event);
                     Ok(Right(ConnMngrActions::NoAction))
                 }
             });
@@ -308,7 +308,7 @@ impl P2pConnManager {
 
             let bridge_msg = self.conn_bridge_rx.recv().map(|msg| match msg {
                 Some(Left((peer, msg))) => {
-                    log::debug!("Message outbound: {:?}", msg);
+                    tracing::debug!("Message outbound: {:?}", msg);
                     Ok(Right(SendMessage { peer, msg }))
                 }
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
@@ -340,7 +340,7 @@ impl P2pConnManager {
                                     if tx_type == TransactionType::JoinRing
                                         && self.public_addr.is_none() /* FIXME: this should be not a gateway instead */ =>
                                 {
-                                    log::warn!("Retrying joining the ring with an other peer");
+                                    tracing::warn!("Retrying joining the ring with an other peer");
                                     let gateway = self.gateways.iter().shuffle().next().unwrap();
                                     join_ring_request(
                                         None,
@@ -367,7 +367,7 @@ impl P2pConnManager {
                     }
                 }
                 Ok(Right(SendMessage { peer, msg })) => {
-                    log::debug!(
+                    tracing::debug!(
                         "Sending swarm message from {} to {}",
                         op_manager.ring.peer_key,
                         peer
@@ -379,11 +379,11 @@ impl P2pConnManager {
                         .push_front((peer.0, Left(*msg)));
                 }
                 Ok(Right(NodeAction(NodeEvent::ShutdownNode))) => {
-                    log::info!("Shutting down message loop gracefully");
+                    tracing::info!("Shutting down message loop gracefully");
                     break;
                 }
                 Ok(Right(NodeAction(NodeEvent::Error(err)))) => {
-                    log::error!("Bridge conn error: {err}");
+                    tracing::error!("Bridge conn error: {err}");
                 }
                 Ok(Right(NodeAction(NodeEvent::AcceptConnection(_key)))) => {
                     // todo: if we prefilter connections, should only accept ones informed this way
@@ -393,7 +393,7 @@ impl P2pConnManager {
                     address: addr,
                     peer,
                 })) => {
-                    log::debug!("Established connection with peer {} @ {}", peer, addr);
+                    tracing::debug!("Established connection with peer {} @ {}", peer, addr);
                     self.bridge.active_net_connections.insert(peer, addr);
                 }
                 Ok(Right(ConnectionClosed { peer: peer_id }))
@@ -402,7 +402,7 @@ impl P2pConnManager {
                     op_manager.prune_connection(peer_id);
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     let _ = self.swarm.disconnect_peer_id(peer_id.0);
-                    log::debug!("Dropped connection with peer {}", peer_id);
+                    tracing::debug!("Dropped connection with peer {}", peer_id);
                 }
                 Ok(Right(UpdatePublicAddr(address))) => {
                     self.public_addr = Some(address);
@@ -411,7 +411,7 @@ impl P2pConnManager {
                     todo!("attempt hole punching")
                 }
                 Ok(Right(ClosedChannel)) => {
-                    log::info!("Notification channel closed");
+                    tracing::info!("Notification channel closed");
                     break;
                 }
                 Err(err) => {
@@ -525,7 +525,7 @@ impl NetworkBehaviour for LocutusBehaviour {
 
         if let Some((peer_id, msg)) = self.outbound.pop_back() {
             if let Right(NodeEvent::Error(err)) = msg {
-                log::warn!("Connection error: {}", err);
+                tracing::warn!("Connection error: {}", err);
                 return Poll::Pending;
             }
 
@@ -757,7 +757,7 @@ impl ProtocolsHandler for Handler {
                 }
             }
             HandlerEvent::Outbound(Right(node_ev)) => {
-                log::debug!("Received node event at connection handler: {node_ev}");
+                tracing::debug!("Received node event at connection handler: {node_ev}");
             }
             HandlerEvent::Inbound(_) => unreachable!(),
         }

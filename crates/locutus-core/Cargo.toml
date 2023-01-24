@@ -35,7 +35,6 @@ libp2p = { version = "0.42.2", features = [
     "tcp-tokio",
     "yamux"
 ], default-features = false }
-log = { version = "0.4", features = ["serde"] }
 once_cell = "1"
 parking_lot = "0.12.0"
 rand = { workspace = true }
@@ -71,6 +70,6 @@ locutus-stdlib = { path = "../locutus-stdlib", features = ["testing", "net"] }
 
 [features]
 testing = ["arbitrary"]
-default = ["websocket"]
+default = ["websocket", "trace"]
 websocket = ["warp/websocket", "rmp-serde"]
 trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]

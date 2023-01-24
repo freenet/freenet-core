@@ -147,7 +147,7 @@ async fn responses(
                     Some((client_id, response)) => {
                         if let Some(ch) = clients.get_mut(&client_id) {
                             if Sender::send(ch, response).await.is_err() {
-                                log::error!("Tried to send an a response to an unregistered client");
+                                tracing::error!("Tried to send an a response to an unregistered client");
                                 return;
                             }
                         } else {

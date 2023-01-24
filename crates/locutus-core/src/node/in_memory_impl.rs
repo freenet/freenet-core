@@ -107,7 +107,7 @@ where
                     state,
                 })
                 .await?;
-            log::debug!(
+            tracing::debug!(
                 "Appended contract {} to peer {}",
                 key,
                 self.op_storage.ring.peer_key
@@ -122,7 +122,7 @@ where
                         .add_subscriber(&key, *subscriber)
                         .is_err()
                     {
-                        log::warn!("Max subscribers for contract {} reached", key);
+                        tracing::warn!("Max subscribers for contract {} reached", key);
                         break;
                     }
                 }
@@ -157,7 +157,7 @@ where
                     Err(OpError::MaxRetriesExceeded(_, _))
                         if tx_type == TransactionType::JoinRing && !self.is_gateway =>
                     {
-                        log::warn!("Retrying joining the ring with an other peer");
+                        tracing::warn!("Retrying joining the ring with an other peer");
                         let gateway = self.gateways.iter().shuffle().next().unwrap();
                         join_ring_request(
                             None,
@@ -182,7 +182,7 @@ where
                     NodeEvent::DropConnection(_) => continue,
                     NodeEvent::AcceptConnection(_) => continue,
                     NodeEvent::Error(err) => {
-                        log::error!("Connection error within ops: {err}");
+                        tracing::error!("Connection error within ops: {err}");
                         continue;
                     }
                 },

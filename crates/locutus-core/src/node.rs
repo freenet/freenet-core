@@ -269,12 +269,12 @@ where
         join_ring::initial_request(peer_key, *gateway, op_storage.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
-        log::warn!(
+        tracing::warn!(
             "Performing a new join attempt, attempt number: {}",
             backoff.retries()
         );
         if backoff.sleep_async().await.is_none() {
-            log::error!("Max number of retries reached");
+            tracing::error!("Max number of retries reached");
             return Err(OpError::MaxRetriesExceeded(
                 tx_id,
                 format!("{:?}", tx_id.tx_type()),
@@ -301,7 +301,7 @@ async fn client_event_handling<ClientEv, CErr>(
         } = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
         if let ClientRequest::Disconnect { .. } = request {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
-                log::error!("{}", err);
+                tracing::error!("{}", err);
             }
             break;
         }
@@ -316,7 +316,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         related_contracts,
                     } => {
                         // Initialize a put op.
-                        log::debug!(
+                        tracing::debug!(
                             "Received put from user event @ {}",
                             &op_storage_cp.ring.peer_key
                         );
@@ -327,7 +327,7 @@ async fn client_event_handling<ClientEv, CErr>(
                             &op_storage_cp.ring.peer_key,
                         );
                         if let Err(err) = put::request_put(&op_storage_cp, op).await {
-                            log::error!("{}", err);
+                            tracing::error!("{}", err);
                         }
                         todo!("use `related_contracts`: {related_contracts:?}")
                     }
@@ -342,13 +342,13 @@ async fn client_event_handling<ClientEv, CErr>(
                         fetch_contract: contract,
                     } => {
                         // Initialize a get op.
-                        log::debug!(
+                        tracing::debug!(
                             "Received get from user event @ {}",
                             &op_storage_cp.ring.peer_key
                         );
                         let op = get::start_op(key, contract, &op_storage_cp.ring.peer_key);
                         if let Err(err) = get::request_get(&op_storage_cp, op).await {
-                            log::error!("{}", err);
+                            tracing::error!("{}", err);
                         }
                     }
                     ContractRequest::Subscribe { key, .. } => {
@@ -361,7 +361,7 @@ async fn client_event_handling<ClientEv, CErr>(
                                 Err(OpError::ContractError(ContractError::ContractNotFound(
                                     key,
                                 ))) => {
-                                    log::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
+                                    tracing::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
                                     let get_op = get::start_op(
                                         key.clone(),
                                         true,
@@ -369,12 +369,12 @@ async fn client_event_handling<ClientEv, CErr>(
                                     );
                                     if let Err(err) = get::request_get(&op_storage_cp, get_op).await
                                     {
-                                        log::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
+                                        tracing::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
                                         tokio::time::sleep(Duration::from_secs(5)).await;
                                     }
                                 }
                                 Err(err) => {
-                                    log::error!("{}", err);
+                                    tracing::error!("{}", err);
                                     break;
                                 }
                                 Ok(()) => break,
@@ -393,7 +393,7 @@ async fn client_event_handling<ClientEv, CErr>(
 
 macro_rules! log_handling_msg {
     ($op:expr, $id:expr, $op_storage:ident) => {
-        log::debug!(
+        tracing::debug!(
             concat!("Handling ", $op, " get request @ {} (tx: {})"),
             $op_storage.ring.peer_key,
             $id
@@ -407,7 +407,7 @@ where
     CErr: std::error::Error,
 {
     if let Err(err) = op_result {
-        log::debug!("Finished tx w/ error: {}", err)
+        tracing::debug!("Finished tx w/ error: {}", err)
     }
 }
 
@@ -480,7 +480,7 @@ where
     CErr: std::error::Error,
     CM: ConnectionBridge + Send + Sync,
 {
-    log::warn!("Failed tx `{}`, potentially attempting a retry", tx);
+    tracing::warn!("Failed tx `{}`, potentially attempting a retry", tx);
     match tx.tx_type() {
         TransactionType::JoinRing => {
             const MSG: &str = "Fatal error: unable to connect to the network";
@@ -516,9 +516,9 @@ where
                         .next()
                         .expect("at least one gateway");
                     if !cfg!(test) {
-                        log::error!("{}", MSG);
+                        tracing::error!("{}", MSG);
                     } else {
-                        log::debug!("{}", MSG);
+                        tracing::debug!("{}", MSG);
                     }
                     join_ring_request(None, peer_key, rand_gw, op_storage, conn_manager).await?;
                 }
