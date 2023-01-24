@@ -112,6 +112,12 @@ impl SecretsId {
     }
 }
 
+impl Display for SecretsId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.encode())
+    }
+}
+
 pub trait ComponentInterface {
     /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the component must be stored using the secret mechanism.
@@ -283,9 +289,11 @@ impl UserInputResponse<'_> {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum OutboundComponentMsg {
-    // from the apps
+    // for the apps
     ApplicationMessage(ApplicationMessage),
     RequestUserInput(#[serde(deserialize_with = "deser_func")] UserInputRequest<'static>),
+    // todo: remove when context can be accessed from the component environment and we pass it as reference
+    ContextUpdated(ComponentContext),
     // from the node
     GetSecretRequest(GetSecretRequest),
     SetSecretRequest(SetSecretRequest),
@@ -316,6 +324,7 @@ impl OutboundComponentMsg {
             OutboundComponentMsg::RandomBytesRequest(_) => false,
             OutboundComponentMsg::SetSecretRequest(_) => false,
             OutboundComponentMsg::RequestUserInput(_) => true,
+            OutboundComponentMsg::ContextUpdated(_) => true,
         }
     }
 

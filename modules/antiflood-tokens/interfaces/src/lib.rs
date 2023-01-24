@@ -1,26 +1,15 @@
 use chrono::{DateTime, Duration, SubsecRound, Timelike, Utc};
 use ed25519_dalek::{PublicKey, Signature};
 use locutus_stdlib::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 type Assignment = Vec<u8>;
 
-/*
-1. Alice has Bob pub key
-2. Bob inbox contract specifies the token assignment criteria (tier, recency, etc.). 
-IMPORTANT: Bob must be able to change that setting and that setting must be accesible publically
-must keep track of when changes are done to not invalidate old messages;
-messages should be indexed, and we can use that to keep track of what seetings should apply to each message
----
-* Tokens are "generated" (or available) by the component all the time.
-* Tokens max allowed age are specified by the inbox contract of the receiver.
----
-3. Component verifies that Allice agrees with allocating tokens for Bob's messages (or all messages).
-...
-4. Bob's inbox uses the related contract mechanism to verify that Alice's token assignment is present on Alice's
-5. The anti-flood token generator contract and its signature match the message.
-6. Bob periodically reads his inbox and clears his inbox contract once the messages are downloaded/read.
-*/
+/// Contracts making use of the allocation must implement a type with this trait that allows
+/// extracting the criteria for the given contract.
+pub trait TokenAllocation: DeserializeOwned {
+    fn get_criteria(&self) -> AllocationCriteria;
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -71,7 +60,7 @@ impl Tier {
         }
     }
 
-    /// Given a datetime, get the next closest free slot for this tier.
+    /// Given a datetime, get the oldest free slot for this tier.
     pub fn next_assignment(&self, mut date: DateTime<Utc>) -> DateTime<Utc> {
         match self {
             Tier::Min1 => {
@@ -163,7 +152,8 @@ impl TryFrom<State<'_>> for TokenAllocationRecord {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[must_use]
 pub struct TokenAssignment {
     pub tier: Tier,
     pub time_slot: DateTime<Utc>,

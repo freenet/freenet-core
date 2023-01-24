@@ -30,17 +30,12 @@ impl ComponentInterface for TokenComponent {
                     TokenComponentMessage::RequestNewToken(req) => {
                         allocate_token(&mut context, app, req)
                     }
-                    TokenComponentMessage::ReturnNewToken {
-                        component_id,
-                        records,
-                    } => {
-                        todo!()
-                    }
                     TokenComponentMessage::Failure => todo!(),
+                    TokenComponentMessage::AllocatedToken { .. } => Err(ComponentError::Other(
+                        "unexpected message type: allocated token".into(),
+                    )),
                 }
             }
-            InboundComponentMsg::GetSecretResponse(_) => todo!(),
-            InboundComponentMsg::RandomBytes(_) => todo!(),
             InboundComponentMsg::UserResponse(UserInputResponse {
                 request_id,
                 response,
@@ -48,17 +43,30 @@ impl ComponentInterface for TokenComponent {
             }) => {
                 let mut context = Context::try_from(context)?;
                 context.waiting_for_user_input.remove(&request_id);
-                let response = serde_json::from_slice(&*response)
+                let response = serde_json::from_slice(&response)
                     .map_err(|err| ComponentError::Deser(format!("{err}")))?;
                 context.user_response.insert(request_id, response);
-                // let msg = ApplicationMessage {
-                //     app: todo!(),
-                //     payload: todo!(),
-                //     context: todo!(),
-                //     processed: todo!(),
-                // };
-                Ok(vec![])
+                let context: ComponentContext = (&context).try_into()?;
+                Ok(vec![OutboundComponentMsg::ContextUpdated(context)])
             }
+            InboundComponentMsg::GetSecretResponse(GetSecretResponse {
+                key,
+                value,
+                context,
+            }) => {
+                let mut context = Context::try_from(context)?;
+                let secret = value.ok_or_else(|| {
+                    ComponentError::Other(format!("secret not found for key: {key}"))
+                })?;
+                let keypair = Keypair::from_bytes(&secret)
+                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                context.key_pair = Some(keypair);
+                let context: ComponentContext = (&context).try_into()?;
+                Ok(vec![OutboundComponentMsg::ContextUpdated(context)])
+            }
+            InboundComponentMsg::RandomBytes(_) => Err(ComponentError::Other(
+                "unexpected message type: radom bytes".into(),
+            )),
         }
     }
 }
@@ -166,20 +174,17 @@ fn allocate_token(
             // got response, check if allocation is allowed and return to application
             let application_response = match response {
                 Response::Allowed => {
-                    records.assign(assignee, criteria.frequency, keypair);
+                    let assignment = records.assign(assignee, criteria.frequency, keypair);
                     let context: ComponentContext = (&*context).try_into()?;
-                    // TODO: fix response type
-                    let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
-                        request_id,
+                    let msg = TokenComponentMessage::AllocatedToken {
                         component_id,
-                        criteria,
+                        assignment,
                         records,
-                        assignee: vec![],
-                    });
+                    };
                     let serialized = bincode::serialize(&msg)
                         .map_err(|err| ComponentError::Deser(format!("{err}")))?;
                     OutboundComponentMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, serialized, false).with_context(context),
+                        ApplicationMessage::new(app, serialized, true).with_context(context),
                     )
                 }
                 Response::NotAllowed => todo!("return to application communicating the denial"),
@@ -193,8 +198,10 @@ fn allocate_token(
 #[derive(Debug, Serialize, Deserialize)]
 enum TokenComponentMessage {
     RequestNewToken(RequestNewToken),
-    ReturnNewToken {
+    AllocatedToken {
         component_id: SecretsId,
+        assignment: TokenAssignment,
+        /// An updated version of the record with the newly allocated token included
         records: TokenAllocationRecord,
     },
     Failure,
@@ -261,7 +268,7 @@ pub trait TokenAssignmentExt {
 ///  
 /// Conflicting assignments for the same time slot are not permitted and indicate that the generator is broken or malicious.
 trait TokenAssignmentInternal {
-    fn assign(&mut self, assignee: Assignee, tier: Tier, private_key: &Keypair);
+    fn assign(&mut self, assignee: Assignee, tier: Tier, private_key: &Keypair) -> TokenAssignment;
     fn next_free_assignment(&self, tier: Tier) -> DateTime<Utc>;
 }
 
@@ -283,7 +290,7 @@ impl TokenAssignmentExt for TokenAllocationRecord {
 impl TokenAssignmentInternal for TokenAllocationRecord {
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
-    fn assign(&mut self, assignee: Assignee, tier: Tier, keys: &Keypair) {
+    fn assign(&mut self, assignee: Assignee, tier: Tier, keys: &Keypair) -> TokenAssignment {
         let time_slot = self.next_free_assignment(tier);
         let assignment = {
             let msg = TokenAssignment::to_be_signed(&time_slot, &assignee, tier);
@@ -295,7 +302,8 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
                 signature,
             }
         };
-        self.append_unchecked(assignment);
+        self.append_unchecked(assignment.clone());
+        assignment
     }
 
     fn next_free_assignment(&self, tier: Tier) -> DateTime<Utc> {

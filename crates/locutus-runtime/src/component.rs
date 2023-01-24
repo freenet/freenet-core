@@ -154,6 +154,9 @@ impl Runtime {
                         outbound_msgs.push_back(msg);
                     }
                 }
+                OutboundComponentMsg::ContextUpdated(context) => {
+                    last_context = context;
+                }
             }
         }
         Ok(last_context)
