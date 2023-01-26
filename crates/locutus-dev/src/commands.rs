@@ -1,6 +1,6 @@
 use std::{fs::File, io::Read};
 
-use locutus_core::{locutus_runtime::StateDelta, ClientId, Config, Executor, SqlitePool};
+use locutus_core::{locutus_runtime::StateDelta, ClientId, Config, Executor, Storage};
 use locutus_runtime::{
     ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore,
 };
@@ -71,7 +71,7 @@ async fn execute_command(
         .contract_data_dir
         .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
     let contract_store = ContractStore::new(data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
-    let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
+    let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
     let mut executor = Executor::new(contract_store, state_store, || {}).await?;
 
     executor

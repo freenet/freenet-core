@@ -94,7 +94,7 @@ pub struct PutConfig {
 /// Builds and packages a contract.
 ///
 /// This tool will build the WASM contract and publish it to the network.
-#[derive(clap::Parser, Clone)]
+#[derive(clap::Parser, Clone, Debug)]
 pub struct BuildToolCliConfig {
     /// Compile the contract with WASI extension enabled (useful for debugging).
     #[clap(long)]

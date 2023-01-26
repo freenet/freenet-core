@@ -9,7 +9,7 @@ use std::{
 
 use locutus_core::locutus_runtime::ContractContainer;
 use locutus_core::{
-    libp2p::identity::ed25519::PublicKey, locutus_runtime::StateStore, Config, SqlitePool,
+    libp2p::identity::ed25519::PublicKey, locutus_runtime::StateStore, Config, Storage,
     WrappedState,
 };
 use locutus_stdlib::prelude::Parameters;
@@ -90,7 +90,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let contract_dir = Config::get_conf().config_paths.local_contracts_dir();
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
-    let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
+    let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node = Executor::new(contract_store, state_store, || {
         locutus_core::util::set_cleanup_on_exit().unwrap();
     })
