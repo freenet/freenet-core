@@ -411,7 +411,7 @@ impl Deref for ClientResponse<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
