@@ -10,4 +10,5 @@ hashbrown = {workspace = true }
 locutus-stdlib = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true }
+strum = { version = "0.24", features = ["derive"] }
 thiserror = "1"

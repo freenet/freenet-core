@@ -2,8 +2,8 @@ use super::*;
 
 mod token_assignment {
     use super::*;
-    use chrono::NaiveDate;
-    use ed25519_dalek::Signature;
+    use chrono::{NaiveDate, Timelike};
+    use ed25519_dalek::{PublicKey, Signature};
     use locutus_aft_interface::Tier;
 
     fn get_assignment_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
@@ -17,6 +17,10 @@ mod token_assignment {
     const TEST_TIER: Tier = Tier::Day1;
     const MAX_DURATION_1Y: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
+    fn test_assignee() -> PublicKey {
+        PublicKey::from_bytes(&[1; ed25519_dalek::PUBLIC_KEY_LENGTH]).unwrap()
+    }
+
     #[test]
     fn free_spot_first() {
         let records = TokenAllocationRecord::new(HashMap::from_iter([(
@@ -24,7 +28,7 @@ mod token_assignment {
             vec![TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: get_assignment_date(2023, 1, 25),
-                assignee: vec![],
+                assignee: test_assignee(),
                 signature: Signature::from([1; 64]),
             }],
         )]));
@@ -43,13 +47,13 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: vec![],
+                    assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2023, 1, 26),
-                    assignee: vec![],
+                    assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
                 },
             ],
@@ -69,13 +73,13 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: vec![],
+                    assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 29),
-                    assignee: vec![],
+                    assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
                 },
             ],
@@ -92,19 +96,19 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: vec![],
+                    assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 28),
-                    assignee: vec![],
+                    assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 30),
-                    assignee: vec![],
+                    assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
                 },
             ],

@@ -65,6 +65,7 @@ impl WsApiError {
 pub struct UpdateModification<'a> {
     #[serde(borrow)]
     pub new_state: Option<State<'a>>,
+    /// Request an other contract so updates can be resolved.
     pub related: Vec<RelatedContract>,
 }
 

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, SubsecRound, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Keypair, Signer};
 use hashbrown::{HashMap, HashSet};
 use locutus_aft_interface::{AllocationCriteria, TokenAllocationRecord, TokenAssignment};
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 mod tests;
 
-type Assignee = Vec<u8>;
+type Assignee = ed25519_dalek::PublicKey;
 
 struct TokenComponent;
 
@@ -80,13 +80,13 @@ const RESPONSES: &[&str] = &["true", "false"];
 
 fn user_input(criteria: &AllocationCriteria, assignee: &Assignee) -> NotificationMessage<'static> {
     let notification_json = serde_json::json!({
-        "user": String::from_utf8_lossy(assignee),
+        "user": format!("{assignee:?}"), // todo: encode this
         "token": {
             "tier": criteria.frequency,
             "max_age": format!("{} seconds", criteria.max_age.as_secs())
         }
     });
-    todo!()
+    NotificationMessage::try_from(&notification_json).unwrap()
 }
 
 fn allocate_token(

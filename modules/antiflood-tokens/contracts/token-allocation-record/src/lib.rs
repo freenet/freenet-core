@@ -1,11 +1,13 @@
-use ed25519_dalek::{PublicKey, Verifier};
-use locutus_aft_interface::{TokenAllocationRecord, TokenAssignment, TokenParameters};
+use ed25519_dalek::Verifier;
+use locutus_aft_interface::{
+    AllocationError, TokenAllocationRecord, TokenAllocationSummary, TokenAssignment,
+    TokenParameters,
+};
 use locutus_stdlib::prelude::*;
 
 struct TokenAllocContract;
 
 impl ContractInterface for TokenAllocContract {
-    // TODO: only can validate that the slot is valid, nothing else?
     fn validate_state(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -26,7 +28,6 @@ impl ContractInterface for TokenAllocContract {
     /// The contract verifies that the release times for a tier matches the tier.
     ///
     /// For example, a 15:30 UTC release time isn't permitted for hour_1 tier, but 15:00 UTC is permitted.
-    // TODO: only can validate that the slot is valid, nothing else?
     fn validate_delta(
         parameters: Parameters<'static>,
         delta: StateDelta<'static>,
@@ -47,49 +48,64 @@ impl ContractInterface for TokenAllocContract {
             match update {
                 UpdateData::State(s) => {
                     let new_assigned_tokens = TokenAllocationRecord::try_from(s)?;
-                    assigned_tokens.merge(new_assigned_tokens, &params)?;
+                    assigned_tokens
+                        .merge(new_assigned_tokens, &params)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            ContractError::InvalidUpdate
+                        })?;
                 }
                 UpdateData::Delta(d) => {
                     let new_assigned_token = TokenAssignment::try_from(d)?;
-                    assigned_tokens.append(new_assigned_token, &params)?;
+                    assigned_tokens
+                        .append(new_assigned_token, &params)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            ContractError::InvalidUpdate
+                        })?;
                 }
                 // does this send the prev state + new delta?
                 UpdateData::StateAndDelta { state, delta } => {
                     let new_assigned_tokens = TokenAllocationRecord::try_from(state)?;
-                    assigned_tokens.merge(new_assigned_tokens, &params)?;
+                    assigned_tokens
+                        .merge(new_assigned_tokens, &params)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            ContractError::InvalidUpdate
+                        })?;
                     let new_assigned_token = TokenAssignment::try_from(delta)?;
-                    assigned_tokens.append(new_assigned_token, &params)?;
+                    assigned_tokens
+                        .append(new_assigned_token, &params)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            ContractError::InvalidUpdate
+                        })?;
                 }
-                // UpdateData::RelatedState { related_to, state } => {
-                //     todo!()
-                // }
-                // UpdateData::RelatedDelta { related_to, delta } => todo!(),
-                // UpdateData::RelatedStateAndDelta {
-                //     related_to,
-                //     state,
-                //     delta,
-                // } => todo!(),
                 _ => unreachable!(),
             }
         }
-        todo!()
+        let update = assigned_tokens.try_into()?;
+        Ok(UpdateModification::valid(update))
     }
 
     fn summarize_state(
-        parameters: Parameters<'static>,
+        _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        // FIXME: the state summary must be a summary of tokens assigned per tier
-        todo!()
+        let assigned_tokens = TokenAllocationRecord::try_from(state)?;
+        let summary = assigned_tokens.summarize();
+        summary.try_into()
     }
 
     fn get_state_delta(
-        parameters: Parameters<'static>,
+        _parameters: Parameters<'static>,
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        // FIXME: return only the assignments not present in the summary
-        todo!()
+        let assigned_tokens = TokenAllocationRecord::try_from(state)?;
+        let summary = TokenAllocationSummary::try_from(summary)?;
+        let delta = assigned_tokens.delta(&summary);
+        delta.try_into()
     }
 }
 
@@ -102,17 +118,13 @@ impl TokenAssignmentExt for TokenAssignment {
         if !self.tier.is_valid_slot(self.time_slot) {
             return false;
         }
-        let pk = PublicKey::from_bytes(&self.assignee).unwrap();
-        if pk != params.generator_public_key {
-            return false;
-        }
         let msg = TokenAssignment::to_be_signed(&self.time_slot, &self.assignee, self.tier);
         if params
             .generator_public_key
             .verify(&msg, &self.signature)
             .is_err()
         {
-            // not signed by the privte key of this contract
+            // not signed by the private key of this generator
             return false;
         }
         true
@@ -120,16 +132,16 @@ impl TokenAssignmentExt for TokenAssignment {
 }
 
 trait TokenAllocationRecordExt {
-    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), ContractError>;
+    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), AllocationError>;
     fn append(
         &mut self,
         assignment: TokenAssignment,
         params: &TokenParameters,
-    ) -> Result<(), ContractError>;
+    ) -> Result<(), AllocationError>;
 }
 
 impl TokenAllocationRecordExt for TokenAllocationRecord {
-    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), ContractError> {
+    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), AllocationError> {
         for (_, assignments) in other.into_iter() {
             for assignment in assignments {
                 self.append(assignment, params)?;
@@ -142,7 +154,7 @@ impl TokenAllocationRecordExt for TokenAllocationRecord {
         &mut self,
         assignment: TokenAssignment,
         params: &TokenParameters,
-    ) -> Result<(), ContractError> {
+    ) -> Result<(), AllocationError> {
         match self.get_mut_tier(&assignment.tier) {
             Some(list) => {
                 if list.binary_search(&assignment).is_err() {
@@ -151,10 +163,10 @@ impl TokenAllocationRecordExt for TokenAllocationRecord {
                         list.sort_unstable();
                         Ok(())
                     } else {
-                        todo!()
+                        Err(AllocationError::invalid_assignment(assignment))
                     }
                 } else {
-                    todo!()
+                    Err(AllocationError::allocated_slot(&assignment))
                 }
             }
             None => {

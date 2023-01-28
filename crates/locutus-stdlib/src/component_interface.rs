@@ -383,6 +383,16 @@ pub struct NotificationMessage<'a>(
     Cow<'a, [u8]>,
 );
 
+impl TryFrom<&serde_json::Value> for NotificationMessage<'static> {
+    type Error = ();
+
+    fn try_from(json: &serde_json::Value) -> Result<NotificationMessage<'static>, ()> {
+        // todo: validate format when we have a better idea of what we want here
+        let bytes = serde_json::to_vec(json).unwrap();
+        Ok(Self(Cow::Owned(bytes)))
+    }
+}
+
 impl NotificationMessage<'_> {
     pub fn into_owned(self) -> NotificationMessage<'static> {
         NotificationMessage(self.0.into_owned().into())
