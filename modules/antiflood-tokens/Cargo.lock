@@ -567,6 +567,7 @@ dependencies = [
  "hashbrown 0.13.1",
  "locutus-stdlib",
  "serde",
+ "thiserror",
 ]
 
 [[package]]

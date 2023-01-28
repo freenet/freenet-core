@@ -13,7 +13,7 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<ValidateResult, ContractError> {
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenParameters::try_from(parameters)?;
-        for (_tier, assignments) in assigned_tokens.tokens_by_tier.iter() {
+        for (_tier, assignments) in (&assigned_tokens).into_iter() {
             for assignment in assignments {
                 if !assignment.is_valid(&params) {
                     return Ok(ValidateResult::Invalid);
@@ -130,7 +130,7 @@ trait TokenAllocationRecordExt {
 
 impl TokenAllocationRecordExt for TokenAllocationRecord {
     fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), ContractError> {
-        for (_, assignments) in other.tokens_by_tier {
+        for (_, assignments) in other.into_iter() {
             for assignment in assignments {
                 self.append(assignment, params)?;
             }
@@ -143,7 +143,7 @@ impl TokenAllocationRecordExt for TokenAllocationRecord {
         assignment: TokenAssignment,
         params: &TokenParameters,
     ) -> Result<(), ContractError> {
-        match self.tokens_by_tier.get_mut(&assignment.tier) {
+        match self.get_mut_tier(&assignment.tier) {
             Some(list) => {
                 if list.binary_search(&assignment).is_err() {
                     if assignment.is_valid(params) {
@@ -158,8 +158,7 @@ impl TokenAllocationRecordExt for TokenAllocationRecord {
                 }
             }
             None => {
-                self.tokens_by_tier
-                    .insert(assignment.tier, vec![assignment]);
+                self.insert(assignment.tier, vec![assignment]);
                 Ok(())
             }
         }

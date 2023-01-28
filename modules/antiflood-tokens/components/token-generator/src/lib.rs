@@ -1,9 +1,12 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Timelike, Utc};
 use ed25519_dalek::{Keypair, Signer};
 use hashbrown::{HashMap, HashSet};
-use locutus_aft_interface::{AllocationCriteria, Tier, TokenAllocationRecord, TokenAssignment};
+use locutus_aft_interface::{AllocationCriteria, TokenAllocationRecord, TokenAssignment};
 use locutus_stdlib::{prelude::*, time};
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+mod tests;
 
 type Assignee = Vec<u8>;
 
@@ -30,7 +33,9 @@ impl ComponentInterface for TokenComponent {
                     TokenComponentMessage::RequestNewToken(req) => {
                         allocate_token(&mut context, app, req)
                     }
-                    TokenComponentMessage::Failure => todo!(),
+                    TokenComponentMessage::Failure { .. } => Err(ComponentError::Other(
+                        "unexpected message type: failure".into(),
+                    )),
                     TokenComponentMessage::AllocatedToken { .. } => Err(ComponentError::Other(
                         "unexpected message type: allocated token".into(),
                     )),
@@ -73,7 +78,14 @@ impl ComponentInterface for TokenComponent {
 
 const RESPONSES: &[&str] = &["true", "false"];
 
-fn user_input() -> NotificationMessage<'static> {
+fn user_input(criteria: &AllocationCriteria, assignee: &Assignee) -> NotificationMessage<'static> {
+    let notification_json = serde_json::json!({
+        "user": String::from_utf8_lossy(assignee),
+        "token": {
+            "tier": criteria.frequency,
+            "max_age": format!("{} seconds", criteria.max_age.as_secs())
+        }
+    });
     todo!()
 }
 
@@ -115,10 +127,8 @@ fn allocate_token(
                     records,
                     assignee,
                 });
-                let serialized = bincode::serialize(&msg)
-                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
                 OutboundComponentMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, serialized, false).with_context(context),
+                    ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
                 )
             };
             Ok(vec![request_secret, req_allocation])
@@ -127,6 +137,7 @@ fn allocate_token(
             // request user input and add to waiting queue
             context.waiting_for_user_input.insert(request_id);
             let context: ComponentContext = (&*context).try_into()?;
+            let message = user_input(&criteria, &assignee);
             let req_allocation = {
                 let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
                     request_id,
@@ -135,10 +146,8 @@ fn allocate_token(
                     records,
                     assignee,
                 });
-                let serialized = bincode::serialize(&msg)
-                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
                 OutboundComponentMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, serialized, false).with_context(context),
+                    ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
                 )
             };
             let request_user_input = OutboundComponentMsg::RequestUserInput(UserInputRequest {
@@ -147,7 +156,7 @@ fn allocate_token(
                     .iter()
                     .map(|s| ClientResponse::new(s.as_bytes().to_vec()))
                     .collect(),
-                message: user_input(),
+                message,
             });
             Ok(vec![request_user_input, req_allocation])
         }
@@ -162,10 +171,8 @@ fn allocate_token(
                     records,
                     assignee,
                 });
-                let serialized = bincode::serialize(&msg)
-                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
                 OutboundComponentMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, serialized, false).with_context(context),
+                    ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
                 )
             };
             Ok(vec![req_allocation])
@@ -174,20 +181,29 @@ fn allocate_token(
             // got response, check if allocation is allowed and return to application
             let application_response = match response {
                 Response::Allowed => {
-                    let assignment = records.assign(assignee, criteria.frequency, keypair);
                     let context: ComponentContext = (&*context).try_into()?;
+                    let Some(assignment) = records.assign(assignee, &criteria, keypair) else {
+                        let msg = TokenComponentMessage::Failure(FailureReason::NoFreeSlot { component_id, criteria } );
+                        return Ok(vec![OutboundComponentMsg::ApplicationMessage(
+                            ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
+                        )]);
+                    };
                     let msg = TokenComponentMessage::AllocatedToken {
                         component_id,
                         assignment,
                         records,
                     };
-                    let serialized = bincode::serialize(&msg)
-                        .map_err(|err| ComponentError::Deser(format!("{err}")))?;
                     OutboundComponentMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, serialized, true).with_context(context),
+                        ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
                     )
                 }
-                Response::NotAllowed => todo!("return to application communicating the denial"),
+                Response::NotAllowed => {
+                    let context: ComponentContext = (&*context).try_into()?;
+                    let msg = TokenComponentMessage::Failure(FailureReason::UserPermissionDenied);
+                    OutboundComponentMsg::ApplicationMessage(
+                        ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
+                    )
+                }
             };
             context.user_response.remove(&request_id);
             Ok(vec![application_response])
@@ -204,7 +220,24 @@ enum TokenComponentMessage {
         /// An updated version of the record with the newly allocated token included
         records: TokenAllocationRecord,
     },
-    Failure,
+    Failure(FailureReason),
+}
+
+impl TokenComponentMessage {
+    fn serialize(self) -> Result<Vec<u8>, ComponentError> {
+        bincode::serialize(&self).map_err(|err| ComponentError::Deser(format!("{err}")))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum FailureReason {
+    /// The user didn't accept to allocate the tokens.
+    UserPermissionDenied,
+    /// No free slot to allocate with the requested criteria
+    NoFreeSlot {
+        component_id: SecretsId,
+        criteria: AllocationCriteria,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -256,9 +289,6 @@ impl TryFrom<&[u8]> for TokenComponentMessage {
     }
 }
 
-// TODO: clarify where this functionality would be called, e.g.:
-// - does the application request a token and then appends the returned token if successful
-// - or instead, the application requests a token and this is appended in place by the component and returns an updated component
 /// This should be used by applications to assign tokens previously requested to this component.
 pub trait TokenAssignmentExt {
     fn append_unchecked(&mut self, assignment: TokenAssignment);
@@ -268,20 +298,30 @@ pub trait TokenAssignmentExt {
 ///  
 /// Conflicting assignments for the same time slot are not permitted and indicate that the generator is broken or malicious.
 trait TokenAssignmentInternal {
-    fn assign(&mut self, assignee: Assignee, tier: Tier, private_key: &Keypair) -> TokenAssignment;
-    fn next_free_assignment(&self, tier: Tier) -> DateTime<Utc>;
+    fn assign(
+        &mut self,
+        assignee: Assignee,
+        criteria: &AllocationCriteria,
+        private_key: &Keypair,
+    ) -> Option<TokenAssignment>;
+
+    /// Given a datetime, get the newest free slot for this criteria.
+    fn next_free_assignment(
+        &self,
+        criteria: &AllocationCriteria,
+        current: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>>;
 }
 
 impl TokenAssignmentExt for TokenAllocationRecord {
     fn append_unchecked(&mut self, assignment: TokenAssignment) {
-        match self.tokens_by_tier.get_mut(&assignment.tier) {
+        match self.get_mut_tier(&assignment.tier) {
             Some(list) => {
                 list.push(assignment);
                 list.sort_unstable();
             }
             None => {
-                self.tokens_by_tier
-                    .insert(assignment.tier, vec![assignment]);
+                self.insert(assignment.tier, vec![assignment]);
             }
         }
     }
@@ -290,30 +330,87 @@ impl TokenAssignmentExt for TokenAllocationRecord {
 impl TokenAssignmentInternal for TokenAllocationRecord {
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
-    fn assign(&mut self, assignee: Assignee, tier: Tier, keys: &Keypair) -> TokenAssignment {
-        let time_slot = self.next_free_assignment(tier);
+    fn assign(
+        &mut self,
+        assignee: Assignee,
+        criteria: &AllocationCriteria,
+        keys: &Keypair,
+    ) -> Option<TokenAssignment> {
+        let current = time::now();
+        let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
-            let msg = TokenAssignment::to_be_signed(&time_slot, &assignee, tier);
+            let msg = TokenAssignment::to_be_signed(&time_slot, &assignee, criteria.frequency);
             let signature = keys.sign(&msg);
             TokenAssignment {
-                tier,
+                tier: criteria.frequency,
                 time_slot,
                 assignee,
                 signature,
             }
         };
         self.append_unchecked(assignment.clone());
-        assignment
+        Some(assignment)
     }
 
-    fn next_free_assignment(&self, tier: Tier) -> DateTime<Utc> {
-        let now = time::now();
-        match self.tokens_by_tier.get(&tier) {
-            Some(_others) => {
-                //
-                todo!()
+    fn next_free_assignment(
+        &self,
+        criteria: &AllocationCriteria,
+        current: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let normalized = criteria.frequency.normalize_to_next(current);
+        let max_age = Duration::from_std(criteria.max_age).unwrap();
+        // todo: add optimization branch where we check if all slots have been allocated upfront
+        match self.get_tier(&criteria.frequency) {
+            Some(currently_assigned) => {
+                let mut oldest_valid_observed = None;
+                let mut first_valid = None;
+                for (_idx, assignment) in currently_assigned.iter().enumerate() {
+                    // dbg!(
+                    //     oldest_valid_observed.map(|a: &TokenAssignment| a.time_slot),
+                    //     first_valid,
+                    //     assignment.time_slot
+                    // );
+                    if assignment.time_slot >= (normalized - max_age) {
+                        match (oldest_valid_observed, first_valid) {
+                            (None, None) => {
+                                oldest_valid_observed = Some(assignment);
+                                let oldest_valid = normalized - max_age;
+                                if assignment.time_slot != oldest_valid {
+                                    first_valid = Some(oldest_valid);
+                                } else {
+                                    let prev = assignment.previous_slot();
+                                    if prev > oldest_valid {
+                                        first_valid = Some(prev);
+                                    } else {
+                                        first_valid = Some(assignment.next_slot());
+                                    }
+                                }
+                            }
+                            (Some(_), Some(first_valid_date)) => {
+                                if first_valid_date == assignment.time_slot {
+                                    let next = assignment.next_slot();
+                                    if next > normalized {
+                                        first_valid = None;
+                                    } else {
+                                        first_valid = Some(next);
+                                    }
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+
+                if oldest_valid_observed.is_none() {
+                    // first slot for the tier free
+                    return Some(normalized - max_age);
+                }
+                if first_valid.is_some() {
+                    return first_valid;
+                }
+                None
             }
-            None => tier.next_assignment(now),
+            None => Some(normalized - max_age),
         }
     }
 }
