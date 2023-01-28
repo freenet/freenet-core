@@ -9,9 +9,9 @@ mod native_api;
 mod runtime;
 mod secrets_store;
 mod state_store;
+mod store;
 #[cfg(test)]
 pub(crate) mod tests;
-mod store;
 pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
