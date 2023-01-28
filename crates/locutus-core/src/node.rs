@@ -26,7 +26,10 @@ use self::{
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
     config::{GlobalExecutor, CONFIG},
-    contract::{ContractError, MockRuntime, SQLiteContractHandler, SqlDbError},
+    contract::{
+        storages::{StorageContractHandler, StorageDbError},
+        ContractError, MockRuntime,
+    },
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
         get,
@@ -163,10 +166,10 @@ impl<const CLIENTS: usize> NodeConfig<CLIENTS> {
     }
 
     /// Builds a node using the default backend connection manager.
-    pub fn build(self) -> Result<Node<SqlDbError>, anyhow::Error> {
-        let node = NodeP2P::<SqlDbError>::build::<
-            SQLiteContractHandler<MockRuntime>,
-            SqlDbError,
+    pub fn build(self) -> Result<Node<StorageDbError>, anyhow::Error> {
+        let node = NodeP2P::<StorageDbError>::build::<
+            StorageContractHandler<MockRuntime>,
+            StorageDbError,
             CLIENTS,
         >(self)?;
         Ok(Node(node))

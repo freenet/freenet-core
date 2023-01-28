@@ -21,7 +21,7 @@ pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientEventsProxy, ClientId, HostResult,
     OpenRequest, RequestError,
 };
-pub use contract::{SQLiteContractHandler, SqlitePool};
+pub use contract::storages::{Storage, StorageContractHandler};
 pub use either;
 pub use executor::Executor;
 pub use libp2p;

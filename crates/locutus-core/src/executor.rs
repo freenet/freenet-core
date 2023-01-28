@@ -12,7 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::{
     client_events::{ComponentError as CoreComponentError, ContractError as CoreContractError},
     either::Either,
-    ClientId, DynError, HostResult, RequestError, SqlitePool,
+    ClientId, DynError, HostResult, RequestError, Storage,
 };
 
 type Response = Result<HostResponse, Either<RequestError, DynError>>;
@@ -24,7 +24,7 @@ type Response = Result<HostResponse, Either<RequestError, DynError>>;
 /// of changes or can alternatively use the notification channel.
 pub struct Executor {
     runtime: Runtime,
-    contract_state: StateStore<SqlitePool>,
+    contract_state: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, StateSummary<'static>>>,
 }
@@ -32,7 +32,7 @@ pub struct Executor {
 impl Executor {
     pub async fn new(
         store: ContractStore,
-        contract_state: StateStore<SqlitePool>,
+        contract_state: StateStore<Storage>,
         ctrl_handler: impl FnOnce(),
     ) -> Result<Self, DynError> {
         ctrl_handler();
@@ -418,7 +418,7 @@ mod test {
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_path = std::env::temp_dir().join("locutus-test");
         let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
-        let state_store = StateStore::new(SqlitePool::new().await?, MAX_MEM_CACHE).unwrap();
+        let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         Executor::new(contract_store, state_store, || {
             counter += 1;
