@@ -526,10 +526,10 @@ impl TryFrom<StateDelta<'_>> for TokenAssignment {
 
 impl Display for TokenAssignment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let assignee = bs58::encode(&self.assignee).into_string();
         write!(
             f,
-            "{{ {tier} @ {slot} for {assignee:?}}}",
-            assignee = self.assignee.as_bytes(), // todo: encode this
+            "{{ {tier} @ {slot} for {assignee}}}",
             tier = self.tier,
             slot = self.time_slot,
         )

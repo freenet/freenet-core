@@ -554,6 +554,7 @@ name = "locutus-aft-generator"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bs58",
  "chrono",
  "ed25519-dalek",
  "hashbrown 0.13.1",
@@ -568,6 +569,7 @@ name = "locutus-aft-interface"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bs58",
  "chrono",
  "ed25519-dalek",
  "hashbrown 0.13.1",

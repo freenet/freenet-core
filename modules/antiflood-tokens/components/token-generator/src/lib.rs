@@ -79,8 +79,9 @@ impl ComponentInterface for TokenComponent {
 const RESPONSES: &[&str] = &["true", "false"];
 
 fn user_input(criteria: &AllocationCriteria, assignee: &Assignee) -> NotificationMessage<'static> {
+    let assignee = bs58::encode(assignee).into_string();
     let notification_json = serde_json::json!({
-        "user": format!("{assignee:?}"), // todo: encode this
+        "user": assignee,
         "token": {
             "tier": criteria.frequency,
             "max_age": format!("{} seconds", criteria.max_age.as_secs())

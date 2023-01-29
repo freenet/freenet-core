@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bincode = { workspace = true }
+bs58 = { workspace = true }
 chrono = { workspace = true }
 hashbrown = {workspace = true }
 locutus-stdlib = { workspace = true }
