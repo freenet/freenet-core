@@ -9,7 +9,7 @@ use itertools::Itertools;
 use libp2p::{identity, PeerId};
 use locutus_runtime::prelude::ContractKey;
 use locutus_runtime::ContractContainer;
-use locutus_stdlib::api::ClientRequest;
+use locutus_stdlib::client_api::ClientRequest;
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, instrument};
@@ -360,7 +360,7 @@ fn group_locations_in_buckets(
     }
     distances
         .into_iter()
-        .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)) as f64, v))
+        .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)), v))
 }
 
 pub(crate) async fn check_connectivity(

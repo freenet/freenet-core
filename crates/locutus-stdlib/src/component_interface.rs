@@ -1,6 +1,7 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt::Display,
+    ops::Deref,
     path::Path,
 };
 
@@ -12,6 +13,8 @@ use crate::prelude::ContractInstanceId;
 
 const APPLICATION_HASH_SIZE: usize = 32;
 const COMPONENT_HASH_LENGTH: usize = 32;
+
+type Secret = Vec<u8>;
 
 /// Executable component
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -109,10 +112,16 @@ impl SecretsId {
     }
 }
 
+impl Display for SecretsId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.encode())
+    }
+}
+
 pub trait ComponentInterface {
     /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the component must be stored using the secret mechanism.
-    fn process(messages: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError>;
+    fn process(message: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError>;
 }
 
 #[serde_as]
@@ -147,6 +156,7 @@ impl Display for ComponentKey {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ComponentContext(pub Vec<u8>);
 
@@ -229,7 +239,8 @@ impl InboundComponentMsg<'_> {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetSecretResponse {
     pub key: SecretsId,
-    pub value: Option<Vec<u8>>,
+    pub value: Option<Secret>,
+    #[serde(skip)]
     pub context: ComponentContext,
 }
 
@@ -260,9 +271,10 @@ impl ApplicationMessage {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UserInputResponse<'a> {
-    request_id: u32,
+    pub request_id: u32,
     #[serde(borrow)]
-    response: ClientResponse<'a>,
+    pub response: ClientResponse<'a>,
+    pub context: ComponentContext,
 }
 
 impl UserInputResponse<'_> {
@@ -270,15 +282,18 @@ impl UserInputResponse<'_> {
         UserInputResponse {
             request_id: self.request_id,
             response: self.response.into_owned(),
+            context: self.context,
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum OutboundComponentMsg {
-    // from the apps
+    // for the apps
     ApplicationMessage(ApplicationMessage),
     RequestUserInput(#[serde(deserialize_with = "deser_func")] UserInputRequest<'static>),
+    // todo: remove when context can be accessed from the component environment and we pass it as reference
+    ContextUpdated(ComponentContext),
     // from the node
     GetSecretRequest(GetSecretRequest),
     SetSecretRequest(SetSecretRequest),
@@ -309,6 +324,7 @@ impl OutboundComponentMsg {
             OutboundComponentMsg::RandomBytesRequest(_) => false,
             OutboundComponentMsg::SetSecretRequest(_) => false,
             OutboundComponentMsg::RequestUserInput(_) => true,
+            OutboundComponentMsg::ContextUpdated(_) => true,
         }
     }
 
@@ -356,7 +372,7 @@ pub struct GetSecretRequest {
 pub struct SetSecretRequest {
     pub key: SecretsId,
     /// Sets or unsets (if none) a value associated with the key.
-    pub value: Option<Vec<u8>>,
+    pub value: Option<Secret>,
 }
 
 #[serde_as]
@@ -366,6 +382,16 @@ pub struct NotificationMessage<'a>(
     #[serde(borrow)]
     Cow<'a, [u8]>,
 );
+
+impl TryFrom<&serde_json::Value> for NotificationMessage<'static> {
+    type Error = ();
+
+    fn try_from(json: &serde_json::Value) -> Result<NotificationMessage<'static>, ()> {
+        // todo: validate format when we have a better idea of what we want here
+        let bytes = serde_json::to_vec(json).unwrap();
+        Ok(Self(Cow::Owned(bytes)))
+    }
+}
 
 impl NotificationMessage<'_> {
     pub fn into_owned(self) -> NotificationMessage<'static> {
@@ -381,7 +407,18 @@ pub struct ClientResponse<'a>(
     Cow<'a, [u8]>,
 );
 
+impl Deref for ClientResponse<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl ClientResponse<'_> {
+    pub fn new(response: Vec<u8>) -> Self {
+        Self(response.into())
+    }
     pub fn into_owned(self) -> ClientResponse<'static> {
         ClientResponse(self.0.into_owned().into())
     }
@@ -389,12 +426,12 @@ impl ClientResponse<'_> {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UserInputRequest<'a> {
-    request_id: u32,
+    pub request_id: u32,
     #[serde(borrow)]
     /// An interpretable message by the notification system.
-    message: NotificationMessage<'a>,
+    pub message: NotificationMessage<'a>,
     /// If a response is required from the user they can be chosen from this list.
-    responses: Vec<ClientResponse<'a>>,
+    pub responses: Vec<ClientResponse<'a>>,
 }
 
 impl UserInputRequest<'_> {

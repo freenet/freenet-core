@@ -1,0 +1,15 @@
+[package]
+name = "locutus-aft-interface"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode = { workspace = true }
+bs58 = { workspace = true }
+chrono = { workspace = true }
+hashbrown = {workspace = true }
+locutus-stdlib = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+strum = { version = "0.24", features = ["derive"] }
+thiserror = "1"

@@ -8,12 +8,12 @@ use locutus_runtime::{
 };
 
 use locutus_core::{
-    locutus_runtime::locutus_stdlib::api::{
+    locutus_runtime::locutus_stdlib::client_api::{
         ClientRequest, ContractRequest, ContractResponse, HostResponse,
     },
     *,
 };
-use locutus_stdlib::api::ErrorKind;
+use locutus_stdlib::client_api::ErrorKind;
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 use warp::{
     reject::{self, Reject},

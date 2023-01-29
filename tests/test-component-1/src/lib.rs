@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use locutus_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +17,7 @@ impl SecretsContext {
 
 impl From<SecretsContext> for ComponentContext {
     fn from(val: SecretsContext) -> Self {
-        ComponentContext(val.serialized())
+        ComponentContext::new(val.serialized())
     }
 }
 
@@ -152,9 +150,9 @@ impl ComponentInterface for Component {
 
 #[test]
 fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
-    // 1- create inbox message parts
+    // 1. create inbox message parts
     let contract = WrappedContract::new(
-        Arc::new(ContractCode::from(vec![1])),
+        std::sync::Arc::new(ContractCode::from(vec![1])),
         Parameters::from(vec![]),
     );
     let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();

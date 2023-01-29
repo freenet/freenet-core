@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use locutus_runtime::{ContractContainer, ContractStore, Parameters, StateStorage, StateStore};
-use locutus_stdlib::api::{ClientRequest, HostResponse};
+use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -190,7 +190,7 @@ pub mod test {
 
     use locutus_runtime::{ContractStore, WasmAPIVersion};
     use locutus_stdlib::{
-        api::{ClientRequest, HostResponse},
+        client_api::{ClientRequest, HostResponse},
         prelude::ContractCode,
     };
 

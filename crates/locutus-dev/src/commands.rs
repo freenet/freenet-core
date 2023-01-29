@@ -4,7 +4,7 @@ use locutus_core::{locutus_runtime::StateDelta, ClientId, Config, Executor, Stor
 use locutus_runtime::{
     ContractContainer, ContractInstanceId, ContractStore, Parameters, StateStore,
 };
-use locutus_stdlib::api::{ClientRequest, ContractRequest};
+use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},

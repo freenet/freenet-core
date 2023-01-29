@@ -28,14 +28,18 @@ jobs:
 
       - uses: actions/checkout@v3
 
+      - uses: actions/cache@v2
+        with:
+          path: ~/.cargo
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           profile: minimal
           override: "true"
           default: "true"
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: |
@@ -57,6 +61,13 @@ jobs:
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
 
+      - name: Cache cargo registry
+        if: always()
+        uses: actions/cache@v2
+        with:
+          path: ~/.cargo
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+
   build_target:
     name: Build targets
 
@@ -76,14 +87,18 @@ jobs:
 
       - uses: actions/checkout@v3
 
+      - uses: actions/cache@v2
+        with:
+          path: ~/.cargo
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           profile: minimal
           override: "true"
           default: "true"
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Add dependencies
         run: |
@@ -110,6 +125,12 @@ jobs:
 
       - uses: actions/checkout@v3
 
+      - uses: actions/cache@v2
+        with:
+          path: ~/.cargo
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -117,8 +138,6 @@ jobs:
           components: clippy
           override: "true"
           default: "true"
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Add dependencies
         run: |

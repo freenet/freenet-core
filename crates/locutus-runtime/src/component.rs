@@ -154,6 +154,9 @@ impl Runtime {
                         outbound_msgs.push_back(msg);
                     }
                 }
+                OutboundComponentMsg::ContextUpdated(context) => {
+                    last_context = context;
+                }
             }
         }
         Ok(last_context)
@@ -170,8 +173,9 @@ impl ComponentRuntimeInterface for Runtime {
         if inbound.is_empty() {
             return Ok(results);
         }
-        let instance = self.prepare_component_call(key, 4096)?;
-        let process_func: TypedFunction<i64, i64> = instance
+        let running = self.prepare_component_call(key, 4096)?;
+        let process_func: TypedFunction<i64, i64> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "process")?;
 
@@ -202,14 +206,14 @@ impl ComponentRuntimeInterface for Runtime {
                                     .with_context(last_context.clone()),
                             ),
                             &process_func,
-                            &instance,
+                            &running.instance,
                         )?,
                     );
 
                     // Update the shared context for next messages
                     last_context = self.get_outbound(
                         key,
-                        &instance,
+                        &running.instance,
                         &process_func,
                         &mut outbound,
                         &mut results,
@@ -219,9 +223,15 @@ impl ComponentRuntimeInterface for Runtime {
                     let mut outbound = VecDeque::from(self.exec_inbound(
                         &InboundComponentMsg::UserResponse(response),
                         &process_func,
-                        &instance,
+                        &running.instance,
                     )?);
-                    self.get_outbound(key, &instance, &process_func, &mut outbound, &mut results)?;
+                    self.get_outbound(
+                        key,
+                        &running.instance,
+                        &process_func,
+                        &mut outbound,
+                        &mut results,
+                    )?;
                 }
                 InboundComponentMsg::GetSecretResponse(_) => {
                     return Err(ComponentExecError::UnexpectedMessage("get secret response").into())
@@ -230,9 +240,15 @@ impl ComponentRuntimeInterface for Runtime {
                     let mut outbound = VecDeque::from(self.exec_inbound(
                         &InboundComponentMsg::RandomBytes(bytes),
                         &process_func,
-                        &instance,
+                        &running.instance,
                     )?);
-                    self.get_outbound(key, &instance, &process_func, &mut outbound, &mut results)?;
+                    self.get_outbound(
+                        key,
+                        &running.instance,
+                        &process_func,
+                        &mut outbound,
+                        &mut results,
+                    )?;
                 }
             }
         }
@@ -260,22 +276,14 @@ impl ComponentRuntimeInterface for Runtime {
 #[cfg(test)]
 mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
-    use locutus_stdlib::{
-        contract_interface::ContractCode,
-        prelude::{ContractInstanceId, Parameters},
-    };
+    use locutus_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
     use serde::{Deserialize, Serialize};
-    use std::{
-        path::{Path, PathBuf},
-        process::Command,
-        sync::{atomic::AtomicUsize, Arc},
-    };
+    use std::sync::Arc;
 
     use super::*;
     use crate::{component_store::ComponentStore, ContractStore, SecretsStore, WrappedContract};
 
     const TEST_COMPONENT_1: &str = "test_component_1";
-    static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Serialize, Deserialize)]
     struct SecretsContext {
@@ -294,59 +302,12 @@ mod test {
         MessageSigned(Vec<u8>),
     }
 
-    fn test_dir() -> PathBuf {
-        let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
-            "component-api-test-{}",
-            TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        if !test_dir.exists() {
-            std::fs::create_dir_all(&test_dir).unwrap();
-        }
-        test_dir
-    }
-
-    fn get_test_component(name: &str) -> Result<Component, Box<dyn std::error::Error>> {
-        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
-        let contracts = PathBuf::from(CONTRACTS_DIR);
-        let mut dirs = contracts.ancestors();
-        let path = dirs.nth(2).unwrap();
-        let component_dir = path.join("tests").join(name.replace('_', "-"));
-        let mut component_build = component_dir
-            .join("build/locutus")
-            .join(name)
-            .with_extension("wasm");
-        if !component_build.exists() {
-            let target =
-                std::env::var("CARGO_TARGET_DIR").map_err(|_| "CARGO_TARGET_DIR should be set")?;
-            println!("trying to compile the test contract, target: {target}");
-            // attempt to compile it
-            const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
-            const WASI_TARGET: &str = "wasm32-wasi";
-            let cmd_args = RUST_TARGET_ARGS
-                .iter()
-                .copied()
-                .chain([WASI_TARGET])
-                .collect::<Vec<_>>();
-            let mut child = Command::new("cargo")
-                .args(&cmd_args)
-                .current_dir(&component_dir)
-                .spawn()?;
-            child.wait()?;
-            let output_file = Path::new(&target)
-                .join("wasm32-wasi")
-                .join("debug")
-                .join(name)
-                .with_extension("wasm");
-            println!("output file: {output_file:?}");
-            component_build = output_file;
-        }
-        Ok(Component::try_from(component_build.as_path())?)
-    }
-
-    fn set_up_runtime(name: &str) -> Result<(Component, Runtime), Box<dyn std::error::Error>> {
-        let contracts_dir = test_dir();
-        let components_dir = test_dir();
-        let secrets_dir = test_dir();
+    fn setup_runtime(name: &str) -> Result<(Component, Runtime), Box<dyn std::error::Error>> {
+        const TEST_PREFIX: &str = "component-api";
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let contracts_dir = crate::tests::test_dir(TEST_PREFIX);
+        let components_dir = crate::tests::test_dir(TEST_PREFIX);
+        let secrets_dir = crate::tests::test_dir(TEST_PREFIX);
 
         let contract_store = ContractStore::new(contracts_dir, 10_000)?;
         let component_store = ComponentStore::new(components_dir, 10_000)?;
@@ -355,7 +316,10 @@ mod test {
         let mut runtime =
             Runtime::build(contract_store, component_store, secret_store, false).unwrap();
 
-        let component = get_test_component(name).unwrap();
+        let component = {
+            let bytes = crate::tests::get_test_module(name)?;
+            Component::from(bytes)
+        };
         let _ = runtime.component_store.store_component(component.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
@@ -375,7 +339,7 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let (component, mut runtime) = set_up_runtime(TEST_COMPONENT_1)?;
+        let (component, mut runtime) = setup_runtime(TEST_COMPONENT_1)?;
         let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // CreateInboxRequest message parts

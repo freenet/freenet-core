@@ -1,0 +1,3 @@
+[contract]
+type = "standard"
+lang = "rust"

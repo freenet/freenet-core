@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
-use locutus_stdlib::api::{
+use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ComponentRequest, ContractRequest, ContractResponse, HostResponse,
 };
 use tokio::sync::mpsc::UnboundedSender;

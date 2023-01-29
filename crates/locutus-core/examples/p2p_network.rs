@@ -9,7 +9,7 @@ use libp2p::{
 use locutus_core::*;
 use locutus_runtime::prelude::{ContractContainer, WasmAPIVersion, WrappedContract, WrappedState};
 use locutus_stdlib::{
-    api::{ClientError, ClientRequest, ContractRequest, HostResponse},
+    client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
     prelude::{ContractCode, Parameters},
 };
 use tokio::sync::mpsc::{channel, Receiver, Sender};

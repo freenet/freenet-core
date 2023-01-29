@@ -1,5 +1,4 @@
 use locutus_stdlib::prelude::*;
-// ANCHOR: contractifce
 
 struct Contract;
 

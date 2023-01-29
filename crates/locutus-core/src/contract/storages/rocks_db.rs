@@ -7,7 +7,7 @@ use locutus_runtime::{
     ContractContainer, ContractError, ContractExecError, ContractRuntimeInterface, ContractStore,
     Parameters, StateStorage, StateStore, StateStoreError, ValidateResult,
 };
-use locutus_stdlib::api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
+use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 
 use crate::contract::ContractKey;
 use crate::{config::CONFIG, contract::test::MockRuntime, WrappedState};

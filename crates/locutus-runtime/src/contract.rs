@@ -75,29 +75,31 @@ impl ContractRuntimeInterface for crate::Runtime {
         related: RelatedContracts,
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state)?;
             state_buf.ptr()
         };
         let related_buf_ptr = {
             let serialized = bincode::serialize(&related)?;
-            let mut related_buf = self.init_buf(&instance, &serialized)?;
+            let mut related_buf = self.init_buf(&running.instance, &serialized)?;
             related_buf.write(serialized)?;
             related_buf.ptr()
         };
 
-        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
-            .exports
-            .get_typed_function(&self.wasm_store, "validate_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> =
+            running
+                .instance
+                .exports
+                .get_typed_function(&self.wasm_store, "validate_state")?;
         let is_valid = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
@@ -122,21 +124,22 @@ impl ContractRuntimeInterface for crate::Runtime {
     ) -> RuntimeResult<bool> {
         // todo: if we keep this hot in memory on next calls overwrite the buffer with new delta
         let req_bytes = parameters.size() + delta.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let delta_buf_ptr = {
-            let mut delta_buf = self.init_buf(&instance, delta)?;
+            let mut delta_buf = self.init_buf(&running.instance, delta)?;
             delta_buf.write(delta)?;
             delta_buf.ptr()
         };
 
-        let validate_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+        let validate_func: TypedFunction<(i64, i64), FfiReturnTy> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "validate_delta")?;
         let is_valid = unsafe {
@@ -166,29 +169,31 @@ impl ContractRuntimeInterface for crate::Runtime {
         //       - the delta may not be necessarily the same size
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
         let update_data_buf_ptr = {
             let serialized = bincode::serialize(update_data)?;
-            let mut update_data_buf = self.init_buf(&instance, &serialized)?;
+            let mut update_data_buf = self.init_buf(&running.instance, &serialized)?;
             update_data_buf.write(serialized)?;
             update_data_buf.ptr()
         };
 
-        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
-            .exports
-            .get_typed_function(&self.wasm_store, "update_state")?;
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> =
+            running
+                .instance
+                .exports
+                .get_typed_function(&self.wasm_store, "update_state")?;
         let update_res = unsafe {
             ContractInterfaceResult::from_raw(
                 validate_func.call(
@@ -212,21 +217,22 @@ impl ContractRuntimeInterface for crate::Runtime {
         state: &WrappedState,
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
 
-        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = instance
+        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "summarize_state")?;
 
@@ -254,26 +260,27 @@ impl ContractRuntimeInterface for crate::Runtime {
         summary: &StateSummary<'a>,
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
-        let instance = self.prepare_contract_call(key, parameters, req_bytes)?;
-        let linear_mem = self.linear_mem(&instance)?;
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let linear_mem = self.linear_mem(&running.instance)?;
 
         let param_buf_ptr = {
-            let mut param_buf = self.init_buf(&instance, parameters)?;
+            let mut param_buf = self.init_buf(&running.instance, parameters)?;
             param_buf.write(parameters)?;
             param_buf.ptr()
         };
         let state_buf_ptr = {
-            let mut state_buf = self.init_buf(&instance, state)?;
+            let mut state_buf = self.init_buf(&running.instance, state)?;
             state_buf.write(state.clone())?;
             state_buf.ptr()
         };
         let summary_buf_ptr = {
-            let mut summary_buf = self.init_buf(&instance, summary)?;
+            let mut summary_buf = self.init_buf(&running.instance, summary)?;
             summary_buf.write(summary)?;
             summary_buf.ptr()
         };
 
-        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = instance
+        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = running
+            .instance
             .exports
             .get_typed_function(&self.wasm_store, "get_state_delta")?;
 
@@ -299,88 +306,14 @@ impl ContractRuntimeInterface for crate::Runtime {
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::prelude::WrappedContract;
-
     use super::*;
-    use crate::component_store::ComponentStore;
-    use crate::{
-        secrets_store::SecretsStore, ContractContainer, ContractStore, Runtime, WasmAPIVersion,
-    };
-    use std::{
-        path::{Path, PathBuf},
-        process::Command,
-        sync::atomic::AtomicUsize,
-    };
+    use crate::{secrets_store::SecretsStore, tests::setup_test_contract, ComponentStore, Runtime};
 
     const TEST_CONTRACT_1: &str = "test_contract_1";
-    static TEST_NO: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_dir() -> PathBuf {
-        let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
-            "contract-api-test-{}",
-            TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        if !test_dir.exists() {
-            std::fs::create_dir_all(&test_dir).unwrap();
-        }
-        test_dir
-    }
-
-    fn get_test_contract(name: &str) -> Result<WrappedContract, Box<dyn std::error::Error>> {
-        const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
-        let contracts = PathBuf::from(CONTRACTS_DIR);
-        let mut dirs = contracts.ancestors();
-        let path = dirs.nth(2).unwrap();
-        let contract_dir = path.join("tests").join(name.replace('_', "-"));
-        let mut contract_build = contract_dir
-            .join("build/locutus")
-            .join(name)
-            .with_extension("wasm");
-
-        if !contract_build.exists() {
-            let target =
-                std::env::var("CARGO_TARGET_DIR").map_err(|_| "CARGO_TARGET_DIR should be set")?;
-            println!("trying to compile the test contract, target: {target}");
-            // attempt to compile it
-            const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
-            const WASI_TARGET: &str = "wasm32-wasi";
-            let cmd_args = RUST_TARGET_ARGS
-                .iter()
-                .copied()
-                .chain([WASI_TARGET])
-                .collect::<Vec<_>>();
-            let mut child = Command::new("cargo")
-                .args(&cmd_args)
-                .current_dir(&contract_dir)
-                .spawn()?;
-            child.wait()?;
-            let output_file = Path::new(&target)
-                .join("wasm32-wasi")
-                .join("debug")
-                .join(name)
-                .with_extension("wasm");
-            println!("output file: {output_file:?}");
-            contract_build = output_file;
-        }
-
-        Ok(
-            WrappedContract::try_from((contract_build.as_path(), Parameters::from(vec![])))
-                .expect("contract found"),
-        )
-    }
-
-    fn set_up_test_contract(name: &str) -> RuntimeResult<(ContractStore, ContractKey)> {
-        let mut store = ContractStore::new(test_dir(), 10_000)?;
-        let contract =
-            ContractContainer::Wasm(WasmAPIVersion::V1(get_test_contract(name).unwrap()));
-        let key = contract.key();
-        store.store_contract(contract)?;
-        Ok((store, key))
-    }
 
     #[test]
     fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(
             store,
             ComponentStore::default(),
@@ -411,7 +344,7 @@ mod test {
 
     #[test]
     fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(
             store,
             ComponentStore::default(),
@@ -440,7 +373,7 @@ mod test {
 
     #[test]
     fn update_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(
             store,
             ComponentStore::default(),
@@ -465,7 +398,7 @@ mod test {
 
     #[test]
     fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(
             store,
             ComponentStore::default(),
@@ -486,7 +419,7 @@ mod test {
 
     #[test]
     fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
-        let (store, key) = set_up_test_contract(TEST_CONTRACT_1)?;
+        let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
         let mut runtime = Runtime::build(
             store,
             ComponentStore::default(),

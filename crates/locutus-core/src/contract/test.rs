@@ -4,7 +4,7 @@ use locutus_runtime::{
     ContractKey, ContractRuntimeInterface, ContractStore, StateStorage, StateStore,
     UpdateModification, ValidateResult,
 };
-use locutus_stdlib::api::{ClientRequest, HostResponse};
+use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
 use crate::{config::CONFIG, WrappedState};

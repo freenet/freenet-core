@@ -198,7 +198,7 @@ async fn process_response(
 
 #[cfg(test)]
 mod test {
-    use crate::api::HostResponse;
+    use crate::client_api::HostResponse;
 
     use super::*;
     use std::{net::Ipv4Addr, sync::atomic::AtomicU16, time::Duration};
