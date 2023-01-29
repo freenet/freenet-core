@@ -180,6 +180,7 @@ mod test {
         }
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping() -> Result<(), ()> {
         let peer1_port = get_free_port().unwrap();

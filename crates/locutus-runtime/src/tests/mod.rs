@@ -39,8 +39,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .with_extension("wasm");
     if !contract_build_path.exists() {
         const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
-        std::env::set_var(TARGET_DIR_VAR, "/home/nachod/.cargo");
-        let target = std::env::var(TARGET_DIR_VAR)?;
+        let target = std::env::var(TARGET_DIR_VAR).map_err(|_| "CARGO_TARGET_DIR should be set")?;
         println!("trying to compile the test contract, target: {target}");
         // attempt to compile it
         const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
