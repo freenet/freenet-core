@@ -44,51 +44,18 @@ impl Tier {
                 let vs = dt.second() == 0;
                 vns && vs
             }
-            Tier::Min5 => {
-                let vns = dt.nanosecond() == 0;
-                let vs = dt.second() == 0;
-                let vm = dt.minute() % 5 == 0;
-                vns && vs && vm
-            }
-            Tier::Min10 => {
-                let vns = dt.nanosecond() == 0;
-                let vs = dt.second() == 0;
-                let vm = dt.minute() % 10 == 0;
-                vns && vs && vm
-            }
-            Tier::Min30 => {
-                let vns = dt.nanosecond() == 0;
-                let vs = dt.second() == 0;
-                let vm = dt.minute() % 30 == 0;
-                vns && vs && vm
-            }
+            Tier::Min5 => Self::check_is_correct_minute(dt, 5),
+            Tier::Min10 => Self::check_is_correct_minute(dt, 10),
+            Tier::Min30 => Self::check_is_correct_minute(dt, 30),
             Tier::Hour1 => {
                 let vns = dt.nanosecond() == 0;
                 let vs = dt.second() == 0;
                 let vm = dt.minute() == 0;
                 vns && vs && vm
             }
-            Tier::Hour3 => {
-                let vns = dt.nanosecond() == 0;
-                let vs = dt.second() == 0;
-                let vm = dt.minute() == 0;
-                let vh = dt.hour() % 3 == 0;
-                vns && vs && vm && vh
-            }
-            Tier::Hour6 => {
-                let vns = dt.nanosecond() == 0;
-                let vs = dt.second() == 0;
-                let vm = dt.minute() == 0;
-                let vh = dt.hour() % 6 == 0;
-                vns && vs && vm && vh
-            }
-            Tier::Hour12 => {
-                let vns = dt.nanosecond() == 0;
-                let vs = dt.second() == 0;
-                let vm = dt.minute() == 0;
-                let vh = dt.hour() % 12 == 0;
-                vns && vs && vm && vh
-            }
+            Tier::Hour3 => Self::check_is_correct_hour(dt, 3),
+            Tier::Hour6 => Self::check_is_correct_hour(dt, 6),
+            Tier::Hour12 => Self::check_is_correct_hour(dt, 12),
             Tier::Day1 => {
                 let vns = dt.nanosecond() == 0;
                 let vs = dt.second() == 0;
@@ -96,13 +63,31 @@ impl Tier {
                 let vh = dt.hour() == 0;
                 vns && vs && vm && vh
             }
-            Tier::Day7 => todo!(),
-            Tier::Day15 => todo!(),
-            Tier::Day30 => todo!(),
-            Tier::Day90 => todo!(),
-            Tier::Day180 => todo!(),
-            Tier::Day365 => todo!(),
+            Tier::Day7 => Self::check_is_correct_day(dt, 7),
+            Tier::Day15 => Self::check_is_correct_day(dt, 15),
+            Tier::Day30 => Self::check_is_correct_day(dt, 30),
+            Tier::Day90 => Self::check_is_correct_day(dt, 90),
+            Tier::Day180 => Self::check_is_correct_day(dt, 180),
+            Tier::Day365 => Self::check_is_correct_day(dt, 365),
         }
+    }
+
+    fn check_is_correct_minute(dt: DateTime<Utc>, base_min: u32) -> bool {
+        dt.second() == 0 && dt.nanosecond() == 0 && dt.minute() % base_min == 0
+    }
+
+    fn check_is_correct_hour(dt: DateTime<Utc>, base_hour: u32) -> bool {
+        dt.minute() == 0 && dt.second() == 0 && dt.nanosecond() == 0 && dt.hour() % base_hour == 0
+    }
+
+    fn check_is_correct_day(dt: DateTime<Utc>, base_day: i64) -> bool {
+        let year = get_date(dt.year() - 1, 12, 31);
+        let delta = dt - year;
+        dt.hour() == 0
+            && dt.minute() == 0
+            && dt.second() == 0
+            && dt.nanosecond() == 0
+            && delta.num_days() % base_day == 0
     }
 
     pub fn tier_duration(&self) -> std::time::Duration {
@@ -141,9 +126,9 @@ impl Tier {
                 }
                 time
             }
-            Tier::Min5 => todo!(),
-            Tier::Min10 => todo!(),
-            Tier::Min30 => todo!(),
+            Tier::Min5 => self.normalize_to_next_minute(time, 5),
+            Tier::Min10 => self.normalize_to_next_minute(time, 10),
+            Tier::Min30 => self.normalize_to_next_minute(time, 15),
             Tier::Hour1 => {
                 let is_rounded = time.hour() == 0
                     && time.minute() == 0
@@ -157,9 +142,9 @@ impl Tier {
                 }
                 time
             }
-            Tier::Hour3 => todo!(),
-            Tier::Hour6 => todo!(),
-            Tier::Hour12 => todo!(),
+            Tier::Hour3 => self.normalize_to_next_hour(time, 3),
+            Tier::Hour6 => self.normalize_to_next_hour(time, 6),
+            Tier::Hour12 => self.normalize_to_next_hour(time, 12),
             Tier::Day1 => {
                 let is_rounded = time.hour() == 0
                     && time.minute() == 0
@@ -182,6 +167,42 @@ impl Tier {
         }
     }
 
+    fn normalize_to_next_minute(&self, mut time: DateTime<Utc>, base_minute: u32) -> DateTime<Utc> {
+        let is_rounded =
+            time.minute() % base_minute == 0 && time.second() == 0 && time.nanosecond() == 0;
+        if !is_rounded {
+            time = time.with_second(0).unwrap();
+            time = time.trunc_subsecs(0);
+            let minutes_in_time = time.minute();
+            let remainder_minutes = minutes_in_time % base_minute;
+            if remainder_minutes != 0 {
+                let duration = chrono::Duration::from_std(self.tier_duration()).unwrap();
+                time = time.with_minute(time.minute() - remainder_minutes).unwrap();
+                time += duration;
+            }
+        }
+        time
+    }
+
+    fn normalize_to_next_hour(&self, mut time: DateTime<Utc>, base_hour: u32) -> DateTime<Utc> {
+        let is_rounded = time.hour() % base_hour == 0
+            && time.minute() == 0
+            && time.second() == 0
+            && time.nanosecond() == 0;
+        if !is_rounded {
+            time = time.with_second(0).unwrap().with_minute(0).unwrap();
+            time = time.trunc_subsecs(0);
+            let hours_in_time = time.hour();
+            let remainder_hours = hours_in_time % base_hour;
+            if remainder_hours != 0 {
+                let duration = chrono::Duration::from_std(self.tier_duration()).unwrap();
+                time = time.with_hour(time.hour() - remainder_hours).unwrap();
+                time += duration;
+            }
+        }
+        time
+    }
+
     fn normalize_to_next_day(&self, mut time: DateTime<Utc>, base_day: i64) -> DateTime<Utc> {
         let year = get_date(time.year() - 1, 12, 31);
         let delta = time - year;
@@ -189,7 +210,7 @@ impl Tier {
             && time.minute() == 0
             && time.second() == 0
             && time.nanosecond() == 0
-            && delta.num_days() % 7 == 0;
+            && delta.num_days() % base_day == 0;
         if !is_rounded {
             time = time.with_second(0).unwrap().with_minute(0).unwrap();
             time = time.trunc_subsecs(0);
@@ -216,19 +237,113 @@ fn get_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
 #[cfg(test)]
 mod tier_tests {
     use super::*;
+
+    #[test]
+    fn is_correct_minute() {
+        let day7_tier = Tier::Day7;
+        assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
+        assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
+
+        let day30_tier = Tier::Day30;
+        assert!(day30_tier.is_valid_slot(get_date(2023, 1, 30)));
+        assert!(day30_tier.is_valid_slot(get_date(2023, 3, 1)));
+        assert!(!day30_tier.is_valid_slot(get_date(2023, 3, 30)));
+    }
+
+    #[test]
+    fn is_correct_hour() {
+        let hour3_tier = Tier::Hour3;
+        assert!(hour3_tier.is_valid_slot(get_date(2023, 1, 7).with_hour(6).unwrap()));
+        assert!(!hour3_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(7).unwrap()));
+
+        let hour12_tier = Tier::Hour12;
+        assert!(hour12_tier.is_valid_slot(get_date(2023, 1, 30).with_hour(12).unwrap()));
+        assert!(hour12_tier.is_valid_slot(get_date(2023, 3, 1)));
+        assert!(!hour12_tier.is_valid_slot(get_date(2023, 3, 30).with_hour(13).unwrap()));
+    }
+
+    #[test]
+    fn is_correct_day() {
+        let day7_tier = Tier::Day7;
+        assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
+        assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
+
+        let day30_tier = Tier::Day30;
+        assert!(day30_tier.is_valid_slot(get_date(2023, 1, 30)));
+        assert!(day30_tier.is_valid_slot(get_date(2023, 3, 1)));
+        assert!(!day30_tier.is_valid_slot(get_date(2023, 3, 30)));
+    }
+
+    #[test]
+    fn minute_tier_normalization() {
+        let min5_tier = Tier::Min5;
+        let min5_normalized =
+            min5_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(37).unwrap());
+        assert_eq!(
+            min5_normalized,
+            get_date(2023, 1, 1).with_minute(40).unwrap()
+        );
+        let min5_normalized =
+            min5_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(8).unwrap());
+        assert_eq!(
+            min5_normalized,
+            get_date(2023, 1, 1).with_minute(10).unwrap()
+        );
+
+        let min10_tier = Tier::Min10;
+        let min10_normalized =
+            min10_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(22).unwrap());
+        assert_eq!(
+            min10_normalized,
+            get_date(2023, 1, 1).with_minute(30).unwrap()
+        );
+        let min10_tier = Tier::Min10;
+        let min10_normalized =
+            min10_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(38).unwrap());
+        assert_eq!(
+            min10_normalized,
+            get_date(2023, 1, 1).with_minute(40).unwrap()
+        );
+    }
+
+    #[test]
+    fn hour_tier_normalization() {
+        let hour6_tier = Tier::Hour6;
+        let hour6_normalized =
+            hour6_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(4).unwrap());
+        assert_eq!(hour6_normalized, get_date(2023, 1, 1).with_hour(6).unwrap());
+        let hour6_normalized =
+            hour6_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(17).unwrap());
+        assert_eq!(
+            hour6_normalized,
+            get_date(2023, 1, 1).with_hour(18).unwrap()
+        );
+
+        let hour12_tier = Tier::Hour12;
+        let hour12_normalized =
+            hour12_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(4).unwrap());
+        assert_eq!(
+            hour12_normalized,
+            get_date(2023, 1, 1).with_hour(12).unwrap()
+        );
+        let hour12_normalized =
+            hour12_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(17).unwrap());
+        assert_eq!(hour12_normalized, get_date(2023, 1, 2));
+    }
+
     #[test]
     fn day_tier_normalization() {
         let day7_tier = Tier::Day7;
         let day7_normalized = day7_tier.normalize_to_next(get_date(2023, 1, 17));
         assert_eq!(day7_normalized, get_date(2023, 1, 21));
-        let day7_tier = day7_tier.normalize_to_next(get_date(2023, 1, 31));
-        assert_eq!(day7_tier, get_date(2023, 2, 4));
+        let day15_normalized = day7_tier.normalize_to_next(get_date(2023, 1, 31));
+        assert_eq!(day15_normalized, get_date(2023, 2, 4));
 
-        let day7_tier = Tier::Day15;
-        let day7_normalized = day7_tier.normalize_to_next(get_date(2023, 1, 17));
-        assert_eq!(day7_normalized, get_date(2023, 1, 30));
-        let day7_tier = day7_tier.normalize_to_next(get_date(2023, 1, 31));
-        assert_eq!(day7_tier, get_date(2023, 2, 14));
+        let day15_tier = Tier::Day15;
+        let day15_normalized = day15_tier.normalize_to_next(get_date(2023, 1, 17));
+        assert_eq!(day15_normalized, get_date(2023, 1, 30));
+        let day15_normalized = day15_tier.normalize_to_next(get_date(2023, 1, 31));
+        assert_eq!(day15_normalized, get_date(2023, 2, 14));
     }
 }
 

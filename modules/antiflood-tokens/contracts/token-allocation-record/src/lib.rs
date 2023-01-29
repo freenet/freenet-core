@@ -64,7 +64,6 @@ impl ContractInterface for TokenAllocContract {
                             ContractError::InvalidUpdate
                         })?;
                 }
-                // does this send the prev state + new delta?
                 UpdateData::StateAndDelta { state, delta } => {
                     let new_assigned_tokens = TokenAllocationRecord::try_from(state)?;
                     assigned_tokens
