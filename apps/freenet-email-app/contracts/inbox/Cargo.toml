@@ -1,0 +1,14 @@
+[package]
+name = "freenet-email-inbox"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.58.0"
+resolver = "2"
+publish = false
+
+[dependencies]
+locutus-stdlib = { workspace = true }
+locutus-aft-interface = { workspace = true }
+
+[lib]
+crate-type = ["cdylib"]
