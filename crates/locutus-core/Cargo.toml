@@ -23,7 +23,7 @@ ctrlc = { version = "3.0", features = ["termination"] }
 dashmap = "^5.1"
 directories = "4"
 either = { workspace = true , features = ["serde"] }
-futures = "0.3.21"
+futures = "0.3.26"
 libp2p = { version = "0.42.2", features = [
     "autonat",
     "deflate",
