@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/checkout@v3
 
-      - uses: actions/cache@v2
+      - uses: actions/cache@v3
         with:
           path: ~/.cargo
           key: cargo-registry-${{ hashFiles('Cargo.lock') }}
@@ -63,7 +63,7 @@ jobs:
 
       - name: Cache cargo registry
         if: always()
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: ~/.cargo
           key: cargo-registry-${{ hashFiles('Cargo.lock') }}
@@ -87,7 +87,7 @@ jobs:
 
       - uses: actions/checkout@v3
 
-      - uses: actions/cache@v2
+      - uses: actions/cache@v3
         with:
           path: ~/.cargo
           key: cargo-registry-${{ hashFiles('Cargo.lock') }}
@@ -125,7 +125,7 @@ jobs:
 
       - uses: actions/checkout@v3
 
-      - uses: actions/cache@v2
+      - uses: actions/cache@v3
         with:
           path: ~/.cargo
           key: cargo-registry-${{ hashFiles('Cargo.lock') }}
