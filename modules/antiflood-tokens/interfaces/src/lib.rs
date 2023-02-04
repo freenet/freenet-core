@@ -478,6 +478,13 @@ impl TokenAllocationRecord {
             tokens_by_tier: delta,
         }
     }
+
+    pub fn assignment_exists(&self, record: &TokenAssignment) -> bool {
+        let Some(assignments) = self.tokens_by_tier.get(&record.tier) else { return false };
+        let Ok(idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else { return false };
+        let assignment = &assignments[idx];
+        assignment == record
+    }
 }
 
 impl<'a> IntoIterator for &'a TokenAllocationRecord {
@@ -553,16 +560,18 @@ impl TryFrom<TokenAllocationSummary> for StateSummary<'static> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[must_use]
 pub struct TokenAssignment {
     pub tier: Tier,
     pub time_slot: DateTime<Utc>,
     /// The assignment, the recipient decides whether this assignment is valid based on this field.
-    /// This will often be a PublicKey.
+    /// This will often be a public key.
     pub assignee: Assignment,
-    /// `(tier, issue_time, assigned_to)` must be signed by `generator_public_key`
+    /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
     pub signature: Signature,
+    /// A Blake2s256 hash of the message.
+    pub assignment_hash: [u8; 32],
 }
 
 impl TokenAssignment {
@@ -572,7 +581,7 @@ impl TokenAssignment {
 
     pub const SIGNED_MSG_SIZE: usize = Self::TIER_SIZE + Self::TS_SIZE + Self::ASSIGNEE_SIZE;
 
-    /// The `(tier, issue_time, assigned_to)` tuple that has to be verified as bytes.
+    /// The `(tier, issue_time, assignee)` tuple that has to be verified as bytes.
     pub fn to_be_signed(
         issue_time: &DateTime<Utc>,
         assigned_to: &Assignment,
@@ -608,14 +617,6 @@ fn to_be_signed_test() {
     );
     // dbg!(_to_be_signed);
 }
-
-impl PartialEq for TokenAssignment {
-    fn eq(&self, other: &Self) -> bool {
-        self.tier == other.tier && self.time_slot == other.time_slot
-    }
-}
-
-impl Eq for TokenAssignment {}
 
 impl PartialOrd for TokenAssignment {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {

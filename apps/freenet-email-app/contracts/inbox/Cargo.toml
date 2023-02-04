@@ -7,8 +7,12 @@ resolver = "2"
 publish = false
 
 [dependencies]
+bincode = { workspace = true }
+ed25519-dalek = { workspace = true }
 locutus-stdlib = { workspace = true }
 locutus-aft-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lib]
 crate-type = ["cdylib"]

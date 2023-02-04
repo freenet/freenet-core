@@ -30,6 +30,7 @@ mod token_assignment {
                 time_slot: get_assignment_date(2023, 1, 25),
                 assignee: test_assignee(),
                 signature: Signature::from([1; 64]),
+                assignment_hash: [0; 32],
             }],
         )]));
         let assignment = records.next_free_assignment(
@@ -49,12 +50,14 @@ mod token_assignment {
                     time_slot: get_assignment_date(2022, 1, 27),
                     assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
+                    assignment_hash: [0; 32],
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2023, 1, 26),
                     assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
+                    assignment_hash: [0; 32],
                 },
             ],
         )]));
@@ -75,12 +78,14 @@ mod token_assignment {
                     time_slot: get_assignment_date(2022, 1, 27),
                     assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
+                    assignment_hash: [0; 32],
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 29),
                     assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
+                    assignment_hash: [0; 32],
                 },
             ],
         )]));
@@ -98,18 +103,21 @@ mod token_assignment {
                     time_slot: get_assignment_date(2022, 1, 27),
                     assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
+                    assignment_hash: [0; 32],
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 28),
                     assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
+                    assignment_hash: [0; 32],
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 30),
                     assignee: test_assignee(),
                     signature: Signature::from([1; 64]),
+                    assignment_hash: [0; 32],
                 },
             ],
         )]));
