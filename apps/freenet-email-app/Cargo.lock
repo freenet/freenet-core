@@ -326,6 +326,7 @@ name = "freenet-email-inbox"
 version = "0.0.1"
 dependencies = [
  "bincode",
+ "chrono",
  "ed25519-dalek",
  "locutus-aft-interface",
  "locutus-stdlib",

@@ -404,12 +404,21 @@ pub struct AllocationCriteria {
     pub frequency: Tier,
     /// Maximum age of the allocated token.
     pub max_age: std::time::Duration,
+    pub contract: ContractInstanceId,
 }
 
 impl AllocationCriteria {
-    pub fn new(frequency: Tier, max_age: std::time::Duration) -> Result<Self, AllocationError> {
+    pub fn new(
+        frequency: Tier,
+        max_age: std::time::Duration,
+        contract: ContractInstanceId,
+    ) -> Result<Self, AllocationError> {
         if max_age <= std::time::Duration::from_secs(3600 * 24 * 365 * 2) {
-            Ok(Self { frequency, max_age })
+            Ok(Self {
+                frequency,
+                max_age,
+                contract,
+            })
         } else {
             Err(AllocationErrorInner::IncorrectMaxAge.into())
         }
@@ -560,6 +569,8 @@ impl TryFrom<TokenAllocationSummary> for StateSummary<'static> {
     }
 }
 
+pub type TokenAssignmentHash = [u8; 32];
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[must_use]
 pub struct TokenAssignment {
@@ -571,7 +582,9 @@ pub struct TokenAssignment {
     /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
     pub signature: Signature,
     /// A Blake2s256 hash of the message.
-    pub assignment_hash: [u8; 32],
+    pub assignment_hash: TokenAssignmentHash,
+    /// Key to the contract holding the token records of the assignee.
+    pub token_record: ContractInstanceId, // TODO: include this in the TokenAssignment itself
 }
 
 impl TokenAssignment {

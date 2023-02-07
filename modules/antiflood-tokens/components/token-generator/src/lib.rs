@@ -339,6 +339,7 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
                 assignee,
                 signature,
                 assignment_hash,
+                token_record: criteria.contract,
             }
         };
         self.append_unchecked(assignment.clone());

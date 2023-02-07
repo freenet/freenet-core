@@ -5,6 +5,7 @@ mod token_assignment {
     use chrono::{NaiveDate, Timelike};
     use ed25519_dalek::{PublicKey, Signature};
     use locutus_aft_interface::Tier;
+    use once_cell::sync::Lazy;
 
     fn get_assignment_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         let naive = NaiveDate::from_ymd_opt(y, m, d)
@@ -17,9 +18,14 @@ mod token_assignment {
     const TEST_TIER: Tier = Tier::Day1;
     const MAX_DURATION_1Y: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
-    fn test_assignee() -> PublicKey {
-        PublicKey::from_bytes(&[1; ed25519_dalek::PUBLIC_KEY_LENGTH]).unwrap()
-    }
+    static PK: Lazy<PublicKey> =
+        Lazy::new(|| PublicKey::from_bytes(&[1; ed25519_dalek::PUBLIC_KEY_LENGTH]).unwrap());
+
+    static ID: Lazy<ContractInstanceId> = Lazy::new(|| {
+        let rnd = [1; 32];
+        let mut gen = arbitrary::Unstructured::new(&rnd);
+        gen.arbitrary().unwrap()
+    });
 
     #[test]
     fn free_spot_first() {
@@ -28,13 +34,14 @@ mod token_assignment {
             vec![TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: get_assignment_date(2023, 1, 25),
-                assignee: test_assignee(),
+                assignee: *PK,
                 signature: Signature::from([1; 64]),
                 assignment_hash: [0; 32],
+                token_record: *ID,
             }],
         )]));
         let assignment = records.next_free_assignment(
-            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y).unwrap(),
+            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y, *ID).unwrap(),
             get_assignment_date(2023, 1, 27),
         );
         assert_eq!(assignment.unwrap(), get_assignment_date(2022, 1, 27));
@@ -48,21 +55,23 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: test_assignee(),
+                    assignee: *PK,
                     signature: Signature::from([1; 64]),
                     assignment_hash: [0; 32],
+                    token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2023, 1, 26),
-                    assignee: test_assignee(),
+                    assignee: *PK,
                     signature: Signature::from([1; 64]),
                     assignment_hash: [0; 32],
+                    token_record: *ID,
                 },
             ],
         )]));
         let assignment = records.next_free_assignment(
-            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y).unwrap(),
+            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y, *ID).unwrap(),
             get_assignment_date(2023, 1, 27).with_minute(1).unwrap(),
         );
         assert_eq!(assignment.unwrap(), get_assignment_date(2022, 1, 28));
@@ -76,21 +85,23 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: test_assignee(),
+                    assignee: *PK,
                     signature: Signature::from([1; 64]),
                     assignment_hash: [0; 32],
+                    token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 29),
-                    assignee: test_assignee(),
+                    assignee: *PK,
                     signature: Signature::from([1; 64]),
                     assignment_hash: [0; 32],
+                    token_record: *ID,
                 },
             ],
         )]));
         let assignment = records.next_free_assignment(
-            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y).unwrap(),
+            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y, *ID).unwrap(),
             get_assignment_date(2023, 1, 27),
         );
         assert_eq!(assignment.unwrap(), get_assignment_date(2022, 1, 28));
@@ -101,28 +112,31 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: test_assignee(),
+                    assignee: *PK,
                     signature: Signature::from([1; 64]),
                     assignment_hash: [0; 32],
+                    token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 28),
-                    assignee: test_assignee(),
+                    assignee: *PK,
                     signature: Signature::from([1; 64]),
                     assignment_hash: [0; 32],
+                    token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 30),
-                    assignee: test_assignee(),
+                    assignee: *PK,
                     signature: Signature::from([1; 64]),
                     assignment_hash: [0; 32],
+                    token_record: *ID,
                 },
             ],
         )]));
         let assignment = records.next_free_assignment(
-            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y).unwrap(),
+            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y, *ID).unwrap(),
             get_assignment_date(2023, 1, 27).with_minute(1).unwrap(),
         );
         assert_eq!(assignment.unwrap(), get_assignment_date(2022, 1, 29));
@@ -132,7 +146,7 @@ mod token_assignment {
     fn free_spot_new() {
         let records = TokenAllocationRecord::new(HashMap::new());
         let assignment = records.next_free_assignment(
-            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y).unwrap(),
+            &AllocationCriteria::new(TEST_TIER, MAX_DURATION_1Y, *ID).unwrap(),
             get_assignment_date(2023, 1, 27).with_minute(1).unwrap(),
         );
         assert_eq!(assignment.unwrap(), get_assignment_date(2022, 1, 28));

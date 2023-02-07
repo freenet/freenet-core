@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier};
-use locutus_aft_interface::{TokenAllocationRecord, TokenAssignment};
+use locutus_aft_interface::{Tier, TokenAllocationRecord, TokenAssignment, TokenAssignmentHash};
 use locutus_stdlib::prelude::{blake2::Digest, *};
 use serde::{Deserialize, Serialize};
-
-type MessageId = u64;
 
 #[derive(Serialize, Deserialize)]
 struct InboxParams {
@@ -22,16 +21,20 @@ impl TryFrom<Parameters<'static>> for InboxParams {
 
 #[derive(Serialize, Deserialize)]
 enum UpdateInbox {
-    AddMessage(Box<Message>),
     AddMessages(Vec<Message>),
-    RemoveMessage {
-        signature: Signature,
-        id: MessageId,
-    },
     RemoveMessages {
         signature: Signature,
-        ids: Vec<MessageId>,
+        ids: Vec<TokenAssignmentHash>,
     },
+    ModifySettings {
+        signature: Signature,
+        settings: InboxSettings,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct InboxSettings {
+    minimum_tier: Tier,
 }
 
 impl TryFrom<StateDelta<'static>> for UpdateInbox {
@@ -39,12 +42,6 @@ impl TryFrom<StateDelta<'static>> for UpdateInbox {
     fn try_from(state: StateDelta<'static>) -> Result<Self, Self::Error> {
         bincode::deserialize(&state).map_err(|err| ContractError::Deser(format!("{err}")))
     }
-}
-
-#[derive(Serialize, Deserialize)]
-struct MessageWithMeta {
-    message: Message,
-    id: u64,
 }
 
 /// Requires a shared key between both peers to decrypt the secrets.
@@ -56,14 +53,14 @@ struct Message {
     title: EncryptedContent,
     content: EncryptedContent,
     token_assignment: TokenAssignment,
-    /// Key to the contract holding the token records of the assignee.
-    token_record: ContractInstanceId,
+    time: DateTime<Utc>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Inbox {
-    messages: Vec<MessageWithMeta>,
-    msg_id_counter: u64,
+    messages: Vec<Message>,
+    last_update: DateTime<Utc>,
+    settings: InboxSettings,
 }
 
 enum VerificationError {
@@ -82,13 +79,15 @@ impl Inbox {
     ) -> Result<(), VerificationError> {
         for message in messages {
             let records = allocation_records
-                .get(&message.token_record)
-                .ok_or_else(|| VerificationError::MissingContracts(vec![message.token_record]))?;
+                .get(&message.token_assignment.token_record)
+                .ok_or_else(|| {
+                    VerificationError::MissingContracts(vec![message.token_assignment.token_record])
+                })?;
             if !records.assignment_exists(&message.token_assignment) {
                 return Err(VerificationError::TokenAssignmentMismatch);
             }
             let mut hasher = blake2::Blake2s256::new();
-            hasher.update(&message.title);
+            // hasher.update(&message.title);
             hasher.update(&message.content);
             let hash = hasher.finalize();
             if message.token_assignment.assignment_hash != hash.as_slice() {
@@ -106,19 +105,19 @@ impl Inbox {
     ) -> Result<(), VerificationError> {
         let mut some_missing = false;
         let mut missing = vec![];
-        for meta in &self.messages {
-            let Some(records) = allocation_records.get(&meta.message.token_record) else {
-                missing.push(meta.message.token_record);
+        for message in &self.messages {
+            let Some(records) = allocation_records.get(&message.token_assignment.token_record) else {
+                missing.push(message.token_assignment.token_record);
                 some_missing = true;
                 continue;
             };
             if some_missing {
                 continue;
             }
-            if !records.assignment_exists(&meta.message.token_assignment) {
+            if !records.assignment_exists(&message.token_assignment) {
                 return Err(VerificationError::TokenAssignmentMismatch);
             }
-            (meta.message.token_assignment.assignee == params.pub_key)
+            (message.token_assignment.assignee == params.pub_key)
                 .then_some(())
                 .ok_or(VerificationError::InvalidInboxKey)?;
         }
@@ -136,31 +135,35 @@ impl Inbox {
         (message.token_assignment.assignee == params.pub_key)
             .then_some(())
             .ok_or(VerificationError::InvalidInboxKey)?;
-        self.messages.push(MessageWithMeta {
-            message,
-            id: self.msg_id_counter,
-        });
-        self.msg_id_counter += 1;
+        self.messages.push(message);
         Ok(())
     }
 
-    fn other_messages(&self, delta: Inbox) -> impl Iterator<Item = Message> {
-        let counter = self.msg_id_counter;
-        delta
+    fn other_messages(&self, delta: Inbox) -> impl Iterator<Item = Message> + '_ {
+        let hashes: HashSet<_> = self
             .messages
-            .into_iter()
-            .filter_map(move |m| (m.id >= counter).then_some(m.message))
+            .iter()
+            .map(|m| &m.token_assignment.assignment_hash)
+            .collect();
+        delta.messages.into_iter().filter_map(move |m| {
+            (hashes.contains(&m.token_assignment.assignment_hash)).then_some(m)
+        })
     }
 
-    fn remove_messages(&mut self, messages: HashSet<MessageId>) {
-        self.messages.retain(|m| !messages.contains(&m.id));
+    fn remove_messages(&mut self, messages: HashSet<TokenAssignmentHash>) {
+        self.messages
+            .retain(|m| !messages.contains(&m.token_assignment.assignment_hash));
     }
 
     fn summarize(self) -> Result<StateSummary<'static>, ContractError> {
         let messages = self
             .messages
             .into_iter()
-            .map(|MessageWithMeta { id, .. }| id)
+            .map(
+                |Message {
+                     token_assignment, ..
+                 }| token_assignment.assignment_hash,
+            )
             .collect::<HashSet<_>>();
         let serialized = bincode::serialize(&InboxSummary(messages))
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
@@ -171,11 +174,12 @@ impl Inbox {
         let delta = self
             .messages
             .into_iter()
-            .filter(|m| !messages.contains(&m.id))
+            .filter(|m| !messages.contains(&m.token_assignment.assignment_hash))
             .collect();
         Inbox {
             messages: delta,
-            msg_id_counter: self.msg_id_counter,
+            last_update: self.last_update,
+            settings: self.settings,
         }
     }
 }
@@ -197,7 +201,7 @@ impl TryFrom<Inbox> for StateDelta<'static> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct InboxSummary(HashSet<u64>);
+struct InboxSummary(HashSet<TokenAssignmentHash>);
 
 impl TryFrom<StateSummary<'static>> for InboxSummary {
     type Error = ContractError;
@@ -209,13 +213,29 @@ impl TryFrom<StateSummary<'static>> for InboxSummary {
 fn can_remove_message<'a>(
     params: &InboxParams,
     signature: &Signature,
-    ids: impl Iterator<Item = &'a MessageId>,
+    ids: impl Iterator<Item = &'a TokenAssignmentHash>,
 ) -> Result<(), ContractError> {
-    let bytes: Vec<_> = ids.flat_map(|id| id.to_le_bytes()).collect();
+    for hash in ids {
+        params
+            .pub_key
+            .verify(hash, signature)
+            .map_err(|_err| ContractError::InvalidUpdate)?;
+    }
+    Ok(())
+}
+
+fn can_update_settings(
+    params: &InboxParams,
+    signature: &Signature,
+    settings: &InboxSettings,
+) -> Result<(), ContractError> {
+    let serialized =
+        serde_json::to_vec(settings).map_err(|e| ContractError::Deser(format!("{e}")))?;
     params
         .pub_key
-        .verify(&bytes, signature)
-        .map_err(|_err| ContractError::InvalidUpdate)
+        .verify(&serialized, signature)
+        .map_err(|_err| ContractError::InvalidUpdate)?;
+    Ok(())
 }
 
 #[contract]
@@ -264,6 +284,7 @@ impl ContractInterface for Inbox {
         state: State<'static>,
         updates: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
+        // todo: take care of race condition between token alloc record and the assignment
         let mut inbox = Inbox::try_from(state)?;
         let params = InboxParams::try_from(parameters)?;
         let mut missing_related = vec![];
@@ -278,38 +299,42 @@ impl ContractInterface for Inbox {
                     new_messages.extend(delta_messages);
                 }
                 UpdateData::Delta(d) => match UpdateInbox::try_from(d)? {
-                    UpdateInbox::AddMessage(msg) => {
-                        missing_related.push(msg.token_record);
-                        new_messages.push(*msg);
-                    }
                     UpdateInbox::AddMessages(mut messages) => {
+                        for m in &messages {
+                            missing_related.push(m.token_assignment.token_record);
+                        }
                         new_messages.append(&mut messages);
-                    }
-                    UpdateInbox::RemoveMessage { signature, id } => {
-                        can_remove_message(&params, &signature, [&id].into_iter())?;
-                        rm_messages.insert(id);
                     }
                     UpdateInbox::RemoveMessages { signature, ids } => {
                         can_remove_message(&params, &signature, ids.iter())?;
                         rm_messages.extend(ids);
                     }
+                    UpdateInbox::ModifySettings {
+                        settings,
+                        signature,
+                    } => {
+                        can_update_settings(&params, &signature, &settings)?;
+                        inbox.settings = settings;
+                    }
                 },
                 UpdateData::StateAndDelta { state, delta } => {
                     match UpdateInbox::try_from(delta)? {
-                        UpdateInbox::AddMessage(msg) => {
-                            missing_related.push(msg.token_record);
-                            new_messages.push(*msg);
-                        }
                         UpdateInbox::AddMessages(mut messages) => {
+                            for m in &messages {
+                                missing_related.push(m.token_assignment.token_record);
+                            }
                             new_messages.append(&mut messages);
-                        }
-                        UpdateInbox::RemoveMessage { signature, id } => {
-                            can_remove_message(&params, &signature, [&id].into_iter())?;
-                            rm_messages.insert(id);
                         }
                         UpdateInbox::RemoveMessages { signature, ids } => {
                             can_remove_message(&params, &signature, ids.iter())?;
                             rm_messages.extend(ids);
+                        }
+                        UpdateInbox::ModifySettings {
+                            settings,
+                            signature,
+                        } => {
+                            can_update_settings(&params, &signature, &settings)?;
+                            inbox.settings = settings;
                         }
                     }
                     let delta_inbox = Inbox::try_from(state)?;
@@ -340,6 +365,7 @@ impl ContractInterface for Inbox {
                 .add_messages(&params, &allocation_records, new_messages)
                 .map_err(|_| ContractError::InvalidUpdate)?;
             inbox.remove_messages(rm_messages);
+            inbox.last_update = locutus_stdlib::time::now();
             let serialized =
                 serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;
             Ok(UpdateModification::valid(serialized.into()))

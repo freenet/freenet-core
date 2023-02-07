@@ -184,6 +184,7 @@ impl<'a> From<HashMap<ContractInstanceId, Option<State<'a>>>> for RelatedContrac
 pub struct RelatedContract {
     pub contract_instance_id: ContractInstanceId,
     pub mode: RelatedMode,
+    // todo: add a timeout so we stop listening/subscribing eventually
 }
 
 /// Specification of the notifications of interest from a related contract.

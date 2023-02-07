@@ -23,6 +23,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e90af4de65aa7b293ef2d09daff88501eb254f58edde2e1ac02c82d873eadad"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -254,6 +263,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7618812407e9402654622dd402b0a89dff9ba93badd6540781526117b92aab7e"
 dependencies = [
  "darling_core",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8beee4701e2e229e8098bbdecdca12449bc3e322f137d269182fa1291e20bd00"
+dependencies = [
+ "proc-macro2",
  "quote",
  "syn",
 ]
@@ -553,6 +573,7 @@ dependencies = [
 name = "locutus-aft-generator"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "bincode",
  "bs58",
  "chrono",
@@ -560,6 +581,7 @@ dependencies = [
  "hashbrown 0.13.2",
  "locutus-aft-interface",
  "locutus-stdlib",
+ "once_cell",
  "serde",
  "serde_json",
 ]
@@ -592,6 +614,7 @@ dependencies = [
 name = "locutus-stdlib"
 version = "0.0.3"
 dependencies = [
+ "arbitrary",
  "arrayvec",
  "bincode",
  "blake2",

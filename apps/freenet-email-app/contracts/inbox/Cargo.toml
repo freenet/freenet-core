@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 bincode = { workspace = true }
 ed25519-dalek = { workspace = true }
+chrono = { workspace = true }
 locutus-stdlib = { workspace = true }
 locutus-aft-interface = { workspace = true }
 serde = { workspace = true }
