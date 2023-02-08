@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["contracts/*"]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+opt-level = 's'
+debug = false
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[workspace.dependencies]
+bincode = "1"
+chrono = "0.4"
+ed25519-dalek = { version = "1", no-default-features = true, features = ["serde"] }
+serde = "1"
+serde_json = "1"
+
+locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+locutus-aft-interface = { path = "../../modules/antiflood-tokens/interfaces" }
+
+#[target.wasm32-unknown-unknown]
+#rustflags = ["-C", "link-arg=--import-memory"]

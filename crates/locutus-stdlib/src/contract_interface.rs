@@ -138,6 +138,12 @@ impl RelatedContracts<'_> {
     }
 }
 
+impl RelatedContracts<'static> {
+    pub fn states(self) -> impl Iterator<Item = (ContractInstanceId, Option<State<'static>>)> {
+        self.map.into_iter()
+    }
+}
+
 impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
     type Error = String;
 
@@ -178,6 +184,7 @@ impl<'a> From<HashMap<ContractInstanceId, Option<State<'a>>>> for RelatedContrac
 pub struct RelatedContract {
     pub contract_instance_id: ContractInstanceId,
     pub mode: RelatedMode,
+    // todo: add a timeout so we stop listening/subscribing eventually
 }
 
 /// Specification of the notifications of interest from a related contract.

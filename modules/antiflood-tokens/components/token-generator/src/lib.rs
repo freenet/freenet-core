@@ -10,6 +10,8 @@ mod tests;
 
 type Assignee = ed25519_dalek::PublicKey;
 
+type AssignmentHash = [u8; 32];
+
 struct TokenComponent;
 
 impl ComponentInterface for TokenComponent {
@@ -93,15 +95,15 @@ fn user_input(criteria: &AllocationCriteria, assignee: &Assignee) -> Notificatio
 fn allocate_token(
     context: &mut Context,
     app: ContractInstanceId,
-    req: RequestNewToken,
-) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
-    let RequestNewToken {
+    RequestNewToken {
         request_id,
         component_id,
         criteria,
         mut records,
         assignee,
-    } = req;
+        assignment_hash,
+    }: RequestNewToken,
+) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
     let request = context
         .waiting_for_user_input
         .iter()
@@ -127,6 +129,7 @@ fn allocate_token(
                     criteria,
                     records,
                     assignee,
+                    assignment_hash,
                 });
                 OutboundComponentMsg::ApplicationMessage(
                     ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
@@ -146,6 +149,7 @@ fn allocate_token(
                     criteria,
                     records,
                     assignee,
+                    assignment_hash,
                 });
                 OutboundComponentMsg::ApplicationMessage(
                     ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
@@ -171,6 +175,7 @@ fn allocate_token(
                     criteria,
                     records,
                     assignee,
+                    assignment_hash,
                 });
                 OutboundComponentMsg::ApplicationMessage(
                     ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
@@ -183,7 +188,7 @@ fn allocate_token(
             let application_response = match response {
                 Response::Allowed => {
                     let context: ComponentContext = (&*context).try_into()?;
-                    let Some(assignment) = records.assign(assignee, &criteria, keypair) else {
+                    let Some(assignment) = records.assign(assignee, &criteria, keypair, assignment_hash) else {
                         let msg = TokenComponentMessage::Failure(FailureReason::NoFreeSlot { component_id, criteria } );
                         return Ok(vec![OutboundComponentMsg::ApplicationMessage(
                             ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
@@ -248,6 +253,7 @@ struct RequestNewToken {
     criteria: AllocationCriteria,
     records: TokenAllocationRecord,
     assignee: Assignee,
+    assignment_hash: AssignmentHash,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -290,11 +296,6 @@ impl TryFrom<&[u8]> for TokenComponentMessage {
     }
 }
 
-/// This should be used by applications to assign tokens previously requested to this component.
-pub trait TokenAssignmentExt {
-    fn append_unchecked(&mut self, assignment: TokenAssignment);
-}
-
 /// This is used internally by the component to allocate new tokens on behave of the requesting client app.
 ///  
 /// Conflicting assignments for the same time slot are not permitted and indicate that the generator is broken or malicious.
@@ -304,6 +305,7 @@ trait TokenAssignmentInternal {
         assignee: Assignee,
         criteria: &AllocationCriteria,
         private_key: &Keypair,
+        assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment>;
 
     /// Given a datetime, get the newest free slot for this criteria.
@@ -312,20 +314,8 @@ trait TokenAssignmentInternal {
         criteria: &AllocationCriteria,
         current: DateTime<Utc>,
     ) -> Option<DateTime<Utc>>;
-}
 
-impl TokenAssignmentExt for TokenAllocationRecord {
-    fn append_unchecked(&mut self, assignment: TokenAssignment) {
-        match self.get_mut_tier(&assignment.tier) {
-            Some(list) => {
-                list.push(assignment);
-                list.sort_unstable();
-            }
-            None => {
-                self.insert(assignment.tier, vec![assignment]);
-            }
-        }
-    }
+    fn append_unchecked(&mut self, assignment: TokenAssignment);
 }
 
 impl TokenAssignmentInternal for TokenAllocationRecord {
@@ -336,6 +326,7 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         assignee: Assignee,
         criteria: &AllocationCriteria,
         keys: &Keypair,
+        assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
         let current = time::now();
         let time_slot = self.next_free_assignment(criteria, current)?;
@@ -347,6 +338,8 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
                 time_slot,
                 assignee,
                 signature,
+                assignment_hash,
+                token_record: criteria.contract,
             }
         };
         self.append_unchecked(assignment.clone());
@@ -412,6 +405,18 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
                 None
             }
             None => Some(normalized - max_age),
+        }
+    }
+
+    fn append_unchecked(&mut self, assignment: TokenAssignment) {
+        match self.get_mut_tier(&assignment.tier) {
+            Some(list) => {
+                list.push(assignment);
+                list.sort_unstable();
+            }
+            None => {
+                self.insert(assignment.tier, vec![assignment]);
+            }
         }
     }
 }
