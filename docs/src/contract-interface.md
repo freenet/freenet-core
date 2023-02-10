@@ -9,10 +9,10 @@
 
 ## Interface
 
-Locutus contracts must implement the contract interface from [crates/locutus-stdlib/src/interface.rs](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/interface.rs):
+Locutus contracts must implement the contract interface from [crates/locutus-stdlib/src/contract_interface.rs](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/contract_interface.rs):
 
 ```rust,no_run,noplayground
-{{#include ../../crates/locutus-stdlib/src/interface.rs:contractifce}}
+{{#include ../../crates/locutus-stdlib/src/contract_interface.rs:contractifce}}
 ```
 
 `Parameters`, `State`, and `StateDelta` are all wrappers around simple `[u8]` byte arrays for maximum efficiency and flexibility.

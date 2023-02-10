@@ -10,18 +10,30 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v3.4.1
         with:
           fetch-depth: 0
-      - name: Install mdbook
+      - name: Setup Rust
+        uses: actions/setup-rust@v2
+        with:
+          rust-version: stable
+      - name: Cache Dependencies
+        uses: actions/cache@v2
+        with:
+          path: ~/.cargo
+          key: cargo-cache-${{ hashFiles('Cargo.lock') }}
+      - name: Install dependencies
         run: |
-          mkdir mdbook
-          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.21/mdbook-v0.4.21-x86_64-unknown-linux-gnu.tar.gz | tar -xz --directory=./mdbook
-          echo `pwd`/mdbook >> $GITHUB_PATH
+          cargo install mdbook mdbook-mermaid
       - name: Build MDBook
         run: |
-          cd docs
-          mdbook build
+          if [ -d "docs" ]; then
+            cd docs
+            mdbook build
+          else
+            echo "Docs folder not found."
+          fi
       - name: Deploy
         uses: JamesIves/github-pages-deploy-action@v4
         with:

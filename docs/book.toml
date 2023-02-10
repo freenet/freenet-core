@@ -3,4 +3,11 @@ authors = ["The Freenet Project Inc."]
 language = "en"
 multilingual = false
 src = "src"
-title = "The Locutus Book"
+title = "Freenet Manual"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+default-theme = "ayu"
