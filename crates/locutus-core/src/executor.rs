@@ -178,7 +178,7 @@ impl Executor {
                 if self.mode == OperationMode::Local {
                     for (id, related) in related_contracts.update() {
                         let Ok(contract) = self.contract_state.get(&(*id).into()).await else {
-                            return Err(Either::Right(CoreContractError::MissingRelated { key: *id}.into())); 
+                            return Err(Either::Right(CoreContractError::MissingRelated { key: *id}.into()));
                         };
                         let state: &[u8] = unsafe {
                             // Safety: this is fine since this will never scape this scope
