@@ -17,6 +17,7 @@ bincode = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
 chacha20poly1305 = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
 config = { version = "0.13.0", features = [ "toml" ] } 
 crossbeam = "0.8.2"
 ctrlc = { version = "3.0", features = ["termination"] }
