@@ -1,5 +1,5 @@
 use futures::future::BoxFuture;
-use locutus_runtime::ComponentKey;
+use locutus_runtime::{ComponentKey, ContractInstanceId};
 use locutus_stdlib::client_api::ClientRequest;
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
@@ -110,6 +110,8 @@ pub enum ContractError {
     Put { key: ContractKey, cause: String },
     #[error("update error for contract {key}, reason: {cause}")]
     Update { key: ContractKey, cause: String },
+    #[error("missing related contract: {key}")]
+    MissingRelated { key: ContractInstanceId },
 }
 
 #[cfg(test)]

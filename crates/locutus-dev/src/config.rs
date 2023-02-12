@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::local_node::LocalNodeCliConfig;
+use locutus_core::OperationMode;
 use locutus_stdlib::prelude::Version;
 
 #[derive(clap::Parser, Clone)]
@@ -12,14 +13,6 @@ pub struct Config {
     pub sub_command: SubCommand,
     #[clap(flatten)]
     pub additional: BaseConfig,
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-pub enum OperationMode {
-    /// Run the node in local-only mode. Useful for development purposes.
-    Local,
-    /// Standard operation mode.
-    Network,
 }
 
 #[derive(clap::Parser, Clone)]

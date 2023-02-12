@@ -144,6 +144,14 @@ impl RelatedContracts<'static> {
     }
 }
 
+impl<'a> RelatedContracts<'a> {
+    pub fn update<'b>(
+        &'b mut self,
+    ) -> impl Iterator<Item = (&ContractInstanceId, &mut Option<State<'a>>)> + 'b {
+        self.map.iter_mut()
+    }
+}
+
 impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
     type Error = String;
 
@@ -190,14 +198,10 @@ pub struct RelatedContract {
 /// Specification of the notifications of interest from a related contract.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RelatedMode {
-    /// Retrieve the state once, not concerned with subsequent changes.
+    /// Retrieve the state once, don't be concerned with subsequent changes.
     StateOnce,
-    /// Retrieve the state once, and then supply deltas from then on.
-    StateOnceThenDeltas,
-    /// Retrieve the state and then provide new states every time it updates.
-    StateEvery,
-    /// Retrieve the state and then provide new states and deltas every time it updates.
-    StateThenStateAndDeltas,
+    /// Retrieve the state once, and then subscribe to updates.
+    StateThenSubscribe,
 }
 
 /// The result of calling the [`ContractInterface::validate_state`] function.

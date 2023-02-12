@@ -355,7 +355,7 @@ impl ContractInterface for Inbox {
             .filter_map(|missing| {
                 (!allocation_records.contains_key(&missing)).then(|| RelatedContract {
                     contract_instance_id: missing,
-                    mode: RelatedMode::StateEvery,
+                    mode: RelatedMode::StateOnce,
                 })
             })
             .collect();

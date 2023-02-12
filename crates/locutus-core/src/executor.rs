@@ -17,12 +17,21 @@ use crate::{
 
 type Response = Result<HostResponse, Either<RequestError, DynError>>;
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationMode {
+    /// Run the node in local-only mode. Useful for development purposes.
+    Local,
+    /// Standard operation mode.
+    Network,
+}
+
 /// A WASM executor which will run any contracts, components, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 pub struct Executor {
+    mode: OperationMode,
     runtime: Runtime,
     contract_state: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
@@ -34,10 +43,12 @@ impl Executor {
         store: ContractStore,
         contract_state: StateStore<Storage>,
         ctrl_handler: impl FnOnce(),
+        mode: OperationMode,
     ) -> Result<Self, DynError> {
         ctrl_handler();
 
         Ok(Self {
+            mode,
             runtime: Runtime::build(
                 store,
                 ComponentStore::default(),
@@ -142,7 +153,7 @@ impl Executor {
             ContractRequest::Put {
                 contract,
                 state,
-                related_contracts,
+                mut related_contracts,
             } => {
                 // FIXME: in net node, we don't allow puts for existing contract states
                 //        if it hits a node which already has it it will get rejected
@@ -163,13 +174,37 @@ impl Executor {
                     .map_err(Either::Right)?;
 
                 tracing::debug!("executing with params: {:?}", params);
-                let is_valid = self
+
+                if self.mode == OperationMode::Local {
+                    for (id, related) in related_contracts.update() {
+                        let Ok(contract) = self.contract_state.get(&(*id).into()).await else {
+                            return Err(Either::Right(CoreContractError::MissingRelated { key: *id}.into()));
+                        };
+                        let state: &[u8] = unsafe {
+                            // Safety: this is fine since this will never scape this scope
+                            std::mem::transmute::<&[u8], &'_ [u8]>(contract.as_ref())
+                        };
+                        *related = Some(State::from(state));
+                    }
+                }
+
+                let result = self
                     .runtime
                     .validate_state(&key, &params, &state, related_contracts)
                     .map_err(Into::into)
-                    .map_err(Either::Right)?
-                    == ValidateResult::Valid;
-                // FIXME: should deal with additional related contracts requested
+                    .map_err(Either::Right)?;
+                let is_valid = match result {
+                    ValidateResult::Valid => true,
+                    ValidateResult::Invalid => false,
+                    ValidateResult::RequestRelated(_related) => {
+                        if self.mode == OperationMode::Network {
+                            // FIXME: should deal with additional related contracts requested
+                            todo!()
+                        } else {
+                            unreachable!()
+                        }
+                    }
+                };
                 let res = is_valid
                     .then(|| ContractResponse::PutResponse { key: key.clone() }.into())
                     .ok_or_else(|| {
@@ -334,8 +369,6 @@ impl Executor {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
-                // FIXME: here we are always sending an state_delta,
-                //        but what we send back depends on the kind of subscription
                 let update = self
                     .runtime
                     .get_state_delta(key, params, new_state, &*peer_summary)
@@ -420,9 +453,14 @@ mod test {
         let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
         let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
-        Executor::new(contract_store, state_store, || {
-            counter += 1;
-        })
+        Executor::new(
+            contract_store,
+            state_store,
+            || {
+                counter += 1;
+            },
+            OperationMode::Local,
+        )
         .await
         .expect("local node with handle");
 
