@@ -1,0 +1,26 @@
+[package]
+name = "freenet-email-ui"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.58.0"
+resolver = "2"
+publish = false
+
+[dependencies]
+bincode = { workspace = true }
+ed25519-dalek = { workspace = true }
+chrono = { workspace = true }
+locutus-stdlib = { workspace = true }
+locutus-aft-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dioxus = { version = "0.3" }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+dioxus-web = { version = "0.3" }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+dioxus-desktop = { version = "0.3" }
