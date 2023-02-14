@@ -1,9 +1,8 @@
 use clap::Parser;
 use locutus_core::{
     locutus_runtime::{ContractStore, StateStore},
-    Config, Executor, Storage,
+    Config, Executor, OperationMode, Storage,
 };
-use locutus_dev::config::OperationMode;
 use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -29,9 +28,14 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
     // TODO: Generate components and secrets store from config
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
-    let executor = Executor::new(contract_store, state_store, || {
-        locutus_core::util::set_cleanup_on_exit().unwrap();
-    })
+    let executor = Executor::new(
+        contract_store,
+        state_store,
+        || {
+            locutus_core::util::set_cleanup_on_exit().unwrap();
+        },
+        OperationMode::Local,
+    )
     .await?;
     let socket: SocketAddr = (config.bind, config.port).into();
     locutus::local_node::run_local_node(executor, socket).await

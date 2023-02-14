@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use locutus_core::{Config, Executor, Storage};
+use locutus_core::{Config, Executor, OperationMode, Storage};
 use locutus_runtime::{ContractStore, StateStore};
 use tokio::sync::RwLock;
 
@@ -23,9 +23,14 @@ impl AppState {
         let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE).unwrap();
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
-                Executor::new(contract_store, state_store, || {
-                    locutus_core::util::set_cleanup_on_exit().unwrap();
-                })
+                Executor::new(
+                    contract_store,
+                    state_store,
+                    || {
+                        locutus_core::util::set_cleanup_on_exit().unwrap();
+                    },
+                    OperationMode::Local,
+                )
                 .await?,
             )),
             config: config.clone(),

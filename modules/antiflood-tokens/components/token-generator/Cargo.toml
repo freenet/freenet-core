@@ -15,5 +15,10 @@ serde_json = { workspace = true }
 
 locutus-aft-interface = { path = "../../interfaces" }
 
+[dev-dependencies]
+arbitrary = "1"
+once_cell = "1"
+locutus-stdlib = { workspace = true, features = ["testing"] }
+
 [lib]
 crate-type = ["cdylib"]
