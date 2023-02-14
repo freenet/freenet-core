@@ -5,5 +5,5 @@
   - [Locutus Manifest Format](manifest.md)
   - [Building with Docker](docker.md)
 - [Contract Interface](contract-interface.md)
-- [Case Study: Anti Flood Tokens](antiflood.md)
+- [Primitives of Decentralized Software](primitives.md)
 - [Glossary](glossary.md)
