@@ -7,14 +7,16 @@ resolver = "2"
 publish = false
 
 [dependencies]
-bincode = { workspace = true }
 ed25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true, features = ["std"] }
 chrono = { workspace = true }
-locutus-stdlib = { workspace = true }
+dioxus = { version = "0.3" }
+locutus-stdlib = { workspace = true, features = ["net"] }
 locutus-aft-interface = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-dioxus = { version = "0.3" }
+
+freenet-email-inbox = { path = "../contracts/inbox" }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
