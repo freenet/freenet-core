@@ -15,7 +15,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Setup Rust
-        uses: actions/setup-rust@v1
+        uses: ATiltedTree/setup-rust@v1
         with:
           rust-version: stable
       - name: Cache Dependencies
