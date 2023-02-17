@@ -21,14 +21,22 @@ messaging system. Applications will typically run in a web browser and either im
 
 Delegates are software that act as intermediaries between the user and various digital entities such as contracts,
 apps, and other delegates. They perform tasks, store secrets, perform cryptographic operations, and communicate with
-the user for permission to perform specific actions. Delegates are webassembly code implementing the DelegateInterface.
+the user for permission to perform specific actions. Delegates are webassembly code implementing the
+[DelegateInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
+
+The AFT relies on a [TokenDelegate](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/modules/antiflood-tokens/components/token-generator/src/lib.rs#L17) that implements this DelegateInterface.
 
 ### Contracts
 
+Contracts are webassembly code implementing the 
+[ContractInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/modules/antiflood-tokens/contracts/token-allocation-record/src/lib.rs#L10). 
+
 #### Token Generator
 
-The Token generator contract keeps track of token assignments to ensure that tokens are not double spent. New tokens
-are generated at a fixed rate that depends on the tier required by the recipient.
+The
+[TokenAllocContract](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/modules/antiflood-tokens/contracts/token-allocation-record/src/lib.rs#L10)
+keeps track of token assignments to ensure that tokens are not double spent. New tokens are generated at a fixed rate
+that depends on the tier required by the recipient.
 
 #### Recepient Inbox
 
