@@ -11,15 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3.4.1
+        uses: actions/checkout@v3
         with:
           fetch-depth: 0
       - name: Setup Rust
-        uses: actions/setup-rust@v2
+        uses: actions/setup-rust@v1
         with:
           rust-version: stable
       - name: Cache Dependencies
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: ~/.cargo
           key: cargo-cache-${{ hashFiles('Cargo.lock') }}
