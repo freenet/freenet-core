@@ -1,5 +1,7 @@
 # The Primitives of Decentralized Software on Freenet
 
+## Introduction
+
 To illustrate the primitives of decentralized software, we will use the Antiflood Token System (AFT) as an example.
 
 The AFT is a decentralized system aimed at combating flooding, denial-of-service attacks, and spam. AFT operates by
@@ -17,14 +19,14 @@ make it more challenging to generate, thus reducing the flood.
 This is the user interface that wishes to use the AFT system to send a message, for example a decentralized instant
 messaging system. Applications will typically run in a web browser and either implemented in JavaScript or WebAssembly.
 
-### Components
+### Delegates
 
-Components are software that act as intermediaries between the user and various digital entities such as contracts,
+Delegates are software that act as intermediaries between the user and various digital entities such as contracts,
 apps, and other delegates. They perform tasks, store secrets, perform cryptographic operations, and communicate with
-the user for permission to perform specific actions. Components are webassembly code implementing the
-[ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
+the user for permission to perform specific actions. Delegates are webassembly code implementing the
+[DelegateInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
 
-The AFT relies on a [TokenComponent](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/modules/antiflood-tokens/components/token-generator/src/lib.rs#L17) that implements this ComponentInterface.
+The AFT relies on a [TokenDelegate](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/modules/antiflood-tokens/components/token-generator/src/lib.rs#L17) that implements this DelegateInterface.
 
 ### Contracts
 
@@ -49,16 +51,16 @@ by a valid token of the required tier.
 sequenceDiagram
   participant User
   participant Application
-  participant Component
+  participant Delegate
   participant TokenGeneratorContract
   participant RecipientInboxContract
 
   User->>Application: 1. RequestToken
-  Application->>Component: 2. RequestToken
-  Component->>User: 3. Allocate?
-  User->>Component: 4. approved
-  Component->>TokenGeneratorContract: 5. TokenAllocation
-  Component->>RecipientInboxContract: 6. Message+TokenAllocation
+  Application->>Delegate: 2. RequestToken
+  Delegate->>User: 3. Allocate?
+  User->>Delegate: 4. approved
+  Delegate->>TokenGeneratorContract: 5. TokenAllocation
+  Delegate->>RecipientInboxContract: 6. Message+TokenAllocation
   RecipientInboxContract->>TokenGeneratorContract: 7. verify
   TokenGeneratorContract->>RecipientInboxContract: 8. verified
 ```
