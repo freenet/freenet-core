@@ -1,34 +1,43 @@
-use warp::{hyper::StatusCode, reject::Reject, reply, Rejection, Reply};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Response};
+use locutus_stdlib::client_api::ErrorKind;
+use std::fmt::{Display, Formatter};
 
-use super::*;
-
-pub(super) async fn handle_error(err: Rejection) -> Result<impl Reply, std::convert::Infallible> {
-    if let Some(e) = err.find::<errors::InvalidParam>() {
-        return Ok(reply::with_status(e.0.to_owned(), StatusCode::BAD_REQUEST));
-    }
-    if err.find::<errors::NodeError>().is_some() {
-        return Ok(reply::with_status(
-            "Node unavailable".to_owned(),
-            StatusCode::BAD_GATEWAY,
-        ));
-    }
-    Ok(reply::with_status(
-        "INTERNAL SERVER ERROR".to_owned(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-    ))
+#[derive(Debug)]
+pub enum Error {
+    /// Something went wrong when calling the user repo.
+    InvalidParam(String),
+    NodeError,
+    HttpError(StatusCode),
+    AxumError(ErrorKind),
 }
 
-#[derive(Debug)]
-pub(super) struct InvalidParam(pub String);
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        let (status, error_message) = match self {
+            Error::InvalidParam(err) => (StatusCode::BAD_REQUEST, err),
+            Error::NodeError => (StatusCode::BAD_GATEWAY, "Node unavailable".to_owned()),
+            Error::HttpError(code) => (code, "INTERNAL SERVER ERROR".to_owned()),
+            Error::AxumError(error_kind) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("{error_kind}"))
+            }
+        };
 
-impl Reject for InvalidParam {}
+        let body = Html(error_message);
 
-#[derive(Debug)]
-pub(super) struct NodeError;
+        (status, body).into_response()
+    }
+}
 
-impl Reject for NodeError {}
-
-#[derive(Debug)]
-pub(super) struct HttpError(pub warp::http::StatusCode);
-
-impl Reject for HttpError {}
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::InvalidParam(err) => write!(f, "Invalid request params: {err}"),
+            Error::NodeError => write!(f, "Node error: {}", StatusCode::BAD_GATEWAY.as_str()),
+            Error::HttpError(code) => write!(f, "HttpError with status code {}", code.as_str()),
+            Error::AxumError(error_kind) => {
+                write!(f, "Axum error: {}", error_kind)
+            }
+        }
+    }
+}

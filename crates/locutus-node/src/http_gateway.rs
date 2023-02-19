@@ -1,5 +1,10 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Path, WebSocketUpgrade};
+use axum::response::{Html, Response};
+use axum::routing::get;
+use axum::{Extension, Router};
 use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
@@ -14,18 +19,14 @@ use std::{
     },
     time::Duration,
 };
-use axum::extract::{Path, WebSocketUpgrade};
-use axum::{Extension, Router};
-use axum::extract::ws::{Message, WebSocket};
-use axum::response::IntoResponse;
-use axum::routing::get;
 use tokio::sync::{
     mpsc::{self, error::TryRecvError, UnboundedReceiver},
     Mutex,
 };
 use tower_http::trace::TraceLayer;
 
-use crate::{ClientConnection, DynError, HostCallbackResult, web_handling};
+use crate::errors::Error;
+use crate::{web_handling, ClientConnection, DynError, HostCallbackResult};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
@@ -136,18 +137,18 @@ async fn home() -> axum::response::Response {
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
-) -> impl IntoResponse {
-    web_handling::contract_home(key, rs).await
+) -> Result<Html<String>, Error> {
+    web_handling::contract_home(key, rs).await.into()
 }
 
-async fn web_subpages(Path((key, path)): Path<(String, String)>) -> axum::response::Response {
-    web_handling::variable_content(key, path).await
+async fn web_subpages(Path((key, path)): Path<(String, String)>) -> Result<Html<String>, Error> {
+    web_handling::variable_content(key, path).await.into()
 }
 
 async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
-) -> axum::response::Response {
+) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
         if let Err(e) = websocket_interface(rs.clone(), ws).await {
             tracing::error!("{e}");

@@ -50,8 +50,7 @@ rmp-serde = { workspace = true, optional = true }
 sqlx = { version = "0.6", features = ["sqlite", "runtime-tokio-rustls"], optional = true }
 # TODO(kakoc): clang should be installed for rocksdb; write about that in prerequisites/dev guide
 rocksdb = { version = "0.20.0", default-features = false, optional = true }
-warp = { version = "0.3", default-features = false, optional = true, features = ["multipart", "tls"] }
-axum = { version = "0.6", default-features = false, features = ["ws", "tower-log"] }
+axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
 
 # Tracing deps
 tower-http = { version = "0.3", features = ["trace"] }

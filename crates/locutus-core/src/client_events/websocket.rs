@@ -237,7 +237,6 @@ async fn new_request(
             };
             deserialized
         }
-        Some(Ok(_)) => return Ok(()),
         Some(Err(e)) => {
             let _ = request_sender
                 .send(

@@ -1,5 +1,7 @@
 //! Handle the `web` part of the bundles.
 
+use axum::http::StatusCode;
+use axum::response::{Html, Response};
 use std::path::{Path, PathBuf};
 
 use locutus_runtime::{
@@ -13,31 +15,26 @@ use locutus_core::{
     },
     *,
 };
-use locutus_stdlib::client_api::ErrorKind;
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
-use warp::{
-    reject::{self, Reject},
-    reply, Rejection, Reply,
-};
 
-use crate::{
-    errors::{self, InvalidParam, NodeError},
-    ClientConnection, HostCallbackResult,
-};
+use crate::errors::Error;
+use crate::{ClientConnection, HostCallbackResult};
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 pub(crate) async fn contract_home(
     key: String,
     request_sender: mpsc::Sender<ClientConnection>,
-) -> Result<impl Reply, Rejection> {
+) -> Result<Html<String>, Error> {
     let key = ContractKey::from_id(key)
-        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+        .map_err(|err| Error::InvalidParam(format!("{err}")))
+        .unwrap();
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection(response_sender))
         .await
-        .map_err(|_| reject::custom(errors::NodeError))?;
+        .map_err(|_| Error::NodeError)
+        .unwrap();
     let client_id = if let Some(HostCallbackResult::NewId(id)) = response_recv.recv().await {
         id
     } else {
@@ -53,7 +50,8 @@ pub(crate) async fn contract_home(
             .into(),
         })
         .await
-        .map_err(|_| reject::custom(errors::NodeError))?;
+        .map_err(|_| Error::NodeError)
+        .unwrap();
     let response = match response_recv.recv().await {
         Some(HostCallbackResult::Result {
             result:
@@ -69,39 +67,35 @@ pub(crate) async fn contract_home(
                 let path = contract_web_path(&key);
                 let web_body = match get_web_body(&path).await {
                     Ok(b) => b,
-                    Err(err) => {
-                        let err: std::io::ErrorKind = err.kind();
-                        match err {
-                            std::io::ErrorKind::NotFound => {
-                                let state = State::from(state.as_ref());
+                    Err(err) => match err {
+                        Error::NodeError => {
+                            let state = State::from(state.as_ref());
 
-                                fn err(
-                                    err: WebContractError,
-                                    contract: &ContractContainer,
-                                ) -> InvalidParam {
-                                    let key = contract.key();
-                                    tracing::error!("{err}");
-                                    InvalidParam(format!("failed unpacking contract: {key}"))
-                                }
+                            fn err(err: WebContractError, contract: &ContractContainer) -> Error {
+                                let key = contract.key();
+                                tracing::error!("{err}");
+                                Error::InvalidParam(format!("failed unpacking contract: {key}"))
+                            }
 
-                                let mut web = WebApp::try_from(state.as_ref())
-                                    .map_err(|e| err(e, &contract))?;
-                                web.unpack(path).map_err(|e| err(e, &contract))?;
-                                let index =
-                                    web.get_file("index.html").map_err(|e| err(e, &contract))?;
-                                warp::hyper::Body::from(index)
-                            }
-                            other => {
-                                tracing::error!("{other}");
-                                return Err(errors::HttpError(
-                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                )
-                                .into());
-                            }
+                            let mut web = WebApp::try_from(state.as_ref())
+                                .map_err(|e| err(e, &contract))
+                                .unwrap();
+                            web.unpack(path).map_err(|e| err(e, &contract)).unwrap();
+                            let index = web
+                                .get_file("index.html")
+                                .map_err(|e| err(e, &contract))
+                                .unwrap();
+                            let index_body =
+                                String::from_utf8(index).map_err(|_| Error::NodeError)?;
+                            Html(index_body)
                         }
-                    }
+                        other => {
+                            tracing::error!("{other}");
+                            return Err(Error::HttpError(StatusCode::INTERNAL_SERVER_ERROR));
+                        }
+                    },
                 };
-                Ok(reply::html(web_body))
+                web_body
             }
             None => {
                 todo!("error indicating the contract is not present");
@@ -111,10 +105,10 @@ pub(crate) async fn contract_home(
             result: Err(err), ..
         }) => {
             tracing::error!("error getting contract `{key}`: {err}");
-            return Err(WrapErr(err.kind()).into());
+            return Err(Error::AxumError(err.kind()));
         }
         None => {
-            return Err(NodeError.into());
+            return Err(Error::NodeError);
         }
         other => unreachable!("received unexpected node response: {other:?}"),
     };
@@ -124,40 +118,39 @@ pub(crate) async fn contract_home(
             req: ClientRequest::Disconnect { cause: None },
         })
         .await
-        .map_err(|_| NodeError)?;
-    response
+        .map_err(|_| Error::NodeError)
+        .unwrap();
+    Ok(response)
 }
 
-#[derive(Debug)]
-struct WrapErr(ErrorKind);
-
-impl Reject for WrapErr {}
-
-pub async fn variable_content(
-    key: String,
-    req_path: warp::path::FullPath,
-) -> Result<impl Reply, Rejection> {
+pub async fn variable_content(key: String, req_path: String) -> Result<Html<String>, Error> {
     let key = ContractKey::from_id(key)
-        .map_err(|err| reject::custom(errors::InvalidParam(format!("{err}"))))?;
+        .map_err(|err| Error::InvalidParam(format!("{err}")))
+        .unwrap();
     let base_path = contract_web_path(&key);
-    let req_uri = req_path.as_str().parse().unwrap();
-    let file_path = base_path.join(get_file_path(req_uri)?);
+    let req_uri = req_path.parse().unwrap();
+    let file_path = base_path.join(get_file_path(req_uri).unwrap());
     let mut buf = vec![];
     File::open(file_path)
         .await
-        .map_err(|_| NodeError)?
+        .map_err(|_| Error::NodeError)?
         .read_to_end(&mut buf)
         .await
-        .map_err(|_| NodeError)?;
-    Ok(reply::html(warp::hyper::Body::from(buf)))
+        .map_err(|_| Error::NodeError)?;
+    let body = String::from_utf8(buf).map_err(|_| Error::NodeError)?;
+    Ok(Html(body))
 }
 
-async fn get_web_body(path: &Path) -> std::io::Result<warp::hyper::Body> {
+async fn get_web_body(path: &Path) -> Result<Html<String>, Error> {
     let web_path = path.join("web").join("index.html");
-    let mut key_file = File::open(&web_path).await?;
+    let mut key_file = File::open(&web_path).await.map_err(|_| Error::NodeError)?;
     let mut buf = vec![];
-    key_file.read_to_end(&mut buf).await?;
-    Ok(warp::hyper::Body::from(buf))
+    key_file
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|_| Error::NodeError)?;
+    let body = String::from_utf8(buf).map_err(|_| Error::NodeError)?;
+    Ok(Html(body))
 }
 
 fn contract_web_path(key: &ContractKey) -> PathBuf {
@@ -169,11 +162,12 @@ fn contract_web_path(key: &ContractKey) -> PathBuf {
 }
 
 #[inline]
-fn get_file_path(uri: warp::http::Uri) -> Result<String, Rejection> {
+fn get_file_path(uri: axum::http::Uri) -> Result<String, Response> {
     let p = uri
         .path()
         .strip_prefix("/contract/")
-        .ok_or_else(|| reject::custom(errors::InvalidParam(format!("invalid uri: {uri}"))))?;
+        .ok_or_else(|| Error::InvalidParam(format!("invalid uri: {uri}")))
+        .unwrap();
     let path = p
         .chars()
         .skip_while(|c| ALPHABET.contains(*c))
@@ -189,7 +183,7 @@ fn get_path() {
     let req_path = "/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/state.html";
     let base_dir =
         PathBuf::from("/tmp/locutus/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/");
-    let uri: warp::http::Uri = req_path.parse().unwrap();
+    let uri: axum::http::Uri = req_path.parse().unwrap();
     let parsed = get_file_path(uri).unwrap();
     let result = base_dir.join(parsed);
     assert_eq!(
