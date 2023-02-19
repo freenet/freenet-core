@@ -118,11 +118,7 @@ impl Inbox {
             .iter()
             .map(|m| m.to_stored(&self.settings.encryption_key))
             .collect::<Result<Vec<_>, _>>()?;
-        let inbox = StoredInbox {
-            settings,
-            last_update: Utc::now(),
-            messages,
-        };
+        let inbox = StoredInbox::new(&self.settings.signing_keypair, settings, messages);
         let serialized = serde_json::to_vec(&inbox)?;
         Ok(serialized.into())
     }

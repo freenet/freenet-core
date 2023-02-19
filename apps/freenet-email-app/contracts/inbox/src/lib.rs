@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Verifier};
+use ed25519_dalek::{Keypair, Signature, Signer, Verifier};
 use locutus_aft_interface::{Tier, TokenAllocationRecord, TokenAssignment, TokenAssignmentHash};
 use locutus_stdlib::prelude::{blake2::Digest, *};
 use serde::{Deserialize, Serialize};
+
+/// Sign this byte array and include the signature in the `inbox_signature` so this inbox can be verified on updates.
+const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
 
 #[derive(Serialize, Deserialize)]
 struct InboxParams {
@@ -65,6 +68,7 @@ pub struct Inbox {
     pub messages: Vec<Message>,
     pub last_update: DateTime<Utc>,
     pub settings: InboxSettings,
+    inbox_signature: Signature,
 }
 
 enum VerificationError {
@@ -72,9 +76,39 @@ enum VerificationError {
     TokenAssignmentMismatch,
     InvalidInboxKey,
     InvalidMessageHash,
+    WrongSignature,
+}
+
+impl From<VerificationError> for ContractError {
+    fn from(_err: VerificationError) -> Self {
+        ContractError::InvalidUpdate
+    }
 }
 
 impl Inbox {
+    #[cfg(feature = "wasmbind")]
+    pub fn new(key: &Keypair, settings: InboxSettings, messages: Vec<Message>) -> Self {
+        let inbox_signature = Self::sign(key);
+        Self {
+            settings,
+            messages,
+            last_update: Utc::now(),
+            inbox_signature,
+        }
+    }
+
+    pub fn sign(key: &Keypair) -> Signature {
+        key.sign(STATE_UPDATE)
+    }
+
+    fn verify(&self, params: &InboxParams) -> Result<(), VerificationError> {
+        params
+            .pub_key
+            .verify(STATE_UPDATE, &self.inbox_signature)
+            .map_err(|_e| VerificationError::WrongSignature)?;
+        Ok(())
+    }
+
     fn add_messages(
         &mut self,
         params: &InboxParams,
@@ -172,6 +206,7 @@ impl Inbox {
             messages: delta,
             last_update: self.last_update,
             settings: self.settings,
+            inbox_signature: self.inbox_signature,
         }
     }
 }
@@ -242,6 +277,7 @@ impl ContractInterface for Inbox {
     ) -> Result<ValidateResult, ContractError> {
         let inbox = Inbox::try_from(&state)?;
         let params = InboxParams::try_from(parameters)?;
+        inbox.verify(&params)?;
 
         let mut missing_related = vec![];
         let mut allocation_records = HashMap::new();
@@ -282,6 +318,7 @@ impl ContractInterface for Inbox {
         // fixme: take care of race condition between token alloc record and the assignment
         let mut inbox = Inbox::try_from(&state)?;
         let params = InboxParams::try_from(parameters)?;
+        inbox.verify(&params)?;
         let mut missing_related = vec![];
         let mut new_messages = vec![];
         let mut rm_messages = HashSet::new();

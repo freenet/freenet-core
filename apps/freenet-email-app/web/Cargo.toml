@@ -16,7 +16,7 @@ locutus-aft-interface = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-freenet-email-inbox = { path = "../contracts/inbox" }
+freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
