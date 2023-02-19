@@ -138,11 +138,11 @@ async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
 ) -> Result<Html<String>, Error> {
-    web_handling::contract_home(key, rs).await.into()
+    web_handling::contract_home(key, rs).await
 }
 
 async fn web_subpages(Path((key, path)): Path<(String, String)>) -> Result<Html<String>, Error> {
-    web_handling::variable_content(key, path).await.into()
+    web_handling::variable_content(key, path).await
 }
 
 async fn websocket_commands(
