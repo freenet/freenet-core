@@ -6,12 +6,19 @@ use std::fmt::{Display, Formatter};
 #[derive(Debug)]
 pub enum Error {
     /// Something went wrong when calling the user repo.
-    InvalidParam { error_cause: String },
-    Node { error_cause: String },
-    Http { code: StatusCode },
-    Axum { error: ErrorKind },
+    InvalidParam {
+        error_cause: String,
+    },
+    Node {
+        error_cause: String,
+    },
+    Http {
+        code: StatusCode,
+    },
+    Axum {
+        error: ErrorKind,
+    },
 }
-
 
 impl Error {
     pub fn status_code(&self) -> StatusCode {
@@ -25,7 +32,9 @@ impl Error {
 
     pub fn error_message(&self) -> String {
         match self {
-            Error::InvalidParam { error_cause } => format!("Invalid request params: {}", error_cause),
+            Error::InvalidParam { error_cause } => {
+                format!("Invalid request params: {}", error_cause)
+            }
             Error::Node { error_cause } => format!("Node error: {}", error_cause),
             Error::Http { code } => {
                 let error_message = match *code {
@@ -35,7 +44,7 @@ impl Error {
                     _ => "Internal Server Error",
                 };
                 format!("HTTP error: {}", error_message)
-            },
+            }
             Error::Axum { error } => format!("Axum error: {}", error),
         }
     }
@@ -54,16 +63,13 @@ impl From<Error> for Response {
     }
 }
 
-
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
             Error::InvalidParam { error_cause: cause } => (StatusCode::BAD_REQUEST, cause),
             Error::Node { error_cause: cause } => (StatusCode::BAD_GATEWAY, cause),
             Error::Http { code } => (code, "INTERNAL SERVER ERROR".to_owned()),
-            Error::Axum { error } => {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}"))
-            }
+            Error::Axum { error } => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}")),
         };
 
         let body = Html(error_message);

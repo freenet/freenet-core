@@ -27,13 +27,17 @@ pub(crate) async fn contract_home(
     request_sender: mpsc::Sender<ClientConnection>,
 ) -> Result<Html<String>, Error> {
     let key = ContractKey::from_id(key)
-        .map_err(|err| Error::InvalidParam { error_cause: format!("{err}")})
+        .map_err(|err| Error::InvalidParam {
+            error_cause: format!("{err}"),
+        })
         .unwrap();
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection(response_sender))
         .await
-        .map_err(|err| Error::Node { error_cause: format!("{err}")})
+        .map_err(|err| Error::Node {
+            error_cause: format!("{err}"),
+        })
         .unwrap();
     let client_id = if let Some(HostCallbackResult::NewId(id)) = response_recv.recv().await {
         id
@@ -50,7 +54,9 @@ pub(crate) async fn contract_home(
             .into(),
         })
         .await
-        .map_err(|err| Error::Node { error_cause: format!("{err}")})
+        .map_err(|err| Error::Node {
+            error_cause: format!("{err}"),
+        })
         .unwrap();
     let response = match response_recv.recv().await {
         Some(HostCallbackResult::Result {
@@ -68,13 +74,17 @@ pub(crate) async fn contract_home(
                 let web_body = match get_web_body(&path).await {
                     Ok(b) => b,
                     Err(err) => match err {
-                        Error::Node { error_cause: _cause } => {
+                        Error::Node {
+                            error_cause: _cause,
+                        } => {
                             let state = State::from(state.as_ref());
 
                             fn err(err: WebContractError, contract: &ContractContainer) -> Error {
                                 let key = contract.key();
                                 tracing::error!("{err}");
-                                Error::InvalidParam { error_cause: format!("failed unpacking contract: {key}")}
+                                Error::InvalidParam {
+                                    error_cause: format!("failed unpacking contract: {key}"),
+                                }
                             }
 
                             let mut web = WebApp::try_from(state.as_ref())
@@ -86,12 +96,16 @@ pub(crate) async fn contract_home(
                                 .map_err(|e| err(e, &contract))
                                 .unwrap();
                             let index_body =
-                                String::from_utf8(index).map_err(|err| Error::Node { error_cause: format!("{err}")})?;
+                                String::from_utf8(index).map_err(|err| Error::Node {
+                                    error_cause: format!("{err}"),
+                                })?;
                             Html(index_body)
                         }
                         other => {
                             tracing::error!("{other}");
-                            return Err(Error::Http {code: StatusCode::INTERNAL_SERVER_ERROR});
+                            return Err(Error::Http {
+                                code: StatusCode::INTERNAL_SERVER_ERROR,
+                            });
                         }
                     },
                 };
@@ -108,7 +122,9 @@ pub(crate) async fn contract_home(
             return Err(Error::Axum { error: err.kind() });
         }
         None => {
-            return Err(Error::Node { error_cause: "Not contact found".to_string()});
+            return Err(Error::Node {
+                error_cause: "Not contact found".to_string(),
+            });
         }
         other => unreachable!("received unexpected node response: {other:?}"),
     };
@@ -118,14 +134,18 @@ pub(crate) async fn contract_home(
             req: ClientRequest::Disconnect { cause: None },
         })
         .await
-        .map_err(|err| Error::Node { error_cause: format!("{err}")})
+        .map_err(|err| Error::Node {
+            error_cause: format!("{err}"),
+        })
         .unwrap();
     Ok(response)
 }
 
 pub async fn variable_content(key: String, req_path: String) -> Result<Html<String>, Error> {
     let key = ContractKey::from_id(key)
-        .map_err(|err| Error::InvalidParam { error_cause: format!("{err}")})
+        .map_err(|err| Error::InvalidParam {
+            error_cause: format!("{err}"),
+        })
         .unwrap();
     let base_path = contract_web_path(&key);
     let req_uri = req_path.parse().unwrap();
@@ -133,23 +153,35 @@ pub async fn variable_content(key: String, req_path: String) -> Result<Html<Stri
     let mut buf = vec![];
     File::open(file_path)
         .await
-        .map_err(|err| Error::Node { error_cause: format!("{err}")})?
+        .map_err(|err| Error::Node {
+            error_cause: format!("{err}"),
+        })?
         .read_to_end(&mut buf)
         .await
-        .map_err(|err| Error::Node { error_cause: format!("{err}")})?;
-    let body = String::from_utf8(buf).map_err(|err| Error::Node { error_cause: format!("{err}")})?;
+        .map_err(|err| Error::Node {
+            error_cause: format!("{err}"),
+        })?;
+    let body = String::from_utf8(buf).map_err(|err| Error::Node {
+        error_cause: format!("{err}"),
+    })?;
     Ok(Html(body))
 }
 
 async fn get_web_body(path: &Path) -> Result<Html<String>, Error> {
     let web_path = path.join("web").join("index.html");
-    let mut key_file = File::open(&web_path).await.map_err(|err| Error::Node { error_cause: format!("{err}")})?;
+    let mut key_file = File::open(&web_path).await.map_err(|err| Error::Node {
+        error_cause: format!("{err}"),
+    })?;
     let mut buf = vec![];
     key_file
         .read_to_end(&mut buf)
         .await
-        .map_err(|err| Error::Node { error_cause: format!("{err}")})?;
-    let body = String::from_utf8(buf).map_err(|err| Error::Node { error_cause: format!("{err}")})?;
+        .map_err(|err| Error::Node {
+            error_cause: format!("{err}"),
+        })?;
+    let body = String::from_utf8(buf).map_err(|err| Error::Node {
+        error_cause: format!("{err}"),
+    })?;
     Ok(Html(body))
 }
 
@@ -166,7 +198,9 @@ fn get_file_path(uri: axum::http::Uri) -> Result<String, Response> {
     let p = uri
         .path()
         .strip_prefix("/contract/")
-        .ok_or_else(|| Error::InvalidParam { error_cause: format!("invalid uri: {uri}")})
+        .ok_or_else(|| Error::InvalidParam {
+            error_cause: format!("invalid uri: {uri}"),
+        })
         .unwrap();
     let path = p
         .chars()
