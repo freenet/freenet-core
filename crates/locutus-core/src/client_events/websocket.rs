@@ -1,3 +1,6 @@
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::WebSocketUpgrade;
+use axum::{Extension, Router};
 use std::{
     collections::HashMap,
     error::Error,
@@ -5,12 +8,13 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use tower_http::trace::TraceLayer;
 
+use axum::routing::get;
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
 use locutus_runtime::prelude::TryFromTsStd;
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind, HostResponse};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use warp::{filters::BoxedFilter, Filter, Reply};
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 
@@ -27,7 +31,7 @@ impl WebSocketProxy {
     /// Starts this as an upgrade to an existing HTTP connection at the `/ws-api` URL
     pub fn as_upgrade<T>(
         socket: T,
-        server_config: BoxedFilter<(impl Reply + 'static,)>,
+        server_config: Router,
     ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>>
     where
         T: Into<SocketAddr>,
@@ -42,13 +46,13 @@ impl WebSocketProxy {
     where
         T: Into<SocketAddr>,
     {
-        let filter = warp::filters::path::end().map(warp::reply::reply).boxed();
+        let filter = Router::default();
         Self::start_server_internal(socket.into(), filter)
     }
 
     async fn start_server_internal(
         socket: SocketAddr,
-        filter: BoxedFilter<(impl Reply + 'static,)>,
+        filter: Router,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
         let (request_sender, server_request) = channel(PARALLELISM);
         let (server_response, response_receiver) = channel(PARALLELISM);
@@ -106,17 +110,18 @@ async fn serve(
     request_sender: Sender<StaticOpenRequest>,
     new_responses: Sender<ClientHandling>,
     socket: SocketAddr,
-    server_config: BoxedFilter<(impl Reply + 'static,)>,
+    server_config: Router,
 ) {
-    let req_channel = warp::any().map(move || (request_sender.clone(), new_responses.clone()));
-    let request_receiver = server_config.or(warp::path("ws-api")
-        .and(warp::ws())
-        .and(req_channel)
-        .map(|ws: warp::ws::Ws, (request_sender, new_responses)| {
-            ws.on_upgrade(move |socket| handle_socket(socket, request_sender, new_responses))
-        })
-        .with(warp::trace::request()));
-    warp::serve(request_receiver).run(socket).await;
+    let (req_sender, new_res) = (request_sender.clone(), new_responses.clone());
+    let request_receiver = server_config
+        .route("/ws-api", get(ws_api_handler))
+        .layer(Extension(req_sender))
+        .layer(Extension(new_res))
+        .layer(TraceLayer::new_for_http());
+    axum::Server::bind(&socket)
+        .serve(request_receiver.into_make_service())
+        .await
+        .unwrap();
 }
 
 enum ClientHandling {
@@ -163,8 +168,16 @@ async fn responses(
 
 static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
+async fn ws_api_handler(
+    ws: WebSocketUpgrade,
+    Extension(request_sender): Extension<Sender<StaticOpenRequest>>,
+    Extension(client_sender): Extension<Sender<ClientHandling>>,
+) -> axum::response::Response {
+    ws.on_upgrade(|socket| handle_socket(socket, request_sender, client_sender))
+}
+
 async fn handle_socket(
-    socket: warp::ws::WebSocket,
+    socket: WebSocket,
     request_sender: Sender<StaticOpenRequest>,
     client_handler: Sender<ClientHandling>,
 ) {
@@ -176,7 +189,7 @@ async fn handle_socket(
         .await
         .is_err()
     {
-        let _ = client_tx.send(warp::ws::Message::binary(vec![])).await;
+        let _ = client_tx.send(Message::Binary(vec![])).await;
         return;
     }
     loop {
@@ -199,11 +212,11 @@ async fn handle_socket(
 async fn new_request(
     request_sender: &Sender<StaticOpenRequest>,
     id: ClientId,
-    result: Option<Result<warp::ws::Message, warp::Error>>,
+    result: Option<Result<Message, axum::Error>>,
 ) -> Result<(), ()> {
     let msg = match result {
-        Some(Ok(msg)) if msg.is_binary() => {
-            let data = msg.into_bytes();
+        Some(Ok(msg)) => {
+            let data = msg.into_data();
             let deserialized: ClientRequest = match ContractRequest::try_decode(&data) {
                 Ok(m) => m.into(),
                 Err(e) => {
@@ -260,12 +273,10 @@ async fn new_request(
 }
 
 async fn send_reponse_to_client(
-    response_stream: &mut SplitSink<warp::ws::WebSocket, warp::ws::Message>,
+    response_stream: &mut SplitSink<WebSocket, Message>,
     response: Result<HostResponse, ClientError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serialize = rmp_serde::to_vec(&response).unwrap();
-    response_stream
-        .send(warp::ws::Message::binary(serialize))
-        .await?;
+    response_stream.send(Message::Binary(serialize)).await?;
     Ok(())
 }
