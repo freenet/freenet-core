@@ -147,6 +147,12 @@ pub enum WasmAPIVersion {
     V1(WrappedContract),
 }
 
+impl From<WasmAPIVersion> for ContractContainer {
+    fn from(value: WasmAPIVersion) -> Self {
+        ContractContainer::Wasm(value)
+    }
+}
+
 impl Display for WasmAPIVersion {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {

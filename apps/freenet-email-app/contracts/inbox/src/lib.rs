@@ -115,6 +115,8 @@ impl Inbox {
         allocation_records: &HashMap<ContractInstanceId, TokenAllocationRecord>,
         messages: Vec<Message>,
     ) -> Result<(), VerificationError> {
+        // FIXME: make sure we are not re-adding old messages by verifying the time is moe recent
+        // than last updated
         for message in messages {
             let records = allocation_records
                 .get(&message.token_assignment.token_record)

@@ -1239,6 +1239,12 @@ impl From<Vec<u8>> for WrappedState {
     }
 }
 
+impl From<&'_ [u8]> for WrappedState {
+    fn from(bytes: &[u8]) -> Self {
+        Self::new(bytes.to_owned())
+    }
+}
+
 impl TryFromTsStd<&rmpv::Value> for WrappedState {
     fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
         let state = value.as_slice().unwrap().to_vec();

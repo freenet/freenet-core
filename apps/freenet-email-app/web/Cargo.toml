@@ -26,3 +26,8 @@ dioxus-web = { version = "0.3" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dioxus-desktop = { version = "0.3" }
+# dioxus-hot-reload = "0.1"
+
+[features]
+default = ["ui-testing"]
+ui-testing = []

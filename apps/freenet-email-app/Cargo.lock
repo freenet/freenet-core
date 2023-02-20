@@ -720,9 +720,9 @@ dependencies = [
 
 [[package]]
 name = "dioxus-core"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0e8be06e49889e277b298a2fca381d78a37379b0daecbd0df2e59130f3e73f5"
+checksum = "bc602f0ca7030f80fe4abc47cc43ffa75c6e7f48208c2b3f6ae24ec7bc6f6618"
 dependencies = [
  "bumpalo",
  "bumpslab",
