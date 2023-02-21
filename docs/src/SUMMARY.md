@@ -2,8 +2,8 @@
 
 - [Introduction](README.md)
 - [Development Guide](dev-guide.md)
-  - [Locutus Manifest Format](manifest.md)
+  - [Manifest Format](manifest.md)
   - [Building with Docker](docker.md)
 - [Contract Interface](contract-interface.md)
-- [Primitives of Decentralized Software](primitives.md)
+- [Building Blocks](building-blocks.md)
 - [Glossary](glossary.md)
