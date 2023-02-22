@@ -1,7 +1,7 @@
 //! Handle the `web` part of the bundles.
 
 use axum::http::StatusCode;
-use axum::response::{Html, Response};
+use axum::response::Html;
 use std::path::{Path, PathBuf};
 
 use locutus_runtime::{
@@ -17,7 +17,7 @@ use locutus_core::{
 };
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
-use crate::errors::Error;
+use crate::errors::WebSocketApiError;
 use crate::{ClientConnection, HostCallbackResult};
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -25,9 +25,9 @@ const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 pub(crate) async fn contract_home(
     key: String,
     request_sender: mpsc::Sender<ClientConnection>,
-) -> Result<Html<String>, Error> {
+) -> Result<Html<String>, WebSocketApiError> {
     let key = ContractKey::from_id(key)
-        .map_err(|err| Error::InvalidParam {
+        .map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         })
         .unwrap();
@@ -35,7 +35,7 @@ pub(crate) async fn contract_home(
     request_sender
         .send(ClientConnection::NewConnection(response_sender))
         .await
-        .map_err(|err| Error::Node {
+        .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })
         .unwrap();
@@ -54,7 +54,7 @@ pub(crate) async fn contract_home(
             .into(),
         })
         .await
-        .map_err(|err| Error::Node {
+        .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })
         .unwrap();
@@ -74,15 +74,18 @@ pub(crate) async fn contract_home(
                 let web_body = match get_web_body(&path).await {
                     Ok(b) => b,
                     Err(err) => match err {
-                        Error::Node {
+                        WebSocketApiError::NodeError {
                             error_cause: _cause,
                         } => {
                             let state = State::from(state.as_ref());
 
-                            fn err(err: WebContractError, contract: &ContractContainer) -> Error {
+                            fn err(
+                                err: WebContractError,
+                                contract: &ContractContainer,
+                            ) -> WebSocketApiError {
                                 let key = contract.key();
                                 tracing::error!("{err}");
-                                Error::InvalidParam {
+                                WebSocketApiError::InvalidParam {
                                     error_cause: format!("failed unpacking contract: {key}"),
                                 }
                             }
@@ -95,15 +98,16 @@ pub(crate) async fn contract_home(
                                 .get_file("index.html")
                                 .map_err(|e| err(e, &contract))
                                 .unwrap();
-                            let index_body =
-                                String::from_utf8(index).map_err(|err| Error::Node {
+                            let index_body = String::from_utf8(index).map_err(|err| {
+                                WebSocketApiError::NodeError {
                                     error_cause: format!("{err}"),
-                                })?;
+                                }
+                            })?;
                             Html(index_body)
                         }
                         other => {
                             tracing::error!("{other}");
-                            return Err(Error::Http {
+                            return Err(WebSocketApiError::HttpError {
                                 code: StatusCode::INTERNAL_SERVER_ERROR,
                             });
                         }
@@ -119,10 +123,10 @@ pub(crate) async fn contract_home(
             result: Err(err), ..
         }) => {
             tracing::error!("error getting contract `{key}`: {err}");
-            return Err(Error::Axum { error: err.kind() });
+            return Err(WebSocketApiError::AxumError { error: err.kind() });
         }
         None => {
-            return Err(Error::Node {
+            return Err(WebSocketApiError::NodeError {
                 error_cause: "Not contact found".to_string(),
             });
         }
@@ -134,52 +138,59 @@ pub(crate) async fn contract_home(
             req: ClientRequest::Disconnect { cause: None },
         })
         .await
-        .map_err(|err| Error::Node {
+        .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })
         .unwrap();
     Ok(response)
 }
 
-pub async fn variable_content(key: String, req_path: String) -> Result<Html<String>, Error> {
-    let key = ContractKey::from_id(key)
-        .map_err(|err| Error::InvalidParam {
-            error_cause: format!("{err}"),
-        })
-        .unwrap();
+pub async fn variable_content(
+    key: String,
+    req_path: String,
+) -> Result<Html<String>, WebSocketApiError> {
+    let key = ContractKey::from_id(key).map_err(|err| WebSocketApiError::InvalidParam {
+        error_cause: format!("{err}"),
+    })?;
     let base_path = contract_web_path(&key);
-    let req_uri = req_path.parse().unwrap();
-    let file_path = base_path.join(get_file_path(req_uri).unwrap());
+    let req_uri = req_path
+        .parse()
+        .map_err(|err| WebSocketApiError::NodeError {
+            error_cause: format!("{err}"),
+        })?;
+    let file_path = base_path.join(get_file_path(req_uri)?);
     let mut buf = vec![];
     File::open(file_path)
         .await
-        .map_err(|err| Error::Node {
+        .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?
         .read_to_end(&mut buf)
         .await
-        .map_err(|err| Error::Node {
+        .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
-    let body = String::from_utf8(buf).map_err(|err| Error::Node {
+    let body = String::from_utf8(buf).map_err(|err| WebSocketApiError::NodeError {
         error_cause: format!("{err}"),
     })?;
     Ok(Html(body))
 }
 
-async fn get_web_body(path: &Path) -> Result<Html<String>, Error> {
+async fn get_web_body(path: &Path) -> Result<Html<String>, WebSocketApiError> {
     let web_path = path.join("web").join("index.html");
-    let mut key_file = File::open(&web_path).await.map_err(|err| Error::Node {
-        error_cause: format!("{err}"),
-    })?;
+    let mut key_file = File::open(&web_path)
+        .await
+        .map_err(|err| WebSocketApiError::NodeError {
+            error_cause: format!("{err}"),
+        })?;
     let mut buf = vec![];
     key_file
         .read_to_end(&mut buf)
         .await
-        .map_err(|err| Error::Node {
+        .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
-    let body = String::from_utf8(buf).map_err(|err| Error::Node {
+    let body = String::from_utf8(buf).map_err(|err| WebSocketApiError::NodeError {
         error_cause: format!("{err}"),
     })?;
     Ok(Html(body))
@@ -194,14 +205,13 @@ fn contract_web_path(key: &ContractKey) -> PathBuf {
 }
 
 #[inline]
-fn get_file_path(uri: axum::http::Uri) -> Result<String, Response> {
-    let p = uri
-        .path()
-        .strip_prefix("/contract/")
-        .ok_or_else(|| Error::InvalidParam {
-            error_cause: format!("invalid uri: {uri}"),
-        })
-        .unwrap();
+fn get_file_path(uri: axum::http::Uri) -> Result<String, WebSocketApiError> {
+    let p =
+        uri.path()
+            .strip_prefix("/contract/")
+            .ok_or_else(|| WebSocketApiError::InvalidParam {
+                error_cause: format!("{uri} not valid"),
+            })?;
     let path = p
         .chars()
         .skip_while(|c| ALPHABET.contains(*c))

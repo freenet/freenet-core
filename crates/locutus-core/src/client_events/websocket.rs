@@ -46,19 +46,19 @@ impl WebSocketProxy {
     where
         T: Into<SocketAddr>,
     {
-        let filter = Router::default();
-        Self::start_server_internal(socket.into(), filter)
+        let router = Router::default();
+        Self::start_server_internal(socket.into(), router)
     }
 
     async fn start_server_internal(
         socket: SocketAddr,
-        filter: Router,
+        router: Router,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
         let (request_sender, server_request) = channel(PARALLELISM);
         let (server_response, response_receiver) = channel(PARALLELISM);
         let (new_client_up, new_clients) = channel(PARALLELISM);
 
-        let server = serve(request_sender, new_client_up, socket, filter);
+        let server = serve(request_sender, new_client_up, socket, router);
         tokio::spawn(server);
         tokio::spawn(responses(new_clients, response_receiver));
 

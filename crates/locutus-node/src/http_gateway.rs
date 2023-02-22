@@ -25,7 +25,7 @@ use tokio::sync::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::errors::Error;
+use crate::errors::WebSocketApiError;
 use crate::{web_handling, ClientConnection, DynError, HostCallbackResult};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
@@ -45,8 +45,8 @@ pub struct HttpGateway {
 }
 
 impl HttpGateway {
-    /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
-    pub fn as_filter() -> (Self, Router) {
+    /// Returns the uninitialized axum router to compose with other routing handling or websockets.
+    pub fn as_router() -> (Self, Router) {
         let contract_web_path = std::env::temp_dir().join("locutus").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
 
@@ -56,54 +56,15 @@ impl HttpGateway {
             response_channels: HashMap::new(),
         };
 
-        // let get_home = warp::path::end().and_then(home);
-        // let base_web_contract = warp::path::path("contract").and(warp::path::path("web"));
-
-        // let rs = request_sender.clone();
-        // let websocket_commands = warp::path!("contract" / "command")
-        //     .map(move || rs.clone())
-        //     .and(warp::path::end())
-        //     .and(warp::ws())
-        //     .map(|rs, ws: warp::ws::Ws| {
-        //         ws.on_upgrade(|ws: WebSocket| async {
-        //             if let Err(e) = websocket_interface(rs, ws).await {
-        //                 tracing::error!("{e}");
-        //             }
-        //         })
-        //     });
-        //
-        // let web_home = base_web_contract
-        //     .map(move || request_sender.clone())
-        //     .and(warp::path::param())
-        //     .and(warp::path::end())
-        //     .and_then(|rs, key: String| async move {
-        //         crate::web_handling::contract_home(key, rs).await
-        //     });
-        //
-        // let web_subpages = base_web_contract
-        //     .and(warp::path::param())
-        //     .and(warp::filters::path::full())
-        //     .and_then(|key: String, path| async move {
-        //         crate::web_handling::variable_content(key, path).await
-        //     });
-
-        // let filters2 = websocket_commands
-        //     .or(get_home)
-        //     .or(web_home)
-        //     .or(web_subpages)
-        //     .recover(errors::handle_error)
-        //     .with(warp::trace::request());
-
-        let filters = Router::new()
+        let router = Router::new()
             .route("/", get(home))
             .route("/contract/web/command", get(websocket_commands))
             .route("/contract/web/:key", get(web_home))
             .route("/contract/web/:key/*", get(web_subpages))
-            // .layer(HandleErrorLayer::new(handle_error))
             .layer(TraceLayer::new_for_http())
             .layer(Extension(request_sender));
 
-        (gateway, filters)
+        (gateway, router)
     }
 
     pub fn next_client_id() -> ClientId {
@@ -137,11 +98,13 @@ async fn home() -> axum::response::Response {
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
-) -> Result<Html<String>, Error> {
+) -> Result<Html<String>, WebSocketApiError> {
     web_handling::contract_home(key, rs).await
 }
 
-async fn web_subpages(Path((key, path)): Path<(String, String)>) -> Result<Html<String>, Error> {
+async fn web_subpages(
+    Path((key, path)): Path<(String, String)>,
+) -> Result<Html<String>, WebSocketApiError> {
     web_handling::variable_content(key, path).await
 }
 
@@ -246,9 +209,17 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
 ) -> Result<Option<Message>, Option<DynError>> {
     let msg = match msg {
-        Ok(m) => m.into_data(),
+        Ok(Message::Binary(data)) => data,
+        Ok(Message::Text(data)) => data.into_bytes(),
+        Ok(Message::Close(_)) => return Err(None),
+        Ok(Message::Ping(_)) => return Ok(Some(Message::Pong(vec![0, 3, 2]))),
+        Ok(m) => {
+            tracing::debug!(msg = ?m, "received random message");
+            return Ok(None);
+        }
         Err(err) => return Err(Some(err.into())),
     };
+
     let req: ClientRequest = {
         match ContractRequest::try_decode(&msg) {
             Ok(r) => r.into(),
