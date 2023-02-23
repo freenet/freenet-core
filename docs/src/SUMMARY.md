@@ -1,10 +1,10 @@
 # Summary
 
-- What is Freenet?
+- [Introduction](introduction.md)
   - The Internet's dangerous design flaw
   - Our solution: Freenet
 
-- Freenet Software
+- [Architecture](architecture.md)
   - Primitives
     - Contracts
     - Delegates
