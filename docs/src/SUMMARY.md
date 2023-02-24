@@ -12,8 +12,7 @@
       - Web Proxy
 
 - Development Guide
-  - Tools
-    - Locutus Build Tool
+  - Locutus Build Tool
 
 - Examples
   - Antiflood Token System
@@ -22,6 +21,6 @@
 - [Development Guide](dev-guide.md)
   - [Manifest Format](manifest.md)
   - [Building with Docker](docker.md)
-- [Contract Interface](contract-interface.md)
+- [Contract Interface](contract-interface.md)2
 - [Building Blocks](building-blocks.md)
 - [Glossary](glossary.md)
