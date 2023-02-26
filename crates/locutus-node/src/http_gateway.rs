@@ -1,7 +1,7 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, WebSocketUpgrade};
+use axum::extract::{Path, WebSocketUpgrade, MatchedPath};
 use axum::response::{Html, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -60,7 +60,7 @@ impl HttpGateway {
             .route("/", get(home))
             .route("/contract/web/command", get(websocket_commands))
             .route("/contract/web/:key", get(web_home))
-            .route("/contract/web/:key/*", get(web_subpages))
+            .route("/contract/web/:key/*path", get(web_subpages))
             .layer(TraceLayer::new_for_http())
             .layer(Extension(request_sender));
 
@@ -103,9 +103,10 @@ async fn web_home(
 }
 
 async fn web_subpages(
-    Path((key, path)): Path<(String, String)>,
+    matched_path: MatchedPath,
+    Path(key): Path<String>
 ) -> Result<Html<String>, WebSocketApiError> {
-    web_handling::variable_content(key, path).await
+    web_handling::variable_content(key, matched_path.as_str().to_string()).await
 }
 
 async fn websocket_commands(
