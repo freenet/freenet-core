@@ -1,26 +1,15 @@
 # Summary
 
 - [Introduction](introduction.md)
-  - The Internet's dangerous design flaw
-  - Our solution: Freenet
+
+# User Guide
 
 - [Architecture](architecture.md)
-  - Primitives
-    - Contracts
-    - Delegates
-    - Applications
-      - Web Proxy
-
-- Development Guide
-  - Locutus Build Tool
-
-- Examples
-  - Antiflood Token System
-
-- [Introduction](README.md)
 - [Development Guide](dev-guide.md)
-  - [Manifest Format](manifest.md)
-  - [Building with Docker](docker.md)
-- [Contract Interface](contract-interface.md)2
-- [Building Blocks](building-blocks.md)
+- [Frequently Asked Questions](faq.md)
 - [Glossary](glossary.md)
+
+# Examples
+
+- [Antiflood Tokens](examples/antiflood-tokens.md)
+- [Blind Trust Tokens](examples/blind-trust-tokens.md)
