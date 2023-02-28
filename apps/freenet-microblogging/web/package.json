@@ -4,28 +4,30 @@
     "locutus-stdlib": "file:../../stdlib",
     "module-alias": "^2.2.2"
   },
+  "main": "src/index.ts",
   "private": "true",
   "devDependencies": {
+    "babel-loader": "9.1.2",
+    "css-loader": "6.7.1",
+    "postcss-loader": "7.0.1",
+    "sass-loader": "13.0.2",
+    "style-loader": "3.3.1",
+    "ts-loader": "9.4.2",
     "@types/bootstrap": "5.2.2",
     "@types/jest": "^28.1.5",
     "autoprefixer": "10.4.8",
-    "css-loader": "6.7.1",
-    "jest": "^28.1.3",
-    "postcss-loader": "7.0.1",
+    "jest": "28.1.3",
     "sass": "1.54.5",
-    "sass-loader": "13.0.2",
-    "style-loader": "3.3.1",
     "ts-jest": "^28.0.6",
-    "ts-loader": "^9.4.1",
     "ts-node": "10.9.1",
-    "typescript": "^4.9.3",
-    "webpack": "^5.74.0",
-    "webpack-cli": "^5.0.0",
+    "typescript": "4.9.5",
+    "webpack": "5.75.0",
+    "webpack-cli": "5.0.0",
     "webpack-dev-server": "4.10.0"
   },
   "scripts": {
     "test": "jest",
-    "build": "webpack",
+    "build": "webpack --mode development",
     "start": "webpack serve --mode development"
   }
 }

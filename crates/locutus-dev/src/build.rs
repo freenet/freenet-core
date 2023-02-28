@@ -628,8 +628,8 @@ mod test {
         let deps = toml::toml! {
             posts = { path = "../contracts/posts" }
         };
-        let defs = include_deps(deps.as_table().unwrap())?;
-        embed_deps(&cwd, defs, &BuildToolCliConfig::default())?;
+        let defs = include_deps(deps.as_table().unwrap()).unwrap();
+        embed_deps(&cwd, defs, &BuildToolCliConfig::default()).unwrap();
         Ok(())
     }
 }

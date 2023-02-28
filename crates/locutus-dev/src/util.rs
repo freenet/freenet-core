@@ -36,26 +36,34 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
     let mut stderr = io::stderr();
     let mut stderr_buf = vec![];
 
+    let mut write_child_output = || -> Result<(), DynError> {
+        c_stdout.read_to_end(&mut stdout_buf)?;
+        stdout.write_all(&stdout_buf)?;
+        stdout_buf.clear();
+
+        c_stderr.read_to_end(&mut stderr_buf)?;
+        stderr.write_all(&stderr_buf)?;
+        stderr_buf.clear();
+        Ok(())
+    };
+
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                write_child_output()?;
                 if !status.success() {
-                    return Err(format!("exist with status: {status}").into());
+                    return Err(format!("exit with status: {status}").into());
                 }
                 break;
             }
             Ok(None) => {
-                // attempt to write output to parent stds
-                c_stdout.read_to_end(&mut stdout_buf)?;
-                stdout.write_all(&stdout_buf)?;
-                stdout_buf.clear();
-
-                c_stderr.read_to_end(&mut stderr_buf)?;
-                stderr.write_all(&stderr_buf)?;
-                stderr_buf.clear();
+                write_child_output()?;
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                write_child_output()?;
+                return Err(err.into());
+            }
         }
     }
 
