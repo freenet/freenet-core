@@ -1,7 +1,5 @@
 *.wasm
 **/node_modules/*
-**/dist/**/*
-**/dist/**/*
 **/target/*
 **/build/*
 
