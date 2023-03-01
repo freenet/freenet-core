@@ -53,7 +53,7 @@ jobs:
 
       - name: Install stdlib packages
         working-directory: apps/stdlib
-        run: npm install
+        run: npm run dev.package
 
       - name: Test - default
         run: cargo test
