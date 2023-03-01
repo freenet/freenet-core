@@ -2383,6 +2383,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "locutus-router"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "bytes",
+ "clap",
+ "futures",
+ "locutus-core",
+ "locutus-dev",
+ "locutus-stdlib",
+ "rmp",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tar",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "warp",
+ "xz2",
+]
+
+[[package]]
 name = "locutus-runtime"
 version = "0.0.3"
 dependencies = [
