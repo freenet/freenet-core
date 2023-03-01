@@ -1,7 +1,7 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, WebSocketUpgrade, MatchedPath};
+use axum::extract::{MatchedPath, Path, WebSocketUpgrade};
 use axum::response::{Html, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -104,7 +104,7 @@ async fn web_home(
 
 async fn web_subpages(
     matched_path: MatchedPath,
-    Path(key): Path<String>
+    Path(key): Path<String>,
 ) -> Result<Html<String>, WebSocketApiError> {
     web_handling::variable_content(key, matched_path.as_str().to_string()).await
 }
