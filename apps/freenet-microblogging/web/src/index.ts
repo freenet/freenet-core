@@ -7,7 +7,7 @@ import {
   Key,
   HostError,
   StateDelta,
-} from "locutus-stdlib/dist/src/webSocketInterface";
+} from "locutus-stdlib/webSocketInterface";
 import "./scss/styles.scss";
 // import * as bootstrap from "bootstrap";
 

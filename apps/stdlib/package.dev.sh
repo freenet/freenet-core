@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-# npm run test
-# npm run build
+npm run test
+npm run build
 if [ "$1"="dev" ]; then 
 PKG_DIR=$SCRIPT_DIR/dist/pack
 IS_DEV=1
