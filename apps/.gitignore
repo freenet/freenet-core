@@ -1,6 +1,7 @@
 *.wasm
 **/node_modules/*
-**/dist/**/*.js*
+**/dist/**/*
+**/dist/**/*
 **/target/*
 **/build/*
 
