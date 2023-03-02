@@ -72,4 +72,3 @@ enum Target {
     Contract(ContractKey),
 }
 ```
-

@@ -2,7 +2,6 @@
 
 ## Concepts
 
-
 ### Applications
 
 This is the user interface that wishes to use the AFT system to send a message,
@@ -20,7 +19,6 @@ more powerful version of cookies or local storage in a web browser. Delegates
 can be created by applications or other delegates, with the user's permission.
 Delegates implement the
 [DelegateInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
-
 
 ### Contracts
 

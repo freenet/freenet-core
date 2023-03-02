@@ -23,7 +23,3 @@ serves their interests, rather than those of the powerful.
 
 Freenet is software that runs on your computer and gives you access to an
 alternate decentralized Internet, but using familiar tools like web browsers.
-
-
-
-

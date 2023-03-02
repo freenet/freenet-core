@@ -13,7 +13,7 @@ container. This is mapped to `/tmp/locutus-docker` outside the container.
 
 All the docker related files are in the `docker` subdirectory.
 
-Requires that Docker be installed and working.  Then, in the root directory of the repo:
+Requires that Docker be installed and working. Then, in the root directory of the repo:
 
 To build the docker locutus container:
 
@@ -47,9 +47,9 @@ behaves just like the `ldt` tool, except as stated below.
 
 To BUILD a contract, we need to define 1 or 2 env vars:
 
-* `PROJECT_SRC_DIR` = Root of the Project being build and defaults to `pwd` so
+- `PROJECT_SRC_DIR` = Root of the Project being build and defaults to `pwd` so
   if you are in your project root, no need to set it.
-* `CONTRACT_SRC_DIR` = Relative DIR under PROJECT_SRC_DIR to the Contract to
+- `CONTRACT_SRC_DIR` = Relative DIR under PROJECT_SRC_DIR to the Contract to
   build. eg, `./web` would build a contract in the `web` subdirectory of the
   `PROJECT_SRC_DIR`. Note: This MUST be a subdirectory.
 

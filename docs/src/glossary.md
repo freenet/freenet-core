@@ -30,7 +30,7 @@ Represents a modification to some state - similar to a [diff](https://en.wikiped
 
 Data that forms part of a contract along with the WebAssembly code. This is supplied to the contract as a parameter to the contract's functions. Parameters are typically be used to configure a contract, much like the parameters of a constructor function.
 
-For example, the parameters could contain a hash of the state itself. The contract would then use it to verify that the state hashes to that value. This would create a contract that is guaranteed to contain the same state. In the original Freenet, this was known as a [content hash key](http://justsolve.archiveteam.org/wiki/Content_Hash_Key_(Freenet)).
+For example, the parameters could contain a hash of the state itself. The contract would then use it to verify that the state hashes to that value. This would create a contract that is guaranteed to contain the same state. In the original Freenet, this was known as a [content hash key](<http://justsolve.archiveteam.org/wiki/Content_Hash_Key_(Freenet)>).
 
 ## State Summary
 
