@@ -21,7 +21,8 @@
   "scripts": {
     "test": "jest",
     "build": "tsc",
-    "package": "./package.sh"
+    "prod.package": "./package.prod.sh",
+    "dev.package": "./package.dev.sh dev"
   },
   "license": "MIT+APACHE-2.0",
   "homepage": "https://github.com/freenet/locutus",

@@ -1,8 +1,10 @@
 import { decode, Encoder } from "@msgpack/msgpack";
 import base58 from "bs58";
 
-const MAX_U8: number = 255;
-const MIN_U8: number = 0;
+const GLOBAL = {
+  MAX_U8: 255,
+  MIN_U8: 0,
+};
 
 // base interface types:
 
@@ -677,7 +679,11 @@ export class HostResponse {
     assert(Array.isArray(state) || ArrayBuffer.isView(state));
     assert(
       state.every((value: any) => {
-        if (typeof value === "number" && value >= MIN_U8 && value <= MAX_U8)
+        if (
+          typeof value === "number" &&
+          value >= GLOBAL.MIN_U8 &&
+          value <= GLOBAL.MAX_U8
+        )
           return true;
         else return false;
       }),

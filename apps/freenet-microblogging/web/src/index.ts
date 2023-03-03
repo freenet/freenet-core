@@ -7,9 +7,9 @@ import {
   Key,
   HostError,
   StateDelta,
-} from "locutus-stdlib/src/webSocketInterface";
+} from "locutus-stdlib/webSocketInterface";
 import "./scss/styles.scss";
-// import * as bootstrap from 'bootstrap'
+// import * as bootstrap from "bootstrap";
 
 function getDocument(): Document {
   if (document) {
