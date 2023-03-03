@@ -1,5 +1,7 @@
 #!/usr/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+set -e
+npm install --save-dev .
 npm run test
 npm run build
 if [ "$1"="dev" ]; then 
