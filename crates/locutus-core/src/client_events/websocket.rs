@@ -118,6 +118,8 @@ async fn serve(
         .layer(Extension(req_sender))
         .layer(Extension(new_res))
         .layer(TraceLayer::new_for_http());
+
+    tracing::info!("listening on {}", socket);
     axum::Server::bind(&socket)
         .serve(request_receiver.into_make_service())
         .await
