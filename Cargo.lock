@@ -2441,20 +2441,15 @@ dependencies = [
  "rmpv",
  "semver 1.0.16",
  "serde",
- "serde-wasm-bindgen",
  "serde_bytes",
  "serde_json",
  "serde_with",
  "tar",
  "thiserror",
- "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "wasm-bindgen",
  "wasmer",
  "wasmer-wasi",
- "web-sys",
  "xz2",
 ]
 
@@ -5009,8 +5004,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31f8dcbc21f30d9b8f2ea926ecb58f6b91192c17e9d33594b3df58b2007ca53b"
 dependencies = [
  "cfg-if 1.0.0",
- "serde",
- "serde_json",
  "wasm-bindgen-macro",
 ]
 
