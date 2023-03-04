@@ -1,7 +1,7 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{MatchedPath, Path, WebSocketUpgrade};
+use axum::extract::{Path, WebSocketUpgrade};
 use axum::response::{Html, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -23,7 +23,6 @@ use tokio::sync::{
     mpsc::{self, error::TryRecvError, UnboundedReceiver},
     Mutex,
 };
-use tower_http::trace::TraceLayer;
 
 use crate::errors::WebSocketApiError;
 use crate::{web_handling, ClientConnection, DynError, HostCallbackResult};
@@ -58,10 +57,9 @@ impl HttpGateway {
 
         let router = Router::new()
             .route("/", get(home))
-            .route("/contract/web/command", get(websocket_commands))
-            .route("/contract/web/:key", get(web_home))
+            .route("/contract/command/", get(websocket_commands))
+            .route("/contract/web/:key/", get(web_home))
             .route("/contract/web/:key/*path", get(web_subpages))
-            .layer(TraceLayer::new_for_http())
             .layer(Extension(request_sender));
 
         (gateway, router)
@@ -103,10 +101,10 @@ async fn web_home(
 }
 
 async fn web_subpages(
-    matched_path: MatchedPath,
-    Path(key): Path<String>,
+    Path((key, last_path)): Path<(String, String)>,
 ) -> Result<Html<String>, WebSocketApiError> {
-    web_handling::variable_content(key, matched_path.as_str().to_string()).await
+    let full_path: String = format!("/contract/web/{}/{}", key, last_path);
+    web_handling::variable_content(key, full_path).await
 }
 
 async fn websocket_commands(
