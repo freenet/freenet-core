@@ -29,7 +29,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 xz2 = "0.1"
-warp = { version = "0.3", default-features = false, features = ["multipart", "tls"] }
+tower-http = { version = "0.3", features = ["trace"] }
+axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path"] }
 rmp = { workspace = true }
 rmpv = { workspace = true }
 rmp-serde = { workspace = true }
