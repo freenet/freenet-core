@@ -332,6 +332,8 @@ impl ContractInterface for Inbox {
                         mut messages,
                         signature,
                     } => {
+                        // FIXME: should the msg be verified for the pub key in the token assignment (the one sending the msg)
+                        // instead of the one owning the inbox?
                         can_modify_inbox(
                             &params,
                             &signature,

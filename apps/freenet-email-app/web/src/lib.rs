@@ -46,7 +46,6 @@ pub fn main() {
                         .with_position(LogicalPosition::new(200, 100)),
                 ),
         );
-        // dioxus_desktop::launch(app::App)
     }
 
     #[cfg(target_family = "wasm")]

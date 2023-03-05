@@ -21,14 +21,18 @@ impl Inbox {
                     id: 0,
                     sender: "Mary".into(),
                     title: "Unread email from Mary".into(),
-                    content: "".into(),
+                    content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                        .repeat(10)
+                        .into(),
                     read: false,
                 },
                 Email {
                     id: 1,
                     sender: "Jane".to_string().into(),
                     title: "Email from Jane".to_string().into(),
-                    content: "".into(),
+                    content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                        .repeat(10)
+                        .into(),
                     read: true,
                 },
             ]
@@ -48,7 +52,7 @@ struct User {
     password: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, Eq, Props)]
 struct Email {
     id: u64,
     sender: Cow<'static, str>,
@@ -95,12 +99,38 @@ pub(crate) fn App(cx: Scope) -> Element {
     }
 }
 
-struct NewMessageWindow {
-    show: bool,
+#[derive(Default)]
+struct MenuSelection {
+    email: Option<u64>,
+    new_msg: bool,
+}
+
+impl MenuSelection {
+    fn set_new_msg(&mut self) {
+        if self.new_msg {
+            self.new_msg = false;
+        } else {
+            self.new_msg = true;
+            self.email = None;
+        }
+    }
+
+    fn new_msg(&self) -> bool {
+        self.new_msg
+    }
+
+    fn set_received(&mut self) {
+        self.email = None;
+        self.new_msg = false;
+    }
+
+    fn received(&self) -> bool {
+        !self.new_msg && self.email.is_none()
+    }
 }
 
 fn UserInbox(cx: Scope) -> Element {
-    use_shared_state_provider(cx, || NewMessageWindow { show: false });
+    use_shared_state_provider(cx, MenuSelection::default);
     cx.render(rsx!(
         div {
             class: "columns",
@@ -117,8 +147,18 @@ fn UserInbox(cx: Scope) -> Element {
 }
 
 fn UserMenuComponent(cx: Scope) -> Element {
-    let new_msg_window = use_shared_state::<NewMessageWindow>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
+    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
+
+    let received_class = (menu_selection.read().received() || !menu_selection.read().new_msg())
+        .then(|| "is-active")
+        .unwrap_or("");
+    let write_msg_class = menu_selection
+        .read()
+        .new_msg()
+        .then(|| "is-active")
+        .unwrap_or("");
+
     cx.render(rsx!(
         div {
             class: "pl-3 pr-3 mt-3",
@@ -126,19 +166,17 @@ fn UserMenuComponent(cx: Scope) -> Element {
                 class: "menu-list",
                 li {
                     a {
-                        class: "is-active",
+                        class: received_class,
+                        onclick: move |_| { menu_selection.write().set_received(); },
                         "Received"
                     }
                 }
                 li {
                     a {
+                        class: write_msg_class,
                         onclick: move |_| {
-                            let mut new_msg_state = new_msg_window.write();
-                            if new_msg_state.show {
-                                new_msg_state.show = false;
-                            } else {
-                                new_msg_state.show = true;
-                            }
+                            let mut selection = menu_selection.write();
+                            selection.set_new_msg();
                         },
                         "Write message"
                     }
@@ -159,10 +197,7 @@ fn UserMenuComponent(cx: Scope) -> Element {
 
 fn InboxComponent(cx: Scope) -> Element {
     let inbox = use_context::<Inbox>(cx).unwrap();
-    use_shared_state_provider(cx, OpenEmail::default);
-
-    #[derive(Default)]
-    struct OpenEmail(Option<u64>);
+    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
 
     #[inline_props]
     fn EmailLink<'a>(
@@ -172,14 +207,14 @@ fn InboxComponent(cx: Scope) -> Element {
         read: bool,
         id: u64,
     ) -> Element {
-        let open_mail = use_shared_state::<OpenEmail>(cx).unwrap();
+        let open_mail = use_shared_state::<MenuSelection>(cx).unwrap();
         let icon_style = read
             .then(|| "fa-regular fa-envelope")
             .unwrap_or("fa-solid fa-envelope");
         cx.render(rsx!(a {
             class: "panel-block",
             id: "email-inbox-accessor-{id}",
-            onclick: move |_| { open_mail.write().0 = Some(*id); },
+            onclick: move |_| { open_mail.write().email = Some(*id); },
             span {
                 class: "panel-icon",
                 i { class: icon_style }
@@ -191,24 +226,23 @@ fn InboxComponent(cx: Scope) -> Element {
 
     let emails = inbox.emails.borrow();
 
-    let opened_email = use_shared_state::<OpenEmail>(cx).unwrap();
-    let opened_email = opened_email.read();
-    if let Some(email_id) = opened_email.0 {
+    let menu_selection_ref = menu_selection.read();
+    let new_msg = menu_selection_ref.new_msg;
+    if let Some(email_id) = menu_selection_ref.email {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();
         let email = &emails[id_p];
         cx.render(rsx! {
-            div {
-                class: "panel is-link mt-3",
-                p { class: "panel-heading", "Inbox" }
-                div {
-                    class: "panel-block",
-                    p {
-                        class: "control has-icons-left",
-                        input { class: "input is-link", r#type: "text", placeholder: "Search" }
-                        span { class: "icon is-left", i { class: "fas fa-search", aria_hidden: true } }
-                    }
-                }
+            OpenMessage {
+                id: email.id,
+                sender: email.sender.clone(),
+                title: email.title.clone(),
+                content: email.content.clone(),
+                read: email.read,
             }
+        })
+    } else if new_msg {
+        cx.render(rsx! {
+            NewMessageWindow {}
         })
     } else {
         let links = emails.iter().map(|email| {
@@ -227,17 +261,17 @@ fn InboxComponent(cx: Scope) -> Element {
                     class: "panel-tabs",
                     a {
                         class: "is-active icon-text",
-                        span { class: "icon", i { class: "fas fa-thin fa-inbox" } }
+                        span { class: "icon", i { class: "fas fa-inbox" } }
                         span { "Primary" }
                     }
                     a {
                         class: "icon-text",
-                        span { class: "icon",i { class: "fas fa-thin fa-user-group" } },
+                        span { class: "icon",i { class: "fas fa-user-group" } },
                         span { "Social" }
                     }
                     a {
                         class: "icon-text",
-                        span { class: "icon", i { class: "fas fa-thin fa-circle-exclamation" } },
+                        span { class: "icon", i { class: "fas fa-circle-exclamation" } },
                         span { "Updates" }
                     }
                 }
@@ -255,10 +289,41 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 }
 
+fn OpenMessage(cx: Scope<Email>) -> Element {
+    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
+    let email = cx.props;
+    cx.render(rsx! {
+        div {
+            class: "columns title mt-3",
+            div {
+                class: "column",
+                a {
+                    class: "icon is-small",
+                    onclick: move |_| { menu_selection.write().email = None; },
+                    i { class: "fa-sharp fa-solid fa-arrow-left", aria_label: "Back to Inbox", style: "color:#4a4a4a" }, 
+                }
+            }
+            div { class: "column is-four-fifths", h2 { "{email.title}" } }
+            div {
+                class: "column", 
+                a { class: "icon is-small", 
+                onclick: move |_| { menu_selection.write().email = None; },
+                i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" } } 
+            }
+        }
+        div {
+            id: "email-content-{email.id}",
+            p {
+                "{email.content}"
+            }
+        }
+    })
+}
+
 fn NewMessageWindow(cx: Scope) -> Element {
-    let state = use_shared_state::<NewMessageWindow>(cx).unwrap();
+    let state = use_shared_state::<MenuSelection>(cx).unwrap();
     let state = state.read();
-    if state.show {
+    if state.new_msg {
         cx.render(rsx! {
             div {
                 input {
