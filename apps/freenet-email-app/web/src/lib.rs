@@ -1,6 +1,7 @@
 mod app;
 pub(crate) mod inbox;
 
+use dioxus_desktop::{tao::dpi::LogicalPosition, LogicalSize};
 #[cfg(target_family = "unix")]
 use locutus_stdlib::client_api::WebApi as OriginalWebApi;
 #[cfg(target_family = "unix")]
@@ -38,7 +39,12 @@ pub fn main() {
                 .with_root_name(MAIN_ELEMENT_ID)
                 .with_custom_index(INDEX.to_string())
                 .with_resource_directory(env!("CARGO_MANIFEST_DIR"))
-                .with_window(WindowBuilder::new().with_title("Freenet Email App")),
+                .with_window(
+                    WindowBuilder::new()
+                        .with_title("Freenet Email App")
+                        .with_inner_size(LogicalSize::new(1200, 800))
+                        .with_position(LogicalPosition::new(200, 100)),
+                ),
         );
         // dioxus_desktop::launch(app::App)
     }
