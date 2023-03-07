@@ -321,17 +321,37 @@ fn OpenMessage(cx: Scope<Email>) -> Element {
 }
 
 fn NewMessageWindow(cx: Scope) -> Element {
-    let state = use_shared_state::<MenuSelection>(cx).unwrap();
-    let state = state.read();
-    if state.new_msg {
-        cx.render(rsx! {
+    cx.render(rsx! {
+        div {
+            class: "column mt-3",
             div {
-                input {
-                    "New message..."
+                class: "box has-background-light",
+                h3 { class: "title is-3", "New message" }
+                table {
+                    class: "table is-narrow has-background-light",
+                    tbody {
+                        tr {
+                            th { "From" }
+                            td { style: "width: 100%", contenteditable: true, br {} }
+                        }
+                        tr {
+                            th { "To"}
+                            td { style: "width: 100%", contenteditable: true, br {} }
+                        }
+                        tr {
+                            th { "Title"}
+                            td { style: "width: 100%", contenteditable: true, br {} }
+                        }
+                    }
                 }
             }
-        })
-    } else {
-        None
-    }
+            div {
+                class: "box",
+                div { contenteditable: true, br {} }
+            }
+            div {
+                button { class: "button is-info is-outlined", "Send" }
+            }
+        }
+    })
 }
