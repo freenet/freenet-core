@@ -4226,9 +4226,9 @@ checksum = "213701ba3370744dcd1a12960caa4843b3d68b4d1c0a5d575e0d65b2ee9d16c0"
 
 [[package]]
 name = "stretto"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e84bcc3af74e733dcd0382baa7deec3fadee09cc89089d1f0350068f31df39bb"
+checksum = "b6bcb902b974bc20b50c3ad3148022a366a46c9a676b587684ff46c237a3329e"
 dependencies = [
  "async-channel",
  "async-io",
