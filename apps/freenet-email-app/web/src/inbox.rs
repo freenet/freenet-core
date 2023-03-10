@@ -89,13 +89,13 @@ struct DecryptedMessage {
 }
 
 /// Inbox state
-struct Inbox {
+pub(crate) struct InboxModel {
     messages: Vec<Message>,
     settings: InternalSettings,
     key: ContractKey,
 }
 
-impl Inbox {
+impl InboxModel {
     fn new() -> Self {
         let cipher = XChaCha20Poly1305::new(&[0u8; 32].into());
         Self {
@@ -272,7 +272,7 @@ impl Inbox {
 
     #[cfg(debug_assertions)]
     pub(crate) fn create_inbox() -> Self {
-        Inbox::new()
+        InboxModel::new()
     }
 
     #[cfg(not(debug_assertions))]
@@ -281,7 +281,7 @@ impl Inbox {
         keypair: ed25519_dalek::Keypair,
         code: WrappedContract,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let inbox = Inbox::new();
+        let inbox = InboxModel::new();
         let request = ContractRequest::Put {
             contract: WasmAPIVersion::V1(code).into(),
             state: inbox.to_state()?.as_ref().into(),
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn remove_msg() {
-        let mut inbox = Inbox::new();
+        let mut inbox = InboxModel::new();
         for id in 0..10000 {
             inbox.messages.push(Message {
                 id,
