@@ -2,7 +2,7 @@
 name = "locutus-stdlib"
 version = "0.0.3"
 edition = "2021"
-rust-version = "1.58.0"
+rust-version = "1.60.0"
 publish = true
 description = "Locutus P2P network standard library"
 license = "MIT OR Apache-2.0"
@@ -64,6 +64,6 @@ rand = { version = "0.8", features = ["small_rng"] }
 [features]
 default = []
 archive = ["xz2", "tar"]
-net = ["serde-wasm-bindgen", "tokio", "tokio-tungstenite", "wasm-bindgen", "web-sys"]
+net = ["dep:tokio", "dep:tokio-tungstenite", "dep:wasm-bindgen", "dep:web-sys", "dep:serde-wasm-bindgen"]
 testing = ["arbitrary"]
 trace = []

@@ -7,7 +7,6 @@ edition = "2021"
 bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
-hashbrown = { workspace = true }
 locutus-stdlib = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true }

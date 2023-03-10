@@ -259,7 +259,7 @@ impl InboxModel {
 
     pub(crate) async fn get_inbox(
         client: &mut WebApi,
-        keypair: ed25519_dalek::Keypair,
+        keypair: &ed25519_dalek::Keypair,
         key: ContractKey,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let request = ContractRequest::Get {

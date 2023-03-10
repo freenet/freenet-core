@@ -1,59 +1,150 @@
 #![allow(non_snake_case)]
-use std::{borrow::Cow, cell::RefCell};
+use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use dioxus::prelude::*;
 use ed25519_dalek::Keypair;
+use locutus_stdlib::prelude::ContractKey;
+use once_cell::unsync::Lazy;
 
 mod login;
 
-#[derive(Debug, Clone)]
-struct Inbox {
-    emails: RefCell<Vec<Email>>,
+thread_local! {
+    static CONNECTION: Lazy<RefCell<crate::WebApi>> = Lazy::new(|| {
+        let api = crate::WebApi::new()
+            .map_err(|err| {
+                web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+                err
+            })
+            .expect("open connection");
+        RefCell::new(api)
+    })
 }
 
-impl Inbox {}
+#[derive(Debug, Clone)]
+struct Inbox {
+    contract: ContractKey,
+    messages: Rc<RefCell<Vec<Message>>>,
+}
 
 impl Inbox {
     fn new() -> Self {
-        let emails = if cfg!(feature = "ui-testing") {
-            vec![
-                Email {
-                    id: 0,
-                    sender: "Mary".into(),
-                    title: "Unread email from Mary".into(),
-                    content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
-                        .repeat(10)
-                        .into(),
-                    read: false,
-                },
-                Email {
-                    id: 1,
-                    sender: "Jane".to_string().into(),
-                    title: "Email from Jane".to_string().into(),
-                    content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
-                        .repeat(10)
-                        .into(),
-                    read: true,
-                },
-            ]
-        } else {
-            todo!()
-        };
         Self {
-            emails: RefCell::new(emails),
+            contract: todo!(),
+            messages: Rc::new(RefCell::new(vec![])),
         }
+    }
+
+    // #[cfg(all(not(feature = "ui-testing"), target_family = "wasm"))]
+    #[cfg(target_family = "wasm")]
+    fn load_messages(&self, id: &Identity, keypair: &ed25519_dalek::Keypair) {
+        use crate::inbox::InboxModel;
+
+        CONNECTION.with(|c| {
+            let client = &mut *(**c).borrow_mut();
+            InboxModel::get_inbox(client, keypair, self.contract.clone());
+        });
+    }
+
+    #[cfg(all(feature = "ui-testing", not(target_family = "wasm")))]
+    fn load_messages(&self, id: &Identity, _keypair: &ed25519_dalek::Keypair) {
+        let emails = {
+            if id.id == 0 {
+                vec![
+                    Message {
+                        id: 0,
+                        sender: "Ian's Other Account".into(),
+                        title: "Unread email from Ian's Other Account".into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: false,
+                    },
+                    Message {
+                        id: 1,
+                        sender: "Mary".to_string().into(),
+                        title: "Email from Mary".to_string().into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: true,
+                    },
+                ]
+            } else {
+                vec![
+                    Message {
+                        id: 0,
+                        sender: "Ian Clarke".into(),
+                        title: "Unread email from Ian".into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: false,
+                    },
+                    Message {
+                        id: 1,
+                        sender: "Jane".to_string().into(),
+                        title: "Email from Jane".to_string().into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: true,
+                    },
+                ]
+            }
+        };
+        self.messages.replace(emails);
     }
 }
 
-#[derive(Default)]
 struct User {
     logged: bool,
-    peer: Option<Keypair>,
-    password: Option<Vec<u8>>,
+    active_id: Option<usize>,
+    identities: Vec<Identity>,
+    keypair: Option<Keypair>,
+}
+
+impl User {
+    #[cfg(feature = "ui-testing")]
+    fn new() -> Self {
+        const KEY: &[u8] = &[
+            130, 39, 155, 15, 62, 76, 188, 63, 124, 122, 26, 251, 233, 253, 225, 220, 14, 41, 166,
+            120, 108, 35, 254, 77, 160, 83, 172, 58, 219, 42, 86, 120,
+        ];
+        User {
+            logged: true,
+            active_id: None,
+            identities: vec![
+                Identity {
+                    id: 0,
+                    pub_key: ed25519_dalek::PublicKey::from_bytes(KEY).unwrap(),
+                },
+                Identity {
+                    id: 1,
+                    pub_key: ed25519_dalek::PublicKey::from_bytes(KEY).unwrap(),
+                },
+            ],
+            keypair: None,
+        }
+    }
+
+    fn logged_id(&self) -> Option<&Identity> {
+        self.active_id.and_then(|id| self.identities.get(id))
+    }
+
+    fn set_logged_id(&mut self, id: usize) {
+        assert!(id < self.identities.len());
+        self.active_id = Some(id);
+    }
+}
+
+#[derive(Clone)]
+struct Identity {
+    id: usize,
+    pub_key: ed25519_dalek::PublicKey,
 }
 
 #[derive(Debug, Clone, Eq, Props)]
-struct Email {
+struct Message {
     id: u64,
     sender: Cow<'static, str>,
     title: Cow<'static, str>,
@@ -61,34 +152,33 @@ struct Email {
     read: bool,
 }
 
-impl PartialEq for Email {
+impl PartialEq for Message {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl PartialOrd for Email {
+impl PartialOrd for Message {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.id.partial_cmp(&other.id)
     }
 }
 
-impl Ord for Email {
+impl Ord for Message {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.partial_cmp(other).unwrap()
     }
 }
 
 pub(crate) fn App(cx: Scope) -> Element {
-    // todo: create a connection to the node ws api and retrieve the current inbox state
-    use_shared_state_provider(cx, || User {
-        logged: true,
-        ..Default::default()
-    });
+    use_shared_state_provider(cx, User::new);
+    use_context_provider(cx, Inbox::new);
 
     let user = use_shared_state::<User>(cx).unwrap();
-    if user.read().logged {
-        use_context_provider(cx, Inbox::new);
+    let user = user.read();
+    if let Some(id) = user.logged_id() {
+        let inbox = use_context::<Inbox>(cx).unwrap();
+        inbox.load_messages(id, user.keypair.as_ref().unwrap().clone());
         cx.render(rsx! {
            UserInbox {}
         })
@@ -186,6 +276,7 @@ fn UserMenuComponent(cx: Scope) -> Element {
                         onclick: move |_| {
                             let mut logged_state = user.write();
                             logged_state.logged = false;
+                            logged_state.active_id = None;
                         },
                         "Log out"
                     }
@@ -224,7 +315,7 @@ fn InboxComponent(cx: Scope) -> Element {
         }))
     }
 
-    let emails = inbox.emails.borrow();
+    let emails = inbox.messages.borrow();
 
     let menu_selection_ref = menu_selection.read();
     let new_msg = menu_selection_ref.new_msg;
@@ -289,7 +380,7 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 }
 
-fn OpenMessage(cx: Scope<Email>) -> Element {
+fn OpenMessage(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
     let email = cx.props;
     cx.render(rsx! {

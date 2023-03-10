@@ -1,8 +1,8 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SubsecRound, Timelike, Utc};
 use ed25519_dalek::{PublicKey, Signature};
-use hashbrown::HashMap;
 use locutus_stdlib::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::Display;
@@ -499,7 +499,7 @@ impl TokenAllocationRecord {
 impl<'a> IntoIterator for &'a TokenAllocationRecord {
     type Item = (&'a Tier, &'a Vec<TokenAssignment>);
 
-    type IntoIter = hashbrown::hash_map::Iter<'a, Tier, Vec<TokenAssignment>>;
+    type IntoIter = std::collections::hash_map::Iter<'a, Tier, Vec<TokenAssignment>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.tokens_by_tier.iter()
@@ -509,7 +509,7 @@ impl<'a> IntoIterator for &'a TokenAllocationRecord {
 impl IntoIterator for TokenAllocationRecord {
     type Item = (Tier, Vec<TokenAssignment>);
 
-    type IntoIter = hashbrown::hash_map::IntoIter<Tier, Vec<TokenAssignment>>;
+    type IntoIter = std::collections::hash_map::IntoIter<Tier, Vec<TokenAssignment>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.tokens_by_tier.into_iter()

@@ -12,7 +12,7 @@ pub struct WebApi {
 impl WebApi {
     pub fn start(
         conn: Connection,
-        result_handler: impl FnOnce(HostResult) + Copy + 'static,
+        mut result_handler: impl FnMut(HostResult) + 'static,
         error_handler: impl FnOnce(Error) + Copy + 'static,
         onopen_handler: impl FnOnce() + Copy + 'static,
     ) -> Self {

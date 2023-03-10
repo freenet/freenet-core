@@ -1,17 +1,16 @@
+use std::sync::Mutex;
+
+use locutus_stdlib::client_api::{ClientError, HostResponse};
+
 mod app;
 pub(crate) mod inbox;
-
-use dioxus_desktop::{tao::dpi::LogicalPosition, LogicalSize};
-#[cfg(target_family = "unix")]
-use locutus_stdlib::client_api::WebApi as OriginalWebApi;
-#[cfg(target_family = "unix")]
-type WebApi = OriginalWebApi;
 
 const MAIN_ELEMENT_ID: &str = "freenet-email-main";
 
 pub fn main() {
     #[cfg(not(target_family = "wasm"))]
     {
+        use dioxus_desktop::{tao::dpi::LogicalPosition, LogicalSize};
         use dioxus_desktop::{Config, WindowBuilder};
         // if cfg!(debug_assertions) {
         //     hot_reload_init!();
@@ -49,5 +48,43 @@ pub fn main() {
     }
 
     #[cfg(target_family = "wasm")]
-    dioxus_web::launch(app);
+    dioxus_web::launch(app::App);
+}
+
+struct WebApi {
+    api: locutus_stdlib::client_api::WebApi,
+    received: crossbeam::channel::Receiver<Result<HostResponse, ClientError>>,
+}
+
+#[cfg(target_family = "wasm")]
+impl WebApi {
+    fn new() -> Result<Self, String> {
+        let conn = web_sys::WebSocket::new("ws://localhost:55008/contract/command").unwrap();
+        let (tx, received) = crossbeam::channel::unbounded();
+        let result_handler = move |result: Result<HostResponse, ClientError>| {
+            tx.send(result).expect("channel open");
+        };
+        let api = locutus_stdlib::client_api::WebApi::start(
+            conn,
+            result_handler,
+            |err| {
+                web_sys::console::error_1(
+                    &serde_wasm_bindgen::to_value(&format!("connection error: {err}")).unwrap(),
+                );
+            },
+            || {},
+        );
+        Ok(Self { api, received })
+    }
+
+    async fn send(
+        &mut self,
+        request: locutus_stdlib::client_api::ClientRequest<'static>,
+    ) -> Result<(), locutus_stdlib::client_api::Error> {
+        self.api.send(request)
+    }
+
+    async fn recv(&mut self) -> Result<HostResponse, ClientError> {
+        self.received.recv().expect("channel open")
+    }
 }

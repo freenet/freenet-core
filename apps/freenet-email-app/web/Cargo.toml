@@ -6,6 +6,9 @@ rust-version = "1.58.0"
 resolver = "2"
 publish = false
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 ed25519-dalek = { workspace = true }
 chacha20poly1305 = { workspace = true, features = ["std"] }
@@ -15,14 +18,29 @@ locutus-stdlib = { workspace = true, features = ["net"] }
 locutus-aft-interface = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+once_cell = { workspace = true }
+crossbeam = "0.8"
 
 freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [target.'cfg(target_family = "wasm")'.dependencies]
 dioxus-web = { version = "0.3" }
+getrandom = { version = "*", features = ["js"] }
+locutus-stdlib = { workspace = true, features = ["net"] }
+serde-wasm-bindgen = { version = "0.5" }
+
+[target.'cfg(target_family = "wasm")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  "BinaryType",
+  "Blob",
+  "console",
+  "ErrorEvent",
+#   "FileReader",
+#   "MessageEvent",
+#   "ProgressEvent",
+  "WebSocket",
+]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dioxus-desktop = { version = "0.3" }
