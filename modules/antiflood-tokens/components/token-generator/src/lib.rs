@@ -15,6 +15,7 @@ type AssignmentHash = [u8; 32];
 
 struct TokenComponent;
 
+#[component]
 impl ComponentInterface for TokenComponent {
     fn process(message: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
         match message {

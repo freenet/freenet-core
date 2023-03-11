@@ -1,5 +1,5 @@
 [package]
-name = "locutus-aft-allocation-record"
+name = "locutus-token-allocation-record"
 version = "0.1.0"
 edition = "2021"
 
