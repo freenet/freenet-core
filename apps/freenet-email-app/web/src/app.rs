@@ -62,13 +62,13 @@ impl Inbox {
     }
 
     #[cfg(all(feature = "ui-testing", not(target_family = "wasm")))]
-    fn load_messages(&self, id: &Identity, _keypair: &ed25519_dalek::Keypair) {
+    fn load_messages(&self, _cx: Scope, id: &Identity, _keypair: &rsa::RsaPrivateKey) {
         let emails = {
             if id.id == 0 {
                 vec![
                     Message {
                         id: 0,
-                        sender: "Ian's Other Account".into(),
+                        from: "Ian's Other Account".into(),
                         title: "Unread email from Ian's Other Account".into(),
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
@@ -77,7 +77,7 @@ impl Inbox {
                     },
                     Message {
                         id: 1,
-                        sender: "Mary".to_string().into(),
+                        from: "Mary".to_string().into(),
                         title: "Email from Mary".to_string().into(),
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
@@ -89,7 +89,7 @@ impl Inbox {
                 vec![
                     Message {
                         id: 0,
-                        sender: "Ian Clarke".into(),
+                        from: "Ian Clarke".into(),
                         title: "Unread email from Ian".into(),
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
@@ -98,7 +98,7 @@ impl Inbox {
                     },
                     Message {
                         id: 1,
-                        sender: "Jane".to_string().into(),
+                        from: "Jane".to_string().into(),
                         title: "Email from Jane".to_string().into(),
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
@@ -116,13 +116,16 @@ struct User {
     logged: bool,
     active_id: Option<usize>,
     identities: Vec<Identity>,
-    keypair: Option<RsaPrivateKey>,
+    private_key: Option<RsaPrivateKey>,
 }
 
 impl User {
     #[cfg(feature = "ui-testing")]
     fn new() -> Self {
+        use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
+
         const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
+        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
         let pub_key =
             <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
                 .unwrap();
@@ -136,7 +139,7 @@ impl User {
                 },
                 Identity { id: 1, pub_key },
             ],
-            keypair: None,
+            private_key: Some(RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap()),
         }
     }
 
@@ -205,7 +208,7 @@ pub(crate) fn App(cx: Scope) -> Element {
     let user = user.read();
     if let Some(id) = user.logged_id() {
         let inbox = use_context::<Inbox>(cx).unwrap();
-        inbox.load_messages(cx, id, user.keypair.as_ref().unwrap());
+        inbox.load_messages(cx, id, user.private_key.as_ref().unwrap());
         cx.render(rsx! {
            UserInbox {}
         })
