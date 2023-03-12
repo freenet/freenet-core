@@ -258,6 +258,7 @@ struct RequestNewToken {
     component_id: SecretsId,
     criteria: AllocationCriteria,
     records: TokenAllocationRecord,
+    /// The public key
     assignee: Assignee,
     assignment_hash: AssignmentHash,
 }
