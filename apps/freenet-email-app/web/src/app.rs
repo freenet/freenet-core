@@ -2,12 +2,13 @@
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use dioxus::prelude::*;
-use ed25519_dalek::Keypair;
 use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
+use rsa::{RsaPrivateKey, RsaPublicKey};
 
 mod login;
 
+#[cfg(target_family = "wasm")]
 thread_local! {
     static CONNECTION: Lazy<RefCell<crate::WebApi>> = Lazy::new(|| {
         let api = crate::WebApi::new()
@@ -27,21 +28,20 @@ struct Inbox {
 }
 
 impl Inbox {
-    fn new() -> Self {
+    fn new(contract: ContractKey) -> Self {
         Self {
-            contract: todo!(),
+            contract,
             messages: Rc::new(RefCell::new(vec![])),
         }
     }
 
-    // #[cfg(all(not(feature = "ui-testing"), target_family = "wasm"))]
     #[cfg(target_family = "wasm")]
-    fn load_messages(&self, id: &Identity, keypair: &ed25519_dalek::Keypair) {
+    fn load_messages(&self, id: &Identity, private_key: &rsa::RsaPrivateKey) {
         use crate::inbox::InboxModel;
 
         CONNECTION.with(|c| {
             let client = &mut *(**c).borrow_mut();
-            InboxModel::get_inbox(client, keypair, self.contract.clone());
+            InboxModel::get_inbox(client, private_key, self.contract.clone());
         });
     }
 
@@ -100,28 +100,25 @@ struct User {
     logged: bool,
     active_id: Option<usize>,
     identities: Vec<Identity>,
-    keypair: Option<Keypair>,
+    keypair: Option<RsaPrivateKey>,
 }
 
 impl User {
     #[cfg(feature = "ui-testing")]
     fn new() -> Self {
-        const KEY: &[u8] = &[
-            130, 39, 155, 15, 62, 76, 188, 63, 124, 122, 26, 251, 233, 253, 225, 220, 14, 41, 166,
-            120, 108, 35, 254, 77, 160, 83, 172, 58, 219, 42, 86, 120,
-        ];
+        const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
+        let pub_key =
+            <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
+                .unwrap();
         User {
             logged: true,
             active_id: None,
             identities: vec![
                 Identity {
                     id: 0,
-                    pub_key: ed25519_dalek::PublicKey::from_bytes(KEY).unwrap(),
+                    pub_key: pub_key.clone(),
                 },
-                Identity {
-                    id: 1,
-                    pub_key: ed25519_dalek::PublicKey::from_bytes(KEY).unwrap(),
-                },
+                Identity { id: 1, pub_key },
             ],
             keypair: None,
         }
@@ -140,7 +137,7 @@ impl User {
 #[derive(Clone)]
 struct Identity {
     id: usize,
-    pub_key: ed25519_dalek::PublicKey,
+    pub_key: RsaPublicKey,
 }
 
 #[derive(Debug, Clone, Eq, Props)]
@@ -171,14 +168,16 @@ impl Ord for Message {
 }
 
 pub(crate) fn App(cx: Scope) -> Element {
+    // TODO: get this from the code + params through the API
+    let contract = ContractKey::from_id("7i4DAmvgk3E3L7XF1SZrpGEHAq7rPZmNaJNeUqz4yKTu").unwrap();
     use_shared_state_provider(cx, User::new);
-    use_context_provider(cx, Inbox::new);
+    use_context_provider(cx, || Inbox::new(contract));
 
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();
     if let Some(id) = user.logged_id() {
         let inbox = use_context::<Inbox>(cx).unwrap();
-        inbox.load_messages(id, user.keypair.as_ref().unwrap().clone());
+        inbox.load_messages(id, user.keypair.as_ref().unwrap());
         cx.render(rsx! {
            UserInbox {}
         })

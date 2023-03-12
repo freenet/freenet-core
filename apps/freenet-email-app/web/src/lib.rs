@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 
 mod app;
@@ -56,8 +54,8 @@ struct WebApi {
     received: crossbeam::channel::Receiver<Result<HostResponse, ClientError>>,
 }
 
-#[cfg(target_family = "wasm")]
 impl WebApi {
+    #[cfg(target_family = "wasm")]
     fn new() -> Result<Self, String> {
         let conn = web_sys::WebSocket::new("ws://localhost:55008/contract/command").unwrap();
         let (tx, received) = crossbeam::channel::unbounded();
@@ -81,7 +79,7 @@ impl WebApi {
         &mut self,
         request: locutus_stdlib::client_api::ClientRequest<'static>,
     ) -> Result<(), locutus_stdlib::client_api::Error> {
-        self.api.send(request)
+        self.api.send(request).await
     }
 
     async fn recv(&mut self) -> Result<HostResponse, ClientError> {

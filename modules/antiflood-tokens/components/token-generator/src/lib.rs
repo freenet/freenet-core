@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use locutus_aft_interface::{AllocationCriteria, TokenAllocationRecord, TokenAssignment};
 use locutus_stdlib::{prelude::*, time};
-use rand_chacha::{rand_core::SeedableRng, ChaChaRng};
 use rsa::{
     pkcs1v15::SigningKey, pkcs8::EncodePublicKey, sha2::Sha256, RsaPrivateKey, RsaPublicKey,
 };
@@ -335,15 +334,13 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
-        use rsa::signature::RandomizedSigner;
+        use rsa::signature::Signer;
         let current = time::now();
         let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
             let msg = TokenAssignment::to_be_signed(&time_slot, &assignee, criteria.frequency);
             let signing_key = SigningKey::<Sha256>::new_with_prefix(key.clone());
-            // FIXME: must change fopr a random seed from locutus_stdlib::rand::* ; just a quick workaround
-            let mut rng = ChaChaRng::seed_from_u64(1);
-            let signature = signing_key.sign_with_rng(&mut rng, &msg);
+            let signature = signing_key.sign(&msg);
             TokenAssignment {
                 tier: criteria.frequency,
                 time_slot,

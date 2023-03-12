@@ -1153,7 +1153,6 @@ dependencies = [
  "locutus-stdlib",
  "once_cell",
  "rand",
- "rand_chacha",
  "rsa",
  "serde",
  "serde_json",

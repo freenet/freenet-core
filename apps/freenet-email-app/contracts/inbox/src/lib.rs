@@ -1,9 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Keypair, Signature, Signer, Verifier};
 use locutus_aft_interface::{Tier, TokenAllocationRecord, TokenAssignment, TokenAssignmentHash};
 use locutus_stdlib::prelude::{blake2::Digest, *};
+use rsa::{
+    pkcs1v15::{SigningKey, VerifyingKey},
+    sha2::Sha256,
+    signature::{Signer, Verifier},
+    RsaPrivateKey, RsaPublicKey,
+};
 use serde::{Deserialize, Serialize};
 
 /// Sign this byte array and include the signature in the `inbox_signature` so this inbox can be verified on updates.
@@ -12,7 +17,7 @@ const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
 #[derive(Serialize, Deserialize)]
 struct InboxParams {
     // The public key of the inbox owner message.
-    pub_key: ed25519_dalek::PublicKey,
+    pub_key: RsaPublicKey,
 }
 
 impl TryFrom<Parameters<'static>> for InboxParams {
@@ -22,6 +27,8 @@ impl TryFrom<Parameters<'static>> for InboxParams {
             .map_err(|err| ContractError::Deser(format!("{err}")))
     }
 }
+
+type Signature = Box<[u8]>;
 
 #[derive(Serialize, Deserialize)]
 pub enum UpdateInbox {
@@ -87,7 +94,7 @@ impl From<VerificationError> for ContractError {
 
 impl Inbox {
     #[cfg(feature = "wasmbind")]
-    pub fn new(key: &Keypair, settings: InboxSettings, messages: Vec<Message>) -> Self {
+    pub fn new(key: &RsaPrivateKey, settings: InboxSettings, messages: Vec<Message>) -> Self {
         let inbox_signature = Self::sign(key);
         Self {
             settings,
@@ -97,14 +104,18 @@ impl Inbox {
         }
     }
 
-    pub fn sign(key: &Keypair) -> Signature {
-        key.sign(STATE_UPDATE)
+    pub fn sign(key: &RsaPrivateKey) -> Signature {
+        let signing_key = SigningKey::<Sha256>::new_with_prefix(key.clone());
+        signing_key.sign(STATE_UPDATE).into()
     }
 
     fn verify(&self, params: &InboxParams) -> Result<(), VerificationError> {
-        params
-            .pub_key
-            .verify(STATE_UPDATE, &self.inbox_signature)
+        let verifying_key = VerifyingKey::<Sha256>::from(params.pub_key.clone());
+        verifying_key
+            .verify(
+                STATE_UPDATE,
+                &rsa::pkcs1v15::Signature::from(self.inbox_signature.clone()),
+            )
             .map_err(|_e| VerificationError::WrongSignature)?;
         Ok(())
     }
@@ -249,9 +260,9 @@ fn can_modify_inbox<'a>(
     for hash in ids {
         signed.extend(hash);
     }
-    params
-        .pub_key
-        .verify(signed.as_ref(), signature)
+    let verifying_key = VerifyingKey::<Sha256>::from(params.pub_key.clone());
+    verifying_key
+        .verify(signed.as_ref(), &signature.clone().into())
         .map_err(|_err| ContractError::InvalidUpdate)?;
     Ok(())
 }
@@ -263,9 +274,9 @@ fn can_update_settings(
 ) -> Result<(), ContractError> {
     let serialized =
         serde_json::to_vec(settings).map_err(|e| ContractError::Deser(format!("{e}")))?;
-    params
-        .pub_key
-        .verify(&serialized, signature)
+    let verifying_key = VerifyingKey::<Sha256>::from(params.pub_key.clone());
+    verifying_key
+        .verify(&serialized, &signature.clone().into())
         .map_err(|_err| ContractError::InvalidUpdate)?;
     Ok(())
 }

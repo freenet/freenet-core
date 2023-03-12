@@ -10,16 +10,17 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ed25519-dalek = { workspace = true }
-chacha20poly1305 = { workspace = true, features = ["std"] }
+rand_chacha = "0.3"
 chrono = { workspace = true }
+crossbeam = "0.8"
 dioxus = { version = "0.3" }
 locutus-stdlib = { workspace = true, features = ["net"] }
 locutus-aft-interface = { workspace = true }
+once_cell = { workspace = true }
+rsa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-once_cell = { workspace = true }
-crossbeam = "0.8"
+tokio = "1.26"
 
 freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 

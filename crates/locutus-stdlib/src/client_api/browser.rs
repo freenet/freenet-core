@@ -52,7 +52,7 @@ impl WebApi {
         WebApi { conn }
     }
 
-    pub fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
+    pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
         let send = rmp_serde::to_vec(&request)?;
         self.conn.send_with_u8_array(&send).map_err(
             |err| match serde_wasm_bindgen::from_value(err) {

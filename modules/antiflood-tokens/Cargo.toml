@@ -5,8 +5,7 @@ members = ["components/token-generator", "contracts/token-allocation-record", "i
 bincode = { version = "1" }
 bs58 = "0.4"
 chrono = { version = "0.4.23", default-features = false, features = ["alloc", "serde"] }
-rsa = { version = "0.8.2", default-features = false, features = ["serde", "pem"] }
 locutus-stdlib = { version = "0.0.3", path = "../../crates/locutus-stdlib" }
-rand_chacha = { version = "0.3" }
+rsa = { version = "0.8.2", default-features = false, features = ["serde", "pem"] }
 serde = { version = "1" }
 serde_json = { version = "1" }

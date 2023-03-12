@@ -14,9 +14,9 @@ panic = 'abort'
 strip = true
 
 [workspace.dependencies]
-chacha20poly1305 = { version = "0.10" }
 chrono = "0.4"
 ed25519-dalek = { version = "1", features = ["serde"], default-features = false }
+rsa = { version = "0.8.2", default-features = false, features = ["serde", "pem"] }
 serde = "1"
 serde_json = "1"
 once_cell = "1"

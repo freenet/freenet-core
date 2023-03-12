@@ -1,16 +1,16 @@
-use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::ed25519::signature::SignerMut;
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxSettings as StoredSettings, Message as StoredMessage, UpdateInbox,
 };
 use locutus_aft_interface::{Tier, TokenAssignment};
 use locutus_stdlib::{
     client_api::ContractRequest,
-    prelude::{
-        ContractCode, ContractContainer, ContractKey, Parameters, RelatedContracts, State,
-        UpdateData, WasmAPIVersion, WrappedContract,
-    },
+    prelude::{ContractCode, ContractKey, Parameters, State, UpdateData},
+};
+use rand_chacha::rand_core::SeedableRng;
+use rsa::{
+    pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, PublicKey,
+    RsaPrivateKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,11 +21,9 @@ struct InternalSettings {
     /// or unique across sessions.
     next_msg_id: usize,
     minimum_tier: Tier,
-    /// Used with the nonce for encrypting private data only knowledgeable to the user,
-    encryption_key: (XChaCha20Poly1305, XNonce),
     /// Used for signing modifications to the state that are to be persisted.
     /// The public key must be the same as the one used for the inbox contract.
-    signing_keypair: ed25519_dalek::Keypair,
+    private_key: RsaPrivateKey,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,15 +33,13 @@ impl InternalSettings {
     fn from_stored(
         stored_settings: StoredSettings,
         next_id: usize,
-        encryption_key: (XChaCha20Poly1305, XNonce),
-        keypair: ed25519_dalek::Keypair,
+        private_key: RsaPrivateKey,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // let settings = cipher.decrypt(&nonce, stored_settings.private.as_ref())?;
         // let settings: StoredDecryptedSettings = serde_json::from_slice(&settings)?;
         Ok(Self {
             next_msg_id: next_id,
-            encryption_key,
-            signing_keypair: keypair,
+            private_key,
             minimum_tier: stored_settings.minimum_tier,
         })
     }
@@ -65,12 +61,14 @@ struct Message {
 }
 
 impl Message {
-    fn to_stored(
-        &self,
-        (cipher, nonce): &(XChaCha20Poly1305, XNonce),
-    ) -> Result<StoredMessage, Box<dyn std::error::Error>> {
-        let encrypted_content = serde_json::to_vec(&self.content)?;
-        let content = cipher.encrypt(nonce, encrypted_content.as_ref()).unwrap();
+    fn to_stored(&self, key: &RsaPrivateKey) -> Result<StoredMessage, Box<dyn std::error::Error>> {
+        // FIXME: use a real source of entropy
+        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let decrypted_content = serde_json::to_vec(&self.content)?;
+        let content = key
+            .to_public_key()
+            .encrypt(&mut rng, Pkcs1v15Encrypt, decrypted_content.as_ref())
+            .map_err(|e| format!("{e}"))?;
         Ok::<_, Box<dyn std::error::Error>>(StoredMessage {
             content,
             token_assignment: self.token_assignment.clone(),
@@ -97,14 +95,12 @@ pub(crate) struct InboxModel {
 
 impl InboxModel {
     fn new() -> Self {
-        let cipher = XChaCha20Poly1305::new(&[0u8; 32].into());
         Self {
             messages: vec![],
             settings: InternalSettings {
                 next_msg_id: 0,
                 minimum_tier: Tier::Hour1,
-                encryption_key: (cipher, [0u8; 24].into()),
-                signing_keypair: (ed25519_dalek::Keypair::from_bytes(&[1; 64]).unwrap()),
+                private_key: todo!(),
             },
             key: ContractKey::from((
                 Parameters::from([].as_slice()),
@@ -118,16 +114,15 @@ impl InboxModel {
         let messages = self
             .messages
             .iter()
-            .map(|m| m.to_stored(&self.settings.encryption_key))
+            .map(|m| m.to_stored(&self.settings.private_key))
             .collect::<Result<Vec<_>, _>>()?;
-        let inbox = StoredInbox::new(&self.settings.signing_keypair, settings, messages);
+        let inbox = StoredInbox::new(&self.settings.private_key, settings, messages);
         let serialized = serde_json::to_vec(&inbox)?;
         Ok(serialized.into())
     }
 
     fn from_state(
-        (cipher, nonce): (XChaCha20Poly1305, XNonce),
-        keypair: ed25519_dalek::Keypair,
+        private_key: rsa::RsaPrivateKey,
         state: StoredInbox,
         key: ContractKey,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -136,7 +131,9 @@ impl InboxModel {
             .iter()
             .enumerate()
             .map(|(id, msg)| {
-                let decrypted_content = cipher.decrypt(&nonce, msg.content.as_ref())?;
+                let decrypted_content = private_key
+                    .decrypt(Pkcs1v15Encrypt, msg.content.as_ref())
+                    .map_err(|e| format!("{e}"))?;
                 let content: DecryptedMessage = serde_json::from_slice(&decrypted_content)?;
                 Ok(Message {
                     id,
@@ -146,12 +143,7 @@ impl InboxModel {
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         Ok(Self {
-            settings: InternalSettings::from_stored(
-                state.settings,
-                messages.len(),
-                (cipher, nonce),
-                keypair,
-            )?,
+            settings: InternalSettings::from_stored(state.settings, messages.len(), private_key)?,
             key,
             messages,
         })
@@ -197,7 +189,8 @@ impl InboxModel {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let settings = self.settings.to_stored()?;
         let serialized = serde_json::to_vec(&settings)?;
-        let signature = self.settings.signing_keypair.sign(&serialized);
+        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
+        let signature = signing_key.sign(&serialized).into();
         let delta = UpdateInbox::ModifySettings {
             signature,
             settings,
@@ -210,6 +203,7 @@ impl InboxModel {
         Ok(())
     }
 
+    #[cfg(target_family = "wasm")]
     async fn remove_messages_from_store(
         &mut self,
         client: &mut WebApi,
@@ -222,7 +216,8 @@ impl InboxModel {
             signed.extend(h);
             ids.push(*h);
         }
-        let signature = self.settings.signing_keypair.sign(&signed);
+        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
+        let signature = signing_key.sign(&signed).into();
         let delta = UpdateInbox::RemoveMessages { signature, ids };
         let request = ContractRequest::Update {
             key: self.key.clone(),
@@ -242,9 +237,10 @@ impl InboxModel {
         for m in &self.messages {
             let h = &m.token_assignment.assignment_hash;
             signed.extend(h);
-            messages.push(m.to_stored(&self.settings.encryption_key)?);
+            messages.push(m.to_stored(&self.settings.private_key)?);
         }
-        let signature = self.settings.signing_keypair.sign(&signed);
+        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
+        let signature = signing_key.sign(&signed).into();
         let delta = UpdateInbox::AddMessages {
             signature,
             messages,
@@ -257,9 +253,10 @@ impl InboxModel {
         Ok(())
     }
 
+    #[cfg(target_family = "wasm")]
     pub(crate) async fn get_inbox(
         client: &mut WebApi,
-        keypair: &ed25519_dalek::Keypair,
+        private_key: &RsaPrivateKey,
         key: ContractKey,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let request = ContractRequest::Get {
@@ -297,15 +294,20 @@ mod tests {
     use std::str::FromStr;
 
     use locutus_stdlib::prelude::ContractInstanceId;
+    use rsa::RsaPublicKey;
 
     use super::*;
 
     fn test_assignment() -> TokenAssignment {
+        const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
+        let assignee =
+            <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
+                .unwrap();
         TokenAssignment {
             tier: Tier::Day1,
             time_slot: Default::default(),
-            assignee: ed25519_dalek::PublicKey::from_bytes(&[0; 32]).unwrap(),
-            signature: ed25519_dalek::Signature::from([1; 64]),
+            assignee,
+            signature: rsa::pkcs1v15::Signature::from(vec![1; 64].into_boxed_slice()),
             assignment_hash: [0; 32],
             token_record: ContractInstanceId::from_str(
                 "7MxRGrYiBBK2rHCVpP25SxqBLco2h4zpb2szsTS7XXgg",

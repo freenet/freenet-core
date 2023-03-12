@@ -8,7 +8,6 @@ bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
 locutus-stdlib = { workspace = true }
-rand_chacha = { workspace = true }
 rsa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +20,7 @@ once_cell = "1"
 chacha20poly1305 = "0.10"
 # FIXME: addign rand here pulls rand for transitive deps and gets included in the final wasm32 bin
 rand = { version = "0.8", features = ["std"] }
+rand_chacha = { workspace = true }
 locutus-stdlib = { workspace = true, features = ["testing"] }
 locutus-runtime = { path = "../../../../crates/locutus-runtime", version = "0.0.3" }
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
