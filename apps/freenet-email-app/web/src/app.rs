@@ -6,18 +6,20 @@ use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 
+use crate::inbox::MessageModel;
+
 mod login;
 
 #[cfg(target_family = "wasm")]
 thread_local! {
-    static CONNECTION: Lazy<RefCell<crate::WebApi>> = Lazy::new(|| {
+    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
         let api = crate::WebApi::new()
             .map_err(|err| {
                 web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
                 err
             })
             .expect("open connection");
-        RefCell::new(api)
+        Rc::new(RefCell::new(api))
     })
 }
 
@@ -36,13 +38,27 @@ impl Inbox {
     }
 
     #[cfg(target_family = "wasm")]
-    fn load_messages(&self, id: &Identity, private_key: &rsa::RsaPrivateKey) {
+    fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
         use crate::inbox::InboxModel;
 
         CONNECTION.with(|c| {
-            let client = &mut *(**c).borrow_mut();
-            InboxModel::get_inbox(client, private_key, self.contract.clone());
-        });
+            let private_key = private_key.clone();
+            let contract = self.contract.clone();
+            let client = (**c).clone();
+            let f = use_future(cx, (), |_| async move {
+                let client = &mut *client.borrow_mut();
+                InboxModel::get_inbox(client, &private_key, contract).await
+            });
+            let inbox = loop {
+                match f.value() {
+                    Some(v) => break v.as_ref().unwrap(),
+                    None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                }
+            };
+            let messages = &mut *self.messages.borrow_mut();
+            messages.clear();
+            messages.extend(inbox.messages.iter().map(|m| m.clone().into()));
+        })
     }
 
     #[cfg(all(feature = "ui-testing", not(target_family = "wasm")))]
@@ -143,10 +159,22 @@ struct Identity {
 #[derive(Debug, Clone, Eq, Props)]
 struct Message {
     id: u64,
-    sender: Cow<'static, str>,
+    from: Cow<'static, str>,
     title: Cow<'static, str>,
     content: Cow<'static, str>,
     read: bool,
+}
+
+impl From<MessageModel> for Message {
+    fn from(value: MessageModel) -> Self {
+        Message {
+            id: value.id,
+            from: value.content.from.into(),
+            title: value.content.title.into(),
+            content: value.content.content.into(),
+            read: false,
+        }
+    }
 }
 
 impl PartialEq for Message {
@@ -177,7 +205,7 @@ pub(crate) fn App(cx: Scope) -> Element {
     let user = user.read();
     if let Some(id) = user.logged_id() {
         let inbox = use_context::<Inbox>(cx).unwrap();
-        inbox.load_messages(id, user.keypair.as_ref().unwrap());
+        inbox.load_messages(cx, id, user.keypair.as_ref().unwrap());
         cx.render(rsx! {
            UserInbox {}
         })
@@ -324,7 +352,7 @@ fn InboxComponent(cx: Scope) -> Element {
         cx.render(rsx! {
             OpenMessage {
                 id: email.id,
-                sender: email.sender.clone(),
+                from: email.from.clone(),
                 title: email.title.clone(),
                 content: email.content.clone(),
                 read: email.read,
@@ -337,7 +365,7 @@ fn InboxComponent(cx: Scope) -> Element {
     } else {
         let links = emails.iter().map(|email| {
             rsx!(EmailLink {
-                sender: email.sender.clone(),
+                sender: email.from.clone(),
                 title: email.title.clone()
                 read: email.read,
                 id: email.id,

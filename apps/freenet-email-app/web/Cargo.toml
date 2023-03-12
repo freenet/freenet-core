@@ -20,7 +20,6 @@ once_cell = { workspace = true }
 rsa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = "1.26"
 
 freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 

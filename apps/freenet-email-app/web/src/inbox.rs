@@ -19,7 +19,7 @@ use crate::WebApi;
 struct InternalSettings {
     /// This id is used for internal handling of the inbox and is not persistent
     /// or unique across sessions.
-    next_msg_id: usize,
+    next_msg_id: u64,
     minimum_tier: Tier,
     /// Used for signing modifications to the state that are to be persisted.
     /// The public key must be the same as the one used for the inbox contract.
@@ -32,7 +32,7 @@ struct StoredDecryptedSettings {}
 impl InternalSettings {
     fn from_stored(
         stored_settings: StoredSettings,
-        next_id: usize,
+        next_id: u64,
         private_key: RsaPrivateKey,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // let settings = cipher.decrypt(&nonce, stored_settings.private.as_ref())?;
@@ -53,14 +53,14 @@ impl InternalSettings {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Message {
-    id: usize,
-    content: DecryptedMessage,
-    token_assignment: TokenAssignment,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct MessageModel {
+    pub id: u64,
+    pub content: DecryptedMessage,
+    pub token_assignment: TokenAssignment,
 }
 
-impl Message {
+impl MessageModel {
     fn to_stored(&self, key: &RsaPrivateKey) -> Result<StoredMessage, Box<dyn std::error::Error>> {
         // FIXME: use a real source of entropy
         let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
@@ -76,11 +76,11 @@ impl Message {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
-struct DecryptedMessage {
-    title: String,
-    content: String,
-    from: String,
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub(crate) struct DecryptedMessage {
+    pub title: String,
+    pub content: String,
+    pub from: String,
     to: Vec<String>,
     cc: Vec<String>,
     time: DateTime<Utc>,
@@ -88,7 +88,7 @@ struct DecryptedMessage {
 
 /// Inbox state
 pub(crate) struct InboxModel {
-    messages: Vec<Message>,
+    pub messages: Vec<MessageModel>,
     settings: InternalSettings,
     key: ContractKey,
 }
@@ -135,15 +135,19 @@ impl InboxModel {
                     .decrypt(Pkcs1v15Encrypt, msg.content.as_ref())
                     .map_err(|e| format!("{e}"))?;
                 let content: DecryptedMessage = serde_json::from_slice(&decrypted_content)?;
-                Ok(Message {
-                    id,
+                Ok(MessageModel {
+                    id: id as u64,
                     content,
                     token_assignment: msg.token_assignment.clone(),
                 })
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         Ok(Self {
-            settings: InternalSettings::from_stored(state.settings, messages.len(), private_key)?,
+            settings: InternalSettings::from_stored(
+                state.settings,
+                messages.len() as u64,
+                private_key,
+            )?,
             key,
             messages,
         })
@@ -155,7 +159,7 @@ impl InboxModel {
         content: DecryptedMessage,
         token_assignment: TokenAssignment,
     ) {
-        self.messages.push(Message {
+        self.messages.push(MessageModel {
             id: self.settings.next_msg_id,
             content,
             token_assignment,
@@ -164,7 +168,7 @@ impl InboxModel {
     }
 
     /// This only affects in-memory messages, changes are not persisted.
-    fn remove_received_message(&mut self, id: usize) {
+    fn remove_received_message(&mut self, id: u64) {
         if let Ok(p) = self.messages.binary_search_by_key(&id, |a| a.id) {
             self.messages.remove(p);
         }
@@ -320,7 +324,7 @@ mod tests {
     fn remove_msg() {
         let mut inbox = InboxModel::new();
         for id in 0..10000 {
-            inbox.messages.push(Message {
+            inbox.messages.push(MessageModel {
                 id,
                 content: DecryptedMessage::default(),
                 token_assignment: test_assignment(),
