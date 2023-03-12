@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SubsecRound, Timelike, Utc};
-use ed25519_dalek::{PublicKey, Signature};
 use locutus_stdlib::prelude::*;
+use rsa::{pkcs1v15::Signature, RsaPublicKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::Display;
 
-type Assignment = ed25519_dalek::PublicKey;
+type Assignment = RsaPublicKey;
 
 /// Contracts making use of the allocation must implement a type with this trait that allows
 /// extracting the criteria for the given contract.
@@ -350,7 +350,7 @@ mod tier_tests {
 #[non_exhaustive]
 #[derive(Serialize, Deserialize)]
 pub struct TokenParameters {
-    pub generator_public_key: PublicKey,
+    pub generator_public_key: RsaPublicKey,
 }
 
 impl TryFrom<Parameters<'_>> for TokenParameters {
@@ -444,9 +444,9 @@ impl TokenAllocationRecord {
     }
 
     pub fn new(mut tokens: HashMap<Tier, Vec<TokenAssignment>>) -> Self {
-        for (_, assignments) in &mut tokens {
+        tokens.iter_mut().for_each(|(_, assignments)| {
             assignments.sort_unstable();
-        }
+        });
         Self {
             tokens_by_tier: tokens,
         }
@@ -579,6 +579,7 @@ pub struct TokenAssignment {
     /// The assignment, the recipient decides whether this assignment is valid based on this field.
     /// This will often be a public key.
     pub assignee: Assignment,
+    #[serde(with = "token_sig_ser")]
     /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
     pub signature: Signature,
     /// A Blake2s256 hash of the message.
@@ -587,10 +588,31 @@ pub struct TokenAssignment {
     pub token_record: ContractInstanceId, // TODO: include this in the TokenAssignment itself
 }
 
+mod token_sig_ser {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn deserialize<'de, D>(deser: D) -> Result<Signature, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let d = <Box<[u8]> as Deserialize>::deserialize(deser)?;
+        Ok(d.into())
+    }
+
+    pub fn serialize<S>(sig: &Signature, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s: Box<[u8]> = sig.clone().into();
+        s.serialize(ser)
+    }
+}
+
 impl TokenAssignment {
     const TIER_SIZE: usize = std::mem::size_of::<Tier>();
     const TS_SIZE: usize = std::mem::size_of::<i64>();
-    const ASSIGNEE_SIZE: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
+    const ASSIGNEE_SIZE: usize = rsa::RsaPublicKey::MAX_SIZE;
 
     pub const SIGNED_MSG_SIZE: usize = Self::TIER_SIZE + Self::TS_SIZE + Self::ASSIGNEE_SIZE;
 
@@ -607,7 +629,8 @@ impl TokenAssignment {
         let timestamp = issue_time.timestamp();
         to_be_signed[cursor..cursor + Self::TS_SIZE].copy_from_slice(&timestamp.to_le_bytes());
         cursor += Self::TS_SIZE;
-        to_be_signed[cursor..].copy_from_slice(assigned_to.as_bytes());
+        let key = bincode::serialize(&assigned_to).unwrap();
+        to_be_signed[cursor..].copy_from_slice(&key);
 
         to_be_signed
     }
@@ -623,9 +646,11 @@ impl TokenAssignment {
 
 #[test]
 fn to_be_signed_test() {
+    const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
     let _to_be_signed = TokenAssignment::to_be_signed(
         &get_date(2021, 7, 28),
-        &ed25519_dalek::PublicKey::from_bytes(&[1; ed25519_dalek::PUBLIC_KEY_LENGTH]).unwrap(),
+        &<RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
+            .unwrap(),
         Tier::Day90,
     );
     // dbg!(_to_be_signed);
@@ -655,12 +680,12 @@ impl TryFrom<StateDelta<'_>> for TokenAssignment {
 
 impl Display for TokenAssignment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let assignee = bs58::encode(&self.assignee).into_string();
         write!(
             f,
-            "{{ {tier} @ {slot} for {assignee}}}",
+            "{{ {tier} @ {slot} for {assignee:?}}}",
             tier = self.tier,
             slot = self.time_slot,
+            assignee = self.assignee
         )
     }
 }

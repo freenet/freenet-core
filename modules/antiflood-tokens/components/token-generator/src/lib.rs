@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use ed25519_dalek::{Keypair, Signer};
 use locutus_aft_interface::{AllocationCriteria, TokenAllocationRecord, TokenAssignment};
 use locutus_stdlib::{prelude::*, time};
+use rand_chacha::{rand_core::SeedableRng, ChaChaRng};
+use rsa::{
+    pkcs1v15::SigningKey, pkcs8::EncodePublicKey, sha2::Sha256, RsaPrivateKey, RsaPublicKey,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod tests;
 
-type Assignee = ed25519_dalek::PublicKey;
+type Assignee = RsaPublicKey;
 
 type AssignmentHash = [u8; 32];
 
@@ -67,7 +70,7 @@ impl ComponentInterface for TokenComponent {
                 let secret = value.ok_or_else(|| {
                     ComponentError::Other(format!("secret not found for key: {key}"))
                 })?;
-                let keypair = Keypair::from_bytes(&secret)
+                let keypair: RsaPrivateKey = bincode::deserialize(&secret)
                     .map_err(|err| ComponentError::Deser(format!("{err}")))?;
                 context.key_pair = Some(keypair);
                 let context: ComponentContext = (&context).try_into()?;
@@ -83,7 +86,9 @@ impl ComponentInterface for TokenComponent {
 const RESPONSES: &[&str] = &["true", "false"];
 
 fn user_input(criteria: &AllocationCriteria, assignee: &Assignee) -> NotificationMessage<'static> {
-    let assignee = bs58::encode(assignee).into_string();
+    let assignee = assignee
+        .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+        .unwrap();
     let notification_json = serde_json::json!({
         "user": assignee,
         "token": {
@@ -263,7 +268,7 @@ struct Context {
     waiting_for_user_input: HashSet<u32>,
     user_response: HashMap<u32, Response>,
     /// The token generator instance key pair (pub + secret key).
-    key_pair: Option<Keypair>,
+    key_pair: Option<rsa::RsaPrivateKey>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -306,7 +311,7 @@ trait TokenAssignmentInternal {
         &mut self,
         assignee: Assignee,
         criteria: &AllocationCriteria,
-        private_key: &Keypair,
+        private_key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment>;
 
@@ -327,14 +332,18 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         &mut self,
         assignee: Assignee,
         criteria: &AllocationCriteria,
-        keys: &Keypair,
+        key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
+        use rsa::signature::RandomizedSigner;
         let current = time::now();
         let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
             let msg = TokenAssignment::to_be_signed(&time_slot, &assignee, criteria.frequency);
-            let signature = keys.sign(&msg);
+            let signing_key = SigningKey::<Sha256>::new_with_prefix(key.clone());
+            // FIXME: must change fopr a random seed from locutus_stdlib::rand::* ; just a quick workaround
+            let mut rng = ChaChaRng::seed_from_u64(1);
+            let signature = signing_key.sign_with_rng(&mut rng, &msg);
             TokenAssignment {
                 tier: criteria.frequency,
                 time_slot,

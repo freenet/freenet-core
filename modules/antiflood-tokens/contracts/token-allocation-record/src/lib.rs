@@ -1,9 +1,9 @@
-use ed25519_dalek::Verifier;
 use locutus_aft_interface::{
     AllocationError, TokenAllocationRecord, TokenAllocationSummary, TokenAssignment,
     TokenParameters,
 };
 use locutus_stdlib::prelude::*;
+use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256};
 
 struct TokenAllocContract;
 
@@ -114,15 +114,13 @@ trait TokenAssignmentExt {
 
 impl TokenAssignmentExt for TokenAssignment {
     fn is_valid(&self, params: &TokenParameters) -> bool {
+        use rsa::signature::Verifier;
         if !self.tier.is_valid_slot(self.time_slot) {
             return false;
         }
         let msg = TokenAssignment::to_be_signed(&self.time_slot, &self.assignee, self.tier);
-        if params
-            .generator_public_key
-            .verify(&msg, &self.signature)
-            .is_err()
-        {
+        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
+        if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator
             return false;
         }

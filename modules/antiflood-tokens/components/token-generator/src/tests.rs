@@ -3,9 +3,9 @@ use super::*;
 mod token_assignment {
     use super::*;
     use chrono::{NaiveDate, Timelike};
-    use ed25519_dalek::{PublicKey, Signature};
     use locutus_aft_interface::Tier;
     use once_cell::sync::Lazy;
+    use rsa::{pkcs1v15::Signature, RsaPublicKey};
 
     fn get_assignment_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         let naive = NaiveDate::from_ymd_opt(y, m, d)
@@ -18,8 +18,10 @@ mod token_assignment {
     const TEST_TIER: Tier = Tier::Day1;
     const MAX_DURATION_1Y: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
-    static PK: Lazy<PublicKey> =
-        Lazy::new(|| PublicKey::from_bytes(&[1; ed25519_dalek::PUBLIC_KEY_LENGTH]).unwrap());
+    const RSA_4096_PUB_PEM: &str = include_str!("../../../interfaces/examples/rsa4096-pub.pem");
+    static PK: Lazy<RsaPublicKey> = Lazy::new(|| {
+        <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM).unwrap()
+    });
 
     static ID: Lazy<ContractInstanceId> = Lazy::new(|| {
         let rnd = [1; 32];
@@ -34,8 +36,8 @@ mod token_assignment {
             vec![TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: get_assignment_date(2023, 1, 25),
-                assignee: *PK,
-                signature: Signature::from([1; 64]),
+                assignee: PK.clone(),
+                signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                 assignment_hash: [0; 32],
                 token_record: *ID,
             }],
@@ -55,16 +57,16 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2023, 1, 26),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
@@ -85,16 +87,16 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 29),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
@@ -112,24 +114,24 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 28),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 30),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
@@ -158,8 +160,6 @@ mod integration_test {
         aead::{AeadCore, KeyInit, OsRng},
         XChaCha20Poly1305,
     };
-    use ed25519_dalek::Keypair;
-    use ed25519_dalek::PublicKey;
     use locutus_aft_interface::{AllocationCriteria, Tier, TokenAllocationRecord};
     use locutus_runtime::{
         ApplicationMessage, ComponentRuntimeInterface, ComponentStore, ContractContainer,
@@ -167,7 +167,8 @@ mod integration_test {
         SecretsStore, WasmAPIVersion,
     };
     use locutus_stdlib::prelude::{Component, ContractCode, WrappedContract};
-    use rand::rngs as rng;
+    use rand_chacha::rand_core::SeedableRng;
+    use rsa::RsaPrivateKey;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::AtomicUsize;
@@ -224,7 +225,7 @@ mod integration_test {
     }
 
     fn set_up_aft<'a>(
-        key_pair: &Keypair,
+        key_pair: &RsaPrivateKey,
         contract_name: &str,
         component_name: &str,
     ) -> Result<(Component<'a>, SecretsId, ContractKey, Runtime), Box<dyn std::error::Error>> {
@@ -232,7 +233,7 @@ mod integration_test {
 
         // Setup contract
         let contracts_dir = test_dir("contract");
-        let mut contract_store = ContractStore::new(contracts_dir.clone(), 10_000)?;
+        let mut contract_store = ContractStore::new(contracts_dir, 10_000)?;
         let contract_bytes = WrappedContract::new(
             Arc::new(ContractCode::from(get_test_module(
                 "contracts",
@@ -264,12 +265,9 @@ mod integration_test {
 
         // Store secret token
         let secret_id = SecretsId::new(vec![0, 1, 2]);
+        let encoded = bincode::serialize(&key_pair.to_public_key()).unwrap();
         secret_store
-            .store_secret(
-                &component.key().clone(),
-                &secret_id,
-                key_pair.public.as_bytes().to_vec(),
-            )
+            .store_secret(&component.key().clone(), &secret_id, encoded)
             .unwrap();
 
         let runtime = Runtime::build(contract_store, component_store, secret_store, false).unwrap();
@@ -280,16 +278,16 @@ mod integration_test {
 
     #[test]
     fn test_process_allocated_token() {
-        let mut csprng = rng::OsRng {};
-        let key_pair = Keypair::generate(&mut csprng);
+        let mut csprng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let private_key = RsaPrivateKey::new(&mut csprng, 8).unwrap();
 
         let (component, secret_id, contract_key, mut runtime) =
-            set_up_aft(&key_pair, "token-allocation-record", "token-generator").unwrap();
+            set_up_aft(&private_key, "token-allocation-record", "token-generator").unwrap();
         let app = ContractInstanceId::try_from(contract_key.to_string()).unwrap();
         let criteria = AllocationCriteria::new(
             Tier::Day1,
             std::time::Duration::from_secs(365 * 24 * 3600),
-            app.clone(),
+            app,
         )
         .unwrap();
 
@@ -298,7 +296,7 @@ mod integration_test {
             component_id: secret_id,
             criteria,
             records: TokenAllocationRecord::new(std::collections::HashMap::new()),
-            assignee: PublicKey::from_bytes(key_pair.public.as_bytes().as_slice()).unwrap(),
+            assignee: private_key.to_public_key(),
             assignment_hash: [0; 32],
         };
 
@@ -310,6 +308,5 @@ mod integration_test {
         let _outbound = runtime
             .inbound_app_message(component.key(), vec![inbound_message])
             .unwrap();
-        assert!(true)
     }
 }

@@ -23,7 +23,10 @@ pub(crate) mod time {
 
     pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
         let utc_now = Function::new_typed(store, utc_now);
-        imports.register_namespace("locutus_time", [("utc_now".to_owned(), utc_now.into())]);
+        imports.register_namespace(
+            "locutus_time",
+            [("__loc__time__utc_now".to_owned(), utc_now.into())],
+        );
     }
 
     fn utc_now(id: i64, ptr: i64) {

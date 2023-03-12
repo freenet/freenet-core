@@ -8,7 +8,12 @@ bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
 locutus-stdlib = { workspace = true }
-ed25519-dalek = { workspace = true }
+rsa = { workspace = true }
 serde = { workspace = true }
 strum = { version = "0.24", features = ["derive"] }
 thiserror = "1"
+
+[dev-dependencies]
+hex-literal = "0.3.4"
+# FIXME: addign rand here pulls rand for transitive deps and gets included in the final wasm32 bin
+rand = "*"

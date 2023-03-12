@@ -7,7 +7,7 @@ edition = "2021"
 bincode = { workspace = true }
 chrono = { workspace = true }
 locutus-stdlib = { workspace = true }
-ed25519-dalek = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true }
 
 locutus-aft-interface = { path = "../../interfaces" }
