@@ -56,6 +56,12 @@ impl ContractContainer {
             Self::Wasm(WasmAPIVersion::V1(contract_v1)) => contract_v1.clone().try_into().unwrap(),
         }
     }
+
+    pub fn unwrap_v1(self) -> WrappedContract {
+        match self {
+            Self::Wasm(WasmAPIVersion::V1(contract_v1)) => contract_v1,
+        }
+    }
 }
 
 impl Display for ContractContainer {

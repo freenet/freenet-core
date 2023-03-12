@@ -35,8 +35,6 @@ impl InternalSettings {
         next_id: u64,
         private_key: RsaPrivateKey,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // let settings = cipher.decrypt(&nonce, stored_settings.private.as_ref())?;
-        // let settings: StoredDecryptedSettings = serde_json::from_slice(&settings)?;
         Ok(Self {
             next_msg_id: next_id,
             private_key,
@@ -45,7 +43,6 @@ impl InternalSettings {
     }
 
     fn to_stored(&self) -> Result<StoredSettings, Box<dyn std::error::Error>> {
-        // let private = serde_json::to_vec(&StoredDecryptedSettings {})?;
         Ok(StoredSettings {
             minimum_tier: self.minimum_tier,
             private: vec![],
@@ -263,17 +260,20 @@ impl InboxModel {
         private_key: &RsaPrivateKey,
         key: ContractKey,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        use locutus_stdlib::client_api::{ContractResponse, HostResponse};
         let request = ContractRequest::Get {
             key,
             fetch_contract: false,
         };
         client.send(request.into()).await?;
-        todo!()
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn create_inbox() -> Self {
-        InboxModel::new()
+        match client.recv().await? {
+            HostResponse::ContractResponse(ContractResponse::GetResponse { contract, state }) => {
+                let Some(c) = contract else { panic!() };
+                let state: StoredInbox = serde_json::from_slice(state.as_ref())?;
+                Self::from_state(private_key.clone(), state, c.key())
+            }
+            _ => panic!(),
+        }
     }
 
     #[cfg(not(debug_assertions))]

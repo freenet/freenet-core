@@ -1297,13 +1297,13 @@ pub struct WrappedContract {
         serialize_with = "WrappedContract::ser_contract_data",
         deserialize_with = "WrappedContract::deser_contract_data"
     )]
-    pub data: Arc<ContractCode<'static>>,
+    data: Arc<ContractCode<'static>>,
     #[serde(
         serialize_with = "WrappedContract::ser_params",
         deserialize_with = "WrappedContract::deser_params"
     )]
-    pub params: Parameters<'static>,
-    pub key: ContractKey,
+    params: Parameters<'static>,
+    key: ContractKey,
 }
 
 impl PartialEq for WrappedContract {

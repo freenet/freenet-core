@@ -2,7 +2,6 @@
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use dioxus::prelude::*;
-use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 
@@ -25,29 +24,44 @@ thread_local! {
 
 #[derive(Debug, Clone)]
 struct Inbox {
-    contract: ContractKey,
+    contracts: Vec<Identity>,
     messages: Rc<RefCell<Vec<Message>>>,
 }
 
 impl Inbox {
-    fn new(contract: ContractKey) -> Self {
+    fn new(contracts: Vec<Identity>) -> Self {
         Self {
-            contract,
+            contracts,
             messages: Rc::new(RefCell::new(vec![])),
         }
     }
 
     #[cfg(target_family = "wasm")]
+    fn send_message(&self, to: &str, title: &str, content: &str) {
+        use crate::inbox::InboxModel;
+        CONNECTION.with(|conn| {
+            // todo: neer to keep  copy of the InboxModel, add messages there, and update messages not send
+            todo!()
+        })
+    }
+
+    #[cfg(target_family = "wasm")]
     fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
         use crate::inbox::InboxModel;
-
-        CONNECTION.with(|c| {
+        CONNECTION.with(|conn| {
             let private_key = private_key.clone();
-            let contract = self.contract.clone();
-            let client = (**c).clone();
+            let key = self
+                .contracts
+                .iter()
+                .find(|c| c.id == id.id)
+                .unwrap()
+                .pub_key
+                .clone();
+            let contract_key = todo!("get the id, from the code + params");
+            let client = (**conn).clone();
             let f = use_future(cx, (), |_| async move {
                 let client = &mut *client.borrow_mut();
-                InboxModel::get_inbox(client, &private_key, contract).await
+                InboxModel::get_inbox(client, &private_key, contract_key).await
             });
             let inbox = loop {
                 match f.value() {
@@ -122,7 +136,7 @@ struct User {
 impl User {
     #[cfg(feature = "ui-testing")]
     fn new() -> Self {
-        use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
+        use rsa::pkcs1::DecodeRsaPrivateKey;
 
         const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
         const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
@@ -153,7 +167,7 @@ impl User {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Identity {
     id: usize,
     pub_key: RsaPublicKey,
@@ -199,10 +213,10 @@ impl Ord for Message {
 }
 
 pub(crate) fn App(cx: Scope) -> Element {
-    // TODO: get this from the code + params through the API
-    let contract = ContractKey::from_id("7i4DAmvgk3E3L7XF1SZrpGEHAq7rPZmNaJNeUqz4yKTu").unwrap();
+    // TODO: for the test, we add the hardcoded 2 contracts to this vector
+    let contracts = vec![];
     use_shared_state_provider(cx, User::new);
-    use_context_provider(cx, || Inbox::new(contract));
+    use_context_provider(cx, || Inbox::new(contracts));
 
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();
@@ -442,6 +456,10 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
 }
 
 fn NewMessageWindow(cx: Scope) -> Element {
+    let inbox = use_context::<Inbox>(cx).unwrap();
+    let to = use_state(cx, String::new);
+    let title = use_state(cx, String::new);
+    let content = use_state(cx, String::new);
     cx.render(rsx! {
         div {
             class: "column mt-3",
@@ -468,10 +486,23 @@ fn NewMessageWindow(cx: Scope) -> Element {
             }
             div {
                 class: "box",
-                div { contenteditable: true, br {} }
+                div {
+                    contenteditable: true,
+                    oninput: move |ev| { content.set(ev.value.clone()); },
+                    br {}
+                }
             }
             div {
-                button { class: "button is-info is-outlined", "Send" }
+                button {
+                    class: "button is-info is-outlined",
+                    onclick: move |_| {
+                        #[cfg(target_family = "wasm")]
+                        {
+                            inbox.send_message(to.get(), title.get(), content.get());
+                        }
+                    },
+                    "Send"
+                }
             }
         }
     })
