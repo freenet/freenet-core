@@ -289,6 +289,7 @@ fn can_update_settings(
     Ok(())
 }
 
+#[cfg(feature = "contract")]
 #[contract]
 impl ContractInterface for Inbox {
     fn validate_state(

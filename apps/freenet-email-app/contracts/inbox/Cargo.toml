@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 chrono = { version = "0.4.23", default-features = false, features = ["alloc", "serde"] }
-locutus-stdlib = { path = "../../../../crates/locutus-stdlib", features = ["time"] }
+locutus-stdlib = { path = "../../../../crates/locutus-stdlib" }
 rsa = { version = "0.8.2", default-features = false, features = ["serde", "pem", "sha2"] }
 locutus-aft-interface = { path = "../../../../modules/antiflood-tokens/interfaces" }
 serde = "1"
@@ -19,4 +19,5 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+contract = []
 wasmbind = ["chrono/wasmbind"]
