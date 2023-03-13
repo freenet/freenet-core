@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 use once_cell::unsync::Lazy;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 
-use crate::inbox::MessageModel;
+use crate::inbox::{InboxModel, MessageModel};
 
 mod login;
 
@@ -26,11 +26,32 @@ thread_local! {
 struct Inbox {
     contracts: Vec<Identity>,
     messages: Rc<RefCell<Vec<Message>>>,
+    models: Vec<InboxModel>,
 }
 
 impl Inbox {
-    fn new(contracts: Vec<Identity>) -> Self {
+    fn new(cx: Scope, contracts: Vec<Identity>, private_key: &rsa::RsaPrivateKey) -> Self {
+        let models = Vec::with_capacity(contracts.len());
+        for contract in &contracts {
+            let model = CONNECTION.with(|conn| {
+                let key = &contract.pub_key;
+                let contract_key = todo!("get the id, from the code + params");
+                let client = (**conn).clone();
+                let f = use_future(cx, (), |_| async move {
+                    let client = &mut *client.borrow_mut();
+                    InboxModel::get_inbox(client, private_key, contract_key).await
+                });
+                let inbox = loop {
+                    match f.value() {
+                        Some(v) => break v.as_ref().unwrap(),
+                        None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                    }
+                };
+                inbox.clone()
+            });
+        }
         Self {
+            models,
             contracts,
             messages: Rc::new(RefCell::new(vec![])),
         }
@@ -38,16 +59,11 @@ impl Inbox {
 
     #[cfg(target_family = "wasm")]
     fn send_message(&self, to: &str, title: &str, content: &str) {
-        use crate::inbox::InboxModel;
-        CONNECTION.with(|conn| {
-            // todo: neer to keep  copy of the InboxModel, add messages there, and update messages not send
-            todo!()
-        })
+        todo!()
     }
 
     #[cfg(target_family = "wasm")]
     fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
-        use crate::inbox::InboxModel;
         CONNECTION.with(|conn| {
             let private_key = private_key.clone();
             let key = self
@@ -216,7 +232,10 @@ pub(crate) fn App(cx: Scope) -> Element {
     // TODO: for the test, we add the hardcoded 2 contracts to this vector
     let contracts = vec![];
     use_shared_state_provider(cx, User::new);
-    use_context_provider(cx, || Inbox::new(contracts));
+    use_context_provider(cx, || {
+        let private_key = todo!();
+        Inbox::new(cx, contracts, &private_key)
+    });
 
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();

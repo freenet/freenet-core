@@ -15,9 +15,17 @@ use serde::{Deserialize, Serialize};
 const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
 
 #[derive(Serialize, Deserialize)]
-struct InboxParams {
+pub struct InboxParams {
     // The public key of the inbox owner message.
-    pub_key: RsaPublicKey,
+    pub pub_key: RsaPublicKey,
+}
+
+impl TryFrom<InboxParams> for Parameters<'_> {
+    type Error = serde_json::Error;
+
+    fn try_from(value: InboxParams) -> Result<Self, Self::Error> {
+        serde_json::to_vec(&value).map(Into::into)
+    }
 }
 
 impl TryFrom<Parameters<'static>> for InboxParams {

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use freenet_email_inbox::{
-    Inbox as StoredInbox, InboxSettings as StoredSettings, Message as StoredMessage, UpdateInbox,
+    Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
+    UpdateInbox,
 };
 use locutus_aft_interface::{Tier, TokenAssignment};
 use locutus_stdlib::{
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::WebApi;
 
+#[derive(Debug, Clone)]
 struct InternalSettings {
     /// This id is used for internal handling of the inbox and is not persistent
     /// or unique across sessions.
@@ -84,6 +86,7 @@ pub(crate) struct DecryptedMessage {
 }
 
 /// Inbox state
+#[derive(Debug, Clone)]
 pub(crate) struct InboxModel {
     pub messages: Vec<MessageModel>,
     settings: InternalSettings,
@@ -91,19 +94,19 @@ pub(crate) struct InboxModel {
 }
 
 impl InboxModel {
-    fn new() -> Self {
-        Self {
+    fn new(private_key: RsaPrivateKey) -> Result<Self, Box<dyn std::error::Error>> {
+        let params = InboxParams {
+            pub_key: private_key.to_public_key(),
+        };
+        Ok(Self {
             messages: vec![],
             settings: InternalSettings {
                 next_msg_id: 0,
                 minimum_tier: Tier::Hour1,
-                private_key: todo!(),
+                private_key,
             },
-            key: ContractKey::from((
-                Parameters::from([].as_slice()),
-                ContractCode::from([].as_slice()),
-            )),
-        }
+            key: ContractKey::from((&params.try_into()?, ContractCode::from([].as_slice()))),
+        })
     }
 
     fn to_state(&self) -> Result<State<'static>, Box<dyn std::error::Error>> {
@@ -298,7 +301,7 @@ mod tests {
     use std::str::FromStr;
 
     use locutus_stdlib::prelude::ContractInstanceId;
-    use rsa::RsaPublicKey;
+    use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPublicKey};
 
     use super::*;
 
@@ -322,7 +325,9 @@ mod tests {
 
     #[test]
     fn remove_msg() {
-        let mut inbox = InboxModel::new();
+        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
+        let key = RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap();
+        let mut inbox = InboxModel::new(key).unwrap();
         for id in 0..10000 {
             inbox.messages.push(MessageModel {
                 id,
