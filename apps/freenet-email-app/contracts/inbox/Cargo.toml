@@ -7,12 +7,12 @@ resolver = "2"
 publish = false
 
 [dependencies]
-chrono = { workspace = true }
-locutus-stdlib = { workspace = true }
-locutus-aft-interface = { workspace = true }
-rsa = { workspace = true, features = ["sha2"] }
-serde = { workspace = true }
-serde_json = { workspace = true }
+chrono = { version = "0.4.23", default-features = false, features = ["alloc", "serde"] }
+locutus-stdlib = { path = "../../../../crates/locutus-stdlib" }
+rsa = { version = "0.8.2", default-features = false, features = ["serde", "pem", "sha2"] }
+locutus-aft-interface = { path = "../../../../modules/antiflood-tokens/interfaces" }
+serde = "1"
+serde_json = "1"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
