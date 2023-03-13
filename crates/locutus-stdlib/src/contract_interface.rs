@@ -1100,16 +1100,16 @@ impl ContractKey {
     /// Returns the decoded contract key from encoded hash of the contract key and the given
     /// parameters.
     pub fn decode(
-        contract_key: impl Into<String>,
+        code_hash: impl Into<String>,
         parameters: Parameters,
     ) -> Result<Self, bs58::decode::Error> {
-        let mut contract = [0; CONTRACT_KEY_SIZE];
-        bs58::decode(contract_key.into())
+        let mut code_key = [0; CONTRACT_KEY_SIZE];
+        bs58::decode(code_hash.into())
             .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut contract)?;
+            .into(&mut code_key)?;
 
         let mut hasher = Blake2s256::new();
-        hasher.update(contract);
+        hasher.update(code_key);
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
 
@@ -1117,7 +1117,7 @@ impl ContractKey {
         spec.copy_from_slice(&full_key_arr);
         Ok(Self {
             instance: ContractInstanceId(spec),
-            code: Some(contract),
+            code: Some(code_key),
         })
     }
 

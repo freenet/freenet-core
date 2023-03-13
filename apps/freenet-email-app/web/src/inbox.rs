@@ -207,7 +207,6 @@ impl InboxModel {
         Ok(())
     }
 
-    #[cfg(target_family = "wasm")]
     async fn remove_messages_from_store(
         &mut self,
         client: &mut WebApi,
@@ -257,7 +256,6 @@ impl InboxModel {
         Ok(())
     }
 
-    #[cfg(target_family = "wasm")]
     pub(crate) async fn get_inbox(
         client: &mut WebApi,
         private_key: &RsaPrivateKey,

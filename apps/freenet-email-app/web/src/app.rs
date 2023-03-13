@@ -2,14 +2,16 @@
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use dioxus::prelude::*;
+use freenet_email_inbox::InboxParams;
+use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::inbox::{InboxModel, MessageModel};
 
 mod login;
 
-#[cfg(target_family = "wasm")]
+#[cfg(feature = "node")]
 thread_local! {
     static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
         let api = crate::WebApi::new()
@@ -29,32 +31,49 @@ struct Inbox {
     models: Vec<InboxModel>,
 }
 
+// todo: in the build.rs we can generate this hash and use `include_str!(env!(BUILD_ENV_VAR))` to include it
+static INBOX_CODE_HASH: &str = "";
+
 impl Inbox {
-    fn new(cx: Scope, contracts: Vec<Identity>, private_key: &rsa::RsaPrivateKey) -> Self {
-        let models = Vec::with_capacity(contracts.len());
-        for contract in &contracts {
-            let model = CONNECTION.with(|conn| {
-                let key = &contract.pub_key;
-                let contract_key = todo!("get the id, from the code + params");
-                let client = (**conn).clone();
-                let f = use_future(cx, (), |_| async move {
-                    let client = &mut *client.borrow_mut();
-                    InboxModel::get_inbox(client, private_key, contract_key).await
-                });
-                let inbox = loop {
-                    match f.value() {
-                        Some(v) => break v.as_ref().unwrap(),
-                        None => std::thread::sleep(std::time::Duration::from_millis(100)),
+    fn new(
+        cx: Scope,
+        contracts: Vec<Identity>,
+        private_key: &rsa::RsaPrivateKey,
+    ) -> Result<Self, String> {
+        let mut models = Vec::with_capacity(contracts.len());
+        #[cfg(feature = "node")]
+        {
+            for contract in &contracts {
+                let private_key = private_key.clone();
+                let model = CONNECTION.with(|conn| {
+                    let params = InboxParams {
+                        pub_key: contract.pub_key.clone(),
                     }
-                };
-                inbox.clone()
-            });
+                    .try_into()
+                    .map_err(|e| format!("{e}"))?;
+                    let contract_key =
+                        ContractKey::decode(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
+                    let client = (**conn).clone();
+                    let f = use_future(cx, (), |_| async move {
+                        let client = &mut *client.borrow_mut();
+                        InboxModel::get_inbox(client, &private_key, contract_key).await
+                    });
+                    let inbox = loop {
+                        match f.value() {
+                            Some(v) => break v.as_ref().unwrap(),
+                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                        }
+                    };
+                    Ok::<_, String>(inbox.clone())
+                })?;
+                models.push(model);
+            }
         }
-        Self {
+        Ok(Self {
             models,
             contracts,
             messages: Rc::new(RefCell::new(vec![])),
-        }
+        })
     }
 
     #[cfg(target_family = "wasm")]
@@ -62,37 +81,8 @@ impl Inbox {
         todo!()
     }
 
-    #[cfg(target_family = "wasm")]
+    #[cfg(feature = "ui-testing")]
     fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
-        CONNECTION.with(|conn| {
-            let private_key = private_key.clone();
-            let key = self
-                .contracts
-                .iter()
-                .find(|c| c.id == id.id)
-                .unwrap()
-                .pub_key
-                .clone();
-            let contract_key = todo!("get the id, from the code + params");
-            let client = (**conn).clone();
-            let f = use_future(cx, (), |_| async move {
-                let client = &mut *client.borrow_mut();
-                InboxModel::get_inbox(client, &private_key, contract_key).await
-            });
-            let inbox = loop {
-                match f.value() {
-                    Some(v) => break v.as_ref().unwrap(),
-                    None => std::thread::sleep(std::time::Duration::from_millis(100)),
-                }
-            };
-            let messages = &mut *self.messages.borrow_mut();
-            messages.clear();
-            messages.extend(inbox.messages.iter().map(|m| m.clone().into()));
-        })
-    }
-
-    #[cfg(all(feature = "ui-testing", not(target_family = "wasm")))]
-    fn load_messages(&self, _cx: Scope, id: &Identity, _keypair: &rsa::RsaPrivateKey) {
         let emails = {
             if id.id == 0 {
                 vec![
@@ -140,6 +130,35 @@ impl Inbox {
         };
         self.messages.replace(emails);
     }
+
+    #[cfg(all(feature = "node", not(feature = "ui-testing")))]
+    fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
+        CONNECTION.with(|conn| {
+            let private_key = private_key.clone();
+            let key = self
+                .contracts
+                .iter()
+                .find(|c| c.id == id.id)
+                .unwrap()
+                .pub_key
+                .clone();
+            let contract_key = todo!("get the id, from the code + params");
+            let client = (**conn).clone();
+            let f = use_future(cx, (), |_| async move {
+                let client = &mut *client.borrow_mut();
+                InboxModel::get_inbox(client, &private_key, contract_key).await
+            });
+            let inbox = loop {
+                match f.value() {
+                    Some(v) => break v.as_ref().unwrap(),
+                    None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                }
+            };
+            let messages = &mut *self.messages.borrow_mut();
+            messages.clear();
+            messages.extend(inbox.messages.iter().map(|m| m.clone().into()));
+        })
+    }
 }
 
 struct User {
@@ -152,8 +171,6 @@ struct User {
 impl User {
     #[cfg(feature = "ui-testing")]
     fn new() -> Self {
-        use rsa::pkcs1::DecodeRsaPrivateKey;
-
         const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
         const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
         let pub_key =
@@ -233,8 +250,9 @@ pub(crate) fn App(cx: Scope) -> Element {
     let contracts = vec![];
     use_shared_state_provider(cx, User::new);
     use_context_provider(cx, || {
-        let private_key = todo!();
-        Inbox::new(cx, contracts, &private_key)
+        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
+        let key = RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap();
+        Inbox::new(cx, contracts, &key).unwrap()
     });
 
     let user = use_shared_state::<User>(cx).unwrap();
