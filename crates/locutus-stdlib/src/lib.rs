@@ -17,6 +17,7 @@ mod component_interface;
 mod contract_interface;
 pub(crate) mod global;
 pub mod rand;
+#[cfg(feature = "time")]
 pub mod time;
 mod versioning;
 #[cfg(feature = "archive")]

@@ -276,22 +276,6 @@ impl InboxModel {
             _ => panic!(),
         }
     }
-
-    #[cfg(not(debug_assertions))]
-    pub(crate) async fn create_inbox(
-        client: &mut WebApi,
-        keypair: ed25519_dalek::Keypair,
-        code: WrappedContract,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let inbox = InboxModel::new();
-        let request = ContractRequest::Put {
-            contract: WasmAPIVersion::V1(code).into(),
-            state: inbox.to_state()?.as_ref().into(),
-            related_contracts: RelatedContracts::new(),
-        };
-        client.send(request.into()).await?;
-        todo!()
-    }
 }
 
 #[cfg(test)]

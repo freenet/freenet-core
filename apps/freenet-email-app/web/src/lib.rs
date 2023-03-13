@@ -3,11 +3,11 @@ use locutus_stdlib::client_api::{ClientError, HostResponse};
 mod app;
 pub(crate) mod inbox;
 
+const MAIN_ELEMENT_ID: &str = "freenet-email-main";
 
 pub fn main() {
     #[cfg(not(target_family = "wasm"))]
     {
-        const MAIN_ELEMENT_ID: &str = "freenet-email-main";
         use dioxus_desktop::{tao::dpi::LogicalPosition, LogicalSize};
         use dioxus_desktop::{Config, WindowBuilder};
         // if cfg!(debug_assertions) {
@@ -46,7 +46,10 @@ pub fn main() {
     }
 
     #[cfg(target_family = "wasm")]
-    dioxus_web::launch(app::App);
+    {
+        use dioxus_web::Config;
+        dioxus_web::launch_cfg(app::App, Config::new().rootname(MAIN_ELEMENT_ID));
+    }
 }
 
 struct WebApi {
