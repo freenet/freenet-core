@@ -98,6 +98,13 @@ pub struct BuildToolCliConfig {
     pub(crate) version: Version,
 }
 
+impl BuildToolCliConfig {
+    pub fn with_version(mut self, version: Version) -> Self {
+        self.version = version;
+        self
+    }
+}
+
 impl Default for BuildToolCliConfig {
     fn default() -> Self {
         Self {

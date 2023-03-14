@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 
 freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 
+locutus-dev = { path = "../../../crates/locutus-dev", optional = true }
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 dioxus-web = { version = "0.3" }
 getrandom = { version = "*", features = ["js"] }
@@ -50,3 +52,9 @@ dioxus-desktop = { version = "0.3" }
 default = ["ui-testing"]
 ui-testing = []
 node = []
+build-binary = ["locutus-dev"]
+
+[[bin]]
+name = "get_key"
+required-features = ["build-binary"]
+

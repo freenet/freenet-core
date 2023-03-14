@@ -1,9 +1,9 @@
 #![allow(non_snake_case)]
-use std::{borrow::Cow, cell::RefCell, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, path::PathBuf, rc::Rc};
 
 use dioxus::prelude::*;
 use freenet_email_inbox::InboxParams;
-use locutus_stdlib::prelude::ContractKey;
+use locutus_stdlib::prelude::{ContractContainer, ContractKey};
 use once_cell::unsync::Lazy;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
 
@@ -11,16 +11,23 @@ use crate::inbox::{InboxModel, MessageModel};
 
 mod login;
 
-#[cfg(feature = "node")]
+#[cfg(all(feature = "node", target_arch = "wasm32"))]
 thread_local! {
     static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
-        let api = crate::WebApi::new()
-            .map_err(|err| {
-                web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-                err
-            })
-            .expect("open connection");
-        Rc::new(RefCell::new(api))
+            let api = crate::WebApi::new()
+                .map_err(|err| {
+                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+                    err
+                })
+                .expect("open connection");
+            Rc::new(RefCell::new(api))
+    })
+}
+
+#[cfg(all(feature = "node", not(target_arch = "wasm32")))]
+thread_local! {
+    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
+        todo!()
     })
 }
 
@@ -31,8 +38,11 @@ struct Inbox {
     models: Vec<InboxModel>,
 }
 
-// todo: in the build.rs we can generate this hash and use `include_str!(env!(BUILD_ENV_VAR))` to include it
-static INBOX_CODE_HASH: &str = "";
+static INBOX_CODE_HASH: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+    const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+    let contract_path = PathBuf::from(MANIFEST).join("src/inbox_key");
+    String::from_utf8(std::fs::read(contract_path).unwrap()).unwrap()
+});
 
 impl Inbox {
     fn new(
@@ -246,6 +256,10 @@ impl Ord for Message {
 }
 
 pub(crate) fn App(cx: Scope) -> Element {
+    // #[cfg(target_arch = "wasm32")]
+    // {
+    //     web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
+    // }
     // TODO: for the test, we add the hardcoded 2 contracts to this vector
     let contracts = vec![];
     use_shared_state_provider(cx, User::new);
