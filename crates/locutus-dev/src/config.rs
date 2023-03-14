@@ -89,6 +89,11 @@ pub struct PutConfig {
 /// This tool will build the WASM contract and publish it to the network.
 #[derive(clap::Parser, Clone, Debug)]
 pub struct BuildToolCliConfig {
+
+    /// Compile the contract with a specific features.
+    #[clap(long)]
+    pub(crate) features: Option<String>,
+
     /// Compile the contract with WASI extension enabled (useful for debugging).
     #[clap(long)]
     pub(crate) wasi: bool,
@@ -108,6 +113,7 @@ impl BuildToolCliConfig {
 impl Default for BuildToolCliConfig {
     fn default() -> Self {
         Self {
+            features: None,
             wasi: false,
             version: Version::new(0, 0, 1),
         }

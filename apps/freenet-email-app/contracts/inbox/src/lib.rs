@@ -399,7 +399,7 @@ impl ContractInterface for Inbox {
                 .add_messages(&params, &allocation_records, new_messages)
                 .map_err(|_| ContractError::InvalidUpdate)?;
             inbox.remove_messages(rm_messages);
-            inbox.last_update = locutus_stdlib::time::now();
+            //inbox.last_update = locutus_stdlib::time::now();
             let serialized =
                 serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;
             Ok(UpdateModification::valid(serialized.into()))
@@ -425,5 +425,50 @@ impl ContractInterface for Inbox {
         let summary = InboxSummary::try_from(summary)?;
         let delta = inbox.delta(summary);
         delta.try_into()
+    }
+}
+
+mod prueba {
+    use std::fs::File;
+    use std::io::Read;
+    use locutus_stdlib::prelude::{Parameters, State};
+    use locutus_stdlib::rand;
+    use crate::Inbox;
+    use crate::InboxParams;
+
+    use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPublicKey};
+    use serde_json::to_vec;
+
+    #[test]
+    fn prueba() {
+        // let state_bytes = r#"{
+        //     "messages": [],
+        //         "last_update": "2022-05-10T00:00:00Z",
+        //         "settings": {
+        //             "minimum_tier": "Day1",
+        //             "private": []
+        //         },
+        //         "inbox_signature": []
+        //     }"#
+        //     .as_bytes()
+        //     .to_vec();
+        // let state = State::from(state_bytes);
+        // let i = Inbox::try_from(&state);
+
+        let mut buf = vec![];
+        File::open("/home/minion/workspace/locutus/apps/freenet-email-app/web/examples/rsa4096-pub.pem").unwrap().read_to_end(&mut buf).unwrap();
+
+        let a: &str = base64::(s)?;
+
+        const RSA_4096_PUB_PEM: &str = include_str!("/home/minion/workspace/locutus/apps/freenet-email-app/web/examples/rsa4096-pub.pem");
+        let pub_key =
+            <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
+                .unwrap();
+
+        let pub_key =
+            <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(a)
+                .unwrap();
+        let a = 1;
+        //let params = InboxParams::try_from(Parameters::from(buf));
     }
 }

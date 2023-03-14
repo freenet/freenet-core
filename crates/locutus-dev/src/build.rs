@@ -329,17 +329,18 @@ fn compile_contract(
             if target == WASI_TARGET {
                 println!("Enabling WASI extension");
             }
+            let build_features = cli_config.features.as_ref().unwrap().as_str();
             let cmd_args = if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
                 RUST_TARGET_ARGS
                     .iter()
                     .copied()
-                    .chain([target, "--color", "always"])
+                    .chain([target, "--features", build_features, "--color", "always"])
                     .collect::<Vec<_>>()
             } else {
                 RUST_TARGET_ARGS
                     .iter()
                     .copied()
-                    .chain([target])
+                    .chain([target, "--features", build_features])
                     .collect::<Vec<_>>()
             };
 
