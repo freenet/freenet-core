@@ -38,11 +38,7 @@ struct Inbox {
     models: Vec<InboxModel>,
 }
 
-static INBOX_CODE_HASH: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
-    const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
-    let contract_path = PathBuf::from(MANIFEST).join("src/inbox_key");
-    String::from_utf8(std::fs::read(contract_path).unwrap()).unwrap()
-});
+static INBOX_CODE_HASH: &str = include_str!("./inbox_key");
 
 impl Inbox {
     fn new(
@@ -92,7 +88,7 @@ impl Inbox {
     }
 
     #[cfg(feature = "ui-testing")]
-    fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
+    fn load_messages(&self, _cx: Scope, id: &Identity, _private_key: &rsa::RsaPrivateKey) {
         let emails = {
             if id.id == 0 {
                 vec![
