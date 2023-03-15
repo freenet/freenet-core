@@ -6,7 +6,7 @@ use freenet_email_inbox::{
 use locutus_aft_interface::{Tier, TokenAssignment};
 use locutus_stdlib::{
     client_api::ContractRequest,
-    prelude::{ContractCode, ContractKey, Parameters, State, UpdateData},
+    prelude::{ContractCode, ContractKey, State, UpdateData},
 };
 use rand_chacha::rand_core::SeedableRng;
 use rsa::{
@@ -80,9 +80,9 @@ pub(crate) struct DecryptedMessage {
     pub title: String,
     pub content: String,
     pub from: String,
-    to: Vec<String>,
-    cc: Vec<String>,
-    time: DateTime<Utc>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub time: DateTime<Utc>,
 }
 
 /// Inbox state
@@ -154,7 +154,7 @@ impl InboxModel {
     }
 
     /// This only affects in-memory messages, changes are not persisted.
-    fn add_received_message(
+    pub fn add_received_message(
         &mut self,
         content: DecryptedMessage,
         token_assignment: TokenAssignment,
@@ -230,7 +230,8 @@ impl InboxModel {
         Ok(())
     }
 
-    async fn add_messages_to_store(
+    #[cfg(feature = "node")]
+    pub async fn add_messages_to_store(
         &mut self,
         client: &mut WebApi,
         ids: &[usize],
@@ -283,19 +284,17 @@ mod tests {
     use std::str::FromStr;
 
     use locutus_stdlib::prelude::ContractInstanceId;
-    use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPublicKey};
+    use rsa::pkcs1::DecodeRsaPrivateKey;
 
     use super::*;
 
     fn test_assignment() -> TokenAssignment {
-        const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
-        let assignee =
-            <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
-                .unwrap();
+        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-user-priv.pem");
+        let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
         TokenAssignment {
             tier: Tier::Day1,
             time_slot: Default::default(),
-            assignee,
+            assignee: key.to_public_key(),
             signature: rsa::pkcs1v15::Signature::from(vec![1; 64].into_boxed_slice()),
             assignment_hash: [0; 32],
             token_record: ContractInstanceId::from_str(
@@ -307,8 +306,8 @@ mod tests {
 
     #[test]
     fn remove_msg() {
-        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
-        let key = RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap();
+        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-user-priv.pem");
+        let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
         let mut inbox = InboxModel::new(key).unwrap();
         for id in 0..10000 {
             inbox.messages.push(MessageModel {

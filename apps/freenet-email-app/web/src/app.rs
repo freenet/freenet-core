@@ -1,13 +1,15 @@
 #![allow(non_snake_case)]
-use std::{borrow::Cow, cell::RefCell, path::PathBuf, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
+use chrono::Utc;
 use dioxus::prelude::*;
 use freenet_email_inbox::InboxParams;
-use locutus_stdlib::prelude::{ContractContainer, ContractKey};
+use locutus_aft_interface::TokenAssignment;
+use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
 
-use crate::inbox::{InboxModel, MessageModel};
+use crate::inbox::{DecryptedMessage, InboxModel, MessageModel};
 
 mod login;
 
@@ -27,15 +29,16 @@ thread_local! {
 #[cfg(all(feature = "node", not(target_arch = "wasm32")))]
 thread_local! {
     static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
-        todo!()
+        unimplemented!()
     })
 }
 
 #[derive(Debug, Clone)]
 struct Inbox {
-    contracts: Vec<Identity>,
+    inbox_ids: Vec<Identity>,
+    inbox_data: Vec<Rc<RefCell<InboxModel>>>,
     messages: Rc<RefCell<Vec<Message>>>,
-    models: Vec<InboxModel>,
+    active_id: usize,
 }
 
 static INBOX_CODE_HASH: &str = include_str!("./inbox_key");
@@ -67,24 +70,75 @@ impl Inbox {
                     let inbox = loop {
                         match f.value() {
                             Some(v) => break v.as_ref().unwrap(),
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                            None => std::thread::sleep(std::time::Duration::from_micros(100)),
                         }
                     };
                     Ok::<_, String>(inbox.clone())
                 })?;
-                models.push(model);
+                models.push(Rc::new(RefCell::new(model)));
             }
         }
         Ok(Self {
-            models,
-            contracts,
+            inbox_data: models,
+            inbox_ids: contracts,
             messages: Rc::new(RefCell::new(vec![])),
+            active_id: 0,
         })
     }
 
-    #[cfg(target_family = "wasm")]
-    fn send_message(&self, to: &str, title: &str, content: &str) {
-        todo!()
+    fn send_message(
+        &self,
+        cx: Scope,
+        to: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let inbox = self.inbox_data[self.active_id].clone();
+        {
+            let content = DecryptedMessage {
+                title: title.to_owned(),
+                content: title.to_owned(),
+                from: "".to_owned(),
+                to: vec![to.to_owned()],
+                cc: vec![],
+                time: Utc::now(),
+            };
+            // todo: request the token assignment to the component here
+            let token = TokenAssignment {
+                tier: todo!(),
+                time_slot: todo!(),
+                assignee: todo!(),
+                signature: todo!(),
+                assignment_hash: todo!(),
+                token_record: todo!(),
+            };
+            inbox.borrow_mut().add_received_message(content, token);
+        }
+        #[cfg(feature = "node")]
+        {
+            CONNECTION.with(|conn| {
+                let id = &self.inbox_ids[self.active_id];
+                let client = (**conn).clone();
+                let f = use_future(cx, (), |_| async move {
+                    let client = &mut *client.borrow_mut();
+                    inbox
+                        .borrow_mut()
+                        .add_messages_to_store(client, &[0])
+                        .await?;
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                });
+                loop {
+                    match f.value() {
+                        Some(Err(e)) => {
+                            break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
+                        }
+                        Some(_) => {}
+                        None => std::thread::sleep(std::time::Duration::from_micros(100)),
+                    }
+                }
+            })?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "ui-testing")]
@@ -177,22 +231,22 @@ struct User {
 impl User {
     #[cfg(feature = "ui-testing")]
     fn new() -> Self {
-        const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
-        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
-        let pub_key =
-            <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
-                .unwrap();
+        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
+        let priv_key = RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap();
         User {
             logged: true,
             active_id: None,
             identities: vec![
                 Identity {
                     id: 0,
-                    pub_key: pub_key.clone(),
+                    pub_key: priv_key.to_public_key(),
                 },
-                Identity { id: 1, pub_key },
+                Identity {
+                    id: 1,
+                    pub_key: priv_key.to_public_key(),
+                },
             ],
-            private_key: Some(RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap()),
+            private_key: Some(priv_key),
         }
     }
 
@@ -256,12 +310,31 @@ pub(crate) fn App(cx: Scope) -> Element {
     // {
     //     web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
     // }
-    // TODO: for the test, we add the hardcoded 2 contracts to this vector
-    let contracts = vec![];
+    // TODO: in the future this will be dinamically loaded from the identity component
+    let contracts = vec![
+        Identity {
+            id: 0,
+            pub_key: {
+                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
+                RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
+                    .unwrap()
+                    .to_public_key()
+            },
+        },
+        Identity {
+            id: 1,
+            pub_key: {
+                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
+                RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
+                    .unwrap()
+                    .to_public_key()
+            },
+        },
+    ];
     use_shared_state_provider(cx, User::new);
     use_context_provider(cx, || {
-        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-priv.pem");
-        let key = RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap();
+        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-user-priv.pem");
+        let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
         Inbox::new(cx, contracts, &key).unwrap()
     });
 
@@ -503,6 +576,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
 }
 
 fn NewMessageWindow(cx: Scope) -> Element {
+    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let to = use_state(cx, String::new);
     let title = use_state(cx, String::new);
@@ -518,15 +592,15 @@ fn NewMessageWindow(cx: Scope) -> Element {
                     tbody {
                         tr {
                             th { "From" }
-                            td { style: "width: 100%", contenteditable: true, br {} }
+                            td { style: "width: 100%", br {} }
                         }
                         tr {
                             th { "To"}
-                            td { style: "width: 100%", contenteditable: true, br {} }
+                            td { style: "width: 100%", contenteditable: true, "{to}" }
                         }
                         tr {
                             th { "Title"}
-                            td { style: "width: 100%", contenteditable: true, br {} }
+                            td { style: "width: 100%", contenteditable: true, "{title}"  }
                         }
                     }
                 }
@@ -543,10 +617,8 @@ fn NewMessageWindow(cx: Scope) -> Element {
                 button {
                     class: "button is-info is-outlined",
                     onclick: move |_| {
-                        #[cfg(target_family = "wasm")]
-                        {
-                            inbox.send_message(to.get(), title.get(), content.get());
-                        }
+                        inbox.send_message(cx, to.get(), title.get(), content.get()).expect("connection error");
+                        menu_selection.write().set_new_msg();
                     },
                     "Send"
                 }
