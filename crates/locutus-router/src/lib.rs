@@ -1,46 +1,63 @@
-use std::time::Duration;
+
+use std::{collections::HashMap, time::Duration};
 
 use locutus_core::{libp2p::PeerId, Location};
-use pav_regression::{*, pav::{IsotonicRegression, Point}};
+use pav_regression::{
+    pav::{IsotonicRegression, Point},
+};
 
-pub struct PAVRouter {
-    dist_to_time_regression : IsotonicRegression,
+pub struct RetrievalTimeEstimator {
+    dist_to_time_regression: IsotonicRegression,
+
+    dist_to_time_regressions_by_peer: HashMap<PeerId, IsotonicRegression>,
 }
 
-impl PAVRouter {
+fn merge(value1 : &[u8], value2 : &[u8]) -> Vec<u8>
+
+impl RetrievalTimeEstimator {
     fn new<I>(history: I) -> Self
     where
         I: IntoIterator<Item = RoutingEvent>,
     {
-        let points: Vec<Point> = history
+        let mut all_points : Vec<Point> = vec![];
+
+        let mut points_by_peer: HashMap<PeerId, Vec<Point>> = HashMap::new();
+
+        for event in history {
+            if let RoutingOutcome::Success { duration } = event.routing_outcome {
+                let x = event.peer_location.distance(&event.contract_location);
+                let y = duration.as_millis() as f64;
+                let point = Point::new(x.into(), y);
+
+                all_points.push(point);
+
+                points_by_peer.entry(event.peer).or_insert_with(|| {vec![]}).push(point);
+            };
+        }
+
+        let dist_to_time_regression = IsotonicRegression::new_ascending(all_points.as_slice());
+
+        let dist_to_time_regressions_by_peer = points_by_peer
             .into_iter()
-            .filter_map(|routing_event| match routing_event.routing_outcome {
-                RoutingOutcome::Success { duration } => {
-                    let x = routing_event
-                        .peer_location
-                        .distance(&routing_event.contract_location);
-                    let y = duration.as_millis() as f64;
-                    Some(Point::new(x.into(), y))
-                }
-                RoutingOutcome::Failure => None,
+            .map(|(peer, points)| {
+                let regression = IsotonicRegression::new_ascending(points.as_slice());
+                (peer, regression)
             })
             .collect();
-    
-        let regression = IsotonicRegression::new_ascending(&points);
-    
-        PAVRouter {
-            dist_to_time_regression: regression,
+
+        RetrievalTimeEstimator {
+            dist_to_time_regression,
+            dist_to_time_regressions_by_peer,
         }
     }
-    
 }
 
 pub struct RoutingEvent {
-    peer : PeerId,
-    peer_location : Location,
-    contract_location : Location,
-    routing_type : RoutingType,
-    routing_outcome : RoutingOutcome,
+    peer: PeerId,
+    peer_location: Location,
+    contract_location: Location,
+    routing_type: RoutingType,
+    routing_outcome: RoutingOutcome,
 }
 
 pub enum RoutingType {
@@ -51,10 +68,9 @@ pub enum RoutingType {
 }
 
 pub enum RoutingOutcome {
-    Success { duration : Duration },
+    Success { duration: Duration },
     Failure,
 }
-
 
 #[test]
 fn test() {

@@ -1,25 +1,28 @@
 # Introduction
 
-## The Internet's dangerous design flaw
+The internet has revolutionized the way we live our lives, forging connections
+and facilitating communication on a global scale. Since its inception in the
+1960s and widespread adoption in the 1990s, the internet has transformed our
+world, enabling us to access information and interact with people from all
+corners of the globe.
 
-In the early days of the Internet, each computer had an IP address and could
-establish connections with others, resembling a peer-to-peer network. However,
-as the Internet evolved, centralized client-server architectures became the
-norm, with HTTP, SMTP, and FTP protocols dominating the scene. Among these,
-HTTP has emerged as the most widely used, overshadowing the others.
+However as it grew the Internet become much more centralized, with a few large
+corporations holding unprecedented power over users. Worsening over time, these
+corporations have abused their power to censor, manipulate, and exclude people
+from services that have become essential to modern life. To address this
+growing concern, a new decentralized internet is necessary to ensure that tools
+serve the users and not the interests of large corporations.
 
-While this centralized approach initially posed little risk, over time, it has
-enabled a few large companies to amass an alarming amount of power. Although
-these companies were initially neutral platforms, they have increasingly used
-their power to censor and punish users, often in collaboration with
-governments. This concentration of power poses an existential threat to
-democracy and freedom of speech.
+Our aim is to create a decentralized internet on top of the existing
+infrastructure that utilizes the Internet Protocol (IP), which is inherently
+decentralized. We recognize that the ease of use has always been a limiting
+factor in democratizing tools, but we plan to overcome this challenge by using
+existing tools that we are familiar with, such as browsers, HTML, JavaScript,
+and more. 
 
-To address this issue we're building a new Freenet, an alternative to the
-client-server oligarchy, a decentralized platform that empowers users and
-serves their interests, rather than those of the powerful.
-
-## Our solution: A new Freenet
-
-Freenet is software that runs on your computer and gives you access to an
-alternate decentralized Internet, but using familiar tools like web browsers.
+A fresh approach to solving age-old problems, such as spam, is possible with
+the creation of a new decentralized internet. Existing solutions, like
+Captchas, have proven to be ineffective as they are easy to bypass. By building
+a new decentralized internet, we can reclaim our freedom to communicate from
+tech oligarchs, ensuring that we have access to a free and open internet that
+serves its users.

@@ -2391,6 +2391,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "itertools",
  "locutus-core",
  "locutus-dev",
  "locutus-stdlib",
