@@ -118,7 +118,7 @@ impl TokenAssignmentExt for TokenAssignment {
         if !self.tier.is_valid_slot(self.time_slot) {
             return false;
         }
-        let msg = TokenAssignment::to_be_signed(&self.time_slot, &self.assignee, self.tier);
+        let msg = TokenAssignment::signature_content(&self.time_slot, &self.assignee, self.tier);
         let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
         if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator

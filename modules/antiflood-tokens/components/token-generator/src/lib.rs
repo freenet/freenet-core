@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use locutus_aft_interface::{AllocationCriteria, TokenAllocationRecord, TokenAssignment};
-use locutus_stdlib::{prelude::*, time};
+use locutus_stdlib::prelude::*;
 use rsa::{
     pkcs1v15::SigningKey, pkcs8::EncodePublicKey, sha2::Sha256, RsaPrivateKey, RsaPublicKey,
 };
@@ -326,6 +326,7 @@ trait TokenAssignmentInternal {
 }
 
 impl TokenAssignmentInternal for TokenAllocationRecord {
+    #[cfg(feature = "node")]
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
     fn assign(
@@ -335,11 +336,12 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
+        use locutus_stdlib::time;
         use rsa::signature::Signer;
         let current = time::now();
         let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
-            let msg = TokenAssignment::to_be_signed(&time_slot, &assignee, criteria.frequency);
+            let msg = TokenAssignment::signature_content(&time_slot, &assignee, criteria.frequency);
             let signing_key = SigningKey::<Sha256>::new_with_prefix(key.clone());
             let signature = signing_key.sign(&msg);
             TokenAssignment {

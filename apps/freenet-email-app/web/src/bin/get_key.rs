@@ -17,5 +17,9 @@ fn main() {
         .unwrap_v1()
         .code()
         .hash_str();
-    std::fs::write(PathBuf::from(MANIFEST).join("src/inbox_key"), code_key).unwrap();
+    std::fs::write(
+        PathBuf::from(MANIFEST).join("../examples/inbox_key"),
+        code_key,
+    )
+    .unwrap();
 }

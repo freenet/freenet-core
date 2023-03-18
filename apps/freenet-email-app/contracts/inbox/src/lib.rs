@@ -41,7 +41,6 @@ type Signature = Box<[u8]>;
 #[derive(Serialize, Deserialize)]
 pub enum UpdateInbox {
     AddMessages {
-        signature: Signature,
         messages: Vec<Message>,
     },
     RemoveMessages {
@@ -134,7 +133,7 @@ impl Inbox {
         allocation_records: &HashMap<ContractInstanceId, TokenAllocationRecord>,
         messages: Vec<Message>,
     ) -> Result<(), VerificationError> {
-        // FIXME: make sure we are not re-adding old messages by verifying the time is moe recent
+        // FIXME: make sure we are not re-adding old messages by verifying the time is more recent
         // than last updated
         for message in messages {
             let records = allocation_records
@@ -348,17 +347,7 @@ impl ContractInterface for Inbox {
         for update in updates {
             match update {
                 UpdateData::Delta(d) => match UpdateInbox::try_from(d)? {
-                    UpdateInbox::AddMessages {
-                        mut messages,
-                        signature,
-                    } => {
-                        // FIXME: should the msg be verified for the pub key in the token assignment (the one sending the msg)
-                        // instead of the one owning the inbox?
-                        can_modify_inbox(
-                            &params,
-                            &signature,
-                            messages.iter().map(|m| &m.token_assignment.assignment_hash),
-                        )?;
+                    UpdateInbox::AddMessages { mut messages } => {
                         for m in &messages {
                             missing_related.push(m.token_assignment.token_record);
                         }
@@ -399,6 +388,7 @@ impl ContractInterface for Inbox {
                 .add_messages(&params, &allocation_records, new_messages)
                 .map_err(|_| ContractError::InvalidUpdate)?;
             inbox.remove_messages(rm_messages);
+            // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
             //inbox.last_update = locutus_stdlib::time::now();
             let serialized =
                 serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;

@@ -2,12 +2,22 @@ use locutus_stdlib::client_api::{ClientError, HostResponse};
 
 mod app;
 pub(crate) mod inbox;
+#[cfg(any(feature = "ui-testing", test))]
+pub(crate) mod test_util;
 
 const MAIN_ELEMENT_ID: &str = "freenet-email-main";
 
 pub fn main() {
     #[cfg(not(target_family = "wasm"))]
     {
+        use tracing_subscriber::{filter::LevelFilter, EnvFilter};
+        let _e = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::builder()
+                    .with_default_directive(LevelFilter::INFO.into())
+                    .from_env_lossy(),
+            )
+            .try_init();
         use dioxus_desktop::{tao::dpi::LogicalPosition, LogicalSize};
         use dioxus_desktop::{Config, WindowBuilder};
         // if cfg!(debug_assertions) {

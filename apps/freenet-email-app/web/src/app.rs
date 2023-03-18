@@ -4,7 +4,6 @@ use std::{borrow::Cow, cell::RefCell, rc::Rc};
 use chrono::Utc;
 use dioxus::prelude::*;
 use freenet_email_inbox::InboxParams;
-use locutus_aft_interface::TokenAssignment;
 use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
@@ -41,7 +40,7 @@ struct Inbox {
     active_id: usize,
 }
 
-static INBOX_CODE_HASH: &str = include_str!("./inbox_key");
+static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_key");
 
 impl Inbox {
     fn new(
@@ -93,31 +92,31 @@ impl Inbox {
         title: &str,
         content: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let inbox = self.inbox_data[self.active_id].clone();
+        tracing::debug!("adding to {}", self.active_id);
+        #[cfg(feature = "node")]
         {
             let content = DecryptedMessage {
                 title: title.to_owned(),
-                content: title.to_owned(),
+                content: content.to_owned(),
                 from: "".to_owned(),
                 to: vec![to.to_owned()],
                 cc: vec![],
                 time: Utc::now(),
             };
-            // todo: request the token assignment to the component here
-            let token = TokenAssignment {
-                tier: todo!(),
-                time_slot: todo!(),
-                assignee: todo!(),
-                signature: todo!(),
-                assignment_hash: todo!(),
-                token_record: todo!(),
+            #[cfg(target_arch = "wasm32")]
+            {
+                web_sys::console::error_1(
+                    &serde_wasm_bindgen::to_value(&format!("adding to {}", self.active_id))
+                        .unwrap(),
+                );
+            }
+            let inbox = self.inbox_data[self.active_id].clone();
+            let token = {
+                // todo: request the recipient inbox contract and try to add it to the inbox
+                todo!("request the token assignment to the component here with the specs of the recipient inbox")
             };
             inbox.borrow_mut().add_received_message(content, token);
-        }
-        #[cfg(feature = "node")]
-        {
             CONNECTION.with(|conn| {
-                let id = &self.inbox_ids[self.active_id];
                 let client = (**conn).clone();
                 let f = use_future(cx, (), |_| async move {
                     let client = &mut *client.borrow_mut();
@@ -141,6 +140,57 @@ impl Inbox {
         Ok(())
     }
 
+    fn remove_messages<T>(
+        &self,
+        cx: Scope<T>,
+        ids: &[u64],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::debug!("removing {}", self.active_id);
+        #[cfg(feature = "node")]
+        {
+            let inbox = self.inbox_data[self.active_id].clone();
+            inbox.borrow_mut().remove_received_message(ids);
+            let ids = ids.to_vec();
+            CONNECTION.with(|conn| {
+                let client = (**conn).clone();
+                let f = use_future(cx, (), |_| async move {
+                    let client = &mut *client.borrow_mut();
+                    inbox
+                        .borrow_mut()
+                        .remove_messages_from_store(client, &ids)
+                        .await?;
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                });
+                loop {
+                    match f.value() {
+                        Some(Err(e)) => {
+                            break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
+                        }
+                        Some(_) => {}
+                        None => std::thread::sleep(std::time::Duration::from_micros(100)),
+                    }
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    // Remove the messages from the inbox contract, and move them to local storage
+    fn mark_as_read<T>(&self, cx: Scope<T>, ids: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
+        let messages = &mut *self.messages.borrow_mut();
+        let mut removed_messages = Vec::with_capacity(ids.len());
+        for e in messages {
+            if ids.contains(&e.id) {
+                e.read = true;
+                let m = e.clone();
+                removed_messages.push(m);
+            }
+        }
+        // todo: persist in a sidekick `removed_messages`
+        self.remove_messages(cx, ids)?;
+        Ok(())
+    }
+
     #[cfg(feature = "ui-testing")]
     fn load_messages(&self, _cx: Scope, id: &Identity, _private_key: &rsa::RsaPrivateKey) {
         let emails = {
@@ -149,7 +199,7 @@ impl Inbox {
                     Message {
                         id: 0,
                         from: "Ian's Other Account".into(),
-                        title: "Unread email from Ian's Other Account".into(),
+                        title: "Email from Ian's Other Account".into(),
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
                             .into(),
@@ -162,7 +212,7 @@ impl Inbox {
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
                             .into(),
-                        read: true,
+                        read: false,
                     },
                 ]
             } else {
@@ -170,7 +220,7 @@ impl Inbox {
                     Message {
                         id: 0,
                         from: "Ian Clarke".into(),
-                        title: "Unread email from Ian".into(),
+                        title: "Email from Ian".into(),
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
                             .into(),
@@ -183,7 +233,7 @@ impl Inbox {
                         content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
                             .repeat(10)
                             .into(),
-                        read: true,
+                        read: false,
                     },
                 ]
             }
@@ -353,38 +403,48 @@ pub(crate) fn App(cx: Scope) -> Element {
     }
 }
 
-#[derive(Default)]
-struct MenuSelection {
-    email: Option<u64>,
-    new_msg: bool,
-}
+mod menu {
+    #[derive(Default)]
+    pub(super) struct MenuSelection {
+        email: Option<u64>,
+        new_msg: bool,
+    }
 
-impl MenuSelection {
-    fn set_new_msg(&mut self) {
-        if self.new_msg {
-            self.new_msg = false;
-        } else {
-            self.new_msg = true;
-            self.email = None;
+    impl MenuSelection {
+        pub fn at_new_msg(&mut self) {
+            if self.new_msg {
+                self.new_msg = false;
+            } else {
+                self.new_msg = true;
+                self.email = None;
+            }
         }
-    }
 
-    fn new_msg(&self) -> bool {
-        self.new_msg
-    }
+        pub fn is_new_msg(&self) -> bool {
+            self.new_msg
+        }
 
-    fn set_received(&mut self) {
-        self.email = None;
-        self.new_msg = false;
-    }
+        pub fn at_inbox_list(&mut self) {
+            self.email = None;
+            self.new_msg = false;
+        }
 
-    fn received(&self) -> bool {
-        !self.new_msg && self.email.is_none()
+        pub fn is_received(&self) -> bool {
+            !self.new_msg && self.email.is_none()
+        }
+
+        pub fn open_email(&mut self, id: u64) {
+            self.email = Some(id);
+        }
+
+        pub fn email(&self) -> Option<u64> {
+            self.email
+        }
     }
 }
 
 fn UserInbox(cx: Scope) -> Element {
-    use_shared_state_provider(cx, MenuSelection::default);
+    use_shared_state_provider(cx, menu::MenuSelection::default);
     cx.render(rsx!(
         div {
             class: "columns",
@@ -402,14 +462,15 @@ fn UserInbox(cx: Scope) -> Element {
 
 fn UserMenuComponent(cx: Scope) -> Element {
     let user = use_shared_state::<User>(cx).unwrap();
-    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
+    let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
 
-    let received_class = (menu_selection.read().received() || !menu_selection.read().new_msg())
-        .then(|| "is-active")
-        .unwrap_or("");
+    let received_class = (menu_selection.read().is_received()
+        || !menu_selection.read().is_new_msg())
+    .then(|| "is-active")
+    .unwrap_or("");
     let write_msg_class = menu_selection
         .read()
-        .new_msg()
+        .is_new_msg()
         .then(|| "is-active")
         .unwrap_or("");
 
@@ -421,7 +482,7 @@ fn UserMenuComponent(cx: Scope) -> Element {
                 li {
                     a {
                         class: received_class,
-                        onclick: move |_| { menu_selection.write().set_received(); },
+                        onclick: move |_| { menu_selection.write().at_inbox_list(); },
                         "Received"
                     }
                 }
@@ -430,7 +491,7 @@ fn UserMenuComponent(cx: Scope) -> Element {
                         class: write_msg_class,
                         onclick: move |_| {
                             let mut selection = menu_selection.write();
-                            selection.set_new_msg();
+                            selection.at_new_msg();
                         },
                         "Write message"
                     }
@@ -452,7 +513,7 @@ fn UserMenuComponent(cx: Scope) -> Element {
 
 fn InboxComponent(cx: Scope) -> Element {
     let inbox = use_context::<Inbox>(cx).unwrap();
-    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
+    let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
 
     #[inline_props]
     fn EmailLink<'a>(
@@ -462,14 +523,14 @@ fn InboxComponent(cx: Scope) -> Element {
         read: bool,
         id: u64,
     ) -> Element {
-        let open_mail = use_shared_state::<MenuSelection>(cx).unwrap();
+        let open_mail = use_shared_state::<menu::MenuSelection>(cx).unwrap();
         let icon_style = read
             .then(|| "fa-regular fa-envelope")
             .unwrap_or("fa-solid fa-envelope");
         cx.render(rsx!(a {
             class: "panel-block",
             id: "email-inbox-accessor-{id}",
-            onclick: move |_| { open_mail.write().email = Some(*id); },
+            onclick: move |_| { open_mail.write().open_email(*id); },
             span {
                 class: "panel-icon",
                 i { class: icon_style }
@@ -480,10 +541,8 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 
     let emails = inbox.messages.borrow();
-
-    let menu_selection_ref = menu_selection.read();
-    let new_msg = menu_selection_ref.new_msg;
-    if let Some(email_id) = menu_selection_ref.email {
+    let is_email = menu_selection.read().email();
+    if let Some(email_id) = is_email {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();
         let email = &emails[id_p];
         cx.render(rsx! {
@@ -495,7 +554,7 @@ fn InboxComponent(cx: Scope) -> Element {
                 read: email.read,
             }
         })
-    } else if new_msg {
+    } else if menu_selection.read().is_new_msg() {
         cx.render(rsx! {
             NewMessageWindow {}
         })
@@ -545,8 +604,20 @@ fn InboxComponent(cx: Scope) -> Element {
 }
 
 fn OpenMessage(cx: Scope<Message>) -> Element {
-    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
+    let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
+    let inbox = use_context::<Inbox>(cx).unwrap();
     let email = cx.props;
+    match inbox.mark_as_read(cx, &[email.id]) {
+        Ok(()) => {}
+        Err(e) => {
+            let err = format!("{e}");
+            #[cfg(all(feature = "node", target_arch = "wasm32"))]
+            {
+                web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+            }
+            tracing::error!("error while updating message state: {err}");
+        }
+    }
     cx.render(rsx! {
         div {
             class: "columns title mt-3",
@@ -554,16 +625,33 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
                 class: "column",
                 a {
                     class: "icon is-small",
-                    onclick: move |_| { menu_selection.write().email = None; },
+                    onclick: move |_| {
+                        menu_selection.write().at_inbox_list();
+                    },
                     i { class: "fa-sharp fa-solid fa-arrow-left", aria_label: "Back to Inbox", style: "color:#4a4a4a" }, 
                 }
             }
             div { class: "column is-four-fifths", h2 { "{email.title}" } }
             div {
                 class: "column", 
-                a { class: "icon is-small", 
-                onclick: move |_| { menu_selection.write().email = None; },
-                i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" } } 
+                a {
+                    class: "icon is-small", 
+                    onclick: move |_| {
+                        match inbox.remove_messages(cx, &[email.id]) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let err = format!("{e}");
+                                #[cfg(all(feature = "node", target_arch = "wasm32"))]
+                                {
+                                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+                                }
+                                tracing::error!("error while deleting message: {err}");
+                            }
+                        }
+                        menu_selection.write().at_inbox_list();
+                    },
+                    i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" } 
+                }
             }
         }
         div {
@@ -576,7 +664,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
 }
 
 fn NewMessageWindow(cx: Scope) -> Element {
-    let menu_selection = use_shared_state::<MenuSelection>(cx).unwrap();
+    let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let to = use_state(cx, String::new);
     let title = use_state(cx, String::new);
@@ -617,8 +705,18 @@ fn NewMessageWindow(cx: Scope) -> Element {
                 button {
                     class: "button is-info is-outlined",
                     onclick: move |_| {
-                        inbox.send_message(cx, to.get(), title.get(), content.get()).expect("connection error");
-                        menu_selection.write().set_new_msg();
+                        match inbox.send_message(cx, to.get(), title.get(), content.get()) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let err = format!("{e}");
+                                #[cfg(all(feature = "node", target_arch = "wasm32"))]
+                                {
+                                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+                                }
+                                tracing::error!("error while sending message: {err}");
+                            }
+                        }
+                        menu_selection.write().at_new_msg();
                     },
                     "Send"
                 }

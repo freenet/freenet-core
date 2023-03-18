@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
@@ -168,23 +170,17 @@ impl InboxModel {
     }
 
     /// This only affects in-memory messages, changes are not persisted.
-    fn remove_received_message(&mut self, id: u64) {
-        if let Ok(p) = self.messages.binary_search_by_key(&id, |a| a.id) {
-            self.messages.remove(p);
+    pub fn remove_received_message(&mut self, ids: &[u64]) {
+        if ids.len() > 1 {
+            let drop: HashSet<u64> = HashSet::from_iter(ids.iter().copied());
+            self.messages.retain(|a| !drop.contains(&a.id));
+        } else {
+            for id in ids {
+                if let Ok(p) = self.messages.binary_search_by_key(id, |a| a.id) {
+                    self.messages.remove(p);
+                }
+            }
         }
-    }
-
-    async fn store_all_messages(
-        &self,
-        client: &mut WebApi,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let data = self.to_state()?;
-        let request = ContractRequest::Update {
-            key: self.key.clone(),
-            data: UpdateData::State(data),
-        };
-        client.send(request.into()).await?;
-        Ok(())
     }
 
     async fn update_settings_at_store(
@@ -207,10 +203,10 @@ impl InboxModel {
         Ok(())
     }
 
-    async fn remove_messages_from_store(
+    pub async fn remove_messages_from_store(
         &mut self,
         client: &mut WebApi,
-        ids: &[usize],
+        ids: &[u64],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut signed = Vec::with_capacity(ids.len() * 32);
         let mut ids = Vec::with_capacity(ids.len() * 32);
@@ -236,19 +232,11 @@ impl InboxModel {
         client: &mut WebApi,
         ids: &[usize],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut signed = Vec::with_capacity(ids.len() * 32);
         let mut messages = Vec::with_capacity(ids.len() * 32);
         for m in &self.messages {
-            let h = &m.token_assignment.assignment_hash;
-            signed.extend(h);
             messages.push(m.to_stored(&self.settings.private_key)?);
         }
-        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
-        let signature = signing_key.sign(&signed).into();
-        let delta = UpdateInbox::AddMessages {
-            signature,
-            messages,
-        };
+        let delta = UpdateInbox::AddMessages { messages };
         let request = ContractRequest::Update {
             key: self.key.clone(),
             data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
@@ -281,28 +269,9 @@ impl InboxModel {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use locutus_stdlib::prelude::ContractInstanceId;
     use rsa::pkcs1::DecodeRsaPrivateKey;
 
     use super::*;
-
-    fn test_assignment() -> TokenAssignment {
-        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-user-priv.pem");
-        let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
-        TokenAssignment {
-            tier: Tier::Day1,
-            time_slot: Default::default(),
-            assignee: key.to_public_key(),
-            signature: rsa::pkcs1v15::Signature::from(vec![1; 64].into_boxed_slice()),
-            assignment_hash: [0; 32],
-            token_record: ContractInstanceId::from_str(
-                "7MxRGrYiBBK2rHCVpP25SxqBLco2h4zpb2szsTS7XXgg",
-            )
-            .unwrap(),
-        }
-    }
 
     #[test]
     fn remove_msg() {
@@ -313,13 +282,13 @@ mod tests {
             inbox.messages.push(MessageModel {
                 id,
                 content: DecryptedMessage::default(),
-                token_assignment: test_assignment(),
+                token_assignment: crate::test_util::test_assignment(),
             });
         }
         eprintln!("started {}", chrono::Utc::now());
         let t0 = std::time::Instant::now();
         for id in 2500..7500 {
-            inbox.remove_received_message(id);
+            inbox.remove_received_message(&[id]);
         }
         eprintln!("{}ms", t0.elapsed().as_millis());
     }

@@ -617,7 +617,7 @@ impl TokenAssignment {
     pub const SIGNED_MSG_SIZE: usize = Self::TIER_SIZE + Self::TS_SIZE + Self::ASSIGNEE_SIZE;
 
     /// The `(tier, issue_time, assignee)` tuple that has to be verified as bytes.
-    pub fn to_be_signed(
+    pub fn signature_content(
         issue_time: &DateTime<Utc>,
         assigned_to: &Assignment,
         tier: Tier,
@@ -647,7 +647,7 @@ impl TokenAssignment {
 #[test]
 fn to_be_signed_test() {
     const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
-    let _to_be_signed = TokenAssignment::to_be_signed(
+    let _to_be_signed = TokenAssignment::signature_content(
         &get_date(2021, 7, 28),
         &<RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
             .unwrap(),
