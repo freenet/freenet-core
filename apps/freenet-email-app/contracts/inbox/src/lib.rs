@@ -117,7 +117,7 @@ impl Inbox {
     }
 
     fn verify(&self, params: &InboxParams) -> Result<(), VerificationError> {
-        let verifying_key = VerifyingKey::<Sha256>::from(params.pub_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(params.pub_key.clone());
         verifying_key
             .verify(
                 STATE_UPDATE,
@@ -415,5 +415,61 @@ impl ContractInterface for Inbox {
         let summary = InboxSummary::try_from(summary)?;
         let delta = inbox.delta(summary);
         delta.try_into()
+    }
+}
+
+#[cfg(feature = "contract")]
+mod tests {
+    use super::*;
+    use rsa::{pkcs1::DecodeRsaPrivateKey, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+
+    #[test]
+    fn validate_test() -> Result<(), Box<dyn std::error::Error>> {
+        let private_key = RsaPrivateKey::from_pkcs1_pem(include_str!(
+            "../../../web/examples/rsa4096-id-0-priv.pem"
+        ))
+        .unwrap();
+        let public_key = private_key.to_public_key();
+
+        let params: Parameters = InboxParams {
+            pub_key: public_key.clone(),
+        }
+        .try_into()
+        .map_err(|e| format!("{e}"))
+        .unwrap();
+
+        let digest = Sha256::digest(STATE_UPDATE).to_vec();
+        let signature = private_key
+            .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+            .unwrap();
+
+        println!("{:?}", signature);
+
+        let state_bytes = format!(
+            r#"{{
+            "messages": [],
+            "last_update": "2022-05-10T00:00:00Z",
+            "settings": {{
+                "minimum_tier": "Day1",
+                "private": []
+            }},
+            "inbox_signature": {}
+        }}"#,
+            serde_json::to_string(&signature).unwrap()
+        )
+        .as_bytes()
+        .to_vec();
+
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(public_key.clone());
+        let sign = &rsa::pkcs1v15::Signature::try_from(signature.as_slice()).unwrap();
+
+        match verifying_key.verify(STATE_UPDATE, sign) {
+            Ok(_) => println!("successful verification"),
+            Err(e) => println!("verification error: {:?}", e),
+        };
+
+        let is_valid = Inbox::validate_state(params, State::from(state_bytes), Default::default())?;
+        assert!(is_valid == ValidateResult::Valid);
+        Ok(())
     }
 }

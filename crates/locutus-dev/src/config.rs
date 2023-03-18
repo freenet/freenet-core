@@ -89,7 +89,6 @@ pub struct PutConfig {
 /// This tool will build the WASM contract and publish it to the network.
 #[derive(clap::Parser, Clone, Debug)]
 pub struct BuildToolCliConfig {
-
     /// Compile the contract with a specific features.
     #[clap(long)]
     pub(crate) features: Option<String>,
