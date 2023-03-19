@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn validate_test() -> Result<(), Box<dyn std::error::Error>> {
         let private_key = RsaPrivateKey::from_pkcs1_pem(include_str!(
-            "../../../web/examples/rsa4096-id-0-priv.pem"
+            "../../../web/examples/rsa4096-user-priv.pem"
         ))
         .unwrap();
         let public_key = private_key.to_public_key();
@@ -442,8 +442,6 @@ mod tests {
         let signature = private_key
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
             .unwrap();
-
-        println!("{:?}", signature);
 
         let state_bytes = format!(
             r#"{{

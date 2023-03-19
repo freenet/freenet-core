@@ -2,4 +2,4 @@
 lang = "rust"
 
 [state]
-files = ["initial_state.json"]
+files = ["examples/initial_state.json"]

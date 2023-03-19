@@ -4,10 +4,11 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use freenet_email_inbox::InboxParams;
-use locutus_stdlib::prelude::Parameters;
-use rsa::RsaPrivateKey;
+use locutus_stdlib::prelude::{Parameters, blake2::Digest};
+use rsa::{RsaPrivateKey, sha2::Sha256, Pkcs1v15Sign};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -30,10 +31,22 @@ fn main() {
             .unwrap();
     let pub_key = private_key.to_public_key();
     let inbox_path = PathBuf::from(MANIFEST);
-    let params: Parameters = InboxParams { pub_key }
-        .try_into()
-        .map_err(|e| format!("{e}"))
+    let digest = Sha256::digest(STATE_UPDATE).to_vec();
+    let signature = private_key
+        .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
         .unwrap();
-    let params_file_name = format!("inbox_key_{}", key_id);
-    std::fs::write(inbox_path.join("examples").join(params_file_name), params.into_bytes()).unwrap();
+
+    let state = format!(
+        r#"{{
+            "messages": [],
+            "last_update": "2022-05-10T00:00:00Z",
+            "settings": {{
+                "minimum_tier": "Day1",
+                "private": []
+            }},
+            "inbox_signature": {}
+        }}"#,
+        serde_json::to_string(&signature).unwrap()
+    );
+    std::fs::write(inbox_path.join("examples").join("initial_state.json"), state).unwrap();
 }
