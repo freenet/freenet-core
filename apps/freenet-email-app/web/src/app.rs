@@ -291,7 +291,7 @@ pub(crate) fn App(cx: Scope) -> Element {
             id: 0,
             alias: "ian.clarke@freenet.org".to_owned(),
             pub_key: {
-                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
+                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
                 RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
                     .unwrap()
                     .to_public_key()
@@ -301,7 +301,7 @@ pub(crate) fn App(cx: Scope) -> Element {
             id: 1,
             alias: "other.stuff@freenet.org".to_owned(),
             pub_key: {
-                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
+                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-2-priv.pem");
                 RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
                     .unwrap()
                     .to_public_key()
