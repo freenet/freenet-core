@@ -125,7 +125,8 @@ impl Runtime {
                     }
                     let outbound = self.exec_inbound(
                         &InboundComponentMsg::ApplicationMessage(
-                            ApplicationMessage::new(msg.app, msg.payload, msg.processed)
+                            ApplicationMessage::new(msg.app, msg.payload)
+                                .processed(msg.processed)
                                 .with_context(last_context.clone()),
                         ),
                         process_func,
@@ -202,8 +203,9 @@ impl ComponentRuntimeInterface for Runtime {
                     let mut outbound = VecDeque::from(
                         self.exec_inbound(
                             &InboundComponentMsg::ApplicationMessage(
-                                ApplicationMessage::new(app, payload, processed)
-                                    .with_context(last_context.clone()),
+                                ApplicationMessage::new(app, payload)
+                                    .with_context(last_context.clone())
+                                    .processed(processed),
                             ),
                             &process_func,
                             &running.instance,
@@ -344,7 +346,7 @@ mod test {
 
         // CreateInboxRequest message parts
         let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
-        let create_inbox_request_msg = ApplicationMessage::new(app, payload, false);
+        let create_inbox_request_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundComponentMsg::ApplicationMessage(create_inbox_request_msg);
         let outbound = runtime.inbound_app_message(component.key(), vec![inbound])?;
@@ -360,7 +362,7 @@ mod test {
         // CreateInboxRequest message parts
         let payload: Vec<u8> =
             bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
-        let please_sign_message_msg = ApplicationMessage::new(app, payload, false);
+        let please_sign_message_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundComponentMsg::ApplicationMessage(please_sign_message_msg);
         let outbound = runtime.inbound_app_message(component.key(), vec![inbound])?;

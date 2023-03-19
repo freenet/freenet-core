@@ -20,9 +20,6 @@ pub fn main() {
             .try_init();
         use dioxus_desktop::{tao::dpi::LogicalPosition, LogicalSize};
         use dioxus_desktop::{Config, WindowBuilder};
-        // if cfg!(debug_assertions) {
-        //     hot_reload_init!();
-        // }
         const INDEX: &str = r#"
             <!DOCTYPE html>
             <html>

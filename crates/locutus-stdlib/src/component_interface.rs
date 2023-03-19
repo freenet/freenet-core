@@ -144,7 +144,7 @@ impl ComponentKey {
             .into_string()
     }
 
-    /// Returns the hash of the contract key only.
+    /// Returns the hash of the component code only.
     pub fn code_hash(&self) -> &[u8; COMPONENT_HASH_LENGTH] {
         &self.0
     }
@@ -254,17 +254,22 @@ pub struct ApplicationMessage {
 }
 
 impl ApplicationMessage {
-    pub fn new(app: ContractInstanceId, payload: Vec<u8>, processed: bool) -> Self {
+    pub fn new(app: ContractInstanceId, payload: Vec<u8>) -> Self {
         Self {
             app,
             payload,
             context: ComponentContext::default(),
-            processed,
+            processed: false,
         }
     }
 
     pub fn with_context(mut self, context: ComponentContext) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn processed(mut self, p: bool) -> Self {
+        self.processed = p;
         self
     }
 }

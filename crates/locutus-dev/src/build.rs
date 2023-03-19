@@ -329,18 +329,31 @@ fn compile_contract(
             if target == WASI_TARGET {
                 println!("Enabling WASI extension");
             }
-            let build_features = cli_config.features.as_ref().unwrap().as_str();
             let cmd_args = if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
                 RUST_TARGET_ARGS
                     .iter()
                     .copied()
-                    .chain([target, "--features", build_features, "--color", "always"])
+                    .chain([target, "--color", "always"])
+                    .chain(
+                        cli_config
+                            .features
+                            .as_ref()
+                            .iter()
+                            .flat_map(|x| ["--features", x.as_str()]),
+                    )
                     .collect::<Vec<_>>()
             } else {
                 RUST_TARGET_ARGS
                     .iter()
                     .copied()
-                    .chain([target, "--features", build_features])
+                    .chain([target])
+                    .chain(
+                        cli_config
+                            .features
+                            .as_ref()
+                            .iter()
+                            .flat_map(|x| ["--features", x.as_str()]),
+                    )
                     .collect::<Vec<_>>()
             };
 
@@ -420,6 +433,7 @@ fn get_contract_with_version(
     cli_config: &BuildToolCliConfig,
 ) -> Result<Vec<u8>, DynError> {
     let code = WrappedContract::get_data_from_fs(contract_path)?;
+    tracing::info!("compiled contract code hash: {}", code.hash_str());
     let mut serialized_version = serde_json::to_vec(&cli_config.version).map_err(|e| {
         Error::MissConfiguration(format!("couldn't serialize contract version: {e}").into())
     })?;

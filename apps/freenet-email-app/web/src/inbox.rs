@@ -1,23 +1,54 @@
 use std::collections::HashSet;
+use std::{cell::RefCell, rc::Rc};
 
 use chrono::{DateTime, Utc};
+use dioxus::prelude::*;
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
     UpdateInbox,
 };
 use locutus_aft_interface::{Tier, TokenAssignment};
+use locutus_stdlib::client_api::{ClientRequest, ComponentRequest};
+use locutus_stdlib::prelude::{
+    ApplicationMessage, ComponentKey, InboundComponentMsg, OutboundComponentMsg,
+};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractCode, ContractKey, State, UpdateData},
 };
+use once_cell::unsync::Lazy;
 use rand_chacha::rand_core::SeedableRng;
+use rsa::RsaPublicKey;
 use rsa::{
     pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, PublicKey,
     RsaPrivateKey,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::app::Identity;
 use crate::WebApi;
+
+static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
+
+#[cfg(all(feature = "use-node", target_arch = "wasm32"))]
+thread_local! {
+    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
+            let api = crate::WebApi::new()
+                .map_err(|err| {
+                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+                    err
+                })
+                .expect("open connection");
+            Rc::new(RefCell::new(api))
+    })
+}
+
+#[cfg(all(feature = "use-node", not(target_arch = "wasm32")))]
+thread_local! {
+    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
+        unimplemented!()
+    })
+}
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -96,6 +127,109 @@ pub(crate) struct InboxModel {
 }
 
 impl InboxModel {
+    pub(crate) fn load(
+        cx: Scope,
+        contract: &Identity,
+        private_key: &RsaPrivateKey,
+    ) -> Result<Self, String> {
+        let private_key = private_key.clone();
+        CONNECTION.with(|conn| {
+            let params = InboxParams {
+                pub_key: contract.pub_key.clone(),
+            }
+            .try_into()
+            .map_err(|e| format!("{e}"))?;
+            let contract_key =
+                ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
+            let client = (**conn).clone();
+            // FIXME: properly set this future to re-evaluate on change, now it would only send once
+            let f = use_future(cx, (), |_| async move {
+                let client = &mut *client.borrow_mut();
+                InboxModel::get_inbox(client, &private_key, contract_key).await
+            });
+            let inbox = loop {
+                match f.value() {
+                    Some(v) => break v.as_ref().unwrap(),
+                    None => std::thread::sleep(std::time::Duration::from_micros(100)),
+                }
+            };
+            Ok::<_, String>(inbox.clone())
+        })
+    }
+
+    pub(crate) fn send_message(
+        mut self,
+        cx: Scope,
+        content: DecryptedMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        CONNECTION.with(|conn| {
+            let client = (**conn).clone();
+            let token = {
+                // FIXME: properly set this future to re-evaluate on change, now it would only send once
+                let f = use_future(cx, (), |_| async move {
+                    fn recipient_key() -> RsaPublicKey {
+                        todo!()
+                    }
+                    let client = &mut *client.borrow_mut();
+                    InboxModel::assign_token(client, recipient_key()).await
+                });
+                loop {
+                    match f.value() {
+                        Some(Ok(r)) => break r.clone(),
+                        Some(Err(e)) => return Err(format!("{e}").into()),
+                        None => std::thread::sleep(std::time::Duration::from_micros(100)),
+                    }
+                }
+            };
+            self.add_received_message(content, token);
+            // FIXME: properly set this future to re-evaluate on change, now it would only send once
+            let client = (**conn).clone();
+            let f = use_future(cx, (), |_| async move {
+                let client = &mut *client.borrow_mut();
+                self.add_messages_to_store(client, &[0]).await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            });
+            loop {
+                match f.value() {
+                    Some(Err(e)) => {
+                        break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
+                    }
+                    Some(_) => {}
+                    None => std::thread::sleep(std::time::Duration::from_micros(100)),
+                }
+            }
+        })
+    }
+
+    pub(crate) fn remove_messages<T>(
+        this: Rc<RefCell<Self>>,
+        cx: Scope<T>,
+        ids: &[u64],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        this.borrow_mut().remove_received_message(ids);
+        let ids = ids.to_vec();
+        CONNECTION.with(|conn| {
+            let client = (**conn).clone();
+            // FIXME: properly set this future to re-evaluate on change, now it would only send once
+            let f = use_future(cx, (), |_| async move {
+                let client = &mut *client.borrow_mut();
+                this.borrow_mut()
+                    .remove_messages_from_store(client, &ids)
+                    .await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            });
+            loop {
+                match f.value() {
+                    Some(Err(e)) => {
+                        break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
+                    }
+                    Some(_) => {}
+                    None => std::thread::sleep(std::time::Duration::from_micros(100)),
+                }
+            }
+        })
+    }
+
     fn new(private_key: RsaPrivateKey) -> Result<Self, Box<dyn std::error::Error>> {
         let params = InboxParams {
             pub_key: private_key.to_public_key(),
@@ -156,7 +290,7 @@ impl InboxModel {
     }
 
     /// This only affects in-memory messages, changes are not persisted.
-    pub fn add_received_message(
+    fn add_received_message(
         &mut self,
         content: DecryptedMessage,
         token_assignment: TokenAssignment,
@@ -170,7 +304,7 @@ impl InboxModel {
     }
 
     /// This only affects in-memory messages, changes are not persisted.
-    pub fn remove_received_message(&mut self, ids: &[u64]) {
+    fn remove_received_message(&mut self, ids: &[u64]) {
         if ids.len() > 1 {
             let drop: HashSet<u64> = HashSet::from_iter(ids.iter().copied());
             self.messages.retain(|a| !drop.contains(&a.id));
@@ -203,7 +337,7 @@ impl InboxModel {
         Ok(())
     }
 
-    pub async fn remove_messages_from_store(
+    async fn remove_messages_from_store(
         &mut self,
         client: &mut WebApi,
         ids: &[u64],
@@ -226,8 +360,27 @@ impl InboxModel {
         Ok(())
     }
 
-    #[cfg(feature = "node")]
-    pub async fn add_messages_to_store(
+    async fn assign_token(
+        client: &mut WebApi,
+        recipient_key: RsaPublicKey,
+    ) -> Result<TokenAssignment, Box<dyn std::error::Error>> {
+        let key = ComponentKey::new(&[]); // TODO: this should be the AFT component key
+        let params = InboxParams {
+            pub_key: recipient_key,
+        }
+        .try_into()?;
+        let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, params)?;
+        let request = ClientRequest::ComponentOp(ComponentRequest::ApplicationMessages {
+            key,
+            inbound: vec![InboundComponentMsg::ApplicationMessage(
+                ApplicationMessage::new(inbox_key.into(), vec![]),
+            )],
+        });
+        client.send(request).await?;
+        todo!()
+    }
+
+    async fn add_messages_to_store(
         &mut self,
         client: &mut WebApi,
         ids: &[usize],
@@ -245,7 +398,7 @@ impl InboxModel {
         Ok(())
     }
 
-    pub(crate) async fn get_inbox(
+    async fn get_inbox(
         client: &mut WebApi,
         private_key: &RsaPrivateKey,
         key: ContractKey,

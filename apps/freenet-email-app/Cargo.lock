@@ -1743,6 +1743,7 @@ dependencies = [
  "dioxus-desktop",
  "dioxus-web",
  "freenet-email-inbox",
+ "futures",
  "getrandom 0.2.8",
  "locutus-aft-interface",
  "locutus-dev",

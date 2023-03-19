@@ -1052,6 +1052,12 @@ impl From<ContractInstanceId> for ContractKey {
     }
 }
 
+impl From<ContractKey> for ContractInstanceId {
+    fn from(key: ContractKey) -> Self {
+        key.instance
+    }
+}
+
 impl<'a, T, U> From<(T, U)> for ContractKey
 where
     T: Borrow<Parameters<'a>>,
@@ -1097,9 +1103,9 @@ impl ContractKey {
         })
     }
 
-    /// Returns the decoded contract key from encoded hash of the contract key and the given
+    /// Returns the contract key from the encoded hash of the contract code and the given
     /// parameters.
-    pub fn decode(
+    pub fn from_params(
         code_hash: impl Into<String>,
         parameters: Parameters,
     ) -> Result<Self, bs58::decode::Error> {
@@ -1709,7 +1715,7 @@ mod test {
         // let encoded_code = expected.contract_part_as_str();
         // println!("encoded key: {encoded_code}");
 
-        let decoded = ContractKey::decode(code.hash_str(), [].as_ref().into())?;
+        let decoded = ContractKey::from_params(code.hash_str(), [].as_ref().into())?;
         assert_eq!(expected, decoded);
         assert_eq!(expected.code_hash(), decoded.code_hash());
         Ok(())

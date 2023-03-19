@@ -3,34 +3,12 @@ use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use chrono::Utc;
 use dioxus::prelude::*;
-use freenet_email_inbox::InboxParams;
-use locutus_stdlib::prelude::ContractKey;
-use once_cell::unsync::Lazy;
+use locutus_stdlib::prelude::ContractContainer;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::inbox::{DecryptedMessage, InboxModel, MessageModel};
 
 mod login;
-
-#[cfg(all(feature = "node", target_arch = "wasm32"))]
-thread_local! {
-    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
-            let api = crate::WebApi::new()
-                .map_err(|err| {
-                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-                    err
-                })
-                .expect("open connection");
-            Rc::new(RefCell::new(api))
-    })
-}
-
-#[cfg(all(feature = "node", not(target_arch = "wasm32")))]
-thread_local! {
-    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
-        unimplemented!()
-    })
-}
 
 #[derive(Debug, Clone)]
 struct Inbox {
@@ -40,8 +18,6 @@ struct Inbox {
     active_id: usize,
 }
 
-static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_key");
-
 impl Inbox {
     fn new(
         cx: Scope,
@@ -49,31 +25,10 @@ impl Inbox {
         private_key: &rsa::RsaPrivateKey,
     ) -> Result<Self, String> {
         let mut models = Vec::with_capacity(contracts.len());
-        #[cfg(feature = "node")]
+        #[cfg(feature = "use-node")]
         {
             for contract in &contracts {
-                let private_key = private_key.clone();
-                let model = CONNECTION.with(|conn| {
-                    let params = InboxParams {
-                        pub_key: contract.pub_key.clone(),
-                    }
-                    .try_into()
-                    .map_err(|e| format!("{e}"))?;
-                    let contract_key =
-                        ContractKey::decode(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-                    let client = (**conn).clone();
-                    let f = use_future(cx, (), |_| async move {
-                        let client = &mut *client.borrow_mut();
-                        InboxModel::get_inbox(client, &private_key, contract_key).await
-                    });
-                    let inbox = loop {
-                        match f.value() {
-                            Some(v) => break v.as_ref().unwrap(),
-                            None => std::thread::sleep(std::time::Duration::from_micros(100)),
-                        }
-                    };
-                    Ok::<_, String>(inbox.clone())
-                })?;
+                let model = InboxModel::load(cx, contract, private_key)?;
                 models.push(Rc::new(RefCell::new(model)));
             }
         }
@@ -93,7 +48,7 @@ impl Inbox {
         content: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::debug!("adding to {}", self.active_id);
-        #[cfg(feature = "node")]
+        #[cfg(feature = "use-node")]
         {
             let content = DecryptedMessage {
                 title: title.to_owned(),
@@ -105,38 +60,22 @@ impl Inbox {
             };
             #[cfg(target_arch = "wasm32")]
             {
-                web_sys::console::error_1(
+                web_sys::console::log_1(
                     &serde_wasm_bindgen::to_value(&format!("adding to {}", self.active_id))
                         .unwrap(),
                 );
             }
-            let inbox = self.inbox_data[self.active_id].clone();
-            let token = {
-                // todo: request the recipient inbox contract and try to add it to the inbox
-                todo!("request the token assignment to the component here with the specs of the recipient inbox")
-            };
-            inbox.borrow_mut().add_received_message(content, token);
-            CONNECTION.with(|conn| {
-                let client = (**conn).clone();
-                let f = use_future(cx, (), |_| async move {
-                    let client = &mut *client.borrow_mut();
-                    inbox
-                        .borrow_mut()
-                        .add_messages_to_store(client, &[0])
-                        .await?;
-                    Ok::<_, Box<dyn std::error::Error>>(())
-                });
-                loop {
-                    match f.value() {
-                        Some(Err(e)) => {
-                            break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
-                        }
-                        Some(_) => {}
-                        None => std::thread::sleep(std::time::Duration::from_micros(100)),
-                    }
-                }
-            })?;
+
+            async fn get_inbox(key: &str) -> Result<InboxModel, Box<dyn std::error::Error>> {
+                todo!()
+            }
+
+            for k in content.to.iter() {
+                let inbox = futures::executor::block_on(get_inbox(k))?;
+                InboxModel::send_message(inbox, cx, content.clone())?;
+            }
         }
+        let _ = cx;
         Ok(())
     }
 
@@ -146,31 +85,10 @@ impl Inbox {
         ids: &[u64],
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::debug!("removing {}", self.active_id);
-        #[cfg(feature = "node")]
+        #[cfg(feature = "use-node")]
         {
             let inbox = self.inbox_data[self.active_id].clone();
-            inbox.borrow_mut().remove_received_message(ids);
-            let ids = ids.to_vec();
-            CONNECTION.with(|conn| {
-                let client = (**conn).clone();
-                let f = use_future(cx, (), |_| async move {
-                    let client = &mut *client.borrow_mut();
-                    inbox
-                        .borrow_mut()
-                        .remove_messages_from_store(client, &ids)
-                        .await?;
-                    Ok::<_, Box<dyn std::error::Error>>(())
-                });
-                loop {
-                    match f.value() {
-                        Some(Err(e)) => {
-                            break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
-                        }
-                        Some(_) => {}
-                        None => std::thread::sleep(std::time::Duration::from_micros(100)),
-                    }
-                }
-            })?;
+            InboxModel::remove_messages(inbox, cx, ids)?;
         }
         Ok(())
     }
@@ -241,7 +159,7 @@ impl Inbox {
         self.messages.replace(emails);
     }
 
-    #[cfg(all(feature = "node", not(feature = "ui-testing")))]
+    #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
     fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
         CONNECTION.with(|conn| {
             let private_key = private_key.clone();
@@ -273,6 +191,7 @@ impl Inbox {
 
 struct User {
     logged: bool,
+    identified: bool,
     active_id: Option<usize>,
     identities: Vec<Identity>,
     private_key: Option<RsaPrivateKey>,
@@ -283,15 +202,20 @@ impl User {
     fn new() -> Self {
         const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
         let priv_key = RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap();
+        // TODO: here we should be checking if an existing identity sidekick exists
+        let identified = true;
         User {
-            logged: true,
+            logged: false,
+            identified,
             active_id: None,
             identities: vec![
                 Identity {
+                    alias: "ian.clarke@freenet.org".to_owned(),
                     id: 0,
                     pub_key: priv_key.to_public_key(),
                 },
                 Identity {
+                    alias: "other.stuff@freenet.org".to_owned(),
                     id: 1,
                     pub_key: priv_key.to_public_key(),
                 },
@@ -311,9 +235,10 @@ impl User {
 }
 
 #[derive(Clone, Debug)]
-struct Identity {
-    id: usize,
-    pub_key: RsaPublicKey,
+pub(crate) struct Identity {
+    pub id: usize,
+    pub pub_key: RsaPublicKey,
+    alias: String,
 }
 
 #[derive(Debug, Clone, Eq, Props)]
@@ -364,6 +289,7 @@ pub(crate) fn App(cx: Scope) -> Element {
     let contracts = vec![
         Identity {
             id: 0,
+            alias: "ian.clarke@freenet.org".to_owned(),
             pub_key: {
                 const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
                 RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
@@ -373,6 +299,7 @@ pub(crate) fn App(cx: Scope) -> Element {
         },
         Identity {
             id: 1,
+            alias: "other.stuff@freenet.org".to_owned(),
             pub_key: {
                 const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
                 RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
@@ -389,16 +316,19 @@ pub(crate) fn App(cx: Scope) -> Element {
     });
 
     let user = use_shared_state::<User>(cx).unwrap();
-    let user = user.read();
-    if let Some(id) = user.logged_id() {
+    if !user.read().identified {
+        cx.render(rsx! {
+            login::GetOrCreateIndentity {}
+        })
+    } else if let Some(id) = user.read().logged_id() {
         let inbox = use_context::<Inbox>(cx).unwrap();
-        inbox.load_messages(cx, id, user.private_key.as_ref().unwrap());
+        inbox.load_messages(cx, id, user.read().private_key.as_ref().unwrap());
         cx.render(rsx! {
            UserInbox {}
         })
     } else {
         cx.render(rsx! {
-           login::LoggingScreen {}
+           login::IdentifiersList {}
         })
     }
 }
@@ -611,7 +541,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
         Ok(()) => {}
         Err(e) => {
             let err = format!("{e}");
-            #[cfg(all(feature = "node", target_arch = "wasm32"))]
+            #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
             {
                 web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
             }
@@ -641,7 +571,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
                             Ok(()) => {}
                             Err(e) => {
                                 let err = format!("{e}");
-                                #[cfg(all(feature = "node", target_arch = "wasm32"))]
+                                #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
                                 {
                                     web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
                                 }
@@ -666,6 +596,9 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
 fn NewMessageWindow(cx: Scope) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let inbox = use_context::<Inbox>(cx).unwrap();
+    let user = use_shared_state::<User>(cx).unwrap();
+    let user = user.read();
+    let user_alias = user.logged_id().unwrap().alias.as_str();
     let to = use_state(cx, String::new);
     let title = use_state(cx, String::new);
     let content = use_state(cx, String::new);
@@ -680,7 +613,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
                     tbody {
                         tr {
                             th { "From" }
-                            td { style: "width: 100%", br {} }
+                            td { style: "width: 100%", "{user_alias}" }
                         }
                         tr {
                             th { "To"}
@@ -709,7 +642,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
                             Ok(()) => {}
                             Err(e) => {
                                 let err = format!("{e}");
-                                #[cfg(all(feature = "node", target_arch = "wasm32"))]
+                                #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
                                 {
                                     web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
                                 }

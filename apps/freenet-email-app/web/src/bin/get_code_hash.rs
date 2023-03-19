@@ -17,8 +17,9 @@ fn main() {
         .unwrap_v1()
         .code()
         .hash_str();
+    eprintln!("Inbox code hash: {code_key}");
     std::fs::write(
-        PathBuf::from(MANIFEST).join("../examples/inbox_key"),
+        PathBuf::from(MANIFEST).join("examples/inbox_code_hash"),
         code_key,
     )
     .unwrap();

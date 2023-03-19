@@ -5,15 +5,24 @@ edition = "2021"
 rust-version = "1.58.0"
 resolver = "2"
 publish = false
+default-run = "app"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "get_code_hash"
+required-features = ["build-binary"]
+
+[[bin]]
+name = "app"
 
 [dependencies]
 rand_chacha = "0.3"
 chrono = { workspace = true }
 crossbeam = "0.8"
 dioxus = { version = "0.3" }
+futures = "*"
 locutus-stdlib = { workspace = true, features = ["net"] }
 locutus-aft-interface = { workspace = true }
 once_cell = { workspace = true }
@@ -48,15 +57,9 @@ features = [
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 dioxus-desktop = { version = "0.3" }
-# dioxus-hot-reload = "0.1"
 
 [features]
 default = ["ui-testing"]
 ui-testing = []
-node = []
+use-node = []
 build-binary = ["locutus-dev"]
-
-[[bin]]
-name = "get_key"
-required-features = ["build-binary"]
-
