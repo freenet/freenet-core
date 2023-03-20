@@ -35,5 +35,9 @@ fn main() {
         .map_err(|e| format!("{e}"))
         .unwrap();
     let params_file_name = format!("inbox_key_{}", key_id);
-    std::fs::write(inbox_path.join("examples").join(params_file_name), params.into_bytes()).unwrap();
+    std::fs::write(
+        inbox_path.join("examples").join(params_file_name),
+        params.into_bytes(),
+    )
+    .unwrap();
 }

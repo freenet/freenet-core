@@ -4,8 +4,8 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use freenet_email_inbox::InboxParams;
-use locutus_stdlib::prelude::{Parameters, blake2::Digest};
-use rsa::{RsaPrivateKey, sha2::Sha256, Pkcs1v15Sign};
+use locutus_stdlib::prelude::{blake2::Digest, Parameters};
+use rsa::{sha2::Sha256, Pkcs1v15Sign, RsaPrivateKey};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
@@ -48,5 +48,9 @@ fn main() {
         }}"#,
         serde_json::to_string(&signature).unwrap()
     );
-    std::fs::write(inbox_path.join("examples").join("initial_state.json"), state).unwrap();
+    std::fs::write(
+        inbox_path.join("examples").join("initial_state.json"),
+        state,
+    )
+    .unwrap();
 }

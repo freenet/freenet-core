@@ -5,7 +5,7 @@ use locutus_stdlib::prelude::ContractInstanceId;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 
 pub(crate) fn test_assignment() -> TokenAssignment {
-    const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-user-priv.pem");
+    const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
     let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
     TokenAssignment {
         tier: Tier::Day1,

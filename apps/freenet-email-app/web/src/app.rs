@@ -310,7 +310,7 @@ pub(crate) fn App(cx: Scope) -> Element {
     ];
     use_shared_state_provider(cx, User::new);
     use_context_provider(cx, || {
-        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-user-priv.pem");
+        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
         let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
         Inbox::new(cx, contracts, &key).unwrap()
     });
