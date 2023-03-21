@@ -20,10 +20,10 @@ all:
 	$(MAKE) run-web &
 	wait
 
-build: build-tool build-inbox-1 build-inbox-2
+build: build-tool build-inbox-1 build-inbox-2 generate-contract-code-hash
 
-build-inbox-1: build-inbox-1 generate-contract-code-hash-1 publish-inbox-1
-build-inbox-2: build-inbox-2 generate-contract-code-hash-2 publish-inbox-2
+build-inbox-1: build-inbox-1 publish-inbox-1
+build-inbox-2: build-inbox-2 publish-inbox-2
 
 build-tool:
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
@@ -36,8 +36,8 @@ build-inbox-%:
 publish-inbox-%:
 	cd $(INBOX_DIR) && ldt publish --code build/locutus/freenet_email_inbox --state build/locutus/contract-state --parameters examples/inbox_key_$*
 
-generate-contract-code-hash-%:
-	cd $(WEB_DIR_SRC) && cargo run --bin get_code_hash --features use-node,build-binary -- $* "../../contracts/inbox/examples/inbox_key_$*"
+generate-contract-code-hash:
+	cd $(WEB_DIR_SRC) && cargo run --bin get_code_hash --features use-node,build-binary
 
 run-node:
 	 ${CARGO_TARGET_DIR}/debug/locutus-node local

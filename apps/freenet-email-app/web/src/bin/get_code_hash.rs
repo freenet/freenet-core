@@ -42,5 +42,5 @@ fn main() {
         PathBuf::from(MANIFEST).join(format!("examples/inbox_code_hash_{}", key_id)),
         code_key,
     )
-    .unwrap();
+        .unwrap();
 }
