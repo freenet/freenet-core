@@ -6,18 +6,27 @@ LOCUTUS_DIR := $(shell cd ../../ && pwd)
 INBOX_WEB_DIR := $(LOCUTUS_DIR)/apps/freenet-email-app/web
 INBOX_DIR := $(LOCUTUS_DIR)/apps/freenet-email-app/contracts/inbox
 INBOX_SRC_DIR := $(INBOX_DIR)/src
+WEB_DIR_SRC := $(LOCUTUS_DIR)/apps/freenet-email-app/web/src
+
+ifeq ($(CARGO_TARGET_DIR),)
+$(error CARGO_TARGET_DIR is not set)
+endif
 
 .PHONY: all build clean
 
-all: build run-node run-web
+all:
+	$(MAKE) build
+	$(MAKE) run-node &
+	$(MAKE) run-web &
+	wait
 
-build: build-tool build-and-publish-1 build-and-publish-2
+build: build-tool build-inbox-1 build-inbox-2
+
+build-inbox-1: build-inbox-1 generate-contract-code-hash-1 publish-inbox-1
+build-inbox-2: build-inbox-2 generate-contract-code-hash-2 publish-inbox-2
 
 build-tool:
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
-
-build-and-publish-1: build-inbox-1 publish-inbox-1
-build-and-publish-2: build-inbox-2 publish-inbox-2
 
 build-inbox-%:
 	cd $(INBOX_SRC_DIR) && cargo run --bin gen_initial_state -- $* "../../../web/examples/rsa4096-id-$*-priv.pem"
@@ -27,8 +36,11 @@ build-inbox-%:
 publish-inbox-%:
 	cd $(INBOX_DIR) && ldt publish --code build/locutus/freenet_email_inbox --state build/locutus/contract-state --parameters examples/inbox_key_$*
 
+generate-contract-code-hash-%:
+	cd $(WEB_DIR_SRC) && cargo run --bin get_code_hash --features use-node,build-binary -- $* "../../contracts/inbox/examples/inbox_key_$*"
+
 run-node:
-	 ${CARGO_TARGET_DIR}/debug/locutus-node local &
+	 ${CARGO_TARGET_DIR}/debug/locutus-node local
 
 run-web:
 	cd $(INBOX_WEB_DIR)

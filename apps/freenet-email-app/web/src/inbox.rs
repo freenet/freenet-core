@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::{cell::RefCell, rc::Rc};
 
 use chrono::{DateTime, Utc};
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::Identity;
 use crate::WebApi;
 
-static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
+static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash_1");
 
 #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
 thread_local! {
