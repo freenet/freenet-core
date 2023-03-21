@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::Identity;
 use crate::WebApi;
 
-static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash_1");
+static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
 
 #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
 thread_local! {
