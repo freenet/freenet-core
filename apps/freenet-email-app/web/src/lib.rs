@@ -67,7 +67,7 @@ struct WebApi {
 impl WebApi {
     #[cfg(target_family = "wasm")]
     fn new() -> Result<Self, String> {
-        let conn = web_sys::WebSocket::new("ws://localhost:55008/contract/command").unwrap();
+        let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
         let (tx, received) = crossbeam::channel::unbounded();
         let result_handler = move |result: Result<HostResponse, ClientError>| {
             tx.send(result).expect("channel open");
