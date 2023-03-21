@@ -9,12 +9,10 @@ use freenet_email_inbox::{
 };
 use locutus_aft_interface::{Tier, TokenAssignment};
 use locutus_stdlib::client_api::{ClientRequest, ComponentRequest};
-use locutus_stdlib::prelude::{
-    ApplicationMessage, ComponentKey, InboundComponentMsg, OutboundComponentMsg,
-};
+use locutus_stdlib::prelude::{ApplicationMessage, ComponentKey, InboundComponentMsg};
 use locutus_stdlib::{
     client_api::ContractRequest,
-    prelude::{ContractCode, ContractKey, State, UpdateData},
+    prelude::{ContractKey, State, UpdateData},
 };
 use once_cell::unsync::Lazy;
 use rand_chacha::rand_core::SeedableRng;
@@ -118,6 +116,25 @@ pub(crate) struct DecryptedMessage {
     pub time: DateTime<Utc>,
 }
 
+impl DecryptedMessage {
+    fn to_stored(
+        &self,
+        token_assignment: TokenAssignment,
+    ) -> Result<StoredMessage, Box<dyn std::error::Error>> {
+        // FIXME: use a real source of entropy
+        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let decrypted_content = serde_json::to_vec(self)?;
+        let content = token_assignment
+            .assignee
+            .encrypt(&mut rng, Pkcs1v15Encrypt, decrypted_content.as_ref())
+            .map_err(|e| format!("{e}"))?;
+        Ok::<_, Box<dyn std::error::Error>>(StoredMessage {
+            content,
+            token_assignment,
+        })
+    }
+}
+
 /// Inbox state
 #[derive(Debug, Clone)]
 pub(crate) struct InboxModel {
@@ -127,25 +144,22 @@ pub(crate) struct InboxModel {
 }
 
 impl InboxModel {
-    pub(crate) fn load(
-        cx: Scope,
-        contract: &Identity,
-        private_key: &RsaPrivateKey,
-    ) -> Result<Self, String> {
-        let private_key = private_key.clone();
+    pub(crate) fn load(cx: Scope, contract: &Identity) -> Result<Self, String> {
+        let private_key = contract.key.clone();
+        let params = InboxParams {
+            pub_key: contract.key.to_public_key(),
+        }
+        .try_into()
+        .map_err(|e| format!("{e}"))?;
+        let contract_key =
+            ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         CONNECTION.with(|conn| {
-            let params = InboxParams {
-                pub_key: contract.pub_key.clone(),
-            }
-            .try_into()
-            .map_err(|e| format!("{e}"))?;
-            let contract_key =
-                ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
             let client = (**conn).clone();
             // FIXME: properly set this future to re-evaluate on change, now it would only send once
             let f = use_future(cx, (), |_| async move {
                 let client = &mut *client.borrow_mut();
-                InboxModel::get_inbox(client, &private_key, contract_key).await
+                let state = InboxModel::get_state(client, contract_key.clone()).await?;
+                Self::from_state(private_key, state, contract_key)
             });
             let inbox = loop {
                 match f.value() {
@@ -156,22 +170,19 @@ impl InboxModel {
             Ok::<_, String>(inbox.clone())
         })
     }
-
     pub(crate) fn send_message(
-        mut self,
         cx: Scope,
         content: DecryptedMessage,
+        pub_key: RsaPublicKey,
     ) -> Result<(), Box<dyn std::error::Error>> {
         CONNECTION.with(|conn| {
             let client = (**conn).clone();
             let token = {
                 // FIXME: properly set this future to re-evaluate on change, now it would only send once
+                let key = pub_key.clone();
                 let f = use_future(cx, (), |_| async move {
-                    fn recipient_key() -> RsaPublicKey {
-                        todo!()
-                    }
                     let client = &mut *client.borrow_mut();
-                    InboxModel::assign_token(client, recipient_key()).await
+                    InboxModel::assign_token(client, key).await
                 });
                 loop {
                     match f.value() {
@@ -181,12 +192,23 @@ impl InboxModel {
                     }
                 }
             };
-            self.add_received_message(content, token);
             // FIXME: properly set this future to re-evaluate on change, now it would only send once
             let client = (**conn).clone();
+            let params = InboxParams { pub_key }
+                .try_into()
+                .map_err(|e| format!("{e}"))?;
+            let key =
+                ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
             let f = use_future(cx, (), |_| async move {
                 let client = &mut *client.borrow_mut();
-                self.add_messages_to_store(client, &[0]).await?;
+                let delta = UpdateInbox::AddMessages {
+                    messages: vec![content.to_stored(token)?],
+                };
+                let request = ContractRequest::Update {
+                    key,
+                    data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
+                };
+                client.send(request.into()).await?;
                 Ok::<_, Box<dyn std::error::Error>>(())
             });
             loop {
@@ -230,21 +252,7 @@ impl InboxModel {
         })
     }
 
-    fn new(private_key: RsaPrivateKey) -> Result<Self, Box<dyn std::error::Error>> {
-        let params = InboxParams {
-            pub_key: private_key.to_public_key(),
-        };
-        Ok(Self {
-            messages: vec![],
-            settings: InternalSettings {
-                next_msg_id: 0,
-                minimum_tier: Tier::Hour1,
-                private_key,
-            },
-            key: ContractKey::from((&params.try_into()?, ContractCode::from([].as_slice()))),
-        })
-    }
-
+    // TODO: only used when an inbox is created first time
     fn to_state(&self) -> Result<State<'static>, Box<dyn std::error::Error>> {
         let settings = self.settings.to_stored()?;
         let messages = self
@@ -290,6 +298,7 @@ impl InboxModel {
     }
 
     /// This only affects in-memory messages, changes are not persisted.
+    // TODO: call when new message updates come from the node
     fn add_received_message(
         &mut self,
         content: DecryptedMessage,
@@ -380,29 +389,28 @@ impl InboxModel {
         todo!()
     }
 
-    async fn add_messages_to_store(
-        &mut self,
-        client: &mut WebApi,
-        ids: &[usize],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut messages = Vec::with_capacity(ids.len() * 32);
-        for m in &self.messages {
-            messages.push(m.to_stored(&self.settings.private_key)?);
-        }
-        let delta = UpdateInbox::AddMessages { messages };
-        let request = ContractRequest::Update {
-            key: self.key.clone(),
-            data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
-        };
-        client.send(request.into()).await?;
-        Ok(())
-    }
+    // async fn add_messages_to_store(
+    //     &mut self,
+    //     client: &mut WebApi,
+    //     ids: &[usize],
+    // ) -> Result<(), Box<dyn std::error::Error>> {
+    //     let mut messages = Vec::with_capacity(ids.len() * 32);
+    //     for message in &self.messages {
+    //         // messages.push(message.to_stored(&self.settings.private_key)?);
+    //     }
+    //     let delta = UpdateInbox::AddMessages { messages };
+    //     let request = ContractRequest::Update {
+    //         key: self.key.clone(),
+    //         data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
+    //     };
+    //     client.send(request.into()).await?;
+    //     Ok(())
+    // }
 
-    async fn get_inbox(
+    async fn get_state(
         client: &mut WebApi,
-        private_key: &RsaPrivateKey,
         key: ContractKey,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<StoredInbox, Box<dyn std::error::Error>> {
         use locutus_stdlib::client_api::{ContractResponse, HostResponse};
         let request = ContractRequest::Get {
             key,
@@ -410,10 +418,9 @@ impl InboxModel {
         };
         client.send(request.into()).await?;
         match client.recv().await? {
-            HostResponse::ContractResponse(ContractResponse::GetResponse { contract, state }) => {
-                let Some(c) = contract else { panic!() };
+            HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
                 let state: StoredInbox = serde_json::from_slice(state.as_ref())?;
-                Self::from_state(private_key.clone(), state, c.key())
+                Ok(state)
             }
             _ => panic!(),
         }
@@ -422,9 +429,27 @@ impl InboxModel {
 
 #[cfg(test)]
 mod tests {
+    use locutus_stdlib::prelude::ContractCode;
     use rsa::pkcs1::DecodeRsaPrivateKey;
 
     use super::*;
+
+    impl InboxModel {
+        fn new(private_key: RsaPrivateKey) -> Result<Self, Box<dyn std::error::Error>> {
+            let params = InboxParams {
+                pub_key: private_key.to_public_key(),
+            };
+            Ok(Self {
+                messages: vec![],
+                settings: InternalSettings {
+                    next_msg_id: 0,
+                    minimum_tier: Tier::Hour1,
+                    private_key,
+                },
+                key: ContractKey::from((&params.try_into()?, ContractCode::from([].as_slice()))),
+            })
+        }
+    }
 
     #[test]
     fn remove_msg() {

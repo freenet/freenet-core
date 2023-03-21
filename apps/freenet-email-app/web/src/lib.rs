@@ -2,7 +2,7 @@ use locutus_stdlib::client_api::{ClientError, HostResponse};
 
 mod app;
 pub(crate) mod inbox;
-#[cfg(any(feature = "ui-testing", test))]
+#[cfg(test)]
 pub(crate) mod test_util;
 
 const MAIN_ELEMENT_ID: &str = "freenet-email-main";

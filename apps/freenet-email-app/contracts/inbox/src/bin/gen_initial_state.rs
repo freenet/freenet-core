@@ -3,8 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-use freenet_email_inbox::InboxParams;
-use locutus_stdlib::prelude::{blake2::Digest, Parameters};
+use locutus_stdlib::prelude::blake2::Digest;
 use rsa::{sha2::Sha256, Pkcs1v15Sign, RsaPrivateKey};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
@@ -17,7 +16,6 @@ fn main() {
         std::process::exit(1);
     }
     println!("args: {:?}", args);
-    let key_id = &args[1];
     let key_file_path = &args[2];
 
     // Open the key file and read its contents into a buffer
@@ -29,7 +27,6 @@ fn main() {
     let private_key =
         <RsaPrivateKey as rsa::pkcs1::DecodeRsaPrivateKey>::from_pkcs1_pem(private_key_str)
             .unwrap();
-    let pub_key = private_key.to_public_key();
     let inbox_path = PathBuf::from(MANIFEST);
     let digest = Sha256::digest(STATE_UPDATE).to_vec();
     let signature = private_key

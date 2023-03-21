@@ -3,38 +3,59 @@ use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use chrono::Utc;
 use dioxus::prelude::*;
-use locutus_stdlib::prelude::ContractContainer;
-use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
+use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::inbox::{DecryptedMessage, InboxModel, MessageModel};
 
 mod login;
 
+pub(crate) fn App(cx: Scope) -> Element {
+    // #[cfg(target_arch = "wasm32")]
+    // {
+    //     web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
+    // }
+
+    use_shared_state_provider(cx, User::new);
+    let user = use_shared_state::<User>(cx).unwrap();
+
+    use_context_provider(cx, || Inbox::new(cx, &user.read().identities).unwrap());
+
+    if !user.read().identified {
+        cx.render(rsx! {
+            login::GetOrCreateIndentity {}
+        })
+    } else if let Some(id) = user.read().logged_id() {
+        let inbox = use_context::<Inbox>(cx).unwrap();
+        inbox.load_messages(cx, id);
+        cx.render(rsx! {
+           UserInbox {}
+        })
+    } else {
+        cx.render(rsx! {
+           login::IdentifiersList {}
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Inbox {
-    inbox_ids: Vec<Identity>,
     inbox_data: Vec<Rc<RefCell<InboxModel>>>,
     messages: Rc<RefCell<Vec<Message>>>,
     active_id: usize,
 }
 
 impl Inbox {
-    fn new(
-        cx: Scope,
-        contracts: Vec<Identity>,
-        private_key: &rsa::RsaPrivateKey,
-    ) -> Result<Self, String> {
+    fn new(cx: Scope, contracts: &[Identity]) -> Result<Self, String> {
         let mut models = Vec::with_capacity(contracts.len());
         #[cfg(feature = "use-node")]
         {
-            for contract in &contracts {
-                let model = InboxModel::load(cx, contract, private_key)?;
+            for identity in contracts {
+                let model = InboxModel::load(cx, identity)?;
                 models.push(Rc::new(RefCell::new(model)));
             }
         }
         Ok(Self {
             inbox_data: models,
-            inbox_ids: contracts,
             messages: Rc::new(RefCell::new(vec![])),
             active_id: 0,
         })
@@ -65,14 +86,9 @@ impl Inbox {
                         .unwrap(),
                 );
             }
-
-            async fn get_inbox(key: &str) -> Result<InboxModel, Box<dyn std::error::Error>> {
-                todo!()
-            }
-
             for k in content.to.iter() {
-                let inbox = futures::executor::block_on(get_inbox(k))?;
-                InboxModel::send_message(inbox, cx, content.clone())?;
+                let key = RsaPublicKey::from_public_key_pem(k).map_err(|e| format!("{e}"))?;
+                InboxModel::send_message(cx, content.clone(), key)?;
             }
         }
         let _ = cx;
@@ -110,7 +126,7 @@ impl Inbox {
     }
 
     #[cfg(feature = "ui-testing")]
-    fn load_messages(&self, _cx: Scope, id: &Identity, _private_key: &rsa::RsaPrivateKey) {
+    fn load_messages(&self, _cx: Scope, id: &Identity) {
         let emails = {
             if id.id == 0 {
                 vec![
@@ -194,15 +210,15 @@ struct User {
     identified: bool,
     active_id: Option<usize>,
     identities: Vec<Identity>,
-    private_key: Option<RsaPrivateKey>,
 }
 
 impl User {
     #[cfg(feature = "ui-testing")]
     fn new() -> Self {
-        const RSA_4096_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-        let priv_key = RsaPrivateKey::from_pkcs1_pem(RSA_4096_PRIV_PEM).unwrap();
-        // TODO: here we should be checking if an existing identity sidekick exists
+        const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
+        const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
+        let key0 = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM).unwrap();
+        let key1 = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM).unwrap();
         let identified = true;
         User {
             logged: false,
@@ -212,15 +228,14 @@ impl User {
                 Identity {
                     alias: "ian.clarke@freenet.org".to_owned(),
                     id: 0,
-                    pub_key: priv_key.to_public_key(),
+                    key: key0,
                 },
                 Identity {
                     alias: "other.stuff@freenet.org".to_owned(),
                     id: 1,
-                    pub_key: priv_key.to_public_key(),
+                    key: key1,
                 },
             ],
-            private_key: Some(priv_key),
         }
     }
 
@@ -237,7 +252,7 @@ impl User {
 #[derive(Clone, Debug)]
 pub(crate) struct Identity {
     pub id: usize,
-    pub pub_key: RsaPublicKey,
+    pub key: RsaPrivateKey,
     alias: String,
 }
 
@@ -277,59 +292,6 @@ impl PartialOrd for Message {
 impl Ord for Message {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.partial_cmp(other).unwrap()
-    }
-}
-
-pub(crate) fn App(cx: Scope) -> Element {
-    // #[cfg(target_arch = "wasm32")]
-    // {
-    //     web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
-    // }
-    // TODO: in the future this will be dinamically loaded from the identity component
-    let contracts = vec![
-        Identity {
-            id: 0,
-            alias: "ian.clarke@freenet.org".to_owned(),
-            pub_key: {
-                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-                RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
-                    .unwrap()
-                    .to_public_key()
-            },
-        },
-        Identity {
-            id: 1,
-            alias: "other.stuff@freenet.org".to_owned(),
-            pub_key: {
-                const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-2-priv.pem");
-                RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM)
-                    .unwrap()
-                    .to_public_key()
-            },
-        },
-    ];
-    use_shared_state_provider(cx, User::new);
-    use_context_provider(cx, || {
-        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-        let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
-        Inbox::new(cx, contracts, &key).unwrap()
-    });
-
-    let user = use_shared_state::<User>(cx).unwrap();
-    if !user.read().identified {
-        cx.render(rsx! {
-            login::GetOrCreateIndentity {}
-        })
-    } else if let Some(id) = user.read().logged_id() {
-        let inbox = use_context::<Inbox>(cx).unwrap();
-        inbox.load_messages(cx, id, user.read().private_key.as_ref().unwrap());
-        cx.render(rsx! {
-           UserInbox {}
-        })
-    } else {
-        cx.render(rsx! {
-           login::IdentifiersList {}
-        })
     }
 }
 

@@ -71,13 +71,13 @@ impl TryFrom<StateDelta<'static>> for UpdateInbox {
 /// The inbox contract does not need to be aware of the content.
 type EncryptedContent = Vec<u8>;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Message {
     pub content: EncryptedContent,
     pub token_assignment: TokenAssignment,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Inbox {
     pub messages: Vec<Message>,
     pub last_update: DateTime<Utc>,
@@ -418,10 +418,10 @@ impl ContractInterface for Inbox {
     }
 }
 
-#[cfg(feature = "contract")]
+#[cfg(all(feature = "contract", test))]
 mod tests {
     use super::*;
-    use rsa::{pkcs1::DecodeRsaPrivateKey, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+    use rsa::{pkcs1::DecodeRsaPrivateKey, Pkcs1v15Sign, RsaPrivateKey};
 
     #[test]
     fn validate_test() -> Result<(), Box<dyn std::error::Error>> {
@@ -458,7 +458,7 @@ mod tests {
         .as_bytes()
         .to_vec();
 
-        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(public_key);
         let sign = &rsa::pkcs1v15::Signature::try_from(signature.as_slice()).unwrap();
 
         match verifying_key.verify(STATE_UPDATE, sign) {
