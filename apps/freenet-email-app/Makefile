@@ -20,10 +20,10 @@ all:
 	$(MAKE) run-web &
 	wait
 
-build: build-tool build-inbox-1 build-inbox-2 generate-contract-code-hash
+build: build-tool build-inbox-0 build-inbox-1 generate-contract-code-hash
 
-build-inbox-1: build-inbox-1 publish-inbox-1
-build-inbox-2: build-inbox-2 publish-inbox-2
+build-inbox-1: build-inbox-0 publish-inbox-0
+build-inbox-2: build-inbox-1 publish-inbox-1
 
 build-tool:
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
