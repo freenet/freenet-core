@@ -5,20 +5,35 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
 
-use crate::inbox::{DecryptedMessage, InboxModel, MessageModel};
+use crate::{
+    api::{WebApi, WebApiSender},
+    inbox::{DecryptedMessage, InboxModel, MessageModel},
+};
 
 mod login;
 
 pub(crate) fn App(cx: Scope) -> Element {
-    // #[cfg(target_arch = "wasm32")]
+    // #[cfg(target_family = "wasm")]
     // {
     //     web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
     // }
 
+    use_shared_state_provider(cx, || {
+        WebApi::new()
+            .map_err(|err| {
+                #[cfg(target_family = "wasm")]
+                {
+                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+                }
+                err
+            })
+            .expect("open connection")
+    });
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
+    let client = use_shared_state::<WebApi>(cx).unwrap().read().sender_half();
 
-    use_context_provider(cx, || Inbox::new(cx, &user.read().identities).unwrap());
+    use_context_provider(cx, || Inbox::new(client, &user.read().identities).unwrap());
 
     if !user.read().identified {
         cx.render(rsx! {
@@ -45,12 +60,12 @@ struct Inbox {
 }
 
 impl Inbox {
-    fn new(cx: Scope, contracts: &[Identity]) -> Result<Self, String> {
+    fn new(client: WebApiSender, contracts: &[Identity]) -> Result<Self, String> {
         let mut models = Vec::with_capacity(contracts.len());
         #[cfg(feature = "use-node")]
         {
             for identity in contracts {
-                let model = InboxModel::load(cx, identity)?;
+                let model = InboxModel::load(client, identity)?;
                 models.push(Rc::new(RefCell::new(model)));
             }
         }
@@ -63,7 +78,7 @@ impl Inbox {
 
     fn send_message(
         &self,
-        cx: Scope,
+        client: WebApiSender,
         to: &str,
         title: &str,
         content: &str,
@@ -79,7 +94,7 @@ impl Inbox {
                 cc: vec![],
                 time: Utc::now(),
             };
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             {
                 web_sys::console::log_1(
                     &serde_wasm_bindgen::to_value(&format!("adding to {}", self.active_id))
@@ -88,29 +103,33 @@ impl Inbox {
             }
             for k in content.to.iter() {
                 let key = RsaPublicKey::from_public_key_pem(k).map_err(|e| format!("{e}"))?;
-                InboxModel::send_message(cx, content.clone(), key)?;
+                InboxModel::send_message(client, content.clone(), key)?;
             }
         }
-        let _ = cx;
+        let _ = client;
         Ok(())
     }
 
-    fn remove_messages<T>(
+    fn remove_messages(
         &self,
-        cx: Scope<T>,
+        mut client: WebApiSender,
         ids: &[u64],
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::debug!("removing {}", self.active_id);
         #[cfg(feature = "use-node")]
         {
             let inbox = self.inbox_data[self.active_id].clone();
-            InboxModel::remove_messages(inbox, cx, ids)?;
+            InboxModel::remove_messages(&mut client, inbox, ids)?;
         }
         Ok(())
     }
 
     // Remove the messages from the inbox contract, and move them to local storage
-    fn mark_as_read<T>(&self, cx: Scope<T>, ids: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
+    fn mark_as_read(
+        &self,
+        client: WebApiSender,
+        ids: &[u64],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let messages = &mut *self.messages.borrow_mut();
         let mut removed_messages = Vec::with_capacity(ids.len());
         for e in messages {
@@ -121,7 +140,7 @@ impl Inbox {
             }
         }
         // todo: persist in a sidekick `removed_messages`
-        self.remove_messages(cx, ids)?;
+        self.remove_messages(client, ids)?;
         Ok(())
     }
 
@@ -497,9 +516,10 @@ fn InboxComponent(cx: Scope) -> Element {
 
 fn OpenMessage(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
+    let client = use_shared_state::<WebApi>(cx).unwrap().read().sender_half();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let email = cx.props;
-    match inbox.mark_as_read(cx, &[email.id]) {
+    match inbox.mark_as_read(client.clone(), &[email.id]) {
         Ok(()) => {}
         Err(e) => {
             let err = format!("{e}");
@@ -529,7 +549,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
                 a {
                     class: "icon is-small", 
                     onclick: move |_| {
-                        match inbox.remove_messages(cx, &[email.id]) {
+                        match inbox.remove_messages(client, &[email.id]) {
                             Ok(()) => {}
                             Err(e) => {
                                 let err = format!("{e}");
@@ -557,6 +577,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
 
 fn NewMessageWindow(cx: Scope) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
+    let client = use_shared_state::<WebApi>(cx).unwrap().read().sender_half();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();
@@ -600,7 +621,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
                 button {
                     class: "button is-info is-outlined",
                     onclick: move |_| {
-                        match inbox.send_message(cx, to.get(), title.get(), content.get()) {
+                        match inbox.send_message(client, to.get(), title.get(), content.get()) {
                             Ok(()) => {}
                             Err(e) => {
                                 let err = format!("{e}");

@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 
 use chrono::{DateTime, Utc};
-use dioxus::prelude::*;
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
     UpdateInbox,
@@ -14,7 +13,6 @@ use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
 };
-use once_cell::unsync::Lazy;
 use rand_chacha::rand_core::SeedableRng;
 use rsa::RsaPublicKey;
 use rsa::{
@@ -23,30 +21,10 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::api::WebApiSender;
 use crate::app::Identity;
-use crate::WebApi;
 
 static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
-
-#[cfg(all(feature = "use-node", target_arch = "wasm32"))]
-thread_local! {
-    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
-            let api = crate::WebApi::new()
-                .map_err(|err| {
-                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-                    err
-                })
-                .expect("open connection");
-            Rc::new(RefCell::new(api))
-    })
-}
-
-#[cfg(all(feature = "use-node", not(target_arch = "wasm32")))]
-thread_local! {
-    static CONNECTION: Lazy<Rc<RefCell<crate::WebApi>>> = Lazy::new(|| {
-        unimplemented!()
-    })
-}
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -144,7 +122,10 @@ pub(crate) struct InboxModel {
 }
 
 impl InboxModel {
-    pub(crate) fn load(cx: Scope, contract: &Identity) -> Result<Self, String> {
+    pub(crate) async fn load(
+        mut client: WebApiSender,
+        contract: &Identity,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let private_key = contract.key.clone();
         let params = InboxParams {
             pub_key: contract.key.to_public_key(),
@@ -153,103 +134,46 @@ impl InboxModel {
         .map_err(|e| format!("{e}"))?;
         let contract_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-        CONNECTION.with(|conn| {
-            let client = (**conn).clone();
-            // FIXME: properly set this future to re-evaluate on change, now it would only send once
-            let f = use_future(cx, (), |_| async move {
-                let client = &mut *client.borrow_mut();
-                let state = InboxModel::get_state(client, contract_key.clone()).await?;
-                Self::from_state(private_key, state, contract_key)
-            });
-            let inbox = loop {
-                match f.value() {
-                    Some(v) => break v.as_ref().unwrap(),
-                    None => std::thread::sleep(std::time::Duration::from_micros(100)),
-                }
-            };
-            Ok::<_, String>(inbox.clone())
-        })
+        let state = InboxModel::get_state(&mut client, contract_key.clone()).await?;
+        Self::from_state(private_key, state, contract_key)
     }
-    pub(crate) fn send_message(
-        cx: Scope,
+
+    pub(crate) async fn send_message(
+        mut client: WebApiSender,
         content: DecryptedMessage,
         pub_key: RsaPublicKey,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        CONNECTION.with(|conn| {
-            let client = (**conn).clone();
-            let token = {
-                // FIXME: properly set this future to re-evaluate on change, now it would only send once
-                let key = pub_key.clone();
-                let f = use_future(cx, (), |_| async move {
-                    let client = &mut *client.borrow_mut();
-                    InboxModel::assign_token(client, key).await
-                });
-                loop {
-                    match f.value() {
-                        Some(Ok(r)) => break r.clone(),
-                        Some(Err(e)) => return Err(format!("{e}").into()),
-                        None => std::thread::sleep(std::time::Duration::from_micros(100)),
-                    }
-                }
-            };
-            // FIXME: properly set this future to re-evaluate on change, now it would only send once
-            let client = (**conn).clone();
-            let params = InboxParams { pub_key }
-                .try_into()
-                .map_err(|e| format!("{e}"))?;
-            let key =
-                ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-            let f = use_future(cx, (), |_| async move {
-                let client = &mut *client.borrow_mut();
-                let delta = UpdateInbox::AddMessages {
-                    messages: vec![content.to_stored(token)?],
-                };
-                let request = ContractRequest::Update {
-                    key,
-                    data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
-                };
-                client.send(request.into()).await?;
-                Ok::<_, Box<dyn std::error::Error>>(())
-            });
-            loop {
-                match f.value() {
-                    Some(Err(e)) => {
-                        break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
-                    }
-                    Some(_) => {}
-                    None => std::thread::sleep(std::time::Duration::from_micros(100)),
-                }
-            }
-        })
+        let token = {
+            let key = pub_key.clone();
+            InboxModel::assign_token(&mut client, key).await?
+        };
+        let params = InboxParams { pub_key }
+            .try_into()
+            .map_err(|e| format!("{e}"))?;
+        let key = ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
+
+        let delta = UpdateInbox::AddMessages {
+            messages: vec![content.to_stored(token)?],
+        };
+        let request = ContractRequest::Update {
+            key,
+            data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
+        };
+        client.send(request.into()).await?;
+        Ok(())
     }
 
-    pub(crate) fn remove_messages<T>(
+    pub(crate) async fn remove_messages(
+        client: &mut WebApiSender,
         this: Rc<RefCell<Self>>,
-        cx: Scope<T>,
         ids: &[u64],
     ) -> Result<(), Box<dyn std::error::Error>> {
         this.borrow_mut().remove_received_message(ids);
         let ids = ids.to_vec();
-        CONNECTION.with(|conn| {
-            let client = (**conn).clone();
-            // FIXME: properly set this future to re-evaluate on change, now it would only send once
-            let f = use_future(cx, (), |_| async move {
-                let client = &mut *client.borrow_mut();
-                this.borrow_mut()
-                    .remove_messages_from_store(client, &ids)
-                    .await?;
-                Ok::<_, Box<dyn std::error::Error>>(())
-            });
-            loop {
-                match f.value() {
-                    Some(Err(e)) => {
-                        break Err::<(), Box<dyn std::error::Error>>(format!("{e}").into())
-                    }
-                    Some(_) => {}
-                    None => std::thread::sleep(std::time::Duration::from_micros(100)),
-                }
-            }
-        })
+        this.borrow_mut()
+            .remove_messages_from_store(client, &ids)
+            .await?;
+        Ok(())
     }
 
     // TODO: only used when an inbox is created first time
@@ -328,7 +252,7 @@ impl InboxModel {
 
     async fn update_settings_at_store(
         &mut self,
-        client: &mut WebApi,
+        client: &mut WebApiSender,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let settings = self.settings.to_stored()?;
         let serialized = serde_json::to_vec(&settings)?;
@@ -348,7 +272,7 @@ impl InboxModel {
 
     async fn remove_messages_from_store(
         &mut self,
-        client: &mut WebApi,
+        client: &mut WebApiSender,
         ids: &[u64],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut signed = Vec::with_capacity(ids.len() * 32);
@@ -370,7 +294,7 @@ impl InboxModel {
     }
 
     async fn assign_token(
-        client: &mut WebApi,
+        client: &mut WebApiSender,
         recipient_key: RsaPublicKey,
     ) -> Result<TokenAssignment, Box<dyn std::error::Error>> {
         let key = ComponentKey::new(&[]); // TODO: this should be the AFT component key
@@ -408,7 +332,7 @@ impl InboxModel {
     // }
 
     async fn get_state(
-        client: &mut WebApi,
+        client: &mut WebApiSender,
         key: ContractKey,
     ) -> Result<StoredInbox, Box<dyn std::error::Error>> {
         use locutus_stdlib::client_api::{ContractResponse, HostResponse};
@@ -417,13 +341,14 @@ impl InboxModel {
             fetch_contract: false,
         };
         client.send(request.into()).await?;
-        match client.recv().await? {
-            HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
-                let state: StoredInbox = serde_json::from_slice(state.as_ref())?;
-                Ok(state)
-            }
-            _ => panic!(),
-        }
+        // match client.recv().await? {
+        //     HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
+        //         let state: StoredInbox = serde_json::from_slice(state.as_ref())?;
+        //         Ok(state)
+        //     }
+        //     _ => panic!(),
+        // }
+        todo!("FIXME")
     }
 }
 

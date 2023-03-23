@@ -1,5 +1,3 @@
-use locutus_stdlib::client_api::{ClientError, HostResponse};
-
 mod app;
 pub(crate) mod inbox;
 #[cfg(test)]
@@ -59,40 +57,75 @@ pub fn main() {
     }
 }
 
-struct WebApi {
-    api: locutus_stdlib::client_api::WebApi,
-    received: crossbeam::channel::Receiver<Result<HostResponse, ClientError>>,
-}
+mod api {
+    use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
-impl WebApi {
-    #[cfg(target_family = "wasm")]
-    fn new() -> Result<Self, String> {
-        let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
-        let (tx, received) = crossbeam::channel::unbounded();
-        let result_handler = move |result: Result<HostResponse, ClientError>| {
-            tx.send(result).expect("channel open");
-        };
-        let api = locutus_stdlib::client_api::WebApi::start(
-            conn,
-            result_handler,
-            |err| {
-                web_sys::console::error_1(
-                    &serde_wasm_bindgen::to_value(&format!("connection error: {err}")).unwrap(),
-                );
-            },
-            || {},
-        );
-        Ok(Self { api, received })
+    type SenderHalf = tokio::sync::mpsc::Sender<ClientRequest<'static>>;
+    type ReceiverHalf = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
+
+    pub(crate) struct WebApi {
+        api: locutus_stdlib::client_api::WebApi,
+        receiver_half: ReceiverHalf,
+        sender_half: SenderHalf,
     }
 
-    async fn send(
-        &mut self,
-        request: locutus_stdlib::client_api::ClientRequest<'static>,
-    ) -> Result<(), locutus_stdlib::client_api::Error> {
-        self.api.send(request).await
+    #[derive(Clone)]
+    pub(crate) struct WebApiSender(SenderHalf);
+    impl WebApiSender {
+        pub async fn send(
+            &mut self,
+            request: locutus_stdlib::client_api::ClientRequest<'static>,
+        ) -> Result<(), locutus_stdlib::client_api::Error> {
+            self.0
+                .send(request)
+                .await
+                .map_err(|_| locutus_stdlib::client_api::Error::ChannelClosed)
+        }
     }
 
-    async fn recv(&mut self) -> Result<HostResponse, ClientError> {
-        self.received.recv().expect("channel open")
+    impl WebApi {
+        #[cfg(not(target_family = "wasm"))]
+        pub fn new() -> Result<Self, String> {
+            todo!()
+        }
+
+        #[cfg(target_family = "wasm")]
+        pub fn new() -> Result<Self, String> {
+            let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
+            let (tx, receiver_half) = crossbeam::channel::unbounded();
+            let (sender_half, rx) = tokio::sync::mpsc::channel(10);
+            let result_handler = move |result: Result<HostResponse, ClientError>| {
+                tx.send(result).expect("channel open");
+            };
+            let api = locutus_stdlib::client_api::WebApi::start(
+                conn,
+                result_handler,
+                |err| {
+                    web_sys::console::error_1(
+                        &serde_wasm_bindgen::to_value(&format!("connection error: {err}")).unwrap(),
+                    );
+                },
+                || {},
+            );
+            tokio::task::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    api.send(msg).await?;
+                }
+                Ok(())
+            });
+            Ok(Self {
+                api,
+                receiver_half,
+                sender_half,
+            })
+        }
+
+        pub async fn recv(&mut self) -> Result<HostResponse, ClientError> {
+            self.receiver_half.recv().expect("channel open")
+        }
+
+        pub fn sender_half(&self) -> WebApiSender {
+            WebApiSender(self.sender_half.clone())
+        }
     }
 }
