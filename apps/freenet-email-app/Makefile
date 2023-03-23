@@ -2,7 +2,7 @@
 
 .ONESHELL:
 
-LOCUTUS_DIR := $(shell cd ../../ && pwd)
+LOCUTUS_DIR := $(abspath ../../)
 INBOX_WEB_DIR := $(LOCUTUS_DIR)/apps/freenet-email-app/web
 INBOX_DIR := $(LOCUTUS_DIR)/apps/freenet-email-app/contracts/inbox
 INBOX_SRC_DIR := $(INBOX_DIR)/src
@@ -26,6 +26,7 @@ build-inbox-1: build-inbox-0 publish-inbox-0
 build-inbox-2: build-inbox-1 publish-inbox-1
 
 build-tool:
+	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
 build-inbox-%:
@@ -44,7 +45,7 @@ run-node:
 
 run-web:
 	cd $(INBOX_WEB_DIR)
-	cargo build --features use-node
+	trunk build --features use-node
 	trunk serve --features use-node
 
 clean:
