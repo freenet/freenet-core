@@ -22,7 +22,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::app::{error_handling, AsyncAction};
+use crate::app::{error_handling, TryAsyncAction};
 use crate::{api::WebApiSender, app::Identity, DynError};
 
 static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
@@ -123,8 +123,7 @@ impl InboxModel {
     pub(crate) async fn load(
         client: &mut WebApiSender,
         contract: &Identity,
-    ) -> Result<Self, DynError> {
-        let private_key = contract.key.clone();
+    ) -> Result<(), DynError> {
         let params = InboxParams {
             pub_key: contract.key.to_public_key(),
         }
@@ -132,8 +131,8 @@ impl InboxModel {
         .map_err(|e| format!("{e}"))?;
         let contract_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-        let state = InboxModel::get_state(client, contract_key.clone()).await?;
-        Self::from_state(private_key, state, contract_key)
+        InboxModel::get_state(client, contract_key.clone()).await?;
+        Ok(())
     }
 
     pub(crate) async fn send_message(
@@ -190,7 +189,7 @@ impl InboxModel {
                 error_handling(
                     client.into(),
                     r.map_err(Into::into),
-                    AsyncAction::RemoveMessages,
+                    TryAsyncAction::RemoveMessages,
                 )
                 .await;
             };
@@ -215,7 +214,7 @@ impl InboxModel {
         Ok(serialized.into())
     }
 
-    fn from_state(
+    pub(crate) fn from_state(
         private_key: rsa::RsaPrivateKey,
         state: StoredInbox,
         key: ContractKey,
@@ -334,24 +333,13 @@ impl InboxModel {
     //     Ok(())
     // }
 
-    async fn get_state(
-        client: &mut WebApiSender,
-        key: ContractKey,
-    ) -> Result<StoredInbox, DynError> {
-        // use locutus_stdlib::client_api::{ContractResponse, HostResponse};
+    async fn get_state(client: &mut WebApiSender, key: ContractKey) -> Result<(), DynError> {
         let request = ContractRequest::Get {
             key,
             fetch_contract: false,
         };
         client.send(request.into()).await?;
-        // match client.recv().await? {
-        //     HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
-        //         let state: StoredInbox = serde_json::from_slice(state.as_ref())?;
-        //         Ok(state)
-        //     }
-        //     _ => panic!(),
-        // }
-        todo!("FIXME")
+        Ok(())
     }
 }
 

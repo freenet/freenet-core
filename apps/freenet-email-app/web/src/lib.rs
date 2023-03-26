@@ -60,20 +60,21 @@ pub fn main() {
 }
 
 mod api {
+    use dioxus::prelude::{Scope, UnboundedSender};
     use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
     use crate::app::AsyncActionResult;
 
-    type SenderHalf = tokio::sync::mpsc::Sender<ClientRequest<'static>>;
+    type SenderHalf = UnboundedSender<ClientRequest<'static>>;
     type ReceiverHalf = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
 
     pub(crate) type ErrorChannel = crossbeam::channel::Sender<AsyncActionResult>;
 
     #[cfg(feature = "use-node")]
     pub(crate) struct WebApi {
-        receiver_half: ReceiverHalf,
+        pub receiver_half: ReceiverHalf,
         sender_half: SenderHalf,
-        error_channel: crossbeam::channel::Receiver<AsyncActionResult>,
+        pub error_channel: crossbeam::channel::Receiver<AsyncActionResult>,
         error_channel_sender: ErrorChannel,
     }
 
@@ -97,6 +98,8 @@ mod api {
             &mut self,
             request: locutus_stdlib::client_api::ClientRequest<'static>,
         ) -> Result<(), locutus_stdlib::client_api::Error> {
+            use futures::SinkExt;
+
             self.sender
                 .send(request)
                 .await
@@ -122,20 +125,21 @@ mod api {
 
     impl WebApi {
         #[cfg(not(feature = "use-node"))]
-        pub fn new() -> Result<Self, String> {
+        pub fn new(_: Scope) -> Result<Self, String> {
             Ok(Self {})
         }
 
         #[cfg(all(not(target_family = "wasm"), feature = "use-node"))]
-        pub fn new() -> Result<Self, String> {
+        pub fn new(_: Scope) -> Result<Self, String> {
             todo!()
         }
 
         #[cfg(all(target_family = "wasm", feature = "use-node"))]
-        pub fn new() -> Result<Self, String> {
+        pub fn new(cx: Scope) -> Result<Self, String> {
+            use futures::StreamExt;
             let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
             let (tx, receiver_half) = crossbeam::channel::unbounded();
-            let (sender_half, mut rx) = tokio::sync::mpsc::channel(10);
+            let (sender_half, mut rx) = futures::channel::mpsc::unbounded();
             let result_handler = move |result: Result<HostResponse, ClientError>| {
                 tx.send(result).expect("channel open");
             };
@@ -149,16 +153,18 @@ mod api {
                 },
                 || {},
             );
-
-            let local = tokio::task::LocalSet::new();
-            local.spawn_local(async move {
-                while let Some(msg) = rx.recv().await {
-                    api.send(msg).await.map_err(|e| {
-                        tracing::error!("{e}");
-                        e
-                    })?;
+            cx.spawn({
+                async move {
+                    while let Some(msg) = rx.next().await {
+                        api.send(msg)
+                            .await
+                            .map_err(|e| {
+                                tracing::error!("{e}");
+                                e
+                            })
+                            .unwrap();
+                    }
                 }
-                Ok::<_, locutus_stdlib::client_api::Error>(())
             });
             let (error_channel_sender, error_channel) = crossbeam::channel::unbounded();
             Ok(Self {
@@ -167,11 +173,6 @@ mod api {
                 error_channel,
                 error_channel_sender,
             })
-        }
-
-        #[cfg(feature = "use-node")]
-        pub async fn recv(&mut self) -> Result<HostResponse, ClientError> {
-            self.receiver_half.recv().expect("channel open")
         }
 
         #[cfg(feature = "use-node")]

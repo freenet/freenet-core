@@ -1753,7 +1753,6 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen 0.5.0",
  "serde_json",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "web-sys",
