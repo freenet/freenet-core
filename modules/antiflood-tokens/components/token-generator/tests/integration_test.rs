@@ -14,7 +14,7 @@ mod integration_test {
     use serde::{Deserialize, Serialize};
 
     use locutus_aft_interface::{AllocationCriteria, Tier, TokenAllocationRecord, TokenAssignment};
-    use locutus_stdlib::prelude::{Component, ComponentContext, ComponentError, ContractCode, NotificationMessage, OutboundComponentMsg, UserInputRequest, WrappedContract};
+    use locutus_stdlib::prelude::{ClientResponse, Component, ComponentContext, ComponentError, ContractCode, NotificationMessage, OutboundComponentMsg, UserInputRequest, UserInputResponse, WrappedContract};
     use locutus_runtime::{
         ApplicationMessage, ComponentRuntimeInterface, ComponentStore, ContractContainer,
         ContractInstanceId, ContractKey, ContractStore, InboundComponentMsg, Runtime, SecretsId,
@@ -190,7 +190,7 @@ mod integration_test {
         let (component, secret_id, contract_key, mut runtime) =
             set_up_aft(&private_key, "token-allocation-record", "token-generator").unwrap();
         let app = ContractInstanceId::try_from(contract_key.to_string()).unwrap();
-        let context: Context = Context {waiting_for_user_input: HashSet::default(), user_response: HashMap::default(), key_pair: Some(private_key.clone())};
+        let mut context: Context = Context {waiting_for_user_input: HashSet::default(), user_response: HashMap::default(), key_pair: Some(private_key.clone())};
         let component_context = ComponentContext::new(bincode::serialize(&context).unwrap());
         let criteria = AllocationCriteria::new(
             Tier::Day1,
@@ -211,8 +211,9 @@ mod integration_test {
         let message = TokenComponentMessage::RequestNewToken(request_new_token);
         let payload: Vec<u8> = bincode::serialize(&message).unwrap();
 
+        // The application request new token allocation
         let inbound_message =
-            InboundComponentMsg::ApplicationMessage(ApplicationMessage::new(app, payload).with_context(component_context));
+            InboundComponentMsg::ApplicationMessage(ApplicationMessage::new(app, payload.clone()).with_context(component_context.clone()));
         let outbound = runtime
             .inbound_app_message(component.key(), vec![inbound_message])
             .unwrap();
@@ -221,5 +222,34 @@ mod integration_test {
             outbound.get(0),
             Some(OutboundComponentMsg::RequestUserInput(..))
         ));
+
+        let request_id = match outbound.get(0) {
+            Some(OutboundComponentMsg::RequestUserInput(user_input_request)) => user_input_request.request_id,
+            _ => panic!("Unexpected outbound message"),
+        };
+
+        // The user approves the allocation, and send a response
+        let user_response = ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
+        let inbound_message =
+            InboundComponentMsg::UserResponse(UserInputResponse {request_id, response: user_response.clone(), context: component_context.clone()});
+        let outbound = runtime
+            .inbound_app_message(component.key(), vec![inbound_message])
+            .unwrap();
+        assert_eq!(outbound.len(), 0);
+
+        //Updated context after process user response
+        let response: Response = serde_json::from_slice(&user_response)
+            .map_err(|err| ComponentError::Deser(format!("{err}"))).unwrap();
+        context.waiting_for_user_input.remove(&request_id);
+        context.user_response.insert(request_id, response);
+        let component_context = ComponentContext::new(bincode::serialize(&context).unwrap());
+
+        // Request new token allocation after user approval
+        let inbound_message =
+            InboundComponentMsg::ApplicationMessage(ApplicationMessage::new(app, payload).with_context(component_context.clone()));
+        let outbound = runtime
+            .inbound_app_message(component.key(), vec![inbound_message])
+            .unwrap();
+        println!("outbound: {:#?}", outbound);
     }
 }
