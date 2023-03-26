@@ -22,7 +22,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::app::error_handling;
+use crate::app::{error_handling, AsyncAction};
 use crate::{api::WebApiSender, app::Identity, DynError};
 
 static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
@@ -137,13 +137,13 @@ impl InboxModel {
     }
 
     pub(crate) async fn send_message(
-        mut client: WebApiSender,
+        client: &mut WebApiSender,
         content: DecryptedMessage,
         pub_key: RsaPublicKey,
     ) -> Result<(), DynError> {
         let token = {
             let key = pub_key.clone();
-            InboxModel::assign_token(&mut client, key).await?
+            InboxModel::assign_token(client, key).await?
         };
         let params = InboxParams { pub_key }
             .try_into()
@@ -168,26 +168,38 @@ impl InboxModel {
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         self.remove_received_message(ids);
         let ids = ids.to_vec();
-        let mut signed = Vec::with_capacity(ids.len() * 32);
+        let mut signed: Vec<u8> = Vec::with_capacity(ids.len() * 32);
         let mut ids = Vec::with_capacity(ids.len() * 32);
         for m in &self.messages {
             let h = &m.token_assignment.assignment_hash;
             signed.extend(h);
             ids.push(*h);
         }
-        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
-        let signature = signing_key.sign(&signed).into();
-        let delta = UpdateInbox::RemoveMessages { signature, ids };
-        let request = ContractRequest::Update {
-            key: self.key.clone(),
-            data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
-        };
-        let f = async move {
-            if let Err(e) = client.send(request.into()).await {
-                error_handling(e.into()).await;
-            }
-        };
-        Ok(f.boxed_local())
+        #[cfg(feature = "use-node")]
+        {
+            let signing_key =
+                SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
+            let signature = signing_key.sign(&signed).into();
+            let delta = UpdateInbox::RemoveMessages { signature, ids };
+            let request = ContractRequest::Update {
+                key: self.key.clone(),
+                data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
+            };
+            let f = async move {
+                let r = client.send(request.into()).await;
+                error_handling(
+                    client.into(),
+                    r.map_err(Into::into),
+                    AsyncAction::RemoveMessages,
+                )
+                .await;
+            };
+            Ok(f.boxed_local())
+        }
+        #[cfg(not(feature = "use-node"))]
+        {
+            Ok(async {}.boxed_local())
+        }
     }
 
     // TODO: only used when an inbox is created first time when putting the contract

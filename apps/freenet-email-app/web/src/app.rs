@@ -8,12 +8,20 @@ use futures::FutureExt;
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::{
-    api::{WebApi, WebApiSender},
+    api::{ErrorChannel, WebApi, WebApiSender},
     inbox::{DecryptedMessage, InboxModel, MessageModel},
     DynError,
 };
 
 mod login;
+
+pub(crate) type AsyncActionResult = Result<(), (DynError, AsyncAction)>;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AsyncAction {
+    RemoveMessages,
+    SendMessage,
+}
 
 pub(crate) fn App(cx: Scope) -> Element {
     #[cfg(target_family = "wasm")]
@@ -119,12 +127,10 @@ impl Inbox {
             for k in content.to.iter() {
                 let key = RsaPublicKey::from_public_key_pem(k).map_err(|e| format!("{e}"))?;
                 let content = content.clone();
-                let client = client.clone();
+                let mut client = client.clone();
                 let f = async move {
-                    let r = InboxModel::send_message(client, content, key).await;
-                    if let Err(err) = r {
-                        error_handling(err).await;
-                    }
+                    let r = InboxModel::send_message(&mut client, content, key).await;
+                    error_handling(client.into(), r, AsyncAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());
             }
@@ -137,18 +143,10 @@ impl Inbox {
         &self,
         client: WebApiSender,
         ids: &[u64],
-    ) -> Result<LocalBoxFuture<()>, DynError> {
+    ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
-        #[cfg(feature = "use-node")]
-        {
-            let mut inbox = self.inbox_data[self.active_id].borrow_mut();
-            let f = inbox.remove_messages(client, ids)?;
-            Ok(f)
-        }
-        #[cfg(not(feature = "use-node"))]
-        {
-            async {}.boxed_local()
-        }
+        let mut inbox = self.inbox_data[self.active_id].borrow_mut();
+        inbox.remove_messages(client, ids)
     }
 
     // Remove the messages from the inbox contract, and move them to local storage
@@ -156,7 +154,7 @@ impl Inbox {
         &self,
         client: WebApiSender,
         ids: &[u64],
-    ) -> Result<LocalBoxFuture<()>, DynError> {
+    ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         let messages = &mut *self.messages.borrow_mut();
         let mut removed_messages = Vec::with_capacity(ids.len());
         for e in messages {
@@ -534,7 +532,8 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
     let inbox = use_context::<Inbox>(cx).unwrap();
     let email = cx.props;
     let email_id = [cx.props.id];
-    let results = inbox.mark_as_read(client.clone(), &email_id);
+    let result = inbox.mark_as_read(client.clone(), &email_id).unwrap();
+    cx.spawn(result);
     cx.render(rsx! {
         div {
             class: "columns title mt-3",
@@ -554,7 +553,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
                 a {
                     class: "icon is-small", 
                     onclick: move |_| {
-                       let results = inbox.remove_messages(client.clone(), &email_id);
+                        let results = inbox.remove_messages(client.clone(), &email_id);
                         menu_selection.write().at_inbox_list();
                     },
                     i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" } 
@@ -636,13 +635,21 @@ fn NewMessageWindow(cx: Scope) -> Element {
     })
 }
 
-pub(crate) async fn error_handling(err: DynError) {
-    // FIXME: error handling, notify somehow to renderer
-    #[cfg(target_family = "wasm")]
-    {
-        let err = format!("{err}");
-        web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+pub(crate) async fn error_handling(
+    error_channel: ErrorChannel,
+    res: Result<(), DynError>,
+    action: AsyncAction,
+) {
+    if let Err(err) = res {
+        // FIXME: error handling, notify somehow to renderer
+        #[cfg(target_family = "wasm")]
+        {
+            let err = format!("{err}");
+            web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+        }
+        tracing::error!("error while updating message state: {err}");
+        error_channel.send(Err((err, action))).unwrap();
+    } else {
+        error_channel.send(Ok(())).unwrap();
     }
-    tracing::error!("error while updating message state: {err}");
-    todo!()
 }

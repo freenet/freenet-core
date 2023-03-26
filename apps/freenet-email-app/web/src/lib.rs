@@ -5,7 +5,7 @@ pub(crate) mod test_util;
 
 const MAIN_ELEMENT_ID: &str = "freenet-email-main";
 
-type DynError = Box<dyn std::error::Error>;
+type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn main() {
     #[cfg(not(target_family = "wasm"))]
@@ -62,13 +62,19 @@ pub fn main() {
 mod api {
     use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
+    use crate::app::AsyncActionResult;
+
     type SenderHalf = tokio::sync::mpsc::Sender<ClientRequest<'static>>;
     type ReceiverHalf = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
+
+    pub(crate) type ErrorChannel = crossbeam::channel::Sender<AsyncActionResult>;
 
     #[cfg(feature = "use-node")]
     pub(crate) struct WebApi {
         receiver_half: ReceiverHalf,
         sender_half: SenderHalf,
+        error_channel: crossbeam::channel::Receiver<AsyncActionResult>,
+        error_channel_sender: ErrorChannel,
     }
 
     #[cfg(not(feature = "use-node"))]
@@ -76,7 +82,10 @@ mod api {
 
     #[cfg(feature = "use-node")]
     #[derive(Clone)]
-    pub(crate) struct WebApiSender(SenderHalf);
+    pub(crate) struct WebApiSender {
+        sender: SenderHalf,
+        error_channel: ErrorChannel,
+    }
 
     #[cfg(not(feature = "use-node"))]
     #[derive(Clone)]
@@ -88,7 +97,7 @@ mod api {
             &mut self,
             request: locutus_stdlib::client_api::ClientRequest<'static>,
         ) -> Result<(), locutus_stdlib::client_api::Error> {
-            self.0
+            self.sender
                 .send(request)
                 .await
                 .map_err(|_| locutus_stdlib::client_api::Error::ChannelClosed)
@@ -101,6 +110,13 @@ mod api {
         ) -> Result<(), locutus_stdlib::client_api::Error> {
             tracing::debug!(?request, "emulated request");
             Ok(())
+        }
+    }
+
+    #[cfg(feature = "use-node")]
+    impl From<WebApiSender> for ErrorChannel {
+        fn from(val: WebApiSender) -> Self {
+            val.error_channel
         }
     }
 
@@ -144,9 +160,12 @@ mod api {
                 }
                 Ok::<_, locutus_stdlib::client_api::Error>(())
             });
+            let (error_channel_sender, error_channel) = crossbeam::channel::unbounded();
             Ok(Self {
                 receiver_half,
                 sender_half,
+                error_channel,
+                error_channel_sender,
             })
         }
 
@@ -157,7 +176,10 @@ mod api {
 
         #[cfg(feature = "use-node")]
         pub fn sender_half(&self) -> WebApiSender {
-            WebApiSender(self.sender_half.clone())
+            WebApiSender {
+                sender: self.sender_half.clone(),
+                error_channel: self.error_channel_sender.clone(),
+            }
         }
 
         #[cfg(not(feature = "use-node"))]
