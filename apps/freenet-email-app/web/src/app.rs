@@ -1,6 +1,10 @@
 #![allow(non_snake_case)]
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
+use arc_swap::ArcSwap;
 use chrono::Utc;
 use crossbeam::channel::TryRecvError;
 use dioxus::prelude::*;
@@ -9,7 +13,7 @@ use futures::{future::LocalBoxFuture, StreamExt};
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::{
-    api::{ErrorChannel, WebApi, WebApiSender},
+    api::{NodeResponses, WebApi, WebApiSender},
     inbox::{DecryptedMessage, InboxModel, MessageModel},
     DynError,
 };
@@ -47,32 +51,33 @@ pub(crate) fn App(cx: Scope) -> Element {
         })
         .expect("open connection");
     let sender = api.sender_half();
-    use_shared_state_provider(cx, move || sender);
+    let client = sender.clone();
+    use_shared_state_provider(cx, move || client);
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
-    let client = use_shared_state::<WebApiSender>(cx).unwrap().read().clone();
 
-    use_coroutine::<AsyncAction, _, _>(cx, move |rx| node_channel(rx, api));
-
-    use_context_provider(cx, || {
-        // todo: don't block here if possible
-        futures::executor::block_on(Inbox::new(client.clone(), &user.read().identities)).unwrap()
+    use_context_provider(cx, move || {
+        Inbox::new(cx, sender, &user.read().identities).unwrap()
     });
+    let inbox = use_context::<Inbox>(cx).unwrap();
+    let inbox_data = inbox.inbox_data.clone();
+
+    #[cfg(feature = "use-node")]
+    use_coroutine::<AsyncAction, _, _>(cx, move |rx| node_comms(rx, api, inbox_data));
 
     if !user.read().identified {
         cx.render(rsx! {
             login::GetOrCreateIndentity {}
         })
     } else if let Some(id) = user.read().logged_id() {
-        let inbox = use_context::<Inbox>(cx).unwrap();
-        // #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
+        #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
         {
             inbox.load_messages(cx, id).expect("load messages");
         }
-        // #[cfg(feature = "ui-testing")]
-        // {
-        //     inbox.load_messages(id).unwrap();
-        // }
+        #[cfg(feature = "ui-testing")]
+        {
+            inbox.load_messages(id).unwrap();
+        }
         cx.render(rsx! {
            UserInbox {}
         })
@@ -83,26 +88,30 @@ pub(crate) fn App(cx: Scope) -> Element {
     }
 }
 
+type InboxesData = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
+
 #[derive(Debug, Clone)]
 struct Inbox {
-    inbox_data: Vec<Rc<RefCell<InboxModel>>>,
+    inbox_data: InboxesData,
+    /// loaded messages for the currently selected `active_id`
     messages: Rc<RefCell<Vec<Message>>>,
     active_id: usize,
 }
 
 impl Inbox {
-    async fn new(mut client: WebApiSender, contracts: &[Identity]) -> Result<Self, DynError> {
-        let mut models = Vec::with_capacity(contracts.len());
-        // #[cfg(feature = "use-node")]
-        // {
-        // FIXME
-        //     for identity in contracts {
-        //         let model = InboxModel::load(&mut client, identity).await?;
-        //         models.push(Rc::new(RefCell::new(model)));
-        //     }
-        // }
+    fn new(cx: Scope, client: WebApiSender, contracts: &[Identity]) -> Result<Self, DynError> {
+        let models = Vec::with_capacity(contracts.len());
+        for identity in contracts {
+            let mut client = client.clone();
+            let identity = identity.clone();
+            #[cfg(feature = "use-node")]
+            cx.spawn(async move {
+                let res = InboxModel::load(&mut client, &identity).await;
+                error_handling(client.into(), res.map(|_| ()), TryAsyncAction::LoadMessages).await;
+            });
+        }
         Ok(Self {
-            inbox_data: models,
+            inbox_data: Arc::new(ArcSwap::from_pointee(models)),
             messages: Rc::new(RefCell::new(vec![])),
             active_id: 0,
         })
@@ -155,7 +164,8 @@ impl Inbox {
         ids: &[u64],
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
-        let mut inbox = self.inbox_data[self.active_id].borrow_mut();
+        let inbox_data = self.inbox_data.load();
+        let mut inbox = inbox_data[self.active_id].borrow_mut();
         inbox.remove_messages(client, ids)
     }
 
@@ -178,62 +188,61 @@ impl Inbox {
         self.remove_messages(client, ids)
     }
 
-    // #[cfg(feature = "ui-testing")]
-    // fn load_messages(&self, id: &Identity) -> Result<(), DynError> {
-    //     let emails = {
-    //         if id.id == 0 {
-    //             vec![
-    //                 Message {
-    //                     id: 0,
-    //                     from: "Ian's Other Account".into(),
-    //                     title: "Email from Ian's Other Account".into(),
-    //                     content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
-    //                         .repeat(10)
-    //                         .into(),
-    //                     read: false,
-    //                 },
-    //                 Message {
-    //                     id: 1,
-    //                     from: "Mary".to_string().into(),
-    //                     title: "Email from Mary".to_string().into(),
-    //                     content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
-    //                         .repeat(10)
-    //                         .into(),
-    //                     read: false,
-    //                 },
-    //             ]
-    //         } else {
-    //             vec![
-    //                 Message {
-    //                     id: 0,
-    //                     from: "Ian Clarke".into(),
-    //                     title: "Email from Ian".into(),
-    //                     content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
-    //                         .repeat(10)
-    //                         .into(),
-    //                     read: false,
-    //                 },
-    //                 Message {
-    //                     id: 1,
-    //                     from: "Jane".to_string().into(),
-    //                     title: "Email from Jane".to_string().into(),
-    //                     content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
-    //                         .repeat(10)
-    //                         .into(),
-    //                     read: false,
-    //                 },
-    //             ]
-    //         }
-    //     };
-    //     self.messages.replace(emails);
-    //     Ok(())
-    // }
+    #[cfg(feature = "ui-testing")]
+    fn load_messages(&self, id: &Identity) -> Result<(), DynError> {
+        let emails = {
+            if id.id == 0 {
+                vec![
+                    Message {
+                        id: 0,
+                        from: "Ian's Other Account".into(),
+                        title: "Email from Ian's Other Account".into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: false,
+                    },
+                    Message {
+                        id: 1,
+                        from: "Mary".to_string().into(),
+                        title: "Email from Mary".to_string().into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: false,
+                    },
+                ]
+            } else {
+                vec![
+                    Message {
+                        id: 0,
+                        from: "Ian Clarke".into(),
+                        title: "Email from Ian".into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: false,
+                    },
+                    Message {
+                        id: 1,
+                        from: "Jane".to_string().into(),
+                        title: "Email from Jane".to_string().into(),
+                        content: "Lorem ipsum dolor sit amet, consectetur adipiscing elit..."
+                            .repeat(10)
+                            .into(),
+                        read: false,
+                    },
+                ]
+            }
+        };
+        self.messages.replace(emails);
+        Ok(())
+    }
 
-    // #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
+    #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
     fn load_messages(&self, cx: Scope, id: &Identity) -> Result<(), DynError> {
         let actions = use_coroutine_handle::<AsyncAction>(cx).unwrap();
         actions.send(AsyncAction::LoadMessages(id.clone()));
-
         Ok(())
     }
 }
@@ -655,7 +664,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
 }
 
 pub(crate) async fn error_handling(
-    error_channel: ErrorChannel,
+    error_channel: NodeResponses,
     res: Result<(), DynError>,
     action: TryAsyncAction,
 ) {
@@ -673,40 +682,74 @@ pub(crate) async fn error_handling(
     }
 }
 
-pub(crate) async fn node_channel(mut rx: UnboundedReceiver<AsyncAction>, api: WebApi) {
+#[cfg(feature = "use-node")]
+pub(crate) async fn node_comms(
+    mut rx: UnboundedReceiver<AsyncAction>,
+    api: WebApi,
+    inboxes: InboxesData,
+) {
+    use freenet_email_inbox::Inbox as StoredInbox;
+    use locutus_stdlib::client_api::{ContractResponse, HostResponse};
+
     // todo. instead maintain a map of multiple waiting ids to keys
-    let mut waiting_id = None;
-    while let Some(req) = rx.next().await {
-        let AsyncAction::LoadMessages(id) = req;
-        let mut client = api.sender_half();
-        waiting_id.replace(id.key.clone());
-        if let Err(err) = InboxModel::load(&mut client, &id).await {
-            error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
-        }
-    }
+    let mut waiting_updates = HashMap::new();
     loop {
-        match api.receiver_half.try_recv() {
-            Ok(r) => {
-                let r = r.unwrap();
-                use freenet_email_inbox::Inbox as StoredInbox;
-                use locutus_stdlib::client_api::{ContractResponse, HostResponse};
-                match r {
-                    HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        state,
-                        contract,
-                    }) => {
-                        let state: StoredInbox = serde_json::from_slice(state.as_ref()).unwrap();
-                        let contract_key = contract.unwrap().key();
-                        let model =
-                            InboxModel::from_state(waiting_id.take().unwrap(), state, contract_key)
-                                .unwrap();
-                        // todo: update models with atoms
-                    }
-                    _ => panic!(),
+        while let Some(req) = rx.next().await {
+            let AsyncAction::LoadMessages(identity) = req;
+            let mut client = api.sender_half();
+            match InboxModel::load(&mut client, &identity).await {
+                Err(err) => {
+                    error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
+                }
+                Ok(key) => {
+                    waiting_updates.entry(key).or_insert(identity);
                 }
             }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => panic!(),
         }
+        loop {
+            match api.responses.try_recv() {
+                Err(TryRecvError::Empty) | Ok(Ok(())) => {}
+                Err(TryRecvError::Disconnected) => panic!(),
+                Ok(Err((err, _action))) => {
+                    eprintln!("{err}");
+                    todo!("better error handling");
+                }
+            }
+            match api.receiver_half.try_recv() {
+                Ok(r) => {
+                    let r = r.unwrap();
+                    match r {
+                        HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            key,
+                            state,
+                            ..
+                        }) => {
+                            let state: StoredInbox =
+                                serde_json::from_slice(state.as_ref()).unwrap();
+                            let Some(identity) = waiting_updates.remove(&key) else { unreachable!() };
+                            let updated_model =
+                                InboxModel::from_state(identity.key.clone(), state, key.clone())
+                                    .unwrap();
+                            let loaded_models = inboxes.load();
+                            if let Some(pos) = loaded_models.iter().position(|e| {
+                                let x = e.borrow();
+                                x.key == key
+                            }) {
+                                let mut current = loaded_models[pos].borrow_mut();
+                                *current = updated_model;
+                            } else {
+                                let mut cloned = (***loaded_models).to_vec();
+                                std::mem::drop(loaded_models);
+                                cloned.push(Rc::new(RefCell::new(updated_model)));
+                            }
+                        }
+                        _ => panic!(),
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => panic!(),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10))
     }
 }

@@ -68,14 +68,14 @@ mod api {
     type SenderHalf = UnboundedSender<ClientRequest<'static>>;
     type ReceiverHalf = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
 
-    pub(crate) type ErrorChannel = crossbeam::channel::Sender<AsyncActionResult>;
+    pub(crate) type NodeResponses = crossbeam::channel::Sender<AsyncActionResult>;
 
     #[cfg(feature = "use-node")]
     pub(crate) struct WebApi {
         pub receiver_half: ReceiverHalf,
         sender_half: SenderHalf,
-        pub error_channel: crossbeam::channel::Receiver<AsyncActionResult>,
-        error_channel_sender: ErrorChannel,
+        pub responses: crossbeam::channel::Receiver<AsyncActionResult>,
+        responses_sender: NodeResponses,
     }
 
     #[cfg(not(feature = "use-node"))]
@@ -85,7 +85,7 @@ mod api {
     #[derive(Clone)]
     pub(crate) struct WebApiSender {
         sender: SenderHalf,
-        error_channel: ErrorChannel,
+        responses: NodeResponses,
     }
 
     #[cfg(not(feature = "use-node"))]
@@ -117,9 +117,16 @@ mod api {
     }
 
     #[cfg(feature = "use-node")]
-    impl From<WebApiSender> for ErrorChannel {
+    impl From<WebApiSender> for NodeResponses {
         fn from(val: WebApiSender) -> Self {
-            val.error_channel
+            val.responses
+        }
+    }
+
+    #[cfg(not(feature = "use-node"))]
+    impl From<WebApiSender> for NodeResponses {
+        fn from(_val: WebApiSender) -> Self {
+            unimplemented!()
         }
     }
 
@@ -166,12 +173,12 @@ mod api {
                     }
                 }
             });
-            let (error_channel_sender, error_channel) = crossbeam::channel::unbounded();
+            let (responses_sender, responses) = crossbeam::channel::unbounded();
             Ok(Self {
                 receiver_half,
                 sender_half,
-                error_channel,
-                error_channel_sender,
+                responses,
+                responses_sender,
             })
         }
 
@@ -179,7 +186,7 @@ mod api {
         pub fn sender_half(&self) -> WebApiSender {
             WebApiSender {
                 sender: self.sender_half.clone(),
-                error_channel: self.error_channel_sender.clone(),
+                responses: self.responses_sender.clone(),
             }
         }
 

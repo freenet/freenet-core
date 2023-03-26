@@ -422,6 +422,7 @@ impl Executor {
         }
         match self.contract_state.get(&key).await {
             Ok(state) => Ok(ContractResponse::GetResponse {
+                key,
                 contract: got_contract,
                 state,
             }

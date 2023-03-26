@@ -116,14 +116,14 @@ impl DecryptedMessage {
 pub(crate) struct InboxModel {
     pub messages: Vec<MessageModel>,
     settings: InternalSettings,
-    key: ContractKey,
+    pub key: ContractKey,
 }
 
 impl InboxModel {
     pub(crate) async fn load(
         client: &mut WebApiSender,
         contract: &Identity,
-    ) -> Result<(), DynError> {
+    ) -> Result<ContractKey, DynError> {
         let params = InboxParams {
             pub_key: contract.key.to_public_key(),
         }
@@ -132,7 +132,7 @@ impl InboxModel {
         let contract_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         InboxModel::get_state(client, contract_key.clone()).await?;
-        Ok(())
+        Ok(contract_key)
     }
 
     pub(crate) async fn send_message(

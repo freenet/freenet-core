@@ -18,6 +18,7 @@ required-features = ["build-binary"]
 name = "app"
 
 [dependencies]
+arc-swap = "1.6"
 rand_chacha = "0.3"
 chrono = { workspace = true }
 crossbeam = "0.8"

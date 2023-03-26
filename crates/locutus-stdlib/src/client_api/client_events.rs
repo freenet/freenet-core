@@ -359,6 +359,7 @@ impl std::fmt::Display for HostResponse {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum ContractResponse<T = WrappedState> {
     GetResponse {
+        key: ContractKey,
         contract: Option<ContractContainer>,
         #[serde(bound(deserialize = "T: DeserializeOwned"))]
         state: T,

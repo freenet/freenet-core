@@ -211,7 +211,12 @@ where
                         fetch_contract,
                     } => {
                         let (state, contract) = self.get_contract(&key, fetch_contract).await?;
-                        Ok(ContractResponse::GetResponse { contract, state }.into())
+                        Ok(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }
+                        .into())
                     }
                     ContractRequest::Put {
                         contract,

@@ -255,9 +255,15 @@ async fn process_host_response(
                     tracing::debug!(response = %res, cli_id = %id, "sending response");
                     match res {
                         HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            key,
                             contract,
                             state,
-                        }) => Ok(ContractResponse::GetResponse { contract, state }.into()),
+                        }) => Ok(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }
+                        .into()),
                         other => Ok(other),
                     }
                 }
