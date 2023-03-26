@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use locutus_aft_interface::{AllocationCriteria, TokenAllocationRecord, TokenAssignment};
 use locutus_stdlib::prelude::*;
-use rsa::{
-    pkcs1v15::SigningKey, pkcs8::EncodePublicKey, sha2::Sha256, RsaPrivateKey, RsaPublicKey,
-};
+use rsa::pkcs1v15::SigningKey;
+use rsa::sha2::Sha256;
+use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -138,7 +138,7 @@ fn allocate_token(
                     assignment_hash,
                 });
                 OutboundComponentMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
+                    ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                 )
             };
             Ok(vec![request_secret, req_allocation])
@@ -158,7 +158,7 @@ fn allocate_token(
                     assignment_hash,
                 });
                 OutboundComponentMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
+                    ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                 )
             };
             let request_user_input = OutboundComponentMsg::RequestUserInput(UserInputRequest {
@@ -184,7 +184,7 @@ fn allocate_token(
                     assignment_hash,
                 });
                 OutboundComponentMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
+                    ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                 )
             };
             Ok(vec![req_allocation])
@@ -197,7 +197,7 @@ fn allocate_token(
                     let Some(assignment) = records.assign(assignee, &criteria, keypair, assignment_hash) else {
                         let msg = TokenComponentMessage::Failure(FailureReason::NoFreeSlot { component_id, criteria } );
                         return Ok(vec![OutboundComponentMsg::ApplicationMessage(
-                            ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
+                            ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                         )]);
                     };
                     let msg = TokenComponentMessage::AllocatedToken {
@@ -206,14 +206,14 @@ fn allocate_token(
                         records,
                     };
                     OutboundComponentMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
+                        ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                     )
                 }
                 Response::NotAllowed => {
                     let context: ComponentContext = (&*context).try_into()?;
                     let msg = TokenComponentMessage::Failure(FailureReason::UserPermissionDenied);
                     OutboundComponentMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
+                        ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                     )
                 }
             };

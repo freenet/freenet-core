@@ -7,6 +7,7 @@ use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256};
 
 struct TokenAllocContract;
 
+#[contract]
 impl ContractInterface for TokenAllocContract {
     fn validate_state(
         parameters: Parameters<'static>,
