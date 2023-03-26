@@ -5,6 +5,8 @@ pub(crate) mod test_util;
 
 const MAIN_ELEMENT_ID: &str = "freenet-email-main";
 
+type DynError = Box<dyn std::error::Error>;
+
 pub fn main() {
     #[cfg(not(target_family = "wasm"))]
     {
@@ -63,15 +65,25 @@ mod api {
     type SenderHalf = tokio::sync::mpsc::Sender<ClientRequest<'static>>;
     type ReceiverHalf = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
 
+    #[cfg(feature = "use-node")]
     pub(crate) struct WebApi {
-        api: locutus_stdlib::client_api::WebApi,
         receiver_half: ReceiverHalf,
         sender_half: SenderHalf,
     }
 
+    #[cfg(not(feature = "use-node"))]
+    pub(crate) struct WebApi {}
+
+    #[cfg(feature = "use-node")]
     #[derive(Clone)]
     pub(crate) struct WebApiSender(SenderHalf);
+
+    #[cfg(not(feature = "use-node"))]
+    #[derive(Clone)]
+    pub(crate) struct WebApiSender;
+
     impl WebApiSender {
+        #[cfg(feature = "use-node")]
         pub async fn send(
             &mut self,
             request: locutus_stdlib::client_api::ClientRequest<'static>,
@@ -81,23 +93,37 @@ mod api {
                 .await
                 .map_err(|_| locutus_stdlib::client_api::Error::ChannelClosed)
         }
+
+        #[cfg(not(feature = "use-node"))]
+        pub async fn send(
+            &mut self,
+            request: locutus_stdlib::client_api::ClientRequest<'static>,
+        ) -> Result<(), locutus_stdlib::client_api::Error> {
+            tracing::debug!(?request, "emulated request");
+            Ok(())
+        }
     }
 
     impl WebApi {
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(not(feature = "use-node"))]
+        pub fn new() -> Result<Self, String> {
+            Ok(Self {})
+        }
+
+        #[cfg(all(not(target_family = "wasm"), feature = "use-node"))]
         pub fn new() -> Result<Self, String> {
             todo!()
         }
 
-        #[cfg(target_family = "wasm")]
+        #[cfg(all(target_family = "wasm", feature = "use-node"))]
         pub fn new() -> Result<Self, String> {
             let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
             let (tx, receiver_half) = crossbeam::channel::unbounded();
-            let (sender_half, rx) = tokio::sync::mpsc::channel(10);
+            let (sender_half, mut rx) = tokio::sync::mpsc::channel(10);
             let result_handler = move |result: Result<HostResponse, ClientError>| {
                 tx.send(result).expect("channel open");
             };
-            let api = locutus_stdlib::client_api::WebApi::start(
+            let mut api = locutus_stdlib::client_api::WebApi::start(
                 conn,
                 result_handler,
                 |err| {
@@ -107,25 +133,36 @@ mod api {
                 },
                 || {},
             );
-            tokio::task::spawn(async move {
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
                 while let Some(msg) = rx.recv().await {
-                    api.send(msg).await?;
+                    api.send(msg).await.map_err(|e| {
+                        tracing::error!("{e}");
+                        e
+                    })?;
                 }
-                Ok(())
+                Ok::<_, locutus_stdlib::client_api::Error>(())
             });
             Ok(Self {
-                api,
                 receiver_half,
                 sender_half,
             })
         }
 
+        #[cfg(feature = "use-node")]
         pub async fn recv(&mut self) -> Result<HostResponse, ClientError> {
             self.receiver_half.recv().expect("channel open")
         }
 
+        #[cfg(feature = "use-node")]
         pub fn sender_half(&self) -> WebApiSender {
             WebApiSender(self.sender_half.clone())
+        }
+
+        #[cfg(not(feature = "use-node"))]
+        pub fn sender_half(&self) -> WebApiSender {
+            WebApiSender
         }
     }
 }

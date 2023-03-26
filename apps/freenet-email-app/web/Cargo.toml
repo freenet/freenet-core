@@ -22,7 +22,7 @@ rand_chacha = "0.3"
 chrono = { workspace = true }
 crossbeam = "0.8"
 dioxus = { version = "0.3" }
-futures = "*"
+futures = "0.3"
 locutus-stdlib = { workspace = true, features = ["net"] }
 locutus-aft-interface = { workspace = true }
 # once_cell = { workspace = true }
@@ -31,7 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { version = "0.1" }
 tracing-subscriber = "0.3"
-tokio = "1"
+tokio =  { version = "1", features = ["sync", "rt"] }
 
 freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 

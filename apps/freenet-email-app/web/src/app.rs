@@ -3,22 +3,26 @@ use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use chrono::Utc;
 use dioxus::prelude::*;
+use futures::future::LocalBoxFuture;
+use futures::FutureExt;
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::{
     api::{WebApi, WebApiSender},
     inbox::{DecryptedMessage, InboxModel, MessageModel},
+    DynError,
 };
 
 mod login;
 
 pub(crate) fn App(cx: Scope) -> Element {
-    // #[cfg(target_family = "wasm")]
-    // {
-    //     web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
-    // }
+    #[cfg(target_family = "wasm")]
+    {
+        web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
+    }
 
     use_shared_state_provider(cx, || {
+        #[allow(clippy::map_identity)]
         WebApi::new()
             .map_err(|err| {
                 #[cfg(target_family = "wasm")]
@@ -33,7 +37,10 @@ pub(crate) fn App(cx: Scope) -> Element {
     let user = use_shared_state::<User>(cx).unwrap();
     let client = use_shared_state::<WebApi>(cx).unwrap().read().sender_half();
 
-    use_context_provider(cx, || Inbox::new(client, &user.read().identities).unwrap());
+    use_context_provider(cx, || {
+        // todo: don't block here if possible
+        futures::executor::block_on(Inbox::new(client.clone(), &user.read().identities)).unwrap()
+    });
 
     if !user.read().identified {
         cx.render(rsx! {
@@ -41,7 +48,14 @@ pub(crate) fn App(cx: Scope) -> Element {
         })
     } else if let Some(id) = user.read().logged_id() {
         let inbox = use_context::<Inbox>(cx).unwrap();
-        inbox.load_messages(cx, id);
+        #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
+        {
+            inbox.load_messages(client, id).expect("load messages");
+        }
+        #[cfg(feature = "ui-testing")]
+        {
+            inbox.load_messages(id);
+        }
         cx.render(rsx! {
            UserInbox {}
         })
@@ -60,12 +74,12 @@ struct Inbox {
 }
 
 impl Inbox {
-    fn new(client: WebApiSender, contracts: &[Identity]) -> Result<Self, String> {
+    async fn new(mut client: WebApiSender, contracts: &[Identity]) -> Result<Self, DynError> {
         let mut models = Vec::with_capacity(contracts.len());
         #[cfg(feature = "use-node")]
         {
             for identity in contracts {
-                let model = InboxModel::load(client, identity)?;
+                let model = InboxModel::load(&mut client, identity).await?;
                 models.push(Rc::new(RefCell::new(model)));
             }
         }
@@ -82,18 +96,19 @@ impl Inbox {
         to: &str,
         title: &str,
         content: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Vec<LocalBoxFuture<()>>, DynError> {
         tracing::debug!("adding to {}", self.active_id);
+        let content = DecryptedMessage {
+            title: title.to_owned(),
+            content: content.to_owned(),
+            from: "".to_owned(),
+            to: vec![to.to_owned()],
+            cc: vec![],
+            time: Utc::now(),
+        };
+        let mut futs = Vec::with_capacity(content.to.len());
         #[cfg(feature = "use-node")]
         {
-            let content = DecryptedMessage {
-                title: title.to_owned(),
-                content: content.to_owned(),
-                from: "".to_owned(),
-                to: vec![to.to_owned()],
-                cc: vec![],
-                time: Utc::now(),
-            };
             #[cfg(target_family = "wasm")]
             {
                 web_sys::console::log_1(
@@ -103,25 +118,37 @@ impl Inbox {
             }
             for k in content.to.iter() {
                 let key = RsaPublicKey::from_public_key_pem(k).map_err(|e| format!("{e}"))?;
-                InboxModel::send_message(client, content.clone(), key)?;
+                let content = content.clone();
+                let client = client.clone();
+                let f = async move {
+                    let r = InboxModel::send_message(client, content, key).await;
+                    if let Err(err) = r {
+                        error_handling(err).await;
+                    }
+                };
+                futs.push(f.boxed_local());
             }
         }
         let _ = client;
-        Ok(())
+        Ok(futs)
     }
 
     fn remove_messages(
         &self,
-        mut client: WebApiSender,
+        client: WebApiSender,
         ids: &[u64],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::debug!("removing {}", self.active_id);
+    ) -> Result<LocalBoxFuture<()>, DynError> {
+        tracing::debug!("removing messages: {ids:?}");
         #[cfg(feature = "use-node")]
         {
-            let inbox = self.inbox_data[self.active_id].clone();
-            InboxModel::remove_messages(&mut client, inbox, ids)?;
+            let mut inbox = self.inbox_data[self.active_id].borrow_mut();
+            let f = inbox.remove_messages(client, ids)?;
+            Ok(f)
         }
-        Ok(())
+        #[cfg(not(feature = "use-node"))]
+        {
+            async {}.boxed_local()
+        }
     }
 
     // Remove the messages from the inbox contract, and move them to local storage
@@ -129,7 +156,7 @@ impl Inbox {
         &self,
         client: WebApiSender,
         ids: &[u64],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<LocalBoxFuture<()>, DynError> {
         let messages = &mut *self.messages.borrow_mut();
         let mut removed_messages = Vec::with_capacity(ids.len());
         for e in messages {
@@ -140,12 +167,11 @@ impl Inbox {
             }
         }
         // todo: persist in a sidekick `removed_messages`
-        self.remove_messages(client, ids)?;
-        Ok(())
+        self.remove_messages(client, ids)
     }
 
     #[cfg(feature = "ui-testing")]
-    fn load_messages(&self, _cx: Scope, id: &Identity) {
+    fn load_messages(&self, id: &Identity) {
         let emails = {
             if id.id == 0 {
                 vec![
@@ -195,32 +221,13 @@ impl Inbox {
     }
 
     #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
-    fn load_messages(&self, cx: Scope, id: &Identity, private_key: &rsa::RsaPrivateKey) {
-        CONNECTION.with(|conn| {
-            let private_key = private_key.clone();
-            let key = self
-                .contracts
-                .iter()
-                .find(|c| c.id == id.id)
-                .unwrap()
-                .pub_key
-                .clone();
-            let contract_key = todo!("get the id, from the code + params");
-            let client = (**conn).clone();
-            let f = use_future(cx, (), |_| async move {
-                let client = &mut *client.borrow_mut();
-                InboxModel::get_inbox(client, &private_key, contract_key).await
-            });
-            let inbox = loop {
-                match f.value() {
-                    Some(v) => break v.as_ref().unwrap(),
-                    None => std::thread::sleep(std::time::Duration::from_millis(100)),
-                }
-            };
-            let messages = &mut *self.messages.borrow_mut();
-            messages.clear();
-            messages.extend(inbox.messages.iter().map(|m| m.clone().into()));
-        })
+    fn load_messages(&self, mut client: WebApiSender, id: &Identity) -> Result<(), DynError> {
+        let mut messages = self.messages.borrow_mut();
+        // todo: don't block here if possible
+        let inbox = futures::executor::block_on(InboxModel::load(&mut client, id))?;
+        messages.clear();
+        messages.extend(inbox.messages.iter().map(|m| m.clone().into()));
+        Ok(())
     }
 }
 
@@ -232,7 +239,8 @@ struct User {
 }
 
 impl User {
-    #[cfg(feature = "ui-testing")]
+    // todo: enable feature gates after impl the other `use-node` version
+    // #[cfg(feature = "ui-testing")]
     fn new() -> Self {
         const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
         const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
@@ -257,6 +265,12 @@ impl User {
             ],
         }
     }
+
+    // #[cfg(all(not(feature = "ui-testing"), feature = "use-node"))]
+    // fn new() -> Self {
+    //     // TODO: here we should load the user identities from the identity component
+    //     todo!()
+    // }
 
     fn logged_id(&self) -> Option<&Identity> {
         self.active_id.and_then(|id| self.identities.get(id))
@@ -519,17 +533,8 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
     let client = use_shared_state::<WebApi>(cx).unwrap().read().sender_half();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let email = cx.props;
-    match inbox.mark_as_read(client.clone(), &[email.id]) {
-        Ok(()) => {}
-        Err(e) => {
-            let err = format!("{e}");
-            #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
-            {
-                web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-            }
-            tracing::error!("error while updating message state: {err}");
-        }
-    }
+    let email_id = [cx.props.id];
+    let results = inbox.mark_as_read(client.clone(), &email_id);
     cx.render(rsx! {
         div {
             class: "columns title mt-3",
@@ -549,17 +554,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
                 a {
                     class: "icon is-small", 
                     onclick: move |_| {
-                        match inbox.remove_messages(client, &[email.id]) {
-                            Ok(()) => {}
-                            Err(e) => {
-                                let err = format!("{e}");
-                                #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
-                                {
-                                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-                                }
-                                tracing::error!("error while deleting message: {err}");
-                            }
-                        }
+                       let results = inbox.remove_messages(client.clone(), &email_id);
                         menu_selection.write().at_inbox_list();
                     },
                     i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" } 
@@ -621,8 +616,8 @@ fn NewMessageWindow(cx: Scope) -> Element {
                 button {
                     class: "button is-info is-outlined",
                     onclick: move |_| {
-                        match inbox.send_message(client, to.get(), title.get(), content.get()) {
-                            Ok(()) => {}
+                        match inbox.send_message(client.clone(), to.get(), title.get(), content.get()) {
+                            Ok(futs) => {}
                             Err(e) => {
                                 let err = format!("{e}");
                                 #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
@@ -639,4 +634,15 @@ fn NewMessageWindow(cx: Scope) -> Element {
             }
         }
     })
+}
+
+pub(crate) async fn error_handling(err: DynError) {
+    // FIXME: error handling, notify somehow to renderer
+    #[cfg(target_family = "wasm")]
+    {
+        let err = format!("{err}");
+        web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+    }
+    tracing::error!("error while updating message state: {err}");
+    todo!()
 }

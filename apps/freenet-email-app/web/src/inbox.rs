@@ -1,11 +1,12 @@
 use std::collections::HashSet;
-use std::{cell::RefCell, rc::Rc};
 
 use chrono::{DateTime, Utc};
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
     UpdateInbox,
 };
+use futures::future::LocalBoxFuture;
+use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment};
 use locutus_stdlib::client_api::{ClientRequest, ComponentRequest};
 use locutus_stdlib::prelude::{ApplicationMessage, ComponentKey, InboundComponentMsg};
@@ -21,8 +22,8 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::WebApiSender;
-use crate::app::Identity;
+use crate::app::error_handling;
+use crate::{api::WebApiSender, app::Identity, DynError};
 
 static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
 
@@ -45,7 +46,7 @@ impl InternalSettings {
         stored_settings: StoredSettings,
         next_id: u64,
         private_key: RsaPrivateKey,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, DynError> {
         Ok(Self {
             next_msg_id: next_id,
             private_key,
@@ -53,7 +54,7 @@ impl InternalSettings {
         })
     }
 
-    fn to_stored(&self) -> Result<StoredSettings, Box<dyn std::error::Error>> {
+    fn to_stored(&self) -> Result<StoredSettings, DynError> {
         Ok(StoredSettings {
             minimum_tier: self.minimum_tier,
             private: vec![],
@@ -69,7 +70,7 @@ pub(crate) struct MessageModel {
 }
 
 impl MessageModel {
-    fn to_stored(&self, key: &RsaPrivateKey) -> Result<StoredMessage, Box<dyn std::error::Error>> {
+    fn to_stored(&self, key: &RsaPrivateKey) -> Result<StoredMessage, DynError> {
         // FIXME: use a real source of entropy
         let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
         let decrypted_content = serde_json::to_vec(&self.content)?;
@@ -77,7 +78,7 @@ impl MessageModel {
             .to_public_key()
             .encrypt(&mut rng, Pkcs1v15Encrypt, decrypted_content.as_ref())
             .map_err(|e| format!("{e}"))?;
-        Ok::<_, Box<dyn std::error::Error>>(StoredMessage {
+        Ok::<_, DynError>(StoredMessage {
             content,
             token_assignment: self.token_assignment.clone(),
         })
@@ -95,10 +96,7 @@ pub(crate) struct DecryptedMessage {
 }
 
 impl DecryptedMessage {
-    fn to_stored(
-        &self,
-        token_assignment: TokenAssignment,
-    ) -> Result<StoredMessage, Box<dyn std::error::Error>> {
+    fn to_stored(&self, token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
         // FIXME: use a real source of entropy
         let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
         let decrypted_content = serde_json::to_vec(self)?;
@@ -106,7 +104,7 @@ impl DecryptedMessage {
             .assignee
             .encrypt(&mut rng, Pkcs1v15Encrypt, decrypted_content.as_ref())
             .map_err(|e| format!("{e}"))?;
-        Ok::<_, Box<dyn std::error::Error>>(StoredMessage {
+        Ok::<_, DynError>(StoredMessage {
             content,
             token_assignment,
         })
@@ -123,9 +121,9 @@ pub(crate) struct InboxModel {
 
 impl InboxModel {
     pub(crate) async fn load(
-        mut client: WebApiSender,
+        client: &mut WebApiSender,
         contract: &Identity,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, DynError> {
         let private_key = contract.key.clone();
         let params = InboxParams {
             pub_key: contract.key.to_public_key(),
@@ -134,7 +132,7 @@ impl InboxModel {
         .map_err(|e| format!("{e}"))?;
         let contract_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-        let state = InboxModel::get_state(&mut client, contract_key.clone()).await?;
+        let state = InboxModel::get_state(client, contract_key.clone()).await?;
         Self::from_state(private_key, state, contract_key)
     }
 
@@ -142,7 +140,7 @@ impl InboxModel {
         mut client: WebApiSender,
         content: DecryptedMessage,
         pub_key: RsaPublicKey,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), DynError> {
         let token = {
             let key = pub_key.clone();
             InboxModel::assign_token(&mut client, key).await?
@@ -163,21 +161,37 @@ impl InboxModel {
         Ok(())
     }
 
-    pub(crate) async fn remove_messages(
-        client: &mut WebApiSender,
-        this: Rc<RefCell<Self>>,
+    pub(crate) fn remove_messages(
+        &mut self,
+        mut client: WebApiSender,
         ids: &[u64],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        this.borrow_mut().remove_received_message(ids);
+    ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
+        self.remove_received_message(ids);
         let ids = ids.to_vec();
-        this.borrow_mut()
-            .remove_messages_from_store(client, &ids)
-            .await?;
-        Ok(())
+        let mut signed = Vec::with_capacity(ids.len() * 32);
+        let mut ids = Vec::with_capacity(ids.len() * 32);
+        for m in &self.messages {
+            let h = &m.token_assignment.assignment_hash;
+            signed.extend(h);
+            ids.push(*h);
+        }
+        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
+        let signature = signing_key.sign(&signed).into();
+        let delta = UpdateInbox::RemoveMessages { signature, ids };
+        let request = ContractRequest::Update {
+            key: self.key.clone(),
+            data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
+        };
+        let f = async move {
+            if let Err(e) = client.send(request.into()).await {
+                error_handling(e.into()).await;
+            }
+        };
+        Ok(f.boxed_local())
     }
 
-    // TODO: only used when an inbox is created first time
-    fn to_state(&self) -> Result<State<'static>, Box<dyn std::error::Error>> {
+    // TODO: only used when an inbox is created first time when putting the contract
+    fn to_state(&self) -> Result<State<'static>, DynError> {
         let settings = self.settings.to_stored()?;
         let messages = self
             .messages
@@ -193,7 +207,7 @@ impl InboxModel {
         private_key: rsa::RsaPrivateKey,
         state: StoredInbox,
         key: ContractKey,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, DynError> {
         let messages = state
             .messages
             .iter()
@@ -209,7 +223,7 @@ impl InboxModel {
                     token_assignment: msg.token_assignment.clone(),
                 })
             })
-            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            .collect::<Result<Vec<_>, DynError>>()?;
         Ok(Self {
             settings: InternalSettings::from_stored(
                 state.settings,
@@ -253,7 +267,7 @@ impl InboxModel {
     async fn update_settings_at_store(
         &mut self,
         client: &mut WebApiSender,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), DynError> {
         let settings = self.settings.to_stored()?;
         let serialized = serde_json::to_vec(&settings)?;
         let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
@@ -270,33 +284,10 @@ impl InboxModel {
         Ok(())
     }
 
-    async fn remove_messages_from_store(
-        &mut self,
-        client: &mut WebApiSender,
-        ids: &[u64],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut signed = Vec::with_capacity(ids.len() * 32);
-        let mut ids = Vec::with_capacity(ids.len() * 32);
-        for m in &self.messages {
-            let h = &m.token_assignment.assignment_hash;
-            signed.extend(h);
-            ids.push(*h);
-        }
-        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
-        let signature = signing_key.sign(&signed).into();
-        let delta = UpdateInbox::RemoveMessages { signature, ids };
-        let request = ContractRequest::Update {
-            key: self.key.clone(),
-            data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
-        };
-        client.send(request.into()).await?;
-        Ok(())
-    }
-
     async fn assign_token(
         client: &mut WebApiSender,
         recipient_key: RsaPublicKey,
-    ) -> Result<TokenAssignment, Box<dyn std::error::Error>> {
+    ) -> Result<TokenAssignment, DynError> {
         let key = ComponentKey::new(&[]); // TODO: this should be the AFT component key
         let params = InboxParams {
             pub_key: recipient_key,
@@ -317,7 +308,7 @@ impl InboxModel {
     //     &mut self,
     //     client: &mut WebApi,
     //     ids: &[usize],
-    // ) -> Result<(), Box<dyn std::error::Error>> {
+    // ) -> Result<(), DynError> {
     //     let mut messages = Vec::with_capacity(ids.len() * 32);
     //     for message in &self.messages {
     //         // messages.push(message.to_stored(&self.settings.private_key)?);
@@ -334,8 +325,8 @@ impl InboxModel {
     async fn get_state(
         client: &mut WebApiSender,
         key: ContractKey,
-    ) -> Result<StoredInbox, Box<dyn std::error::Error>> {
-        use locutus_stdlib::client_api::{ContractResponse, HostResponse};
+    ) -> Result<StoredInbox, DynError> {
+        // use locutus_stdlib::client_api::{ContractResponse, HostResponse};
         let request = ContractRequest::Get {
             key,
             fetch_contract: false,
@@ -360,7 +351,7 @@ mod tests {
     use super::*;
 
     impl InboxModel {
-        fn new(private_key: RsaPrivateKey) -> Result<Self, Box<dyn std::error::Error>> {
+        fn new(private_key: RsaPrivateKey) -> Result<Self, DynError> {
             let params = InboxParams {
                 pub_key: private_key.to_public_key(),
             };
