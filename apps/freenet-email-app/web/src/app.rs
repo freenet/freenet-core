@@ -105,10 +105,13 @@ impl Inbox {
             let mut client = client.clone();
             let identity = identity.clone();
             #[cfg(feature = "use-node")]
-            cx.spawn(async move {
-                let res = InboxModel::load(&mut client, &identity).await;
-                error_handling(client.into(), res.map(|_| ()), TryAsyncAction::LoadMessages).await;
-            });
+            {
+                cx.spawn(async move {
+                    let res = InboxModel::load(&mut client, &identity).await;
+                    error_handling(client.into(), res.map(|_| ()), TryAsyncAction::LoadMessages)
+                        .await;
+                });
+            }
         }
         Ok(Self {
             inbox_data: Arc::new(ArcSwap::from_pointee(models)),

@@ -45,6 +45,7 @@ impl WebApi {
         let onopen_callback = Closure::<dyn FnMut()>::new(move || {
             onopen_handler();
         });
+        conn.add_event_listener_with_callback("open", onopen_callback.as_ref().unchecked_ref());
         conn.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
         onopen_callback.forget();
 

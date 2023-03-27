@@ -60,6 +60,8 @@ pub fn main() {
 }
 
 mod api {
+    use std::sync::atomic::AtomicBool;
+
     use dioxus::prelude::{Scope, UnboundedSender};
     use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
@@ -130,6 +132,8 @@ mod api {
         }
     }
 
+    static STARTED: AtomicBool = AtomicBool::new(false);
+
     impl WebApi {
         #[cfg(not(feature = "use-node"))]
         pub fn new(_: Scope) -> Result<Self, String> {
@@ -144,11 +148,15 @@ mod api {
         #[cfg(all(target_family = "wasm", feature = "use-node"))]
         pub fn new(cx: Scope) -> Result<Self, String> {
             use futures::StreamExt;
+            use wasm_bindgen::JsCast;
             let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
             let (tx, receiver_half) = crossbeam::channel::unbounded();
             let (sender_half, mut rx) = futures::channel::mpsc::unbounded();
             let result_handler = move |result: Result<HostResponse, ClientError>| {
                 tx.send(result).expect("channel open");
+            };
+            let onopen_handler = || {
+                STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
             };
             let mut api = locutus_stdlib::client_api::WebApi::start(
                 conn,
@@ -158,7 +166,7 @@ mod api {
                         &serde_wasm_bindgen::to_value(&format!("connection error: {err}")).unwrap(),
                     );
                 },
-                || {},
+                onopen_handler,
             );
             cx.spawn({
                 async move {
@@ -174,6 +182,23 @@ mod api {
                 }
             });
             let (responses_sender, responses) = crossbeam::channel::unbounded();
+            let wait = wasm_bindgen::prelude::Closure::<dyn FnMut()>::new(|| {
+                web_sys::console::log_1(
+                    &serde_wasm_bindgen::to_value("Attempting to connect").unwrap(),
+                )
+            });
+            web_sys::console::log_1(&serde_wasm_bindgen::to_value("Connecting...").unwrap());
+            while !STARTED.load(std::sync::atomic::Ordering::SeqCst) {
+                web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                        wait.as_ref().unchecked_ref(),
+                        10,
+                    );
+            }
+            web_sys::console::log_1(
+                &serde_wasm_bindgen::to_value("Connected to websocket").unwrap(),
+            );
             Ok(Self {
                 receiver_half,
                 sender_half,
