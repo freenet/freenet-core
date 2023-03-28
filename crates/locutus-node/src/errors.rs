@@ -1,34 +1,83 @@
-use warp::{hyper::StatusCode, reject::Reject, reply, Rejection, Reply};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Response};
+use locutus_stdlib::client_api::ErrorKind;
+use std::fmt::{Display, Formatter};
 
-use super::*;
-
-pub(super) async fn handle_error(err: Rejection) -> Result<impl Reply, std::convert::Infallible> {
-    if let Some(e) = err.find::<errors::InvalidParam>() {
-        return Ok(reply::with_status(e.0.to_owned(), StatusCode::BAD_REQUEST));
-    }
-    if err.find::<errors::NodeError>().is_some() {
-        return Ok(reply::with_status(
-            "Node unavailable".to_owned(),
-            StatusCode::BAD_GATEWAY,
-        ));
-    }
-    Ok(reply::with_status(
-        "INTERNAL SERVER ERROR".to_owned(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-    ))
+#[derive(Debug)]
+pub enum WebSocketApiError {
+    /// Something went wrong when calling the user repo.
+    InvalidParam {
+        error_cause: String,
+    },
+    NodeError {
+        error_cause: String,
+    },
+    HttpError {
+        code: StatusCode,
+    },
+    AxumError {
+        error: ErrorKind,
+    },
 }
 
-#[derive(Debug)]
-pub(super) struct InvalidParam(pub String);
+impl WebSocketApiError {
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            WebSocketApiError::InvalidParam { .. } => StatusCode::BAD_REQUEST,
+            WebSocketApiError::NodeError { .. } => StatusCode::BAD_GATEWAY,
+            WebSocketApiError::HttpError { code } => *code,
+            WebSocketApiError::AxumError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 
-impl Reject for InvalidParam {}
+    pub fn error_message(&self) -> String {
+        match self {
+            WebSocketApiError::InvalidParam { error_cause } => {
+                format!("Invalid request params: {}", error_cause)
+            }
+            WebSocketApiError::NodeError { error_cause } => format!("Node error: {}", error_cause),
+            WebSocketApiError::HttpError { code } => {
+                let error_message = match *code {
+                    StatusCode::BAD_REQUEST => "Bad Request",
+                    StatusCode::BAD_GATEWAY => "Bad Gateway",
+                    StatusCode::NOT_FOUND => "Not Found",
+                    _ => "Internal Server Error",
+                };
+                format!("HTTP error: {}", error_message)
+            }
+            WebSocketApiError::AxumError { error } => format!("Axum error: {}", error),
+        }
+    }
+}
 
-#[derive(Debug)]
-pub(super) struct NodeError;
+impl Display for WebSocketApiError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error_message())
+    }
+}
 
-impl Reject for NodeError {}
+impl From<WebSocketApiError> for Response {
+    fn from(error: WebSocketApiError) -> Self {
+        let body = Html(error.error_message());
+        (error.status_code(), body).into_response()
+    }
+}
 
-#[derive(Debug)]
-pub(super) struct HttpError(pub warp::http::StatusCode);
+impl IntoResponse for WebSocketApiError {
+    fn into_response(self) -> Response {
+        let (status, error_message) = match self {
+            WebSocketApiError::InvalidParam { error_cause: cause } => {
+                (StatusCode::BAD_REQUEST, cause)
+            }
+            WebSocketApiError::NodeError { error_cause: cause } => (StatusCode::BAD_GATEWAY, cause),
+            WebSocketApiError::HttpError { code } => (code, "INTERNAL SERVER ERROR".to_owned()),
+            WebSocketApiError::AxumError { error } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}"))
+            }
+        };
 
-impl Reject for HttpError {}
+        let body = Html(error_message);
+
+        (status, body).into_response()
+    }
+}

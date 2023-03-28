@@ -18,7 +18,7 @@ mod contract_interface;
 pub(crate) mod global;
 pub mod time;
 mod versioning;
-#[cfg(feature = "xz2")]
+#[cfg(feature = "archive")]
 pub mod web;
 
 /// Locutus stdlib prelude.
