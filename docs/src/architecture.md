@@ -4,7 +4,7 @@
 
 ### Overview
 
-Delegates, contracts, and applications each serve distinct roles in the Freenet ecosystem. Contracts control public data, or "shared state". Delegates act as the user's agent and can store private data. Apps serve as the user interface to contracts and delegates.
+Delegates, contracts, and applications each serve distinct roles in the Freenet ecosystem. Contracts control public data, or "shared state". Delegates act as the user's agent and can store private data on the user's behalf. Apps serve as the user interface to contracts and delegates.
 
 ### Applications
 
@@ -12,13 +12,14 @@ Applications are the user interface for decentralized systems on Freenet. They a
 
 ### Contracts
 
-Contracts in Freenet are WebAssembly code that manage and regulate public state. They can be likened to inodes in a filesystem, tables in a database, or memory locations in a globally shared memory. As the fundamental unit of shared state in Freenet, contracts define the circumstances under which state can be modified and whether a given state is allowed under the contract.
+Contracts in Freenet are WebAssembly code that manage and regulate public state. They can be likened to inodes in a filesystem, tables in a database, or memory locations in a globally shared memory. Contracts define the circumstances under which state can be modified and whether a given state is allowed under the contract.
+
+Contracts also outline how to merge two valid states, creating a new state that incorporates both. This process ensures eventual consistency of the state in Freenet, using an approach akin to [CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 
 Each contract is identified by a cryptographic hash, which is a combination of its code and parameters, also referred to as its "key." This key corresponds to the value in a global key-value store.
 
 Take, for example, a public blog contract. The state of this contract would be the blog's content, which consists of a list of blog posts. The code within the contract dictates that new posts may only be added if they are signed by the blog's owner, while the contract's parameters include the blog owner's public key.
 
-Contracts also outline how to merge two valid states, creating a new state that incorporates both. This process ensures eventual consistency of the state in Freenet, using an approach akin to [CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 
 ### Delegates
 
