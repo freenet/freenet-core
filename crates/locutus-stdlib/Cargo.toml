@@ -38,7 +38,7 @@ tokio = { version = "1", optional = true, features = ["macros", "parking_lot", "
 tokio-tungstenite = { version = "0.18", optional = true } 
 
 [target.'cfg(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"))'.dependencies]
-serde-wasm-bindgen = { version = "0.4", optional = true }
+serde-wasm-bindgen = { version = "0.5", optional = true }
 wasm-bindgen = { version = "0.2", features = ["serde-serialize"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"))'.dependencies.web-sys]
