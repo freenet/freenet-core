@@ -35,13 +35,20 @@ pub(crate) enum TryAsyncAction {
     RemoveMessages,
 }
 
+impl std::fmt::Display for TryAsyncAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryAsyncAction::LoadMessages => write!(f, "load messages"),
+            TryAsyncAction::SendMessage => write!(f, "send message"),
+            TryAsyncAction::RemoveMessages => write!(f, "remove messages"),
+        }
+    }
+}
+
 static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
 
 pub(crate) fn App(cx: Scope) -> Element {
-    #[cfg(target_family = "wasm")]
-    {
-        web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
-    }
+    crate::log::log("Loging screen");
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
 
@@ -112,7 +119,7 @@ impl Inbox {
         title: &str,
         content: &str,
     ) -> Result<Vec<LocalBoxFuture<'static, ()>>, DynError> {
-        tracing::debug!("adding to {}", self.active_id);
+        tracing::debug!("sending message from id #{}", self.active_id);
         let content = DecryptedMessage {
             title: title.to_owned(),
             content: content.to_owned(),
@@ -124,20 +131,14 @@ impl Inbox {
         let mut futs = Vec::with_capacity(content.to.len());
         #[cfg(feature = "use-node")]
         {
-            #[cfg(target_family = "wasm")]
-            {
-                web_sys::console::log_1(
-                    &serde_wasm_bindgen::to_value(&format!("adding to {}", self.active_id))
-                        .unwrap(),
-                );
-            }
+            crate::log::log(format!("sending message from id #{}", self.active_id));
             for k in content.to.iter() {
                 let key = RsaPublicKey::from_public_key_pem(k).map_err(|e| format!("{e}"))?;
                 let content = content.clone();
                 let mut client = client.clone();
                 let f = async move {
-                    let r = InboxModel::send_message(&mut client, content, key).await;
-                    error_handling(client.into(), r, TryAsyncAction::SendMessage).await;
+                    let res = InboxModel::send_message(&mut client, content, key).await;
+                    error_handling(client.into(), res, TryAsyncAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());
             }
@@ -597,12 +598,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
                 futs.into_iter().for_each(|f| cx.spawn(f));
             }
             Err(e) => {
-                let err = format!("{e}");
-                #[cfg(all(feature = "use-node", target_arch = "wasm32"))]
-                {
-                    web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-                }
-                tracing::error!("error while sending message: {err}");
+                crate::log::error(format!("{e}"));
             }
         }
         menu_selection.write().at_new_msg();
@@ -656,15 +652,10 @@ pub(crate) async fn error_handling(
     res: Result<(), DynError>,
     action: TryAsyncAction,
 ) {
-    if let Err(err) = res {
-        // FIXME: error handling, notify somehow to renderer
-        #[cfg(target_family = "wasm")]
-        {
-            let err = format!("{err}");
-            web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-        }
-        tracing::error!("error while updating message state: {err}");
-        error_channel.send(Err((err, action))).unwrap();
+    if let Err(error) = res {
+        crate::log::error(format!("error while {action}: {error}"));
+        tracing::error!(%error, %action);
+        error_channel.send(Err((error, action))).unwrap();
     } else {
         error_channel.send(Ok(())).unwrap();
     }
@@ -679,13 +670,9 @@ pub(crate) async fn node_comms(
     use freenet_email_inbox::Inbox as StoredInbox;
     use locutus_stdlib::client_api::{ContractResponse, HostResponse};
 
-    #[allow(clippy::map_identity)]
     let api = WebApi::new()
         .map_err(|err| {
-            #[cfg(target_family = "wasm")]
-            {
-                web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-            }
+            crate::log::error(format!("error while connecting to node: {err}"));
             err
         })
         .expect("open connection");
@@ -736,9 +723,11 @@ pub(crate) async fn node_comms(
                                 let x = e.borrow();
                                 x.key == key
                             }) {
+                                crate::log::log(format!("loaded inbox {key}"));
                                 let mut current = loaded_models[pos].borrow_mut();
                                 *current = updated_model;
                             } else {
+                                crate::log::log(format!("updated inbox {key}"));
                                 let mut cloned = (***loaded_models).to_vec();
                                 std::mem::drop(loaded_models);
                                 cloned.push(Rc::new(RefCell::new(updated_model)));

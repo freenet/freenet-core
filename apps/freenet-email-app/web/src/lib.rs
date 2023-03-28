@@ -1,5 +1,6 @@
 mod app;
 pub(crate) mod inbox;
+pub(crate) mod log;
 #[cfg(test)]
 pub(crate) mod test_util;
 
@@ -76,7 +77,7 @@ mod api {
         send_half: ClientRequester,
         pub client_errors: crossbeam::channel::Receiver<AsyncActionResult>,
         error_sender: NodeResponses,
-        api: locutus_stdlib::client_api::WebApi,
+        _api: locutus_stdlib::client_api::WebApi,
     }
 
     #[cfg(not(feature = "use-node"))]
@@ -104,17 +105,13 @@ mod api {
                 send_host_responses.send(result).expect("channel open");
             };
             let onopen_handler = || {
-                web_sys::console::log_1(
-                    &serde_wasm_bindgen::to_value("Connected to websocket").unwrap(),
-                );
+                crate::log::log("Connected to websocket");
             };
             let mut api = locutus_stdlib::client_api::WebApi::start(
                 conn,
                 result_handler,
                 |err| {
-                    web_sys::console::error_1(
-                        &serde_wasm_bindgen::to_value(&format!("connection error: {err}")).unwrap(),
-                    );
+                    crate::log::error(format!("connection error: {err}"));
                 },
                 onopen_handler,
             );
@@ -125,7 +122,7 @@ mod api {
                 send_half,
                 client_errors,
                 error_sender,
-                api,
+                _api: api,
             })
         }
 

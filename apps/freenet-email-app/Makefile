@@ -45,8 +45,8 @@ run-node:
 
 run-web:
 	cd $(INBOX_WEB_DIR)
-	trunk build --features use-node
-	trunk serve --features use-node
+	trunk build --features use-node --no-default-features
+	trunk serve --features use-node --no-default-features
 
 clean:
 	rm -rf $(CARGO_TARGET_DIR)
