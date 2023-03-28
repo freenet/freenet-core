@@ -4,7 +4,7 @@
 
 ### Overview
 
-Delegates, contracts, and applications each serve distinct roles in the software ecosystem. Contracts function as shared models, representing the agreed-upon state that can be modified according to user-defined rules. Delegates, on the other hand, operate on the user's device and manage private state, such as keys, secret tokens, and message inboxes/outboxes. They also facilitate the user's interaction with contracts and apps by controlling access to private data. Apps serve as the user interface for contracts and delegates, running in the browser and built using various web technologies like React.
+Delegates, contracts, and applications each serve distinct roles in the Freenet ecosystem. Contracts function as shared models, representing the agreed-upon state that can be modified according to user-defined rules. Delegates, on the other hand, operate on the user's device and manage private state, such as keys, secret tokens, and message inboxes/outboxes. They also facilitate the user's interaction with contracts and apps by controlling access to private data. Apps serve as the user interface for contracts and delegates, running in the browser and built using various web technologies like React.
 
 ### Applications
 
