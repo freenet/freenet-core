@@ -8,13 +8,13 @@ Delegates, contracts, and applications each serve distinct roles in the Freenet 
 
 ### Applications
 
-Applications are the user interface for decentralized systems on Freenet. They are built using web technologies such as HTML, CSS, and JavaScript, and are distributed over Freenet. Applications can create, retrieve, and update contracts through a WebSocket connection to the local Freenet peer, as well as communicate with delegates and contracts. Applications run in a web browser, and can be built using any web framework, such as React, Angular, Vue.js, Bootstrap, and so on.
+Applications are the user interface for decentralized systems on Freenet. They are built using web technologies such as HTML, CSS, and JavaScript, and are distributed over Freenet. Applications can create, retrieve, and update contracts through a WebSocket connection to the local Freenet peer, as well as communicate with delegates. Applications run in a web browser, and can be built using any web framework, such as React, Angular, Vue.js, Bootstrap, and so on.
 
 ### Contracts
 
 Contracts in Freenet are WebAssembly code that manage and regulate public state. They can be likened to inodes in a filesystem, tables in a database, or memory locations in a globally shared memory. Contracts define the circumstances under which state can be modified and whether a given state is allowed under the contract.
 
-Contracts also outline how to merge two valid states, creating a new state that incorporates both. This process ensures eventual consistency of the state in Freenet, using an approach akin to [CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
+Contracts also outline how to merge two valid states, creating a new state that incorporates both. This process ensures [eventual consistency](https://en.wikipedia.org/wiki/Eventual_consistency) of the state in Freenet, using an approach akin to [CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 
 Each contract is identified by a cryptographic hash, which is a combination of its code and parameters, also referred to as its "key". This key is used to identify the contract and to verify that the contract's code and parameters have not been tampered with.
 
@@ -27,7 +27,12 @@ Delegates are WebAssembly code components that serve as personal agents for user
 
 Delegates must implemenent the [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
 
-While contracts' state is public (but potentially encrypted), delegates state is private.
+While contracts' state is public (but potentially encrypted), delegates state is private. Example uses for delegates include:
+
+* Storing and controlling the use of private data such as passwords, keys, tokens, and other sensitive information
+* Participating on the user's behalf in decentralized systems like a web of trust
+* Storing private data on behalf of the user, like contacts, or sent and received messages
+
 
 #### Origin Attestation
 
