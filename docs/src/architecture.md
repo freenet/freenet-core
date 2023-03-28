@@ -16,7 +16,7 @@ Contracts in Freenet are WebAssembly code that manage and regulate public state.
 
 Contracts also outline how to merge two valid states, creating a new state that incorporates both. This process ensures eventual consistency of the state in Freenet, using an approach akin to [CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 
-Each contract is identified by a cryptographic hash, which is a combination of its code and parameters, also referred to as its "key." This key corresponds to the value in a global key-value store.
+Each contract is identified by a cryptographic hash, which is a combination of its code and parameters, also referred to as its "key". This key is used to identify the contract and to verify that the contract's code and parameters have not been tampered with.
 
 Take, for example, a public blog contract. The state of this contract would be the blog's content, which consists of a list of blog posts. The code within the contract dictates that new posts may only be added if they are signed by the blog's owner, while the contract's parameters include the blog owner's public key.
 
@@ -27,7 +27,7 @@ Delegates are WebAssembly code components that serve as personal agents for user
 
 Delegates must implemenent the [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
 
-While contract states are public, delegates handle private state. However, it is important to note that public contract state can be encrypted if necessary, such as in the case of an inbox for a messaging system.
+While contracts' state is public (but potentially encrypted), delegates state is private.
 
 #### Origin Attestation
 
