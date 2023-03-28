@@ -1,9 +1,6 @@
-use std::{collections::HashMap};
-
+use std::collections::HashMap;
 use locutus_core::{libp2p::PeerId, Location};
-use pav_regression::{
-    pav::{IsotonicRegression, Point},
-};
+use pav_regression::pav::{IsotonicRegression, Point};
 
 const MIN_PEER_POINTS_FOR_REGRESSION: usize = 10;
 
@@ -123,13 +120,9 @@ mod tests {
             assert!(estimated_time.is_some());
             let estimated_time = estimated_time.unwrap();
             let actual_time = event.result;
-            // print estimated and actual
-            println!("Estimated: {:?}, Actual: {:?}", estimated_time, actual_time);
             let error = (estimated_time - actual_time).abs();
             errors.push(error);
         }
-
-        println!("Errors: {:?}", errors);
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
