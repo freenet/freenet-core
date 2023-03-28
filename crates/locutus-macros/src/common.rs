@@ -8,7 +8,7 @@ pub fn set_logger() -> TokenStream {
         {
             use ::locutus_stdlib::prelude::{tracing_subscriber as tra};
             if let Err(err) = tra::fmt()
-                .with_env_filter("warn,locutus_stdlib=trace")
+                .with_env_filter("info,locutus_stdlib=trace")
                 .try_init()
             {
                 return ::locutus_stdlib::prelude::ContractInterfaceResult::from(
