@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use locutus_core::{libp2p::PeerId, Location};
 use pav_regression::pav::{IsotonicRegression, Point};
 
-const MIN_PEER_POINTS_FOR_REGRESSION: usize = 10;
+const MIN_POINTS_FOR_REGRESSION: usize = 10;
 
 /// `RoutingOutcomeEstimator` is a Rust struct that provides outcome estimation for a given action,
 /// such as retrieving the state of a contract, based on the distance between the peer and the contract.
@@ -14,8 +14,6 @@ const MIN_PEER_POINTS_FOR_REGRESSION: usize = 10;
 /// assuming all other factors are equal. Each peer has its own regression model, which is used only
 /// if it has enough data points for accurate predictions. Otherwise, the global regression model
 /// is used.
-///
-/// New data points can be added to the estimator without the need to rebuild the model.
 
 pub struct RoutingOutcomeEstimator {
     global_regression: IsotonicRegression,
@@ -45,7 +43,6 @@ impl RoutingOutcomeEstimator {
 
         let peer_regressions = peer_points
             .into_iter()
-            .filter(|(_, points)| points.len() > MIN_PEER_POINTS_FOR_REGRESSION)
             .map(|(peer, points)| {
                 let regression = IsotonicRegression::new_ascending(&points);
                 (peer, regression)
@@ -75,13 +72,18 @@ impl RoutingOutcomeEstimator {
 
     pub fn estimate_retrieval_time(&self, peer: PeerId, distance: f64) -> Option<f64> {
         if let Some(regression) = self.peer_regressions.get(&peer) {
-            Some(regression.interpolate(distance))
-        } else if self.global_regression.len() > MIN_PEER_POINTS_FOR_REGRESSION {
-            Some(self.global_regression.interpolate(distance))
-        } else {
-            None
+            if regression.len() > MIN_POINTS_FOR_REGRESSION {
+                return Some(regression.interpolate(distance));
+            }
         }
+    
+        if self.global_regression.len() > MIN_POINTS_FOR_REGRESSION {
+            return Some(self.global_regression.interpolate(distance));
+        }
+    
+        None
     }
+    
 }
 
 /// A routing event is a single request to a peer for a contract, and some value indicating
