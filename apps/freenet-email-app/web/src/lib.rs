@@ -61,7 +61,7 @@ pub fn main() {
 }
 
 mod api {
-    use dioxus::prelude::UnboundedSender;
+    use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
     use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
     use crate::app::AsyncActionResult;
@@ -73,11 +73,12 @@ mod api {
 
     #[cfg(feature = "use-node")]
     pub(crate) struct WebApi {
+        pub requests: UnboundedReceiver<ClientRequest<'static>>,
         pub host_responses: HostResponses,
-        send_half: ClientRequester,
         pub client_errors: crossbeam::channel::Receiver<AsyncActionResult>,
+        send_half: ClientRequester,
         error_sender: NodeResponses,
-        _api: locutus_stdlib::client_api::WebApi,
+        pub api: locutus_stdlib::client_api::WebApi,
     }
 
     #[cfg(not(feature = "use-node"))]
@@ -100,7 +101,7 @@ mod api {
             use wasm_bindgen::JsCast;
             let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
             let (send_host_responses, host_responses) = crossbeam::channel::unbounded();
-            let (send_half, mut rx) = futures::channel::mpsc::unbounded();
+            let (send_half, requests) = futures::channel::mpsc::unbounded();
             let result_handler = move |result: Result<HostResponse, ClientError>| {
                 send_host_responses.send(result).expect("channel open");
             };
@@ -118,11 +119,12 @@ mod api {
             let (error_sender, client_errors) = crossbeam::channel::unbounded();
 
             Ok(Self {
+                requests,
                 host_responses,
-                send_half,
                 client_errors,
+                send_half,
                 error_sender,
-                _api: api,
+                api,
             })
         }
 
@@ -158,11 +160,12 @@ mod api {
             request: locutus_stdlib::client_api::ClientRequest<'static>,
         ) -> Result<(), locutus_stdlib::client_api::Error> {
             use futures::SinkExt;
-
             self.sender
                 .send(request)
                 .await
-                .map_err(|_| locutus_stdlib::client_api::Error::ChannelClosed)
+                .map_err(|_| locutus_stdlib::client_api::Error::ChannelClosed)?;
+            self.sender.flush().await.unwrap();
+            Ok(())
         }
 
         #[cfg(not(feature = "use-node"))]

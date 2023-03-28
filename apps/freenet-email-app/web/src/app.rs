@@ -670,7 +670,7 @@ pub(crate) async fn node_comms(
     use freenet_email_inbox::Inbox as StoredInbox;
     use locutus_stdlib::client_api::{ContractResponse, HostResponse};
 
-    let api = WebApi::new()
+    let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"));
             err
@@ -693,6 +693,9 @@ pub(crate) async fn node_comms(
                     waiting_updates.entry(key).or_insert(identity);
                 }
             }
+        }
+        while let Some(req) = api.requests.next().await {
+            api.api.send(req).await.unwrap();
         }
         loop {
             match api.client_errors.try_recv() {
