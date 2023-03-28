@@ -10,10 +10,11 @@ use crossbeam::channel::TryRecvError;
 use dioxus::prelude::*;
 use futures::FutureExt;
 use futures::{future::LocalBoxFuture, StreamExt};
+use once_cell::sync::OnceCell;
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::{
-    api::{NodeResponses, WebApi, WebApiSender},
+    api::{NodeResponses, WebApi, WebApiRequestClient},
     inbox::{DecryptedMessage, InboxModel, MessageModel},
     DynError,
 };
@@ -34,36 +35,24 @@ pub(crate) enum TryAsyncAction {
     RemoveMessages,
 }
 
+static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
+
 pub(crate) fn App(cx: Scope) -> Element {
     #[cfg(target_family = "wasm")]
     {
         web_sys::console::log_1(&serde_wasm_bindgen::to_value("Starting app...").unwrap());
     }
-
-    #[allow(clippy::map_identity)]
-    let api = WebApi::new(cx)
-        .map_err(|err| {
-            #[cfg(target_family = "wasm")]
-            {
-                web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
-            }
-            err
-        })
-        .expect("open connection");
-    let sender = api.sender_half();
-    let client = sender.clone();
-    use_shared_state_provider(cx, move || client);
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
 
-    use_context_provider(cx, move || {
-        Inbox::new(cx, sender, &user.read().identities).unwrap()
-    });
+    use_context_provider(cx, Inbox::new);
     let inbox = use_context::<Inbox>(cx).unwrap();
     let inbox_data = inbox.inbox_data.clone();
 
     #[cfg(feature = "use-node")]
-    use_coroutine::<AsyncAction, _, _>(cx, move |rx| node_comms(rx, api, inbox_data));
+    use_coroutine::<AsyncAction, _, _>(cx, move |rx| {
+        node_comms(rx, user.read().identities.clone(), inbox_data)
+    });
 
     if !user.read().identified {
         cx.render(rsx! {
@@ -99,30 +88,26 @@ struct Inbox {
 }
 
 impl Inbox {
-    fn new(cx: Scope, client: WebApiSender, contracts: &[Identity]) -> Result<Self, DynError> {
-        let models = Vec::with_capacity(contracts.len());
+    fn new() -> Self {
+        Self {
+            inbox_data: Arc::new(ArcSwap::from_pointee(vec![])),
+            messages: Rc::new(RefCell::new(vec![])),
+            active_id: 0,
+        }
+    }
+
+    async fn load_all(client: WebApiRequestClient, contracts: &[Identity]) {
         for identity in contracts {
             let mut client = client.clone();
             let identity = identity.clone();
-            #[cfg(feature = "use-node")]
-            {
-                cx.spawn(async move {
-                    let res = InboxModel::load(&mut client, &identity).await;
-                    error_handling(client.into(), res.map(|_| ()), TryAsyncAction::LoadMessages)
-                        .await;
-                });
-            }
+            let res = InboxModel::load(&mut client, &identity).await;
+            error_handling(client.into(), res.map(|_| ()), TryAsyncAction::LoadMessages).await;
         }
-        Ok(Self {
-            inbox_data: Arc::new(ArcSwap::from_pointee(models)),
-            messages: Rc::new(RefCell::new(vec![])),
-            active_id: 0,
-        })
     }
 
     fn send_message(
         &self,
-        client: WebApiSender,
+        client: WebApiRequestClient,
         to: &str,
         title: &str,
         content: &str,
@@ -163,7 +148,7 @@ impl Inbox {
 
     fn remove_messages(
         &self,
-        client: WebApiSender,
+        client: WebApiRequestClient,
         ids: &[u64],
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
@@ -175,7 +160,7 @@ impl Inbox {
     // Remove the messages from the inbox contract, and move them to local storage
     fn mark_as_read(
         &self,
-        client: WebApiSender,
+        client: WebApiRequestClient,
         ids: &[u64],
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         let messages = &mut *self.messages.borrow_mut();
@@ -549,7 +534,7 @@ fn InboxComponent(cx: Scope) -> Element {
 
 fn OpenMessage(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
-    let client = use_shared_state::<WebApiSender>(cx).unwrap().read().clone();
+    let client = WEB_API_SENDER.get().unwrap();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let email = cx.props;
     let email_id = [cx.props.id];
@@ -597,7 +582,7 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
 
 fn NewMessageWindow(cx: Scope) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
-    let client = use_shared_state::<WebApiSender>(cx).unwrap().read().clone();
+    let client = WEB_API_SENDER.get().unwrap();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();
@@ -688,11 +673,24 @@ pub(crate) async fn error_handling(
 #[cfg(feature = "use-node")]
 pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<AsyncAction>,
-    api: WebApi,
+    contracts: Vec<Identity>,
     inboxes: InboxesData,
 ) {
     use freenet_email_inbox::Inbox as StoredInbox;
     use locutus_stdlib::client_api::{ContractResponse, HostResponse};
+
+    #[allow(clippy::map_identity)]
+    let api = WebApi::new()
+        .map_err(|err| {
+            #[cfg(target_family = "wasm")]
+            {
+                web_sys::console::error_1(&serde_wasm_bindgen::to_value(&err).unwrap());
+            }
+            err
+        })
+        .expect("open connection");
+    Inbox::load_all(api.sender_half(), &contracts).await;
+    WEB_API_SENDER.set(api.sender_half()).expect("");
 
     // todo. instead maintain a map of multiple waiting ids to keys
     let mut waiting_updates = HashMap::new();
@@ -710,7 +708,7 @@ pub(crate) async fn node_comms(
             }
         }
         loop {
-            match api.responses.try_recv() {
+            match api.client_errors.try_recv() {
                 Err(TryRecvError::Empty) | Ok(Ok(())) => {}
                 Err(TryRecvError::Disconnected) => panic!(),
                 Ok(Err((err, _action))) => {
@@ -718,7 +716,7 @@ pub(crate) async fn node_comms(
                     todo!("better error handling");
                 }
             }
-            match api.receiver_half.try_recv() {
+            match api.host_responses.try_recv() {
                 Ok(r) => {
                     let r = r.unwrap();
                     match r {

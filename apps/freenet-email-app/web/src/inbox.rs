@@ -23,7 +23,7 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::{error_handling, TryAsyncAction};
-use crate::{api::WebApiSender, app::Identity, DynError};
+use crate::{api::WebApiRequestClient, app::Identity, DynError};
 
 static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
 
@@ -121,7 +121,7 @@ pub(crate) struct InboxModel {
 
 impl InboxModel {
     pub(crate) async fn load(
-        client: &mut WebApiSender,
+        client: &mut WebApiRequestClient,
         contract: &Identity,
     ) -> Result<ContractKey, DynError> {
         let params = InboxParams {
@@ -136,7 +136,7 @@ impl InboxModel {
     }
 
     pub(crate) async fn send_message(
-        client: &mut WebApiSender,
+        client: &mut WebApiRequestClient,
         content: DecryptedMessage,
         pub_key: RsaPublicKey,
     ) -> Result<(), DynError> {
@@ -162,7 +162,7 @@ impl InboxModel {
 
     pub(crate) fn remove_messages(
         &mut self,
-        mut client: WebApiSender,
+        mut client: WebApiRequestClient,
         ids: &[u64],
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         self.remove_received_message(ids);
@@ -277,7 +277,7 @@ impl InboxModel {
 
     async fn update_settings_at_store(
         &mut self,
-        client: &mut WebApiSender,
+        client: &mut WebApiRequestClient,
     ) -> Result<(), DynError> {
         let settings = self.settings.to_stored()?;
         let serialized = serde_json::to_vec(&settings)?;
@@ -296,7 +296,7 @@ impl InboxModel {
     }
 
     async fn assign_token(
-        client: &mut WebApiSender,
+        client: &mut WebApiRequestClient,
         recipient_key: RsaPublicKey,
     ) -> Result<TokenAssignment, DynError> {
         let key = ComponentKey::new(&[]); // TODO: this should be the AFT component key
@@ -333,7 +333,7 @@ impl InboxModel {
     //     Ok(())
     // }
 
-    async fn get_state(client: &mut WebApiSender, key: ContractKey) -> Result<(), DynError> {
+    async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
         let request = ContractRequest::Get {
             key,
             fetch_contract: false,

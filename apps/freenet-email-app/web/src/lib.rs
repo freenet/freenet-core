@@ -60,41 +60,101 @@ pub fn main() {
 }
 
 mod api {
-    use std::sync::atomic::AtomicBool;
-
-    use dioxus::prelude::{Scope, UnboundedSender};
+    use dioxus::prelude::UnboundedSender;
     use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
     use crate::app::AsyncActionResult;
 
-    type SenderHalf = UnboundedSender<ClientRequest<'static>>;
-    type ReceiverHalf = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
+    type ClientRequester = UnboundedSender<ClientRequest<'static>>;
+    type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
 
     pub(crate) type NodeResponses = crossbeam::channel::Sender<AsyncActionResult>;
 
     #[cfg(feature = "use-node")]
     pub(crate) struct WebApi {
-        pub receiver_half: ReceiverHalf,
-        sender_half: SenderHalf,
-        pub responses: crossbeam::channel::Receiver<AsyncActionResult>,
-        responses_sender: NodeResponses,
+        pub host_responses: HostResponses,
+        send_half: ClientRequester,
+        pub client_errors: crossbeam::channel::Receiver<AsyncActionResult>,
+        error_sender: NodeResponses,
+        api: locutus_stdlib::client_api::WebApi,
     }
 
     #[cfg(not(feature = "use-node"))]
     pub(crate) struct WebApi {}
 
+    impl WebApi {
+        #[cfg(not(feature = "use-node"))]
+        pub fn new() -> Result<Self, String> {
+            Ok(Self {})
+        }
+
+        #[cfg(all(not(target_family = "wasm"), feature = "use-node"))]
+        pub fn new() -> Result<Self, String> {
+            todo!()
+        }
+
+        #[cfg(all(target_family = "wasm", feature = "use-node"))]
+        pub fn new() -> Result<Self, String> {
+            use futures::StreamExt;
+            use wasm_bindgen::JsCast;
+            let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
+            let (send_host_responses, host_responses) = crossbeam::channel::unbounded();
+            let (send_half, mut rx) = futures::channel::mpsc::unbounded();
+            let result_handler = move |result: Result<HostResponse, ClientError>| {
+                send_host_responses.send(result).expect("channel open");
+            };
+            let onopen_handler = || {
+                web_sys::console::log_1(
+                    &serde_wasm_bindgen::to_value("Connected to websocket").unwrap(),
+                );
+            };
+            let mut api = locutus_stdlib::client_api::WebApi::start(
+                conn,
+                result_handler,
+                |err| {
+                    web_sys::console::error_1(
+                        &serde_wasm_bindgen::to_value(&format!("connection error: {err}")).unwrap(),
+                    );
+                },
+                onopen_handler,
+            );
+            let (error_sender, client_errors) = crossbeam::channel::unbounded();
+
+            Ok(Self {
+                host_responses,
+                send_half,
+                client_errors,
+                error_sender,
+                api,
+            })
+        }
+
+        #[cfg(feature = "use-node")]
+        pub fn sender_half(&self) -> WebApiRequestClient {
+            WebApiRequestClient {
+                sender: self.send_half.clone(),
+                responses: self.error_sender.clone(),
+            }
+        }
+
+        #[cfg(not(feature = "use-node"))]
+        pub fn sender_half(&self) -> WebApiRequestClient {
+            WebApiRequestClient
+        }
+    }
+
     #[cfg(feature = "use-node")]
-    #[derive(Clone)]
-    pub(crate) struct WebApiSender {
-        sender: SenderHalf,
+    #[derive(Clone, Debug)]
+    pub(crate) struct WebApiRequestClient {
+        sender: ClientRequester,
         responses: NodeResponses,
     }
 
     #[cfg(not(feature = "use-node"))]
-    #[derive(Clone)]
-    pub(crate) struct WebApiSender;
+    #[derive(Clone, Debug)]
+    pub(crate) struct WebApiRequestClient;
 
-    impl WebApiSender {
+    impl WebApiRequestClient {
         #[cfg(feature = "use-node")]
         pub async fn send(
             &mut self,
@@ -119,105 +179,16 @@ mod api {
     }
 
     #[cfg(feature = "use-node")]
-    impl From<WebApiSender> for NodeResponses {
-        fn from(val: WebApiSender) -> Self {
+    impl From<WebApiRequestClient> for NodeResponses {
+        fn from(val: WebApiRequestClient) -> Self {
             val.responses
         }
     }
 
     #[cfg(not(feature = "use-node"))]
-    impl From<WebApiSender> for NodeResponses {
-        fn from(_val: WebApiSender) -> Self {
+    impl From<WebApiRequestClient> for NodeResponses {
+        fn from(_val: WebApiRequestClient) -> Self {
             unimplemented!()
-        }
-    }
-
-    static STARTED: AtomicBool = AtomicBool::new(false);
-
-    impl WebApi {
-        #[cfg(not(feature = "use-node"))]
-        pub fn new(_: Scope) -> Result<Self, String> {
-            Ok(Self {})
-        }
-
-        #[cfg(all(not(target_family = "wasm"), feature = "use-node"))]
-        pub fn new(_: Scope) -> Result<Self, String> {
-            todo!()
-        }
-
-        #[cfg(all(target_family = "wasm", feature = "use-node"))]
-        pub fn new(cx: Scope) -> Result<Self, String> {
-            use futures::StreamExt;
-            use wasm_bindgen::JsCast;
-            let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
-            let (tx, receiver_half) = crossbeam::channel::unbounded();
-            let (sender_half, mut rx) = futures::channel::mpsc::unbounded();
-            let result_handler = move |result: Result<HostResponse, ClientError>| {
-                tx.send(result).expect("channel open");
-            };
-            let onopen_handler = || {
-                STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
-            };
-            let mut api = locutus_stdlib::client_api::WebApi::start(
-                conn,
-                result_handler,
-                |err| {
-                    web_sys::console::error_1(
-                        &serde_wasm_bindgen::to_value(&format!("connection error: {err}")).unwrap(),
-                    );
-                },
-                onopen_handler,
-            );
-            cx.spawn({
-                async move {
-                    while let Some(msg) = rx.next().await {
-                        api.send(msg)
-                            .await
-                            .map_err(|e| {
-                                tracing::error!("{e}");
-                                e
-                            })
-                            .unwrap();
-                    }
-                }
-            });
-            let (responses_sender, responses) = crossbeam::channel::unbounded();
-            let wait = wasm_bindgen::prelude::Closure::<dyn FnMut()>::new(|| {
-                web_sys::console::log_1(
-                    &serde_wasm_bindgen::to_value("Attempting to connect").unwrap(),
-                )
-            });
-            web_sys::console::log_1(&serde_wasm_bindgen::to_value("Connecting...").unwrap());
-            while !STARTED.load(std::sync::atomic::Ordering::SeqCst) {
-                web_sys::window()
-                    .unwrap()
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(
-                        wait.as_ref().unchecked_ref(),
-                        10,
-                    );
-            }
-            web_sys::console::log_1(
-                &serde_wasm_bindgen::to_value("Connected to websocket").unwrap(),
-            );
-            Ok(Self {
-                receiver_half,
-                sender_half,
-                responses,
-                responses_sender,
-            })
-        }
-
-        #[cfg(feature = "use-node")]
-        pub fn sender_half(&self) -> WebApiSender {
-            WebApiSender {
-                sender: self.sender_half.clone(),
-                responses: self.responses_sender.clone(),
-            }
-        }
-
-        #[cfg(not(feature = "use-node"))]
-        pub fn sender_half(&self) -> WebApiSender {
-            WebApiSender
         }
     }
 }

@@ -1755,6 +1755,7 @@ dependencies = [
  "locutus-aft-interface",
  "locutus-dev",
  "locutus-stdlib",
+ "once_cell",
  "rand_chacha 0.3.1",
  "rsa",
  "serde",
