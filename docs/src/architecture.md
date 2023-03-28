@@ -4,14 +4,11 @@
 
 ### Overview
 
-Delegates, contracts, and applications each serve distinct roles in the Freenet ecosystem. Contracts function as shared models, representing the agreed-upon state that can be modified according to user-defined rules. Delegates, on the other hand, operate on the user's device and manage private state, such as keys, secret tokens, and message inboxes/outboxes. They also facilitate the user's interaction with contracts and apps by controlling access to private data. Apps serve as the user interface for contracts and delegates, running in the browser and built using various web technologies like React.
+Delegates, contracts, and applications each serve distinct roles in the Freenet ecosystem. Contracts function as public shared state, representing the agreed-upon state that can be modified according to user-defined rules. Delegates act as the user's agent and can store private data. Apps serve as the user interface for contracts and delegates.
 
 ### Applications
 
-This is the user interface that wishes to use the AFT system to send a message,
-for example a decentralized instant messaging system. Applications will
-typically run in a web browser and either implemented in JavaScript or
-WebAssembly.
+Applications are the user interface for decentralized systems on Freenet. They are built using web technologies such as HTML, CSS, and JavaScript, and can be distributed over Freenet. Applications can create, retrieve, and update contracts through a WebSocket connection to the local Freenet peer, as well as communicate with delegates and contracts.
 
 ### Contracts
 
