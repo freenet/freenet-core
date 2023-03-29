@@ -432,37 +432,41 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for UpdateData<'a> {
 /// Noncompliant behavior, such as failing to obey the commutativity rule, may result
 /// in the contract being deprioritized or removed from the p2p network.
 pub trait ContractInterface {
-    /// Verify that the state is valid, given the parameters.
+    /// Validates the provided state based on the given parameters and related contracts.
+    /// Returns a `ValidateResult` if the state is valid, or a `ContractError` if not.
     fn validate_state(
         parameters: Parameters<'static>,
         state: State<'static>,
         related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError>;
 
-    /// Verify that a delta is valid if possible, returns false if and only delta is
-    /// definitely invalid, true otherwise.
+    /// Checks if the provided delta is valid based on the given parameters.
+    /// Returns `true` if the delta is valid or indeterminate, `false` if it is definitely invalid.
+    /// Returns a `ContractError` if an error occurs during validation.
     fn validate_delta(
         parameters: Parameters<'static>,
         delta: StateDelta<'static>,
     ) -> Result<bool, ContractError>;
 
-    /// Update the state to account for the new data
+    /// Updates the provided state based on the given update data.
+    /// Returns an `UpdateModification` if the state is successfully updated, or a `ContractError` if an error occurs.
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError>;
 
-    /// Generate a concise summary of a state that can be used to create deltas
-    /// relative to this state.
+    /// Generates a concise summary of the provided state based on the given parameters.
+    /// The summary can be used to create state deltas relative to this state.
+    /// Returns a `StateSummary` if successful, or a `ContractError` if an error occurs.
     fn summarize_state(
         parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError>;
 
-    /// Generate a state delta using a summary from the current state.
-    /// This along with [`Self::summarize_state`] allows flexible and efficient
-    /// state synchronization between peers.
+    /// Generates a state delta using the provided summary, which should be based on the current state.
+    /// This method, along with `summarize_state`, enables flexible and efficient state synchronization between peers.
+    /// Returns a `StateDelta` if successful, or a `ContractError` if an error occurs.
     fn get_state_delta(
         parameters: Parameters<'static>,
         state: State<'static>,
