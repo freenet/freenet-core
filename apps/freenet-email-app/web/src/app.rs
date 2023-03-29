@@ -1,20 +1,17 @@
 #![allow(non_snake_case)]
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use crossbeam::channel::TryRecvError;
 use dioxus::prelude::*;
+use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use futures::{future::LocalBoxFuture, StreamExt};
 use once_cell::sync::OnceCell;
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
 
 use crate::{
-    api::{NodeResponses, WebApi, WebApiRequestClient},
+    api::{NodeResponses, WebApiRequestClient},
     inbox::{DecryptedMessage, InboxModel, MessageModel},
     DynError,
 };
@@ -45,7 +42,7 @@ impl std::fmt::Display for TryAsyncAction {
     }
 }
 
-static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
+pub(crate) static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
 
 pub(crate) fn App(cx: Scope) -> Element {
     crate::log::log("Loging screen");
@@ -58,7 +55,7 @@ pub(crate) fn App(cx: Scope) -> Element {
 
     #[cfg(feature = "use-node")]
     use_coroutine::<AsyncAction, _, _>(cx, move |rx| {
-        node_comms(rx, user.read().identities.clone(), inbox_data)
+        crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
     });
 
     if !user.read().identified {
@@ -66,11 +63,11 @@ pub(crate) fn App(cx: Scope) -> Element {
             login::GetOrCreateIndentity {}
         })
     } else if let Some(id) = user.read().logged_id() {
-        #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
+        #[cfg(feature = "use-node")]
         {
             inbox.load_messages(cx, id).expect("load messages");
         }
-        #[cfg(feature = "ui-testing")]
+        #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
         {
             inbox.load_messages(id).unwrap();
         }
@@ -84,10 +81,10 @@ pub(crate) fn App(cx: Scope) -> Element {
     }
 }
 
-type InboxesData = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
+pub(crate) type InboxesData = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
 
 #[derive(Debug, Clone)]
-struct Inbox {
+pub struct Inbox {
     inbox_data: InboxesData,
     /// loaded messages for the currently selected `active_id`
     messages: Rc<RefCell<Vec<Message>>>,
@@ -103,7 +100,7 @@ impl Inbox {
         }
     }
 
-    async fn load_all(client: WebApiRequestClient, contracts: &[Identity]) {
+    pub(crate) async fn load_all(client: WebApiRequestClient, contracts: &[Identity]) {
         for identity in contracts {
             let mut client = client.clone();
             let identity = identity.clone();
@@ -177,7 +174,7 @@ impl Inbox {
         self.remove_messages(client, ids)
     }
 
-    #[cfg(feature = "ui-testing")]
+    #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
     fn load_messages(&self, id: &Identity) -> Result<(), DynError> {
         let emails = {
             if id.id == 0 {
@@ -228,7 +225,7 @@ impl Inbox {
         Ok(())
     }
 
-    #[cfg(all(feature = "use-node", not(feature = "ui-testing")))]
+    #[cfg(feature = "use-node")]
     fn load_messages(&self, cx: Scope, id: &Identity) -> Result<(), DynError> {
         let actions = use_coroutine_handle::<AsyncAction>(cx).unwrap();
         actions.send(AsyncAction::LoadMessages(id.clone()));
@@ -598,7 +595,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
                 futs.into_iter().for_each(|f| cx.spawn(f));
             }
             Err(e) => {
-                crate::log::error(format!("{e}"));
+                crate::log::error(format!("{e}"), Some(TryAsyncAction::SendMessage));
             }
         }
         menu_selection.write().at_new_msg();
@@ -653,96 +650,9 @@ pub(crate) async fn error_handling(
     action: TryAsyncAction,
 ) {
     if let Err(error) = res {
-        crate::log::error(format!("error while {action}: {error}"));
-        tracing::error!(%error, %action);
+        crate::log::error(format!("{error}"), Some(action.clone()));
         error_channel.send(Err((error, action))).unwrap();
     } else {
         error_channel.send(Ok(())).unwrap();
-    }
-}
-
-#[cfg(feature = "use-node")]
-pub(crate) async fn node_comms(
-    mut rx: UnboundedReceiver<AsyncAction>,
-    contracts: Vec<Identity>,
-    inboxes: InboxesData,
-) {
-    use freenet_email_inbox::Inbox as StoredInbox;
-    use locutus_stdlib::client_api::{ContractResponse, HostResponse};
-
-    let mut api = WebApi::new()
-        .map_err(|err| {
-            crate::log::error(format!("error while connecting to node: {err}"));
-            err
-        })
-        .expect("open connection");
-    Inbox::load_all(api.sender_half(), &contracts).await;
-    WEB_API_SENDER.set(api.sender_half()).expect("");
-
-    // todo. instead maintain a map of multiple waiting ids to keys
-    let mut waiting_updates = HashMap::new();
-    loop {
-        while let Some(req) = rx.next().await {
-            let AsyncAction::LoadMessages(identity) = req;
-            let mut client = api.sender_half();
-            match InboxModel::load(&mut client, &identity).await {
-                Err(err) => {
-                    error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
-                }
-                Ok(key) => {
-                    waiting_updates.entry(key).or_insert(identity);
-                }
-            }
-        }
-        while let Some(req) = api.requests.next().await {
-            api.api.send(req).await.unwrap();
-        }
-        loop {
-            match api.client_errors.try_recv() {
-                Err(TryRecvError::Empty) | Ok(Ok(())) => {}
-                Err(TryRecvError::Disconnected) => panic!(),
-                Ok(Err((err, _action))) => {
-                    eprintln!("{err}");
-                    todo!("better error handling");
-                }
-            }
-            match api.host_responses.try_recv() {
-                Ok(r) => {
-                    let r = r.unwrap();
-                    match r {
-                        HostResponse::ContractResponse(ContractResponse::GetResponse {
-                            key,
-                            state,
-                            ..
-                        }) => {
-                            let state: StoredInbox =
-                                serde_json::from_slice(state.as_ref()).unwrap();
-                            let Some(identity) = waiting_updates.remove(&key) else { unreachable!() };
-                            let updated_model =
-                                InboxModel::from_state(identity.key.clone(), state, key.clone())
-                                    .unwrap();
-                            let loaded_models = inboxes.load();
-                            if let Some(pos) = loaded_models.iter().position(|e| {
-                                let x = e.borrow();
-                                x.key == key
-                            }) {
-                                crate::log::log(format!("loaded inbox {key}"));
-                                let mut current = loaded_models[pos].borrow_mut();
-                                *current = updated_model;
-                            } else {
-                                crate::log::log(format!("updated inbox {key}"));
-                                let mut cloned = (***loaded_models).to_vec();
-                                std::mem::drop(loaded_models);
-                                cloned.push(Rc::new(RefCell::new(updated_model)));
-                            }
-                        }
-                        _ => panic!(),
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => panic!(),
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10))
     }
 }
