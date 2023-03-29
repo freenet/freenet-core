@@ -421,6 +421,16 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for UpdateData<'a> {
 /// }
 /// ```
 // ANCHOR: contractifce
+/// # ContractInterface
+///
+/// This trait defines the core functionality for managing and updating a contract's state.
+/// Implementations must ensure that state delta updates are *commutative*. In other words,
+/// when applying multiple delta updates to a state, the order in which these updates are
+/// applied should not affect the final state. Once all deltas are applied, the resulting
+/// state should be the same, regardless of the order in which the deltas were applied.
+///
+/// Noncompliant behavior, such as failing to obey the commutativity rule, may result
+/// in the contract being deprioritized or removed from the p2p network.
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(
