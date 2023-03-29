@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use locutus_core::{libp2p::PeerId, Location};
 use pav_regression::pav::{IsotonicRegression, Point};
+use serde::Serialize;
 
-const MIN_POINTS_FOR_REGRESSION: usize = 10;
+const MIN_POINTS_FOR_REGRESSION: usize = 50;
 
 /// `RoutingOutcomeEstimator` is a Rust struct that provides outcome estimation for a given action,
 /// such as retrieving the state of a contract, based on the distance between the peer and the contract.
@@ -15,6 +16,9 @@ const MIN_POINTS_FOR_REGRESSION: usize = 10;
 /// if it has enough data points for accurate predictions. Otherwise, the global regression model
 /// is used.
 
+// TODO: Make serializable
+
+#[derive(Debug, Clone)]
 pub struct RoutingOutcomeEstimator {
     global_regression: IsotonicRegression,
     peer_regressions: HashMap<PeerId, IsotonicRegression>,
