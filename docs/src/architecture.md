@@ -20,12 +20,14 @@ Each contract is identified by a cryptographic hash, which is a combination of i
 
 Take, for example, a public blog contract. The state of this contract would be the blog's content, which consists of a list of blog posts. The code within the contract dictates that new posts may only be added if they are signed by the blog's owner, while the contract's parameters include the blog owner's public key.
 
+Contracts implement the [ContractInterface](https://github.com/freenet/locutus/blob/f2fc5374544872bc0a97b0882d56d8d71674397a/crates/locutus-stdlib/src/component_interface.rs#L121) trait.
+
 
 ### Delegates
 
 Delegates are WebAssembly code components that serve as personal agents for users, operating on their devices to manage private data and interact with digital entities such as contracts, apps, and other delegates. These agents provide a range of functionalities, including task execution, secret storage, cryptographic operations, and communication with users to obtain permission for specific actions. Delegates can be seen as an advanced and more powerful alternative to cookies or local storage used in web browsers. With the user's consent, delegates can be created by applications or other delegates.
 
-Delegates must implemenent the [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
+Delegates must implemenent the [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121) trait.
 
 While contracts' state is public (but potentially encrypted), delegates state is private. Example uses for delegates include:
 
