@@ -167,7 +167,8 @@ pub(crate) async fn node_comms(
 
     let mut waiting_updates = HashMap::new();
     loop {
-        while let Some(req) = rx.next().await {
+        crate::log::log("start loop");
+        while let Ok(Some(req)) = rx.try_next() {
             let AsyncAction::LoadMessages(identity) = req;
             let mut client = api.sender_half();
             match InboxModel::load(&mut client, &identity).await {
@@ -179,7 +180,7 @@ pub(crate) async fn node_comms(
                 }
             }
         }
-        while let Some(req) = api.requests.next().await {
+        while let Ok(Some(req)) = api.requests.try_next() {
             api.api.send(req).await.unwrap();
         }
         loop {
@@ -228,6 +229,15 @@ pub(crate) async fn node_comms(
                 Err(TryRecvError::Disconnected) => panic!(),
             }
         }
-        std::thread::sleep(Duration::from_millis(10))
+        #[cfg(target_family = "wasm")]
+        {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_str_and_timeout_and_unused_0("wait_msg", 10);
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
