@@ -1,3 +1,6 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
@@ -16,6 +19,7 @@ struct WebApi {
     send_half: ClientRequester,
     error_sender: NodeResponses,
     api: locutus_stdlib::client_api::WebApi,
+    connecting: Option<futures::channel::oneshot::Receiver<()>>,
 }
 
 #[cfg(not(feature = "use-node"))]
@@ -42,7 +46,9 @@ impl WebApi {
         let result_handler = move |result: Result<HostResponse, ClientError>| {
             send_host_responses.send(result).expect("channel open");
         };
-        let onopen_handler = || {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let onopen_handler = move || {
+            tx.send(());
             crate::log::log("Connected to websocket");
         };
         let mut api = locutus_stdlib::client_api::WebApi::start(
@@ -62,6 +68,7 @@ impl WebApi {
             send_half,
             error_sender,
             api,
+            connecting: Some(rx),
         })
     }
 
@@ -153,8 +160,10 @@ pub(crate) async fn node_comms(
             err
         })
         .expect("open connection");
+    api.connecting.take().unwrap().await.unwrap();
     crate::app::Inbox::load_all(api.sender_half(), &contracts).await;
-    WEB_API_SENDER.set(api.sender_half()).expect("");
+    crate::log::log("Loaded inbox");
+    WEB_API_SENDER.set(api.sender_half()).unwrap();
 
     let mut waiting_updates = HashMap::new();
     loop {

@@ -13,15 +13,15 @@ impl WebApi {
     pub fn start(
         conn: Connection,
         mut result_handler: impl FnMut(HostResult) + 'static,
-        error_handler: impl FnOnce(Error) + Copy + 'static,
-        onopen_handler: impl FnOnce() + Copy + 'static,
+        mut error_handler: impl FnMut(Error) + 'static,
+        mut onopen_handler: impl FnOnce() + 'static,
     ) -> Self {
         let onmessage_callback = Closure::<dyn FnMut(_)>::new(move |e: MessageEvent| {
             let response: HostResult = match serde_wasm_bindgen::from_value(e.data()) {
                 Ok(val) => val,
                 Err(err) => {
                     tracing::error!(%err, "error deserializing message from host");
-                    error_handler(Error::OtherError(format!("{err}").into()));
+                    // error_handler(Error::OtherError(format!("{err}").into()));
                     return;
                 }
             };
@@ -42,7 +42,7 @@ impl WebApi {
         conn.set_onerror(Some(onerror_callback.as_ref().unchecked_ref()));
         onerror_callback.forget();
 
-        let onopen_callback = Closure::<dyn FnMut()>::new(move || {
+        let onopen_callback = Closure::<dyn FnOnce()>::once(move || {
             onopen_handler();
         });
         conn.add_event_listener_with_callback("open", onopen_callback.as_ref().unchecked_ref());
