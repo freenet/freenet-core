@@ -1,10 +1,10 @@
-# Summary
+# Overview
 
 - [Introduction](introduction.md)
+- [Architecture](architecture.md)
 
 # User Guide
 
-- [Architecture](architecture.md)
 - [Development Guide](dev-guide.md)
 - [Frequently Asked Questions](faq.md)
 - [Glossary](glossary.md)
