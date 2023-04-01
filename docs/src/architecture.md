@@ -1,4 +1,4 @@
-# Primitives
+# Architecture
 
 Delegates, contracts, and applications each serve distinct roles in the Freenet ecosystem. Contracts control public data, or "shared state". Delegates act as the user's agent and can store private data on the user's behalf. Apps serve as the user interface to contracts and delegates.
 
