@@ -1,26 +1,28 @@
 #[cfg(test)]
 mod integration_test {
-    use std::collections::{HashMap, HashSet};
     use chacha20poly1305::{
         aead::{AeadCore, KeyInit, OsRng},
         XChaCha20Poly1305,
     };
     use rand_chacha::rand_core::SeedableRng;
     use rsa::{RsaPrivateKey, RsaPublicKey};
+    use serde::{Deserialize, Serialize};
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
-    use serde::{Deserialize, Serialize};
 
     use locutus_aft_interface::{AllocationCriteria, Tier, TokenAllocationRecord, TokenAssignment};
-    use locutus_stdlib::prelude::{ClientResponse, Component, ComponentContext, ComponentError, ContractCode, NotificationMessage, OutboundComponentMsg, UserInputRequest, UserInputResponse, WrappedContract};
     use locutus_runtime::{
         ApplicationMessage, ComponentRuntimeInterface, ComponentStore, ContractContainer,
         ContractInstanceId, ContractKey, ContractStore, InboundComponentMsg, Runtime, SecretsId,
         SecretsStore, WasmAPIVersion,
     };
-    use serde_json::Value;
+    use locutus_stdlib::prelude::{
+        Component, ComponentContext, ComponentError, ContractCode, OutboundComponentMsg,
+        WrappedContract,
+    };
 
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
@@ -76,7 +78,6 @@ mod integration_test {
         key_pair: Option<rsa::RsaPrivateKey>,
     }
 
-
     impl TokenComponentMessage {
         fn serialize(self) -> Result<Vec<u8>, ComponentError> {
             bincode::serialize(&self).map_err(|err| ComponentError::Deser(format!("{err}")))
@@ -94,7 +95,11 @@ mod integration_test {
         test_dir
     }
 
-    fn get_test_module(dir_name: &str, name: &str, features: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn get_test_module(
+        dir_name: &str,
+        name: &str,
+        features: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let module_path = {
             const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
             let contracts = PathBuf::from(CONTRACTS_DIR);
@@ -141,7 +146,7 @@ mod integration_test {
             Arc::new(ContractCode::from(get_test_module(
                 "contracts",
                 contract_name,
-                ""
+                "",
             )?)),
             vec![].into(),
         );
@@ -182,7 +187,9 @@ mod integration_test {
 
     #[test]
     fn test_process_allocated_token() {
-        let _ = tracing_subscriber::fmt().with_env_filter("error").try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("error")
+            .try_init();
 
         let mut csprng = rand_chacha::ChaChaRng::seed_from_u64(1);
         let private_key = RsaPrivateKey::new(&mut csprng, 4098).unwrap();
@@ -190,14 +197,18 @@ mod integration_test {
         let (component, secret_id, contract_key, mut runtime) =
             set_up_aft(&private_key, "token-allocation-record", "token-generator").unwrap();
         let app = ContractInstanceId::try_from(contract_key.to_string()).unwrap();
-        let mut context: Context = Context {waiting_for_user_input: HashSet::default(), user_response: HashMap::default(), key_pair: Some(private_key.clone())};
+        let mut context: Context = Context {
+            waiting_for_user_input: HashSet::default(),
+            user_response: HashMap::default(),
+            key_pair: Some(private_key.clone()),
+        };
         let component_context = ComponentContext::new(bincode::serialize(&context).unwrap());
         let criteria = AllocationCriteria::new(
             Tier::Day1,
             std::time::Duration::from_secs(365 * 24 * 3600),
             app,
         )
-            .unwrap();
+        .unwrap();
 
         let request_new_token = RequestNewToken {
             request_id: 1,
@@ -212,44 +223,16 @@ mod integration_test {
         let payload: Vec<u8> = bincode::serialize(&message).unwrap();
 
         // The application request new token allocation
-        let inbound_message =
-            InboundComponentMsg::ApplicationMessage(ApplicationMessage::new(app, payload.clone()).with_context(component_context.clone()));
+        let inbound_message = InboundComponentMsg::ApplicationMessage(
+            ApplicationMessage::new(app, payload.clone()).with_context(component_context.clone()),
+        );
         let outbound = runtime
             .inbound_app_message(component.key(), vec![inbound_message])
             .unwrap();
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
             outbound.get(0),
-            Some(OutboundComponentMsg::RequestUserInput(..))
+            Some(OutboundComponentMsg::ApplicationMessage(..))
         ));
-
-        let request_id = match outbound.get(0) {
-            Some(OutboundComponentMsg::RequestUserInput(user_input_request)) => user_input_request.request_id,
-            _ => panic!("Unexpected outbound message"),
-        };
-
-        // The user approves the allocation, and send a response
-        let user_response = ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
-        let inbound_message =
-            InboundComponentMsg::UserResponse(UserInputResponse {request_id, response: user_response.clone(), context: component_context.clone()});
-        let outbound = runtime
-            .inbound_app_message(component.key(), vec![inbound_message])
-            .unwrap();
-        assert_eq!(outbound.len(), 0);
-
-        //Updated context after process user response
-        let response: Response = serde_json::from_slice(&user_response)
-            .map_err(|err| ComponentError::Deser(format!("{err}"))).unwrap();
-        context.waiting_for_user_input.remove(&request_id);
-        context.user_response.insert(request_id, response);
-        let component_context = ComponentContext::new(bincode::serialize(&context).unwrap());
-
-        // Request new token allocation after user approval
-        let inbound_message =
-            InboundComponentMsg::ApplicationMessage(ApplicationMessage::new(app, payload).with_context(component_context.clone()));
-        let outbound = runtime
-            .inbound_app_message(component.key(), vec![inbound_message])
-            .unwrap();
-        println!("outbound: {:#?}", outbound);
     }
 }

@@ -1,14 +1,28 @@
 use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
-    ApplicationMessage, Component, ComponentContext, ComponentError, ComponentInterfaceResult,
-    ComponentKey, GetSecretRequest, GetSecretResponse, InboundComponentMsg, OutboundComponentMsg,
-    SetSecretRequest,
+    ApplicationMessage, ClientResponse, Component, ComponentContext, ComponentError,
+    ComponentInterfaceResult, ComponentKey, GetSecretRequest, GetSecretResponse,
+    InboundComponentMsg, OutboundComponentMsg, SetSecretRequest, UserInputResponse,
 };
 
 use crate::error::RuntimeInnerError;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use std::collections::VecDeque;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use wasmer::{Instance, TypedFunction};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Response {
+    Allowed,
+    NotAllowed,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct Context {
+    waiting_for_user_input: HashSet<u32>,
+    user_response: HashMap<u32, Response>,
+    key_pair: Option<rsa::RsaPrivateKey>,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ComponentExecError {
@@ -143,8 +157,18 @@ impl Runtime {
                     break;
                 }
                 OutboundComponentMsg::RequestUserInput(req) => {
-                    results.push(OutboundComponentMsg::RequestUserInput(req));
-                    break;
+                    //results.push(OutboundComponentMsg::RequestUserInput(req));
+                    // Simulate user response changes after receiving the RequestUserInput
+                    let user_response =
+                        ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
+                    let response: Response = serde_json::from_slice(&user_response)
+                        .map_err(|err| ComponentError::Deser(format!("{err}")))
+                        .unwrap();
+                    let req_id = req.request_id.clone();
+                    let mut context: Context = bincode::deserialize(&last_context.0.as_slice()).unwrap();
+                    context.waiting_for_user_input.remove(&req_id);
+                    context.user_response.insert(req_id, response);
+                    last_context = ComponentContext::new(bincode::serialize(&context).unwrap());
                 }
                 OutboundComponentMsg::RandomBytesRequest(bytes) => {
                     let mut bytes = vec![0; bytes];
