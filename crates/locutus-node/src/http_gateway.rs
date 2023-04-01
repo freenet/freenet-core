@@ -219,19 +219,17 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
 
-    let req: ClientRequest = {
-        match ContractRequest::try_decode(&msg) {
-            Ok(r) => r.into(),
-            Err(e) => {
-                let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
-                    ErrorKind::DeserializationError {
-                        cause: format!("{e}"),
-                    }
-                    .into(),
-                ))
-                .map_err(|err| Some(err.into()))?;
-                return Ok(Some(Message::Binary(result_error)));
-            }
+    let req: ClientRequest = match ClientRequest::try_decode(&msg) {
+        Ok(r) => r.into(),
+        Err(e) => {
+            let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+                ErrorKind::DeserializationError {
+                    cause: format!("{e}"),
+                }
+                .into(),
+            ))
+            .map_err(|err| Some(err.into()))?;
+            return Ok(Some(Message::Binary(result_error)));
         }
     };
     tracing::debug!(req = %req, "received client request");

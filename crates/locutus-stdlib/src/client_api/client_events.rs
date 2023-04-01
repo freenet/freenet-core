@@ -122,6 +122,40 @@ impl ClientRequest<'_> {
     }
 }
 
+impl<'a> TryFromTsStd<&[u8]> for ClientRequest<'a> {
+    fn try_decode(msg: &[u8]) -> Result<Self, WsApiError> {
+        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
+            WsApiError::MsgpackDecodeError {
+                cause: format!("{e}"),
+            }
+        })?;
+
+        let req: ClientRequest = {
+            if value.is_map() {
+                let value_map: HashMap<&str, &rmpv::Value> = rmp_value_to_map(&value);
+
+                let mut map_keys = Vec::from_iter(value_map.keys().copied());
+                map_keys.sort();
+                match map_keys.as_slice() {
+                    ["ContractOp"] => {
+                        let contract_op_value = *value_map.get("ContractOp").unwrap();
+                        let mut op_bytes = Vec::new();
+                        rmpv::encode::write_value(&mut op_bytes, contract_op_value).unwrap();
+                        ContractRequest::try_decode(op_bytes.as_slice())?.into()
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err(WsApiError::MsgpackDecodeError {
+                    cause: "value is not a map".into(),
+                });
+            }
+        };
+
+        Ok(req)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum ContractRequest<'a> {
     /// Insert a new value in a contract corresponding with the provided key.
@@ -168,45 +202,61 @@ impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
 
         let req: ContractRequest = {
             if value.is_map() {
-                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-                    value
-                        .as_map()
-                        .unwrap()
-                        .iter()
-                        .map(|(key, val)| (key.as_str().unwrap(), val)),
-                );
+                let value_map: HashMap<&str, &rmpv::Value> = rmp_value_to_map(&value);
 
-                let mut map_keys = Vec::from_iter(value_map.keys().copied());
-                map_keys.sort();
-                match map_keys.as_slice() {
+                // Get specific operation map values from contract op value
+                let op_type = *Vec::from_iter(value_map.keys().copied()).get(0).unwrap();
+                let op_value = *value_map.get(op_type).unwrap();
+                let op_value_map: HashMap<&str, &rmpv::Value> = rmp_value_to_map(op_value);
+                let mut op_value_map_keys: Vec<&str> = Vec::from_iter(op_value_map.keys().copied());
+                op_value_map_keys.sort();
+
+                match op_value_map_keys.as_slice() {
                     ["container", "relatedContracts", "state"] => {
-                        let contract = value_map.get("container").unwrap();
+                        let contract = op_value_map.get("container").unwrap();
                         ContractRequest::Put {
                             contract: ContractContainer::try_decode(*contract)
                                 .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            state: WrappedState::try_decode(*value_map.get("state").unwrap())
+                            state: WrappedState::try_decode(*op_value_map.get("state").unwrap())
                                 .map_err(|err| WsApiError::deserialization(err.to_string()))?,
                             related_contracts: RelatedContracts::try_decode(
-                                *value_map.get("relatedContracts").unwrap(),
+                                *op_value_map.get("relatedContracts").unwrap(),
                             )
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?
                             .into_owned(),
                         }
                     }
                     ["data", "key"] => ContractRequest::Update {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                        key: ContractKey::try_decode(*op_value_map.get("key").unwrap())
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        data: UpdateData::try_decode(*value_map.get("data").unwrap())
+                        data: UpdateData::try_decode(*op_value_map.get("data").unwrap())
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?
                             .into_owned(),
                     },
-                    ["fetchContract", "key"] => ContractRequest::Get {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
-                    },
+                    ["fetchContract", "key"] => {
+                         ContractRequest::Get {
+                            key: ContractKey::try_decode(*op_value_map.get("key").unwrap())
+                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                            fetch_contract: op_value_map
+                                .get("fetch_contract")
+                                .unwrap()
+                                .as_bool()
+                                .unwrap(),
+                        }
+                    }
+                    ["fetch_contract", "key"] => {
+                         ContractRequest::Get {
+                            key: ContractKey::try_decode(*op_value_map.get("key").unwrap())
+                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                            fetch_contract: op_value_map
+                                .get("fetch_contract")
+                                .unwrap()
+                                .as_bool()
+                                .unwrap(),
+                        }
+                    }
                     ["key"] => ContractRequest::Subscribe {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
+                        key: ContractKey::try_decode(*op_value_map.get("key").unwrap())
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
                     },
                     _ => unreachable!(),
@@ -403,4 +453,14 @@ impl<T> From<ContractResponse<T>> for HostResponse<T> {
     fn from(value: ContractResponse<T>) -> HostResponse<T> {
         HostResponse::ContractResponse(value)
     }
+}
+
+fn rmp_value_to_map(value: &rmpv::Value) -> HashMap<&str, &rmpv::Value> {
+    HashMap::from_iter(
+        value
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|(key, val)| (key.as_str().unwrap(), val)),
+    )
 }
