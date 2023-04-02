@@ -7,13 +7,13 @@ the user interface to contracts and delegates.
 
 ![Architectural Primitives Diagram](diagrams/primitives.svg)
 
-## Freenet Kernel
+## Kernel
 
 The kernel is the core of Freenet, it's the software that runs on the user's
 computer. It's responsible for:
 
 * Providing a user-friendly interface to access Freenet via a web browser
-* Manage delegates and the private data they store
+* Host the user's delegates and the private data they store
 * Host contracts and their associated data on behalf of the network
 * Manage communication between contracts, delegates, and applications
 
@@ -36,7 +36,8 @@ allowed under the contract.
 
 Contracts and their associated state reside on the Freenet network on peers
 determined by the contract's location, which is derived from its WebAssembly code
-and parameters.
+and parameters. While a user's delegates are hosted on their local Freenet peer,
+contracts are hosted on the network as a whole.
 
 Contracts also outline how to merge two valid states, creating a new state that
 incorporates both. This process ensures [eventual
