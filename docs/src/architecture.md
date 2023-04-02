@@ -17,6 +17,10 @@ computer. It's responsible for:
 * Host contracts and their associated data on behalf of the network
 * Manage communication between contracts, delegates, and applications
 
+The kernel is written in Rust and is designed to be small (hopefully less than 5
+MB), efficient, and to be able to run on a wide range of devices, from desktops
+to mobile phones.
+
 ## Applications
 
 Applications are the user interface for decentralized systems on Freenet. They
