@@ -55,10 +55,8 @@ impl WebApi {
     }
 
     pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut serializer = rmp_serde::Serializer::new(&mut buffer).with_struct_map();
-        request.serialize(&mut serializer).unwrap();
-        self.conn.send_with_u8_array(&buffer).map_err(
+        let send = rmp_serde::to_vec(&request)?;
+        self.conn.send_with_u8_array(&send).map_err(
             |err| match serde_wasm_bindgen::from_value(err) {
                 Ok(e) => Error::ConnectionError(e),
                 Err(e) => Error::OtherError(format!("{e}").into()),
