@@ -1,13 +1,13 @@
 # Overview
 
 - [Introduction](introduction.md)
-- [Architecture](architecture.md)
-
-# User Guide
-
-- [Development Guide](dev-guide.md)
-- [Frequently Asked Questions](faq.md)
+- [FAQ](faq.md)
 - [Glossary](glossary.md)
+
+# Developer Guide
+
+- [Components](dev-guide/components.md)
+- [Tutorial](dev-guide/tutorial.md)
 
 # Examples
 
