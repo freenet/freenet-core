@@ -26,6 +26,5 @@
 
 # Community and Support
 
-- [Freenet Community](community-support/community.md)
-- [Support Resources](community-support/support-resources.md)
-- [Reporting Bugs and Vulnerabilities](community-support/reporting-bugs.md)
+- [Github](https://github.com/freenet/locutus)
+- [Matrix](https://matrix.to/#/#freenet-locutus:matrix.org)
