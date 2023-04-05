@@ -12,6 +12,3 @@ seconds and is compatible with a wide range of hardware.
 Freenet is a peer-to-peer network, which means that nodes self-organize into a
 global network without any central authority, and the work of hosting services
 is distributed among the users.
-
-This user manual is primarily intended for developers who wish to build
-decentralized software systems on the Freenet platform.
