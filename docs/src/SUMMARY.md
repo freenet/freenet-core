@@ -1,5 +1,4 @@
 - [Introduction](introduction.md)
-- [Key Features](key-features.md)
 - [FAQ](faq.md)
 - [Glossary](glossary.md)
 
@@ -7,12 +6,6 @@
 
 - [Components](components.md)
 - [P2P Network](p2p-network.md)
-
-# User Guide
-
-- [Installation Guide](user-guide/installation.md)
-- [Using Freenet](user-guide/using-freenet.md)
-- [Best Practices and Safety Tips](user-guide/best-practices.md)
 
 # Developer Guide
 
@@ -26,5 +19,4 @@
 
 # Community and Support
 
-- [Github](https://github.com/freenet/locutus)
-- [Matrix](https://matrix.to/#/#freenet-locutus:matrix.org)
+- [Community](community.md)

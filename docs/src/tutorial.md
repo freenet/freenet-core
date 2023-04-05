@@ -1,5 +1,3 @@
-**NOTE:** This document is a work in progress. You can [submit an issue](https://github.com/freenet/locutus/issues/new?labels=A-documentation) if you find a problem or have a suggestion. The source for this documentation is in our repository at [locutus/docs/src](https://github.com/freenet/locutus/tree/main/docs/src). We welcome pull requests.
-
 # Create a Freenet Application
 
 This guide will walk through how to develop a simple distributed web application using Locutus. To do that, we'll be using Rust for the contracts themselves and Typescript for developing the web application.
