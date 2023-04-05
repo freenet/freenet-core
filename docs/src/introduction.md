@@ -1,13 +1,13 @@
 # Introduction
 
-Freenet is a distributed and decentralized alternative to the centralized World
-Wide Web, designed to foster innovation, competition, and protect freedom of
-speech and privacy. As a global decentralized computer, it allows anyone to
-contribute to its growth and development. 
+Freenet is a distributed, decentralized alternative to the centralized World
+Wide Web, designed to unleash a new era of innovation, competition, while
+protecting freedom of speech and privacy. 
 
-Freenet consists of a small core system, written in Rust, that runs on the
-user's computer, or "Freenet node". Freenet's binary is tiny, less than 5 MB,
-allowing it to be installed in seconds and run on a wide variety of hardware.
+At the core of Freenet is a small piece of software known as the Freenet kernel,
+which runs on users' computers, smartphones, or other devices. The kernel is
+tiny, less than 5 MB, allowing it to be installed installed in a matter of
+seconds and is compatible with a wide range of hardware.
 
 Freenet is a peer-to-peer network, which means that nodes self-organize into a
 global network without any central authority, and the work of hosting services
