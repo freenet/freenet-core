@@ -72,6 +72,10 @@ specific actions. Delegates can be seen as an advanced and more powerful
 alternative to cookies or local storage used in web browsers. With the user's
 consent, delegates can be created by applications or other delegates.
 
+Unlike contracts which run on the network meaning that anything they do must
+be verified by other peers, delegates run on the user's computer and can be
+trusted to execute their code without verification.
+
 Delegates must implement the
 [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
 
