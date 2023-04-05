@@ -1,11 +1,11 @@
-# Architecture
+# Components of a Decentralized Application
 
 Delegates, contracts, and applications each serve distinct roles in the Freenet
 ecosystem. Contracts control public data, or "shared state". Delegates act as
-the user's agent and can store private data on the user's behalf. Apps serve as
-the user interface to contracts and delegates.
+the user's agent and can store private data on the user's behalf, while apps serve 
+as the user interface to contracts and delegates.
 
-![Architectural Primitives Diagram](diagrams/primitives.svg)
+![Architectural Primitives Diagram](components.svg)
 
 ## Kernel
 
