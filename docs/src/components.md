@@ -1,9 +1,9 @@
-# Components of a Decentralized Application
+# Components of Decentralized Software on Freenet
 
-Delegates, contracts, and applications each serve distinct roles in the Freenet
-ecosystem. Contracts control public data, or "shared state". Delegates act as
-the user's agent and can store private data on the user's behalf, while apps serve 
-as the user interface to contracts and delegates.
+Delegates, contracts, and user-interface components each serve distinct roles in
+the Freenet ecosystem. Contracts control public data, or "shared state".
+Delegates act as the user's agent and can store private data on the user's
+behalf, while apps serve as the user interface to contracts and delegates.
 
 ![Architectural Primitives Diagram](components.svg)
 
@@ -15,20 +15,22 @@ computer. It's responsible for:
 * Providing a user-friendly interface to access Freenet via a web browser
 * Host the user's delegates and the private data they store
 * Host contracts and their associated data on behalf of the network
-* Manage communication between contracts, delegates, and applications
+* Manage communication between contracts, delegates, and UI componets
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
 MB), efficient, and to be able to run on a wide range of devices, from desktops
 to mobile phones.
 
-## Applications
+## User Interface Component
 
-Applications are the user interface for decentralized systems on Freenet. They
-are built using web technologies such as HTML, CSS, and JavaScript, and are
-distributed over Freenet. Applications can create, retrieve, and update
-contracts through a WebSocket connection to the local Freenet peer, as well as
-communicate with delegates. Applications run in a web browser, and can be built
-using any web framework, such as React, Angular, Vue.js, Bootstrap, and so on.
+UI components are Freenet's version of a [single-page
+application](https://en.wikipedia.org/wiki/Single-page_application). They are
+built using web technologies such as HTML, CSS, and JavaScript, and are
+distributed over Freenet and run in a web browser. UIs can create, retrieve, and
+update contracts through a WebSocket connection to the local Freenet peer, as
+well as communicate with delegates. Because UIs run in a web browser, they can
+be built using any web framework, such as React, Angular, Vue.js, Bootstrap, and
+so on.
 
 ## Contracts
 
@@ -70,7 +72,7 @@ provide a range of functionalities, including task execution, secret storage,
 cryptographic operations, and communication with users to obtain permission for
 specific actions. Delegates can be seen as an advanced and more powerful
 alternative to cookies or local storage used in web browsers. With the user's
-consent, delegates can be created by applications or other delegates.
+consent, delegates can be created by UI components or other delegates.
 
 Unlike contracts which run on the network meaning that anything they do must
 be verified by other peers, delegates run on the user's computer and can be
