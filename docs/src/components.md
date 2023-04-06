@@ -23,7 +23,7 @@ to mobile phones.
 
 ## User Interface
 
-UI components are Freenet's version of a [single-page
+User Interface components are Freenet's version of a [single-page
 application](https://en.wikipedia.org/wiki/Single-page_application). They are
 built using web technologies such as HTML, CSS, and JavaScript, and are
 distributed over Freenet and run in a web browser. UIs can create, retrieve, and
