@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use freenet_email_inbox::InboxParams;
 use locutus_stdlib::prelude::Parameters;
-use rsa::RsaPrivateKey;
+use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 
@@ -25,9 +25,7 @@ fn main() {
     key_file.read_to_end(&mut buffer).unwrap();
     let private_key_str = std::str::from_utf8(&buffer).unwrap();
 
-    let private_key =
-        <RsaPrivateKey as rsa::pkcs1::DecodeRsaPrivateKey>::from_pkcs1_pem(private_key_str)
-            .unwrap();
+    let private_key = RsaPrivateKey::from_pkcs1_pem(private_key_str).unwrap();
     let pub_key = private_key.to_public_key();
     let inbox_path = PathBuf::from(MANIFEST);
     let params: Parameters = InboxParams { pub_key }

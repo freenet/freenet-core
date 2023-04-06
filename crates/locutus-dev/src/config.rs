@@ -107,6 +107,11 @@ impl BuildToolCliConfig {
         self.version = version;
         self
     }
+
+    pub fn with_features(mut self, features: Option<String>) -> Self {
+        self.features = features;
+        self
+    }
 }
 
 impl Default for BuildToolCliConfig {

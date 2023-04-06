@@ -5,7 +5,7 @@ const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 fn main() {
     use locutus_dev::config::BuildToolCliConfig;
     use locutus_stdlib::prelude::ContractContainer;
-    let config = BuildToolCliConfig::default();
+    let config = BuildToolCliConfig::default().with_features(Some("contract".to_string()));
     let contract_path = PathBuf::from(MANIFEST).join("../contracts/inbox");
     eprintln!("inbox path: {contract_path:?}");
     let contract_path = contract_path.canonicalize().unwrap();
@@ -22,5 +22,5 @@ fn main() {
         PathBuf::from(MANIFEST).join("examples/inbox_code_hash"),
         code_key,
     )
-        .unwrap();
+    .unwrap();
 }

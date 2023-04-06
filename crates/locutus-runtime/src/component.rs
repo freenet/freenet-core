@@ -2,7 +2,7 @@ use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
     ApplicationMessage, ClientResponse, Component, ComponentContext, ComponentError,
     ComponentInterfaceResult, ComponentKey, GetSecretRequest, GetSecretResponse,
-    InboundComponentMsg, OutboundComponentMsg, SetSecretRequest, UserInputResponse,
+    InboundComponentMsg, OutboundComponentMsg, SetSecretRequest,
 };
 
 use crate::error::RuntimeInnerError;
