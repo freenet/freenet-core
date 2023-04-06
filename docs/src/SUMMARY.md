@@ -1,6 +1,4 @@
 - [Introduction](introduction.md)
-- [FAQ](faq.md)
-- [Glossary](glossary.md)
 
 # Architecture
 
@@ -20,3 +18,8 @@
 # Community and Support
 
 - [Community](community.md)
+
+# Reference
+
+- [FAQ](faq.md)
+- [Glossary](glossary.md)
