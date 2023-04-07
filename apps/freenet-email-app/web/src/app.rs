@@ -7,8 +7,12 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
+use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
+use rsa::pkcs1::EncodeRsaPublicKey;
+use rsa::pkcs8::{EncodePublicKey, LineEnding};
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
+use std::collections::HashMap;
 
 use crate::{
     api::{NodeResponses, WebApiRequestClient},
@@ -19,6 +23,27 @@ use crate::{
 mod login;
 
 pub(crate) type AsyncActionResult = Result<(), (DynError, TryAsyncAction)>;
+
+lazy_static! {
+    static ref ALIAS_MAP: HashMap<String, String> = {
+        const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
+        const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
+        let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
+            .unwrap()
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
+            .unwrap()
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let mut map = HashMap::new();
+        map.insert("ian.clarke@freenet.org".to_string(), pub_key0);
+        map.insert("other.stuff@freenet.org".to_string(), pub_key1);
+        map
+    };
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum AsyncAction {
@@ -230,6 +255,16 @@ impl Inbox {
         let actions = use_coroutine_handle::<AsyncAction>(cx).unwrap();
         actions.send(AsyncAction::LoadMessages(id.clone()));
         Ok(())
+    }
+
+    #[cfg(feature = "use-node")]
+    fn get_user_from_alias(
+        &self,
+        alias: &str,
+    ) -> Result<String, DynError> {
+        crate::log::log(format!("getting user from alias: {}", alias));
+        let pub_key = ALIAS_MAP.get(alias).ok_or("alias not found").unwrap();
+        Ok(pub_key.to_string())
     }
 }
 
@@ -590,7 +625,8 @@ fn NewMessageWindow(cx: Scope) -> Element {
     let content = use_state(cx, String::new);
 
     let send_msg = move |_| {
-        match inbox.send_message(client.clone(), to.get(), title.get(), content.get()) {
+        let to_pk = inbox.get_user_from_alias(to.get()).unwrap();
+        match inbox.send_message(client.clone(), to_pk.as_str(), title.get(), content.get()) {
             Ok(futs) => {
                 futs.into_iter().for_each(|f| cx.spawn(f));
             }
@@ -616,11 +652,11 @@ fn NewMessageWindow(cx: Scope) -> Element {
                         }
                         tr {
                             th { "To"}
-                            td { style: "width: 100%", contenteditable: true, "{to}" }
+                            td { style: "width: 100%", contenteditable: true, oninput: move |ev| { to.set(ev.value.clone()); } }
                         }
                         tr {
                             th { "Title"}
-                            td { style: "width: 100%", contenteditable: true, "{title}"  }
+                            td { style: "width: 100%", contenteditable: true, oninput: move |ev| { title.set(ev.value.clone()); }  }
                         }
                     }
                 }
