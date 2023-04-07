@@ -166,24 +166,24 @@ pub(crate) async fn node_comms(
     WEB_API_SENDER.set(api.sender_half()).unwrap();
 
     let mut waiting_updates = HashMap::new();
-    loop {
-        crate::log::log("start loop");
-        while let Ok(Some(req)) = rx.try_next() {
-            let AsyncAction::LoadMessages(identity) = req;
-            let mut client = api.sender_half();
-            match InboxModel::load(&mut client, &identity).await {
-                Err(err) => {
-                    error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
-                }
-                Ok(key) => {
-                    waiting_updates.entry(key).or_insert(identity);
+    async move {
+        loop {
+            while let Ok(Some(req)) = rx.try_next() {
+                let AsyncAction::LoadMessages(identity) = req;
+                let mut client = api.sender_half();
+                match InboxModel::load(&mut client, &identity).await {
+                    Err(err) => {
+                        error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
+                    }
+                    Ok(key) => {
+                        waiting_updates.entry(key).or_insert(identity);
+                    }
                 }
             }
-        }
-        while let Ok(Some(req)) = api.requests.try_next() {
-            api.api.send(req).await.unwrap();
-        }
-        loop {
+            while let Ok(Some(req)) = api.requests.try_next() {
+                api.api.send(req).await.unwrap();
+            }
+
             match api.client_errors.try_recv() {
                 Err(TryRecvError::Empty) | Ok(Ok(())) => {}
                 Err(TryRecvError::Disconnected) => panic!(),
@@ -192,6 +192,7 @@ pub(crate) async fn node_comms(
                     todo!("better error handling");
                 }
             }
+
             match api.host_responses.try_recv() {
                 Ok(r) => {
                     let r = r.unwrap();
@@ -228,16 +229,16 @@ pub(crate) async fn node_comms(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => panic!(),
             }
+            #[cfg(target_family = "wasm")]
+            {
+                web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_str_and_timeout_and_unused_0("wait_msg", 10);
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        #[cfg(target_family = "wasm")]
-        {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_str_and_timeout_and_unused_0("wait_msg", 10);
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
+    };
 }
