@@ -9,6 +9,8 @@ which runs on users' computers, smartphones, or other devices. The kernel is
 tiny, less than 5 MB, allowing it to be installed installed in a matter of
 seconds and is compatible with a wide range of hardware.
 
+![Freenet in Context](freenet_in_context.svg)
+
 Freenet is a peer-to-peer network, which means that nodes self-organize into a
 global network without any central authority, and the work of hosting services
 is distributed among the users.

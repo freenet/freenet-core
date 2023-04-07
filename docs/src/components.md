@@ -1,9 +1,9 @@
-# Components of a Decentralized Application
+# Components of Decentralized Software on Freenet
 
-Delegates, contracts, and applications each serve distinct roles in the Freenet
-ecosystem. Contracts control public data, or "shared state". Delegates act as
-the user's agent and can store private data on the user's behalf, while apps serve 
-as the user interface to contracts and delegates.
+Delegates, contracts, and user-interface components each serve distinct roles in
+the Freenet ecosystem. Contracts control public data, or "shared state".
+Delegates act as the user's agent and can store private data on the user's
+behalf, while apps serve as the user interface to contracts and delegates.
 
 ![Architectural Primitives Diagram](components.svg)
 
@@ -15,20 +15,29 @@ computer. It's responsible for:
 * Providing a user-friendly interface to access Freenet via a web browser
 * Host the user's delegates and the private data they store
 * Host contracts and their associated data on behalf of the network
-* Manage communication between contracts, delegates, and applications
+* Manage communication between contracts, delegates, and UI componets
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
 MB), efficient, and to be able to run on a wide range of devices, from desktops
 to mobile phones.
 
-## Applications
+## User Interface
 
-Applications are the user interface for decentralized systems on Freenet. They
-are built using web technologies such as HTML, CSS, and JavaScript, and are
-distributed over Freenet. Applications can create, retrieve, and update
-contracts through a WebSocket connection to the local Freenet peer, as well as
-communicate with delegates. Applications run in a web browser, and can be built
-using any web framework, such as React, Angular, Vue.js, Bootstrap, and so on.
+User Interface components are Freenet's version of a [single-page
+application](https://en.wikipedia.org/wiki/Single-page_application). They are
+built using web technologies such as HTML, CSS, and JavaScript, and are
+distributed over Freenet and run in a web browser. UIs can create, retrieve, and
+update contracts through a WebSocket connection to the local Freenet peer, as
+well as communicate with delegates. 
+
+Because UIs run in a web browser, they can be built using any web framework,
+such as React, Angular, Vue.js, Bootstrap, and so on. 
+
+### UI Use Cases
+
+* A UI front-end for a messaging system similar to Gmail
+* A UI front-end for a social network similar to Twitter
+* A UI front-end for a delegate that manages secrets, similar to LastPass
 
 ## Contracts
 
@@ -39,9 +48,9 @@ the circumstances under which state can be modified and whether a given state is
 allowed under the contract.
 
 Contracts and their associated state reside on the Freenet network on peers
-determined by the contract's location, which is derived from its WebAssembly code
-and parameters. While a user's delegates are hosted on their local Freenet peer,
-contracts are hosted on the network as a whole.
+determined by the contract's location, which is derived from its WebAssembly
+code and parameters. While a user's delegates are hosted on their local Freenet
+peer, contracts are hosted on the network as a whole.
 
 Contracts also outline how to merge two valid states, creating a new state that
 incorporates both. This process ensures [eventual
@@ -53,6 +62,8 @@ Each contract is identified by a cryptographic hash, which is a combination of
 its code and parameters, also referred to as its "key". This key is used to
 identify the contract and to verify that the contract's code and parameters have
 not been tampered with.
+
+### Contract Use Cases
 
 Take, for example, a public blog contract. The state of this contract would be
 the blog's content, which consists of a list of blog posts. The code within the
@@ -70,11 +81,11 @@ provide a range of functionalities, including task execution, secret storage,
 cryptographic operations, and communication with users to obtain permission for
 specific actions. Delegates can be seen as an advanced and more powerful
 alternative to cookies or local storage used in web browsers. With the user's
-consent, delegates can be created by applications or other delegates.
+consent, delegates can be created by UI components or other delegates.
 
-Unlike contracts which run on the network meaning that anything they do must
-be verified by other peers, delegates run on the user's computer and can be
-trusted to execute their code without verification.
+Unlike contracts which run on the network meaning that anything they do must be
+verified by other peers, delegates run on the user's computer and can be trusted
+to execute their code without verification.
 
 Delegates must implement the
 [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
@@ -101,3 +112,14 @@ verify the behavior of other delegates or apps with which they interact.
 This allows for highly flexible composability, as components can trust the
 behavior of the components they communicate with by verifying their code and
 configuration parameters.
+
+### Delegate Use Cases
+
+* A key manager delegate is responsible for managing a user's private keys,
+  other components can request that the key manager delegate sign messages
+  or other data on their behalf.
+
+* An inbox delegate is responsible for maintaining an inbox of messages sent to
+  the user in a messaging system. It pulls messages from an inbox contract,
+  decrypts them, and stores them locally where they can be queried by other
+  components.
