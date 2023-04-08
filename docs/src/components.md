@@ -1,13 +1,13 @@
 # Components of Decentralized Software on Freenet
 
-Delegates, contracts, and user-interface components each serve distinct roles in
-the Freenet ecosystem. Contracts control public data, or "shared state".
-Delegates act as the user's agent and can store private data on the user's
-behalf, while apps serve as the user interface to contracts and delegates.
+Delegates, contracts, and user interfaces (UIs) each serve distinct roles in the
+Freenet ecosystem. Contracts control public data, or "shared state". Delegates
+act as the user's agent and can store private data on the user's behalf, while
+UIs provide an interface between these and the user through a web browser.
 
 ![Architectural Primitives Diagram](components.svg)
 
-## Kernel
+## Freenet Kernel
 
 The kernel is the core of Freenet, it's the software that runs on the user's
 computer. It's responsible for:
@@ -18,34 +18,36 @@ computer. It's responsible for:
 * Manage communication between contracts, delegates, and UI componets
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
-MB), efficient, and to be able to run on a wide range of devices, from desktops
-to mobile phones.
+MB), efficient, and run on a wide range of devices like smartphones, desktop
+computers, and embedded devices.
 
 ## User Interface
 
-User Interface components are Freenet's version of a [single-page
-application](https://en.wikipedia.org/wiki/Single-page_application). They are
-built using web technologies such as HTML, CSS, and JavaScript, and are
-distributed over Freenet and run in a web browser. UIs can create, retrieve, and
-update contracts through a WebSocket connection to the local Freenet peer, as
-well as communicate with delegates. 
+On the normal web, a user might visit https://gmail.com/, their browser
+will download the Gmail user interface which then runs in their browser and connects
+back to the Gmail servers. 
+
+On Freenet the user interface is downloaded from a Freenet contract, and it
+interacts with contracts and delegates through the Freenet kernel.
+
+![Delegate, Contrat, and UI Diagram](ui_delegate_contract.svg)
+
+These UIs are built using web technologies such as HTML, CSS, and JavaScript,
+and are distributed over Freenet and run in a web browser. UIs can create,
+retrieve, and update contracts through a WebSocket connection to the local
+Freenet peer, as well as communicate with delegates. 
 
 Because UIs run in a web browser, they can be built using any web framework,
 such as React, Angular, Vue.js, Bootstrap, and so on. 
 
-### UI Use Cases
-
-* A UI front-end for a messaging system similar to Gmail
-* A UI front-end for a social network similar to Twitter
-* A UI front-end for a delegate that manages secrets, similar to LastPass
 
 ## Contracts
 
-Contracts in Freenet are [WebAssembly](https://webassembly.org) code that manage
-and regulate public state. They can be likened to inodes in a filesystem, tables
-in a database, or memory locations in a globally shared memory. Contracts define
-the circumstances under which state can be modified and whether a given state is
-allowed under the contract.
+Contracts in Freenet are [WebAssembly](https://webassembly.org) components that
+manage and regulate public state. They can be likened to inodes in a filesystem,
+tables in a database, or memory locations in a globally shared memory. Contracts
+define the circumstances under which state can be modified and whether a given
+state is allowed under the contract.
 
 Contracts and their associated state reside on the Freenet network on peers
 determined by the contract's location, which is derived from its WebAssembly
@@ -74,31 +76,28 @@ key.
 
 ## Delegates
 
-Delegates are WebAssembly code components that serve as personal agents for
-users, operating on their devices to manage private data and interact with
-digital entities such as contracts, apps, and other delegates. These agents
-provide a range of functionalities, including task execution, secret storage,
-cryptographic operations, and communication with users to obtain permission for
-specific actions. Delegates can be seen as an advanced and more powerful
-alternative to cookies or local storage used in web browsers. With the user's
-consent, delegates can be created by UI components or other delegates.
-
-Unlike contracts which run on the network meaning that anything they do must be
-verified by other peers, delegates run on the user's computer and can be trusted
-to execute their code without verification.
-
-Delegates must implement the
+Delegates are WebAssembly binaries that act as user avatars on Freenet, they
+must implement the
 [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
 
-While contracts' state is public (but potentially encrypted), delegates state is
-private. Example uses for delegates include:
+Delegates run in the Freenet kernel and manage private data and interact with
+other Freenet entities like contracts, apps, and other delegates on behalf of
+the user. They can store and control private data like cryptographic keys,
+tokens, and passwords, and communicate with users, for example to ask permission
+to sign some data. They can be created by UI components or other delegates.
 
-* Storing and controlling the use of private data such as passwords, keys,
-  tokens, and other sensitive information
-* Participating on the user's behalf in decentralized systems like a web of
-  trust
-* Storing private data on behalf of the user, like contacts, or sent and
-  received messages
+Unlike contracts, which require network verification, delegates run on the
+user's computer and are trusted to execute code without verification. Delegates'
+state is private, while contracts' state is public but may be encrypted.
+
+Delegates are used for:
+- Managing private data similar to a browser's [web
+  storage](https://en.wikipedia.org/wiki/Web_storage)
+  - eg. private keys, tokens
+- Acting on the user's behalf on Freenet
+  - eg. consuming received messages in an inbox
+- Storing user data
+  - e.g., contacts, messages
 
 ### Origin Attestation
 
