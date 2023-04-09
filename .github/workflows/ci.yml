@@ -35,15 +35,7 @@ jobs:
           override: "true"
           default: "true"
 
-      - uses: actions/cache@v3
-        with:
-          path: ~/.cargo
-          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-
-          
-      - uses: actions/cache@v3
-        with:
-          path: target
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install stdlib packages
         working-directory: apps/stdlib
@@ -88,15 +80,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: actions/cache@v3
-        with:
-          path: ~/.cargo
-          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-
-
-      - uses: actions/cache@v3
-        with:
-          path: target
+      - uses: Swatinem/rust-cache@v2
           
       - uses: actions-rs/toolchain@v1
         with:
@@ -133,15 +117,8 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
-      - uses: actions/cache@v3
-        with:
-          path: ~/.cargo
-          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-
 
-      - uses: actions/cache@v3
-        with:
-          path: target
+      - uses: Swatinem/rust-cache@v2
 
       - uses: actions-rs/toolchain@v1
         with:
@@ -178,6 +155,8 @@ jobs:
           components: rustfmt
           override: "true"
           default: "true"
+          
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check code formatting
         run: cargo fmt -- --check
