@@ -44,8 +44,6 @@ jobs:
       - uses: actions/cache@v3
         with:
           path: target
-          key: target-${{ hashFiles('Cargo.lock') }}
-          restore-keys: target-
 
       - name: Install stdlib packages
         working-directory: apps/stdlib
@@ -66,13 +64,6 @@ jobs:
 
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
-
-      - name: Cache cargo registry
-        if: always()
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo
-          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
 
   build_target:
     name: Build targets
@@ -106,9 +97,7 @@ jobs:
       - uses: actions/cache@v3
         with:
           path: target
-          key: target-${{ hashFiles('Cargo.lock') }}
-          restore-keys: target-
-
+          
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -153,8 +142,6 @@ jobs:
       - uses: actions/cache@v3
         with:
           path: target
-          key: target-${{ hashFiles('Cargo.lock') }}
-          restore-keys: target-
 
       - uses: actions-rs/toolchain@v1
         with:
