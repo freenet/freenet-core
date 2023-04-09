@@ -8,11 +8,9 @@ pub struct PeerChooser {
     success_est: RoutingOutcomeEstimator,
 }
 
-impl PeerChooser {
-
-}
+impl PeerChooser {}
 
 struct RoutingEvent {
-    peer_id : PeerId,
-    outcome : RoutingOutcome,
+    peer_id: PeerId,
+    outcome: RoutingOutcome,
 }

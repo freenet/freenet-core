@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use locutus_core::{libp2p::PeerId, Location};
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
+use std::collections::HashMap;
 
 const MIN_POINTS_FOR_REGRESSION: usize = 50;
 
@@ -35,7 +35,10 @@ impl RoutingOutcomeEstimator {
 
         for event in history {
             let point = Point::new(
-                event.peer_location.distance(&event.contract_location).into(),
+                event
+                    .peer_location
+                    .distance(&event.contract_location)
+                    .into(),
                 event.result,
             );
 
@@ -62,7 +65,10 @@ impl RoutingOutcomeEstimator {
     /// Adds a new event to the estimator.
     pub fn add_event(&mut self, event: RoutingEvent) {
         let point = Point::new(
-            event.peer_location.distance(&event.contract_location).into(),
+            event
+                .peer_location
+                .distance(&event.contract_location)
+                .into(),
             event.result,
         );
 
@@ -80,14 +86,13 @@ impl RoutingOutcomeEstimator {
                 return Some(regression.interpolate(distance));
             }
         }
-    
+
         if self.global_regression.len() > MIN_POINTS_FOR_REGRESSION {
             return Some(self.global_regression.interpolate(distance));
         }
-    
+
         None
     }
-    
 }
 
 /// A routing event is a single request to a peer for a contract, and some value indicating
@@ -109,20 +114,19 @@ pub struct RoutingEvent {
 mod tests {
     use super::*;
 
-// This test `test_peer_time_estimator` checks the accuracy of the `RoutingOutcomeEstimator` struct's
-// `estimate_retrieval_time()` method. It generates a list of 100 random events, where each event
-// represents a simulated request made by a random `PeerId` at a random `Location` to retrieve data
-// from a contract at another random `Location`. Each event is created by calling the `simulate_request()`
-// helper function which calculates the distance between the `Peer` and the `Contract`, then estimates
-// the retrieval time based on the distance and some random factor. The list of events is then split
-// into two sets: a training set and a testing set.
-//
-// The `RoutingOutcomeEstimator` is then instantiated using the training set, and the `estimate_retrieval_time()`
-// method is called for each event in the testing set. The estimated retrieval time is compared to the
-// actual retrieval time recorded in the event, and the error between the two is calculated. The average
-// error across all events is then calculated, and the test passes if the average error is less than 0.01.
-// If the error is greater than or equal to 0.01, the test fails.
-
+    // This test `test_peer_time_estimator` checks the accuracy of the `RoutingOutcomeEstimator` struct's
+    // `estimate_retrieval_time()` method. It generates a list of 100 random events, where each event
+    // represents a simulated request made by a random `PeerId` at a random `Location` to retrieve data
+    // from a contract at another random `Location`. Each event is created by calling the `simulate_request()`
+    // helper function which calculates the distance between the `Peer` and the `Contract`, then estimates
+    // the retrieval time based on the distance and some random factor. The list of events is then split
+    // into two sets: a training set and a testing set.
+    //
+    // The `RoutingOutcomeEstimator` is then instantiated using the training set, and the `estimate_retrieval_time()`
+    // method is called for each event in the testing set. The estimated retrieval time is compared to the
+    // actual retrieval time recorded in the event, and the error between the two is calculated. The average
+    // error across all events is then calculated, and the test passes if the average error is less than 0.01.
+    // If the error is greater than or equal to 0.01, the test fails.
 
     #[test]
     fn test_peer_time_estimator() {
@@ -140,11 +144,14 @@ mod tests {
 
         // Create a new estimator from the training set
         let estimator = RoutingOutcomeEstimator::new(training_events.iter().cloned());
-        
+
         // Test the estimator on the testing set, recording the errors
         let mut errors = Vec::new();
         for event in testing_events {
-            let distance = event.contract_location.distance(&event.peer_location).into();
+            let distance = event
+                .contract_location
+                .distance(&event.peer_location)
+                .into();
             let estimated_time = estimator.estimate_retrieval_time(event.peer, distance);
             assert!(estimated_time.is_some());
             let estimated_time = estimated_time.unwrap();
@@ -158,7 +165,11 @@ mod tests {
         assert!(average_error < 0.01);
     }
 
-    fn simulate_request(peer: PeerId, peer_location: Location, contract_location: Location) -> RoutingEvent {
+    fn simulate_request(
+        peer: PeerId,
+        peer_location: Location,
+        contract_location: Location,
+    ) -> RoutingEvent {
         let distance: f64 = peer_location.distance(&contract_location).into();
 
         let result = distance.powf(0.5) + peer.to_bytes()[0] as f64;
