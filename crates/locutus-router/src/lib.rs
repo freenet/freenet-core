@@ -1,6 +1,6 @@
 mod routing_outcome_estimator;
 
-use locutus_core::libp2p::PeerId;
+use locutus_core::libp2p::*;
 use routing_outcome_estimator::RoutingOutcomeEstimator;
 
 pub struct PeerChooser {
