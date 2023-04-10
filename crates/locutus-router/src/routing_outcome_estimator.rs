@@ -1,4 +1,5 @@
-use locutus_core::{libp2p::PeerId, Location};
+use locutus_core::ring::PeerKeyLocation;
+use locutus_core::Location;
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -16,12 +17,10 @@ const MIN_POINTS_FOR_REGRESSION: usize = 50;
 /// if it has enough data points for accurate predictions. Otherwise, the global regression model
 /// is used.
 
-// TODO: Make serializable
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RoutingOutcomeEstimator {
     global_regression: IsotonicRegression,
-    peer_regressions: HashMap<PeerId, IsotonicRegression>,
+    peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
 }
 
 impl RoutingOutcomeEstimator {
@@ -31,76 +30,97 @@ impl RoutingOutcomeEstimator {
         I: IntoIterator<Item = RoutingEvent>,
     {
         let mut all_points = Vec::new();
-        let mut peer_points: HashMap<PeerId, Vec<Point>> = HashMap::new();
+        let mut peer_events: HashMap<PeerKeyLocation, Vec<RoutingEvent>> = HashMap::new();
 
         for event in history {
-            let point = Point::new(
-                event
-                    .peer_location
-                    .distance(&event.contract_location)
-                    .into(),
-                event.result,
-            );
+            let point = Point::new(event.route_distance(), event.result);
 
             all_points.push(point);
-            peer_points.entry(event.peer).or_default().push(point);
+            peer_events.entry(event.peer).or_default().push(event);
         }
 
         let global_regression = IsotonicRegression::new_ascending(&all_points);
 
-        let peer_regressions = peer_points
-            .into_iter()
-            .map(|(peer, points)| {
-                let regression = IsotonicRegression::new_ascending(&points);
-                (peer, regression)
-            })
-            .collect();
+        let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
+
+        for (peer, events) in peer_events.iter() {
+            let mut event_count: u64 = 0;
+            let mut total_adjustment: f64 = 0.0;
+            for event in events {
+                let peer_adjustment =
+                    event.result - global_regression.interpolate(event.route_distance());
+                event_count += 1;
+                total_adjustment += peer_adjustment;
+            }
+            peer_adjustments.insert(
+                *peer,
+                Adjustment {
+                    sum: total_adjustment,
+                    count: event_count,
+                },
+            );
+        }
 
         RoutingOutcomeEstimator {
             global_regression,
-            peer_regressions,
+            peer_adjustments,
         }
     }
 
     /// Adds a new event to the estimator.
     pub fn add_event(&mut self, event: RoutingEvent) {
-        let point = Point::new(
-            event
-                .peer_location
-                .distance(&event.contract_location)
-                .into(),
-            event.result,
-        );
+        let route_distance = event.route_distance();
+
+        let point = Point::new(route_distance, event.result);
 
         self.global_regression.add_points(&[point]);
 
-        self.peer_regressions
+        let adjustment = event.result - self.global_regression.interpolate(route_distance);
+
+        self.peer_adjustments
             .entry(event.peer)
-            .or_insert_with(|| IsotonicRegression::new_ascending(&[point]))
-            .add_points(&[point]);
+            .or_insert_with(Adjustment::default)
+            .add(adjustment);
     }
 
-    pub fn estimate_retrieval_time(&self, peer: PeerId, distance: f64) -> Option<f64> {
-        if let Some(regression) = self.peer_regressions.get(&peer) {
-            if regression.len() > MIN_POINTS_FOR_REGRESSION {
-                return Some(regression.interpolate(distance));
-            }
+    pub fn estimate_retrieval_time(
+        &self,
+        peer: &PeerKeyLocation,
+        distance: f64,
+    ) -> Result<f64, EstimationError> {
+        // Check if there are enough data points for the regression model
+        if self.global_regression.len() < MIN_POINTS_FOR_REGRESSION {
+            return Err(EstimationError::InsufficientData);
         }
 
-        if self.global_regression.len() > MIN_POINTS_FOR_REGRESSION {
-            return Some(self.global_regression.interpolate(distance));
-        }
+        let global_estimate = self.global_regression.interpolate(distance);
 
-        None
+        Ok(self
+            .peer_adjustments
+            .get(peer)
+            .map_or(global_estimate, |peer_adjustment| {
+                let should_use_peer_adjustment =
+                    peer_adjustment.count >= MIN_POINTS_FOR_REGRESSION as u64;
+                global_estimate
+                    + if should_use_peer_adjustment {
+                        peer_adjustment.value()
+                    } else {
+                        0.0
+                    }
+            }))
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum EstimationError {
+    InsufficientData, // Error indicating that there is not enough data for estimation
 }
 
 /// A routing event is a single request to a peer for a contract, and some value indicating
 /// the result of the request, such as the time it took to retrieve the contract.
 #[derive(Debug, Clone)]
 pub struct RoutingEvent {
-    pub peer: PeerId,
-    pub peer_location: Location,
+    pub peer: PeerKeyLocation,
     pub contract_location: Location,
     /// The result of the routing event, which is used to train the estimator, typically the time
     /// but could also represent request success as 0.0 and failure as 1.0, and then be used
@@ -108,10 +128,46 @@ pub struct RoutingEvent {
     pub result: f64,
 }
 
+impl RoutingEvent {
+    fn route_distance(&self) -> f64 {
+        self.contract_location
+            .distance(&self.peer.location.unwrap())
+            .into()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Adjustment {
+    sum: f64,
+    count: u64,
+}
+
+impl Default for Adjustment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Adjustment {
+    fn new() -> Self {
+        Self { sum: 0.0, count: 0 }
+    }
+
+    fn add(&mut self, value: f64) {
+        self.sum += value;
+        self.count += 1;
+    }
+
+    fn value(&self) -> f64 {
+        self.sum / self.count as f64
+    }
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     // This test `test_peer_time_estimator` checks the accuracy of the `RoutingOutcomeEstimator` struct's
@@ -133,10 +189,12 @@ mod tests {
         // Generate a list of random events
         let mut events = Vec::new();
         for _ in 0..100 {
-            let peer = PeerId::random();
-            let peer_location = Location::random();
+            let peer = PeerKeyLocation::random();
+            if peer.location.is_none() {
+                println!("Peer location is none for {peer:?}");
+            }
             let contract_location = Location::random();
-            events.push(simulate_request(peer, peer_location, contract_location));
+            events.push(simulate_request(peer, contract_location));
         }
 
         // Split the events into two sets
@@ -148,13 +206,9 @@ mod tests {
         // Test the estimator on the testing set, recording the errors
         let mut errors = Vec::new();
         for event in testing_events {
-            let distance = event
-                .contract_location
-                .distance(&event.peer_location)
-                .into();
-            let estimated_time = estimator.estimate_retrieval_time(event.peer, distance);
-            assert!(estimated_time.is_some());
-            let estimated_time = estimated_time.unwrap();
+            let estimated_time = estimator
+                .estimate_retrieval_time(&event.peer, event.route_distance())
+                .unwrap();
             let actual_time = event.result;
             let error = (estimated_time - actual_time).abs();
             errors.push(error);
@@ -162,20 +216,16 @@ mod tests {
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
+        println!("Average error: {}", average_error);
         assert!(average_error < 0.01);
     }
 
-    fn simulate_request(
-        peer: PeerId,
-        peer_location: Location,
-        contract_location: Location,
-    ) -> RoutingEvent {
-        let distance: f64 = peer_location.distance(&contract_location).into();
+    fn simulate_request(peer: PeerKeyLocation, contract_location: Location) -> RoutingEvent {
+        let distance: f64 = peer.location.unwrap().distance(&contract_location).into();
 
-        let result = distance.powf(0.5) + peer.to_bytes()[0] as f64;
+        let result = distance.powf(0.5) + peer.peer.to_bytes()[0] as f64;
         RoutingEvent {
             peer,
-            peer_location,
             contract_location,
             result,
         }
