@@ -10,8 +10,10 @@ use futures::FutureExt;
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
 use rsa::pkcs1::EncodeRsaPublicKey;
-use rsa::pkcs8::{EncodePublicKey, LineEnding};
-use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey, RsaPrivateKey, RsaPublicKey};
+use rsa::{
+    pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, pkcs8::LineEnding, RsaPrivateKey,
+    RsaPublicKey,
+};
 use std::collections::HashMap;
 
 use crate::{
@@ -31,12 +33,12 @@ lazy_static! {
         let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
             .unwrap()
             .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
+            .to_pkcs1_pem(LineEnding::LF)
             .unwrap();
         let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
             .unwrap()
             .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
+            .to_pkcs1_pem(LineEnding::LF)
             .unwrap();
         let mut map = HashMap::new();
         map.insert("ian.clarke@freenet.org".to_string(), pub_key0);
@@ -155,7 +157,7 @@ impl Inbox {
         {
             crate::log::log(format!("sending message from id #{}", self.active_id));
             for k in content.to.iter() {
-                let key = RsaPublicKey::from_public_key_pem(k).map_err(|e| format!("{e}"))?;
+                let key = RsaPublicKey::from_pkcs1_pem(k).map_err(|e| format!("{e}"))?;
                 let content = content.clone();
                 let mut client = client.clone();
                 let f = async move {
@@ -258,10 +260,7 @@ impl Inbox {
     }
 
     #[cfg(feature = "use-node")]
-    fn get_user_from_alias(
-        &self,
-        alias: &str,
-    ) -> Result<String, DynError> {
+    fn get_public_key_from_alias(&self, alias: &str) -> Result<String, DynError> {
         crate::log::log(format!("getting user from alias: {}", alias));
         let pub_key = ALIAS_MAP.get(alias).ok_or("alias not found").unwrap();
         Ok(pub_key.to_string())
@@ -625,8 +624,13 @@ fn NewMessageWindow(cx: Scope) -> Element {
     let content = use_state(cx, String::new);
 
     let send_msg = move |_| {
-        let to_pk = inbox.get_user_from_alias(to.get()).unwrap();
-        match inbox.send_message(client.clone(), to_pk.as_str(), title.get(), content.get()) {
+        let receiver_public_key = inbox.get_public_key_from_alias(to.get()).unwrap();
+        match inbox.send_message(
+            client.clone(),
+            receiver_public_key.as_str(),
+            title.get(),
+            content.get(),
+        ) {
             Ok(futs) => {
                 futs.into_iter().for_each(|f| cx.spawn(f));
             }

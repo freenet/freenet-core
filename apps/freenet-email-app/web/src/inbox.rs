@@ -1,29 +1,35 @@
-use std::collections::HashSet;
-
-use chrono::{DateTime, Utc};
-use freenet_email_inbox::{
-    Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
-    UpdateInbox,
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    XChaCha20Poly1305,
 };
+use chrono::{DateTime, NaiveDate, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment};
 use locutus_stdlib::client_api::{ClientRequest, ComponentRequest};
-use locutus_stdlib::prelude::{ApplicationMessage, ComponentKey, InboundComponentMsg};
+use locutus_stdlib::prelude::{
+    ApplicationMessage, ComponentKey, ContractInstanceId, InboundComponentMsg,
+};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
 };
 use rand_chacha::rand_core::SeedableRng;
-use rsa::RsaPublicKey;
 use rsa::{
-    pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, PublicKey,
-    RsaPrivateKey,
+    pkcs1v15::{Signature, SigningKey},
+    sha2::Sha256,
+    signature::Signer,
+    Pkcs1v15Encrypt, PublicKey, RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::app::{error_handling, TryAsyncAction};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
+use freenet_email_inbox::{
+    Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
+    UpdateInbox,
+};
 
 static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
 
@@ -99,11 +105,31 @@ impl DecryptedMessage {
     fn to_stored(&self, token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
         // FIXME: use a real source of entropy
         let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
-        let decrypted_content = serde_json::to_vec(self)?;
-        let content = token_assignment
+        let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
+
+        // Generate a random 256-bit XChaCha20Poly1305 key
+        let chacha_key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        // Encrypt the data using XChaCha20Poly1305
+        let cipher = XChaCha20Poly1305::new(&chacha_key);
+        let encrypted_data = cipher
+            .encrypt(&chacha_nonce, decrypted_content.as_slice())
+            .unwrap();
+
+        // Encrypt the XChaCha20Poly1305 key using RSA
+        let encrypted_key = token_assignment
             .assignee
-            .encrypt(&mut rng, Pkcs1v15Encrypt, decrypted_content.as_ref())
+            .encrypt(&mut rng, Pkcs1v15Encrypt, &chacha_key)
             .map_err(|e| format!("{e}"))?;
+
+        // Concatenate the nonce, encrypted XChaCha20Poly1305 key and encrypted data
+        let mut content =
+            Vec::with_capacity(chacha_nonce.len() + encrypted_key.len() + encrypted_data.len());
+        content.extend(&chacha_nonce);
+        content.extend(encrypted_key);
+        content.extend(encrypted_data);
+
         Ok::<_, DynError>(StoredMessage {
             content,
             token_assignment,
@@ -142,7 +168,25 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let token = {
             let key = pub_key.clone();
-            InboxModel::assign_token(client, key).await?
+            //TODO: Use the component instead of hardcoding the TokenAssignment.
+            //InboxModel::assign_token(client, key).await?
+            const TEST_TIER: Tier = Tier::Day1;
+            const MAX_DURATION_1Y: std::time::Duration =
+                std::time::Duration::from_secs(365 * 24 * 3600);
+            let naive = NaiveDate::from_ymd_opt(2023, 1, 25)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap();
+            let slot = DateTime::<Utc>::from_utc(naive, Utc);
+
+            TokenAssignment {
+                tier: TEST_TIER,
+                time_slot: slot,
+                assignee: key.clone(),
+                signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
+                assignment_hash: [0; 32],
+                token_record: ContractInstanceId::try_from(INBOX_CODE_HASH.to_string()).unwrap(),
+            }
         };
         let params = InboxParams { pub_key }
             .try_into()

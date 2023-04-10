@@ -1,6 +1,3 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
@@ -240,5 +237,5 @@ pub(crate) async fn node_comms(
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-    };
+    }.await;
 }
