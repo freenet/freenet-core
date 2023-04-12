@@ -141,14 +141,15 @@ impl Router {
     }
 }
 
-fn routing_prediction_to_expected_time(prediction : RoutingPrediction) -> Duration {
+fn routing_prediction_to_expected_time(prediction: RoutingPrediction) -> Duration {
     let time_if_success = prediction.time.as_secs_f64();
     let failure_probability = prediction.failure_probability;
     /*
      * This is a fairly naive approach, assuming that the cost of a failure is a multiple of the cost of success.
      */
     let failure_cost_multiplier = 3.0;
-    let expected_time = time_if_success + (time_if_success * failure_probability * failure_cost_multiplier);
+    let expected_time =
+        time_if_success + (time_if_success * failure_probability * failure_cost_multiplier);
 
     Duration::from_secs_f64(expected_time)
 }
@@ -179,7 +180,7 @@ pub enum RouteOutcome {
 mod tests {
 
     use super::*;
-/* 
+    /*
     #[test]
     fn simulate_requests() {
         // Create 5 random peers and put them in an array
