@@ -25,8 +25,9 @@ warp = { version = "0.3", default-features = false, features = ["multipart", "tl
 rmp = { workspace = true }
 rmpv = { workspace = true }
 rmp-serde = { workspace = true }
-pav_regression = "0.3.4"
+pav_regression = "0.4.0"
 itertools = "0.10.5"
+rand = "0.8.5"
 
 # internal:
 locutus-core = { path = "../locutus-core", version = "0.0.3" }

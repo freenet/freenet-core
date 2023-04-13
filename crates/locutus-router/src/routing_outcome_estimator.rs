@@ -2,7 +2,7 @@ use locutus_core::ring::PeerKeyLocation;
 use locutus_core::Location;
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
@@ -19,17 +19,26 @@ const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerOutcomeEstimator {
-    global_regression: IsotonicRegression,
-    peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
+    pub(crate) global_regression: IsotonicRegression,
+    pub(crate) peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
 }
 
+// Add a comment to explain the purpose of the PeerOutcomeEstimator struct
+// and describe its fields.
 impl PeerOutcomeEstimator {
-    /// Creates a new `PeerTimeEstimator` from a list of historical events.
+    // Define a constant for the adjustment prior size.
+    const ADJUSTMENT_PRIOR_SIZE: u64 = 10;
+
+    /// Creates a new `PeerOutcomeEstimator` from a list of historical events.
     pub fn new<I>(history: I) -> Self
     where
         I: IntoIterator<Item = PeerRoutingEvent>,
     {
         let mut all_points = Vec::new();
+
+        // Seed with point at origin
+        all_points.push(Point::new(0.0, 0.0));
+
         let mut peer_events: HashMap<PeerKeyLocation, Vec<PeerRoutingEvent>> = HashMap::new();
 
         for event in history {
@@ -43,25 +52,28 @@ impl PeerOutcomeEstimator {
 
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
-        let adjustment_prior_size = 10;
+        // Use the constant defined earlier.
+        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
 
-        for (peer, events) in peer_events.iter() {
+        // Use more descriptive variable names.
+        for (peer_location, events) in peer_events.iter() {
             let mut event_count: u64 = adjustment_prior_size;
             let mut total_adjustment: f64 = 0.0;
             for event in events {
-                let peer_adjustment =
-                    event.result - global_regression.interpolate(event.route_distance());
+                let peer_adjustment = event.result
+                    - global_regression
+                        .interpolate(event.route_distance())
+                        .unwrap();
                 event_count += 1;
-                total_adjustment += peer_adjustment; // Unit tests
-                #[cfg(test)]
-                peer_adjustments.insert(
-                    *peer,
-                    Adjustment {
-                        sum: total_adjustment,
-                        count: event_count,
-                    },
-                );
+                total_adjustment += peer_adjustment;
             }
+            peer_adjustments.insert(
+                *peer_location,
+                Adjustment {
+                    sum: total_adjustment,
+                    count: event_count,
+                },
+            );
         }
 
         PeerOutcomeEstimator {
@@ -78,7 +90,7 @@ impl PeerOutcomeEstimator {
 
         self.global_regression.add_points(&[point]);
 
-        let adjustment = event.result - self.global_regression.interpolate(route_distance);
+        let adjustment = event.result - self.global_regression.interpolate(route_distance).unwrap();
 
         self.peer_adjustments
             .entry(event.peer)
@@ -101,7 +113,10 @@ impl PeerOutcomeEstimator {
 
         let distance: f64 = contract_location.distance(&peer.location.unwrap()).into();
 
-        let global_estimate = self.global_regression.interpolate(distance);
+        let global_estimate = self.global_regression.interpolate(distance).unwrap();
+
+        // Regression can sometimes produce negative estimates
+        let global_estimate = global_estimate.max(0.0);
 
         Ok(self
             .peer_adjustments
@@ -150,7 +165,7 @@ impl PeerRoutingEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct Adjustment {
+pub (crate) struct Adjustment {
     sum: f64,
     count: u64,
 }

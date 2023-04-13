@@ -395,6 +395,12 @@ impl Ring {
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
 pub struct Location(pub(crate) f64);
 
+impl Location {
+    pub fn as_f64(&self) -> f64 {
+        self.0
+    }
+}
+
 pub type Distance = Location;
 
 impl Location {
