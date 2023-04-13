@@ -165,7 +165,7 @@ impl PeerRoutingEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub (crate) struct Adjustment {
+pub(crate) struct Adjustment {
     sum: f64,
     count: u64,
 }

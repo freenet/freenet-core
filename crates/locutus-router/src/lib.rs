@@ -251,7 +251,10 @@ mod tests {
         }
 
         // Dump Router
-        println!("Router success estimator global regression:\n{:#?}", router.success_estimator.global_regression);
+        println!(
+            "Router success estimator global regression:\n{:#?}",
+            router.success_estimator.global_regression
+        );
 
         for _ in 0..100 {
             let contract_location = Location::random();
@@ -265,14 +268,18 @@ mod tests {
             println!(
                 "Predicted best: {predicted_best:?}, simulated best time: {simulated_best_time:?}, simulated best failure prob: {simulated_best_failure_prob:?}");
 
-            assert!((predicted_best.time.as_secs_f64() - simulated_best_time.as_secs_f64()).abs() < 0.01);
+            assert!(
+                (predicted_best.time.as_secs_f64() - simulated_best_time.as_secs_f64()).abs()
+                    < 0.01
+            );
 
             // Get the peer that has the actual best time
             let mut best_peer: Option<(PeerKeyLocation, f64)> = None;
             for peer in &peers {
                 let distance = peer.location.unwrap().distance(&contract_location);
                 let failure_prob = dist_to_failure_prob_simulated(distance);
-                let simulated_time = dist_to_time_simulated(distance).as_secs_f64() * (1.0 + failure_prob * 3.0);
+                let simulated_time =
+                    dist_to_time_simulated(distance).as_secs_f64() * (1.0 + failure_prob * 3.0);
                 if best_peer.is_none() || simulated_time < best_peer.unwrap().1 {
                     best_peer = Some((*peer, simulated_time));
                 }
