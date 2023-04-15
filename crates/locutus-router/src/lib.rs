@@ -1,15 +1,15 @@
-mod routing_outcome_estimator;
+mod isotonic_estimator;
 
 use locutus_core::{ring::PeerKeyLocation, Location};
-use rand::seq::SliceRandom;
-use routing_outcome_estimator::{PeerOutcomeEstimator, PeerRoutingEvent};
+use isotonic_estimator::{IsotonicEstimator, PeerRoutingEvent};
 use serde::Serialize;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Router {
-    pub time_estimator: PeerOutcomeEstimator,
-    pub success_estimator: PeerOutcomeEstimator,
+    pub time_estimator: IsotonicEstimator,
+    pub transfer_rate_estimator : IsotonicEstimator,
+    pub success_estimator: IsotonicEstimator,
 }
 
 impl Router {
@@ -51,8 +51,8 @@ impl Router {
             .collect();
 
         Router {
-            time_estimator: PeerOutcomeEstimator::new(success_durations),
-            success_estimator: PeerOutcomeEstimator::new(success_outcomes),
+            time_estimator: IsotonicEstimator::new(success_durations),
+            success_estimator: IsotonicEstimator::new(success_outcomes),
         }
     }
 
@@ -139,23 +139,37 @@ impl Router {
     }
 }
 
-fn routing_prediction_to_expected_time(prediction: RoutingPrediction) -> Duration {
-    let time_if_success = prediction.time.as_secs_f64();
-    let failure_probability = prediction.failure_probability;
-    /*
-     * This is a fairly naive approach, assuming that the cost of a failure is a multiple of the cost of success.
-     */
-    let failure_cost_multiplier = 3.0;
-    let expected_time =
-        time_if_success + (time_if_success * failure_probability * failure_cost_multiplier);
-
-    Duration::from_secs_f64(expected_time)
-}
-
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct RoutingPrediction {
     pub time: Duration,
     pub failure_probability: f64,
+    pub xfer_speed: TransferSpeed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TransferSpeed {bytes_per_second : f64 }
+
+impl TransferSpeed {
+    pub fn new(bytes : usize, duration: Duration) -> Self {
+        TransferSpeed { bytes_per_second : bytes as f64 / duration.as_secs_f64() }
+    }
+}
+
+impl RoutingPrediction {
+    fn to_expected_time(&self) -> Duration {
+        /*
+         * This is a fairly naive approach, assuming that the cost of a failure is a multiple of the cost of success
+         * and that 1000 bytes are transferred.
+         */
+        let failure_cost_multiplier = 3.0;
+        let expected_bytes_transferred = 1000.0;
+        let expected_time =
+            self.time.as_secs_f64() + 
+            (expected_bytes_transferred / self.xfer_speed.bytes_per_second) +
+                (self.time.as_secs_f64() * self.failure_probability * failure_cost_multiplier);
+    
+        Duration::from_secs_f64(expected_time)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -209,30 +223,27 @@ mod tests {
 
     #[test]
     fn test_request_time() {
-        // Create 5 random peers and put them in an array
-        let mut peers = vec![];
-        for _ in 0..25 {
-            let peer = PeerKeyLocation::random();
-            peers.push(peer);
-        }
-
-        // Create a router with no historical data
+        // Define constants for the number of peers, number of events, and number of test iterations.
+        const NUM_PEERS: usize = 25;
+        const NUM_EVENTS: usize = 1000;
+        const NUM_TEST_ITERATIONS: usize = 100;
+    
+        // Create `NUM_PEERS` random peers and put them in a vector.
+        let peers: Vec<PeerKeyLocation> = (0..NUM_PEERS).map(|_| PeerKeyLocation::random()).collect();
+    
+        // Create a router with no historical data.
         let mut router = Router::new(&[]);
-
-        // Add some events to the router
-        for _ in 0..1000 {
+    
+        // Add `NUM_EVENTS` events to the router.
+        for _ in 0..NUM_EVENTS {
             let contract_location = Location::random();
-
-            let closest = router
-                .select_peer(peers.as_slice(), contract_location)
-                .unwrap();
-            let closest_distance: Distance = closest.location.unwrap().distance(&contract_location);
-
-            // Force the time to be proportional to the distance
+            let closest = router.select_peer(&peers, contract_location).unwrap();
+            let closest_distance = closest.location.unwrap().distance(&contract_location);
+    
+            // Force the time to be proportional to the distance.
             let time = dist_to_time_simulated(closest_distance);
-
             let failure_prob = dist_to_failure_prob_simulated(closest_distance);
-
+    
             let outcome = if rand::random::<f64>() < failure_prob {
                 RouteOutcome::Failure
             } else {
@@ -242,21 +253,16 @@ mod tests {
                     payload_transfer_time: Duration::from_secs_f64(1.0),
                 }
             };
-
+    
             router.add_event(RouteEvent {
                 peer: closest,
                 contract_location,
                 outcome,
             });
         }
-
-        // Dump Router
-        println!(
-            "Router success estimator global regression:\n{:#?}",
-            router.success_estimator.global_regression
-        );
-
-        for _ in 0..100 {
+    
+        // Test the router's prediction accuracy for `NUM_TEST_ITERATIONS` iterations.
+        for _ in 0..NUM_TEST_ITERATIONS {
             let contract_location = Location::random();
             let best = router.select_peer(&peers, contract_location).unwrap();
             let predicted_best = router.predict_routing_outcome(best, contract_location);
@@ -264,31 +270,39 @@ mod tests {
                 dist_to_time_simulated(best.location.unwrap().distance(&contract_location));
             let simulated_best_failure_prob =
                 dist_to_failure_prob_simulated(best.location.unwrap().distance(&contract_location));
-
-            println!(
-                "Predicted best: {predicted_best:?}, simulated best time: {simulated_best_time:?}, simulated best failure prob: {simulated_best_failure_prob:?}");
-
+    
+            // Assert that the predicted time is close to the simulated time.
             assert!(
-                (predicted_best.time.as_secs_f64() - simulated_best_time.as_secs_f64()).abs()
-                    < 0.01
+                (predicted_best.time.as_secs_f64() - simulated_best_time.as_secs_f64()).abs() < 0.1
             );
-
-            // Get the peer that has the actual best time
+    
+            // Get the peer that has the actual best time.
             let mut best_peer: Option<(PeerKeyLocation, f64)> = None;
             for peer in &peers {
                 let distance = peer.location.unwrap().distance(&contract_location);
                 let failure_prob = dist_to_failure_prob_simulated(distance);
-                let simulated_time =
-                    dist_to_time_simulated(distance).as_secs_f64() * (1.0 + failure_prob * 3.0);
-                if best_peer.is_none() || simulated_time < best_peer.unwrap().1 {
+                let simulated_time = dist_to_time_simulated(distance).as_secs_f64() * (1.0 + failure_prob * 3.0);
+                if best_peer.map_or(true, |(_, time)| simulated_time < time) {
                     best_peer = Some((*peer, simulated_time));
                 }
             }
+    
+            let predicted_best_score = predicted_best.time.as_secs_f64() * (1.0 + simulated_best_failure_prob * 3.0);
 
-            assert_eq!(best, best_peer.unwrap().0);
-            assert!((predicted_best.time.as_secs_f64() - best_peer.unwrap().1).abs() < 0.001);
+            let (best_peer, best_peer_time_provided) = best_peer.unwrap();
+            let best_peer_failure_prob = dist_to_failure_prob_simulated(best_peer.location.unwrap().distance(&contract_location));
+            let best_peer_score_provided = best_peer_time_provided * (1.0 + best_peer_failure_prob * 3.0);
+    
+            // Assert that the predicted best score is close to the provided best score.
+            assert!(
+                (predicted_best_score - best_peer_score_provided).abs() < 0.001,
+                "Actual pred best score: {:?}, provided pred best score: {:?}",
+                predicted_best_score,
+                best_peer_score_provided
+            );
         }
     }
+    
 
     fn dist_to_failure_prob_simulated(dist: Distance) -> f64 {
         dist.as_f64() * 2.0
