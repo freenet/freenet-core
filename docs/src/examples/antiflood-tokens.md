@@ -4,7 +4,7 @@
 
 The Antiflood Token System (AFT) is a decentralized system aimed to provide a
 simple, but general purpose solution to flooding, denial-of-service attacks,
-and spam. 
+and spam.
 
 AFT allows users to generate tokens through a "token generator", which is
 created by completing a "hard" task, such as making a donation to Freenet.

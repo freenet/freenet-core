@@ -8,6 +8,10 @@ title = "Freenet Manual"
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
 
+[preprocessor.toc]
+command = "mdbook-toc"
+renderer = ["html"]
+
 [output.html]
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
-default-theme = "ayu"
+default-theme = "light"

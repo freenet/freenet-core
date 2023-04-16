@@ -25,7 +25,7 @@ jobs:
           key: cargo-cache-${{ hashFiles('Cargo.lock') }}
       - name: Install dependencies
         run: |
-          cargo install mdbook mdbook-mermaid
+          cargo install mdbook mdbook-mermaid mdbook-toc
       - name: Build MDBook
         run: |
           if [ -d "docs" ]; then

@@ -407,6 +407,12 @@ impl Location {
     }
 }
 
+impl From<Location> for f64 {
+    fn from(val: Location) -> Self {
+        val.0
+    }
+}
+
 /// Ensure at compile time locations can only be constructed from well formed contract keys
 /// (which have been hashed with a strong, cryptographically safe, hash function first).
 impl From<&ContractKey> for Location {
