@@ -7,8 +7,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use lazy_static::lazy_static;
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
     pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, pkcs8::LineEnding, RsaPrivateKey,
@@ -26,26 +25,24 @@ mod login;
 
 pub(crate) type AsyncActionResult = Result<(), (DynError, TryAsyncAction)>;
 
-lazy_static! {
-    static ref ALIAS_MAP: HashMap<String, String> = {
-        const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
-        const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-        let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
-            .unwrap()
-            .to_public_key()
-            .to_pkcs1_pem(LineEnding::LF)
-            .unwrap();
-        let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
-            .unwrap()
-            .to_public_key()
-            .to_pkcs1_pem(LineEnding::LF)
-            .unwrap();
-        let mut map = HashMap::new();
-        map.insert("ian.clarke@freenet.org".to_string(), pub_key0);
-        map.insert("other.stuff@freenet.org".to_string(), pub_key1);
-        map
-    };
-}
+static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
+    const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
+    const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
+    let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
+        .unwrap()
+        .to_public_key()
+        .to_pkcs1_pem(LineEnding::LF)
+        .unwrap();
+    let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
+        .unwrap()
+        .to_public_key()
+        .to_pkcs1_pem(LineEnding::LF)
+        .unwrap();
+    let mut map = HashMap::new();
+    map.insert("ian.clarke@freenet.org".to_string(), pub_key0);
+    map.insert("other.stuff@freenet.org".to_string(), pub_key1);
+    map
+});
 
 #[derive(Clone, Debug)]
 pub(crate) enum AsyncAction {

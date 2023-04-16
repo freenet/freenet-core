@@ -143,7 +143,6 @@ pub(crate) async fn node_comms(
 
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
-    use futures::StreamExt;
     use locutus_stdlib::client_api::ContractResponse;
 
     use crate::{
@@ -163,79 +162,76 @@ pub(crate) async fn node_comms(
     WEB_API_SENDER.set(api.sender_half()).unwrap();
 
     let mut waiting_updates = HashMap::new();
-    async move {
-        loop {
-            while let Ok(Some(req)) = rx.try_next() {
-                let AsyncAction::LoadMessages(identity) = req;
-                let mut client = api.sender_half();
-                match InboxModel::load(&mut client, &identity).await {
-                    Err(err) => {
-                        error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
-                    }
-                    Ok(key) => {
-                        waiting_updates.entry(key).or_insert(identity);
-                    }
+    loop {
+        while let Ok(Some(req)) = rx.try_next() {
+            let AsyncAction::LoadMessages(identity) = req;
+            let mut client = api.sender_half();
+            match InboxModel::load(&mut client, &identity).await {
+                Err(err) => {
+                    error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
                 }
-            }
-            while let Ok(Some(req)) = api.requests.try_next() {
-                api.api.send(req).await.unwrap();
-            }
-
-            match api.client_errors.try_recv() {
-                Err(TryRecvError::Empty) | Ok(Ok(())) => {}
-                Err(TryRecvError::Disconnected) => panic!(),
-                Ok(Err((err, _action))) => {
-                    eprintln!("{err}");
-                    todo!("better error handling");
+                Ok(key) => {
+                    waiting_updates.entry(key).or_insert(identity);
                 }
-            }
-
-            match api.host_responses.try_recv() {
-                Ok(r) => {
-                    let r = r.unwrap();
-                    match r {
-                        HostResponse::ContractResponse(ContractResponse::GetResponse {
-                            key,
-                            state,
-                            ..
-                        }) => {
-                            let state: StoredInbox =
-                                serde_json::from_slice(state.as_ref()).unwrap();
-                            let Some(identity) = waiting_updates.remove(&key) else { unreachable!() };
-                            let updated_model =
-                                InboxModel::from_state(identity.key.clone(), state, key.clone())
-                                    .unwrap();
-                            let loaded_models = inboxes.load();
-                            if let Some(pos) = loaded_models.iter().position(|e| {
-                                let x = e.borrow();
-                                x.key == key
-                            }) {
-                                crate::log::log(format!("loaded inbox {key}"));
-                                let mut current = loaded_models[pos].borrow_mut();
-                                *current = updated_model;
-                            } else {
-                                crate::log::log(format!("updated inbox {key}"));
-                                let mut cloned = (***loaded_models).to_vec();
-                                std::mem::drop(loaded_models);
-                                cloned.push(Rc::new(RefCell::new(updated_model)));
-                            }
-                        }
-                        _ => panic!(),
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => panic!(),
-            }
-            #[cfg(target_family = "wasm")]
-            {
-                web_sys::window()
-                    .unwrap()
-                    .set_timeout_with_str_and_timeout_and_unused_0("wait_msg", 10);
-            }
-            #[cfg(not(target_family = "wasm"))]
-            {
-                std::thread::sleep(Duration::from_millis(10));
             }
         }
-    }.await;
+        while let Ok(Some(req)) = api.requests.try_next() {
+            api.api.send(req).await.unwrap();
+        }
+
+        match api.client_errors.try_recv() {
+            Err(TryRecvError::Empty) | Ok(Ok(())) => {}
+            Err(TryRecvError::Disconnected) => panic!(),
+            Ok(Err((err, _action))) => {
+                eprintln!("{err}");
+                todo!("better error handling");
+            }
+        }
+
+        match api.host_responses.try_recv() {
+            Ok(r) => {
+                let r = r.unwrap();
+                match r {
+                    HostResponse::ContractResponse(ContractResponse::GetResponse {
+                        key,
+                        state,
+                        ..
+                    }) => {
+                        let state: StoredInbox = serde_json::from_slice(state.as_ref()).unwrap();
+                        let Some(identity) = waiting_updates.remove(&key) else { unreachable!() };
+                        let updated_model =
+                            InboxModel::from_state(identity.key.clone(), state, key.clone())
+                                .unwrap();
+                        let loaded_models = inboxes.load();
+                        if let Some(pos) = loaded_models.iter().position(|e| {
+                            let x = e.borrow();
+                            x.key == key
+                        }) {
+                            crate::log::log(format!("loaded inbox {key}"));
+                            let mut current = loaded_models[pos].borrow_mut();
+                            *current = updated_model;
+                        } else {
+                            crate::log::log(format!("updated inbox {key}"));
+                            let mut cloned = (***loaded_models).to_vec();
+                            std::mem::drop(loaded_models);
+                            cloned.push(Rc::new(RefCell::new(updated_model)));
+                        }
+                    }
+                    _ => panic!(),
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => panic!(),
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_str_and_timeout_and_unused_0("wait_msg", 10);
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
