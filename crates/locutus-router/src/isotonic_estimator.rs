@@ -14,7 +14,7 @@ const MIN_POINTS_FOR_REGRESSION: usize = 5;
 /// outcome of the peer's previous requests.
 
 #[derive(Debug, Clone, Serialize)]
-pub struct IsotonicEstimator {
+pub(crate) struct IsotonicEstimator {
     pub(crate) global_regression: IsotonicRegression,
     pub(crate) peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
 }
@@ -24,16 +24,13 @@ impl IsotonicEstimator {
     const ADJUSTMENT_PRIOR_SIZE: u64 = 10;
 
     /// Creates a new `PeerOutcomeEstimator` from a list of historical events.
-    pub fn new<I>(history: I) -> Self
+    pub fn new<I>(history: I, estimator_type: EstimatorType) -> Self
     where
-        I: IntoIterator<Item = PeerRoutingEvent>,
+        I: IntoIterator<Item = IsotonicEvent>,
     {
         let mut all_points = Vec::new();
 
-        // Seed with point at origin
-        all_points.push(Point::new(0.0, 0.0));
-
-        let mut peer_events: HashMap<PeerKeyLocation, Vec<PeerRoutingEvent>> = HashMap::new();
+        let mut peer_events: HashMap<PeerKeyLocation, Vec<IsotonicEvent>> = HashMap::new();
 
         for event in history {
             let point = Point::new(event.route_distance(), event.result);
@@ -42,7 +39,10 @@ impl IsotonicEstimator {
             peer_events.entry(event.peer).or_default().push(event);
         }
 
-        let global_regression = IsotonicRegression::new_ascending(&all_points);
+        let global_regression = match estimator_type {
+            EstimatorType::Positive => IsotonicRegression::new_ascending(&all_points),
+            EstimatorType::Negative => IsotonicRegression::new_descending(&all_points),
+        };
 
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
@@ -77,7 +77,7 @@ impl IsotonicEstimator {
     }
 
     /// Adds a new event to the estimator.
-    pub fn add_event(&mut self, event: PeerRoutingEvent) {
+    pub fn add_event(&mut self, event: IsotonicEvent) {
         let route_distance = event.route_distance();
 
         let point = Point::new(route_distance, event.result);
@@ -132,15 +132,22 @@ impl IsotonicEstimator {
     }
 }
 
+pub(crate) enum EstimatorType {
+    /// Where the estimated value is expected to increase as distance increases
+    Positive,
+    /// Where the estimated value is expected to decrease as distance increases
+    Negative,
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub enum EstimationError {
+pub(crate) enum EstimationError {
     InsufficientData, // Error indicating that there is not enough data for estimation
 }
 
 /// A routing event is a single request to a peer for a contract, and some value indicating
 /// the result of the request, such as the time it took to retrieve the contract.
 #[derive(Debug, Clone)]
-pub struct PeerRoutingEvent {
+pub(crate) struct IsotonicEvent {
     // TODO: Make generic on route type
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
@@ -150,7 +157,7 @@ pub struct PeerRoutingEvent {
     pub result: f64,
 }
 
-impl PeerRoutingEvent {
+impl IsotonicEvent {
     fn route_distance(&self) -> f64 {
         self.contract_location
             .distance(&self.peer.location.unwrap())
@@ -207,7 +214,7 @@ mod tests {
     // If the error is greater than or equal to 0.01, the test fails.
 
     #[test]
-    fn test_peer_time_estimator() {
+    fn test_positive_peer_time_estimator() {
         // Generate a list of random events
         let mut events = Vec::new();
         for _ in 0..100 {
@@ -216,14 +223,15 @@ mod tests {
                 println!("Peer location is none for {peer:?}");
             }
             let contract_location = Location::random();
-            events.push(simulate_request(peer, contract_location));
+            events.push(simulate_positive_request(peer, contract_location));
         }
 
         // Split the events into two sets
         let (training_events, testing_events) = events.split_at(events.len() / 2);
 
         // Create a new estimator from the training set
-        let estimator = IsotonicEstimator::new(training_events.iter().cloned());
+        let estimator =
+            IsotonicEstimator::new(training_events.iter().cloned(), EstimatorType::Positive);
 
         // Test the estimator on the testing set, recording the errors
         let mut errors = Vec::new();
@@ -242,11 +250,65 @@ mod tests {
         assert!(average_error < 0.01);
     }
 
-    fn simulate_request(peer: PeerKeyLocation, contract_location: Location) -> PeerRoutingEvent {
+    #[test]
+    fn test_negative_peer_time_estimator() {
+        // Generate a list of random events
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            let peer = PeerKeyLocation::random();
+            if peer.location.is_none() {
+                println!("Peer location is none for {peer:?}");
+            }
+            let contract_location = Location::random();
+            events.push(simulate_negative_request(peer, contract_location));
+        }
+
+        // Split the events into two sets
+        let (training_events, testing_events) = events.split_at(events.len() / 2);
+
+        // Create a new estimator from the training set
+        let estimator =
+            IsotonicEstimator::new(training_events.iter().cloned(), EstimatorType::Negative);
+
+        // Test the estimator on the testing set, recording the errors
+        let mut errors = Vec::new();
+        for event in testing_events {
+            let estimated_time = estimator
+                .estimate_retrieval_time(&event.peer, event.contract_location)
+                .unwrap();
+            let actual_time = event.result;
+            let error = (estimated_time - actual_time).abs();
+            errors.push(error);
+        }
+
+        // Check that the errors are small
+        let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
+        println!("Average error: {}", average_error);
+        assert!(average_error < 0.01);
+    }
+
+    fn simulate_positive_request(
+        peer: PeerKeyLocation,
+        contract_location: Location,
+    ) -> IsotonicEvent {
         let distance: f64 = peer.location.unwrap().distance(&contract_location).into();
 
         let result = distance.powf(0.5) + peer.peer.to_bytes()[0] as f64;
-        PeerRoutingEvent {
+        IsotonicEvent {
+            peer,
+            contract_location,
+            result,
+        }
+    }
+
+    fn simulate_negative_request(
+        peer: PeerKeyLocation,
+        contract_location: Location,
+    ) -> IsotonicEvent {
+        let distance: f64 = peer.location.unwrap().distance(&contract_location).into();
+
+        let result = (100.0 - distance).powf(0.5) + peer.peer.to_bytes()[0] as f64;
+        IsotonicEvent {
             peer,
             contract_location,
             result,

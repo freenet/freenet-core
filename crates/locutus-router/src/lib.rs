@@ -1,22 +1,25 @@
 mod isotonic_estimator;
+mod util;
 
-use isotonic_estimator::{IsotonicEstimator, PeerRoutingEvent};
+use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use locutus_core::{ring::PeerKeyLocation, Location};
 use serde::Serialize;
 use std::time::Duration;
+use util::{Mean, TransferSpeed};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Router {
-    pub time_estimator: IsotonicEstimator,
-    pub transfer_rate_estimator: IsotonicEstimator,
-    pub success_estimator: IsotonicEstimator,
+    response_start_time_estimator: IsotonicEstimator,
+    transfer_rate_estimator: IsotonicEstimator,
+    failure_estimator: IsotonicEstimator,
+    mean_transfer_size: Mean,
 }
 
 impl Router {
     pub fn new(history: &[RouteEvent]) -> Self {
-        let success_outcomes: Vec<PeerRoutingEvent> = history
+        let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
-            .map(|re| PeerRoutingEvent {
+            .map(|re| IsotonicEvent {
                 peer: re.peer,
                 contract_location: re.contract_location,
                 result: match re.outcome {
@@ -30,7 +33,7 @@ impl Router {
             })
             .collect();
 
-        let success_durations: Vec<PeerRoutingEvent> = history
+        let success_durations: Vec<IsotonicEvent> = history
             .iter()
             .filter_map(|re| {
                 if let RouteOutcome::Success {
@@ -39,7 +42,7 @@ impl Router {
                     payload_transfer_time: _,
                 } = re.outcome
                 {
-                    Some(PeerRoutingEvent {
+                    Some(IsotonicEvent {
                         peer: re.peer,
                         contract_location: re.contract_location,
                         result: time_to_response_start.as_secs_f64(),
@@ -50,9 +53,56 @@ impl Router {
             })
             .collect();
 
+        let transfer_rates: Vec<IsotonicEvent> = history
+            .iter()
+            .filter_map(|re| {
+                if let RouteOutcome::Success {
+                    time_to_response_start: _,
+                    payload_size,
+                    payload_transfer_time,
+                } = re.outcome
+                {
+                    Some(IsotonicEvent {
+                        peer: re.peer,
+                        contract_location: re.contract_location,
+                        result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut mean_transfer_size = Mean::new();
+
+        // Add some initial data so this produces sensible results with low or no historical data
+        mean_transfer_size.add_with_count(1000.0, 10);
+
+        for event in history {
+            if let RouteOutcome::Success {
+                time_to_response_start: _,
+                payload_size,
+                payload_transfer_time: _,
+            } = event.outcome
+            {
+                mean_transfer_size.add(payload_size as f64);
+            }
+        }
+
         Router {
-            time_estimator: IsotonicEstimator::new(success_durations),
-            success_estimator: IsotonicEstimator::new(success_outcomes),
+            // Positive because we expect time to increase as distance increases
+            response_start_time_estimator: IsotonicEstimator::new(
+                success_durations,
+                EstimatorType::Positive,
+            ),
+            // Positive because we expect failure probability to increase as distance increase
+            failure_estimator: IsotonicEstimator::new(failure_outcomes, EstimatorType::Positive),
+            // Negative because we expect transfer rate to decrease as distance increases
+            transfer_rate_estimator: IsotonicEstimator::new(
+                transfer_rates,
+                EstimatorType::Negative,
+            ),
+            mean_transfer_size,
         }
     }
 
@@ -60,22 +110,30 @@ impl Router {
         match event.outcome {
             RouteOutcome::Success {
                 time_to_response_start,
-                payload_size: _,
-                payload_transfer_time: _,
+                payload_size,
+                payload_transfer_time,
             } => {
-                self.time_estimator.add_event(PeerRoutingEvent {
+                self.response_start_time_estimator.add_event(IsotonicEvent {
                     peer: event.peer,
                     contract_location: event.contract_location,
                     result: time_to_response_start.as_secs_f64(),
                 });
-                self.success_estimator.add_event(PeerRoutingEvent {
+                self.failure_estimator.add_event(IsotonicEvent {
                     peer: event.peer,
                     contract_location: event.contract_location,
                     result: 0.0,
                 });
+                let transfer_rate_event = IsotonicEvent {
+                    peer: event.peer,
+                    contract_location: event.contract_location,
+                    result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                };
+                self.mean_transfer_size.add(payload_size as f64);
+
+                self.transfer_rate_estimator.add_event(transfer_rate_event);
             }
             RouteOutcome::Failure => {
-                self.success_estimator.add_event(PeerRoutingEvent {
+                self.failure_estimator.add_event(IsotonicEvent {
                     peer: event.peer,
                     contract_location: event.contract_location,
                     result: 1.0,
@@ -84,95 +142,102 @@ impl Router {
         }
     }
 
-    pub fn select_peer(
-        &self,
-        peers: &[PeerKeyLocation],
-        contract_location: Location,
-    ) -> Option<PeerKeyLocation> {
+    pub fn select_peer<I>(&self, peers: I, contract_location: Location) -> Option<PeerKeyLocation>
+    where
+        I: IntoIterator<Item = PeerKeyLocation>,
+    {
         if !self.has_sufficient_historical_data() {
-            // Find the peer with the minimum distance to the contract location
-            return peers
-                .iter()
+            // Find the peer with the minimum distance to the contract location,
+            // ignoring peers with no location
+            peers
+                .into_iter()
                 .filter_map(|peer| {
                     peer.location
                         .map(|loc| (peer, contract_location.distance(&loc)))
                 })
                 .min_by_key(|&(_, distance)| distance)
-                .map(|(peer, _)| *peer);
+                .map(|(peer, _)| peer)
+        } else {
+            // Find the peer with the minimum predicted routing outcome time
+            peers
+                .into_iter()
+                .map(|peer: PeerKeyLocation| {
+                    let t = self
+                        .predict_routing_outcome(peer, contract_location)
+                        .expect(
+                            "Should always be Ok when has_sufficient_historical_data() is true",
+                        );
+                    (peer, t.time_to_response_start)
+                })
+                // Required because f64 doesn't implement Ord
+                .min_by(|&(_, time1), &(_, time2)| {
+                    time1
+                        .partial_cmp(&time2)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(peer, _)| peer)
         }
-
-        // Find the peer with the minimum predicted routing outcome time
-        // TODO: Should also consider success probability
-        let best_peer = peers
-            .iter()
-            .map(|peer: &PeerKeyLocation| {
-                let t = self.predict_routing_outcome(*peer, contract_location);
-                (peer, routing_prediction_to_expected_time(t))
-            })
-            .min_by_key(|&(_, time)| time)
-            .map(|(peer, _)| *peer);
-
-        best_peer
     }
 
     pub fn predict_routing_outcome(
         &self,
         peer: PeerKeyLocation,
         contract_location: Location,
-    ) -> RoutingPrediction {
-        let time_estimate = self
-            .time_estimator
-            .estimate_retrieval_time(&peer, contract_location);
-        let success_estimate = self
-            .success_estimator
-            .estimate_retrieval_time(&peer, contract_location);
-
-        RoutingPrediction {
-            time: Duration::from_secs_f64(time_estimate.unwrap()),
-            failure_probability: success_estimate.unwrap(),
+    ) -> Result<RoutingPrediction, RoutingError> {
+        if !self.has_sufficient_historical_data() {
+            return Err(RoutingError::InsufficientDataError);
         }
+
+        let time_to_response_start_estimate = self
+            .response_start_time_estimator
+            .estimate_retrieval_time(&peer, contract_location)
+            .unwrap();
+        let failure_estimate = self
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract_location)
+            .unwrap();
+        let transfer_rate_estimate = self
+            .transfer_rate_estimator
+            .estimate_retrieval_time(&peer, contract_location)
+            .unwrap();
+
+        /*
+         * This is a fairly naive approach, assuming that the cost of a failure is a multiple 
+         * of the cost of success.
+         */
+        let failure_cost_multiplier = 3.0;
+
+        let expected_total_time = time_to_response_start_estimate
+            + (self.mean_transfer_size.get() / transfer_rate_estimate)
+            + (time_to_response_start_estimate * failure_estimate * failure_cost_multiplier);
+
+        Ok(RoutingPrediction {
+            failure_probability: failure_estimate,
+            xfer_speed: TransferSpeed {
+                bytes_per_second: transfer_rate_estimate,
+            },
+            time_to_response_start: time_to_response_start_estimate,
+            expected_total_time,
+        })
     }
 
     fn has_sufficient_historical_data(&self) -> bool {
         let minimum_historical_data_for_global_prediction = 200;
-        self.time_estimator.len() >= minimum_historical_data_for_global_prediction
+        self.response_start_time_estimator.len() >= minimum_historical_data_for_global_prediction
     }
+}
+
+#[derive(Debug)]
+pub enum RoutingError {
+    InsufficientDataError,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct RoutingPrediction {
-    pub time: Duration,
     pub failure_probability: f64,
     pub xfer_speed: TransferSpeed,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct TransferSpeed {
-    bytes_per_second: f64,
-}
-
-impl TransferSpeed {
-    pub fn new(bytes: usize, duration: Duration) -> Self {
-        TransferSpeed {
-            bytes_per_second: bytes as f64 / duration.as_secs_f64(),
-        }
-    }
-}
-
-impl RoutingPrediction {
-    fn to_expected_time(&self) -> Duration {
-        /*
-         * This is a fairly naive approach, assuming that the cost of a failure is a multiple of the cost of success
-         * and that 1000 bytes are transferred.
-         */
-        let failure_cost_multiplier = 3.0;
-        let expected_bytes_transferred = 1000.0;
-        let expected_time = self.time.as_secs_f64()
-            + (expected_bytes_transferred / self.xfer_speed.bytes_per_second)
-            + (self.time.as_secs_f64() * self.failure_probability * failure_cost_multiplier);
-
-        Duration::from_secs_f64(expected_time)
-    }
+    pub time_to_response_start: f64,
+    pub expected_total_time: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -195,7 +260,7 @@ pub enum RouteOutcome {
 #[cfg(test)]
 mod tests {
 
-    use locutus_core::ring::Distance;
+    use rand::Rng;
 
     use super::*;
 
@@ -213,10 +278,10 @@ mod tests {
 
         for _ in 0..10 {
             let contract_location = Location::random();
-            let best = router.select_peer(&peers, contract_location).unwrap();
+            let best = router.select_peer(peers.clone(), contract_location).unwrap();
             let best_distance = best.location.unwrap().distance(&contract_location);
-            for peer in &peers {
-                if peer != &best {
+            for peer in peers.clone() {
+                if peer != best {
                     let distance = peer.location.unwrap().distance(&contract_location);
                     assert!(distance >= best_distance);
                 }
@@ -228,95 +293,75 @@ mod tests {
     fn test_request_time() {
         // Define constants for the number of peers, number of events, and number of test iterations.
         const NUM_PEERS: usize = 25;
-        const NUM_EVENTS: usize = 1000;
-        const NUM_TEST_ITERATIONS: usize = 100;
+        const NUM_EVENTS: usize = 10000;
 
         // Create `NUM_PEERS` random peers and put them in a vector.
         let peers: Vec<PeerKeyLocation> =
             (0..NUM_PEERS).map(|_| PeerKeyLocation::random()).collect();
 
-        // Create a router with no historical data.
-        let mut router = Router::new(&[]);
-
-        // Add `NUM_EVENTS` events to the router.
+        // Create NUM_EVENTS random events
+        let mut events = vec![];
+        let mut rng = rand::thread_rng();
         for _ in 0..NUM_EVENTS {
+            let peer = peers[rng.gen_range(0..NUM_PEERS)];
             let contract_location = Location::random();
-            let closest = router.select_peer(&peers, contract_location).unwrap();
-            let closest_distance = closest.location.unwrap().distance(&contract_location);
-
-            // Force the time to be proportional to the distance.
-            let time = dist_to_time_simulated(closest_distance);
-            let failure_prob = dist_to_failure_prob_simulated(closest_distance);
-
-            let outcome = if rand::random::<f64>() < failure_prob {
-                RouteOutcome::Failure
-            } else {
-                RouteOutcome::Success {
-                    time_to_response_start: time,
-                    payload_size: 100,
-                    payload_transfer_time: Duration::from_secs_f64(1.0),
-                }
-            };
-
-            router.add_event(RouteEvent {
-                peer: closest,
+            let simulated_prediction = simulate_prediction(&mut rng, peer, contract_location);
+            let event = RouteEvent {
+                peer,
                 contract_location,
-                outcome,
-            });
+                outcome: if rng.gen_range(0.0 .. 1.0) > simulated_prediction.failure_probability { RouteOutcome::Success {
+                    time_to_response_start: Duration::from_secs_f64(simulated_prediction.time_to_response_start),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_secs_f64(
+                        1000.0 / simulated_prediction.xfer_speed.bytes_per_second,
+                    ) } } else { RouteOutcome::Failure } ,
+            };
+            events.push(event);
         }
 
-        // Test the router's prediction accuracy for `NUM_TEST_ITERATIONS` iterations.
-        for _ in 0..NUM_TEST_ITERATIONS {
-            let contract_location = Location::random();
-            let best = router.select_peer(&peers, contract_location).unwrap();
-            let predicted_best = router.predict_routing_outcome(best, contract_location);
-            let simulated_best_time =
-                dist_to_time_simulated(best.location.unwrap().distance(&contract_location));
-            let simulated_best_failure_prob =
-                dist_to_failure_prob_simulated(best.location.unwrap().distance(&contract_location));
+        // Split events into two vectors, one for training and one for testing.
+        let (training_events, testing_events) = events.split_at(NUM_EVENTS - 100);
 
-            // Assert that the predicted time is close to the simulated time.
-            assert!(
-                (predicted_best.time.as_secs_f64() - simulated_best_time.as_secs_f64()).abs() < 0.1
-            );
+        // Train the router with the training events.
+        let router = Router::new(training_events);
 
-            // Get the peer that has the actual best time.
-            let mut best_peer: Option<(PeerKeyLocation, f64)> = None;
-            for peer in &peers {
-                let distance = peer.location.unwrap().distance(&contract_location);
-                let failure_prob = dist_to_failure_prob_simulated(distance);
-                let simulated_time =
-                    dist_to_time_simulated(distance).as_secs_f64() * (1.0 + failure_prob * 3.0);
-                if best_peer.map_or(true, |(_, time)| simulated_time < time) {
-                    best_peer = Some((*peer, simulated_time));
-                }
-            }
+        // Test the router with the testing events.
+        for event in testing_events {
+            let truth = simulate_prediction(&mut rng, event.peer, event.contract_location);
 
-            let predicted_best_score =
-                predicted_best.time.as_secs_f64() * (1.0 + simulated_best_failure_prob * 3.0);
+            let prediction = router
+                .predict_routing_outcome(event.peer, event.contract_location)
+                .unwrap();
+            
+            // Verify that the prediction is within 0.01 of the truth
 
-            let (best_peer, best_peer_time_provided) = best_peer.unwrap();
-            let best_peer_failure_prob = dist_to_failure_prob_simulated(
-                best_peer.location.unwrap().distance(&contract_location),
-            );
-            let best_peer_score_provided =
-                best_peer_time_provided * (1.0 + best_peer_failure_prob * 3.0);
+            let response_start_time_error = (prediction.time_to_response_start - truth.time_to_response_start).abs();
+            assert!(response_start_time_error < 0.01, "response_start_time: Prediction: {}, Truth: {}, Error: {}", prediction.time_to_response_start, truth.time_to_response_start, response_start_time_error);
 
-            // Assert that the predicted best score is close to the provided best score.
-            assert!(
-                (predicted_best_score - best_peer_score_provided).abs() < 0.001,
-                "Actual pred best score: {:?}, provided pred best score: {:?}",
-                predicted_best_score,
-                best_peer_score_provided
-            );
+            let failure_probability_error = (prediction.failure_probability - truth.failure_probability).abs();
+            assert!(failure_probability_error < 0.1, "failure_probability: Prediction: {}, Truth: {}, Error: {}", prediction.failure_probability, truth.failure_probability, failure_probability_error);
+
+            let transfer_speed_error = (prediction.xfer_speed.bytes_per_second - truth.xfer_speed.bytes_per_second).abs();
+            assert!(transfer_speed_error < 0.01, "transfer_speed: Prediction: {}, Truth: {}, Error: {}", prediction.xfer_speed.bytes_per_second, truth.xfer_speed.bytes_per_second, transfer_speed_error);
         }
+
     }
 
-    fn dist_to_failure_prob_simulated(dist: Distance) -> f64 {
-        dist.as_f64() * 2.0
-    }
+    fn simulate_prediction(random : &mut rand::rngs::ThreadRng, peer : PeerKeyLocation, contract_location : Location) -> RoutingPrediction {
+        let distance = peer.location.unwrap().distance(&contract_location);
+        let time_to_response_start = 2.0 * distance.as_f64();
+        let failure_prob = distance.as_f64();
+        let transfer_speed = 100.0 - (100.0 * distance.as_f64());
+        let payload_size = random.gen_range(100 .. 1000);
+        let transfer_time = transfer_speed * (payload_size as f64);
+        RoutingPrediction {
+            failure_probability: failure_prob,
+            xfer_speed: TransferSpeed {
+                bytes_per_second: transfer_speed,
+            },
+            time_to_response_start,
+            expected_total_time: time_to_response_start + transfer_time,
+        }
 
-    fn dist_to_time_simulated(dist: Distance) -> Duration {
-        Duration::from_secs_f64(dist.as_f64() + 2.8)
     }
 }
