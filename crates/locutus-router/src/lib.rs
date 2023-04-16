@@ -202,7 +202,7 @@ impl Router {
             .unwrap();
 
         /*
-         * This is a fairly naive approach, assuming that the cost of a failure is a multiple 
+         * This is a fairly naive approach, assuming that the cost of a failure is a multiple
          * of the cost of success.
          */
         let failure_cost_multiplier = 3.0;
@@ -278,7 +278,9 @@ mod tests {
 
         for _ in 0..10 {
             let contract_location = Location::random();
-            let best = router.select_peer(peers.clone(), contract_location).unwrap();
+            let best = router
+                .select_peer(peers.clone(), contract_location)
+                .unwrap();
             let best_distance = best.location.unwrap().distance(&contract_location);
             for peer in peers.clone() {
                 if peer != best {
@@ -309,12 +311,19 @@ mod tests {
             let event = RouteEvent {
                 peer,
                 contract_location,
-                outcome: if rng.gen_range(0.0 .. 1.0) > simulated_prediction.failure_probability { RouteOutcome::Success {
-                    time_to_response_start: Duration::from_secs_f64(simulated_prediction.time_to_response_start),
-                    payload_size: 1000,
-                    payload_transfer_time: Duration::from_secs_f64(
-                        1000.0 / simulated_prediction.xfer_speed.bytes_per_second,
-                    ) } } else { RouteOutcome::Failure } ,
+                outcome: if rng.gen_range(0.0..1.0) > simulated_prediction.failure_probability {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_secs_f64(
+                            simulated_prediction.time_to_response_start,
+                        ),
+                        payload_size: 1000,
+                        payload_transfer_time: Duration::from_secs_f64(
+                            1000.0 / simulated_prediction.xfer_speed.bytes_per_second,
+                        ),
+                    }
+                } else {
+                    RouteOutcome::Failure
+                },
             };
             events.push(event);
         }
@@ -332,27 +341,51 @@ mod tests {
             let prediction = router
                 .predict_routing_outcome(event.peer, event.contract_location)
                 .unwrap();
-            
+
             // Verify that the prediction is within 0.01 of the truth
 
-            let response_start_time_error = (prediction.time_to_response_start - truth.time_to_response_start).abs();
-            assert!(response_start_time_error < 0.01, "response_start_time: Prediction: {}, Truth: {}, Error: {}", prediction.time_to_response_start, truth.time_to_response_start, response_start_time_error);
+            let response_start_time_error =
+                (prediction.time_to_response_start - truth.time_to_response_start).abs();
+            assert!(
+                response_start_time_error < 0.01,
+                "response_start_time: Prediction: {}, Truth: {}, Error: {}",
+                prediction.time_to_response_start,
+                truth.time_to_response_start,
+                response_start_time_error
+            );
 
-            let failure_probability_error = (prediction.failure_probability - truth.failure_probability).abs();
-            assert!(failure_probability_error < 0.1, "failure_probability: Prediction: {}, Truth: {}, Error: {}", prediction.failure_probability, truth.failure_probability, failure_probability_error);
+            let failure_probability_error =
+                (prediction.failure_probability - truth.failure_probability).abs();
+            assert!(
+                failure_probability_error < 0.1,
+                "failure_probability: Prediction: {}, Truth: {}, Error: {}",
+                prediction.failure_probability,
+                truth.failure_probability,
+                failure_probability_error
+            );
 
-            let transfer_speed_error = (prediction.xfer_speed.bytes_per_second - truth.xfer_speed.bytes_per_second).abs();
-            assert!(transfer_speed_error < 0.01, "transfer_speed: Prediction: {}, Truth: {}, Error: {}", prediction.xfer_speed.bytes_per_second, truth.xfer_speed.bytes_per_second, transfer_speed_error);
+            let transfer_speed_error =
+                (prediction.xfer_speed.bytes_per_second - truth.xfer_speed.bytes_per_second).abs();
+            assert!(
+                transfer_speed_error < 0.01,
+                "transfer_speed: Prediction: {}, Truth: {}, Error: {}",
+                prediction.xfer_speed.bytes_per_second,
+                truth.xfer_speed.bytes_per_second,
+                transfer_speed_error
+            );
         }
-
     }
 
-    fn simulate_prediction(random : &mut rand::rngs::ThreadRng, peer : PeerKeyLocation, contract_location : Location) -> RoutingPrediction {
+    fn simulate_prediction(
+        random: &mut rand::rngs::ThreadRng,
+        peer: PeerKeyLocation,
+        contract_location: Location,
+    ) -> RoutingPrediction {
         let distance = peer.location.unwrap().distance(&contract_location);
         let time_to_response_start = 2.0 * distance.as_f64();
         let failure_prob = distance.as_f64();
         let transfer_speed = 100.0 - (100.0 * distance.as_f64());
-        let payload_size = random.gen_range(100 .. 1000);
+        let payload_size = random.gen_range(100..1000);
         let transfer_time = transfer_speed * (payload_size as f64);
         RoutingPrediction {
             failure_probability: failure_prob,
@@ -362,6 +395,5 @@ mod tests {
             time_to_response_start,
             expected_total_time: time_to_response_start + transfer_time,
         }
-
     }
 }
