@@ -1,7 +1,7 @@
 # Introduction
 
 Freenet is a distributed, decentralized alternative to the centralized World
-Wide Web, designed to unleash a new era of innovation, competition, while
+Wide Web, designed to unleash a new era of innovation and competition, while
 protecting freedom of speech and privacy. 
 
 At the core of Freenet is a small piece of software known as the Freenet kernel,
