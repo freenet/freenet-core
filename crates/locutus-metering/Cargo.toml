@@ -1,13 +1,14 @@
 [package]
-name = "locutus-router"
+name = "locutus-metering"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.58.0"
 publish = true
-description = "Locutus P2P network main node implementation"
+description = "Locutus P2P network main node"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/freenet/locutus"
 
+# TODO: copied from locutus-router, should remove unused deps
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
@@ -25,9 +26,7 @@ warp = { version = "0.3", default-features = false, features = ["multipart", "tl
 rmp = { workspace = true }
 rmpv = { workspace = true }
 rmp-serde = { workspace = true }
-pav_regression = "0.4.0"
 itertools = "0.10.5"
-rand = "0.8.5"
 
 # internal:
 locutus-core = { path = "../locutus-core", version = "0.0.3" }
