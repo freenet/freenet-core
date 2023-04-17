@@ -47,7 +47,7 @@ Contracts in Freenet are [WebAssembly](https://webassembly.org) components that
 manage and regulate public state. They can be likened to inodes in a filesystem,
 tables in a database, or memory locations in a globally shared memory. Contracts
 define the circumstances under which state can be modified and whether a given
-state is allowed under the contract.
+state is allowed.
 
 Contracts and their associated state reside on the Freenet network on peers
 determined by the contract's location, which is derived from its WebAssembly
