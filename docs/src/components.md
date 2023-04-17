@@ -13,8 +13,8 @@ The kernel is the core of Freenet, it's the software that runs on the user's
 computer. It's responsible for:
 
 * Providing a user-friendly interface to access Freenet via a web browser
-* Host the user's delegates and the private data they store
-* Host contracts and their associated data on behalf of the network
+* Host the user's [delegates](#delegates) and the private data they store
+* Host [contracts](#contracts) and their associated data on behalf of the network
 * Manage communication between contracts, delegates, and UI componets
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
