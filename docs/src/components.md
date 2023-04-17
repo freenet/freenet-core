@@ -18,7 +18,7 @@ computer. It's responsible for:
 * Manage communication between contracts, delegates, and UI componets
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
-MB), efficient, and run on a wide range of devices like smartphones, desktop
+MB), efficient, and able to run on a wide range of devices like smartphones, desktop
 computers, and embedded devices.
 
 ## User Interface
