@@ -2599,6 +2599,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "futures",
+ "js-sys",
  "locutus-macros",
  "once_cell",
  "rand 0.8.5",

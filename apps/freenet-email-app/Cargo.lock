@@ -3418,6 +3418,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "futures",
+ "js-sys",
  "locutus-macros",
  "once_cell",
  "rmp-serde",

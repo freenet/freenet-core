@@ -1,4 +1,7 @@
-use wasm_bindgen::{prelude::Closure, JsCast};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{ErrorEvent, MessageEvent};
 
 use super::{client_events::ClientRequest, Error, HostResult};
@@ -20,31 +23,41 @@ impl WebApi {
     where
         ErrFn: FnMut(Error) + Clone + 'static,
     {
-        let mut eh = error_handler.clone();
+        let mut eh = Rc::new(RefCell::new(error_handler.clone()));
+        let result_handler = Rc::new(RefCell::new(result_handler));
         let onmessage_callback = Closure::<dyn FnMut(_)>::new(move |e: MessageEvent| {
-            let v: serde_json::Value = serde_wasm_bindgen::from_value(e.data()).unwrap();
-            eh(Error::ConnectionError(serde_json::json!({
-                "got data": format!("{:?}", v)
-            })));
-            let bytes: Vec<u8> = match serde_wasm_bindgen::from_value(e.data()) {
-                Ok(val) => val,
-                Err(err) => {
-                    eh(Error::ConnectionError(serde_json::json!({
-                        "error": format!("{err}"), "source": "host response raw bytes deser"
-                    })));
-                    return;
-                }
-            };
-            let response: HostResult = match rmp_serde::from_slice(&bytes) {
-                Ok(val) => val,
-                Err(err) => {
-                    eh(Error::ConnectionError(serde_json::json!({
-                        "error": format!("{err}"), "source": "host response deser"
-                    })));
-                    return;
-                }
-            };
-            result_handler(response);
+            // Extract the Blob from the MessageEvent
+            let value: JsValue = e.data();
+            let blob: web_sys::Blob = value.into();
+
+            // Create a FileReader to read the Blob
+            let file_reader = web_sys::FileReader::new().unwrap();
+
+            // Clone FileReader and function references for use in the onloadend_callback
+            let fr_clone = file_reader.clone();
+            let eh_clone = eh.clone();
+            let result_handler_clone = result_handler.clone();
+
+            let onloadend_callback = Closure::<dyn FnMut()>::new(move || {
+                let array_buffer = fr_clone.result().unwrap().dyn_into::<js_sys::ArrayBuffer>().unwrap();
+                let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
+
+                let response: HostResult = match rmp_serde::from_slice(&bytes) {
+                    Ok(val) => val,
+                    Err(err) => {
+                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
+                            "error": format!("{err}"), "source": "host response deser"
+                        })));
+                        return;
+                    }
+                };
+                result_handler_clone.borrow_mut()(response);
+            });
+
+            // Set the FileReader handlers
+            file_reader.set_onloadend(Some(onloadend_callback.as_ref().unchecked_ref()));
+            file_reader.read_as_array_buffer(&blob).unwrap();
+            onloadend_callback.forget();
         });
         conn.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
         onmessage_callback.forget();

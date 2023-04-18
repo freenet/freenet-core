@@ -54,6 +54,10 @@ features = [
 ]
 optional = true
 
+[target.'cfg(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"))'.dependencies.js-sys]
+version = "0.3"
+optional = true
+
 [target.'cfg(target_family = "unix")'.dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 bincode = "1"
@@ -64,7 +68,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 [features]
 default = []
 archive = ["xz2", "tar"]
-net = ["dep:tokio", "dep:tokio-tungstenite", "dep:wasm-bindgen", "dep:web-sys", "dep:serde-wasm-bindgen"]
+net = ["dep:tokio", "dep:tokio-tungstenite", "dep:wasm-bindgen", "dep:web-sys", "dep:js-sys", "dep:serde-wasm-bindgen"]
 testing = ["arbitrary"]
 trace = []
 time = []
