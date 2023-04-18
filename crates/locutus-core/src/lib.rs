@@ -5,6 +5,7 @@ mod executor;
 mod message;
 mod node;
 mod operations;
+mod metering;
 pub mod ring;
 pub mod util;
 
