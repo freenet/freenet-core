@@ -30,7 +30,7 @@ rmpv = "1"
 rmp-serde = { version = "1" }
 semver = { workspace = true }
 serde_json = { workspace = true }
-stretto = { version = "0.7", features = ["async", "sync"], default-features = false }
+stretto = { version = "0.8", features = ["async", "sync"], default-features = false }
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 thiserror = "1"
