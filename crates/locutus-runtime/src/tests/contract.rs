@@ -1,7 +1,7 @@
 use locutus_stdlib::prelude::*;
 
 use crate::contract::*;
-use crate::{secrets_store::SecretsStore, tests::setup_test_contract, ComponentStore, Runtime};
+use crate::{secrets_store::SecretsStore, tests::setup_test_contract, DelegateStore, Runtime};
 
 const TEST_CONTRACT_1: &str = "test_contract_1";
 
@@ -10,7 +10,7 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(
         store,
-        ComponentStore::default(),
+        DelegateStore::default(),
         SecretsStore::default(),
         false,
     )
@@ -41,7 +41,7 @@ fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(
         store,
-        ComponentStore::default(),
+        DelegateStore::default(),
         SecretsStore::default(),
         false,
     )
@@ -70,7 +70,7 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(
         store,
-        ComponentStore::default(),
+        DelegateStore::default(),
         SecretsStore::default(),
         false,
     )
@@ -95,7 +95,7 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(
         store,
-        ComponentStore::default(),
+        DelegateStore::default(),
         SecretsStore::default(),
         false,
     )
@@ -116,7 +116,7 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(
         store,
-        ComponentStore::default(),
+        DelegateStore::default(),
         SecretsStore::default(),
         false,
     )

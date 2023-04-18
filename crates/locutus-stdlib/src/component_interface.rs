@@ -19,53 +19,53 @@ type Secret = Vec<u8>;
 /// Executable component
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde_as]
-pub struct Component<'a> {
+pub struct Delegate<'a> {
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     code: Cow<'a, [u8]>,
-    key: ComponentKey,
+    key: DelegateKey,
 }
 
-impl PartialEq for Component<'_> {
+impl PartialEq for Delegate<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
 
-impl Eq for Component<'_> {}
+impl Eq for Delegate<'_> {}
 
-impl Component<'_> {
-    pub fn key(&self) -> &ComponentKey {
+impl Delegate<'_> {
+    pub fn key(&self) -> &DelegateKey {
         &self.key
     }
 
-    pub fn into_owned(self) -> Component<'static> {
-        Component {
+    pub fn into_owned(self) -> Delegate<'static> {
+        Delegate {
             key: self.key,
             code: Cow::from(self.code.into_owned()),
         }
     }
 }
 
-impl AsRef<[u8]> for Component<'_> {
+impl AsRef<[u8]> for Delegate<'_> {
     fn as_ref(&self) -> &[u8] {
         self.code.borrow()
     }
 }
 
-impl TryFrom<&Path> for Component<'static> {
+impl TryFrom<&Path> for Delegate<'static> {
     type Error = std::io::Error;
     fn try_from(path: &Path) -> Result<Self, Self::Error> {
         let code = Cow::from(std::fs::read(path)?);
-        let key = ComponentKey::new(code.borrow());
+        let key = DelegateKey::new(code.borrow());
         Ok(Self { code, key })
     }
 }
 
-impl From<Vec<u8>> for Component<'static> {
+impl From<Vec<u8>> for Delegate<'static> {
     fn from(data: Vec<u8>) -> Self {
-        let key = ComponentKey::new(data.as_slice());
-        Component {
+        let key = DelegateKey::new(data.as_slice());
+        Delegate {
             code: Cow::from(data),
             key,
         }
@@ -74,7 +74,7 @@ impl From<Vec<u8>> for Component<'static> {
 
 /// Type of errors during interaction with a component.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
-pub enum ComponentError {
+pub enum DelegateError {
     #[error("de/serialization error: {0}")]
     Deser(String),
     #[error("{0}")]
@@ -118,17 +118,17 @@ impl Display for SecretsId {
     }
 }
 
-pub trait ComponentInterface {
+pub trait DelegateInterface {
     /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the component must be stored using the secret mechanism.
-    fn process(message: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError>;
+    fn process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError>;
 }
 
 #[serde_as]
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-pub struct ComponentKey(#[serde_as(as = "[_; COMPONENT_HASH_LENGTH]")] [u8; COMPONENT_HASH_LENGTH]);
+pub struct DelegateKey(#[serde_as(as = "[_; COMPONENT_HASH_LENGTH]")] [u8; COMPONENT_HASH_LENGTH]);
 
-impl ComponentKey {
+impl DelegateKey {
     pub fn new(wasm_code: &[u8]) -> Self {
         let mut hasher = Blake2s256::new();
         hasher.update(wasm_code);
@@ -150,7 +150,7 @@ impl ComponentKey {
     }
 }
 
-impl Display for ComponentKey {
+impl Display for DelegateKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.encode())
     }
@@ -158,9 +158,9 @@ impl Display for ComponentKey {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ComponentContext(pub Vec<u8>);
+pub struct DelegateContext(pub Vec<u8>);
 
-impl ComponentContext {
+impl DelegateContext {
     pub const MAX_SIZE: usize = 4096 * 10 * 10;
 
     pub fn new(bytes: Vec<u8>) -> Self {
@@ -184,7 +184,7 @@ impl ComponentContext {
 pub struct ContractHash(#[serde_as(as = "[_; APPLICATION_HASH_SIZE]")] [u8; APPLICATION_HASH_SIZE]);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum InboundComponentMsg<'a> {
+pub enum InboundDelegateMsg<'a> {
     ApplicationMessage(ApplicationMessage),
     GetSecretResponse(GetSecretResponse),
     RandomBytes(Vec<u8>),
@@ -197,38 +197,38 @@ pub enum InboundComponentMsg<'a> {
     // },
 }
 
-impl InboundComponentMsg<'_> {
-    pub fn into_owned(self) -> InboundComponentMsg<'static> {
+impl InboundDelegateMsg<'_> {
+    pub fn into_owned(self) -> InboundDelegateMsg<'static> {
         match self {
-            InboundComponentMsg::ApplicationMessage(r) => {
-                InboundComponentMsg::ApplicationMessage(r)
+            InboundDelegateMsg::ApplicationMessage(r) => {
+                InboundDelegateMsg::ApplicationMessage(r)
             }
-            InboundComponentMsg::GetSecretResponse(r) => InboundComponentMsg::GetSecretResponse(r),
-            InboundComponentMsg::RandomBytes(b) => InboundComponentMsg::RandomBytes(b),
-            InboundComponentMsg::UserResponse(r) => {
-                InboundComponentMsg::UserResponse(r.into_owned())
+            InboundDelegateMsg::GetSecretResponse(r) => InboundDelegateMsg::GetSecretResponse(r),
+            InboundDelegateMsg::RandomBytes(b) => InboundDelegateMsg::RandomBytes(b),
+            InboundDelegateMsg::UserResponse(r) => {
+                InboundDelegateMsg::UserResponse(r.into_owned())
             }
         }
     }
 
-    pub fn get_context(&self) -> Option<&ComponentContext> {
+    pub fn get_context(&self) -> Option<&DelegateContext> {
         match self {
-            InboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
                 Some(context)
             }
-            InboundComponentMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
+            InboundDelegateMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
                 Some(context)
             }
             _ => None,
         }
     }
 
-    pub fn get_mut_context(&mut self) -> Option<&mut ComponentContext> {
+    pub fn get_mut_context(&mut self) -> Option<&mut DelegateContext> {
         match self {
-            InboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
                 Some(context)
             }
-            InboundComponentMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
+            InboundDelegateMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
                 Some(context)
             }
             _ => None,
@@ -241,7 +241,7 @@ pub struct GetSecretResponse {
     pub key: SecretsId,
     pub value: Option<Secret>,
     #[serde(skip)]
-    pub context: ComponentContext,
+    pub context: DelegateContext,
 }
 
 #[non_exhaustive]
@@ -249,7 +249,7 @@ pub struct GetSecretResponse {
 pub struct ApplicationMessage {
     pub app: ContractInstanceId,
     pub payload: Vec<u8>,
-    pub context: ComponentContext,
+    pub context: DelegateContext,
     pub processed: bool,
 }
 
@@ -258,12 +258,12 @@ impl ApplicationMessage {
         Self {
             app,
             payload,
-            context: ComponentContext::default(),
+            context: DelegateContext::default(),
             processed,
         }
     }
 
-    pub fn with_context(mut self, context: ComponentContext) -> Self {
+    pub fn with_context(mut self, context: DelegateContext) -> Self {
         self.context = context;
         self
     }
@@ -274,7 +274,7 @@ pub struct UserInputResponse<'a> {
     pub request_id: u32,
     #[serde(borrow)]
     pub response: ClientResponse<'a>,
-    pub context: ComponentContext,
+    pub context: DelegateContext,
 }
 
 impl UserInputResponse<'_> {
@@ -288,12 +288,12 @@ impl UserInputResponse<'_> {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum OutboundComponentMsg {
+pub enum OutboundDelegateMsg {
     // for the apps
     ApplicationMessage(ApplicationMessage),
     RequestUserInput(#[serde(deserialize_with = "deser_func")] UserInputRequest<'static>),
     // todo: remove when context can be accessed from the component environment and we pass it as reference
-    ContextUpdated(ComponentContext),
+    ContextUpdated(DelegateContext),
     // from the node
     GetSecretRequest(GetSecretRequest),
     SetSecretRequest(SetSecretRequest),
@@ -304,48 +304,48 @@ pub enum OutboundComponentMsg {
     // },
 }
 
-impl From<GetSecretRequest> for OutboundComponentMsg {
+impl From<GetSecretRequest> for OutboundDelegateMsg {
     fn from(req: GetSecretRequest) -> Self {
         Self::GetSecretRequest(req)
     }
 }
 
-impl From<ApplicationMessage> for OutboundComponentMsg {
+impl From<ApplicationMessage> for OutboundDelegateMsg {
     fn from(req: ApplicationMessage) -> Self {
         Self::ApplicationMessage(req)
     }
 }
 
-impl OutboundComponentMsg {
+impl OutboundDelegateMsg {
     pub fn processed(&self) -> bool {
         match self {
-            OutboundComponentMsg::ApplicationMessage(msg) => msg.processed,
-            OutboundComponentMsg::GetSecretRequest(msg) => msg.processed,
-            OutboundComponentMsg::RandomBytesRequest(_) => false,
-            OutboundComponentMsg::SetSecretRequest(_) => false,
-            OutboundComponentMsg::RequestUserInput(_) => true,
-            OutboundComponentMsg::ContextUpdated(_) => true,
+            OutboundDelegateMsg::ApplicationMessage(msg) => msg.processed,
+            OutboundDelegateMsg::GetSecretRequest(msg) => msg.processed,
+            OutboundDelegateMsg::RandomBytesRequest(_) => false,
+            OutboundDelegateMsg::SetSecretRequest(_) => false,
+            OutboundDelegateMsg::RequestUserInput(_) => true,
+            OutboundDelegateMsg::ContextUpdated(_) => true,
         }
     }
 
-    pub fn get_context(&self) -> Option<&ComponentContext> {
+    pub fn get_context(&self) -> Option<&DelegateContext> {
         match self {
-            OutboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+            OutboundDelegateMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
                 Some(context)
             }
-            OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
+            OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
                 Some(context)
             }
             _ => None,
         }
     }
 
-    pub fn get_mut_context(&mut self) -> Option<&mut ComponentContext> {
+    pub fn get_mut_context(&mut self) -> Option<&mut DelegateContext> {
         match self {
-            OutboundComponentMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
+            OutboundDelegateMsg::ApplicationMessage(ApplicationMessage { context, .. }) => {
                 Some(context)
             }
-            OutboundComponentMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
+            OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
                 Some(context)
             }
             _ => None,
@@ -364,7 +364,7 @@ where
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetSecretRequest {
     pub key: SecretsId,
-    pub context: ComponentContext,
+    pub context: DelegateContext,
     pub processed: bool,
 }
 
@@ -453,12 +453,12 @@ pub(crate) mod wasm_interface {
 
     #[repr(C)]
     #[derive(Debug, Clone, Copy)]
-    pub struct ComponentInterfaceResult {
+    pub struct DelegateInterfaceResult {
         ptr: i64,
         size: u32,
     }
 
-    impl ComponentInterfaceResult {
+    impl DelegateInterfaceResult {
         pub unsafe fn from_raw(ptr: i64, mem: &WasmLinearMem) -> Self {
             let result = Box::leak(Box::from_raw(crate::buf::compute_ptr(
                 ptr as *mut Self,
@@ -490,12 +490,12 @@ pub(crate) mod wasm_interface {
         pub unsafe fn unwrap(
             self,
             mem: WasmLinearMem,
-        ) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
+        ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
             let ptr = crate::buf::compute_ptr(self.ptr as *mut u8, &mem);
             let serialized = std::slice::from_raw_parts(ptr as *const u8, self.size as _);
-            let value: Result<Vec<OutboundComponentMsg>, ComponentError> =
+            let value: Result<Vec<OutboundDelegateMsg>, DelegateError> =
                 bincode::deserialize(serialized)
-                    .map_err(|e| ComponentError::Other(format!("{e}")))?;
+                    .map_err(|e| DelegateError::Other(format!("{e}")))?;
             #[cfg(feature = "trace")]
             {
                 tracing::trace!(
@@ -510,8 +510,8 @@ pub(crate) mod wasm_interface {
         }
     }
 
-    impl From<Result<Vec<OutboundComponentMsg>, ComponentError>> for ComponentInterfaceResult {
-        fn from(value: Result<Vec<OutboundComponentMsg>, ComponentError>) -> Self {
+    impl From<Result<Vec<OutboundDelegateMsg>, DelegateError>> for DelegateInterfaceResult {
+        fn from(value: Result<Vec<OutboundDelegateMsg>, DelegateError>) -> Self {
             let serialized = bincode::serialize(&value).unwrap();
             let size = serialized.len() as _;
             let ptr = serialized.as_ptr();

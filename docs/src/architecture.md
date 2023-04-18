@@ -25,7 +25,7 @@ Take, for example, a public blog contract. The state of this contract would be t
 
 Delegates are WebAssembly code components that serve as personal agents for users, operating on their devices to manage private data and interact with digital entities such as contracts, apps, and other delegates. These agents provide a range of functionalities, including task execution, secret storage, cryptographic operations, and communication with users to obtain permission for specific actions. Delegates can be seen as an advanced and more powerful alternative to cookies or local storage used in web browsers. With the user's consent, delegates can be created by applications or other delegates.
 
-Delegates must implemenent the [ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
+Delegates must implemenent the [DelegateInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
 
 While contracts' state is public (but potentially encrypted), delegates state is private. Example uses for delegates include:
 

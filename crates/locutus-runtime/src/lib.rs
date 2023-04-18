@@ -1,7 +1,7 @@
 extern crate core;
 
-mod component;
-mod component_store;
+mod delegate;
+mod delegate_store;
 mod contract;
 mod contract_store;
 pub(crate) mod error;
@@ -20,8 +20,8 @@ pub use locutus_stdlib;
 pub use prelude::*;
 
 pub mod prelude {
-    pub use super::component::{ComponentExecError, ComponentRuntimeInterface};
-    pub use super::component_store::ComponentStore;
+    pub use super::delegate::{DelegateExecError, DelegateRuntimeInterface};
+    pub use super::delegate_store::DelegateStore;
     pub use super::contract::ContractRuntimeInterface;
     pub use super::contract_store::ContractStore;
     pub use super::error::ContractError;

@@ -20,7 +20,7 @@ For example, if the contract id is `6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2
 
 ## Contract State
 
-Data associated with a contract that can be retrieved by Applications and Components. For efficiency and flexibility, contract state is represented as a simple `[u8]` byte array.
+Data associated with a contract that can be retrieved by Applications and Delegates. For efficiency and flexibility, contract state is represented as a simple `[u8]` byte array.
 
 ## Delta
 

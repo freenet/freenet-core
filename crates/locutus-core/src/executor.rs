@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
 use locutus_stdlib::client_api::{
-    ClientError, ClientRequest, ComponentRequest, ContractRequest, ContractResponse, HostResponse,
+    ClientError, ClientRequest, DelegateRequest, ContractRequest, ContractResponse, HostResponse,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    client_events::{ComponentError as CoreComponentError, ContractError as CoreContractError},
+    client_events::{DelegateError as CoreDelegateError, ContractError as CoreContractError},
     either::Either,
     ClientId, DynError, HostResult, RequestError, Storage,
 };
@@ -51,7 +51,7 @@ impl Executor {
             mode,
             runtime: Runtime::build(
                 store,
-                ComponentStore::default(),
+                DelegateStore::default(),
                 SecretsStore::default(),
                 false,
             )
@@ -128,7 +128,7 @@ impl Executor {
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_op(op, id, updates).await,
-            ClientRequest::ComponentOp(op) => self.component_op(op),
+            ClientRequest::DelegateOp(op) => self.component_op(op),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -304,9 +304,9 @@ impl Executor {
         }
     }
 
-    fn component_op(&mut self, req: ComponentRequest<'_>) -> Response {
+    fn component_op(&mut self, req: DelegateRequest<'_>) -> Response {
         match req {
-            ComponentRequest::RegisterComponent {
+            DelegateRequest::RegisterDelegate {
                 component,
                 cipher,
                 nonce,
@@ -322,11 +322,11 @@ impl Executor {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
                         tracing::error!("failed registering component `{key}`: {err}");
-                        Err(Either::Left(CoreComponentError::RegisterError(key).into()))
+                        Err(Either::Left(CoreDelegateError::RegisterError(key).into()))
                     }
                 }
             }
-            ComponentRequest::UnregisterComponent(key) => {
+            DelegateRequest::UnregisterDelegate(key) => {
                 match self.runtime.unregister_component(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
@@ -335,19 +335,19 @@ impl Executor {
                     }
                 }
             }
-            ComponentRequest::ApplicationMessages { key, inbound } => {
+            DelegateRequest::ApplicationMessages { key, inbound } => {
                 match self.runtime.inbound_app_message(
                     &key,
                     inbound
                         .into_iter()
-                        .map(InboundComponentMsg::into_owned)
+                        .map(InboundDelegateMsg::into_owned)
                         .collect(),
                 ) {
-                    Ok(values) => Ok(HostResponse::ComponentResponse { key, values }),
+                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
                     Err(err) if err.is_component_exec_error() => {
                         tracing::error!("failed processing messages for component `{key}`: {err}");
                         Err(Either::Left(
-                            CoreComponentError::ExecutionError(format!("{err}")).into(),
+                            CoreDelegateError::ExecutionError(format!("{err}")).into(),
                         ))
                     }
                     Err(err) => {

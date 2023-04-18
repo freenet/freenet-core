@@ -1,5 +1,5 @@
 use futures::future::BoxFuture;
-use locutus_runtime::{ComponentKey, ContractInstanceId};
+use locutus_runtime::{DelegateKey, ContractInstanceId};
 use locutus_stdlib::client_api::ClientRequest;
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
@@ -89,15 +89,15 @@ pub enum RequestError {
     #[error(transparent)]
     ContractError(#[from] ContractError),
     #[error(transparent)]
-    ComponentError(#[from] ComponentError),
+    DelegateError(#[from] DelegateError),
     #[error("client disconnect")]
     Disconnect,
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
-pub enum ComponentError {
+pub enum DelegateError {
     #[error("error while registering component: {0}")]
-    RegisterError(ComponentKey),
+    RegisterError(DelegateKey),
     #[error("execution error, cause: {0}")]
     ExecutionError(String),
 }
