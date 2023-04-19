@@ -2437,6 +2437,7 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rocksdb",
+ "running-average",
  "serde",
  "serde_with",
  "sqlx",
@@ -3799,6 +3800,12 @@ dependencies = [
  "bitflags",
  "serde",
 ]
+
+[[package]]
+name = "running-average"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca70d55297ff92004f0e417bbe0268f59fbabce1ebc234f67794f837fb366e5"
 
 [[package]]
 name = "rust-ini"
