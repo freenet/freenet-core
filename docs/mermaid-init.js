@@ -1,5 +1,5 @@
 mermaid.initialize({
     startOnLoad: true,
     securityLevel: 'loose',
-    theme: 'dark'
+    theme: 'light'
  });

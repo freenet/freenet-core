@@ -1,10 +1,9 @@
 name: Deploy Documentation
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-permissions:
-  contents: write
 
 jobs:
   deploy:

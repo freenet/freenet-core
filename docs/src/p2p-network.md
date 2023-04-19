@@ -26,11 +26,18 @@ methods when necessary. These connections are chosen to ensure the network
 maintains a small-world topology. This means that most of a peer's connections
 will be to peers close to them, but with occasional long-distance connections.
 
-## Greedy Routing
+## Adaptive Routing
 
 When a peer wishes to read, create, or modify a contract it must send a suitable
-request to the peers hosting the contract. This is done using a greedy routing
-algorithm. The peer will send the request to its closest neighbor, and that
-neighbor will forward it to its closest neighbor, and so on. This process
-continues until the request reaches its destination, or hits a dead-end.
+request to the peers hosting the contract, which it can do by sending it to
+whichever neighbor is most likely to be able to retrieve the contract quickly.
 
+All else being equal this will be the neighbor closest to the contract's
+location ("greedy routing"), but in reality other factors will pay a role. For
+example, if a peer is on a slower connection.
+
+To address this Freenet will monitor peer's past performance and select the peer
+most likely to respond successfully the fastest, considering both past
+performance and distance from the desired contract. This is known as adaptive
+routing and relies on an algorithm called [isotonic
+regression](https://github.com/sanity/pav.rs).
