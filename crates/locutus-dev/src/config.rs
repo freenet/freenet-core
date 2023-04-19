@@ -18,6 +18,7 @@ pub struct Config {
 #[derive(clap::Parser, Clone)]
 pub struct BaseConfig {
     /// Overrides the default data directory where Locutus contract files are stored.
+    #[clap(long)]
     pub(crate) contract_data_dir: Option<PathBuf>,
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]

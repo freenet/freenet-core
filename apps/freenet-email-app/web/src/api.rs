@@ -220,11 +220,12 @@ pub(crate) async fn node_comms(
                     _ => panic!(),
                 }
             }
-            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Empty) => continue,
             Err(TryRecvError::Disconnected) => panic!(),
         }
         #[cfg(target_family = "wasm")]
         {
+            //FIXME:  this makes the browser hang...
             web_sys::window()
                 .unwrap()
                 .set_timeout_with_str_and_timeout_and_unused_0("wait_msg", 10);

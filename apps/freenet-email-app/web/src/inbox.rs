@@ -6,9 +6,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment};
-use locutus_stdlib::client_api::{ClientRequest, ComponentRequest};
+use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
 use locutus_stdlib::prelude::{
-    ApplicationMessage, ComponentKey, ContractInstanceId, InboundComponentMsg,
+    ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg,
 };
 use locutus_stdlib::{
     client_api::ContractRequest,
@@ -182,7 +182,7 @@ impl InboxModel {
             TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: slot,
-                assignee: key.clone(),
+                assignee: key,
                 signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                 assignment_hash: [0; 32],
                 token_record: ContractInstanceId::try_from(INBOX_CODE_HASH.to_string()).unwrap(),
@@ -343,15 +343,15 @@ impl InboxModel {
         client: &mut WebApiRequestClient,
         recipient_key: RsaPublicKey,
     ) -> Result<TokenAssignment, DynError> {
-        let key = ComponentKey::new(&[]); // TODO: this should be the AFT component key
+        let key = DelegateKey::new(&[]); // TODO: this should be the AFT component key
         let params = InboxParams {
             pub_key: recipient_key,
         }
         .try_into()?;
         let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, params)?;
-        let request = ClientRequest::ComponentOp(ComponentRequest::ApplicationMessages {
+        let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
             key,
-            inbound: vec![InboundComponentMsg::ApplicationMessage(
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(inbox_key.into(), vec![]),
             )],
         });

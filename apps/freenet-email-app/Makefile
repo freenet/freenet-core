@@ -23,7 +23,7 @@ all:
 build: build-tool build-inbox-0 publish-inbox-0 build-inbox-1 publish-inbox-1 generate-contract-code-hash
 
 build-tool:
-	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build
+	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
 build-inbox-%:
@@ -38,7 +38,7 @@ generate-contract-code-hash:
 	cd $(WEB_DIR_SRC) && cargo run --bin get_code_hash --features use-node,build-binary
 
 run-node:
-	 ${CARGO_TARGET_DIR}/debug/locutus-node local
+	 ${CARGO_TARGET_DIR}/release/locutus-node local
 
 run-web:
 	cd $(INBOX_WEB_DIR)

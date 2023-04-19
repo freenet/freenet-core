@@ -136,11 +136,12 @@ impl Inbox {
     fn send_message(
         &self,
         client: WebApiRequestClient,
+        from: &str,
         to: &str,
         title: &str,
         content: &str,
     ) -> Result<Vec<LocalBoxFuture<'static, ()>>, DynError> {
-        tracing::debug!("sending message from id #{}", self.active_id);
+        tracing::debug!("sending message from {from}");
         let content = DecryptedMessage {
             title: title.to_owned(),
             content: content.to_owned(),
@@ -152,7 +153,7 @@ impl Inbox {
         let mut futs = Vec::with_capacity(content.to.len());
         #[cfg(feature = "use-node")]
         {
-            crate::log::log(format!("sending message from id #{}", self.active_id));
+            crate::log::log(format!("sending message from {from}"));
             for k in content.to.iter() {
                 let key = RsaPublicKey::from_pkcs1_pem(k).map_err(|e| format!("{e}"))?;
                 let content = content.clone();
@@ -256,10 +257,10 @@ impl Inbox {
         Ok(())
     }
 
-    #[cfg(feature = "use-node")]
+    // #[cfg(feature = "use-node")]
     fn get_public_key_from_alias(&self, alias: &str) -> Result<String, DynError> {
         crate::log::log(format!("getting user from alias: {}", alias));
-        let pub_key = ALIAS_MAP.get(alias).ok_or("alias not found").unwrap();
+        let pub_key = ALIAS_MAP.get(alias).ok_or("alias not found")?;
         Ok(pub_key.to_string())
     }
 }
@@ -620,10 +621,18 @@ fn NewMessageWindow(cx: Scope) -> Element {
     let title = use_state(cx, String::new);
     let content = use_state(cx, String::new);
 
+    let alias = user_alias.to_string();
     let send_msg = move |_| {
-        let receiver_public_key = inbox.get_public_key_from_alias(to.get()).unwrap();
+        let receiver_public_key = match inbox.get_public_key_from_alias(to.get()) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::log::error(format!("{e}"), None);
+                return;
+            }
+        };
         match inbox.send_message(
             client.clone(),
+            &alias,
             receiver_public_key.as_str(),
             title.get(),
             content.get(),
@@ -688,8 +697,10 @@ pub(crate) async fn error_handling(
 ) {
     if let Err(error) = res {
         crate::log::error(format!("{error}"), Some(action.clone()));
-        error_channel.send(Err((error, action))).unwrap();
+        error_channel
+            .send(Err((error, action)))
+            .expect("error channel closed");
     } else {
-        error_channel.send(Ok(())).unwrap();
+        error_channel.send(Ok(())).expect("error channel closed");
     }
 }
