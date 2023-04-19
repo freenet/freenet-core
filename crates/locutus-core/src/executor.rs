@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
 use locutus_stdlib::client_api::{
-    ClientError, ClientRequest, DelegateRequest, ContractRequest, ContractResponse, HostResponse,
+    ClientError, ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    client_events::{DelegateError as CoreDelegateError, ContractError as CoreContractError},
+    client_events::{ContractError as CoreContractError, DelegateError as CoreDelegateError},
     either::Either,
     ClientId, DynError, HostResult, RequestError, Storage,
 };

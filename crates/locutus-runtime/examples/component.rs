@@ -8,9 +8,7 @@ struct Delegate;
 
 #[component]
 impl DelegateInterface for Delegate {
-    fn process(
-        _messages: InboundDelegateMsg,
-    ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    fn process(_messages: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         unimplemented!()
     }
 }

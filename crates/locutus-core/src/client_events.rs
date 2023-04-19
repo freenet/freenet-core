@@ -1,5 +1,5 @@
 use futures::future::BoxFuture;
-use locutus_runtime::{DelegateKey, ContractInstanceId};
+use locutus_runtime::{ContractInstanceId, DelegateKey};
 use locutus_stdlib::client_api::ClientRequest;
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;

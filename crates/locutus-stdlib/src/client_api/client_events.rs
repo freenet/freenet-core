@@ -264,9 +264,7 @@ impl DelegateRequest<'_> {
                     nonce,
                 }
             }
-            DelegateRequest::UnregisterDelegate(key) => {
-                DelegateRequest::UnregisterDelegate(key)
-            }
+            DelegateRequest::UnregisterDelegate(key) => DelegateRequest::UnregisterDelegate(key),
         }
     }
 }

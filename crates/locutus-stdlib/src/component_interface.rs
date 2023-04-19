@@ -200,14 +200,10 @@ pub enum InboundDelegateMsg<'a> {
 impl InboundDelegateMsg<'_> {
     pub fn into_owned(self) -> InboundDelegateMsg<'static> {
         match self {
-            InboundDelegateMsg::ApplicationMessage(r) => {
-                InboundDelegateMsg::ApplicationMessage(r)
-            }
+            InboundDelegateMsg::ApplicationMessage(r) => InboundDelegateMsg::ApplicationMessage(r),
             InboundDelegateMsg::GetSecretResponse(r) => InboundDelegateMsg::GetSecretResponse(r),
             InboundDelegateMsg::RandomBytes(b) => InboundDelegateMsg::RandomBytes(b),
-            InboundDelegateMsg::UserResponse(r) => {
-                InboundDelegateMsg::UserResponse(r.into_owned())
-            }
+            InboundDelegateMsg::UserResponse(r) => InboundDelegateMsg::UserResponse(r.into_owned()),
         }
     }
 

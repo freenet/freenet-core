@@ -1,9 +1,9 @@
 extern crate core;
 
-mod delegate;
-mod delegate_store;
 mod contract;
 mod contract_store;
+mod delegate;
+mod delegate_store;
 pub(crate) mod error;
 mod native_api;
 mod runtime;
@@ -20,10 +20,10 @@ pub use locutus_stdlib;
 pub use prelude::*;
 
 pub mod prelude {
-    pub use super::delegate::{DelegateExecError, DelegateRuntimeInterface};
-    pub use super::delegate_store::DelegateStore;
     pub use super::contract::ContractRuntimeInterface;
     pub use super::contract_store::ContractStore;
+    pub use super::delegate::{DelegateExecError, DelegateRuntimeInterface};
+    pub use super::delegate_store::DelegateStore;
     pub use super::error::ContractError;
     pub use super::error::RuntimeResult;
     pub use super::runtime::{ContractExecError, Runtime};

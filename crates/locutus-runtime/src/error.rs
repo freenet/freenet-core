@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use locutus_stdlib::prelude::{DelegateKey, ContractKey};
+use locutus_stdlib::prelude::{ContractKey, DelegateKey};
 
 use crate::{delegate, runtime, secrets_store};
 

@@ -7,7 +7,7 @@ use locutus_stdlib::{
 use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
 
 use crate::{
-    delegate_store::DelegateStore, contract_store::ContractStore, error::RuntimeInnerError,
+    contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
     native_api, secrets_store::SecretsStore, RuntimeResult,
 };
 
