@@ -7,7 +7,18 @@ use dashmap::DashMap;
 
 use crate::ring::PeerKeyLocation;
 
-type ResourceTotals = DashMap<ResourceType, RunningAverage<f64, Instant>>;
+const RUNNING_AVERAGE_WINDOW_SIZE: Duration = Duration::from_secs(10 * 60);
+
+pub struct ResourceTotals {
+    map : DashMap<ResourceType, RunningAverage<f64, Instant>>,
+}
+
+impl ResourceTotals {
+    fn new() -> Self {
+        ResourceTotals { map : DashMap::new() }
+    }
+}
+
 type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
 
 /// A meter for tracking resource usage with attribution.
@@ -56,8 +67,7 @@ impl<'a> AttributionMeter<'a> {
     /// as a parameter.
     pub fn report(&self, time : Instant, resource: ResourceType, value: f64) {
         // Report the total usage for the resource
-        const RUNNING_AVERAGE_WINDOW_SIZE: Duration = Duration::from_secs(60 * 60);
-        let mut total_value = self.parent.totals_by_resource.entry(resource).or_insert_with(|| {
+        let mut total_value = self.parent.totals_by_resource.map.entry(resource).or_insert_with(|| {
             RunningAverage::new(RUNNING_AVERAGE_WINDOW_SIZE)
         });
         total_value.insert(time, value);
@@ -66,7 +76,7 @@ impl<'a> AttributionMeter<'a> {
         let resource_map = self.parent.attribution_meters.entry(self.attribution.clone()).or_insert_with(|| {
             ResourceTotals::new()
         });
-        let mut resource_value = resource_map.entry(resource).or_insert_with(|| {
+        let mut resource_value = resource_map.map.entry(resource).or_insert_with(|| {
             RunningAverage::new(RUNNING_AVERAGE_WINDOW_SIZE)
         });
         resource_value.insert(time, value);
