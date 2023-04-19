@@ -49,7 +49,7 @@ Through this the application can:
 
 Contracts are extremely flexible. they can be used to create decentralized data structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
 
-## Component Ecosystem
+## Delegate Ecosystem
 
 Applications in Locutus don't need to be built from scratch, they can be built on top of components provided by us or others.
 

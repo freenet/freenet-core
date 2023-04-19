@@ -246,7 +246,7 @@ where
                     }
                     _ => unreachable!(),
                 },
-                ClientRequest::ComponentOp(_op) => unreachable!(),
+                ClientRequest::DelegateOp(_op) => unreachable!(),
                 ClientRequest::Disconnect { .. } => unreachable!(),
                 ClientRequest::GenerateRandData { bytes: _ } => unreachable!(),
             }

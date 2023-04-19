@@ -2,7 +2,7 @@
 
 ## Terms
 
-- [Contract State](glossary#contract-state) - data associated with a contract that can be retrieved by Applications and Components.
+- [Contract State](glossary#contract-state) - data associated with a contract that can be retrieved by Applications and Delegates.
 - [Delta](glossary#delta) - Represents a modification to some state - similar to a [diff](https://en.wikipedia.org/wiki/Diff) in source code
 - [Parameters](glossary#parameters) - Data that forms part of a contract along with the WebAssembly code
 - [State Summary](glossary#state-summary) - A compact summary of a contract's state that can be used to create a delta
