@@ -101,6 +101,7 @@ impl WebApi {
     }
 
     pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
+        tracing::debug!(?request, "sending request");
         self.request_tx
             .send(request)
             .await

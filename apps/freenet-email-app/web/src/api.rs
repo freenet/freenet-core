@@ -51,7 +51,7 @@ impl WebApi {
             conn,
             result_handler,
             |err| {
-                crate::log::error(format!("connection error: {err}"), None);
+                crate::log::error(format!("{err}"), None);
             },
             onopen_handler,
         );
@@ -226,7 +226,7 @@ pub(crate) async fn node_comms(
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                panic!("respons ch closed");
+                panic!("response ch closed");
             }
         }
         futures::select! {
