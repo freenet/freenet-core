@@ -6,13 +6,13 @@ use crate::app::AsyncActionResult;
 type ClientRequester = UnboundedSender<ClientRequest<'static>>;
 type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
 
-pub(crate) type NodeResponses = crossbeam::channel::Sender<AsyncActionResult>;
+pub(crate) type NodeResponses = UnboundedSender<AsyncActionResult>;
 
 #[cfg(feature = "use-node")]
 struct WebApi {
     requests: UnboundedReceiver<ClientRequest<'static>>,
     host_responses: HostResponses,
-    client_errors: crossbeam::channel::Receiver<AsyncActionResult>,
+    client_errors: UnboundedReceiver<AsyncActionResult>,
     send_half: ClientRequester,
     error_sender: NodeResponses,
     api: locutus_stdlib::client_api::WebApi,
@@ -35,8 +35,7 @@ impl WebApi {
 
     #[cfg(all(target_family = "wasm", feature = "use-node"))]
     fn new() -> Result<Self, String> {
-        use futures::StreamExt;
-        use wasm_bindgen::JsCast;
+        use futures::{SinkExt, StreamExt};
         let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
         let (send_host_responses, host_responses) = crossbeam::channel::unbounded();
         let (send_half, requests) = futures::channel::mpsc::unbounded();
@@ -56,7 +55,7 @@ impl WebApi {
             },
             onopen_handler,
         );
-        let (error_sender, client_errors) = crossbeam::channel::unbounded();
+        let (error_sender, client_errors) = futures::channel::mpsc::unbounded();
 
         Ok(Self {
             requests,
@@ -137,16 +136,17 @@ impl From<WebApiRequestClient> for NodeResponses {
 pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::AsyncAction>,
     contracts: Vec<crate::app::Identity>,
-    inboxes: crate::app::InboxesData,
+    mut inboxes: crate::app::InboxesData,
 ) {
-    use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
-    use locutus_stdlib::client_api::ContractResponse;
+    use futures::StreamExt;
+    use locutus_stdlib::{client_api::ContractResponse, prelude::ContractKey};
 
     use crate::{
-        app::{error_handling, AsyncAction, TryAsyncAction, WEB_API_SENDER},
+        app::{error_handling, AsyncAction, Identity, TryAsyncAction, WEB_API_SENDER},
         inbox::InboxModel,
     };
 
@@ -162,77 +162,89 @@ pub(crate) async fn node_comms(
     WEB_API_SENDER.set(api.sender_half()).unwrap();
 
     let mut waiting_updates = HashMap::new();
+
+    async fn handle_action(
+        req: AsyncAction,
+        api: &WebApi,
+        waiting_updates: &mut HashMap<ContractKey, Identity>,
+    ) {
+        let AsyncAction::LoadMessages(identity) = req;
+        let mut client = api.sender_half();
+        match InboxModel::load(&mut client, &identity).await {
+            Err(err) => {
+                error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
+            }
+            Ok(key) => {
+                waiting_updates.entry(key).or_insert(identity);
+            }
+        }
+    }
+
+    async fn handle_response(
+        res: Result<HostResponse, ClientError>,
+        waiting_updates: &mut HashMap<ContractKey, Identity>,
+        inboxes: &mut crate::app::InboxesData,
+    ) {
+        let res = match res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::log::error(format!("{e}"), None);
+                return;
+            }
+        };
+        match res {
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, state, ..
+            }) => {
+                let state: StoredInbox = serde_json::from_slice(state.as_ref()).unwrap();
+                let Some(identity) = waiting_updates.remove(&key) else { unreachable!() };
+                let updated_model =
+                    InboxModel::from_state(identity.key, state, key.clone()).unwrap();
+                let loaded_models = inboxes.load();
+                if let Some(pos) = loaded_models.iter().position(|e| {
+                    let x = e.borrow();
+                    x.key == key
+                }) {
+                    crate::log::log(format!("loaded inbox {key}"));
+                    let mut current = loaded_models[pos].borrow_mut();
+                    *current = updated_model;
+                } else {
+                    crate::log::log(format!("updated inbox {key}"));
+                    let mut cloned = (***loaded_models).to_vec();
+                    std::mem::drop(loaded_models);
+                    cloned.push(Rc::new(RefCell::new(updated_model)));
+                }
+            }
+            _ => todo!(),
+        }
+    }
+
     loop {
-        while let Ok(Some(req)) = rx.try_next() {
-            let AsyncAction::LoadMessages(identity) = req;
-            let mut client = api.sender_half();
-            match InboxModel::load(&mut client, &identity).await {
-                Err(err) => {
-                    error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
-                }
-                Ok(key) => {
-                    waiting_updates.entry(key).or_insert(identity);
-                }
-            }
-        }
-        while let Ok(Some(req)) = api.requests.try_next() {
-            api.api.send(req).await.unwrap();
-        }
-
-        match api.client_errors.try_recv() {
-            Err(TryRecvError::Empty) | Ok(Ok(())) => {}
-            Err(TryRecvError::Disconnected) => panic!(),
-            Ok(Err((err, _action))) => {
-                eprintln!("{err}");
-                todo!("better error handling");
-            }
-        }
-
         match api.host_responses.try_recv() {
-            Ok(r) => {
-                let r = r.unwrap();
-                match r {
-                    HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        key,
-                        state,
-                        ..
-                    }) => {
-                        let state: StoredInbox = serde_json::from_slice(state.as_ref()).unwrap();
-                        let Some(identity) = waiting_updates.remove(&key) else { unreachable!() };
-                        let updated_model =
-                            InboxModel::from_state(identity.key.clone(), state, key.clone())
-                                .unwrap();
-                        let loaded_models = inboxes.load();
-                        if let Some(pos) = loaded_models.iter().position(|e| {
-                            let x = e.borrow();
-                            x.key == key
-                        }) {
-                            crate::log::log(format!("loaded inbox {key}"));
-                            let mut current = loaded_models[pos].borrow_mut();
-                            *current = updated_model;
-                        } else {
-                            crate::log::log(format!("updated inbox {key}"));
-                            let mut cloned = (***loaded_models).to_vec();
-                            std::mem::drop(loaded_models);
-                            cloned.push(Rc::new(RefCell::new(updated_model)));
-                        }
-                    }
-                    _ => panic!(),
+            Ok(res) => {
+                handle_response(res, &mut waiting_updates, &mut inboxes).await;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                panic!("respons ch closed");
+            }
+        }
+        futures::select! {
+            req = rx.next() => {
+                let Some(req) = req else { panic!("async action ch closed") };
+                handle_action(req, &api, &mut waiting_updates).await;
+            }
+            req = api.requests.next() => {
+                let Some(req) = req else { panic!("request ch closed") };
+                api.api.send(req).await.unwrap();
+            }
+            error = api.client_errors.next() => {
+                match error {
+                    Some(Err((msg, action))) => crate::log::error(format!("{msg}"), Some(action)),
+                    Some(Ok(_)) => {}
+                    None => panic!("error ch closed"),
                 }
             }
-            Err(TryRecvError::Empty) => continue,
-            Err(TryRecvError::Disconnected) => panic!(),
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            //FIXME:  this makes the browser hang...
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_str_and_timeout_and_unused_0("wait_msg", 10);
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }

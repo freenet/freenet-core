@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
-use futures::FutureExt;
+use futures::{FutureExt, SinkExt};
 use once_cell::sync::{Lazy, OnceCell};
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
@@ -78,9 +78,11 @@ pub(crate) fn App(cx: Scope) -> Element {
     let inbox_data = inbox.inbox_data.clone();
 
     #[cfg(feature = "use-node")]
-    use_coroutine::<AsyncAction, _, _>(cx, move |rx| {
-        crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
-    });
+    {
+        let _sync = use_coroutine::<AsyncAction, _, _>(cx, move |rx| {
+            crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
+        });
+    }
 
     if !user.read().identified {
         cx.render(rsx! {
@@ -691,7 +693,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
 }
 
 pub(crate) async fn error_handling(
-    error_channel: NodeResponses,
+    mut error_channel: NodeResponses,
     res: Result<(), DynError>,
     action: TryAsyncAction,
 ) {
@@ -699,8 +701,12 @@ pub(crate) async fn error_handling(
         crate::log::error(format!("{error}"), Some(action.clone()));
         error_channel
             .send(Err((error, action)))
+            .await
             .expect("error channel closed");
     } else {
-        error_channel.send(Ok(())).expect("error channel closed");
+        error_channel
+            .send(Ok(()))
+            .await
+            .expect("error channel closed");
     }
 }
