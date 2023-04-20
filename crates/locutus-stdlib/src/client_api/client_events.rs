@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Display, io::Cursor};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    component_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
+    delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
     prelude::{
         ContractKey, RelatedContracts, StateSummary, TryFromTsStd, UpdateData, WrappedState,
         WsApiError,
