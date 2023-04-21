@@ -15,12 +15,12 @@ mod integration_test {
 
     use locutus_aft_interface::{AllocationCriteria, Tier, TokenAllocationRecord, TokenAssignment};
     use locutus_runtime::{
-        ApplicationMessage, ComponentRuntimeInterface, ComponentStore, ContractContainer,
-        ContractInstanceId, ContractKey, ContractStore, InboundComponentMsg, Runtime, SecretsId,
+        ApplicationMessage, ContractContainer, ContractInstanceId, ContractKey, ContractStore,
+        DelegateRuntimeInterface, DelegateStore, InboundDelegateMsg, Runtime, SecretsId,
         SecretsStore, WasmAPIVersion,
     };
     use locutus_stdlib::prelude::{
-        Component, ComponentContext, ComponentError, ContractCode, OutboundComponentMsg,
+        ContractCode, Delegate, DelegateContext, DelegateError, OutboundDelegateMsg,
         WrappedContract,
     };
 
@@ -53,7 +53,7 @@ mod integration_test {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
-    enum TokenComponentMessage {
+    enum TokenDelegateMessage {
         RequestNewToken(RequestNewToken),
         AllocatedToken {
             component_id: SecretsId,
@@ -76,12 +76,6 @@ mod integration_test {
         user_response: HashMap<u32, Response>,
         /// The token generator instance key pair (pub + secret key).
         key_pair: Option<rsa::RsaPrivateKey>,
-    }
-
-    impl TokenComponentMessage {
-        fn serialize(self) -> Result<Vec<u8>, ComponentError> {
-            bincode::serialize(&self).map_err(|err| ComponentError::Deser(format!("{err}")))
-        }
     }
 
     fn test_dir(prefix: &str) -> PathBuf {
@@ -138,7 +132,7 @@ mod integration_test {
         key_pair: &RsaPrivateKey,
         contract_name: &str,
         component_name: &str,
-    ) -> Result<(Component<'a>, SecretsId, ContractKey, Runtime), Box<dyn std::error::Error>> {
+    ) -> Result<(Delegate<'a>, SecretsId, ContractKey, Runtime), Box<dyn std::error::Error>> {
         // Setup contract
         let contracts_dir = test_dir("contract");
         let mut contract_store = ContractStore::new(contracts_dir, 10_000)?;
@@ -158,12 +152,12 @@ mod integration_test {
         let components_dir = test_dir("aft-component");
         let secrets_dir = test_dir("aft-secret");
 
-        let mut component_store = ComponentStore::new(components_dir, 10_000)?;
+        let mut component_store = DelegateStore::new(components_dir, 10_000)?;
         let mut secret_store = SecretsStore::new(secrets_dir)?;
 
         let component = {
             let bytes = get_test_module("components", component_name, "node")?;
-            Component::from(bytes)
+            Delegate::from(bytes)
         };
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
@@ -187,9 +181,9 @@ mod integration_test {
 
     #[test]
     fn test_process_allocated_token() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("error")
-            .try_init();
+        // let _ = tracing_subscriber::fmt()
+        //     .with_env_filter("error")
+        //     .try_init();
 
         let mut csprng = rand_chacha::ChaChaRng::seed_from_u64(1);
         let private_key = RsaPrivateKey::new(&mut csprng, 4098).unwrap();
@@ -197,12 +191,12 @@ mod integration_test {
         let (component, secret_id, contract_key, mut runtime) =
             set_up_aft(&private_key, "token-allocation-record", "token-generator").unwrap();
         let app = ContractInstanceId::try_from(contract_key.to_string()).unwrap();
-        let mut context: Context = Context {
+        let context: Context = Context {
             waiting_for_user_input: HashSet::default(),
             user_response: HashMap::default(),
             key_pair: Some(private_key.clone()),
         };
-        let component_context = ComponentContext::new(bincode::serialize(&context).unwrap());
+        let component_context = DelegateContext::new(bincode::serialize(&context).unwrap());
         let criteria = AllocationCriteria::new(
             Tier::Day1,
             std::time::Duration::from_secs(365 * 24 * 3600),
@@ -219,12 +213,12 @@ mod integration_test {
             assignment_hash: [0; 32],
         };
 
-        let message = TokenComponentMessage::RequestNewToken(request_new_token);
+        let message = TokenDelegateMessage::RequestNewToken(request_new_token);
         let payload: Vec<u8> = bincode::serialize(&message).unwrap();
 
         // The application request new token allocation
-        let inbound_message = InboundComponentMsg::ApplicationMessage(
-            ApplicationMessage::new(app, payload.clone()).with_context(component_context.clone()),
+        let inbound_message = InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(app, payload).with_context(component_context),
         );
         let outbound = runtime
             .inbound_app_message(component.key(), vec![inbound_message])
@@ -232,7 +226,7 @@ mod integration_test {
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
             outbound.get(0),
-            Some(OutboundComponentMsg::ApplicationMessage(..))
+            Some(OutboundDelegateMsg::ApplicationMessage(..))
         ));
     }
 }

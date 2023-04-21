@@ -51,7 +51,7 @@ impl WebApi {
             conn,
             result_handler,
             |err| {
-                crate::log::error(format!("{err}"), None);
+                crate::log::error(format!("host error: {err}"), None);
             },
             onopen_handler,
         );
@@ -188,7 +188,7 @@ pub(crate) async fn node_comms(
         let res = match res {
             Ok(r) => r,
             Err(e) => {
-                crate::log::error(format!("{e}"), None);
+                crate::log::error(format!("received error: {e}"), None);
                 return;
             }
         };

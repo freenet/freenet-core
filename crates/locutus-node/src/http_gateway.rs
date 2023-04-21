@@ -11,6 +11,8 @@ use locutus_runtime::ContractKey;
 use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
 };
+use rmp_serde::Deserializer;
+use serde::Deserialize;
 use std::{
     collections::HashMap,
     sync::{
@@ -19,8 +21,6 @@ use std::{
     },
     time::Duration,
 };
-use rmp_serde::Deserializer;
-use serde::Deserialize;
 use tokio::sync::{
     mpsc::{self, error::TryRecvError, UnboundedReceiver},
     Mutex,
@@ -222,23 +222,21 @@ async fn process_client_request(
     };
 
     let mut deserializer = Deserializer::new(&msg[..]);
-    let req: ClientRequest = match ClientRequest::deserialize(&mut deserializer)  {
+    let req: ClientRequest = match ClientRequest::deserialize(&mut deserializer) {
         Ok(client_request) => client_request,
-        Err(_) => {
-            match ContractRequest::try_decode(&msg) {
-                Ok(r) => r.into(),
-                Err(e) => {
-                    let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
-                        ErrorKind::DeserializationError {
-                            cause: format!("{e}"),
-                        }
-                            .into(),
-                    ))
-                        .map_err(|err| Some(err.into()))?;
-                    return Ok(Some(Message::Binary(result_error)));
-                }
+        Err(_) => match ContractRequest::try_decode(&msg) {
+            Ok(r) => r.into(),
+            Err(e) => {
+                let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+                    ErrorKind::DeserializationError {
+                        cause: format!("{e}"),
+                    }
+                    .into(),
+                ))
+                .map_err(|err| Some(err.into()))?;
+                return Ok(Some(Message::Binary(result_error)));
             }
-        }
+        },
     };
 
     tracing::debug!(req = %req, "received client request");

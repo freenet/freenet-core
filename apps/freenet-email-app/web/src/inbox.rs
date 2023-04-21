@@ -168,7 +168,7 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let token = {
             let key = pub_key.clone();
-            //TODO: Use the component instead of hardcoding the TokenAssignment.
+            //TODO: Use the delegate instead of hardcoding the TokenAssignment.
             //InboxModel::assign_token(client, key).await?
             const TEST_TIER: Tier = Tier::Day1;
             const MAX_DURATION_1Y: std::time::Duration =

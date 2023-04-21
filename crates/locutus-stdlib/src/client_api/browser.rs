@@ -22,11 +22,24 @@ impl WebApi {
     {
         let mut eh = error_handler.clone();
         let onmessage_callback = Closure::<dyn FnMut(_)>::new(move |e: MessageEvent| {
-            let response: HostResult = match serde_wasm_bindgen::from_value(e.data()) {
+            let v: serde_json::Value = serde_wasm_bindgen::from_value(e.data()).unwrap();
+            eh(Error::ConnectionError(serde_json::json!({
+                "got data": format!("{:?}", v)
+            })));
+            let bytes: Vec<u8> = match serde_wasm_bindgen::from_value(e.data()) {
                 Ok(val) => val,
                 Err(err) => {
                     eh(Error::ConnectionError(serde_json::json!({
-                        "error": format!("{err}"), "source": "host response"
+                        "error": format!("{err}"), "source": "host response raw bytes deser"
+                    })));
+                    return;
+                }
+            };
+            let response: HostResult = match rmp_serde::from_slice(&bytes) {
+                Ok(val) => val,
+                Err(err) => {
+                    eh(Error::ConnectionError(serde_json::json!({
+                        "error": format!("{err}"), "source": "host response deser"
                     })));
                     return;
                 }
@@ -75,7 +88,15 @@ impl WebApi {
     }
 
     pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
+        (self.error_handler)(Error::ConnectionError(serde_json::json!({
+            "request": format!("{request:?}"),
+            "action": "sending request"
+        })));
         let send = rmp_serde::to_vec(&request)?;
+        (self.error_handler)(Error::ConnectionError(serde_json::json!({
+            "request": format!("{send:?}"),
+            "action": "sending raw request"
+        })));
         self.conn.send_with_u8_array(&send).map_err(|err| {
             let err: serde_json::Value = match serde_wasm_bindgen::from_value(err) {
                 Ok(e) => e,

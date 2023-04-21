@@ -38,7 +38,7 @@ generate-contract-code-hash:
 	cd $(WEB_DIR_SRC) && cargo run --bin get_code_hash --features use-node,build-binary
 
 run-node:
-	 ${CARGO_TARGET_DIR}/release/locutus-node local
+	RUST_LOG=debug locutus-node local
 
 run-web:
 	cd $(INBOX_WEB_DIR)

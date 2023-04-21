@@ -54,6 +54,7 @@ pub(crate) enum TryAsyncAction {
     LoadMessages,
     SendMessage,
     RemoveMessages,
+    TryGetAlias,
 }
 
 impl std::fmt::Display for TryAsyncAction {
@@ -62,6 +63,7 @@ impl std::fmt::Display for TryAsyncAction {
             TryAsyncAction::LoadMessages => write!(f, "load messages"),
             TryAsyncAction::SendMessage => write!(f, "send message"),
             TryAsyncAction::RemoveMessages => write!(f, "remove messages"),
+            TryAsyncAction::TryGetAlias => write!(f, "get alias"),
         }
     }
 }
@@ -628,7 +630,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
         let receiver_public_key = match inbox.get_public_key_from_alias(to.get()) {
             Ok(v) => v,
             Err(e) => {
-                crate::log::error(format!("{e}"), None);
+                crate::log::error(format!("{e}"), Some(TryAsyncAction::TryGetAlias));
                 return;
             }
         };
