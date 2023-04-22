@@ -10,7 +10,7 @@ use crate::ring::PeerKeyLocation;
 const RUNNING_AVERAGE_WINDOW_SIZE: Duration = Duration::from_secs(10 * 60);
 
 pub struct ResourceTotals {
-    map : DashMap<ResourceType, RunningAverage<f64, Instant>>,
+    pub map : DashMap<ResourceType, RunningAverage<f64, Instant>>,
 }
 
 impl ResourceTotals {
@@ -21,7 +21,6 @@ impl ResourceTotals {
 
 type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
 
-/// A meter for tracking resource usage with attribution.
 pub struct Meter {
     totals_by_resource: ResourceTotals,
     attribution_meters: AttributionMeters,
@@ -36,44 +35,46 @@ impl Meter {
         }
     }
 
-    /// Returns an `AttributionMeter` for the specified attribution source.
-    pub fn attribution_meter(&self, attribution: AttributionSource) -> AttributionMeter {
-        AttributionMeter {
-            parent: self,
-            attribution,
+    pub fn total_usage(&self, resource: ResourceType) -> f64 {
+        // Try to get a mutable reference to the Meter for the given resource
+        match self.totals_by_resource.map.get_mut(&resource) {
+            Some(mut meter) => {
+                // Get the current measurement value
+                meter.measurement(Instant::now()).value().to_owned()
+            }
+            None => 0.0, // No meter found for the given resource
         }
     }
 
-    /// Returns a reference to the total usage for each resource.
-    pub fn total_resource_usage(&self) -> &ResourceTotals {
-        &self.totals_by_resource
+    pub fn attributed_usage(&self, attribution: &AttributionSource, resource: ResourceType) -> f64 {
+        // Try to get a mutable reference to the AttributionMeters for the given attribution
+        match self.attribution_meters.get_mut(attribution) {
+            Some(attribution_meters) => {
+                // Try to get a mutable reference to the Meter for the given resource
+                match attribution_meters.map.get_mut(&resource) {
+                    Some(mut meter) => {
+                        // Get the current measurement value
+                        meter.measurement(Instant::now()).value().to_owned()
+                    }
+                    None => 0.0, // No meter found for the given resource
+                }
+            }
+            None => 0.0, // No AttributionMeters found for the given attribution
+        }
     }
 
-    /// Returns a reference to the usage for each resource for a specific attribution.
-    pub fn attributed_resource_usage(&self) -> &AttributionMeters {
-        &self.attribution_meters
-    }
-}
-
-/// A meter for tracking resource usage for a specific attribution source.
-pub struct AttributionMeter<'a> {
-    parent: &'a Meter,
-    attribution: AttributionSource,
-}
-
-impl<'a> AttributionMeter<'a> {
     /// Report the use of a resource. This should be done in the lowest-level
     /// functions that consume the resource, taking an AttributionMeter
     /// as a parameter.
-    pub fn report(&self, time : Instant, resource: ResourceType, value: f64) {
+    pub fn report(&self, time : Instant, attribution : &AttributionSource, resource: ResourceType, value: f64) {
         // Report the total usage for the resource
-        let mut total_value = self.parent.totals_by_resource.map.entry(resource).or_insert_with(|| {
+        let mut total_value = self.totals_by_resource.map.entry(resource).or_insert_with(|| {
             RunningAverage::new(RUNNING_AVERAGE_WINDOW_SIZE)
         });
         total_value.insert(time, value);
 
         // Report the usage for a specific attribution
-        let resource_map = self.parent.attribution_meters.entry(self.attribution.clone()).or_insert_with(|| {
+        let resource_map = self.attribution_meters.entry(attribution.clone()).or_insert_with(|| {
             ResourceTotals::new()
         });
         let mut resource_value = resource_map.map.entry(resource).or_insert_with(|| {

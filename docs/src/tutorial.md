@@ -1,6 +1,6 @@
 # Getting Started
 
-This tutorial will show you how to build decentralized software on Freenet.O
+This tutorial will show you how to build decentralized software on Freenet.
 
 <!-- toc -->
 

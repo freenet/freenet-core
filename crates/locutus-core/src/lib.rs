@@ -6,6 +6,7 @@ mod message;
 mod meter;
 mod node;
 mod operations;
+mod resource_manager;
 pub mod ring;
 pub mod util;
 
