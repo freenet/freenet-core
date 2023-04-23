@@ -5,7 +5,7 @@ use chacha20poly1305::{
 use chrono::{DateTime, NaiveDate, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use locutus_aft_interface::{Tier, TokenAssignment};
+use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
 use locutus_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg,
@@ -32,6 +32,8 @@ use freenet_email_inbox::{
 };
 
 static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
+// FIXME: should be the token record code
+static TOKEN_RECORD_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -165,6 +167,7 @@ impl InboxModel {
         client: &mut WebApiRequestClient,
         content: DecryptedMessage,
         pub_key: RsaPublicKey,
+        generator_public_key: RsaPublicKey,
     ) -> Result<(), DynError> {
         let token = {
             let key = pub_key.clone();
@@ -179,13 +182,18 @@ impl InboxModel {
                 .unwrap();
             let slot = DateTime::<Utc>::from_utc(naive, Utc);
 
+            let record_params = TokenParameters::new(generator_public_key);
+            let token_record =
+                ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
+                    .unwrap()
+                    .into();
             TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: slot,
                 assignee: key,
                 signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                 assignment_hash: [0; 32],
-                token_record: ContractInstanceId::try_from(INBOX_CODE_HASH.to_string()).unwrap(),
+                token_record,
             }
         };
         let params = InboxParams { pub_key }

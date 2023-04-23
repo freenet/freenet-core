@@ -171,8 +171,12 @@ impl Inbox {
                 let key = RsaPublicKey::from_pkcs1_pem(k).map_err(|e| format!("{e}"))?;
                 let content = content.clone();
                 let mut client = client.clone();
+                let from_key = {
+                    let from = ALIAS_MAP.get(from).unwrap();
+                    RsaPublicKey::from_pkcs1_pem(from).map_err(|e| format!("{e}"))?
+                };
                 let f = async move {
-                    let res = InboxModel::send_message(&mut client, content, key).await;
+                    let res = InboxModel::send_message(&mut client, content, key, from_key).await;
                     error_handling(client.into(), res, TryNodeAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());

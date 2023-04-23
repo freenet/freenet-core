@@ -353,12 +353,29 @@ pub struct TokenParameters {
     pub generator_public_key: RsaPublicKey,
 }
 
+impl TokenParameters {
+    pub fn new(generator_public_key: RsaPublicKey) -> Self {
+        Self {
+            generator_public_key,
+        }
+    }
+}
+
 impl TryFrom<Parameters<'_>> for TokenParameters {
     type Error = ContractError;
     fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
         let this = bincode::deserialize_from(params.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)
+    }
+}
+
+impl TryFrom<TokenParameters> for Parameters<'static> {
+    type Error = ContractError;
+    fn try_from(params: TokenParameters) -> Result<Self, Self::Error> {
+        let this =
+            bincode::serialize(&params).map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(this.into())
     }
 }
 
