@@ -97,3 +97,39 @@ pub enum ResourceType {
     OutboundBandwidthBytes,
     CpuInstructions,
 }
+
+// Tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_meter() {
+        let meter = Meter::new();
+
+        // Report some usage
+        let time = Instant::now();
+        let attribution1 = AttributionSource::Peer(PeerKeyLocation::random());
+        let resource = ResourceType::InboundBandwidthBytes;
+        let value = 100.0;
+        meter.report(time, &attribution1, resource, value);
+
+        // Check the total usage
+        assert_eq!(meter.total_usage(resource), value);
+
+        // Check the attributed usage
+        assert_eq!(meter.attributed_usage(&attribution1, resource), value);
+
+        // Check the attributed usage for a different attribution
+        let attribution2 = AttributionSource::Peer(PeerKeyLocation::random());
+        assert_eq!(meter.attributed_usage(&attribution2, resource), 0.0);
+
+        meter.report(time, &attribution2, resource, value);
+
+        // Check the total usage
+        assert_eq!(meter.total_usage(resource), value * 2.0);
+
+        // Check the attributed usage
+        assert_eq!(meter.attributed_usage(&attribution1, resource), value);
+    }
+}
