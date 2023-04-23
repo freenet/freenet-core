@@ -24,7 +24,7 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::app::{error_handling, TryAsyncAction};
+use crate::app::{error_handling, TryNodeAction};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
@@ -233,7 +233,7 @@ impl InboxModel {
                 error_handling(
                     client.into(),
                     r.map_err(Into::into),
-                    TryAsyncAction::RemoveMessages,
+                    TryNodeAction::RemoveMessages,
                 )
                 .await;
             };

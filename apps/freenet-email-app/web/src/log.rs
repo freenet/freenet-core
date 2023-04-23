@@ -1,4 +1,4 @@
-use crate::app::TryAsyncAction;
+use crate::app::TryNodeAction;
 
 pub(crate) fn log(msg: impl AsRef<str>) {
     let msg = msg.as_ref();
@@ -9,7 +9,7 @@ pub(crate) fn log(msg: impl AsRef<str>) {
     let _ = msg;
 }
 
-pub(crate) fn error(msg: impl AsRef<str>, action: Option<TryAsyncAction>) {
+pub(crate) fn error(msg: impl AsRef<str>, action: Option<TryNodeAction>) {
     let error = msg.as_ref();
     if let Some(action) = action {
         tracing::error!(%error, %action);

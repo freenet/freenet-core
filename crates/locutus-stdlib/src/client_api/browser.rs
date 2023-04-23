@@ -16,14 +16,14 @@ pub struct WebApi {
 impl WebApi {
     pub fn start<ErrFn>(
         conn: Connection,
-        mut result_handler: impl FnMut(HostResult) + 'static,
+        result_handler: impl FnMut(HostResult) + 'static,
         error_handler: ErrFn,
         onopen_handler: impl FnOnce() + 'static,
     ) -> Self
     where
         ErrFn: FnMut(Error) + Clone + 'static,
     {
-        let mut eh = Rc::new(RefCell::new(error_handler.clone()));
+        let eh = Rc::new(RefCell::new(error_handler.clone()));
         let result_handler = Rc::new(RefCell::new(result_handler));
         let onmessage_callback = Closure::<dyn FnMut(_)>::new(move |e: MessageEvent| {
             // Extract the Blob from the MessageEvent
@@ -105,15 +105,11 @@ impl WebApi {
     }
 
     pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
-        (self.error_handler)(Error::ConnectionError(serde_json::json!({
-            "request": format!("{request:?}"),
-            "action": "sending request"
-        })));
+        // (self.error_handler)(Error::ConnectionError(serde_json::json!({
+        //     "request": format!("{request:?}"),
+        //     "action": "sending request"
+        // })));
         let send = rmp_serde::to_vec(&request)?;
-        (self.error_handler)(Error::ConnectionError(serde_json::json!({
-            "request": format!("{send:?}"),
-            "action": "sending raw request"
-        })));
         self.conn.send_with_u8_array(&send).map_err(|err| {
             let err: serde_json::Value = match serde_wasm_bindgen::from_value(err) {
                 Ok(e) => e,

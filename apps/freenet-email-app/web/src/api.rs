@@ -45,7 +45,7 @@ impl WebApi {
         let (tx, rx) = futures::channel::oneshot::channel();
         let onopen_handler = move || {
             tx.send(());
-            crate::log::log("Connected to websocket");
+            crate::log::log("connected to websocket");
         };
         let mut api = locutus_stdlib::client_api::WebApi::start(
             conn,
@@ -134,11 +134,11 @@ impl From<WebApiRequestClient> for NodeResponses {
 
 #[cfg(feature = "use-node")]
 pub(crate) async fn node_comms(
-    mut rx: UnboundedReceiver<crate::app::AsyncAction>,
+    mut rx: UnboundedReceiver<crate::app::NodeAction>,
     contracts: Vec<crate::app::Identity>,
     mut inboxes: crate::app::InboxesData,
 ) {
-    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
@@ -146,12 +146,11 @@ pub(crate) async fn node_comms(
     use locutus_stdlib::{client_api::ContractResponse, prelude::ContractKey};
 
     use crate::{
-        app::{error_handling, AsyncAction, Identity, TryAsyncAction, WEB_API_SENDER},
+        app::{error_handling, Identity, NodeAction, TryNodeAction, WEB_API_SENDER},
         inbox::InboxModel,
     };
 
-    let mut waiting_updates = HashMap::new();
-
+    let mut contract_to_id = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -159,20 +158,20 @@ pub(crate) async fn node_comms(
         })
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
-    crate::app::Inbox::load_all(api.sender_half(), &contracts, &mut waiting_updates).await;
-    crate::log::log("Loaded all inbox");
+    crate::app::Inbox::load_all(api.sender_half(), &contracts, &mut contract_to_id).await;
+    crate::log::log("requested inboxes");
     WEB_API_SENDER.set(api.sender_half()).unwrap();
 
     async fn handle_action(
-        req: AsyncAction,
+        req: NodeAction,
         api: &WebApi,
         waiting_updates: &mut HashMap<ContractKey, Identity>,
     ) {
-        let AsyncAction::LoadMessages(identity) = req;
+        let NodeAction::LoadMessages(identity) = req;
         let mut client = api.sender_half();
         match InboxModel::load(&mut client, &identity).await {
             Err(err) => {
-                error_handling(client.into(), Err(err), TryAsyncAction::LoadMessages).await;
+                error_handling(client.into(), Err(err), TryNodeAction::LoadInbox).await;
             }
             Ok(key) => {
                 waiting_updates.entry(key).or_insert(identity);
@@ -182,7 +181,7 @@ pub(crate) async fn node_comms(
 
     async fn handle_response(
         res: Result<HostResponse, ClientError>,
-        waiting_updates: &mut HashMap<ContractKey, Identity>,
+        contract_to_id: &mut HashMap<ContractKey, Identity>,
         inboxes: &mut crate::app::InboxesData,
     ) {
         let res = match res {
@@ -197,9 +196,9 @@ pub(crate) async fn node_comms(
                 key, state, ..
             }) => {
                 let state: StoredInbox = serde_json::from_slice(state.as_ref()).unwrap();
-                let Some(identity) = waiting_updates.remove(&key) else { unreachable!() };
+                let Some(identity) = contract_to_id.remove(&key) else { unreachable!("tried to get wrong contract key: {key}") };
                 let updated_model =
-                    InboxModel::from_state(identity.key, state, key.clone()).unwrap();
+                    InboxModel::from_state(identity.key.clone(), state, key.clone()).unwrap();
                 let loaded_models = inboxes.load();
                 if let Some(pos) = loaded_models.iter().position(|e| {
                     let x = e.borrow();
@@ -210,10 +209,20 @@ pub(crate) async fn node_comms(
                     *current = updated_model;
                 } else {
                     crate::log::log(format!("updated inbox {key}"));
-                    let mut cloned = (***loaded_models).to_vec();
+                    let mut with_new = (***loaded_models).to_vec();
                     std::mem::drop(loaded_models);
-                    cloned.push(Rc::new(RefCell::new(updated_model)));
+                    with_new.push(Rc::new(RefCell::new(updated_model)));
+                    {
+                        let keys = with_new
+                            .iter()
+                            .map(|i| format!("{}", i.borrow().key))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        crate::log::log(format!("loaded inboxes: {keys}"));
+                    }
+                    inboxes.store(Arc::new(with_new));
                 }
+                contract_to_id.insert(key, identity);
             }
             _ => todo!(),
         }
@@ -222,7 +231,7 @@ pub(crate) async fn node_comms(
     loop {
         match api.host_responses.try_recv() {
             Ok(res) => {
-                handle_response(res, &mut waiting_updates, &mut inboxes).await;
+                handle_response(res, &mut contract_to_id, &mut inboxes).await;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -232,7 +241,7 @@ pub(crate) async fn node_comms(
         futures::select! {
             req = rx.next() => {
                 let Some(req) = req else { panic!("async action ch closed") };
-                handle_action(req, &api, &mut waiting_updates).await;
+                handle_action(req, &api, &mut contract_to_id).await;
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };

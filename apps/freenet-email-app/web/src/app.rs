@@ -24,7 +24,7 @@ use crate::{
 
 mod login;
 
-pub(crate) type AsyncActionResult = Result<(), (DynError, TryAsyncAction)>;
+pub(crate) type AsyncActionResult = Result<(), (DynError, TryNodeAction)>;
 
 static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
     const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
@@ -40,31 +40,31 @@ static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
         .to_pkcs1_pem(LineEnding::LF)
         .unwrap();
     let mut map = HashMap::new();
-    map.insert("ian.clarke@freenet.org".to_string(), pub_key0);
-    map.insert("other.stuff@freenet.org".to_string(), pub_key1);
+    map.insert("address1".to_string(), pub_key0);
+    map.insert("address2".to_string(), pub_key1);
     map
 });
 
 #[derive(Clone, Debug)]
-pub(crate) enum AsyncAction {
+pub(crate) enum NodeAction {
     LoadMessages(Identity),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum TryAsyncAction {
-    LoadMessages,
+pub(crate) enum TryNodeAction {
+    LoadInbox,
     SendMessage,
     RemoveMessages,
-    TryGetAlias,
+    GetAlias,
 }
 
-impl std::fmt::Display for TryAsyncAction {
+impl std::fmt::Display for TryNodeAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TryAsyncAction::LoadMessages => write!(f, "load messages"),
-            TryAsyncAction::SendMessage => write!(f, "send message"),
-            TryAsyncAction::RemoveMessages => write!(f, "remove messages"),
-            TryAsyncAction::TryGetAlias => write!(f, "get alias"),
+            TryNodeAction::LoadInbox => write!(f, "load messages"),
+            TryNodeAction::SendMessage => write!(f, "send message"),
+            TryNodeAction::RemoveMessages => write!(f, "remove messages"),
+            TryNodeAction::GetAlias => write!(f, "get alias"),
         }
     }
 }
@@ -72,7 +72,7 @@ impl std::fmt::Display for TryAsyncAction {
 pub(crate) static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
 
 pub(crate) fn App(cx: Scope) -> Element {
-    crate::log::log("Loging screen");
+    crate::log::log("render app");
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
 
@@ -82,7 +82,7 @@ pub(crate) fn App(cx: Scope) -> Element {
 
     #[cfg(feature = "use-node")]
     {
-        let _sync = use_coroutine::<AsyncAction, _, _>(cx, move |rx| {
+        let _sync = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
             crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
         });
     }
@@ -132,16 +132,17 @@ impl Inbox {
     pub(crate) async fn load_all(
         client: WebApiRequestClient,
         contracts: &[Identity],
-        waiting_updates: &mut HashMap<ContractKey, Identity>,
+        contract_to_id: &mut HashMap<ContractKey, Identity>,
     ) {
         for identity in contracts {
             let mut client = client.clone();
-            let identity = identity.clone();
-            let res = InboxModel::load(&mut client, &identity).await.map(|key| {
-                waiting_updates.entry(key.clone()).or_insert(identity);
+            let res = InboxModel::load(&mut client, identity).await.map(|key| {
+                contract_to_id
+                    .entry(key.clone())
+                    .or_insert(identity.clone());
                 key
             });
-            error_handling(client.into(), res.map(|_| ()), TryAsyncAction::LoadMessages).await;
+            error_handling(client.into(), res.map(|_| ()), TryNodeAction::LoadInbox).await;
         }
     }
 
@@ -172,7 +173,7 @@ impl Inbox {
                 let mut client = client.clone();
                 let f = async move {
                     let res = InboxModel::send_message(&mut client, content, key).await;
-                    error_handling(client.into(), res, TryAsyncAction::SendMessage).await;
+                    error_handling(client.into(), res, TryNodeAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());
             }
@@ -264,8 +265,8 @@ impl Inbox {
 
     #[cfg(feature = "use-node")]
     fn load_messages(&self, cx: Scope, id: &Identity) -> Result<(), DynError> {
-        let actions = use_coroutine_handle::<AsyncAction>(cx).unwrap();
-        actions.send(AsyncAction::LoadMessages(id.clone()));
+        let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
+        actions.send(NodeAction::LoadMessages(id.clone()));
         Ok(())
     }
 
@@ -299,12 +300,12 @@ impl User {
             active_id: None,
             identities: vec![
                 Identity {
-                    alias: "ian.clarke@freenet.org".to_owned(),
+                    alias: "address1".to_owned(),
                     id: 0,
                     key: key0,
                 },
                 Identity {
-                    alias: "other.stuff@freenet.org".to_owned(),
+                    alias: "address2".to_owned(),
                     id: 1,
                     key: key1,
                 },
@@ -638,7 +639,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
         let receiver_public_key = match inbox.get_public_key_from_alias(to.get()) {
             Ok(v) => v,
             Err(e) => {
-                crate::log::error(format!("{e}"), Some(TryAsyncAction::TryGetAlias));
+                crate::log::error(format!("{e}"), Some(TryNodeAction::GetAlias));
                 return;
             }
         };
@@ -653,7 +654,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
                 futs.into_iter().for_each(|f| cx.spawn(f));
             }
             Err(e) => {
-                crate::log::error(format!("{e}"), Some(TryAsyncAction::SendMessage));
+                crate::log::error(format!("{e}"), Some(TryNodeAction::SendMessage));
             }
         }
         menu_selection.write().at_new_msg();
@@ -705,7 +706,7 @@ fn NewMessageWindow(cx: Scope) -> Element {
 pub(crate) async fn error_handling(
     mut error_channel: NodeResponses,
     res: Result<(), DynError>,
-    action: TryAsyncAction,
+    action: TryNodeAction,
 ) {
     if let Err(error) = res {
         crate::log::error(format!("{error}"), Some(action.clone()));
