@@ -1288,6 +1288,15 @@ impl Borrow<[u8]> for WrappedState {
     }
 }
 
+impl From<WrappedState> for State<'static> {
+    fn from(value: WrappedState) -> Self {
+        match Arc::try_unwrap(value.0) {
+            Ok(v) => State::from(v),
+            Err(v) => State::from(v.as_ref().to_vec()),
+        }
+    }
+}
+
 impl std::fmt::Display for WrappedState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let data: String = if self.0.len() > 8 {

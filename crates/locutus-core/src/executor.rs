@@ -250,28 +250,65 @@ impl Executor {
                         .map_err(Into::into)
                         .map_err(Either::Right)?
                         .clone();
-                    let update_modification = self
-                        .runtime
-                        .update_state(&key, &parameters, &state, &[data])
-                        .map_err(|err| match err {
-                            err if err.is_contract_exec_error() => Either::Left(
-                                CoreContractError::Update {
-                                    key: key.clone(),
-                                    cause: format!("{err}"),
+                    let mut retrieved_contracts = Vec::new();
+                    retrieved_contracts.push(data);
+                    loop {
+                        let update_modification = self
+                            .runtime
+                            .update_state(&key, &parameters, &state, &retrieved_contracts)
+                            .map_err(|err| match err {
+                                err if err.is_contract_exec_error() => Either::Left(
+                                    CoreContractError::Update {
+                                        key: key.clone(),
+                                        cause: format!("{err}"),
+                                    }
+                                    .into(),
+                                ),
+                                other => Either::Right(other.into()),
+                            })?;
+                        let UpdateModification {
+                            new_state, related, ..
+                        } = update_modification;
+                        if let Some(new_state) = new_state {
+                            let new_state = WrappedState::new(new_state.into_bytes());
+                            self.contract_state
+                                .store(key.clone(), new_state.clone(), None)
+                                .await
+                                .map_err(|err| Either::Right(err.into()))?;
+                            break new_state;
+                        } else if !related.is_empty() {
+                            // some required contracts are missing
+                            let required_contracts = related.len();
+                            for RelatedContract {
+                                contract_instance_id: id,
+                                mode,
+                            } in related
+                            {
+                                match self.contract_state.get(&id.into()).await {
+                                    Ok(state) => {
+                                        // in this case we are already subscribed to and are updating this contract,
+                                        // we can try first with the existing value
+                                        retrieved_contracts.push(UpdateData::State(state.into()));
+                                    }
+                                    Err(StateStoreError::MissingContract)
+                                        if self.mode == OperationMode::Network =>
+                                    {
+                                        // retrieve the contract from the network first in the mode the consumer contract informed the node
+                                        todo!()
+                                    }
+                                    Err(other_err) => return Err(Either::Right(other_err.into())),
                                 }
-                                .into(),
-                            ),
-                            other => Either::Right(other.into()),
-                        })?;
-                    if let Some(new_state) = update_modification.new_state {
-                        let new_state = WrappedState::new(new_state.into_bytes());
-                        self.contract_state
-                            .store(key.clone(), new_state.clone(), None)
-                            .await
-                            .map_err(|err| Either::Right(err.into()))?;
-                        new_state
-                    } else {
-                        todo!()
+                            }
+                            if retrieved_contracts.len() == required_contracts {
+                                // try running again with all the related contracts retrieved
+                                continue;
+                            } else {
+                                todo!("keep waiting/trying until timeout?")
+                            }
+                        } else {
+                            // state wasn't updated
+                            break state;
+                        }
                     }
                 };
                 // in the network impl this would be sent over the network
