@@ -189,8 +189,8 @@ impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
                             related_contracts: RelatedContracts::try_decode(
                                 *value_map.get("relatedContracts").unwrap(),
                             )
-                                .map_err(|err| WsApiError::deserialization(err.to_string()))?
-                                .into_owned(),
+                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
+                            .into_owned(),
                         }
                     }
                     ["data", "key"] => ContractRequest::Update {

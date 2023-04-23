@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use freenet_email_inbox::InboxParams;
 use locutus_stdlib::prelude::Parameters;
-use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
+use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 

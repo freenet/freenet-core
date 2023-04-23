@@ -39,7 +39,11 @@ impl WebApi {
             let result_handler_clone = result_handler.clone();
 
             let onloadend_callback = Closure::<dyn FnMut()>::new(move || {
-                let array_buffer = fr_clone.result().unwrap().dyn_into::<js_sys::ArrayBuffer>().unwrap();
+                let array_buffer = fr_clone
+                    .result()
+                    .unwrap()
+                    .dyn_into::<js_sys::ArrayBuffer>()
+                    .unwrap();
                 let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
 
                 let response: HostResult = match rmp_serde::from_slice(&bytes) {

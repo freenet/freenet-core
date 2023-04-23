@@ -7,6 +7,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, SinkExt};
+use locutus_stdlib::prelude::ContractKey;
 use once_cell::sync::{Lazy, OnceCell};
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
@@ -128,11 +129,18 @@ impl Inbox {
         }
     }
 
-    pub(crate) async fn load_all(client: WebApiRequestClient, contracts: &[Identity]) {
+    pub(crate) async fn load_all(
+        client: WebApiRequestClient,
+        contracts: &[Identity],
+        waiting_updates: &mut HashMap<ContractKey, Identity>,
+    ) {
         for identity in contracts {
             let mut client = client.clone();
             let identity = identity.clone();
-            let res = InboxModel::load(&mut client, &identity).await;
+            let res = InboxModel::load(&mut client, &identity).await.map(|key| {
+                waiting_updates.entry(key.clone()).or_insert(identity);
+                key
+            });
             error_handling(client.into(), res.map(|_| ()), TryAsyncAction::LoadMessages).await;
         }
     }

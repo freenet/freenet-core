@@ -150,6 +150,8 @@ pub(crate) async fn node_comms(
         inbox::InboxModel,
     };
 
+    let mut waiting_updates = HashMap::new();
+
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -157,11 +159,9 @@ pub(crate) async fn node_comms(
         })
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
-    crate::app::Inbox::load_all(api.sender_half(), &contracts).await;
-    crate::log::log("Loaded inbox");
+    crate::app::Inbox::load_all(api.sender_half(), &contracts, &mut waiting_updates).await;
+    crate::log::log("Loaded all inbox");
     WEB_API_SENDER.set(api.sender_half()).unwrap();
-
-    let mut waiting_updates = HashMap::new();
 
     async fn handle_action(
         req: AsyncAction,
