@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Display, io::Cursor};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    component_interface::{Component, ComponentKey, InboundComponentMsg, OutboundComponentMsg},
+    delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
     prelude::{
         ContractKey, RelatedContracts, StateSummary, TryFromTsStd, UpdateData, WrappedState,
         WsApiError,
@@ -70,7 +70,7 @@ impl std::error::Error for ClientError {}
 #[derive(Serialize, Deserialize, Debug, Clone)]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum ClientRequest<'a> {
-    ComponentOp(#[serde(borrow)] ComponentRequest<'a>),
+    DelegateOp(#[serde(borrow)] DelegateRequest<'a>),
     ContractOp(#[serde(borrow)] ContractRequest<'a>),
     GenerateRandData { bytes: usize },
     Disconnect { cause: Option<String> },
@@ -108,9 +108,9 @@ impl ClientRequest<'_> {
                 };
                 owned.into()
             }
-            ClientRequest::ComponentOp(op) => {
+            ClientRequest::DelegateOp(op) => {
                 let op = op.into_owned();
-                ClientRequest::ComponentOp(op)
+                ClientRequest::DelegateOp(op)
             }
             ClientRequest::GenerateRandData { bytes } => ClientRequest::GenerateRandData { bytes },
             ClientRequest::Disconnect { cause } => ClientRequest::Disconnect { cause },
@@ -222,51 +222,49 @@ impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
     }
 }
 
-impl<'a> From<ComponentRequest<'a>> for ClientRequest<'a> {
-    fn from(op: ComponentRequest<'a>) -> Self {
-        ClientRequest::ComponentOp(op)
+impl<'a> From<DelegateRequest<'a>> for ClientRequest<'a> {
+    fn from(op: DelegateRequest<'a>) -> Self {
+        ClientRequest::DelegateOp(op)
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ComponentRequest<'a> {
+pub enum DelegateRequest<'a> {
     ApplicationMessages {
-        key: ComponentKey,
-        inbound: Vec<InboundComponentMsg<'a>>,
+        key: DelegateKey,
+        inbound: Vec<InboundDelegateMsg<'a>>,
     },
-    RegisterComponent {
+    RegisterDelegate {
         #[serde(borrow)]
-        component: Component<'a>,
+        component: Delegate<'a>,
         cipher: [u8; 24],
         nonce: [u8; 24],
     },
-    UnregisterComponent(ComponentKey),
+    UnregisterDelegate(DelegateKey),
 }
 
-impl ComponentRequest<'_> {
-    pub fn into_owned(self) -> ComponentRequest<'static> {
+impl DelegateRequest<'_> {
+    pub fn into_owned(self) -> DelegateRequest<'static> {
         match self {
-            ComponentRequest::ApplicationMessages { key, inbound } => {
-                ComponentRequest::ApplicationMessages {
+            DelegateRequest::ApplicationMessages { key, inbound } => {
+                DelegateRequest::ApplicationMessages {
                     key,
                     inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
                 }
             }
-            ComponentRequest::RegisterComponent {
+            DelegateRequest::RegisterDelegate {
                 component,
                 cipher,
                 nonce,
             } => {
                 let component = component.into_owned();
-                ComponentRequest::RegisterComponent {
+                DelegateRequest::RegisterDelegate {
                     component,
                     cipher,
                     nonce,
                 }
             }
-            ComponentRequest::UnregisterComponent(key) => {
-                ComponentRequest::UnregisterComponent(key)
-            }
+            DelegateRequest::UnregisterDelegate(key) => DelegateRequest::UnregisterDelegate(key),
         }
     }
 }
@@ -290,7 +288,7 @@ impl Display for ClientRequest<'_> {
                 }
                 ContractRequest::Subscribe { key, .. } => write!(f, "subscribe request for {key}"),
             },
-            ClientRequest::ComponentOp(_op) => write!(f, "component request"),
+            ClientRequest::DelegateOp(_op) => write!(f, "component request"),
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
             ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }
@@ -301,9 +299,9 @@ impl Display for ClientRequest<'_> {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HostResponse<T = WrappedState, U = Vec<u8>> {
     ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),
-    ComponentResponse {
-        key: ComponentKey,
-        values: Vec<OutboundComponentMsg>,
+    DelegateResponse {
+        key: DelegateKey,
+        values: Vec<OutboundDelegateMsg>,
     },
     GenerateRandData(U),
     /// A requested action which doesn't require an answer was performed successfully.
@@ -348,7 +346,7 @@ impl std::fmt::Display for HostResponse {
                     f.write_fmt(format_args!("update notification (key: {key})"))
                 }
             },
-            HostResponse::ComponentResponse { .. } => write!(f, "component responses"),
+            HostResponse::DelegateResponse { .. } => write!(f, "component responses"),
             HostResponse::Ok => write!(f, "ok response"),
             HostResponse::GenerateRandData(_) => write!(f, "random bytes"),
         }

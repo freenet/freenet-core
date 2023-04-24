@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
-use locutus_stdlib::prelude::{ComponentKey, ContractKey};
+use locutus_stdlib::prelude::{ContractKey, DelegateKey};
 
-use crate::{component, runtime, secrets_store};
+use crate::{delegate, runtime, secrets_store};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
@@ -15,7 +15,7 @@ impl ContractError {
     }
 
     pub fn is_component_exec_error(&self) -> bool {
-        matches!(&*self.0, RuntimeInnerError::ComponentExecError(_))
+        matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
     }
 }
 
@@ -48,7 +48,7 @@ impl_err!(locutus_stdlib::buf::Error);
 impl_err!(std::io::Error);
 impl_err!(secrets_store::SecretStoreError);
 impl_err!(bincode::Error);
-impl_err!(component::ComponentExecError);
+impl_err!(delegate::DelegateExecError);
 impl_err!(runtime::ContractExecError);
 #[cfg(test)]
 impl_err!(wasmer_wasi::WasiStateCreationError);
@@ -79,10 +79,10 @@ pub(crate) enum RuntimeInnerError {
 
     // component runtime errors
     #[error("component {0} not found in store")]
-    ComponentNotFound(ComponentKey),
+    DelegateNotFound(DelegateKey),
 
     #[error(transparent)]
-    ComponentExecError(#[from] component::ComponentExecError),
+    DelegateExecError(#[from] delegate::DelegateExecError),
 
     // contract runtime  errors
     #[error("contract {0} not found in store")]

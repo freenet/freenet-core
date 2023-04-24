@@ -633,7 +633,7 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
-/// Data associated with a contract that can be retrieved by Applications and Components.
+/// Data associated with a contract that can be retrieved by Applications and Delegates.
 ///
 /// For efficiency and flexibility, contract state is represented as a simple [u8] byte array.
 #[serde_as]

@@ -13,12 +13,12 @@ The kernel is the core of Freenet, it's the software that runs on the user's
 computer. It's responsible for:
 
 * Providing a user-friendly interface to access Freenet via a web browser
-* Host the user's delegates and the private data they store
-* Host contracts and their associated data on behalf of the network
+* Host the user's [delegates](#delegates) and the private data they store
+* Host [contracts](#contracts) and their associated data on behalf of the network
 * Manage communication between contracts, delegates, and UI componets
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
-MB), efficient, and run on a wide range of devices like smartphones, desktop
+MB), efficient, and able to run on a wide range of devices like smartphones, desktop
 computers, and embedded devices.
 
 ## User Interface
@@ -47,7 +47,7 @@ Contracts in Freenet are [WebAssembly](https://webassembly.org) components that
 manage and regulate public state. They can be likened to inodes in a filesystem,
 tables in a database, or memory locations in a globally shared memory. Contracts
 define the circumstances under which state can be modified and whether a given
-state is allowed under the contract.
+state is allowed.
 
 Contracts and their associated state reside on the Freenet network on peers
 determined by the contract's location, which is derived from its WebAssembly
@@ -77,8 +77,7 @@ key.
 ## Delegates
 
 Delegates are WebAssembly code that act as user avatars on Freenet, they
-must implement the
-[ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
+must implement the [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121).
 
 Delegates run in the Freenet kernel and manage private data and interact with
 other Freenet entities like contracts, apps, and other delegates on behalf of
