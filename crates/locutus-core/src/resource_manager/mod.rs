@@ -46,7 +46,8 @@ impl ResourceManager {
     /// Each candidate peer is accompanied by an `f64` value representing its usefulness, typically
     /// measured as the number of requests sent to the peer over a certain period of time.
     ///
-    /// The function returns a list of `PeerKeyLocation` objects representing the peers that should
+    /// Peers are prioritized for deletion based on their usefulness relative to their current resource
+    /// usage. The function returns a list of `PeerKeyLocation` objects representing the peers that should
     /// be deleted. If the total resource usage is already below the limit, an empty list is returned.
     ///
     /// The usefulness value for each peer must be greater than zero. To prevent division by zero,

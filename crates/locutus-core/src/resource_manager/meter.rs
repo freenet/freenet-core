@@ -1,4 +1,3 @@
-
 use std::{hash::Hash};
 
 use dashmap::DashMap;
@@ -10,20 +9,8 @@ use super::running_average::RunningAverage;
 
 const RUNNING_AVERAGE_WINDOW_SIZE: usize = 20;
 
-pub struct ResourceTotals {
-    pub map: DashMap<ResourceType, RunningAverage>,
-}
-
-impl ResourceTotals {
-    fn new() -> Self {
-        ResourceTotals {
-            map: DashMap::new(),
-        }
-    }
-}
-
-type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
-
+/// A structure that keeps track of the usage of dynamic resources which are consumed over time.
+/// It provides methods to report and query resource usage, both total and attributed to specific sources.
 pub struct Meter {
     totals_by_resource: ResourceTotals,
     attribution_meters: AttributionMeters,
@@ -82,7 +69,7 @@ impl Meter {
         let resource_map = self
             .attribution_meters
             .entry(attribution.clone())
-            .or_insert_with(|| ResourceTotals::new());
+            .or_insert_with(ResourceTotals::new);
         let mut resource_value = resource_map
             .map
             .entry(resource)
@@ -103,6 +90,21 @@ pub enum ResourceType {
     InboundBandwidthBytes,
     OutboundBandwidthBytes,
     CpuInstructions,
+}
+
+type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
+
+/// A structure that holds running averages of resource usage for different resource types.
+struct ResourceTotals {
+    pub map: DashMap<ResourceType, RunningAverage>,
+}
+
+impl ResourceTotals {
+    fn new() -> Self {
+        ResourceTotals {
+            map: DashMap::new(),
+        }
+    }
 }
 
 // Tests
