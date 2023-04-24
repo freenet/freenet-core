@@ -3,7 +3,6 @@ mod config;
 mod contract;
 mod executor;
 mod message;
-mod meter;
 mod node;
 mod operations;
 mod resource_manager;
