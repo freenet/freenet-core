@@ -31,7 +31,7 @@ impl ResourceManager {
     /// Report the use of a resource.
     pub fn report(
         &self,
-        time: Instant,
+        _time: Instant,
         attribution: &AttributionSource,
         resource: ResourceType,
         value: f64,

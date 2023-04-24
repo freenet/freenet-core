@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
-use std::{hash::Hash, time::Instant};
+
+use std::{hash::Hash};
 
 use dashmap::DashMap;
 use locutus_runtime::{ComponentKey, ContractInstanceId};
@@ -41,7 +41,7 @@ impl Meter {
     pub fn total_usage(&self, resource: ResourceType) -> f64 {
         // Try to get a mutable reference to the Meter for the given resource
         match self.totals_by_resource.map.get_mut(&resource) {
-            Some(mut meter) => {
+            Some(meter) => {
                 // Get the current measurement value
                 meter.per_second_measurement()
             }
@@ -55,7 +55,7 @@ impl Meter {
             Some(attribution_meters) => {
                 // Try to get a mutable reference to the Meter for the given resource
                 match attribution_meters.map.get_mut(&resource) {
-                    Some(mut meter) => {
+                    Some(meter) => {
                         // Get the current measurement value
                         meter.per_second_measurement()
                     }
