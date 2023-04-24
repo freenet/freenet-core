@@ -114,14 +114,9 @@ impl BytesPerSecond {
     pub fn new(bytes_per_second: f64) -> Self {
         BytesPerSecond(bytes_per_second)
     }
-
-    // Additional method to convert to bits per second
-    pub fn to_bits_per_second(&self) -> f64 {
-        self.0 * 8.0
-    }
 }
 
-impl From<BytesPerSecond> for f64car {
+impl From<BytesPerSecond> for f64 {
     fn from(val: BytesPerSecond) -> Self {
         val.0
     }
