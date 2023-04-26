@@ -5,19 +5,19 @@ use stretto::Cache;
 
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
-use locutus_stdlib::prelude::{Component, ComponentKey};
+use locutus_stdlib::prelude::{Delegate, DelegateKey};
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
 
-type ComponentCodeKey = [u8; 32];
+type DelegateCodeKey = [u8; 32];
 
 #[derive(Serialize, Deserialize, Default)]
-struct KeyToCodeMap(Vec<(ComponentKey, ComponentCodeKey)>);
+struct KeyToCodeMap(Vec<(DelegateKey, DelegateCodeKey)>);
 
 impl StoreEntriesContainer for KeyToCodeMap {
-    type MemContainer = Arc<DashMap<ComponentKey, ComponentCodeKey>>;
-    type Key = ComponentKey;
-    type Value = ComponentCodeKey;
+    type MemContainer = Arc<DashMap<DelegateKey, DelegateCodeKey>>;
+    type Key = DelegateKey;
+    type Value = DelegateCodeKey;
 
     fn update(self, container: &mut Self::MemContainer) {
         for (k, v) in self.0 {
@@ -34,8 +34,8 @@ impl StoreEntriesContainer for KeyToCodeMap {
     }
 }
 
-impl From<&DashMap<ComponentKey, ComponentCodeKey>> for KeyToCodeMap {
-    fn from(vals: &DashMap<ComponentKey, ComponentCodeKey>) -> Self {
+impl From<&DashMap<DelegateKey, DelegateCodeKey>> for KeyToCodeMap {
+    fn from(vals: &DashMap<DelegateKey, DelegateCodeKey>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
             map.push((r.key().clone(), *r.value()));
@@ -44,18 +44,18 @@ impl From<&DashMap<ComponentKey, ComponentCodeKey>> for KeyToCodeMap {
     }
 }
 
-pub struct ComponentStore {
+pub struct DelegateStore {
     components_dir: PathBuf,
-    component_cache: Cache<ComponentCodeKey, Component<'static>>,
-    key_to_component_part: Arc<DashMap<ComponentKey, ComponentCodeKey>>,
+    component_cache: Cache<DelegateCodeKey, Delegate<'static>>,
+    key_to_component_part: Arc<DashMap<DelegateKey, DelegateCodeKey>>,
 }
 
 static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
-impl StoreFsManagement<KeyToCodeMap> for ComponentStore {}
+impl StoreFsManagement<KeyToCodeMap> for DelegateStore {}
 
-impl ComponentStore {
+impl DelegateStore {
     /// # Arguments
     /// - max_size: max size in bytes of the components being cached
     pub fn new(components_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
@@ -96,7 +96,7 @@ impl ComponentStore {
     }
 
     // Returns a copy of the component bytes if available, none otherwise.
-    pub fn fetch_component(&self, key: &ComponentKey) -> Option<Component<'static>> {
+    pub fn fetch_component(&self, key: &DelegateKey) -> Option<Delegate<'static>> {
         if let Some(component) = self.component_cache.get(key.code_hash()) {
             return Some(component.value().clone());
         }
@@ -105,7 +105,7 @@ impl ComponentStore {
                 .components_dir
                 .join(key.encode())
                 .with_extension("wasm");
-            let component = Component::try_from(component_path.as_path()).ok()?;
+            let component = Delegate::try_from(component_path.as_path()).ok()?;
             let size = component.as_ref().len() as i64;
             self.component_cache
                 .insert(*key.code_hash(), component.clone(), size);
@@ -113,7 +113,7 @@ impl ComponentStore {
         })
     }
 
-    pub fn store_component(&mut self, component: Component<'_>) -> RuntimeResult<()> {
+    pub fn store_component(&mut self, component: Delegate<'_>) -> RuntimeResult<()> {
         let key = component.key();
         let component_hash = key.code_hash();
 
@@ -133,7 +133,7 @@ impl ComponentStore {
             .components_dir
             .join(key.encode())
             .with_extension("wasm");
-        if let Ok(component) = Component::try_from(component_path.as_path()) {
+        if let Ok(component) = Delegate::try_from(component_path.as_path()) {
             let size = component.as_ref().len() as i64;
             self.component_cache
                 .insert(*component_hash, component.clone(), size);
@@ -144,7 +144,7 @@ impl ComponentStore {
         let data = component.as_ref();
         let code_size = data.len() as i64;
         self.component_cache
-            .insert(*component_hash, Component::from(data.to_vec()), code_size);
+            .insert(*component_hash, Delegate::from(data.to_vec()), code_size);
 
         let mut output: Vec<u8> = Vec::with_capacity(code_size as usize);
         output.append(&mut component.as_ref().to_vec());
@@ -154,7 +154,7 @@ impl ComponentStore {
         Ok(())
     }
 
-    pub fn remove_component(&mut self, key: &ComponentKey) -> RuntimeResult<()> {
+    pub fn remove_component(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
         self.component_cache.remove(key.code_hash());
         let cmp_path = self
             .components_dir
@@ -167,17 +167,17 @@ impl ComponentStore {
         }
     }
 
-    pub fn get_component_path(&mut self, key: &ComponentKey) -> RuntimeResult<PathBuf> {
+    pub fn get_component_path(&mut self, key: &DelegateKey) -> RuntimeResult<PathBuf> {
         let key_path = key.encode().to_lowercase();
         Ok(self.components_dir.join(key_path).with_extension("wasm"))
     }
 
-    pub fn code_hash_from_key(&self, key: &ComponentKey) -> Option<ComponentCodeKey> {
+    pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<DelegateCodeKey> {
         self.key_to_component_part.get(key).map(|r| *r.value())
     }
 }
 
-impl Default for ComponentStore {
+impl Default for DelegateStore {
     fn default() -> Self {
         Self {
             components_dir: Default::default(),
@@ -197,8 +197,8 @@ mod test {
             .join("locutus-test")
             .join("component-store-test");
         std::fs::create_dir_all(&component_dir)?;
-        let mut store = ComponentStore::new(component_dir, 10_000)?;
-        let component = Component::from(vec![0, 1, 2]);
+        let mut store = DelegateStore::new(component_dir, 10_000)?;
+        let component = Delegate::from(vec![0, 1, 2]);
         store.store_component(component.clone())?;
         let f = store.fetch_component(component.key());
         assert!(f.is_some());

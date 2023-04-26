@@ -2,14 +2,14 @@
 
 use wasmer::TypedFunction;
 
-use crate::{ComponentStore, Runtime, SecretsStore};
+use crate::{DelegateStore, Runtime, SecretsStore};
 
 #[test]
 fn now() -> Result<(), Box<dyn std::error::Error>> {
     let (store, key) = super::setup_test_contract("test_contract_2")?;
     let mut runtime = Runtime::build(
         store,
-        ComponentStore::default(),
+        DelegateStore::default(),
         SecretsStore::default(),
         false,
     )

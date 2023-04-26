@@ -77,8 +77,7 @@ key.
 ## Delegates
 
 Delegates are WebAssembly code that act as user avatars on Freenet, they
-must implement the
-[ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
+must implement the [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121).
 
 Delegates run in the Freenet kernel and manage private data and interact with
 other Freenet entities like contracts, apps, and other delegates on behalf of
