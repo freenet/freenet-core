@@ -274,24 +274,27 @@ mod tests {
         let mut peers = vec![];
         for _ in 0..5 {
             let peer = PeerKeyLocation::random();
-            peers.push(&peer);
+            peers.push(peer);
         }
-
+    
         // Create a router with no historical data
         let router = Router::new(&[]);
-
+    
         for _ in 0..10 {
             let contract_location = Location::random();
-            let best = router.select_peer(peers, &contract_location).unwrap();
+            // Pass a reference to the `peers` vector
+            let best = router.select_peer(&peers, &contract_location).unwrap();
             let best_distance = best.location.unwrap().distance(&contract_location);
-            for peer in peers.clone() {
-                if peer != best {
+            for peer in &peers {
+                // Dereference `best` when making the comparison
+                if *peer != *best {
                     let distance = peer.location.unwrap().distance(&contract_location);
                     assert!(distance >= best_distance);
                 }
             }
         }
     }
+    
 
     #[test]
     fn test_request_time() {
