@@ -44,30 +44,37 @@ impl IsotonicEstimator {
             EstimatorType::Negative => IsotonicRegression::new_descending(&all_points),
         };
 
+        let adjustment_prior_size = 20;
+        let global_regression_big_enough_to_estimate_peer_adjustments =
+            global_regression.len() >= adjustment_prior_size;
+
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
-        // Use the constant defined earlier.
-        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
+        if global_regression_big_enough_to_estimate_peer_adjustments {
+            // Use the constant defined earlier.
+            let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
 
-        // Use more descriptive variable names.
-        for (peer_location, events) in peer_events.iter() {
-            let mut event_count: u64 = adjustment_prior_size;
-            let mut total_adjustment: f64 = 0.0;
-            for event in events {
-                let peer_adjustment = event.result
-                    - global_regression
+            // Use more descriptive variable names.
+            for (peer_location, events) in peer_events.iter() {
+                let mut event_count: u64 = adjustment_prior_size;
+                let mut total_adjustment: f64 = 0.0;
+                for event in events {
+                    let global_estimate_from_distance = global_regression
                         .interpolate(event.route_distance())
-                        .unwrap();
-                event_count += 1;
-                total_adjustment += peer_adjustment;
+                        .expect("Regression should always produce an estimate");
+                    let peer_adjustment = event.result - global_estimate_from_distance;
+
+                    event_count += 1;
+                    total_adjustment += peer_adjustment;
+                }
+                peer_adjustments.insert(
+                    *peer_location,
+                    Adjustment {
+                        sum: total_adjustment,
+                        count: event_count,
+                    },
+                );
             }
-            peer_adjustments.insert(
-                *peer_location,
-                Adjustment {
-                    sum: total_adjustment,
-                    count: event_count,
-                },
-            );
         }
 
         IsotonicEstimator {
@@ -84,18 +91,25 @@ impl IsotonicEstimator {
 
         self.global_regression.add_points(&[point]);
 
-        let adjustment = event.result - self.global_regression.interpolate(route_distance).unwrap();
+        let adjustment_prior_size = 20;
+        let global_regression_big_enough_to_estimate_peer_adjustments =
+            self.global_regression.len() >= adjustment_prior_size;
 
-        self.peer_adjustments
-            .entry(event.peer)
-            .or_insert_with(Adjustment::default)
-            .add(adjustment);
+        if global_regression_big_enough_to_estimate_peer_adjustments {
+            let adjustment =
+                event.result - self.global_regression.interpolate(route_distance).unwrap();
+
+            self.peer_adjustments
+                .entry(event.peer)
+                .or_insert_with(Adjustment::default)
+                .add(adjustment);
+        }
     }
 
     pub fn estimate_retrieval_time(
         &self,
         peer: &PeerKeyLocation,
-        contract_location: Location,
+        contract_location: &Location,
     ) -> Result<f64, EstimationError> {
         // Check if there are enough data points that the model won't produce
         // garbage output, but users of this class must implement their own checks
@@ -148,7 +162,6 @@ pub(crate) enum EstimationError {
 /// the result of the request, such as the time it took to retrieve the contract.
 #[derive(Debug, Clone)]
 pub(crate) struct IsotonicEvent {
-    // TODO: Make generic on route type
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
     /// The result of the routing event, which is used to train the estimator, typically the time
@@ -237,7 +250,7 @@ mod tests {
         let mut errors = Vec::new();
         for event in testing_events {
             let estimated_time = estimator
-                .estimate_retrieval_time(&event.peer, event.contract_location)
+                .estimate_retrieval_time(&event.peer, &event.contract_location)
                 .unwrap();
             let actual_time = event.result;
             let error = (estimated_time - actual_time).abs();
@@ -274,7 +287,7 @@ mod tests {
         let mut errors = Vec::new();
         for event in testing_events {
             let estimated_time = estimator
-                .estimate_retrieval_time(&event.peer, event.contract_location)
+                .estimate_retrieval_time(&event.peer, &event.contract_location)
                 .unwrap();
             let actual_time = event.result;
             let error = (estimated_time - actual_time).abs();
