@@ -11,11 +11,11 @@ use locutus_stdlib::prelude::*;
 type SecretKey = [u8; 32];
 
 #[derive(Serialize, Deserialize, Default)]
-struct KeyToEncryptionMap(Vec<(ComponentKey, Vec<SecretKey>)>);
+struct KeyToEncryptionMap(Vec<(DelegateKey, Vec<SecretKey>)>);
 
 impl StoreEntriesContainer for KeyToEncryptionMap {
-    type MemContainer = Arc<DashMap<ComponentKey, Vec<SecretKey>>>;
-    type Key = ComponentKey;
+    type MemContainer = Arc<DashMap<DelegateKey, Vec<SecretKey>>>;
+    type Key = DelegateKey;
     type Value = Vec<SecretKey>;
 
     fn update(self, container: &mut Self::MemContainer) {
@@ -49,8 +49,8 @@ pub enum SecretStoreError {
     MissingCipher,
 }
 
-impl From<&DashMap<ComponentKey, Vec<SecretKey>>> for KeyToEncryptionMap {
-    fn from(vals: &DashMap<ComponentKey, Vec<SecretKey>>) -> Self {
+impl From<&DashMap<DelegateKey, Vec<SecretKey>>> for KeyToEncryptionMap {
+    fn from(vals: &DashMap<DelegateKey, Vec<SecretKey>>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
             map.push((r.key().clone(), r.value().clone()));
@@ -68,8 +68,8 @@ struct Encryption {
 #[derive(Default)]
 pub struct SecretsStore {
     base_path: PathBuf,
-    ciphers: HashMap<ComponentKey, Encryption>,
-    key_to_secret_part: Arc<DashMap<ComponentKey, Vec<SecretKey>>>,
+    ciphers: HashMap<DelegateKey, Encryption>,
+    key_to_secret_part: Arc<DashMap<DelegateKey, Vec<SecretKey>>>,
 }
 
 static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
@@ -116,7 +116,7 @@ impl SecretsStore {
 
     pub fn register_component(
         &mut self,
-        component: ComponentKey,
+        component: DelegateKey,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> Result<(), SecretStoreError> {
@@ -128,7 +128,7 @@ impl SecretsStore {
 
     pub fn store_secret(
         &mut self,
-        component: &ComponentKey,
+        component: &DelegateKey,
         key: &SecretsId,
         plaintext: Vec<u8>,
     ) -> RuntimeResult<()> {
@@ -156,7 +156,7 @@ impl SecretsStore {
 
     pub fn remove_secret(
         &mut self,
-        component: &ComponentKey,
+        component: &DelegateKey,
         key: &SecretsId,
     ) -> Result<(), SecretStoreError> {
         let secret_path = self.base_path.join(component.encode()).join(key.encode());
@@ -169,7 +169,7 @@ impl SecretsStore {
 
     pub fn get_secret(
         &self,
-        component: &ComponentKey,
+        component: &DelegateKey,
         key: &SecretsId,
     ) -> Result<Vec<u8>, SecretStoreError> {
         let secret_path = self.base_path.join(component.encode()).join(key.encode());
@@ -200,7 +200,7 @@ mod test {
 
         let mut store = SecretsStore::new(secrets_dir)?;
 
-        let component = Component::from(vec![0, 1, 2]);
+        let component = Delegate::from(vec![0, 1, 2]);
 
         let cipher = XChaCha20Poly1305::new(&XChaCha20Poly1305::generate_key(&mut OsRng));
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
