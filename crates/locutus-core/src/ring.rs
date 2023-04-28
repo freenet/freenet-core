@@ -498,8 +498,8 @@ pub struct Distance(f64);
 
 impl Distance {
     pub fn new(value: f64) -> Self {
-        debug_assert!(!value.is_nan());
-        debug_assert!((0.0..=0.5).contains(&value));
+        debug_assert!(!value.is_nan(), "Distance cannot be NaN");
+        debug_assert!((0.0..=0.5).contains(&value), "Distance must be in the range [0, 0.5]");
         Distance(value)
     }
 
