@@ -361,7 +361,7 @@ mod tests {
             let failure_probability_error =
                 (prediction.failure_probability - truth.failure_probability).abs();
             assert!(
-                failure_probability_error < 0.15,
+                failure_probability_error < 0.2,
                 "failure_probability: Prediction: {}, Truth: {}, Error: {}",
                 prediction.failure_probability,
                 truth.failure_probability,

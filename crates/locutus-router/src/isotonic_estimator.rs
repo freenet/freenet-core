@@ -1,4 +1,4 @@
-use locutus_core::ring::PeerKeyLocation;
+use locutus_core::ring::{PeerKeyLocation, Distance};
 use locutus_core::Location;
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
@@ -33,7 +33,7 @@ impl IsotonicEstimator {
         let mut peer_events: HashMap<PeerKeyLocation, Vec<IsotonicEvent>> = HashMap::new();
 
         for event in history {
-            let point = Point::new(event.route_distance(), event.result);
+            let point = Point::new(event.route_distance().as_f64(), event.result);
 
             all_points.push(point);
             peer_events.entry(event.peer).or_default().push(event);
@@ -60,7 +60,7 @@ impl IsotonicEstimator {
                 let mut total_adjustment: f64 = 0.0;
                 for event in events {
                     let global_estimate_from_distance = global_regression
-                        .interpolate(event.route_distance())
+                        .interpolate(event.route_distance().as_f64())
                         .expect("Regression should always produce an estimate");
                     let peer_adjustment = event.result - global_estimate_from_distance;
 
@@ -87,7 +87,7 @@ impl IsotonicEstimator {
     pub fn add_event(&mut self, event: IsotonicEvent) {
         let route_distance = event.route_distance();
 
-        let point = Point::new(route_distance, event.result);
+        let point = Point::new(route_distance.as_f64(), event.result);
 
         self.global_regression.add_points(&[point]);
 
@@ -97,7 +97,7 @@ impl IsotonicEstimator {
 
         if global_regression_big_enough_to_estimate_peer_adjustments {
             let adjustment =
-                event.result - self.global_regression.interpolate(route_distance).unwrap();
+                event.result - self.global_regression.interpolate(route_distance.as_f64()).unwrap();
 
             self.peer_adjustments
                 .entry(event.peer)
@@ -119,7 +119,7 @@ impl IsotonicEstimator {
             return Err(EstimationError::InsufficientData);
         }
 
-        let distance: f64 = contract_location.distance(&peer.location.unwrap()).into();
+        let distance: f64 = contract_location.distance(&peer.location.unwrap()).as_f64();
 
         let global_estimate = self.global_regression.interpolate(distance).unwrap();
 
@@ -171,10 +171,9 @@ pub(crate) struct IsotonicEvent {
 }
 
 impl IsotonicEvent {
-    fn route_distance(&self) -> f64 {
+    fn route_distance(&self) -> Distance {
         self.contract_location
             .distance(&self.peer.location.unwrap())
-            .into()
     }
 }
 
@@ -304,7 +303,7 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(&contract_location).into();
+        let distance: f64 = peer.location.unwrap().distance(&contract_location).as_f64();
 
         let result = distance.powf(0.5) + peer.peer.to_bytes()[0] as f64;
         IsotonicEvent {
@@ -318,7 +317,7 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(&contract_location).into();
+        let distance: f64 = peer.location.unwrap().distance(&contract_location).as_f64();
 
         let result = (100.0 - distance).powf(0.5) + peer.peer.to_bytes()[0] as f64;
         IsotonicEvent {
