@@ -35,10 +35,19 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// The location of a peer in the ring. This location allows routing towards the peer.
-pub(crate) struct PeerKeyLocation {
+pub struct PeerKeyLocation {
     pub peer: PeerKey,
     /// An unspecified location means that the peer hasn't been asigned a location, yet.
     pub location: Option<Location>,
+}
+
+impl PeerKeyLocation {
+    pub fn random() -> Self {
+        PeerKeyLocation {
+            peer: PeerKey::random(),
+            location: Some(Location::random()),
+        }
+    }
 }
 
 impl From<PeerKey> for PeerKeyLocation {
@@ -404,6 +413,10 @@ impl Location {
         } else {
             Location(1.0 - d)
         }
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        self.0
     }
 }
 

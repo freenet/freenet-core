@@ -5,7 +5,7 @@ mod executor;
 mod message;
 mod node;
 mod operations;
-mod ring;
+pub mod ring;
 pub mod util;
 
 pub type WrappedContract = locutus_runtime::prelude::WrappedContract;
