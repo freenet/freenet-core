@@ -1,10 +1,5 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, WebSocketUpgrade};
-use axum::response::{Html, Response};
-use axum::routing::get;
-use axum::{Extension, Router};
 use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
@@ -23,9 +18,11 @@ use tokio::sync::{
     mpsc::{self, error::TryRecvError, UnboundedReceiver},
     Mutex,
 };
+use warp::ws::Message;
+use warp::ws::WebSocket;
+use warp::{filters::BoxedFilter, reply, Filter, Rejection, Reply};
 
-use crate::errors::WebSocketApiError;
-use crate::{web_handling, ClientConnection, DynError, HostCallbackResult};
+use crate::{errors, ClientConnection, DynError, HostCallbackResult};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
@@ -44,8 +41,8 @@ pub struct HttpGateway {
 }
 
 impl HttpGateway {
-    /// Returns the uninitialized axum router to compose with other routing handling or websockets.
-    pub fn as_router() -> (Self, Router) {
+    /// Returns the uninitialized warp filter to compose with other routing handling or websockets.
+    pub fn as_filter() -> (Self, BoxedFilter<(impl Reply + 'static,)>) {
         let contract_web_path = std::env::temp_dir().join("locutus").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
 
@@ -55,14 +52,45 @@ impl HttpGateway {
             response_channels: HashMap::new(),
         };
 
-        let router = Router::new()
-            .route("/", get(home))
-            .route("/contract/command/", get(websocket_commands))
-            .route("/contract/web/:key/", get(web_home))
-            .route("/contract/web/:key/*path", get(web_subpages))
-            .layer(Extension(request_sender));
+        let get_home = warp::path::end().and_then(home);
+        let base_web_contract = warp::path::path("contract").and(warp::path::path("web"));
 
-        (gateway, router)
+        let rs = request_sender.clone();
+        let websocket_commands = warp::path!("contract" / "command")
+            .map(move || rs.clone())
+            .and(warp::path::end())
+            .and(warp::ws())
+            .map(|rs, ws: warp::ws::Ws| {
+                ws.on_upgrade(|ws: WebSocket| async {
+                    if let Err(e) = websocket_interface(rs, ws).await {
+                        tracing::error!("{e}");
+                    }
+                })
+            });
+
+        let web_home = base_web_contract
+            .map(move || request_sender.clone())
+            .and(warp::path::param())
+            .and(warp::path::end())
+            .and_then(|rs, key: String| async move {
+                crate::web_handling::contract_home(key, rs).await
+            });
+
+        let web_subpages = base_web_contract
+            .and(warp::path::param())
+            .and(warp::filters::path::full())
+            .and_then(|key: String, path| async move {
+                crate::web_handling::variable_content(key, path).await
+            });
+
+        let filters = websocket_commands
+            .or(get_home)
+            .or(web_home)
+            .or(web_subpages)
+            .recover(errors::handle_error)
+            .with(warp::trace::request());
+
+        (gateway, filters.boxed())
     }
 
     pub fn next_client_id() -> ClientId {
@@ -89,34 +117,8 @@ async fn new_client_connection(
     }
 }
 
-async fn home() -> axum::response::Response {
-    axum::response::Response::default()
-}
-
-async fn web_home(
-    Path(key): Path<String>,
-    Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
-) -> Result<Html<String>, WebSocketApiError> {
-    web_handling::contract_home(key, rs).await
-}
-
-async fn web_subpages(
-    Path((key, last_path)): Path<(String, String)>,
-) -> Result<Html<String>, WebSocketApiError> {
-    let full_path: String = format!("/contract/web/{}/{}", key, last_path);
-    web_handling::variable_content(key, full_path).await
-}
-
-async fn websocket_commands(
-    ws: WebSocketUpgrade,
-    Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
-) -> Response {
-    let on_upgrade = move |ws: WebSocket| async move {
-        if let Err(e) = websocket_interface(rs.clone(), ws).await {
-            tracing::error!("{e}");
-        }
-    };
-    ws.on_upgrade(on_upgrade)
+async fn home() -> Result<impl Reply, Rejection> {
+    Ok(reply::reply())
 }
 
 async fn websocket_interface(
@@ -191,7 +193,7 @@ async fn websocket_interface(
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
                 let msg = rmp_serde::to_vec(&response)?;
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::binary(msg)).await?;
             }
         }
     }
@@ -204,21 +206,21 @@ struct NewSubscription {
 
 async fn process_client_request(
     client_id: ClientId,
-    msg: Result<Message, axum::Error>,
+    msg: Result<Message, warp::Error>,
     request_sender: &mpsc::Sender<ClientConnection>,
 ) -> Result<Option<Message>, Option<DynError>> {
     let msg = match msg {
-        Ok(Message::Binary(data)) => data,
-        Ok(Message::Text(data)) => data.into_bytes(),
-        Ok(Message::Close(_)) => return Err(None),
-        Ok(Message::Ping(_)) => return Ok(Some(Message::Pong(vec![0, 3, 2]))),
+        Ok(m) if m.is_binary() || m.is_text() => m.into_bytes(),
+        Ok(m) if m.is_close() => return Err(None),
+        Ok(m) if m.is_ping() => {
+            return Ok(Some(Message::pong(vec![0, 3, 2])));
+        }
         Ok(m) => {
             tracing::debug!(msg = ?m, "received random message");
             return Ok(None);
         }
         Err(err) => return Err(Some(err.into())),
     };
-
     let req: ClientRequest = {
         match ContractRequest::try_decode(&msg) {
             Ok(r) => r.into(),
@@ -230,7 +232,7 @@ async fn process_client_request(
                     .into(),
                 ))
                 .map_err(|err| Some(err.into()))?;
-                return Ok(Some(Message::Binary(result_error)));
+                return Ok(Some(Message::binary(result_error)));
             }
         }
     };
@@ -267,7 +269,7 @@ async fn process_host_response(
                 }
             };
             let res = rmp_serde::to_vec(&result)?;
-            tx.send(Message::Binary(res)).await?;
+            tx.send(Message::binary(res)).await?;
             Ok(None)
         }
         Some(HostCallbackResult::SubscriptionChannel { key, id, callback }) => {
@@ -278,8 +280,8 @@ async fn process_host_response(
             let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
                 ErrorKind::NodeUnavailable.into(),
             ))?;
-            tx.send(Message::Binary(result_error)).await?;
-            tx.send(Message::Close(None)).await?;
+            tx.send(Message::binary(result_error)).await?;
+            tx.send(Message::close()).await?;
             tracing::warn!("node shut down while handling responses for {client_id}");
             Err(format!("node shut down while handling responses for {client_id}").into())
         }

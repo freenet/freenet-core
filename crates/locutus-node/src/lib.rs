@@ -45,8 +45,8 @@ pub mod local_node {
         mut executor: Executor,
         socket: SocketAddr,
     ) -> Result<(), DynError> {
-        let (mut http_handle, router) = HttpGateway::as_router();
-        let _ws_handle = WebSocketProxy::as_upgrade(socket, router).await?;
+        let (mut http_handle, filter) = HttpGateway::as_filter();
+        let _ws_handle = WebSocketProxy::as_upgrade(socket, filter).await?;
         // FIXME: use combinator
         // let mut all_clients =
         //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);

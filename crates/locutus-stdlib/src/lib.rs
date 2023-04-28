@@ -18,7 +18,7 @@ mod delegate_interface;
 pub(crate) mod global;
 pub mod time;
 mod versioning;
-#[cfg(feature = "archive")]
+#[cfg(feature = "xz2")]
 pub mod web;
 
 /// Locutus stdlib prelude.

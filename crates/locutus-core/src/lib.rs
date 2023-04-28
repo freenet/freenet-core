@@ -3,7 +3,7 @@ mod config;
 mod contract;
 mod executor;
 mod message;
-mod node;
+pub mod node;
 mod operations;
 pub mod ring;
 pub mod util;

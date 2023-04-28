@@ -401,7 +401,7 @@ impl Location {
     }
 }
 
-pub(crate) type Distance = Location;
+pub type Distance = Location;
 
 impl Location {
     /// Returns a new random location.

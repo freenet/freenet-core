@@ -50,10 +50,9 @@ rmp-serde = { workspace = true, optional = true }
 sqlx = { version = "0.6", features = ["sqlite", "runtime-tokio-rustls"], optional = true }
 # TODO(kakoc): clang should be installed for rocksdb; write about that in prerequisites/dev guide
 rocksdb = { version = "0.20.0", default-features = false, optional = true }
-axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
+warp = { version = "0.3", default-features = false, optional = true, features = ["multipart", "tls"] }
 
 # Tracing deps
-tower-http = { version = "0.3", features = ["trace"] }
 tracing = { version = "0.1", optional = true }
 opentelemetry = { version = "0.18.0" , default-features = false, features = ["rt-tokio", "trace"], optional = true }
 opentelemetry-jaeger = { version = "0.17.0", features = ["rt-tokio","collector_client", "isahc"], optional = true }
@@ -77,5 +76,5 @@ testing = ["arbitrary"]
 default = ["websocket", "rocks_db", "trace"]
 rocks_db = ["rocksdb"]
 sqlite = ["sqlx"]
-websocket = ["axum/ws", "rmp-serde"]
+websocket = ["warp/websocket", "rmp-serde"]
 trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]

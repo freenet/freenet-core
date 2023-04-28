@@ -27,9 +27,10 @@ rmpv = { workspace = true }
 rmp-serde = { workspace = true }
 pav_regression = "0.4.0"
 itertools = "0.10.5"
+rand = "0.8.5"
+ordered-float = "3.6.0"
 
 # internal:
 locutus-core = { path = "../locutus-core", version = "0.0.3" }
 locutus-dev = { path = "../locutus-dev", version = "0.0.3" }
 locutus-stdlib = { path = "../locutus-stdlib", version = "0.0.3" }
-rand.workspace = true
