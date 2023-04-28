@@ -396,6 +396,11 @@ impl Ring {
 pub struct Location(f64);
 
 impl Location {
+    pub fn new(location : f64) -> Self {
+        debug_assert!((0.0..=1.0).contains(&location), "Location must be in the range [0, 1]");
+        Location(location)
+    }
+
     /// Returns a new random location.
     pub fn random() -> Self {
         use rand::prelude::*;
@@ -494,6 +499,7 @@ pub struct Distance(f64);
 impl Distance {
     pub fn new(value: f64) -> Self {
         debug_assert!(!value.is_nan());
+        debug_assert!((0.0..=0.5).contains(&value));
         Distance(value)
     }
 
