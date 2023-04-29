@@ -2503,6 +2503,7 @@ dependencies = [
  "locutus-core",
  "locutus-dev",
  "locutus-stdlib",
+ "ordered-float 3.6.0",
  "pav_regression",
  "rand 0.8.5",
  "rmp",

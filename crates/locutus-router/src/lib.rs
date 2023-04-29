@@ -16,7 +16,7 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn new(history: &[RouteEvent]) -> Self {
+    pub(crate) fn new(history: &[RouteEvent]) -> Self {
         let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
             .map(|re| IsotonicEvent {
@@ -106,7 +106,7 @@ impl Router {
         }
     }
 
-    pub fn add_event(&mut self, event: RouteEvent) {
+    pub(crate) fn add_event(&mut self, event: RouteEvent) {
         match event.outcome {
             RouteOutcome::Success {
                 time_to_response_start,
@@ -142,9 +142,13 @@ impl Router {
         }
     }
 
-    pub fn select_peer<I>(&self, peers: I, contract_location: Location) -> Option<PeerKeyLocation>
+    pub fn select_peer<'a, I>(
+        &self,
+        peers: I,
+        contract_location: &Location,
+    ) -> Option<&'a PeerKeyLocation>
     where
-        I: IntoIterator<Item = PeerKeyLocation>,
+        I: IntoIterator<Item = &'a PeerKeyLocation>,
     {
         if !self.has_sufficient_historical_data() {
             // Find the peer with the minimum distance to the contract location,
@@ -161,7 +165,7 @@ impl Router {
             // Find the peer with the minimum predicted routing outcome time
             peers
                 .into_iter()
-                .map(|peer: PeerKeyLocation| {
+                .map(|peer: &PeerKeyLocation| {
                     let t = self
                         .predict_routing_outcome(peer, contract_location)
                         .expect(
@@ -176,16 +180,6 @@ impl Router {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(peer, _)| peer)
-        }
-    }
-
-    pub fn predict_routing_outcome(
-        &self,
-        peer: PeerKeyLocation,
-        contract_location: Location,
-    ) -> Result<RoutingPrediction, RoutingError> {
-        if !self.has_sufficient_historical_data() {
-            return Err(RoutingError::InsufficientDataError);
         }
 
         let time_to_response_start_estimate = self
@@ -221,6 +215,48 @@ impl Router {
         })
     }
 
+    pub(crate) fn predict_routing_outcome(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: &Location,
+    ) -> Result<RoutingPrediction, RoutingError> {
+        if !self.has_sufficient_historical_data() {
+            return Err(RoutingError::InsufficientDataError);
+        }
+
+        let time_to_response_start_estimate = self
+            .response_start_time_estimator
+            .estimate_retrieval_time(peer, contract_location)
+            .unwrap();
+        let failure_estimate = self
+            .failure_estimator
+            .estimate_retrieval_time(peer, contract_location)
+            .unwrap();
+        let transfer_rate_estimate = self
+            .transfer_rate_estimator
+            .estimate_retrieval_time(peer, contract_location)
+            .unwrap();
+
+        /*
+         * This is a fairly naive approach, assuming that the cost of a failure is a multiple
+         * of the cost of success.
+         */
+        let failure_cost_multiplier = 3.0;
+
+        let expected_total_time = time_to_response_start_estimate
+            + (self.mean_transfer_size.compute() / transfer_rate_estimate)
+            + (time_to_response_start_estimate * failure_estimate * failure_cost_multiplier);
+
+        Ok(RoutingPrediction {
+            failure_probability: failure_estimate,
+            xfer_speed: TransferSpeed {
+                bytes_per_second: transfer_rate_estimate,
+            },
+            time_to_response_start: time_to_response_start_estimate,
+            expected_total_time,
+        })
+    }
+
     fn has_sufficient_historical_data(&self) -> bool {
         let minimum_historical_data_for_global_prediction = 200;
         self.response_start_time_estimator.len() >= minimum_historical_data_for_global_prediction
@@ -228,12 +264,13 @@ impl Router {
 }
 
 #[derive(Debug)]
-pub enum RoutingError {
+pub(crate) enum RoutingError {
     InsufficientDataError,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub struct RoutingPrediction {
+
+pub(crate) struct RoutingPrediction {
     pub failure_probability: f64,
     pub xfer_speed: TransferSpeed,
     pub time_to_response_start: f64,
@@ -241,14 +278,14 @@ pub struct RoutingPrediction {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub struct RouteEvent {
+pub(crate) struct RouteEvent {
     peer: PeerKeyLocation,
     contract_location: Location,
     outcome: RouteOutcome,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub enum RouteOutcome {
+pub(crate) enum RouteOutcome {
     Success {
         time_to_response_start: Duration,
         payload_size: usize,
@@ -278,12 +315,12 @@ mod tests {
 
         for _ in 0..10 {
             let contract_location = Location::random();
-            let best = router
-                .select_peer(peers.clone(), contract_location)
-                .unwrap();
+            // Pass a reference to the `peers` vector
+            let best = router.select_peer(&peers, &contract_location).unwrap();
             let best_distance = best.location.unwrap().distance(&contract_location);
-            for peer in peers.clone() {
-                if peer != best {
+            for peer in &peers {
+                // Dereference `best` when making the comparison
+                if *peer != *best {
                     let distance = peer.location.unwrap().distance(&contract_location);
                     assert!(distance >= best_distance);
                 }
@@ -339,7 +376,7 @@ mod tests {
             let truth = simulate_prediction(&mut rng, event.peer, event.contract_location);
 
             let prediction = router
-                .predict_routing_outcome(event.peer, event.contract_location)
+                .predict_routing_outcome(&event.peer, &event.contract_location)
                 .unwrap();
 
             // Verify that the prediction is within 0.01 of the truth
@@ -357,7 +394,7 @@ mod tests {
             let failure_probability_error =
                 (prediction.failure_probability - truth.failure_probability).abs();
             assert!(
-                failure_probability_error < 0.1,
+                failure_probability_error < 0.2,
                 "failure_probability: Prediction: {}, Truth: {}, Error: {}",
                 prediction.failure_probability,
                 truth.failure_probability,

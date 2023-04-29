@@ -41,6 +41,15 @@ pub struct PeerKeyLocation {
     pub location: Option<Location>,
 }
 
+impl PeerKeyLocation {
+    pub fn random() -> Self {
+        PeerKeyLocation {
+            peer: PeerKey::random(),
+            location: Some(Location::random()),
+        }
+    }
+}
+
 impl From<PeerKey> for PeerKeyLocation {
     fn from(peer: PeerKey) -> Self {
         PeerKeyLocation {
@@ -245,7 +254,7 @@ impl Ring {
             my_location.distance(location)
                 < self
                     .median_distance_to(my_location)
-                    .unwrap_or_else(|| Distance::try_from(0.5).unwrap())
+                    .unwrap_or_else(|| Distance(0.5))
         };
         if !accepted {
             self.open_connections.fetch_sub(1, SeqCst);
@@ -393,7 +402,8 @@ impl Ring {
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
-pub struct Location(pub(crate) f64);
+
+pub struct Location(f64);
 
 impl Location {
     pub fn as_f64(&self) -> f64 {
@@ -401,9 +411,13 @@ impl Location {
     }
 }
 
-pub(crate) type Distance = Location;
 
 impl Location {
+    pub fn new(location : f64) -> Self {
+        debug_assert!((0.0..=1.0).contains(&location), "Location must be in the range [0, 1]");
+        Location(location)
+    }
+
     /// Returns a new random location.
     pub fn random() -> Self {
         use rand::prelude::*;
@@ -415,10 +429,14 @@ impl Location {
     pub fn distance(&self, other: &Location) -> Distance {
         let d = (self.0 - other.0).abs();
         if d < 0.5 {
-            Location(d)
+            Distance(d)
         } else {
-            Location(1.0 - d)
+            Distance(1.0 - d)
         }
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        self.0
     }
 }
 
@@ -492,6 +510,42 @@ impl TryFrom<f64> for Location {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct Distance(f64);
+
+impl Distance {
+    pub fn new(value: f64) -> Self {
+        debug_assert!(!value.is_nan(), "Distance cannot be NaN");
+        debug_assert!((0.0..=0.5).contains(&value), "Distance must be in the range [0, 0.5]");
+        Distance(value)
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for Distance {
+    fn eq(&self, other: &Self) -> bool {
+        (self.0 - other.0).abs() < f64::EPSILON
+    }
+}
+
+impl PartialOrd for Distance {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl Eq for Distance { }
+
+impl Ord for Distance {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other)
+            .expect("always should return a cmp value")
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]
@@ -513,11 +567,11 @@ mod test {
     fn location_dist() {
         let l0 = Location(0.);
         let l1 = Location(0.25);
-        assert!(l0.distance(&l1) == Location(0.25));
+        assert!(l0.distance(&l1) == Distance(0.25));
 
         let l0 = Location(0.75);
         let l1 = Location(0.50);
-        assert!(l0.distance(&l1) == Location(0.25));
+        assert!(l0.distance(&l1) == Distance(0.25));
     }
 
     #[ignore]
