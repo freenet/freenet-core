@@ -370,7 +370,7 @@ mod test_utils {
 
         let distances: Vec<_> = listener.connections(peer_id).collect();
         assert!(distances.len() == 3);
-        assert!((distances.iter().map(|(_, l)| l.0).sum::<f64>() - 0.5f64).abs() < f64::EPSILON);
+        assert!((distances.iter().map(|(_, l)| l.as_f64()).sum::<f64>() - 0.5f64).abs() < f64::EPSILON);
         Ok(())
     }
 }

@@ -303,7 +303,7 @@ impl SimNetwork {
         for (.., key) in &self.labels {
             all_dists.push(self.event_listener.connections(*key).into_iter());
         }
-        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l), scale)
+        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l.as_f64()), scale)
     }
 
     /// Returns the connectivity in the network per peer (that is all the connections
@@ -344,13 +344,13 @@ impl SimNetwork {
 }
 
 fn group_locations_in_buckets(
-    locs: impl IntoIterator<Item = Location>,
+    locs: impl IntoIterator<Item = f64>,
     scale: i32,
 ) -> impl Iterator<Item = (f64, usize)> {
     let mut distances = HashMap::new();
     for (bucket, group) in &locs
         .into_iter()
-        .group_by(|l| (l.0 * (10.0f64).powi(scale)).floor() as u32)
+        .group_by(|l| (l * (10.0f64).powi(scale)).floor() as u32)
     {
         let count = group.count();
         distances
@@ -430,7 +430,7 @@ pub(crate) async fn check_connectivity(
     Ok(())
 }
 
-fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Location>>) -> String {
+fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Distance>>) -> String {
     let mut connections = String::from("Node connections:\n");
     let mut conns = conns.iter().collect::<Vec<_>>();
     conns.sort_by(|a, b| a.0.cmp(b.0));
@@ -440,7 +440,7 @@ fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Location>>) 
         }
         writeln!(&mut connections, "{peer}:").unwrap();
         for (conn, dist) in conns {
-            let dist = dist.0;
+            let dist = dist.as_f64();
             writeln!(&mut connections, "    {conn} (dist: {dist:.3})").unwrap();
         }
     }
@@ -451,13 +451,13 @@ fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Location>>) 
 #[test]
 fn group_locations_test() -> Result<(), anyhow::Error> {
     let locations = vec![
-        Location::try_from(0.5356)?,
-        Location::try_from(0.5435)?,
-        Location::try_from(0.5468)?,
-        Location::try_from(0.5597)?,
-        Location::try_from(0.6745)?,
-        Location::try_from(0.7309)?,
-        Location::try_from(0.7412)?,
+        0.5356,
+        0.5435,
+        0.5468,
+        0.5597,
+        0.6745,
+        0.7309,
+        0.7412,
     ];
 
     let mut grouped: Vec<_> =
