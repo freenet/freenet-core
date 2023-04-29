@@ -32,6 +32,7 @@ pub enum SubCommand {
     New(NewPackageCliConfig),
     Publish(PutConfig),
     Execute(RunCliConfig),
+    Inspect(crate::inspect::InspectCliConfig),
 }
 
 /// Node CLI
@@ -90,7 +91,7 @@ pub struct PutConfig {
 /// This tool will build the WASM contract and publish it to the network.
 #[derive(clap::Parser, Clone, Debug)]
 pub struct BuildToolCliConfig {
-    /// Compile the contract with a specific features.
+    /// Compile the contract with specific features.
     #[clap(long)]
     pub(crate) features: Option<String>,
 
@@ -98,7 +99,7 @@ pub struct BuildToolCliConfig {
     #[clap(long)]
     pub(crate) wasi: bool,
 
-    /// Compile the contract with a specific version.
+    /// Compile the contract with a specific API version.
     #[clap(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
     pub(crate) version: Version,
 }

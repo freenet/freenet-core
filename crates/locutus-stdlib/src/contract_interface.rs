@@ -18,7 +18,8 @@ use std::{
 };
 
 use blake2::{Blake2s256, Digest};
-use byteorder::LittleEndian;
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
+use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 
@@ -508,7 +509,6 @@ impl TryFrom<Vec<u8>> for Contract<'static> {
     type Error = std::io::Error;
 
     fn try_from(data: Vec<u8>) -> Result<Self, Self::Error> {
-        use byteorder::ReadBytesExt;
         let mut reader = Cursor::new(data);
 
         let params_len = reader.read_u64::<LittleEndian>()?;
@@ -857,6 +857,55 @@ pub struct ContractCode<'a> {
     data: Cow<'a, [u8]>,
     #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
     key: [u8; CONTRACT_KEY_SIZE],
+}
+
+impl ContractCode<'static> {
+    /// Loads contract code which has been versioned from the fs.
+    pub fn load_versioned(path: &Path) -> Result<(Self, Version), std::io::Error> {
+        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
+
+        let mut contract_data = Cursor::new(Self::load_bytes(path)?);
+
+        // Get contract version
+        let version_size = contract_data
+            .read_u32::<BigEndian>()
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let mut version_data = vec![0; version_size as usize];
+        contract_data
+            .read_exact(&mut version_data)
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let version: Version = serde_json::from_slice(version_data.as_slice())
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+
+        if version == VERSION_0_0_1 {
+            let mut code_hash = [0u8; 32];
+            contract_data.read_exact(&mut code_hash)?;
+        }
+
+        // Get Contract code
+        let mut code_data: Vec<u8> = vec![];
+        contract_data
+            .read_to_end(&mut code_data)
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+
+        Ok((ContractCode::from(code_data), version))
+    }
+
+    pub fn load_raw(path: &Path) -> Result<Self, std::io::Error> {
+        let contract_data = Self::load_bytes(path)?;
+        Ok(ContractCode::from(contract_data))
+    }
+
+    fn load_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+        let mut contract_file = File::open(path)?;
+        let mut contract_data = if let Ok(md) = contract_file.metadata() {
+            Vec::with_capacity(md.len() as usize)
+        } else {
+            Vec::new()
+        };
+        contract_file.read_to_end(&mut contract_data)?;
+        Ok(contract_data)
+    }
 }
 
 impl ContractCode<'_> {

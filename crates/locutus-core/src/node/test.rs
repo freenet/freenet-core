@@ -301,7 +301,7 @@ impl SimNetwork {
     pub fn ring_distribution(&self, scale: i32) -> impl Iterator<Item = (f64, usize)> {
         let mut all_dists = Vec::with_capacity(self.labels.len());
         for (.., key) in &self.labels {
-            all_dists.push(self.event_listener.connections(*key).into_iter());
+            all_dists.push(self.event_listener.connections(*key));
         }
         group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l), scale)
     }

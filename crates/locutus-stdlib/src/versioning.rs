@@ -1,11 +1,8 @@
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-use byteorder::{BigEndian, ReadBytesExt};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,18 +21,6 @@ pub enum ContractContainer {
 }
 
 impl ContractContainer {
-    /// Return the `ContractContainer` content from the specified path as as `Vec<u8>`.
-    pub(crate) fn get_contract_data_from_fs(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-        let mut contract_file = File::open(path)?;
-        let mut contract_data = if let Ok(md) = contract_file.metadata() {
-            Vec::with_capacity(md.len() as usize)
-        } else {
-            Vec::new()
-        };
-        contract_file.read_to_end(&mut contract_data)?;
-        Ok(contract_data)
-    }
-
     /// Return the `ContractKey` from the specific contract version.
     pub fn key(&self) -> ContractKey {
         match self {
@@ -78,30 +63,13 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
     type Error = std::io::Error;
 
     fn try_from((path, params): (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        let mut contract_data =
-            Cursor::new(ContractContainer::get_contract_data_from_fs(path).unwrap());
+        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
 
-        // Get contract version
-        let version_size = contract_data
-            .read_u32::<BigEndian>()
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let mut version_data = vec![0; version_size as usize];
-        contract_data
-            .read_exact(&mut version_data)
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let version: Version = serde_json::from_slice(version_data.as_slice())
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let (contract_code, version) = ContractCode::load_versioned(path)?;
 
-        // Get Contract code
-        let mut code_data: Vec<u8> = vec![];
-        contract_data
-            .read_to_end(&mut code_data)
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let contract_code = Arc::new(ContractCode::from(code_data));
-
-        match version.to_string().as_str() {
-            "0.0.1" => Ok(ContractContainer::Wasm(WasmAPIVersion::V1(
-                WrappedContract::new(contract_code, params),
+        match version {
+            version if version == VERSION_0_0_1 => Ok(ContractContainer::Wasm(WasmAPIVersion::V1(
+                WrappedContract::new(Arc::new(contract_code), params),
             ))),
             _ => Err(std::io::ErrorKind::InvalidData.into()),
         }

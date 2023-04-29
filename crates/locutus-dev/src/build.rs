@@ -12,7 +12,6 @@ use std::{
 use tar::Builder;
 
 use locutus_runtime::{locutus_stdlib::web::WebApp, ContractCode};
-use locutus_stdlib::prelude::WrappedContract;
 
 use crate::{config::BuildToolCliConfig, util::pipe_std_streams, DynError, Error};
 
@@ -429,10 +428,12 @@ fn get_out_lib(
 }
 
 fn get_contract_with_version(
-    contract_path: &Path,
+    contract_code_path: &Path,
     cli_config: &BuildToolCliConfig,
 ) -> Result<Vec<u8>, DynError> {
-    let code = WrappedContract::get_data_from_fs(contract_path)?;
+    const VERSION_0_0_1: locutus_runtime::Version = locutus_runtime::Version::new(0, 0, 1);
+
+    let code: ContractCode = ContractCode::load_raw(contract_code_path)?;
     tracing::info!("compiled contract code hash: {}", code.hash_str());
     let mut serialized_version = serde_json::to_vec(&cli_config.version).map_err(|e| {
         Error::MissConfiguration(format!("couldn't serialize contract version: {e}").into())
@@ -443,8 +444,11 @@ fn get_contract_with_version(
     );
     output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
     output.append(&mut serialized_version);
-    output.append(&mut code.data().to_vec());
-
+    if cli_config.version == VERSION_0_0_1 {
+        let hash = code.hash();
+        output.extend(hash.iter());
+    }
+    output.extend(code.data());
     Ok(output)
 }
 

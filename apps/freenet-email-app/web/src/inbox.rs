@@ -7,9 +7,7 @@ use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
-use locutus_stdlib::prelude::{
-    ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg,
-};
+use locutus_stdlib::prelude::{ApplicationMessage, DelegateKey, InboundDelegateMsg};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
