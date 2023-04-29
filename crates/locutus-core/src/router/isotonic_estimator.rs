@@ -1,5 +1,4 @@
-use locutus_core::ring::{PeerKeyLocation, Distance};
-use locutus_core::Location;
+use crate::ring::{Distance, Location, PeerKeyLocation};
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -96,8 +95,11 @@ impl IsotonicEstimator {
             self.global_regression.len() >= adjustment_prior_size;
 
         if global_regression_big_enough_to_estimate_peer_adjustments {
-            let adjustment =
-                event.result - self.global_regression.interpolate(route_distance.as_f64()).unwrap();
+            let adjustment = event.result
+                - self
+                    .global_regression
+                    .interpolate(route_distance.as_f64())
+                    .unwrap();
 
             self.peer_adjustments
                 .entry(event.peer)
@@ -119,7 +121,7 @@ impl IsotonicEstimator {
             return Err(EstimationError::InsufficientData);
         }
 
-        let distance: f64 = contract_location.distance(&peer.location.unwrap()).as_f64();
+        let distance: f64 = contract_location.distance(peer.location.unwrap()).as_f64();
 
         let global_estimate = self.global_regression.interpolate(distance).unwrap();
 
@@ -172,8 +174,7 @@ pub(crate) struct IsotonicEvent {
 
 impl IsotonicEvent {
     fn route_distance(&self) -> Distance {
-        self.contract_location
-            .distance(&self.peer.location.unwrap())
+        self.contract_location.distance(self.peer.location.unwrap())
     }
 }
 
@@ -303,7 +304,7 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(&contract_location).as_f64();
+        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
 
         let result = distance.powf(0.5) + peer.peer.to_bytes()[0] as f64;
         IsotonicEvent {
@@ -317,7 +318,7 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(&contract_location).as_f64();
+        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
 
         let result = (100.0 - distance).powf(0.5) + peer.peer.to_bytes()[0] as f64;
         IsotonicEvent {

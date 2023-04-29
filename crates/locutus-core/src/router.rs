@@ -1,14 +1,15 @@
+#![allow(dead_code)] // FIXME: remove this when this module is integrated with the rest of the codebase
 mod isotonic_estimator;
 mod util;
 
+use crate::ring::{Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use locutus_core::{ring::PeerKeyLocation, Location};
 use serde::Serialize;
 use std::time::Duration;
 use util::{Mean, TransferSpeed};
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Router {
+pub(crate) struct Router {
     response_start_time_estimator: IsotonicEstimator,
     transfer_rate_estimator: IsotonicEstimator,
     failure_estimator: IsotonicEstimator,
@@ -16,7 +17,7 @@ pub struct Router {
 }
 
 impl Router {
-    pub(crate) fn new(history: &[RouteEvent]) -> Self {
+    fn new(history: &[RouteEvent]) -> Self {
         let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
             .map(|re| IsotonicEvent {
@@ -106,7 +107,7 @@ impl Router {
         }
     }
 
-    pub(crate) fn add_event(&mut self, event: RouteEvent) {
+    fn add_event(&mut self, event: RouteEvent) {
         match event.outcome {
             RouteOutcome::Success {
                 time_to_response_start,
@@ -142,7 +143,7 @@ impl Router {
         }
     }
 
-    pub fn select_peer<'a, I>(
+    pub(crate) fn select_peer<'a, I>(
         &self,
         peers: I,
         contract_location: &Location,
@@ -157,7 +158,7 @@ impl Router {
                 .into_iter()
                 .filter_map(|peer| {
                     peer.location
-                        .map(|loc| (peer, contract_location.distance(&loc)))
+                        .map(|loc| (peer, contract_location.distance(loc)))
                 })
                 .min_by_key(|&(_, distance)| distance)
                 .map(|(peer, _)| peer)
@@ -183,7 +184,7 @@ impl Router {
         }
     }
 
-    pub(crate) fn predict_routing_outcome(
+    fn predict_routing_outcome(
         &self,
         peer: &PeerKeyLocation,
         contract_location: &Location,
@@ -263,7 +264,6 @@ pub(crate) enum RouteOutcome {
 
 #[cfg(test)]
 mod tests {
-
     use rand::Rng;
 
     use super::*;
@@ -284,11 +284,11 @@ mod tests {
             let contract_location = Location::random();
             // Pass a reference to the `peers` vector
             let best = router.select_peer(&peers, &contract_location).unwrap();
-            let best_distance = best.location.unwrap().distance(&contract_location);
+            let best_distance = best.location.unwrap().distance(contract_location);
             for peer in &peers {
                 // Dereference `best` when making the comparison
                 if *peer != *best {
-                    let distance = peer.location.unwrap().distance(&contract_location);
+                    let distance = peer.location.unwrap().distance(contract_location);
                     assert!(distance >= best_distance);
                 }
             }
@@ -385,7 +385,7 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> RoutingPrediction {
-        let distance = peer.location.unwrap().distance(&contract_location);
+        let distance = peer.location.unwrap().distance(contract_location);
         let time_to_response_start = 2.0 * distance.as_f64();
         let failure_prob = distance.as_f64();
         let transfer_speed = 100.0 - (100.0 * distance.as_f64());
