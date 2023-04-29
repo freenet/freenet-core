@@ -1,6 +1,5 @@
 use std::{fs::File, io::Write, iter::FromIterator, path::PathBuf, sync::Arc};
 
-use byteorder::{BigEndian, WriteBytesExt};
 use dashmap::DashMap;
 use locutus_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
 use semver::Version;
@@ -175,7 +174,7 @@ impl ContractStore {
             .into_string()
             .to_lowercase();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
-        if let Ok(code) = WrappedContract::get_data_from_fs(&key_path) {
+        if let Ok((code, _ver)) = ContractCode::load_versioned(&key_path) {
             let size = code.data().len() as i64;
             self.contract_cache
                 .insert(*contract_hash, Arc::new(code), size);
@@ -189,16 +188,7 @@ impl ContractStore {
             .insert(*contract_hash, Arc::new(ContractCode::from(data)), size);
 
         let version: Version = Version::from(contract);
-        let mut serialized_version =
-            serde_json::to_vec(&version).map_err(|e| RuntimeInnerError::Any(Box::new(e)))?;
-
-        let mut output: Vec<u8> = Vec::with_capacity(
-            std::mem::size_of::<u32>() + serialized_version.len() + code.data().len(),
-        );
-        output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
-        output.append(&mut serialized_version);
-        output.append(&mut code.data().to_vec());
-
+        let output: Vec<u8> = code.to_bytes_versioned(&version)?;
         let mut file = File::create(key_path)?;
         file.write_all(output.as_slice())?;
 

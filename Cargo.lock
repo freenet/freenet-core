@@ -2489,7 +2489,6 @@ version = "0.0.3"
 dependencies = [
  "atty",
  "bincode",
- "byteorder",
  "clap",
  "either",
  "futures",

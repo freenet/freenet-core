@@ -1,4 +1,3 @@
-use byteorder::{BigEndian, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::{
@@ -431,24 +430,9 @@ fn get_contract_with_version(
     contract_code_path: &Path,
     cli_config: &BuildToolCliConfig,
 ) -> Result<Vec<u8>, DynError> {
-    const VERSION_0_0_1: locutus_runtime::Version = locutus_runtime::Version::new(0, 0, 1);
-
     let code: ContractCode = ContractCode::load_raw(contract_code_path)?;
     tracing::info!("compiled contract code hash: {}", code.hash_str());
-    let mut serialized_version = serde_json::to_vec(&cli_config.version).map_err(|e| {
-        Error::MissConfiguration(format!("couldn't serialize contract version: {e}").into())
-    })?;
-
-    let mut output: Vec<u8> = Vec::with_capacity(
-        std::mem::size_of::<u32>() + serialized_version.len() + code.data().len(),
-    );
-    output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
-    output.append(&mut serialized_version);
-    if cli_config.version == VERSION_0_0_1 {
-        let hash = code.hash();
-        output.extend(hash.iter());
-    }
-    output.extend(code.data());
+    let output = code.to_bytes_versioned(&cli_config.version)?;
     Ok(output)
 }
 

@@ -18,7 +18,7 @@ use std::{
 };
 
 use blake2::{Blake2s256, Digest};
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
@@ -887,7 +887,6 @@ impl ContractCode<'static> {
         contract_data
             .read_to_end(&mut code_data)
             .map_err(|_| std::io::ErrorKind::InvalidData)?;
-
         Ok((ContractCode::from(code_data), version))
     }
 
@@ -952,6 +951,27 @@ impl ContractCode<'_> {
         let mut key = [0; CONTRACT_KEY_SIZE];
         key.copy_from_slice(&key_arr);
         key
+    }
+
+    pub fn to_bytes_versioned(
+        &self,
+        version: &Version,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        match version {
+            ver if ver == &Version::new(0, 0, 1) => {
+                let mut serialized_version = serde_json::to_vec(&ver)
+                    .map_err(|e| format!("couldn't serialize contract version: {e}"))?;
+                let output_size =
+                    std::mem::size_of::<u32>() + serialized_version.len() + self.data().len();
+                let mut output: Vec<u8> = Vec::with_capacity(output_size);
+                output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
+                output.append(&mut serialized_version);
+                output.extend(self.key.iter());
+                output.extend(self.data());
+                Ok(output)
+            }
+            _ => panic!("version not supported"),
+        }
     }
 }
 
@@ -1125,10 +1145,10 @@ where
     fn from(val: (T, U)) -> Self {
         let (parameters, code_data) = (val.0.borrow(), val.1.borrow());
         let id = generate_id(parameters, code_data);
-        let contract_hash = code_data.hash();
+        let code_hash = code_data.hash();
         Self {
             instance: id,
-            code: Some(*contract_hash),
+            code: Some(*code_hash),
         }
     }
 }
