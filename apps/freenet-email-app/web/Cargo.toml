@@ -11,10 +11,6 @@ default-run = "app"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "get_code_hash"
-required-features = ["build-binary"]
-
-[[bin]]
 name = "app"
 
 [dependencies]
