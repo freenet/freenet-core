@@ -9,7 +9,7 @@ use locutus_stdlib::prelude::blake2::Digest;
 use locutus_stdlib::prelude::ContractKey;
 use rsa::{sha2::Sha256, Pkcs1v15Sign, RsaPrivateKey};
 use rsa::pkcs1v15::Signature;
-use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
+use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters, TokenAllocationRecord};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
@@ -67,13 +67,14 @@ fn main() {
         token_record,
     };
 
-    let mut tokens = HashMap::new();
-    tokens.insert(Tier::Day1, token_assignment);
+    let mut tokens: HashMap<Tier, Vec<TokenAssignment>> = HashMap::new();
+    tokens.insert(Tier::Day1, vec![token_assignment]);
+    let token_allocation_record: TokenAllocationRecord = TokenAllocationRecord::new(tokens);
 
-    let state: Vec<u8> = bincode::serialize(&tokens).unwrap();
+    let state: Vec<u8> = bincode::serialize(&token_allocation_record).unwrap();
 
     std::fs::write(
-        inbox_path.join("examples").join("initial_state.json"),
+        inbox_path.join("examples").join("initial_state"),
         state,
     )
     .unwrap();

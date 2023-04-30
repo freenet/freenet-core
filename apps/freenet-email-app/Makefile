@@ -30,8 +30,8 @@ build-tool:
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
 build-inbox-%:
-	cd $(INBOX_SRC_DIR) && cargo run --bin gen_initial_state -- $* "../../../web/examples/rsa4096-id-$*-priv.pem"
-	cd $(INBOX_SRC_DIR) && cargo run --bin gen_pub_key -- $* "../../../web/examples/rsa4096-id-$*-priv.pem"
+	cd $(INBOX_SRC_DIR) && cargo run --bin gen_initial_state -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
+	cd $(INBOX_SRC_DIR) && cargo run --bin gen_pub_key -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
 	cd $(INBOX_DIR) && ldt build --features contract
 
 publish-inbox-%:
@@ -39,6 +39,7 @@ publish-inbox-%:
 
 build-token-allocation-contract-%:
 	cd $(TOKEN_ALLOCATION_DIR)
+	cargo run --bin gen_pub_key -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
 	if [ $* -eq 0 ]; then \
 		cargo run --bin gen_initial_state -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-0-priv.pem" "$(WEB_DIR_SRC)/../examples/rsa4096-id-1-priv.pem"; \
 	else \
@@ -47,16 +48,16 @@ build-token-allocation-contract-%:
 	ldt build
 
 publish-token-allocation-contract-%:
-	cd $(TOKEN_ALLOCATION_DIR) && ldt publish --code build/locutus/locutus_token_allocation_record --state build/locutus/contract-state --parameters $(WEB_DIR_SRC)/../examples/inbox_key_$*
+	cd $(TOKEN_ALLOCATION_DIR) && ldt publish --code build/locutus/locutus_token_allocation_record --state build/locutus/contract-state --parameters examples/generator_pub_key_$*
 
 generate-inbox-contract-code-hash:
 	cd $(INBOX_DIR)
-	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
+	hash=$$(bash -c "ldt inspect build/locutus/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
 	echo $$hash > $(WEB_DIR_SRC)/../examples/inbox_code_hash
 
 generate-token-allocation-code-hash:
 	cd $(TOKEN_ALLOCATION_DIR)
-	hash=$$(bash -c "ldt inspect build/locutus/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
+	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
 	echo $$hash > $(WEB_DIR_SRC)/../examples/token_allocation_record_code_hash
 
 run-node:
