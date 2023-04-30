@@ -7,7 +7,7 @@ use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
-use locutus_stdlib::prelude::{ApplicationMessage, DelegateKey, InboundDelegateMsg};
+use locutus_stdlib::prelude::{ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
@@ -180,10 +180,13 @@ impl InboxModel {
             let slot = DateTime::<Utc>::from_utc(naive, Utc);
 
             let record_params = TokenParameters::new(generator_public_key);
-            let token_record =
+            let token_record: ContractInstanceId =
                 ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
                     .unwrap()
                     .into();
+
+            crate::log::log(format!("Sending update request message with token record key: {}", token_record.clone().to_string()).as_str());
+
             TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: slot,

@@ -16,13 +16,14 @@ endif
 .PHONY: all build-inbox build-token-allocation clean
 
 all:
+	$(MAKE) build-tool &
 	$(MAKE) build-inbox &
 	$(MAKE) build-token-allocation &
 	$(MAKE) run-node &
 	$(MAKE) run-web &
 	wait
 
-build-inbox: build-tool build-inbox-0 publish-inbox-0 build-inbox-1 publish-inbox-1 generate-inbox-contract-code-hash
+build-inbox: build-inbox-0 publish-inbox-0 build-inbox-1 publish-inbox-1 generate-inbox-contract-code-hash
 build-token-allocation: build-token-allocation-contract-0 publish-token-allocation-contract-0 build-token-allocation-contract-1 publish-token-allocation-contract-1 generate-token-allocation-code-hash
 
 build-tool:
@@ -53,12 +54,12 @@ publish-token-allocation-contract-%:
 generate-inbox-contract-code-hash:
 	cd $(INBOX_DIR)
 	hash=$$(bash -c "ldt inspect build/locutus/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
-	echo $$hash > $(WEB_DIR_SRC)/../build/inbox_code_hash
+	echo -n $$hash > $(WEB_DIR_SRC)/../build/inbox_code_hash
 
 generate-token-allocation-code-hash:
 	cd $(TOKEN_ALLOCATION_DIR)
 	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
-	echo $$hash > $(WEB_DIR_SRC)/../build/token_allocation_record_code_hash
+	echo -n $$hash > $(WEB_DIR_SRC)/../build/token_allocation_record_code_hash
 
 run-node:
 	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,info locutus-node local

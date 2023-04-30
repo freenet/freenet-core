@@ -278,7 +278,7 @@ impl Executor {
                             break new_state;
                         } else if !related.is_empty() {
                             // some required contracts are missing
-                            let required_contracts = related.len();
+                            let required_contracts = related.len() + 1;
                             for RelatedContract {
                                 contract_instance_id: id,
                                 mode,
