@@ -17,6 +17,7 @@ name = "ldt"
 path = "src/bin/dev-tool.rs"
 
 [dependencies]
+anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
 byteorder = "1"

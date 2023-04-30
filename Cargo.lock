@@ -2414,6 +2414,7 @@ dependencies = [
 name = "locutus"
 version = "0.0.3"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "byteorder",

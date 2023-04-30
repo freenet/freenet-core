@@ -10,13 +10,13 @@ use locutus_dev::{
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     let cwd = std::env::current_dir()?;
     let config = Config::parse();
-    match config.sub_command {
+    let r = match config.sub_command {
         SubCommand::RunLocal(local_node_config) => run_local_node_client(local_node_config).await,
         SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),
         SubCommand::Inspect(inspect_config) => inspect(inspect_config),
@@ -30,5 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 update(update_config, config.additional).await
             }
         },
-    }
+    };
+    // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow
+    r.map_err(|e| anyhow::format_err!(e))
 }

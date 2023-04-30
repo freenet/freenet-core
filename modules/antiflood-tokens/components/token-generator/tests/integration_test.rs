@@ -20,8 +20,7 @@ mod integration_test {
         SecretsStore, WasmAPIVersion,
     };
     use locutus_stdlib::prelude::{
-        ContractCode, Delegate, DelegateContext, DelegateError, OutboundDelegateMsg,
-        WrappedContract,
+        ContractCode, Delegate, DelegateContext, OutboundDelegateMsg, WrappedContract,
     };
 
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
