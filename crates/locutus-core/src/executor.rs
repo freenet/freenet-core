@@ -294,7 +294,7 @@ impl Executor {
                                         if self.mode == OperationMode::Network =>
                                     {
                                         // retrieve the contract from the network first in the mode the consumer contract informed the node
-                                        todo!()
+                                        todo!("related mode updates subscription not implemented for type {mode:?}")
                                     }
                                     Err(other_err) => return Err(Either::Right(other_err.into())),
                                 }

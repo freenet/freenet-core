@@ -61,9 +61,9 @@ pub(crate) enum TryNodeAction {
 impl std::fmt::Display for TryNodeAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TryNodeAction::LoadInbox => write!(f, "load messages"),
-            TryNodeAction::SendMessage => write!(f, "send message"),
-            TryNodeAction::RemoveMessages => write!(f, "remove messages"),
+            TryNodeAction::LoadInbox => write!(f, "loading messages"),
+            TryNodeAction::SendMessage => write!(f, "sending message"),
+            TryNodeAction::RemoveMessages => write!(f, "removing messages"),
             TryNodeAction::GetAlias => write!(f, "get alias"),
         }
     }

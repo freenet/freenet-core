@@ -53,15 +53,15 @@ publish-token-allocation-contract-%:
 generate-inbox-contract-code-hash:
 	cd $(INBOX_DIR)
 	hash=$$(bash -c "ldt inspect build/locutus/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
-	echo $$hash > $(WEB_DIR_SRC)/../dist/inbox_code_hash
+	echo $$hash > $(WEB_DIR_SRC)/../build/inbox_code_hash
 
 generate-token-allocation-code-hash:
 	cd $(TOKEN_ALLOCATION_DIR)
 	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
-	echo $$hash > $(WEB_DIR_SRC)/../dist/token_allocation_record_code_hash
+	echo $$hash > $(WEB_DIR_SRC)/../build/token_allocation_record_code_hash
 
 run-node:
-	RUST_LOG=debug locutus-node local
+	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,info locutus-node local
 
 run-web:
 	cd $(INBOX_WEB_DIR)

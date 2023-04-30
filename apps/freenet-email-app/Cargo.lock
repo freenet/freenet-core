@@ -3313,13 +3313,16 @@ dependencies = [
  "directories",
  "either",
  "futures",
+ "itertools",
  "libp2p",
  "locutus-runtime",
  "locutus-stdlib",
  "once_cell",
  "opentelemetry",
  "opentelemetry-jaeger",
+ "ordered-float 3.7.0",
  "parking_lot 0.12.1",
+ "pav_regression",
  "rand 0.8.5",
  "rmp-serde",
  "rocksdb",
@@ -4090,6 +4093,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ordered-float"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fc2dbde8f8a79f2102cc474ceb0ad68e3b80b85289ea62389b60e66777e4213"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "ordered-multimap"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4204,6 +4216,16 @@ name = "pathdiff"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8835116a5c179084a830efb3adc117ab007512b535bc1a21c991d3b32a6b44dd"
+
+[[package]]
+name = "pav_regression"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55e602c9eaa5bd2b89f5214636de0a845ddb2000db1cb429887eac12dbcd5996"
+dependencies = [
+ "ordered-float 3.7.0",
+ "serde",
+]
 
 [[package]]
 name = "peeking_take_while"

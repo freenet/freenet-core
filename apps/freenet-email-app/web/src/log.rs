@@ -15,7 +15,7 @@ pub(crate) fn error(msg: impl AsRef<str>, action: Option<TryNodeAction>) {
         tracing::error!(%error, %action);
         #[cfg(target_family = "wasm")]
         {
-            let error = format!("error while {action}: {error}");
+            let error = format!("error while `{action}`: {error}");
             web_sys::console::error_1(&serde_wasm_bindgen::to_value(&error).unwrap());
         }
     } else {

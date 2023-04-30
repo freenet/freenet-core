@@ -29,9 +29,8 @@ use freenet_email_inbox::{
     UpdateInbox,
 };
 
-static INBOX_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
-// FIXME: should be the token record code
-static TOKEN_RECORD_CODE_HASH: &str = include_str!("../examples/inbox_code_hash");
+static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
+static TOKEN_RECORD_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
