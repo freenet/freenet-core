@@ -30,7 +30,7 @@ use freenet_email_inbox::{
 };
 
 static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
-static TOKEN_RECORD_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
+static TOKEN_RECORD_CODE_HASH: &str = include_str!("../build/token_allocation_record_code_hash");
 
 #[derive(Debug, Clone)]
 struct InternalSettings {

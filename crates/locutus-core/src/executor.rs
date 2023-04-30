@@ -290,7 +290,7 @@ impl Executor {
                                         // we can try first with the existing value
                                         retrieved_contracts.push(UpdateData::State(state.into()));
                                     }
-                                    Err(StateStoreError::MissingContract)
+                                    Err(StateStoreError::MissingContract(_))
                                         if self.mode == OperationMode::Network =>
                                     {
                                         // retrieve the contract from the network first in the mode the consumer contract informed the node
@@ -464,7 +464,7 @@ impl Executor {
                 state,
             }
             .into()),
-            Err(StateStoreError::MissingContract) => Err(CoreContractError::Get {
+            Err(StateStoreError::MissingContract(_)) => Err(CoreContractError::Get {
                 key,
                 cause: "missing contract state".into(),
             }
