@@ -364,18 +364,15 @@ impl TokenParameters {
 impl TryFrom<Parameters<'_>> for TokenParameters {
     type Error = ContractError;
     fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(params.as_ref())
-            .map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(this)
+        serde_json::from_slice(params.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))
     }
 }
 
 impl TryFrom<TokenParameters> for Parameters<'static> {
-    type Error = ContractError;
+    type Error = serde_json::Error;
     fn try_from(params: TokenParameters) -> Result<Self, Self::Error> {
-        let this =
-            bincode::serialize(&params).map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(this.into())
+        serde_json::to_vec(&params).map(Into::into)
     }
 }
 

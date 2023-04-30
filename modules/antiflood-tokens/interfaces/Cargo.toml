@@ -10,6 +10,7 @@ chrono = { workspace = true }
 locutus-stdlib = { workspace = true }
 rsa = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 strum = { version = "0.24", features = ["derive"] }
 thiserror = "1"
 
