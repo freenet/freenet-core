@@ -2,6 +2,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{Read, Seek},
+    sync::Arc,
     time::Duration,
 };
 
@@ -69,11 +70,11 @@ impl StdInput {
             })
             .transpose()?
             .unwrap_or_default();
-
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::try_from((
-            &*config.contract,
+        let (contract_code, _ver) = ContractCode::load_versioned(&config.contract)?;
+        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(contract_code),
             params.into(),
-        ))?));
+        )));
         Ok(StdInput {
             input: File::open(&config.input_file)?,
             config,

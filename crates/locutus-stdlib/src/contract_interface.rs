@@ -1429,17 +1429,6 @@ impl WrappedContract {
         &self.params
     }
 
-    pub fn get_data_from_fs(path: &Path) -> Result<ContractCode<'static>, std::io::Error> {
-        let mut contract_file = File::open(path)?;
-        let mut contract_data = if let Ok(md) = contract_file.metadata() {
-            Vec::with_capacity(md.len() as usize)
-        } else {
-            Vec::new()
-        };
-        contract_file.read_to_end(&mut contract_data)?;
-        Ok(ContractCode::from(contract_data))
-    }
-
     fn ser_contract_data<S>(data: &Arc<ContractCode<'_>>, ser: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -1470,15 +1459,6 @@ impl WrappedContract {
         // let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
         // Ok(Arc::new(data))
         todo!()
-    }
-}
-
-impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for WrappedContract {
-    type Error = std::io::Error;
-    fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        let (path, params) = data;
-        let data = Arc::new(Self::get_data_from_fs(path)?);
-        Ok(WrappedContract::new(data, params))
     }
 }
 
