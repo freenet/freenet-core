@@ -13,8 +13,8 @@ pub mod buf;
     )
 ))]
 pub mod client_api;
-mod component_interface;
 mod contract_interface;
+mod delegate_interface;
 pub(crate) mod global;
 pub mod rand;
 #[cfg(feature = "time")]
@@ -26,10 +26,10 @@ pub mod web;
 /// Locutus stdlib prelude.
 pub mod prelude {
     pub use super::WasmLinearMem;
-    pub use crate::component_interface::wasm_interface::*;
-    pub use crate::component_interface::*;
     pub use crate::contract_interface::wasm_interface::*;
     pub use crate::contract_interface::*;
+    pub use crate::delegate_interface::wasm_interface::*;
+    pub use crate::delegate_interface::*;
     pub use crate::versioning::*;
     pub use locutus_macros::{component, contract};
 

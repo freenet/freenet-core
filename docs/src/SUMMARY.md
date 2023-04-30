@@ -8,6 +8,7 @@
 # Developer Guide
 
 - [Tutorial: Create an App](tutorial.md)
+  - [Contract interfaces](contract-interface.md)
 - [locutus.toml format](manifest.md)
 
 # Examples
