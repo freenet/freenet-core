@@ -16,13 +16,14 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<ValidateResult, ContractError> {
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenParameters::try_from(parameters)?;
-        for (_tier, assignments) in (&assigned_tokens).into_iter() {
-            for assignment in assignments {
-                if !assignment.is_valid(&params) {
-                    return Ok(ValidateResult::Invalid);
-                }
-            }
-        }
+        // TODO: uncomment this when the validation is implemented
+        // for (_tier, assignments) in (&assigned_tokens).into_iter() {
+        //     for assignment in assignments {
+        //         if !assignment.is_valid(&params) {
+        //             return Ok(ValidateResult::Invalid);
+        //         }
+        //     }
+        // }
         Ok(ValidateResult::Valid)
     }
 

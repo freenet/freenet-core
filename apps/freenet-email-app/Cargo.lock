@@ -3288,6 +3288,7 @@ dependencies = [
  "locutus-stdlib",
  "rsa",
  "serde",
+ "serde_json",
  "strum",
  "thiserror",
 ]
