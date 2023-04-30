@@ -35,13 +35,14 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// The location of a peer in the ring. This location allows routing towards the peer.
-pub struct PeerKeyLocation {
+pub(crate) struct PeerKeyLocation {
     pub peer: PeerKey,
     /// An unspecified location means that the peer hasn't been asigned a location, yet.
     pub location: Option<Location>,
 }
 
 impl PeerKeyLocation {
+    #[cfg(test)]
     pub fn random() -> Self {
         PeerKeyLocation {
             peer: PeerKey::random(),
@@ -245,7 +246,7 @@ impl Ring {
             my_location.distance(location)
                 < self
                     .median_distance_to(my_location)
-                    .unwrap_or_else(|| Distance(0.5))
+                    .unwrap_or(Distance(0.5))
         };
         if !accepted {
             self.open_connections.fetch_sub(1, SeqCst);
@@ -396,8 +397,11 @@ impl Ring {
 pub struct Location(f64);
 
 impl Location {
-    pub fn new(location : f64) -> Self {
-        debug_assert!((0.0..=1.0).contains(&location), "Location must be in the range [0, 1]");
+    pub fn new(location: f64) -> Self {
+        debug_assert!(
+            (0.0..=1.0).contains(&location),
+            "Location must be in the range [0, 1]"
+        );
         Location(location)
     }
 
@@ -409,23 +413,17 @@ impl Location {
     }
 
     /// Compute the distance between two locations.
-    pub fn distance(&self, other: &Location) -> Distance {
-        let d = (self.0 - other.0).abs();
-        if d < 0.5 {
-            Distance(d)
+    pub fn distance(&self, other: impl std::borrow::Borrow<Location>) -> Distance {
+        let d = (self.0 - other.borrow().0).abs();
+        if d < 0.5f64 {
+            Distance::new(d)
         } else {
-            Distance(1.0 - d)
+            Distance::new(1.0f64 - d)
         }
     }
 
     pub fn as_f64(&self) -> f64 {
         self.0
-    }
-}
-
-impl From<Location> for f64 {
-    fn from(val: Location) -> Self {
-        val.0
     }
 }
 
@@ -499,7 +497,10 @@ pub struct Distance(f64);
 impl Distance {
     pub fn new(value: f64) -> Self {
         debug_assert!(!value.is_nan(), "Distance cannot be NaN");
-        debug_assert!((0.0..=0.5).contains(&value), "Distance must be in the range [0, 0.5]");
+        debug_assert!(
+            (0.0..=0.5).contains(&value),
+            "Distance must be in the range [0, 0.5]"
+        );
         Distance(value)
     }
 
@@ -520,7 +521,7 @@ impl PartialOrd for Distance {
     }
 }
 
-impl Eq for Distance { }
+impl Eq for Distance {}
 
 impl Ord for Distance {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -550,11 +551,11 @@ mod test {
     fn location_dist() {
         let l0 = Location(0.);
         let l1 = Location(0.25);
-        assert!(l0.distance(&l1) == Distance(0.25));
+        assert!(l0.distance(l1) == Distance(0.25));
 
         let l0 = Location(0.75);
         let l1 = Location(0.50);
-        assert!(l0.distance(&l1) == Distance(0.25));
+        assert!(l0.distance(l1) == Distance(0.25));
     }
 
     #[ignore]

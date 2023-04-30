@@ -301,9 +301,12 @@ impl SimNetwork {
     pub fn ring_distribution(&self, scale: i32) -> impl Iterator<Item = (f64, usize)> {
         let mut all_dists = Vec::with_capacity(self.labels.len());
         for (.., key) in &self.labels {
-            all_dists.push(self.event_listener.connections(*key).into_iter());
+            all_dists.push(self.event_listener.connections(*key));
         }
-        group_locations_in_buckets(all_dists.into_iter().flatten().map(|(_, l)| l.as_f64()), scale)
+        group_locations_in_buckets(
+            all_dists.into_iter().flatten().map(|(_, l)| l.as_f64()),
+            scale,
+        )
     }
 
     /// Returns the connectivity in the network per peer (that is all the connections
@@ -450,15 +453,7 @@ fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Distance>>) 
 #[ignore]
 #[test]
 fn group_locations_test() -> Result<(), anyhow::Error> {
-    let locations = vec![
-        0.5356,
-        0.5435,
-        0.5468,
-        0.5597,
-        0.6745,
-        0.7309,
-        0.7412,
-    ];
+    let locations = vec![0.5356, 0.5435, 0.5468, 0.5597, 0.6745, 0.7309, 0.7412];
 
     let mut grouped: Vec<_> =
         group_locations_in_buckets(locations.clone().into_iter(), 1).collect();

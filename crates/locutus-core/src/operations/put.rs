@@ -634,7 +634,7 @@ async fn forward_changes<CErr, CB>(
     for peer in forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
         let other_distance = contract_loc.distance(other_loc);
-        let self_distance = contract_loc.distance(&own_loc);
+        let self_distance = contract_loc.distance(own_loc);
         if other_distance < self_distance {
             // forward the contract towards this node since it is indeed closer to the contract location
             // and forget about it, no need to keep track of this op or wait for response

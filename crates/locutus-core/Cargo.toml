@@ -51,6 +51,10 @@ sqlx = { version = "0.6", features = ["sqlite", "runtime-tokio-rustls"], optiona
 # TODO(kakoc): clang should be installed for rocksdb; write about that in prerequisites/dev guide
 rocksdb = { version = "0.20.0", default-features = false, optional = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
+pav_regression = "0.4.0"
+itertools = "0.10.5"
+ordered-float = "3.6.0"
+
 
 # Tracing deps
 tower-http = { version = "0.3", features = ["trace"] }
