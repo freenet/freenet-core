@@ -288,7 +288,10 @@ impl Executor {
                                     Ok(state) => {
                                         // in this case we are already subscribed to and are updating this contract,
                                         // we can try first with the existing value
-                                        retrieved_contracts.push(UpdateData::State(state.into()));
+                                        retrieved_contracts.push(UpdateData::RelatedState {
+                                            related_to: id,
+                                            state: state.into(),
+                                        });
                                     }
                                     Err(StateStoreError::MissingContract(_))
                                         if self.mode == OperationMode::Network =>

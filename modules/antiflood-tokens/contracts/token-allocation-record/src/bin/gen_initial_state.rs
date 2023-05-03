@@ -14,7 +14,7 @@ use rsa::{sha2::Sha256, Pkcs1v15Sign, RsaPrivateKey};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
-static TOKEN_RECORD_CODE_HASH: &str = include_str!("../../token_allocation_record_code_hash");
+static TOKEN_RECORD_CODE_HASH: &str = include_str!("../../../../../../apps/freenet-email-app/web/build/token_allocation_record_code_hash");
 
 struct Args {
     _key_id: String,
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tier: Tier::Day1,
             time_slot: slot,
             assignee: receiver_private_key.to_public_key(),
-            signature: Signature::from(signature.into_boxed_slice()),
+            signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
             assignment_hash: [0; 32],
             token_record,
         };
