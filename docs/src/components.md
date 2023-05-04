@@ -1,4 +1,4 @@
-# Anatomy of a Decentralized Application
+# Building Decentralized Applications on Freenet
 
 Delegates, contracts, and user interfaces (UIs) each serve distinct roles in the
 Freenet ecosystem. Contracts control public data, or "shared state". Delegates
@@ -20,7 +20,7 @@ computer. It's responsible for:
 The kernel is written in Rust and is designed to be small (hopefully less than 5
 MB), efficient, and able to run on a wide range of devices like smartphones, desktop
 computers, and embedded devices.
-
+can 
 ## User Interface
 
 On the normal web, a user might visit https://gmail.com/, their browser
