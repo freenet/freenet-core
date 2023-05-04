@@ -315,7 +315,7 @@ mod test_utils {
                 .filter_map(|l| {
                     if let EventKind::Connected { loc, from, to } = l.kind {
                         if from == peer {
-                            return Some((to.peer, loc.distance(&to.location.unwrap())));
+                            return Some((to.peer, loc.distance(to.location.unwrap())));
                         }
                     }
                     None
@@ -370,7 +370,9 @@ mod test_utils {
 
         let distances: Vec<_> = listener.connections(peer_id).collect();
         assert!(distances.len() == 3);
-        assert!((distances.iter().map(|(_, l)| l.as_f64()).sum::<f64>() - 0.5f64).abs() < f64::EPSILON);
+        assert!(
+            (distances.iter().map(|(_, l)| l.as_f64()).sum::<f64>() - 0.5f64).abs() < f64::EPSILON
+        );
         Ok(())
     }
 }
