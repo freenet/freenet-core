@@ -14,8 +14,8 @@ impl ContractInterface for TokenAllocContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        let assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let params = TokenParameters::try_from(parameters)?;
+        let _assigned_tokens = TokenAllocationRecord::try_from(state)?;
+        let _params = TokenParameters::try_from(parameters)?;
         // TODO: uncomment this when the validation is implemented
         // for (_tier, assignments) in (&assigned_tokens).into_iter() {
         //     for assignment in assignments {

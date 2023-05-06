@@ -72,9 +72,9 @@ pub struct Runtime {
     pub(crate) enable_wasi: bool,
 
     pub(crate) secret_store: SecretsStore,
-    pub(crate) component_store: DelegateStore,
-    /// loaded component modules
-    pub(crate) component_modules: HashMap<DelegateKey, Module>,
+    pub(crate) delegate_store: DelegateStore,
+    /// loaded delegate modules
+    pub(crate) delegate_modules: HashMap<DelegateKey, Module>,
 
     /// Local contract storage.
     pub contract_store: ContractStore,
@@ -85,7 +85,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn build(
         contract_store: ContractStore,
-        component_store: DelegateStore,
+        delegate_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
     ) -> RuntimeResult<Self> {
@@ -111,11 +111,11 @@ impl Runtime {
             enable_wasi: false,
 
             secret_store,
-            component_store,
+            delegate_store,
             contract_modules: HashMap::new(),
 
             contract_store,
-            component_modules: HashMap::new(),
+            delegate_modules: HashMap::new(),
         })
     }
 
@@ -177,21 +177,21 @@ impl Runtime {
         RunningInstance::new(self, instance)
     }
 
-    pub(crate) fn prepare_component_call(
+    pub(crate) fn prepare_delegate_call(
         &mut self,
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
-        let module = if let Some(module) = self.component_modules.get(key) {
+        let module = if let Some(module) = self.delegate_modules.get(key) {
             module
         } else {
             let contract = self
-                .component_store
-                .fetch_component(key)
+                .delegate_store
+                .fetch_delegate(key)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let module = Module::new(&self.wasm_store, contract.as_ref())?;
-            self.component_modules.insert(key.clone(), module);
-            self.component_modules.get(key).unwrap()
+            self.delegate_modules.insert(key.clone(), module);
+            self.delegate_modules.get(key).unwrap()
         }
         .clone();
         let instance = self.prepare_instance(&module)?;

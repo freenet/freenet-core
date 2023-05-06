@@ -14,7 +14,7 @@ impl ContractError {
         matches!(&*self.0, RuntimeInnerError::ContractExecError(_))
     }
 
-    pub fn is_component_exec_error(&self) -> bool {
+    pub fn is_delegate_exec_error(&self) -> bool {
         matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
     }
 }
@@ -77,8 +77,8 @@ pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
 
-    // component runtime errors
-    #[error("component {0} not found in store")]
+    // delegate runtime errors
+    #[error("delegate {0} not found in store")]
     DelegateNotFound(DelegateKey),
 
     #[error(transparent)]

@@ -78,7 +78,7 @@ impl WebSocketApiConfig {
 
 #[derive(Debug)]
 pub struct ConfigPaths {
-    // TODO: Add secrets and components dir
+    // TODO: Add secrets and delegates dir
     pub(crate) contracts_dir: PathBuf,
     pub(crate) db_dir: PathBuf,
     app_data_dir: PathBuf,
@@ -93,7 +93,7 @@ impl ConfigPaths {
         } else {
             project_dir.data_dir().into()
         };
-        // FIXME: Add dirs for components and secrets
+        // FIXME: Add dirs for delegates and secrets
         let contracts_dir = app_data_dir.join("contracts");
         let db_dir = app_data_dir.join("db");
 

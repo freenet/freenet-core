@@ -31,7 +31,7 @@ pub mod prelude {
     pub use crate::delegate_interface::wasm_interface::*;
     pub use crate::delegate_interface::*;
     pub use crate::versioning::*;
-    pub use locutus_macros::{component, contract};
+    pub use locutus_macros::{contract, delegate};
 
     pub use bincode;
     pub use blake2;

@@ -25,7 +25,7 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
     let contract_dir = config
         .contract_data_dir
         .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
-    // TODO: Generate components and secrets store from config
+    // TODO: Generate delegates and secrets store from config
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
     let executor = Executor::new(

@@ -1,5 +1,5 @@
 [workspace]
-members = ["components/token-generator", "contracts/token-allocation-record", "interfaces"]
+members = ["delegates/token-generator", "contracts/token-allocation-record", "interfaces"]
 resolver = "2"
 
 [workspace.dependencies]

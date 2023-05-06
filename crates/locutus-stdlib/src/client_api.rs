@@ -1,5 +1,5 @@
 //! A node client API. Intended to be used from applications (web or otherwise) using the
-//! node capabilities to execute contract, component, etc. instructions and communicating
+//! node capabilities to execute contract, delegate, etc. instructions and communicating
 //! over the network.
 //!
 //! Communication, independent of the transport, revolves around the [`ClientRequest`]

@@ -96,7 +96,7 @@ pub enum RequestError {
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum DelegateError {
-    #[error("error while registering component: {0}")]
+    #[error("error while registering delegate: {0}")]
     RegisterError(DelegateKey),
     #[error("execution error, cause: {0}")]
     ExecutionError(String),

@@ -12,11 +12,11 @@ use serde_with::serde_as;
 use crate::prelude::ContractInstanceId;
 
 const APPLICATION_HASH_SIZE: usize = 32;
-const COMPONENT_HASH_LENGTH: usize = 32;
+const DELEGATE_HASH_LENGTH: usize = 32;
 
 type Secret = Vec<u8>;
 
-/// Executable component
+/// Executable delegate
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde_as]
 pub struct Delegate<'a> {
@@ -72,7 +72,7 @@ impl From<Vec<u8>> for Delegate<'static> {
     }
 }
 
-/// Type of errors during interaction with a component.
+/// Type of errors during interaction with a delegate.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum DelegateError {
     #[error("de/serialization error: {0}")]
@@ -120,22 +120,22 @@ impl Display for SecretsId {
 
 pub trait DelegateInterface {
     /// Process inbound message, producing zero or more outbound messages in response
-    /// Note that all state for the component must be stored using the secret mechanism.
+    /// Note that all state for the delegate must be stored using the secret mechanism.
     fn process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError>;
 }
 
 #[serde_as]
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-pub struct DelegateKey(#[serde_as(as = "[_; COMPONENT_HASH_LENGTH]")] [u8; COMPONENT_HASH_LENGTH]);
+pub struct DelegateKey(#[serde_as(as = "[_; DELEGATE_HASH_LENGTH]")] [u8; DELEGATE_HASH_LENGTH]);
 
 impl DelegateKey {
     pub fn new(wasm_code: &[u8]) -> Self {
         let mut hasher = Blake2s256::new();
         hasher.update(wasm_code);
         let hashed = hasher.finalize();
-        let mut component_key = [0; COMPONENT_HASH_LENGTH];
-        component_key.copy_from_slice(&hashed);
-        Self(component_key)
+        let mut delegate_key = [0; DELEGATE_HASH_LENGTH];
+        delegate_key.copy_from_slice(&hashed);
+        Self(delegate_key)
     }
 
     pub fn encode(&self) -> String {
@@ -144,8 +144,8 @@ impl DelegateKey {
             .into_string()
     }
 
-    /// Returns the hash of the component code only.
-    pub fn code_hash(&self) -> &[u8; COMPONENT_HASH_LENGTH] {
+    /// Returns the hash of the delegate code only.
+    pub fn code_hash(&self) -> &[u8; DELEGATE_HASH_LENGTH] {
         &self.0
     }
 }
@@ -293,7 +293,7 @@ pub enum OutboundDelegateMsg {
     // for the apps
     ApplicationMessage(ApplicationMessage),
     RequestUserInput(#[serde(deserialize_with = "deser_func")] UserInputRequest<'static>),
-    // todo: remove when context can be accessed from the component environment and we pass it as reference
+    // todo: remove when context can be accessed from the delegate environment and we pass it as reference
     ContextUpdated(DelegateContext),
     // from the node
     GetSecretRequest(GetSecretRequest),

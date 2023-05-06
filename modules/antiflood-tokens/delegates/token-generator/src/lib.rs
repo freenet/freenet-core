@@ -17,7 +17,7 @@ type AssignmentHash = [u8; 32];
 
 struct TokenDelegate;
 
-#[component]
+#[delegate]
 impl DelegateInterface for TokenDelegate {
     fn process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
@@ -103,7 +103,7 @@ fn allocate_token(
     app: ContractInstanceId,
     RequestNewToken {
         request_id,
-        component_id,
+        delegate_id,
         criteria,
         mut records,
         assignee,
@@ -122,7 +122,7 @@ fn allocate_token(
             let context: DelegateContext = (&*context).try_into()?;
             let request_secret = {
                 GetSecretRequest {
-                    key: component_id.clone(),
+                    key: delegate_id.clone(),
                     context: context.clone(),
                     processed: false,
                 }
@@ -131,7 +131,7 @@ fn allocate_token(
             let req_allocation = {
                 let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
-                    component_id,
+                    delegate_id,
                     criteria,
                     records,
                     assignee,
@@ -151,7 +151,7 @@ fn allocate_token(
             let req_allocation = {
                 let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
-                    component_id,
+                    delegate_id,
                     criteria,
                     records,
                     assignee,
@@ -177,7 +177,7 @@ fn allocate_token(
             let req_allocation = {
                 let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
-                    component_id,
+                    delegate_id,
                     criteria,
                     records,
                     assignee,
@@ -195,13 +195,13 @@ fn allocate_token(
                 Response::Allowed => {
                     let context: DelegateContext = (&*context).try_into()?;
                     let Some(assignment) = records.assign(assignee, &criteria, keypair, assignment_hash) else {
-                        let msg = TokenDelegateMessage::Failure(FailureReason::NoFreeSlot { component_id, criteria } );
+                        let msg = TokenDelegateMessage::Failure(FailureReason::NoFreeSlot { delegate_id, criteria } );
                         return Ok(vec![OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                         )]);
                     };
                     let msg = TokenDelegateMessage::AllocatedToken {
-                        component_id,
+                        delegate_id,
                         assignment,
                         records,
                     };
@@ -227,7 +227,7 @@ fn allocate_token(
 enum TokenDelegateMessage {
     RequestNewToken(RequestNewToken),
     AllocatedToken {
-        component_id: SecretsId,
+        delegate_id: SecretsId,
         assignment: TokenAssignment,
         /// An updated version of the record with the newly allocated token included
         records: TokenAllocationRecord,
@@ -247,7 +247,7 @@ enum FailureReason {
     UserPermissionDenied,
     /// No free slot to allocate with the requested criteria
     NoFreeSlot {
-        component_id: SecretsId,
+        delegate_id: SecretsId,
         criteria: AllocationCriteria,
     },
 }
@@ -255,7 +255,7 @@ enum FailureReason {
 #[derive(Debug, Serialize, Deserialize)]
 struct RequestNewToken {
     request_id: u32,
-    component_id: SecretsId,
+    delegate_id: SecretsId,
     criteria: AllocationCriteria,
     records: TokenAllocationRecord,
     /// The public key
@@ -303,7 +303,7 @@ impl TryFrom<&[u8]> for TokenDelegateMessage {
     }
 }
 
-/// This is used internally by the component to allocate new tokens on behave of the requesting client app.
+/// This is used internally by the delegate to allocate new tokens on behave of the requesting client app.
 ///  
 /// Conflicting assignments for the same time slot are not permitted and indicate that the generator is broken or malicious.
 trait TokenAssignmentInternal {

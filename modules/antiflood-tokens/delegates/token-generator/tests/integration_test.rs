@@ -19,9 +19,7 @@ mod integration_test {
         DelegateRuntimeInterface, DelegateStore, InboundDelegateMsg, Runtime, SecretsId,
         SecretsStore, WasmAPIVersion,
     };
-    use locutus_stdlib::prelude::{
-        ContractCode, Delegate, DelegateContext, OutboundDelegateMsg, WrappedContract,
-    };
+    use locutus_stdlib::prelude::{ClientResponse, ContractCode, Delegate, DelegateContext, OutboundDelegateMsg, UserInputResponse, WrappedContract};
 
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
@@ -35,7 +33,7 @@ mod integration_test {
         UserPermissionDenied,
         /// No free slot to allocate with the requested criteria
         NoFreeSlot {
-            component_id: SecretsId,
+            delegate_id: SecretsId,
             criteria: AllocationCriteria,
         },
     }
@@ -43,7 +41,7 @@ mod integration_test {
     #[derive(Debug, Serialize, Deserialize)]
     struct RequestNewToken {
         request_id: u32,
-        component_id: SecretsId,
+        delegate_id: SecretsId,
         criteria: AllocationCriteria,
         records: TokenAllocationRecord,
         /// The public key
@@ -55,7 +53,7 @@ mod integration_test {
     enum TokenDelegateMessage {
         RequestNewToken(RequestNewToken),
         AllocatedToken {
-            component_id: SecretsId,
+            delegate_id: SecretsId,
             assignment: TokenAssignment,
             /// An updated version of the record with the newly allocated token included
             records: TokenAllocationRecord,
@@ -130,7 +128,7 @@ mod integration_test {
     fn set_up_aft<'a>(
         key_pair: &RsaPrivateKey,
         contract_name: &str,
-        component_name: &str,
+        delegate_name: &str,
     ) -> Result<(Delegate<'a>, SecretsId, ContractKey, Runtime), Box<dyn std::error::Error>> {
         // Setup contract
         let contracts_dir = test_dir("contract");
@@ -147,35 +145,35 @@ mod integration_test {
         let contract_key = contract.key();
         contract_store.store_contract(contract)?;
 
-        // Setup component
-        let components_dir = test_dir("aft-component");
+        // Setup delegate
+        let delegates_dir = test_dir("aft-delegate");
         let secrets_dir = test_dir("aft-secret");
 
-        let mut component_store = DelegateStore::new(components_dir, 10_000)?;
+        let mut delegate_store = DelegateStore::new(delegates_dir, 10_000)?;
         let mut secret_store = SecretsStore::new(secrets_dir)?;
 
-        let component = {
-            let bytes = get_test_module("components", component_name, "node")?;
+        let delegate = {
+            let bytes = get_test_module("delegates", delegate_name, "node")?;
             Delegate::from(bytes)
         };
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let _ = secret_store.register_component(component.key().clone(), cipher, nonce);
-        let _ = component_store.store_component(component.clone());
+        let _ = secret_store.register_delegate(delegate.key().clone(), cipher, nonce);
+        let _ = delegate_store.store_delegate(delegate.clone());
 
         // Store secret token
         let secret_id = SecretsId::new(vec![0, 1, 2]);
         let encoded = bincode::serialize(&key_pair.to_public_key()).unwrap();
         secret_store
-            .store_secret(&component.key().clone(), &secret_id, encoded)
+            .store_secret(&delegate.key().clone(), &secret_id, encoded)
             .unwrap();
 
-        let runtime = Runtime::build(contract_store, component_store, secret_store, false).unwrap();
+        let runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
 
         //runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
-        Ok((component, secret_id, contract_key, runtime))
+        Ok((delegate, secret_id, contract_key, runtime))
     }
 
     #[test]
@@ -187,15 +185,15 @@ mod integration_test {
         let mut csprng = rand_chacha::ChaChaRng::seed_from_u64(1);
         let private_key = RsaPrivateKey::new(&mut csprng, 4098).unwrap();
 
-        let (component, secret_id, contract_key, mut runtime) =
+        let (delegate, secret_id, contract_key, mut runtime) =
             set_up_aft(&private_key, "token-allocation-record", "token-generator").unwrap();
         let app = ContractInstanceId::try_from(contract_key.to_string()).unwrap();
-        let context: Context = Context {
+        let mut context: Context = Context {
             waiting_for_user_input: HashSet::default(),
             user_response: HashMap::default(),
             key_pair: Some(private_key.clone()),
         };
-        let component_context = DelegateContext::new(bincode::serialize(&context).unwrap());
+        let delegate_context = DelegateContext::new(bincode::serialize(&context).unwrap());
         let criteria = AllocationCriteria::new(
             Tier::Day1,
             std::time::Duration::from_secs(365 * 24 * 3600),
@@ -205,7 +203,7 @@ mod integration_test {
 
         let request_new_token = RequestNewToken {
             request_id: 1,
-            component_id: secret_id,
+            delegate_id: secret_id,
             criteria,
             records: TokenAllocationRecord::new(std::collections::HashMap::new()),
             assignee: private_key.to_public_key(),
@@ -216,16 +214,43 @@ mod integration_test {
         let payload: Vec<u8> = bincode::serialize(&message).unwrap();
 
         // The application request new token allocation
-        let inbound_message = InboundDelegateMsg::ApplicationMessage(
-            ApplicationMessage::new(app, payload).with_context(component_context),
-        );
+        let inbound_message =
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, payload.clone()).with_context(delegate_context.clone()));
         let outbound = runtime
-            .inbound_app_message(component.key(), vec![inbound_message])
+            .inbound_app_message(delegate.key(), vec![inbound_message])
             .unwrap();
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
             outbound.get(0),
-            Some(OutboundDelegateMsg::ApplicationMessage(..))
+            Some(OutboundDelegateMsg::RequestUserInput(..))
         ));
+
+        let request_id = match outbound.get(0) {
+            Some(OutboundDelegateMsg::RequestUserInput(user_input_request)) => user_input_request.request_id,
+            _ => panic!("Unexpected outbound message"),
+        };
+
+        // The user approves the allocation, and send a response
+        let user_response = ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
+        let inbound_message =
+            InboundDelegateMsg::UserResponse(UserInputResponse {request_id, response: user_response.clone(), context: delegate_context.clone()});
+        let outbound = runtime
+            .inbound_app_message(delegate.key(), vec![inbound_message])
+            .unwrap();
+        assert_eq!(outbound.len(), 0);
+
+        //Updated context after process user response
+        let response: Response = serde_json::from_slice(&user_response).unwrap();
+        context.waiting_for_user_input.remove(&request_id);
+        context.user_response.insert(request_id, response);
+        let delegate_context = DelegateContext::new(bincode::serialize(&context).unwrap());
+
+        // Request new token allocation after user approval
+        let inbound_message =
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, payload).with_context(delegate_context.clone()));
+        let outbound = runtime
+            .inbound_app_message(delegate.key(), vec![inbound_message])
+            .unwrap();
+        println!("outbound: {:#?}", outbound);
     }
 }

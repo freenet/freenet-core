@@ -1,14 +1,28 @@
 use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
-    ApplicationMessage, Delegate, DelegateContext, DelegateError, DelegateInterfaceResult,
-    DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg, OutboundDelegateMsg,
-    SetSecretRequest,
+    ApplicationMessage, ClientResponse, Delegate, DelegateContext, DelegateError,
+    DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
+    OutboundDelegateMsg, SetSecretRequest,
 };
 
 use crate::error::RuntimeInnerError;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use std::collections::VecDeque;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use wasmer::{Instance, TypedFunction};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Response {
+    Allowed,
+    NotAllowed,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct Context {
+    waiting_for_user_input: HashSet<u32>,
+    user_response: HashMap<u32, Response>,
+    key_pair: Option<rsa::RsaPrivateKey>,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum DelegateExecError {
@@ -26,14 +40,14 @@ pub trait DelegateRuntimeInterface {
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
-    fn register_component(
+    fn register_delegate(
         &mut self,
-        component: Delegate<'_>,
+        delegate: Delegate<'_>,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> RuntimeResult<()>;
 
-    fn unregister_component(&mut self, key: &DelegateKey) -> RuntimeResult<()>;
+    fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()>;
 }
 
 impl Runtime {
@@ -59,10 +73,10 @@ impl Runtime {
         Ok(outbound)
     }
 
-    // FIXME: modify the context atomically from the components, requires some changes to handle function calls with envs
+    // FIXME: modify the context atomically from the delegates, requires some changes to handle function calls with envs
     fn get_outbound(
         &mut self,
-        component_key: &DelegateKey,
+        delegate_key: &DelegateKey,
         instance: &Instance,
         process_func: &TypedFunction<i64, i64>,
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
@@ -81,7 +95,7 @@ impl Runtime {
                     context,
                     processed,
                 }) if !processed => {
-                    let secret = self.secret_store.get_secret(component_key, &key)?;
+                    let secret = self.secret_store.get_secret(delegate_key, &key)?;
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
                         value: Some(secret),
@@ -114,9 +128,9 @@ impl Runtime {
                 OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
                     if let Some(plaintext) = value {
                         self.secret_store
-                            .store_secret(component_key, &key, plaintext)?;
+                            .store_secret(delegate_key, &key, plaintext)?;
                     } else {
-                        self.secret_store.remove_secret(component_key, &key)?;
+                        self.secret_store.remove_secret(delegate_key, &key)?;
                     }
                 }
                 OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
@@ -143,7 +157,19 @@ impl Runtime {
                     break;
                 }
                 OutboundDelegateMsg::RequestUserInput(req) => {
-                    results.push(OutboundDelegateMsg::RequestUserInput(req));
+                    //results.push(OutboundDelegateMsg::RequestUserInput(req));
+                    // Simulate user response changes after receiving the RequestUserInput
+                    let user_response =
+                        ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
+                    let response: Response = serde_json::from_slice(&user_response)
+                        .map_err(|err| DelegateError::Deser(format!("{err}")))
+                        .unwrap();
+                    let req_id = req.request_id.clone();
+                    let mut context: Context =
+                        bincode::deserialize(&last_context.0.as_slice()).unwrap();
+                    context.waiting_for_user_input.remove(&req_id);
+                    context.user_response.insert(req_id, response);
+                    last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
                     break;
                 }
                 OutboundDelegateMsg::RandomBytesRequest(bytes) => {
@@ -174,7 +200,7 @@ impl DelegateRuntimeInterface for Runtime {
         if inbound.is_empty() {
             return Ok(results);
         }
-        let running = self.prepare_component_call(key, 4096)?;
+        let running = self.prepare_delegate_call(key, 4096)?;
         let process_func: TypedFunction<i64, i64> = running
             .instance
             .exports
@@ -258,20 +284,20 @@ impl DelegateRuntimeInterface for Runtime {
     }
 
     #[inline]
-    fn register_component(
+    fn register_delegate(
         &mut self,
-        component: Delegate<'_>,
+        delegate: Delegate<'_>,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> RuntimeResult<()> {
         self.secret_store
-            .register_component(component.key().clone(), cipher, nonce)?;
-        self.component_store.store_component(component)
+            .register_delegate(delegate.key().clone(), cipher, nonce)?;
+        self.delegate_store.store_delegate(delegate)
     }
 
     #[inline]
-    fn unregister_component(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        self.component_store.remove_component(key)
+    fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
+        self.delegate_store.remove_delegate(key)
     }
 }
 
@@ -285,7 +311,7 @@ mod test {
     use super::*;
     use crate::{delegate_store::DelegateStore, ContractStore, SecretsStore, WrappedContract};
 
-    const TEST_COMPONENT_1: &str = "test_component_1";
+    const TEST_DELEGATE_1: &str = "test_delegate_1";
 
     #[derive(Debug, Serialize, Deserialize)]
     struct SecretsContext {
@@ -305,34 +331,34 @@ mod test {
     }
 
     fn setup_runtime(name: &str) -> Result<(Delegate, Runtime), Box<dyn std::error::Error>> {
-        const TEST_PREFIX: &str = "component-api";
+        const TEST_PREFIX: &str = "delegate-api";
         let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let contracts_dir = crate::tests::test_dir(TEST_PREFIX);
-        let components_dir = crate::tests::test_dir(TEST_PREFIX);
+        let delegates_dir = crate::tests::test_dir(TEST_PREFIX);
         let secrets_dir = crate::tests::test_dir(TEST_PREFIX);
 
         let contract_store = ContractStore::new(contracts_dir, 10_000)?;
-        let component_store = DelegateStore::new(components_dir, 10_000)?;
+        let delegate_store = DelegateStore::new(delegates_dir, 10_000)?;
         let secret_store = SecretsStore::new(secrets_dir)?;
 
         let mut runtime =
-            Runtime::build(contract_store, component_store, secret_store, false).unwrap();
+            Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
 
-        let component = {
+        let delegate = {
             let bytes = crate::tests::get_test_module(name)?;
             Delegate::from(bytes)
         };
-        let _ = runtime.component_store.store_component(component.clone());
+        let _ = runtime.delegate_store.store_delegate(delegate.clone());
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let _ = runtime
             .secret_store
-            .register_component(component.key().clone(), cipher, nonce);
+            .register_delegate(delegate.key().clone(), cipher, nonce);
 
         runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
-        Ok((component, runtime))
+        Ok((delegate, runtime))
     }
 
     #[test]
@@ -341,7 +367,7 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let (component, mut runtime) = setup_runtime(TEST_COMPONENT_1)?;
+        let (delegate, mut runtime) = setup_runtime(TEST_DELEGATE_1)?;
         let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // CreateInboxRequest message parts
@@ -349,7 +375,7 @@ mod test {
         let create_inbox_request_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
-        let outbound = runtime.inbound_app_message(component.key(), vec![inbound])?;
+        let outbound = runtime.inbound_app_message(delegate.key(), vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
 
@@ -365,7 +391,7 @@ mod test {
         let please_sign_message_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundDelegateMsg::ApplicationMessage(please_sign_message_msg);
-        let outbound = runtime.inbound_app_message(component.key(), vec![inbound])?;
+        let outbound = runtime.inbound_app_message(delegate.key(), vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
         assert_eq!(outbound.len(), 1);

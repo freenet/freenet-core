@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let inbox_path = PathBuf::from(MANIFEST);
     let digest = Sha256::digest(STATE_UPDATE).to_vec();
-    let signature = generator_private_key
+    let _signature = generator_private_key
         .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
         .map_err(|e| format!("{e}"))?;
 

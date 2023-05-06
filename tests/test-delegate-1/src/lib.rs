@@ -35,7 +35,7 @@ enum OutboundAppMessage {
 
 struct Delegate;
 
-#[component]
+#[delegate]
 impl DelegateInterface for Delegate {
     fn process(messages: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let mut outbound = Vec::new();
@@ -138,7 +138,7 @@ impl DelegateInterface for Delegate {
                     });
                 outbound.push(get_secret_request_msg);
             }
-            _inbound_component_msg => {
+            _inbound_delegate_msg => {
                 return Err(DelegateError::Other(
                     "Unexpected app inbound message".to_string(),
                 ))

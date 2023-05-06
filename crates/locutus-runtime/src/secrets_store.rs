@@ -90,7 +90,7 @@ impl SecretsStore {
         };
         if !key_file.exists() {
             std::fs::create_dir_all(&secrets_dir).map_err(|err| {
-                tracing::error!("error creating component dir: {err}");
+                tracing::error!("error creating delegate dir: {err}");
                 err
             })?;
             key_to_secret_part = Arc::new(DashMap::new());
@@ -114,31 +114,31 @@ impl SecretsStore {
         })
     }
 
-    pub fn register_component(
+    pub fn register_delegate(
         &mut self,
-        component: DelegateKey,
+        delegate: DelegateKey,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> Result<(), SecretStoreError> {
         // FIXME: store/initialize the cyphers from disc
         let encryption = Encryption { cipher, nonce };
-        self.ciphers.insert(component, encryption);
+        self.ciphers.insert(delegate, encryption);
         Ok(())
     }
 
     pub fn store_secret(
         &mut self,
-        component: &DelegateKey,
+        delegate: &DelegateKey,
         key: &SecretsId,
         plaintext: Vec<u8>,
     ) -> RuntimeResult<()> {
-        let component_path = self.base_path.join(component.encode());
-        let secret_file_path = component_path.join(key.encode());
+        let delegate_path = self.base_path.join(delegate.encode());
+        let secret_file_path = delegate_path.join(key.encode());
         let secret_key = *key.code_hash();
 
         let encryption = self
             .ciphers
-            .get(component)
+            .get(delegate)
             .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = encryption
             .cipher
@@ -146,9 +146,9 @@ impl SecretsStore {
             .map_err(SecretStoreError::Encryption)?;
 
         self.key_to_secret_part
-            .insert(component.clone(), vec![secret_key]);
+            .insert(delegate.clone(), vec![secret_key]);
 
-        fs::create_dir_all(&component_path)?;
+        fs::create_dir_all(&delegate_path)?;
         let mut file = File::create(secret_file_path)?;
         file.write_all(&ciphertext)?;
         Ok(())
@@ -156,10 +156,10 @@ impl SecretsStore {
 
     pub fn remove_secret(
         &mut self,
-        component: &DelegateKey,
+        delegate: &DelegateKey,
         key: &SecretsId,
     ) -> Result<(), SecretStoreError> {
-        let secret_path = self.base_path.join(component.encode()).join(key.encode());
+        let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
         match fs::remove_file(secret_path) {
             Ok(_) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -169,13 +169,13 @@ impl SecretsStore {
 
     pub fn get_secret(
         &self,
-        component: &DelegateKey,
+        delegate: &DelegateKey,
         key: &SecretsId,
     ) -> Result<Vec<u8>, SecretStoreError> {
-        let secret_path = self.base_path.join(component.encode()).join(key.encode());
+        let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
         let encryption = self
             .ciphers
-            .get(component)
+            .get(delegate)
             .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = fs::read(secret_path)?;
         let plaintext = encryption
@@ -200,16 +200,16 @@ mod test {
 
         let mut store = SecretsStore::new(secrets_dir)?;
 
-        let component = Delegate::from(vec![0, 1, 2]);
+        let delegate = Delegate::from(vec![0, 1, 2]);
 
         let cipher = XChaCha20Poly1305::new(&XChaCha20Poly1305::generate_key(&mut OsRng));
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let secret_id = SecretsId::new(vec![0, 1, 2]);
         let text = vec![0, 1, 2];
 
-        store.register_component(component.key().clone(), cipher, nonce)?;
-        store.store_secret(component.key(), &secret_id, text)?;
-        let f = store.get_secret(component.key(), &secret_id);
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        store.store_secret(delegate.key(), &secret_id, text)?;
+        let f = store.get_secret(delegate.key(), &secret_id);
 
         assert!(f.is_ok());
         Ok(())

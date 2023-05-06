@@ -236,7 +236,7 @@ pub enum DelegateRequest<'a> {
     },
     RegisterDelegate {
         #[serde(borrow)]
-        component: Delegate<'a>,
+        delegate: Delegate<'a>,
         cipher: [u8; 24],
         nonce: [u8; 24],
     },
@@ -253,17 +253,14 @@ impl DelegateRequest<'_> {
                 }
             }
             DelegateRequest::RegisterDelegate {
-                component,
+                delegate,
                 cipher,
                 nonce,
-            } => {
-                let component = component.into_owned();
-                DelegateRequest::RegisterDelegate {
-                    component,
-                    cipher,
-                    nonce,
-                }
-            }
+            } => DelegateRequest::RegisterDelegate {
+                delegate: delegate.into_owned(),
+                cipher,
+                nonce,
+            },
             DelegateRequest::UnregisterDelegate(key) => DelegateRequest::UnregisterDelegate(key),
         }
     }
@@ -288,7 +285,7 @@ impl Display for ClientRequest<'_> {
                 }
                 ContractRequest::Subscribe { key, .. } => write!(f, "subscribe request for {key}"),
             },
-            ClientRequest::DelegateOp(_op) => write!(f, "component request"),
+            ClientRequest::DelegateOp(_op) => write!(f, "delegate request"),
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
             ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }
@@ -346,7 +343,7 @@ impl std::fmt::Display for HostResponse {
                     f.write_fmt(format_args!("update notification (key: {key})"))
                 }
             },
-            HostResponse::DelegateResponse { .. } => write!(f, "component responses"),
+            HostResponse::DelegateResponse { .. } => write!(f, "delegate responses"),
             HostResponse::Ok => write!(f, "ok response"),
             HostResponse::GenerateRandData(_) => write!(f, "random bytes"),
         }

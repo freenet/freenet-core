@@ -25,7 +25,7 @@ pub enum OperationMode {
     Network,
 }
 
-/// A WASM executor which will run any contracts, components, etc. registered.
+/// A WASM executor which will run any contracts, delegates, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
 /// Consumers of the executor are required to poll for new changes in order to be notified
@@ -128,7 +128,7 @@ impl Executor {
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_op(op, id, updates).await,
-            ClientRequest::DelegateOp(op) => self.component_op(op),
+            ClientRequest::DelegateOp(op) => self.delegate_op(op),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -344,33 +344,33 @@ impl Executor {
         }
     }
 
-    fn component_op(&mut self, req: DelegateRequest<'_>) -> Response {
+    fn delegate_op(&mut self, req: DelegateRequest<'_>) -> Response {
         match req {
             DelegateRequest::RegisterDelegate {
-                component,
+                delegate,
                 cipher,
                 nonce,
             } => {
                 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = component.key().clone();
+                let key = delegate.key().clone();
 
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
 
-                match self.runtime.register_component(component, cipher, nonce) {
+                match self.runtime.register_delegate(delegate, cipher, nonce) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::error!("failed registering component `{key}`: {err}");
+                        tracing::error!("failed registering delegate `{key}`: {err}");
                         Err(Either::Left(CoreDelegateError::RegisterError(key).into()))
                     }
                 }
             }
             DelegateRequest::UnregisterDelegate(key) => {
-                match self.runtime.unregister_component(&key) {
+                match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::error!("failed unregistering component `{key}`: {err}");
+                        tracing::error!("failed unregistering delegate `{key}`: {err}");
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -384,14 +384,14 @@ impl Executor {
                         .collect(),
                 ) {
                     Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                    Err(err) if err.is_component_exec_error() => {
-                        tracing::error!("failed processing messages for component `{key}`: {err}");
+                    Err(err) if err.is_delegate_exec_error() => {
+                        tracing::error!("failed processing messages for delegate `{key}`: {err}");
                         Err(Either::Left(
                             CoreDelegateError::ExecutionError(format!("{err}")).into(),
                         ))
                     }
                     Err(err) => {
-                        tracing::error!("failed executing component `{key}`: {err}");
+                        tracing::error!("failed executing delegate `{key}`: {err}");
                         Ok(HostResponse::Ok)
                     }
                 }
