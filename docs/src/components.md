@@ -15,7 +15,7 @@ computer. It's responsible for:
 * Providing a user-friendly interface to access Freenet via a web browser
 * Host the user's [delegates](#delegates) and the private data they store
 * Host [contracts](#contracts) and their associated data on behalf of the network
-* Manage communication between contracts, delegates, and UI componets
+* Manage communication between contracts, delegates, and UI components
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
 MB), efficient, and able to run on a wide range of devices like smartphones, desktop
@@ -58,7 +58,9 @@ Contracts also outline how to merge two valid states, creating a new state that
 incorporates both. This process ensures [eventual
 consistency](https://en.wikipedia.org/wiki/Eventual_consistency) of the state in
 Freenet, using an approach akin to
-[CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
+[CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type). The contract
+defines a [commutative monoid](https://en.wikipedia.org/wiki/Monoid#Commutative_monoid)
+on the contract's state.
 
 Each contract is identified by a cryptographic hash, which is a combination of
 its code and parameters, also referred to as its "key". This key is used to
