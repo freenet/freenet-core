@@ -1,6 +1,6 @@
 # Getting Started
 
-This tutorial will show you how to build decentralized software on Freenet.O
+This tutorial will show you how to build decentralized software on Freenet.
 
 <!-- toc -->
 
@@ -26,6 +26,33 @@ $ cargo install locutus
 
 This command will install `ldt` (Locutus Dev Tool) and a working Freenet kernel that can
 be used for local development.
+
+### Node.js and TypeScript
+
+To build user interfaces in JavaScript or TypeScript, you need to have Node.js
+and npm installed. On Linux or Mac:
+
+```bash
+$ sudo apt update
+$ sudo apt install nodejs npm
+```
+
+For Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
+
+Once Node.js and npm are installed, you can install TypeScript globally on your
+system, which includes the `tsc` command:
+
+```bash
+$ sudo npm install -g typescript
+```
+
+You can verify the installation by checking the version of `tsc`:
+
+```bash
+$ tsc --version
+```
+
+This command should output the version of TypeScript that you installed.
 
 ## Creating a new contract
 
