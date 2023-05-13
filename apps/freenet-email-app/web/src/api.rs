@@ -224,15 +224,14 @@ pub(crate) async fn node_comms(
                 }
                 contract_to_id.insert(key, identity);
             }
-            HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update }) => {
-                crate::log::log(format!("received update for key: {key:?} - update: {update:?}"));
+            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                update,
+            }) => {
                 todo!()
-            },
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
-                crate::log::log(format!("received update for key: {key:?} - update: {summary:?}"));
-                todo!()
-            },
-            _ => unreachable!()
+            }
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => {}
+            _ => todo!(),
         }
     }
 
