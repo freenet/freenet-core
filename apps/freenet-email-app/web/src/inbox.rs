@@ -21,8 +21,11 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::io::{BufRead, Cursor, Read};
+use chacha20poly1305::aead::generic_array::GenericArray;
+use rsa::pkcs1::{EncodeRsaPublicKey, LineEnding};
 
-use crate::app::{error_handling, TryNodeAction};
+use crate::app::{ALIAS_MAP2, error_handling, TryNodeAction};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
@@ -123,6 +126,10 @@ impl DecryptedMessage {
             .map_err(|e| format!("{e}"))?;
 
         // Concatenate the nonce, encrypted XChaCha20Poly1305 key and encrypted data
+        crate::log::log(&format!(
+            "Encrypted message len: nonce: {:?}, encrypted_key: {:?}, encrypted_data: {:?}",
+            chacha_nonce.len(), encrypted_key.len(), encrypted_data.len()
+        ));
         let mut content =
             Vec::with_capacity(chacha_nonce.len() + encrypted_key.len() + encrypted_data.len());
         content.extend(&chacha_nonce);
@@ -276,15 +283,33 @@ impl InboxModel {
         state: StoredInbox,
         key: ContractKey,
     ) -> Result<Self, DynError> {
+        crate::log::log(format!("Inbox key: {:?}", ALIAS_MAP2.get(&private_key.to_public_key().to_pkcs1_pem(LineEnding::LF).unwrap())));
         let messages = state
             .messages
             .iter()
             .enumerate()
             .map(|(id, msg)| {
-                let decrypted_content = private_key
-                    .decrypt(Pkcs1v15Encrypt, msg.content.as_ref())
+                let mut msg_cursor = Cursor::new(msg.content.clone());
+                let mut nonce = vec![0;24];
+                msg_cursor.read_exact(&mut nonce)?;
+                let mut encrypted_chacha_key = vec![0;512];
+                msg_cursor.read_exact(&mut encrypted_chacha_key)?;
+                let mut content = vec![];
+                msg_cursor.read_to_end(&mut content)?;
+
+                let chacha_key = private_key
+                    .decrypt(Pkcs1v15Encrypt, encrypted_chacha_key.as_ref())
+                    .map_err(|e| format!("{e}"))?;
+
+                let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
+                let decrypted_content = cipher
+                    .decrypt(
+                        GenericArray::from_slice(nonce.as_ref()),
+                        content.as_ref()
+                    )
                     .map_err(|e| format!("{e}"))?;
                 let content: DecryptedMessage = serde_json::from_slice(&decrypted_content)?;
+
                 Ok(MessageModel {
                     id: id as u64,
                     content,
