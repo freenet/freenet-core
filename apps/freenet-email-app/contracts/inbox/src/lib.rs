@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 
 use chrono::{DateTime, Utc};
 use locutus_aft_interface::{Tier, TokenAllocationRecord, TokenAssignment, TokenAssignmentHash};
@@ -91,11 +92,37 @@ enum VerificationError {
     InvalidInboxKey,
     InvalidMessageHash,
     WrongSignature,
+    Other(String),
 }
 
 impl From<VerificationError> for ContractError {
     fn from(_err: VerificationError) -> Self {
         ContractError::InvalidUpdate
+    }
+}
+
+impl Display for VerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerificationError::MissingContracts(ids) => {
+                write!(f, "Missing contracts: {:?}", ids)
+            }
+            VerificationError::TokenAssignmentMismatch => {
+                write!(f, "Token assignment mismatch")
+            }
+            VerificationError::InvalidInboxKey => {
+                write!(f, "Invalid inbox key")
+            }
+            VerificationError::InvalidMessageHash => {
+                write!(f, "Invalid message hash")
+            }
+            VerificationError::WrongSignature => {
+                write!(f, "Wrong signature")
+            }
+            VerificationError::Other(msg) => {
+                write!(f, "{}", msg)
+            }
+        }
     }
 }
 
@@ -386,12 +413,12 @@ impl ContractInterface for Inbox {
         if missing_related.is_empty() {
             inbox
                 .add_messages(&params, &allocation_records, new_messages)
-                .map_err(|_| ContractError::InvalidUpdate)?;
+                .map_err(|err| ContractError::Other(format!("{err}")))?;
             inbox.remove_messages(rm_messages);
             // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
             //inbox.last_update = locutus_stdlib::time::now();
             let serialized =
-                serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;
+                serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("TEST: {err}")))?;
             Ok(UpdateModification::valid(serialized.into()))
         } else {
             Ok(UpdateModification::requires(missing_related))

@@ -7,7 +7,7 @@ use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
-use locutus_stdlib::prelude::{ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg};
+use locutus_stdlib::prelude::{blake2::Digest, ApplicationMessage, blake2, ContractInstanceId, DelegateKey, InboundDelegateMsg};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
@@ -101,7 +101,7 @@ pub(crate) struct DecryptedMessage {
 }
 
 impl DecryptedMessage {
-    fn to_stored(&self, token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
+    fn to_stored(&self, mut token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
         // FIXME: use a real source of entropy
         let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
         let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
@@ -128,6 +128,11 @@ impl DecryptedMessage {
         content.extend(&chacha_nonce);
         content.extend(encrypted_key);
         content.extend(encrypted_data);
+
+        let mut hasher = blake2::Blake2s256::new();
+        hasher.update(&content);
+        let assignment_hash : [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
+        token_assignment.assignment_hash = assignment_hash;
 
         Ok::<_, DynError>(StoredMessage {
             content,

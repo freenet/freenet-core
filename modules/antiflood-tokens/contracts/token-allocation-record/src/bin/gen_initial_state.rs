@@ -83,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let record_params = TokenParameters::new(generator_private_key.to_public_key());
     let token_record =
         ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)?.into();
+    let assignment_hash: [u8; 32] = vec![238, 20, 117, 45, 1, 84, 9, 198, 49, 106, 34, 149, 133, 156, 76, 67, 239, 4, 124, 206, 63, 192, 42, 9, 188, 99, 177, 241, 75, 202, 118, 10].as_slice().try_into().unwrap();
     let tokens = {
         // FIXME: in the future don't hardcode any TokenAssignment
         let token_assignment = TokenAssignment {
@@ -90,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             time_slot: slot,
             assignee: receiver_private_key.to_public_key(),
             signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
-            assignment_hash: [0; 32],
+            assignment_hash,
             token_record,
         };
 
