@@ -7,7 +7,9 @@ use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
-use locutus_stdlib::prelude::{blake2::Digest, ApplicationMessage, blake2, ContractInstanceId, DelegateKey, InboundDelegateMsg};
+use locutus_stdlib::prelude::{
+    blake2, blake2::Digest, ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg,
+};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
@@ -131,7 +133,7 @@ impl DecryptedMessage {
 
         let mut hasher = blake2::Blake2s256::new();
         hasher.update(&content);
-        let assignment_hash : [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
+        let assignment_hash: [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
         token_assignment.assignment_hash = assignment_hash;
 
         Ok::<_, DynError>(StoredMessage {
@@ -162,6 +164,7 @@ impl InboxModel {
         let contract_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         InboxModel::get_state(client, contract_key.clone()).await?;
+        InboxModel::subscribe(client, contract_key.clone()).await?;
         Ok(contract_key)
     }
 
@@ -190,7 +193,13 @@ impl InboxModel {
                     .unwrap()
                     .into();
 
-            crate::log::log(format!("Sending update request message with token record key: {}", token_record.clone().to_string()).as_str());
+            crate::log::log(
+                format!(
+                    "Sending update request message with token record key: {}",
+                    token_record.clone()
+                )
+                .as_str(),
+            );
 
             TokenAssignment {
                 tier: TEST_TIER,
@@ -395,6 +404,12 @@ impl InboxModel {
             key,
             fetch_contract: false,
         };
+        client.send(request.into()).await?;
+        Ok(())
+    }
+
+    async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
+        let request = ContractRequest::Subscribe { key };
         client.send(request.into()).await?;
         Ok(())
     }

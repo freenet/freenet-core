@@ -224,6 +224,13 @@ pub(crate) async fn node_comms(
                 }
                 contract_to_id.insert(key, identity);
             }
+            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                update,
+            }) => {
+                todo!()
+            }
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => {}
             _ => todo!(),
         }
     }

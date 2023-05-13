@@ -54,10 +54,10 @@ pub enum UpdateInbox {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InboxSettings {
     pub minimum_tier: Tier,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::default")]
     pub private: EncryptedContent,
 }
 
@@ -72,13 +72,13 @@ impl TryFrom<StateDelta<'static>> for UpdateInbox {
 /// The inbox contract does not need to be aware of the content.
 type EncryptedContent = Vec<u8>;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Message {
     pub content: EncryptedContent,
     pub token_assignment: TokenAssignment,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Inbox {
     pub messages: Vec<Message>,
     pub last_update: DateTime<Utc>,
@@ -417,8 +417,8 @@ impl ContractInterface for Inbox {
             inbox.remove_messages(rm_messages);
             // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
             //inbox.last_update = locutus_stdlib::time::now();
-            let serialized =
-                serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("TEST: {err}")))?;
+            let serialized = serde_json::to_vec(&inbox)
+                .map_err(|err| ContractError::Deser(format!("TEST: {err}; {inbox:?}")))?;
             Ok(UpdateModification::valid(serialized.into()))
         } else {
             Ok(UpdateModification::requires(missing_related))
