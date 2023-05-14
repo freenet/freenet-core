@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-use locutus_aft_interface::{TokenParameters};
+use locutus_aft_interface::TokenParameters;
 use locutus_stdlib::prelude::Parameters;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 

@@ -101,10 +101,7 @@ impl DelegateStore {
             return Some(delegate.value().clone());
         }
         self.key_to_delegate_part.get(key).and_then(|_| {
-            let delegate_path = self
-                .delegates_dir
-                .join(key.encode())
-                .with_extension("wasm");
+            let delegate_path = self.delegates_dir.join(key.encode()).with_extension("wasm");
             let delegate = Delegate::try_from(delegate_path.as_path()).ok()?;
             let size = delegate.as_ref().len() as i64;
             self.delegate_cache
@@ -129,10 +126,7 @@ impl DelegateStore {
             LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
 
-        let delegate_path = self
-            .delegates_dir
-            .join(key.encode())
-            .with_extension("wasm");
+        let delegate_path = self.delegates_dir.join(key.encode()).with_extension("wasm");
         if let Ok(delegate) = Delegate::try_from(delegate_path.as_path()) {
             let size = delegate.as_ref().len() as i64;
             self.delegate_cache
@@ -156,10 +150,7 @@ impl DelegateStore {
 
     pub fn remove_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
         self.delegate_cache.remove(key.code_hash());
-        let cmp_path = self
-            .delegates_dir
-            .join(key.encode())
-            .with_extension("wasm");
+        let cmp_path = self.delegates_dir.join(key.encode()).with_extension("wasm");
         match std::fs::remove_file(cmp_path) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),

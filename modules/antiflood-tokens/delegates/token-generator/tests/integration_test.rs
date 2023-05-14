@@ -19,7 +19,10 @@ mod integration_test {
         DelegateRuntimeInterface, DelegateStore, InboundDelegateMsg, Runtime, SecretsId,
         SecretsStore, WasmAPIVersion,
     };
-    use locutus_stdlib::prelude::{ClientResponse, ContractCode, Delegate, DelegateContext, OutboundDelegateMsg, UserInputResponse, WrappedContract};
+    use locutus_stdlib::prelude::{
+        ClientResponse, ContractCode, Delegate, DelegateContext, OutboundDelegateMsg,
+        UserInputResponse, WrappedContract,
+    };
 
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
@@ -214,8 +217,9 @@ mod integration_test {
         let payload: Vec<u8> = bincode::serialize(&message).unwrap();
 
         // The application request new token allocation
-        let inbound_message =
-            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, payload.clone()).with_context(delegate_context.clone()));
+        let inbound_message = InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(app, payload.clone()).with_context(delegate_context.clone()),
+        );
         let outbound = runtime
             .inbound_app_message(delegate.key(), vec![inbound_message])
             .unwrap();
@@ -226,14 +230,19 @@ mod integration_test {
         ));
 
         let request_id = match outbound.get(0) {
-            Some(OutboundDelegateMsg::RequestUserInput(user_input_request)) => user_input_request.request_id,
+            Some(OutboundDelegateMsg::RequestUserInput(user_input_request)) => {
+                user_input_request.request_id
+            }
             _ => panic!("Unexpected outbound message"),
         };
 
         // The user approves the allocation, and send a response
         let user_response = ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
-        let inbound_message =
-            InboundDelegateMsg::UserResponse(UserInputResponse {request_id, response: user_response.clone(), context: delegate_context.clone()});
+        let inbound_message = InboundDelegateMsg::UserResponse(UserInputResponse {
+            request_id,
+            response: user_response.clone(),
+            context: delegate_context.clone(),
+        });
         let outbound = runtime
             .inbound_app_message(delegate.key(), vec![inbound_message])
             .unwrap();
@@ -246,8 +255,9 @@ mod integration_test {
         let delegate_context = DelegateContext::new(bincode::serialize(&context).unwrap());
 
         // Request new token allocation after user approval
-        let inbound_message =
-            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, payload).with_context(delegate_context.clone()));
+        let inbound_message = InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(app, payload).with_context(delegate_context.clone()),
+        );
         let outbound = runtime
             .inbound_app_message(delegate.key(), vec![inbound_message])
             .unwrap();
