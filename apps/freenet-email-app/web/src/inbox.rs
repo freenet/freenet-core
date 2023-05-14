@@ -1,3 +1,4 @@
+use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     XChaCha20Poly1305,
@@ -15,6 +16,7 @@ use locutus_stdlib::{
     prelude::{ContractKey, State, UpdateData},
 };
 use rand_chacha::rand_core::SeedableRng;
+use rsa::pkcs1::{EncodeRsaPublicKey, LineEnding};
 use rsa::{
     pkcs1v15::{Signature, SigningKey},
     sha2::Sha256,
@@ -24,17 +26,15 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{BufRead, Cursor, Read};
-use chacha20poly1305::aead::generic_array::GenericArray;
-use rsa::pkcs1::{EncodeRsaPublicKey, LineEnding};
 
-use crate::app::{ALIAS_MAP2, error_handling, TryNodeAction};
+use crate::app::{error_handling, TryNodeAction, ALIAS_MAP2};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
     UpdateInbox,
 };
 
-static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
+pub(crate) static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
 static TOKEN_RECORD_CODE_HASH: &str = include_str!("../build/token_allocation_record_code_hash");
 
 #[derive(Debug, Clone)]
@@ -128,10 +128,6 @@ impl DecryptedMessage {
             .map_err(|e| format!("{e}"))?;
 
         // Concatenate the nonce, encrypted XChaCha20Poly1305 key and encrypted data
-        crate::log::log(&format!(
-            "Encrypted message len: nonce: {:?}, encrypted_key: {:?}, encrypted_data: {:?}",
-            chacha_nonce.len(), encrypted_key.len(), encrypted_data.len()
-        ));
         let mut content =
             Vec::with_capacity(chacha_nonce.len() + encrypted_key.len() + encrypted_data.len());
         content.extend(&chacha_nonce);
@@ -171,7 +167,7 @@ impl InboxModel {
         let contract_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         InboxModel::get_state(client, contract_key.clone()).await?;
-        InboxModel::subscribe(client, contract_key.clone()).await?;
+        // InboxModel::subscribe(client, contract_key.clone()).await?;
         Ok(contract_key)
     }
 
@@ -292,16 +288,24 @@ impl InboxModel {
         state: StoredInbox,
         key: ContractKey,
     ) -> Result<Self, DynError> {
-        crate::log::log(format!("Inbox key: {:?}", ALIAS_MAP2.get(&private_key.to_public_key().to_pkcs1_pem(LineEnding::LF).unwrap())));
+        crate::log::log(format!(
+            "Inbox key: {:?}",
+            ALIAS_MAP2.get(
+                &private_key
+                    .to_public_key()
+                    .to_pkcs1_pem(LineEnding::LF)
+                    .unwrap()
+            )
+        ));
         let messages = state
             .messages
             .iter()
             .enumerate()
             .map(|(id, msg)| {
                 let mut msg_cursor = Cursor::new(msg.content.clone());
-                let mut nonce = vec![0;24];
+                let mut nonce = vec![0; 24];
                 msg_cursor.read_exact(&mut nonce)?;
-                let mut encrypted_chacha_key = vec![0;512];
+                let mut encrypted_chacha_key = vec![0; 512];
                 msg_cursor.read_exact(&mut encrypted_chacha_key)?;
                 let mut content = vec![];
                 msg_cursor.read_to_end(&mut content)?;
@@ -312,10 +316,7 @@ impl InboxModel {
 
                 let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
                 let decrypted_content = cipher
-                    .decrypt(
-                        GenericArray::from_slice(nonce.as_ref()),
-                        content.as_ref()
-                    )
+                    .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
                     .map_err(|e| format!("{e}"))?;
                 let content: DecryptedMessage = serde_json::from_slice(&decrypted_content)?;
 
@@ -433,7 +434,10 @@ impl InboxModel {
         Ok(())
     }
 
-    async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
+    pub(crate) async fn subscribe(
+        client: &mut WebApiRequestClient,
+        key: ContractKey,
+    ) -> Result<(), DynError> {
         let request = ContractRequest::Subscribe { key };
         client.send(request.into()).await?;
         Ok(())
