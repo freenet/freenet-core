@@ -1436,13 +1436,12 @@ impl WrappedContract {
         data.serialize(ser)
     }
 
-    fn deser_contract_data<'de, D>(_deser: D) -> Result<Arc<ContractCode<'static>>, D::Error>
+    fn deser_contract_data<'de, D>(deser: D) -> Result<Arc<ContractCode<'static>>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
-        // Ok(Arc::new(data))
-        todo!()
+        let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
+        Ok(Arc::new(data.into_owned()))
     }
 
     fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
@@ -1452,13 +1451,12 @@ impl WrappedContract {
         data.serialize(ser)
     }
 
-    fn deser_params<'de, D>(_deser: D) -> Result<Parameters<'static>, D::Error>
+    fn deser_params<'de, D>(deser: D) -> Result<Parameters<'static>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
-        // Ok(Arc::new(data))
-        todo!()
+        let data: Parameters<'de> = Deserialize::deserialize(deser)?;
+        Ok(data.into_owned())
     }
 }
 
