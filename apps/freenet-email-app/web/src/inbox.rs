@@ -322,33 +322,6 @@ impl InboxModel {
         })
     }
 
-    pub(crate) fn from_delta(
-        private_key: rsa::RsaPrivateKey,
-        inbox_model: &mut RefMut<InboxModel>,
-        delta: StoredInbox
-    ) {
-        crate::log::log(format!(
-            "Inbox key: {:?}",
-            ALIAS_MAP2.get(
-                &private_key
-                    .to_public_key()
-                    .to_pkcs1_pem(LineEnding::LF)
-                    .unwrap()
-            )
-        ));
-        delta
-            .messages
-            .iter()
-            .enumerate()
-            .for_each(|(id, msg)| {
-                let content = Self::from_stored(&private_key, msg.content.clone());
-                inbox_model.add_received_message(
-                    content,
-                    msg.token_assignment.clone()
-                );
-            });
-    }
-
     fn from_stored(private_key: &RsaPrivateKey, msg_content: Vec<u8>) -> DecryptedMessage {
         let mut msg_cursor = Cursor::new(msg_content);
         let mut nonce = vec![0; 24];

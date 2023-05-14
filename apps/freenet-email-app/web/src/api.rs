@@ -205,7 +205,7 @@ pub(crate) async fn node_comms(
                     let x = e.borrow();
                     x.key == key
                 }) {
-                    crate::log::log(format!("loaded inbox {key}"));
+                    crate::log::log(format!("loaded inbox {key} with {} messages", updated_model.messages.len()));
                     let mut current = loaded_models[pos].borrow_mut();
                     *current = updated_model;
                 } else {
@@ -237,30 +237,28 @@ pub(crate) async fn node_comms(
                         let updated_model =
                             InboxModel::from_state(identity.key.clone(), delta, key.clone()).unwrap();
                         let loaded_models = inboxes.load();
-                        let mut with_new = (***loaded_models).to_vec();
+                        let mut current_models = (***loaded_models).to_vec();
+                        let mut updated_models = Vec::new();
                         std::mem::drop(loaded_models);
-                        with_new.push(Rc::new(RefCell::new(updated_model)));
+                        current_models.iter_mut().for_each(|inbox| {
+                            if inbox.clone().borrow().key == key {
+                                updated_models.push(Rc::new(RefCell::new(updated_model.clone())));
+                            } else {
+                                updated_models.push(inbox.clone());
+                            }
+                        });
+
                         {
-                            let keys = with_new
+                            let keys = updated_models
                                 .iter()
                                 .map(|i| format!("{}", i.borrow().key))
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             crate::log::log(format!("loaded inboxes: {keys}"));
                         }
-                        inboxes.store(Arc::new(with_new));
+
+                        inboxes.store(Arc::new(updated_models));
                         contract_to_id.insert(key, identity);
-                        // TODO: Update only desired inbox model with new messages
-                        // with_new.iter().enumerate().for_each(|(pos, inbox)| {
-                        //     let mut inbox_mut = inbox.clone().borrow_mut();
-                        //     if inbox_mut.key == delta.key {
-                        //         let updated_model =
-                        //             InboxModel::from_delta(delta.key, &mut inbox_mut, delta).unwrap();
-                        //         with_new.push(Rc::new(RefCell::new(updated_model)));
-                        //     } else {
-                        //         with_new.push(inbox.clone());
-                        //     }
-                        // });
                     },
                     UpdateData::State(state) => {
                         crate::log::log(format!("recieved update state"));
