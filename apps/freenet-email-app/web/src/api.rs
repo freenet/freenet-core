@@ -1,5 +1,6 @@
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+use locutus_stdlib::prelude::UpdateData;
 
 use crate::app::AsyncActionResult;
 
@@ -228,7 +229,49 @@ pub(crate) async fn node_comms(
                 key,
                 update,
             }) => {
-                todo!()
+                match update {
+                    UpdateData::Delta(delta) => {
+                        crate::log::log(format!("recieved update delta"));
+                        let delta: StoredInbox = serde_json::from_slice(delta.as_ref()).unwrap();
+                        let Some(identity) = contract_to_id.remove(&key) else { unreachable!("tried to get wrong contract key: {key}") };
+                        let updated_model =
+                            InboxModel::from_state(identity.key.clone(), delta, key.clone()).unwrap();
+                        let loaded_models = inboxes.load();
+                        let mut with_new = (***loaded_models).to_vec();
+                        std::mem::drop(loaded_models);
+                        with_new.push(Rc::new(RefCell::new(updated_model)));
+                        {
+                            let keys = with_new
+                                .iter()
+                                .map(|i| format!("{}", i.borrow().key))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            crate::log::log(format!("loaded inboxes: {keys}"));
+                        }
+                        inboxes.store(Arc::new(with_new));
+                        contract_to_id.insert(key, identity);
+                        // TODO: Update only desired inbox model with new messages
+                        // with_new.iter().enumerate().for_each(|(pos, inbox)| {
+                        //     let mut inbox_mut = inbox.clone().borrow_mut();
+                        //     if inbox_mut.key == delta.key {
+                        //         let updated_model =
+                        //             InboxModel::from_delta(delta.key, &mut inbox_mut, delta).unwrap();
+                        //         with_new.push(Rc::new(RefCell::new(updated_model)));
+                        //     } else {
+                        //         with_new.push(inbox.clone());
+                        //     }
+                        // });
+                    },
+                    UpdateData::State(state) => {
+                        crate::log::log(format!("recieved update state"));
+                        todo!()
+                    }
+                    UpdateData::StateAndDelta { state, delta} => {
+                        crate::log::log(format!("recieved update state delta"));
+                        todo!()
+                    }
+                    _ => unreachable!(),
+                }
             }
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => {}
             _ => todo!(),

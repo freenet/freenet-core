@@ -1,3 +1,4 @@
+use std::cell::RefMut;
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -302,24 +303,7 @@ impl InboxModel {
             .iter()
             .enumerate()
             .map(|(id, msg)| {
-                let mut msg_cursor = Cursor::new(msg.content.clone());
-                let mut nonce = vec![0; 24];
-                msg_cursor.read_exact(&mut nonce)?;
-                let mut encrypted_chacha_key = vec![0; 512];
-                msg_cursor.read_exact(&mut encrypted_chacha_key)?;
-                let mut content = vec![];
-                msg_cursor.read_to_end(&mut content)?;
-
-                let chacha_key = private_key
-                    .decrypt(Pkcs1v15Encrypt, encrypted_chacha_key.as_ref())
-                    .map_err(|e| format!("{e}"))?;
-
-                let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
-                let decrypted_content = cipher
-                    .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
-                    .map_err(|e| format!("{e}"))?;
-                let content: DecryptedMessage = serde_json::from_slice(&decrypted_content)?;
-
+                let content = Self::from_stored(&private_key, msg.content.clone());
                 Ok(MessageModel {
                     id: id as u64,
                     content,
@@ -336,6 +320,54 @@ impl InboxModel {
             key,
             messages,
         })
+    }
+
+    pub(crate) fn from_delta(
+        private_key: rsa::RsaPrivateKey,
+        inbox_model: &mut RefMut<InboxModel>,
+        delta: StoredInbox
+    ) {
+        crate::log::log(format!(
+            "Inbox key: {:?}",
+            ALIAS_MAP2.get(
+                &private_key
+                    .to_public_key()
+                    .to_pkcs1_pem(LineEnding::LF)
+                    .unwrap()
+            )
+        ));
+        delta
+            .messages
+            .iter()
+            .enumerate()
+            .for_each(|(id, msg)| {
+                let content = Self::from_stored(&private_key, msg.content.clone());
+                inbox_model.add_received_message(
+                    content,
+                    msg.token_assignment.clone()
+                );
+            });
+    }
+
+    fn from_stored(private_key: &RsaPrivateKey, msg_content: Vec<u8>) -> DecryptedMessage {
+        let mut msg_cursor = Cursor::new(msg_content);
+        let mut nonce = vec![0; 24];
+        msg_cursor.read_exact(&mut nonce).unwrap();
+        let mut encrypted_chacha_key = vec![0; 512];
+        msg_cursor.read_exact(&mut encrypted_chacha_key).unwrap();
+        let mut content = vec![];
+        msg_cursor.read_to_end(&mut content).unwrap();
+
+        let chacha_key = private_key
+            .decrypt(Pkcs1v15Encrypt, encrypted_chacha_key.as_ref())
+            .map_err(|e| format!("{e}")).unwrap();
+
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
+        let decrypted_content = cipher
+            .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
+            .map_err(|e| format!("{e}")).unwrap();
+        let content: DecryptedMessage = serde_json::from_slice(&decrypted_content).unwrap();
+        content
     }
 
     /// This only affects in-memory messages, changes are not persisted.
