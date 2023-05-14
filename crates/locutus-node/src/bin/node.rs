@@ -44,6 +44,8 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
 fn main() -> Result<(), DynError> {
     tracing_subscriber::fmt()
         .with_level(true)
+        .with_file(true)
+        .with_line_number(true)
         .with_env_filter(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())

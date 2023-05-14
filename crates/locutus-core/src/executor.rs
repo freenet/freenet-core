@@ -408,19 +408,23 @@ impl Executor {
         if let Some(notifiers) = self.update_notifications.get(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
+                tracing::debug!(?params, ?new_state, "attempt getting delta");
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
                 let update = self
                     .runtime
                     .get_state_delta(key, params, new_state, &*peer_summary)
-                    .map_err(|err| match err {
-                        err if err.is_contract_exec_error() => Either::Left(
-                            CoreContractError::Put {
-                                key: key.clone(),
-                                cause: format!("{err}"),
-                            }
-                            .into(),
-                        ),
-                        other => Either::Right(other.into()),
+                    .map_err(|err| {
+                        tracing::error!("{err}");
+                        match err {
+                            err if err.is_contract_exec_error() => Either::Left(
+                                CoreContractError::Put {
+                                    key: key.clone(),
+                                    cause: format!("{err}"),
+                                }
+                                .into(),
+                            ),
+                            other => Either::Right(other.into()),
+                        }
                     })?;
                 notifier
                     .send(Ok(ContractResponse::UpdateNotification {
