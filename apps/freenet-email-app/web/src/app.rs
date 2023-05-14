@@ -153,8 +153,29 @@ impl Inbox {
         contracts: &[Identity],
         contract_to_id: &mut HashMap<ContractKey, Identity>,
     ) {
+        async fn subscribe(
+            client: &mut WebApiRequestClient,
+            pub_key: RsaPublicKey,
+        ) -> Result<(), DynError> {
+            let alias = ALIAS_MAP2
+                .get(&pub_key.to_pkcs1_pem(LineEnding::LF).unwrap())
+                .unwrap();
+            let params = freenet_email_inbox::InboxParams { pub_key }
+                .try_into()
+                .map_err(|e| format!("{e}"))?;
+            let contract_key = ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
+                .map_err(|e| format!("{e}"))?;
+            crate::log::log(format!(
+                "subscribed to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
+            ));
+            InboxModel::subscribe(client, contract_key.clone()).await?;
+            Ok(())
+        }
+
         for identity in contracts {
             let mut client = client.clone();
+            let res = subscribe(&mut client, identity.key.to_public_key()).await;
+            error_handling(client.clone().into(), res, TryNodeAction::LoadInbox).await;
             let res = InboxModel::load(&mut client, identity).await.map(|key| {
                 contract_to_id
                     .entry(key.clone())
@@ -295,7 +316,6 @@ impl Inbox {
 
     // #[cfg(feature = "use-node")]
     fn get_public_key_from_alias(&self, alias: &str) -> Result<String, DynError> {
-        crate::log::log(format!("getting user from alias: {}", alias));
         let pub_key = ALIAS_MAP.get(alias).ok_or("alias not found")?;
         Ok(pub_key.to_string())
     }
