@@ -49,6 +49,8 @@ fn main() -> Result<(), DynError> {
                 .with_default_directive(LevelFilter::INFO.into())
                 .from_env_lossy(),
         )
+        .with_file(true)
+        .with_line_number(true)
         .init();
     let config = NodeConfig::parse();
     let rt = tokio::runtime::Builder::new_multi_thread()

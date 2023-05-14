@@ -338,7 +338,7 @@ impl Executor {
                 let updates =
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
                 self.register_contract_notifier(key.clone(), id, updates, [].as_ref().into())
-                    .unwrap();
+                    .map_err(Either::Left)?;
                 tracing::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)
