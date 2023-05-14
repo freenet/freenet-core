@@ -417,8 +417,7 @@ impl ContractInterface for Inbox {
             inbox.remove_messages(rm_messages);
             // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
             //inbox.last_update = locutus_stdlib::time::now();
-            let serialized = serde_json::to_vec(&inbox)
-                .map_err(|err| ContractError::Deser(format!("TEST: {err}; {inbox:?}")))?;
+            let serialized = serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;
             Ok(UpdateModification::valid(serialized.into()))
         } else {
             Ok(UpdateModification::requires(missing_related))

@@ -68,12 +68,15 @@ impl Executor {
         cli_id: ClientId,
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: StateSummary<'static>,
-    ) -> Result<(), DynError> {
+    ) -> Result<(), RequestError> {
         let channels = self.update_notifications.entry(key.clone()).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
-                return Err(format!("peer {cli_id} has multiple notification channels").into());
+                return Err(RequestError::from(CoreContractError::Subscribe {
+                    key: key.clone(),
+                    cause: format!("Peer {cli_id} already subscribed").to_owned(),
+                }));
             }
         } else {
             channels.push((cli_id, notification_ch));

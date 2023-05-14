@@ -110,6 +110,8 @@ pub enum ContractError {
     Put { key: ContractKey, cause: String },
     #[error("update error for contract {key}, reason: {cause}")]
     Update { key: ContractKey, cause: String },
+    #[error("failed to subscribe for contract {key}, reason: {cause}")]
+    Subscribe { key: ContractKey, cause: String },
     #[error("missing related contract: {key}")]
     MissingRelated { key: ContractInstanceId },
 }
