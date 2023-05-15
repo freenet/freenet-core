@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use arc_swap::ArcSwap;
@@ -26,7 +26,8 @@ mod login;
 
 pub(crate) type AsyncActionResult = Result<(), (DynError, TryNodeAction)>;
 
-pub static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
+// todo: simplify this whole alias map stuff mapping identities to contract keys
+pub(crate) static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
     const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
     const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
     let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
@@ -45,7 +46,7 @@ pub static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
     map
 });
 
-pub static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
+pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
     const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
     const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
     let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
@@ -63,6 +64,8 @@ pub static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
     map.insert(pub_key1, "address2".to_string());
     map
 });
+
+static ALIAS_MAP3: Lazy<Mutex<HashMap<ContractKey, Id>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
@@ -136,15 +139,19 @@ pub struct Inbox {
     inbox_data: InboxesData,
     /// loaded messages for the currently selected `active_id`
     messages: Rc<RefCell<Vec<Message>>>,
-    active_id: usize,
+    active_id: Id,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct Id(usize);
 
 impl Inbox {
     fn new() -> Self {
         Self {
             inbox_data: Arc::new(ArcSwap::from_pointee(vec![])),
             messages: Rc::new(RefCell::new(vec![])),
-            active_id: 0,
+            active_id: Id(0),
         }
     }
 
@@ -155,8 +162,9 @@ impl Inbox {
     ) {
         async fn subscribe(
             client: &mut WebApiRequestClient,
-            pub_key: RsaPublicKey,
+            identity: &Identity,
         ) -> Result<(), DynError> {
+            let pub_key = identity.key.to_public_key();
             let alias = ALIAS_MAP2
                 .get(&pub_key.to_pkcs1_pem(LineEnding::LF).unwrap())
                 .unwrap();
@@ -165,6 +173,10 @@ impl Inbox {
                 .map_err(|e| format!("{e}"))?;
             let contract_key = ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
                 .map_err(|e| format!("{e}"))?;
+            {
+                let mut l = ALIAS_MAP3.lock().unwrap();
+                l.insert(contract_key.clone(), identity.id);
+            }
             crate::log::log(format!(
                 "subscribed to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
             ));
@@ -174,7 +186,7 @@ impl Inbox {
 
         for identity in contracts {
             let mut client = client.clone();
-            let res = subscribe(&mut client, identity.key.to_public_key()).await;
+            let res = subscribe(&mut client, identity).await;
             error_handling(client.clone().into(), res, TryNodeAction::LoadInbox).await;
             let res = InboxModel::load(&mut client, identity).await.map(|key| {
                 contract_to_id
@@ -233,7 +245,7 @@ impl Inbox {
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
         let inbox_data = self.inbox_data.load();
-        let mut inbox = inbox_data[self.active_id].borrow_mut();
+        let mut inbox = inbox_data[self.active_id.0].borrow_mut();
         inbox.remove_messages(client, ids)
     }
 
@@ -344,12 +356,12 @@ impl User {
             identities: vec![
                 Identity {
                     alias: "address1".to_owned(),
-                    id: 0,
+                    id: Id(0),
                     key: key0,
                 },
                 Identity {
                     alias: "address2".to_owned(),
-                    id: 1,
+                    id: Id(1),
                     key: key1,
                 },
             ],
@@ -374,7 +386,7 @@ impl User {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Identity {
-    pub id: usize,
+    pub id: Id,
     pub key: RsaPrivateKey,
     alias: String,
 }
@@ -555,7 +567,31 @@ fn InboxComponent(cx: Scope) -> Element {
         }))
     }
 
+    {
+        // reload if there were new emails received
+        let all_data = inbox.inbox_data.load();
+        let lock = ALIAS_MAP3.lock().unwrap();
+        if let Some(current_model) = all_data.iter().find(|ib| {
+            let id = lock.get(&ib.borrow().key).unwrap();
+            *id == inbox.active_id
+        }) {
+            crate::log::log(format!("reloading inbox messages {:?}", inbox.active_id));
+            std::mem::drop(lock);
+            let mut emails = inbox.messages.borrow_mut();
+            emails.clear();
+            for msg in &current_model.borrow().messages {
+                let m = Message::from(msg.clone());
+                emails.push(m);
+            }
+        }
+    }
+
     let emails = inbox.messages.borrow();
+    crate::log::log(format!(
+        "active id: {:?}; emails number: {}",
+        inbox.active_id,
+        emails.len()
+    ));
     let is_email = menu_selection.read().email();
     if let Some(email_id) = is_email {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();

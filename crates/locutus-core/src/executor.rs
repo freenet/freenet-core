@@ -74,8 +74,8 @@ impl Executor {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
                 return Err(RequestError::from(CoreContractError::Subscribe {
-                    key: key.clone(),
-                    cause: format!("Peer {cli_id} already subscribed").to_owned(),
+                    key,
+                    cause: format!("Peer {cli_id} already subscribed"),
                 }));
             }
         } else {

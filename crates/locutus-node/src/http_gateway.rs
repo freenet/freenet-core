@@ -374,6 +374,8 @@ impl ClientEventsProxy for HttpGateway {
                 if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(id, ch);
+                } else {
+                    tracing::info!("dropped connection to client #{id}");
                 }
             } else {
                 tracing::warn!("client: {id} not found");

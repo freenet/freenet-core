@@ -16,7 +16,6 @@ use locutus_stdlib::{
     prelude::{ContractKey, State, UpdateData},
 };
 use rand_chacha::rand_core::SeedableRng;
-use rsa::pkcs1::{EncodeRsaPublicKey, LineEnding};
 use rsa::{
     pkcs1v15::{Signature, SigningKey},
     sha2::Sha256,
@@ -27,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 
-use crate::app::{error_handling, TryNodeAction, ALIAS_MAP2};
+use crate::app::{error_handling, TryNodeAction};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
@@ -323,15 +322,6 @@ impl InboxModel {
         state: StoredInbox,
         key: ContractKey,
     ) -> Result<Self, DynError> {
-        crate::log::log(format!(
-            "Inbox key: {:?}",
-            ALIAS_MAP2.get(
-                &private_key
-                    .to_public_key()
-                    .to_pkcs1_pem(LineEnding::LF)
-                    .unwrap()
-            )
-        ));
         let messages = state
             .messages
             .iter()
