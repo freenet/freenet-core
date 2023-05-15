@@ -541,6 +541,7 @@ fn UserMenuComponent(cx: Scope) -> Element {
 fn InboxComponent(cx: Scope) -> Element {
     let inbox = use_context::<Inbox>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
+    let user = use_shared_state::<User>(cx).unwrap();
 
     #[inline_props]
     fn EmailLink<'a>(
@@ -568,14 +569,15 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 
     {
+        let current_active_id: Id = Id(user.read().active_id.unwrap());
         // reload if there were new emails received
         let all_data = inbox.inbox_data.load();
         let lock = ALIAS_MAP3.lock().unwrap();
         if let Some(current_model) = all_data.iter().find(|ib| {
             let id = lock.get(&ib.borrow().key).unwrap();
-            *id == inbox.active_id
+            *id == current_active_id
         }) {
-            crate::log::log(format!("reloading inbox messages {:?}", inbox.active_id));
+            crate::log::log(format!("reloading inbox messages {:?}", current_active_id));
             std::mem::drop(lock);
             let mut emails = inbox.messages.borrow_mut();
             emails.clear();
@@ -589,7 +591,7 @@ fn InboxComponent(cx: Scope) -> Element {
     let emails = inbox.messages.borrow();
     crate::log::log(format!(
         "active id: {:?}; emails number: {}",
-        inbox.active_id,
+        user.read().active_id,
         emails.len()
     ));
     let is_email = menu_selection.read().email();

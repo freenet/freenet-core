@@ -434,7 +434,15 @@ impl Executor {
                         update: update.to_owned().into(),
                     }
                     .into()))
-                    .unwrap();
+                    .map_err(|err| {
+                        tracing::error!("{err}");
+                        Either::Left(
+                            CoreContractError::Update {
+                                key: key.clone(),
+                                cause: format!("{err}"),
+                            }.into(),
+                        )
+                    })?;
             }
         }
         Ok(())
