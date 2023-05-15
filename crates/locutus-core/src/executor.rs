@@ -411,7 +411,6 @@ impl Executor {
         if let Some(notifiers) = self.update_notifications.get(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
-                tracing::debug!(?params, ?new_state, "attempt getting delta");
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
                 let update = self
                     .runtime

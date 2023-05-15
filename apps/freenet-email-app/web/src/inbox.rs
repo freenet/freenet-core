@@ -1,4 +1,3 @@
-use std::cell::RefMut;
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -26,7 +25,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{BufRead, Cursor, Read};
+use std::io::{Cursor, Read};
 
 use crate::app::{error_handling, TryNodeAction, ALIAS_MAP2};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
@@ -144,6 +143,29 @@ impl DecryptedMessage {
             content,
             token_assignment,
         })
+    }
+
+    fn from_stored(private_key: &RsaPrivateKey, msg_content: Vec<u8>) -> DecryptedMessage {
+        let mut msg_cursor = Cursor::new(msg_content);
+        let mut nonce = vec![0; 24];
+        msg_cursor.read_exact(&mut nonce).unwrap();
+        let mut encrypted_chacha_key = vec![0; 512];
+        msg_cursor.read_exact(&mut encrypted_chacha_key).unwrap();
+        let mut content = vec![];
+        msg_cursor.read_to_end(&mut content).unwrap();
+
+        let chacha_key = private_key
+            .decrypt(Pkcs1v15Encrypt, encrypted_chacha_key.as_ref())
+            .map_err(|e| format!("{e}"))
+            .unwrap();
+
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
+        let decrypted_content = cipher
+            .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
+            .map_err(|e| format!("{e}"))
+            .unwrap();
+        let content: DecryptedMessage = serde_json::from_slice(&decrypted_content).unwrap();
+        content
     }
 }
 
@@ -271,6 +293,18 @@ impl InboxModel {
         }
     }
 
+    pub(crate) fn merge(&mut self, other: InboxModel) {
+        for m in other.messages {
+            if !self
+                .messages
+                .iter()
+                .any(|c| c.content.time == m.content.time)
+            {
+                self.add_received_message(m.content, m.token_assignment);
+            }
+        }
+    }
+
     // TODO: only used when an inbox is created first time when putting the contract
     fn to_state(&self) -> Result<State<'static>, DynError> {
         let settings = self.settings.to_stored()?;
@@ -303,7 +337,7 @@ impl InboxModel {
             .iter()
             .enumerate()
             .map(|(id, msg)| {
-                let content = Self::from_stored(&private_key, msg.content.clone());
+                let content = DecryptedMessage::from_stored(&private_key, msg.content.clone());
                 Ok(MessageModel {
                     id: id as u64,
                     content,
@@ -322,29 +356,7 @@ impl InboxModel {
         })
     }
 
-    fn from_stored(private_key: &RsaPrivateKey, msg_content: Vec<u8>) -> DecryptedMessage {
-        let mut msg_cursor = Cursor::new(msg_content);
-        let mut nonce = vec![0; 24];
-        msg_cursor.read_exact(&mut nonce).unwrap();
-        let mut encrypted_chacha_key = vec![0; 512];
-        msg_cursor.read_exact(&mut encrypted_chacha_key).unwrap();
-        let mut content = vec![];
-        msg_cursor.read_to_end(&mut content).unwrap();
-
-        let chacha_key = private_key
-            .decrypt(Pkcs1v15Encrypt, encrypted_chacha_key.as_ref())
-            .map_err(|e| format!("{e}")).unwrap();
-
-        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
-        let decrypted_content = cipher
-            .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
-            .map_err(|e| format!("{e}")).unwrap();
-        let content: DecryptedMessage = serde_json::from_slice(&decrypted_content).unwrap();
-        content
-    }
-
     /// This only affects in-memory messages, changes are not persisted.
-    // TODO: call when new message updates come from the node
     fn add_received_message(
         &mut self,
         content: DecryptedMessage,
@@ -411,24 +423,6 @@ impl InboxModel {
         client.send(request).await?;
         todo!()
     }
-
-    // async fn add_messages_to_store(
-    //     &mut self,
-    //     client: &mut WebApi,
-    //     ids: &[usize],
-    // ) -> Result<(), DynError> {
-    //     let mut messages = Vec::with_capacity(ids.len() * 32);
-    //     for message in &self.messages {
-    //         // messages.push(message.to_stored(&self.settings.private_key)?);
-    //     }
-    //     let delta = UpdateInbox::AddMessages { messages };
-    //     let request = ContractRequest::Update {
-    //         key: self.key.clone(),
-    //         data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
-    //     };
-    //     client.send(request.into()).await?;
-    //     Ok(())
-    // }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
         let request = ContractRequest::Get {

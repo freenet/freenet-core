@@ -436,7 +436,7 @@ impl ContractInterface for Inbox {
     fn get_state_delta(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        summary: StateSummary<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
         let inbox = Inbox::try_from(&state)?;
         // let summary = InboxSummary::try_from(summary)?;

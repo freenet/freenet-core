@@ -205,7 +205,10 @@ pub(crate) async fn node_comms(
                     let x = e.borrow();
                     x.key == key
                 }) {
-                    crate::log::log(format!("loaded inbox {key} with {} messages", updated_model.messages.len()));
+                    crate::log::log(format!(
+                        "loaded inbox {key} with {} messages",
+                        updated_model.messages.len()
+                    ));
                     let mut current = loaded_models[pos].borrow_mut();
                     *current = updated_model;
                 } else {
@@ -228,49 +231,37 @@ pub(crate) async fn node_comms(
             HostResponse::ContractResponse(ContractResponse::UpdateNotification {
                 key,
                 update,
-            }) => {
-                match update {
-                    UpdateData::Delta(delta) => {
-                        crate::log::log(format!("recieved update delta"));
-                        let delta: StoredInbox = serde_json::from_slice(delta.as_ref()).unwrap();
-                        let Some(identity) = contract_to_id.remove(&key) else { unreachable!("tried to get wrong contract key: {key}") };
-                        let updated_model =
-                            InboxModel::from_state(identity.key.clone(), delta, key.clone()).unwrap();
-                        let loaded_models = inboxes.load();
-                        let mut current_models = (***loaded_models).to_vec();
-                        let mut updated_models = Vec::new();
-                        std::mem::drop(loaded_models);
-                        current_models.iter_mut().for_each(|inbox| {
-                            if inbox.clone().borrow().key == key {
-                                updated_models.push(Rc::new(RefCell::new(updated_model.clone())));
-                            } else {
-                                updated_models.push(inbox.clone());
-                            }
-                        });
-
-                        {
-                            let keys = updated_models
-                                .iter()
-                                .map(|i| format!("{}", i.borrow().key))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            crate::log::log(format!("loaded inboxes: {keys}"));
+            }) => match update {
+                UpdateData::Delta(delta) => {
+                    crate::log::log("recieved update delta");
+                    let delta: StoredInbox = serde_json::from_slice(delta.as_ref()).unwrap();
+                    let Some(identity) = contract_to_id.remove(&key) else { unreachable!("tried to get wrong contract key: {key}") };
+                    let updated_model =
+                        InboxModel::from_state(identity.key.clone(), delta, key.clone()).unwrap();
+                    let loaded_models = inboxes.load();
+                    let mut found = false;
+                    for inbox in loaded_models.as_slice() {
+                        if inbox.clone().borrow().key == key {
+                            inbox.borrow_mut().merge(updated_model);
+                            crate::log::log(format!(
+                                "updated inbox {key} with {} messages",
+                                inbox.borrow().messages.len()
+                            ));
+                            found = true;
+                            break;
                         }
-
-                        inboxes.store(Arc::new(updated_models));
-                        contract_to_id.insert(key, identity);
-                    },
-                    UpdateData::State(state) => {
-                        crate::log::log(format!("recieved update state"));
-                        todo!()
                     }
-                    UpdateData::StateAndDelta { state, delta} => {
-                        crate::log::log(format!("recieved update state delta"));
-                        todo!()
-                    }
-                    _ => unreachable!(),
+                    assert!(found);
+                    contract_to_id.insert(key, identity);
                 }
-            }
+                UpdateData::State(_) => {
+                    crate::log::error("recieved update state", None);
+                }
+                UpdateData::StateAndDelta { .. } => {
+                    crate::log::error("recieved update state delta", None);
+                }
+                _ => unreachable!(),
+            },
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => {}
             _ => todo!(),
         }
