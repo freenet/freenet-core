@@ -65,7 +65,8 @@ pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
     map
 });
 
-static ALIAS_MAP3: Lazy<Mutex<HashMap<ContractKey, Id>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static ALIAS_MAP3: Lazy<Mutex<HashMap<ContractKey, UserId>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
@@ -139,20 +140,39 @@ pub struct Inbox {
     inbox_data: InboxesData,
     /// loaded messages for the currently selected `active_id`
     messages: Rc<RefCell<Vec<Message>>>,
-    active_id: Id,
+    active_id: Rc<RefCell<UserId>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct Id(usize);
+pub(crate) struct UserId(usize);
+
+impl UserId {
+    pub fn new(id: usize) -> Self {
+        Self(id)
+    }
+}
+
+impl std::ops::Deref for UserId {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl Inbox {
     fn new() -> Self {
         Self {
             inbox_data: Arc::new(ArcSwap::from_pointee(vec![])),
             messages: Rc::new(RefCell::new(vec![])),
-            active_id: Id(0),
+            active_id: Rc::new(RefCell::new(UserId(0))),
         }
+    }
+
+    fn set_active_id(&self, user: UserId) {
+        let mut id = self.active_id.borrow_mut();
+        *id = user;
     }
 
     pub(crate) async fn load_all(
@@ -245,7 +265,7 @@ impl Inbox {
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
         let inbox_data = self.inbox_data.load();
-        let mut inbox = inbox_data[self.active_id.0].borrow_mut();
+        let mut inbox = inbox_data[**self.active_id.borrow()].borrow_mut();
         inbox.remove_messages(client, ids)
     }
 
@@ -336,7 +356,7 @@ impl Inbox {
 struct User {
     logged: bool,
     identified: bool,
-    active_id: Option<usize>,
+    active_id: Option<UserId>,
     identities: Vec<Identity>,
 }
 
@@ -356,12 +376,12 @@ impl User {
             identities: vec![
                 Identity {
                     alias: "address1".to_owned(),
-                    id: Id(0),
+                    id: UserId(0),
                     key: key0,
                 },
                 Identity {
                     alias: "address2".to_owned(),
-                    id: Id(1),
+                    id: UserId(1),
                     key: key1,
                 },
             ],
@@ -375,18 +395,18 @@ impl User {
     // }
 
     fn logged_id(&self) -> Option<&Identity> {
-        self.active_id.and_then(|id| self.identities.get(id))
+        self.active_id.and_then(|id| self.identities.get(id.0))
     }
 
-    fn set_logged_id(&mut self, id: usize) {
-        assert!(id < self.identities.len());
+    fn set_logged_id(&mut self, id: UserId) {
+        assert!(id.0 < self.identities.len());
         self.active_id = Some(id);
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Identity {
-    pub id: Id,
+    pub id: UserId,
     pub key: RsaPrivateKey,
     alias: String,
 }
@@ -569,7 +589,7 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 
     {
-        let current_active_id: Id = Id(user.read().active_id.unwrap());
+        let current_active_id: UserId = user.read().active_id.unwrap();
         // reload if there were new emails received
         let all_data = inbox.inbox_data.load();
         let lock = ALIAS_MAP3.lock().unwrap();
