@@ -85,6 +85,8 @@ pub struct PutConfig {
     /// A path to a JSON file listing the related contracts.
     #[arg(long)]
     pub(crate) related_contracts: Option<PathBuf>,
+    #[arg(long, default_value_t = PackageType::default())]
+    pub(crate) package_type: PackageType,
 }
 
 /// Builds and packages a contract.

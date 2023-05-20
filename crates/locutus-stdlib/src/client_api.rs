@@ -12,21 +12,23 @@
 //!               (In order to use this client from JS/Typescript refer to the Typescript std lib).
 mod client_events;
 
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", feature = "net"))]
 mod regular;
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", feature = "net"))]
 pub use regular::*;
 
 #[cfg(all(
     target_arch = "wasm32",
     target_vendor = "unknown",
-    target_os = "unknown"
+    target_os = "unknown",
+    feature = "net"
 ))]
 mod browser;
 #[cfg(all(
     target_arch = "wasm32",
     target_vendor = "unknown",
-    target_os = "unknown"
+    target_os = "unknown",
+    feature = "net"
 ))]
 pub use browser::*;
 
@@ -52,4 +54,24 @@ pub enum Error {
     ConnectionClosed,
     #[error("unhandled error: {0}")]
     OtherError(Box<dyn std::error::Error + Send + Sync>),
+}
+
+pub trait TryFromTsStd<T>: Sized {
+    fn try_decode(value: T) -> Result<Self, WsApiError>;
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum WsApiError {
+    #[error("Failed decoding msgpack message from client request: {cause}")]
+    MsgpackDecodeError { cause: String },
+    #[error("Unsupported contract version")]
+    UnsupportedContractVersion,
+    #[error("Failed unpacking contract container")]
+    UnpackingContractContainerError(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl WsApiError {
+    pub fn deserialization(cause: String) -> Self {
+        Self::MsgpackDecodeError { cause }
+    }
 }

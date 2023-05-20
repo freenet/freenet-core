@@ -440,7 +440,8 @@ impl Executor {
                             CoreContractError::Update {
                                 key: key.clone(),
                                 cause: format!("{err}"),
-                            }.into(),
+                            }
+                            .into(),
                         )
                     })?;
             }

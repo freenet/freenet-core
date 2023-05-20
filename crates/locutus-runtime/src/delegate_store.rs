@@ -5,19 +5,17 @@ use stretto::Cache;
 
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
-use locutus_stdlib::prelude::{Delegate, DelegateKey};
+use locutus_stdlib::prelude::{CodeHash, Delegate, DelegateKey};
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
 
-type DelegateCodeKey = [u8; 32];
-
 #[derive(Serialize, Deserialize, Default)]
-struct KeyToCodeMap(Vec<(DelegateKey, DelegateCodeKey)>);
+struct KeyToCodeMap(Vec<(DelegateKey, CodeHash)>);
 
 impl StoreEntriesContainer for KeyToCodeMap {
-    type MemContainer = Arc<DashMap<DelegateKey, DelegateCodeKey>>;
+    type MemContainer = Arc<DashMap<DelegateKey, CodeHash>>;
     type Key = DelegateKey;
-    type Value = DelegateCodeKey;
+    type Value = CodeHash;
 
     fn update(self, container: &mut Self::MemContainer) {
         for (k, v) in self.0 {
@@ -34,11 +32,11 @@ impl StoreEntriesContainer for KeyToCodeMap {
     }
 }
 
-impl From<&DashMap<DelegateKey, DelegateCodeKey>> for KeyToCodeMap {
-    fn from(vals: &DashMap<DelegateKey, DelegateCodeKey>) -> Self {
+impl From<&DashMap<DelegateKey, CodeHash>> for KeyToCodeMap {
+    fn from(vals: &DashMap<DelegateKey, CodeHash>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
-            map.push((r.key().clone(), *r.value()));
+            map.push((r.key().clone(), r.value().clone()));
         }
         Self(map)
     }
@@ -46,8 +44,8 @@ impl From<&DashMap<DelegateKey, DelegateCodeKey>> for KeyToCodeMap {
 
 pub struct DelegateStore {
     delegates_dir: PathBuf,
-    delegate_cache: Cache<DelegateCodeKey, Delegate<'static>>,
-    key_to_delegate_part: Arc<DashMap<DelegateKey, DelegateCodeKey>>,
+    delegate_cache: Cache<CodeHash, Delegate<'static>>,
+    key_to_delegate_part: Arc<DashMap<DelegateKey, CodeHash>>,
 }
 
 static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
@@ -105,15 +103,14 @@ impl DelegateStore {
             let delegate = Delegate::try_from(delegate_path.as_path()).ok()?;
             let size = delegate.as_ref().len() as i64;
             self.delegate_cache
-                .insert(*key.code_hash(), delegate.clone(), size);
+                .insert(key.code_hash().clone(), delegate.clone(), size);
             Some(delegate)
         })
     }
 
     pub fn store_delegate(&mut self, delegate: Delegate<'_>) -> RuntimeResult<()> {
         let key = delegate.key();
-        let delegate_hash = key.code_hash();
-
+        let delegate_hash = delegate.hash();
         if self.delegate_cache.get(delegate_hash).is_some() {
             return Ok(());
         }
@@ -121,7 +118,7 @@ impl DelegateStore {
         Self::update(
             &mut self.key_to_delegate_part,
             key.clone(),
-            *delegate_hash,
+            delegate_hash.clone(),
             KEY_FILE_PATH.get().unwrap(),
             LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
@@ -130,15 +127,18 @@ impl DelegateStore {
         if let Ok(delegate) = Delegate::try_from(delegate_path.as_path()) {
             let size = delegate.as_ref().len() as i64;
             self.delegate_cache
-                .insert(*delegate_hash, delegate.clone(), size);
+                .insert(delegate_hash.clone(), delegate.clone(), size);
             return Ok(());
         }
 
         // insert in the memory cache
         let data = delegate.as_ref();
         let code_size = data.len() as i64;
-        self.delegate_cache
-            .insert(*delegate_hash, Delegate::from(data.to_vec()), code_size);
+        self.delegate_cache.insert(
+            delegate_hash.clone(),
+            Delegate::from(data.to_vec()),
+            code_size,
+        );
 
         let mut output: Vec<u8> = Vec::with_capacity(code_size as usize);
         output.append(&mut delegate.as_ref().to_vec());
@@ -163,8 +163,10 @@ impl DelegateStore {
         Ok(self.delegates_dir.join(key_path).with_extension("wasm"))
     }
 
-    pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<DelegateCodeKey> {
-        self.key_to_delegate_part.get(key).map(|r| *r.value())
+    pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
+        self.key_to_delegate_part
+            .get(key)
+            .map(|r| r.value().clone())
     }
 }
 
@@ -191,7 +193,7 @@ mod test {
         let mut store = DelegateStore::new(cdelegate_dir, 10_000)?;
         let delegate = Delegate::from(vec![0, 1, 2]);
         store.store_delegate(delegate.clone())?;
-        let f = store.fetch_delegate(delegate.key());
+        let f = store.fetch_delegate(&delegate.key());
         assert!(f.is_some());
         Ok(())
     }

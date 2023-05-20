@@ -1,6 +1,7 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt::Display,
+    marker::PhantomData,
     ops::Deref,
     path::Path,
 };
@@ -9,66 +10,137 @@ use blake2::{Blake2s256, Digest};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
+use crate::code_hash::CodeHash;
 use crate::prelude::ContractInstanceId;
 
-const APPLICATION_HASH_SIZE: usize = 32;
 const DELEGATE_HASH_LENGTH: usize = 32;
 
 type Secret = Vec<u8>;
 
-/// Executable delegate
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde_as]
-pub struct Delegate<'a> {
-    #[serde_as(as = "serde_with::Bytes")]
-    #[serde(borrow)]
-    code: Cow<'a, [u8]>,
-    key: DelegateKey,
-}
+// FIXME
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Delegate<'a>(PhantomData<fn() -> &'a ()>);
 
-impl PartialEq for Delegate<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for Delegate<'_> {}
-
-impl Delegate<'_> {
+impl<'a> Delegate<'a> {
     pub fn key(&self) -> &DelegateKey {
-        &self.key
+        todo!()
+    }
+
+    pub fn hash(&self) -> &CodeHash {
+        todo!()
     }
 
     pub fn into_owned(self) -> Delegate<'static> {
-        Delegate {
-            key: self.key,
-            code: Cow::from(self.code.into_owned()),
-        }
-    }
-}
-
-impl AsRef<[u8]> for Delegate<'_> {
-    fn as_ref(&self) -> &[u8] {
-        self.code.borrow()
+        todo!()
     }
 }
 
 impl TryFrom<&Path> for Delegate<'static> {
     type Error = std::io::Error;
     fn try_from(path: &Path) -> Result<Self, Self::Error> {
-        let code = Cow::from(std::fs::read(path)?);
-        let key = DelegateKey::new(code.borrow());
-        Ok(Self { code, key })
+        todo!()
     }
 }
 
 impl From<Vec<u8>> for Delegate<'static> {
     fn from(data: Vec<u8>) -> Self {
-        let key = DelegateKey::new(data.as_slice());
-        Delegate {
-            code: Cow::from(data),
-            key,
+        todo!()
+    }
+}
+
+impl AsRef<[u8]> for Delegate<'_> {
+    fn as_ref(&self) -> &[u8] {
+        todo!()
+    }
+}
+
+/// Executable delegate
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde_as]
+pub struct DelegateCode<'a> {
+    #[serde_as(as = "serde_with::Bytes")]
+    #[serde(borrow)]
+    code: Cow<'a, [u8]>,
+    code_hash: CodeHash,
+}
+
+impl PartialEq for DelegateCode<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.code_hash == other.code_hash
+    }
+}
+
+impl Eq for DelegateCode<'_> {}
+
+impl DelegateCode<'_> {
+    pub fn hash(&self) -> &CodeHash {
+        &self.code_hash
+    }
+
+    pub fn into_owned(self) -> DelegateCode<'static> {
+        DelegateCode {
+            code_hash: self.code_hash,
+            code: Cow::from(self.code.into_owned()),
         }
+    }
+}
+
+impl AsRef<[u8]> for DelegateCode<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.code.borrow()
+    }
+}
+
+impl TryFrom<&Path> for DelegateCode<'static> {
+    type Error = std::io::Error;
+    fn try_from(path: &Path) -> Result<Self, Self::Error> {
+        let code = Cow::from(std::fs::read(path)?);
+        let key = CodeHash::new(code.borrow());
+        Ok(Self {
+            code,
+            code_hash: key,
+        })
+    }
+}
+
+impl From<Vec<u8>> for DelegateCode<'static> {
+    fn from(data: Vec<u8>) -> Self {
+        let key = CodeHash::new(data.as_slice());
+        DelegateCode {
+            code: Cow::from(data),
+            code_hash: key,
+        }
+    }
+}
+
+#[serde_as]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub struct DelegateKey(#[serde_as(as = "[_; DELEGATE_HASH_LENGTH]")] [u8; DELEGATE_HASH_LENGTH]);
+
+impl DelegateKey {
+    pub fn new(wasm_code: &[u8]) -> Self {
+        let mut hasher = Blake2s256::new();
+        hasher.update(wasm_code);
+        let hashed = hasher.finalize();
+        let mut delegate_key = [0; DELEGATE_HASH_LENGTH];
+        delegate_key.copy_from_slice(&hashed);
+        Self(delegate_key)
+    }
+
+    pub fn encode(&self) -> String {
+        bs58::encode(self.0)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
+    }
+
+    pub fn code_hash(&self) -> &CodeHash {
+        todo!()
+    }
+}
+
+impl Display for DelegateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.encode())
     }
 }
 
@@ -124,38 +196,6 @@ pub trait DelegateInterface {
     fn process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError>;
 }
 
-#[serde_as]
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-pub struct DelegateKey(#[serde_as(as = "[_; DELEGATE_HASH_LENGTH]")] [u8; DELEGATE_HASH_LENGTH]);
-
-impl DelegateKey {
-    pub fn new(wasm_code: &[u8]) -> Self {
-        let mut hasher = Blake2s256::new();
-        hasher.update(wasm_code);
-        let hashed = hasher.finalize();
-        let mut delegate_key = [0; DELEGATE_HASH_LENGTH];
-        delegate_key.copy_from_slice(&hashed);
-        Self(delegate_key)
-    }
-
-    pub fn encode(&self) -> String {
-        bs58::encode(self.0)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into_string()
-    }
-
-    /// Returns the hash of the delegate code only.
-    pub fn code_hash(&self) -> &[u8; DELEGATE_HASH_LENGTH] {
-        &self.0
-    }
-}
-
-impl Display for DelegateKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.encode())
-    }
-}
-
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DelegateContext(pub Vec<u8>);
@@ -178,10 +218,6 @@ impl DelegateContext {
         let _ = std::mem::replace(&mut self.0, bytes);
     }
 }
-
-#[serde_as]
-#[derive(Serialize, Deserialize)]
-pub struct ContractHash(#[serde_as(as = "[_; APPLICATION_HASH_SIZE]")] [u8; APPLICATION_HASH_SIZE]);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum InboundDelegateMsg<'a> {
