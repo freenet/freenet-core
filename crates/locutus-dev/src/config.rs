@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::{fmt::Display, path::PathBuf};
 
 use crate::local_node::LocalNodeCliConfig;
+use clap::ValueEnum;
 use locutus_core::OperationMode;
 use locutus_stdlib::prelude::Version;
 
@@ -18,10 +19,10 @@ pub struct Config {
 #[derive(clap::Parser, Clone)]
 pub struct BaseConfig {
     /// Overrides the default data directory where Locutus contract files are stored.
-    #[clap(long)]
+    #[arg(long)]
     pub(crate) contract_data_dir: Option<PathBuf>,
     /// Node operation mode.
-    #[clap(value_enum, default_value_t=OperationMode::Local)]
+    #[arg(value_enum, default_value_t=OperationMode::Local)]
     pub(crate) mode: OperationMode,
 }
 
@@ -68,40 +69,59 @@ pub struct UpdateConfig {
 #[derive(clap::Parser, Clone)]
 pub struct PutConfig {
     /// A path to the compiled WASM code file.
-    #[clap(long)]
+    #[arg(long)]
     pub(crate) code: PathBuf,
     /// A path to the file parameters for the contract. If not specified, the contract
     /// will be published with empty parameters.
-    #[clap(long)]
+    #[arg(long)]
     pub(crate) parameters: Option<PathBuf>,
     /// A path to the initial state for the contract being published.
-    #[clap(long)]
+    #[arg(long)]
     pub(crate) state: PathBuf,
     /// Whether this contract will be released into the network or is just a dry run
     /// to be executed in local mode only. By default puts are performed in local.
-    #[clap(long)]
+    #[arg(long)]
     pub(crate) release: bool,
     /// A path to a JSON file listing the related contracts.
-    #[clap(long)]
+    #[arg(long)]
     pub(crate) related_contracts: Option<PathBuf>,
 }
 
 /// Builds and packages a contract.
 ///
-/// This tool will build the WASM contract and publish it to the network.
+/// This tool will build the WASM contract or delegate and publish it to the network.
 #[derive(clap::Parser, Clone, Debug)]
 pub struct BuildToolCliConfig {
-    /// Compile the contract with specific features.
-    #[clap(long)]
+    /// Compile the contract or delegate with specific features.
+    #[arg(long)]
     pub(crate) features: Option<String>,
 
-    /// Compile the contract with WASI extension enabled (useful for debugging).
-    #[clap(long)]
+    /// Compile the contract or delegate with WASI extension enabled (useful for debugging).
+    #[arg(long)]
     pub(crate) wasi: bool,
 
-    /// Compile the contract with a specific API version.
-    #[clap(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
+    /// Compile the contract or delegate with a specific API version.
+    #[arg(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
     pub(crate) version: Version,
+
+    #[arg(long, value_enum, default_value_t=PackageType::default())]
+    pub(crate) package_type: PackageType,
+}
+
+#[derive(Default, Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum PackageType {
+    #[default]
+    Contract,
+    Delegate,
+}
+
+impl Display for PackageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PackageType::Contract => write!(f, "contract"),
+            PackageType::Delegate => write!(f, "delegate"),
+        }
+    }
 }
 
 impl BuildToolCliConfig {
@@ -122,6 +142,7 @@ impl Default for BuildToolCliConfig {
             features: None,
             wasi: false,
             version: Version::new(0, 0, 1),
+            package_type: PackageType::default(),
         }
     }
 }
@@ -133,7 +154,7 @@ fn parse_version(src: &str) -> Result<Version, String> {
 /// Create a new Locutus contract and/or app.
 #[derive(clap::Parser, Clone)]
 pub struct NewPackageCliConfig {
-    #[clap(id = "type", value_enum)]
+    #[arg(id = "type", value_enum)]
     pub(crate) kind: ContractKind,
 }
 
