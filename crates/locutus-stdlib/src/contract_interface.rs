@@ -23,6 +23,12 @@ use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 
+use crate::{
+    client_api::{TryFromTsStd, WsApiError},
+    code_hash::CodeHash,
+    parameters::Parameters,
+};
+
 const CONTRACT_KEY_SIZE: usize = 32;
 
 /// Type of errors during interaction with a contract.
@@ -38,26 +44,6 @@ pub enum ContractError {
     InvalidDelta,
     #[error("{0}")]
     Other(String),
-}
-
-pub trait TryFromTsStd<T>: Sized {
-    fn try_decode(value: T) -> Result<Self, WsApiError>;
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum WsApiError {
-    #[error("Failed decoding msgpack message from client request: {cause}")]
-    MsgpackDecodeError { cause: String },
-    #[error("Unsupported contract version")]
-    UnsupportedContractVersion,
-    #[error("Failed unpacking contract container")]
-    UnpackingContractContainerError(Box<dyn std::error::Error + Send + Sync + 'static>),
-}
-
-impl WsApiError {
-    pub fn deserialization(cause: String) -> Self {
-        Self::MsgpackDecodeError { cause }
-    }
 }
 
 /// An update to a contract state or any required related contracts to update that state.
@@ -574,65 +560,6 @@ impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     }
 }
 
-/// Data that forms part of a contract along with the WebAssembly code.
-///
-/// This is supplied to the contract as a parameter to the contract's functions. Parameters are
-/// typically be used to configure a contract, much like the parameters of a constructor function.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde_as]
-#[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct Parameters<'a>(
-    #[serde_as(as = "serde_with::Bytes")]
-    #[serde(borrow)]
-    Cow<'a, [u8]>,
-);
-
-impl<'a> Parameters<'a> {
-    /// Gets the number of bytes of data stored in the `Parameters`.
-    pub fn size(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Returns the bytes of parameters.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0.into_owned()
-    }
-
-    /// Copies the data if not owned and returns an owned version of self.
-    pub fn into_owned(self) -> Parameters<'static> {
-        let data: Cow<'static, _> = Cow::from(self.0.into_owned());
-        Parameters(data)
-    }
-}
-
-impl<'a> From<Vec<u8>> for Parameters<'a> {
-    fn from(data: Vec<u8>) -> Self {
-        Parameters(Cow::from(data))
-    }
-}
-
-impl<'a> From<&'a [u8]> for Parameters<'a> {
-    fn from(s: &'a [u8]) -> Self {
-        Parameters(Cow::from(s))
-    }
-}
-
-impl<'a> TryFromTsStd<&'a rmpv::Value> for Parameters<'a> {
-    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
-        let params = value.as_slice().unwrap();
-        Ok(Parameters::from(params))
-    }
-}
-
-impl<'a> AsRef<[u8]> for Parameters<'a> {
-    fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            Cow::Borrowed(arr) => arr,
-            Cow::Owned(arr) => arr.as_ref(),
-        }
-    }
-}
-
 /// Data associated with a contract that can be retrieved by Applications and Delegates.
 ///
 /// For efficiency and flexibility, contract state is represented as a simple [u8] byte array.
@@ -855,8 +782,7 @@ pub struct ContractCode<'a> {
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     data: Cow<'a, [u8]>,
-    #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
-    key: [u8; CONTRACT_KEY_SIZE],
+    hash: CodeHash,
 }
 
 impl ContractCode<'static> {
@@ -909,13 +835,13 @@ impl ContractCode<'static> {
 
 impl ContractCode<'_> {
     /// Contract key hash.
-    pub fn hash(&self) -> &[u8; CONTRACT_KEY_SIZE] {
-        &self.key
+    pub fn hash(&self) -> &CodeHash {
+        &self.hash
     }
 
     /// Returns the `Base58` string representation of the contract key.
     pub fn hash_str(&self) -> String {
-        Self::encode_hash(&self.key)
+        Self::encode_hash(&self.hash.0)
     }
 
     /// Reference to contract code.
@@ -939,18 +865,18 @@ impl ContractCode<'_> {
     pub fn into_owned(self) -> ContractCode<'static> {
         ContractCode {
             data: self.data.into_owned().into(),
-            key: self.key,
+            hash: self.hash,
         }
     }
 
-    fn gen_key(data: &[u8]) -> [u8; CONTRACT_KEY_SIZE] {
+    fn gen_hash(data: &[u8]) -> CodeHash {
         let mut hasher = Blake2s256::new();
         hasher.update(data);
         let key_arr = hasher.finalize();
         debug_assert_eq!(key_arr[..].len(), CONTRACT_KEY_SIZE);
         let mut key = [0; CONTRACT_KEY_SIZE];
         key.copy_from_slice(&key_arr);
-        key
+        CodeHash(key)
     }
 
     pub fn to_bytes_versioned(
@@ -966,7 +892,7 @@ impl ContractCode<'_> {
                 let mut output: Vec<u8> = Vec::with_capacity(output_size);
                 output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
                 output.append(&mut serialized_version);
-                output.extend(self.key.iter());
+                output.extend(self.hash.0.iter());
                 output.extend(self.data());
                 Ok(output)
             }
@@ -977,20 +903,20 @@ impl ContractCode<'_> {
 
 impl From<Vec<u8>> for ContractCode<'static> {
     fn from(data: Vec<u8>) -> Self {
-        let key = ContractCode::gen_key(&data);
+        let key = ContractCode::gen_hash(&data);
         ContractCode {
             data: Cow::from(data),
-            key,
+            hash: key,
         }
     }
 }
 
 impl<'a> From<&'a [u8]> for ContractCode<'a> {
     fn from(data: &'a [u8]) -> ContractCode {
-        let key = ContractCode::gen_key(data);
+        let hash = ContractCode::gen_hash(data);
         ContractCode {
             data: Cow::from(data),
-            key,
+            hash,
         }
     }
 }
@@ -1004,7 +930,7 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for ContractCode<'a> {
 
 impl PartialEq for ContractCode<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.hash == other.hash
     }
 }
 
@@ -1021,7 +947,7 @@ impl<'a> arbitrary::Arbitrary<'a> for ContractCode<'static> {
 impl std::fmt::Display for ContractCode<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Contract( key: ")?;
-        internal_fmt_key(&self.key, f)?;
+        internal_fmt_key(&self.hash.0, f)?;
         let data: String = if self.data.len() > 8 {
             self.data[..4]
                 .iter()
@@ -1106,8 +1032,7 @@ impl Display for ContractInstanceId {
 )]
 pub struct ContractKey {
     instance: ContractInstanceId,
-    #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
-    code: Option<[u8; CONTRACT_KEY_SIZE]>,
+    code: Option<CodeHash>,
 }
 
 impl PartialEq for ContractKey {
@@ -1148,7 +1073,7 @@ where
         let code_hash = code_data.hash();
         Self {
             instance: id,
-            code: Some(*code_hash),
+            code: Some(code_hash.clone()),
         }
     }
 }
@@ -1169,14 +1094,14 @@ impl ContractKey {
     }
 
     /// Returns the hash of the contract code only, if the key is fully specified.
-    pub fn code_hash(&self) -> Option<&[u8; CONTRACT_KEY_SIZE]> {
+    pub fn code_hash(&self) -> Option<&CodeHash> {
         self.code.as_ref()
     }
 
     /// Returns the encoded hash of the contract code, if the key is fully specified.
     pub fn encoded_code_hash(&self) -> Option<String> {
         self.code.as_ref().map(|c| {
-            bs58::encode(c)
+            bs58::encode(c.0)
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string()
         })
@@ -1202,7 +1127,7 @@ impl ContractKey {
         spec.copy_from_slice(&full_key_arr);
         Ok(Self {
             instance: ContractInstanceId(spec),
-            code: Some(code_key),
+            code: Some(CodeHash(code_key)),
         })
     }
 
@@ -1261,7 +1186,7 @@ fn generate_id<'a>(
     let contract_hash = code_data.hash();
 
     let mut hasher = Blake2s256::new();
-    hasher.update(contract_hash);
+    hasher.update(contract_hash.0);
     hasher.update(parameters.as_ref());
     let full_key_arr = hasher.finalize();
 
