@@ -38,6 +38,8 @@ impl Delegate<'_> {
         &self.data.code_hash
     }
 
+    pub fn params(&self) -> &Parameters { &self.parameters }
+
     pub fn into_owned(self) -> Delegate<'static> {
         Delegate {
             parameters: self.parameters.into_owned(),

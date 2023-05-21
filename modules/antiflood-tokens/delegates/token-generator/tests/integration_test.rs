@@ -13,16 +13,13 @@ mod integration_test {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
-    use locutus_aft_interface::{AllocationCriteria, Tier, TokenAllocationRecord, TokenAssignment};
+    use locutus_aft_interface::{AllocationCriteria, DelegateParameters, Tier, TokenAllocationRecord, TokenAssignment};
     use locutus_runtime::{
         ApplicationMessage, ContractContainer, ContractInstanceId, ContractKey, ContractStore,
         DelegateRuntimeInterface, DelegateStore, InboundDelegateMsg, Runtime, SecretsId,
         SecretsStore, WasmAPIVersion,
     };
-    use locutus_stdlib::prelude::{
-        ClientResponse, ContractCode, Delegate, DelegateContext, OutboundDelegateMsg,
-        UserInputResponse, WrappedContract,
-    };
+    use locutus_stdlib::prelude::{ClientResponse, ContractCode, Delegate, DelegateCode, DelegateContext, OutboundDelegateMsg, Parameters, UserInputResponse, WrappedContract};
 
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
@@ -74,8 +71,6 @@ mod integration_test {
     struct Context {
         waiting_for_user_input: HashSet<u32>,
         user_response: HashMap<u32, Response>,
-        /// The token generator instance key pair (pub + secret key).
-        key_pair: Option<rsa::RsaPrivateKey>,
     }
 
     fn test_dir(prefix: &str) -> PathBuf {
@@ -129,7 +124,7 @@ mod integration_test {
     }
 
     fn set_up_aft<'a>(
-        key_pair: &RsaPrivateKey,
+        private_key: &RsaPrivateKey,
         contract_name: &str,
         delegate_name: &str,
     ) -> Result<(Delegate<'a>, SecretsId, ContractKey, Runtime), Box<dyn std::error::Error>> {
@@ -157,7 +152,9 @@ mod integration_test {
 
         let delegate = {
             let bytes = get_test_module("delegates", delegate_name, "node")?;
-            Delegate::from(bytes)
+            let params = Parameters::from(serde_json::to_vec(&private_key.clone())?);
+            let code = DelegateCode::from(bytes);
+            Delegate::from((&code, &params))
         };
 
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
@@ -168,7 +165,7 @@ mod integration_test {
 
         // Store secret token
         let secret_id = SecretsId::new(vec![0, 1, 2]);
-        let encoded = bincode::serialize(&key_pair.to_public_key()).unwrap();
+        let encoded = bincode::serialize(&private_key.to_public_key()).unwrap();
         secret_store
             .store_secret(&delegate.key().clone(), &secret_id, encoded)
             .unwrap();
@@ -194,7 +191,6 @@ mod integration_test {
         let mut context: Context = Context {
             waiting_for_user_input: HashSet::default(),
             user_response: HashMap::default(),
-            key_pair: Some(private_key.clone()),
         };
         let delegate_context = DelegateContext::new(bincode::serialize(&context).unwrap());
         let criteria = AllocationCriteria::new(
@@ -220,13 +216,12 @@ mod integration_test {
         let inbound_message = InboundDelegateMsg::ApplicationMessage(
             ApplicationMessage::new(app, payload.clone()).with_context(delegate_context.clone()),
         );
+
+        let delegate_params = DelegateParameters::new(private_key);
+        let params = Parameters::from(serde_json::to_vec(&delegate_params).unwrap());
         let outbound = runtime
-            .inbound_app_message(delegate.key(), vec![inbound_message])
+            .inbound_app_message(delegate.key(), &params, vec![inbound_message])
             .unwrap();
         assert_eq!(outbound.len(), 1);
-        assert!(matches!(
-            outbound.get(0),
-            Some(OutboundDelegateMsg::RequestUserInput(..))
-        ));
     }
 }

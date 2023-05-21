@@ -3,7 +3,7 @@ use std::fmt::Display;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SubsecRound, Timelike, Utc};
 use locutus_stdlib::prelude::*;
-use rsa::{pkcs1v15::Signature, RsaPublicKey};
+use rsa::{pkcs1v15::Signature, RsaPrivateKey, RsaPublicKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::Display;
 
@@ -372,6 +372,35 @@ impl TryFrom<Parameters<'_>> for TokenParameters {
 impl TryFrom<TokenParameters> for Parameters<'static> {
     type Error = serde_json::Error;
     fn try_from(params: TokenParameters) -> Result<Self, Self::Error> {
+        serde_json::to_vec(&params).map(Into::into)
+    }
+}
+
+#[non_exhaustive]
+#[derive(Serialize, Deserialize)]
+pub struct DelegateParameters {
+    pub generator_private_key: RsaPrivateKey,
+}
+
+impl DelegateParameters {
+    pub fn new(generator_private_key: RsaPrivateKey) -> Self {
+        Self {
+            generator_private_key,
+        }
+    }
+}
+
+impl TryFrom<Parameters<'_>> for DelegateParameters {
+    type Error = DelegateError;
+    fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(params.as_ref())
+            .map_err(|err| DelegateError::Deser(format!("{err}")))
+    }
+}
+
+impl TryFrom<DelegateParameters> for Parameters<'static> {
+    type Error = serde_json::Error;
+    fn try_from(params: DelegateParameters) -> Result<Self, Self::Error> {
         serde_json::to_vec(&params).map(Into::into)
     }
 }
