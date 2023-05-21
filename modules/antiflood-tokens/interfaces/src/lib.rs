@@ -504,9 +504,7 @@ impl TokenAllocationRecord {
 
     pub fn assignment_exists(&self, record: &TokenAssignment) -> bool {
         let Some(assignments) = self.tokens_by_tier.get(&record.tier) else { return false };
-        let Ok(idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else { return false };
-        let assignment = &assignments[idx];
-        //assignment == record
+        let Ok(_idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else { return false };
         true
     }
 }
