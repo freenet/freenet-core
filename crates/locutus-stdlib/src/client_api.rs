@@ -44,10 +44,10 @@ pub enum Error {
     Serialization(#[from] rmp_serde::encode::Error),
     #[error("channel closed")]
     ChannelClosed,
-    #[cfg(target_family = "unix")]
+    #[cfg(all(target_family = "unix", feature = "net"))]
     #[error(transparent)]
     ConnectionError(#[from] tokio_tungstenite::tungstenite::Error),
-    #[cfg(target_family = "wasm")]
+    #[cfg(all(target_family = "wasm", feature = "net"))]
     #[error("request error: {0}")]
     ConnectionError(serde_json::Value),
     #[error("connection closed")]

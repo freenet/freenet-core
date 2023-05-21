@@ -19,7 +19,10 @@ struct TokenDelegate;
 
 #[delegate]
 impl DelegateInterface for TokenDelegate {
-    fn process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    fn process(
+        _params: Parameters<'static>,
+        message: InboundDelegateMsg,
+    ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
             InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
                 app,
