@@ -2,7 +2,7 @@ use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
     ApplicationMessage, ClientResponse, Delegate, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
-    OutboundDelegateMsg, SetSecretRequest,
+    OutboundDelegateMsg, Parameters, SetSecretRequest,
 };
 
 use crate::error::RuntimeInnerError;
@@ -37,6 +37,7 @@ pub trait DelegateRuntimeInterface {
     fn inbound_app_message(
         &mut self,
         key: &DelegateKey,
+        params: &Parameters,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
@@ -164,9 +165,9 @@ impl Runtime {
                     let response: Response = serde_json::from_slice(&user_response)
                         .map_err(|err| DelegateError::Deser(format!("{err}")))
                         .unwrap();
-                    let req_id = req.request_id.clone();
+                    let req_id = req.request_id;
                     let mut context: Context =
-                        bincode::deserialize(&last_context.0.as_slice()).unwrap();
+                        bincode::deserialize(last_context.0.as_slice()).unwrap();
                     context.waiting_for_user_input.remove(&req_id);
                     context.user_response.insert(req_id, response);
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
@@ -193,13 +194,14 @@ impl DelegateRuntimeInterface for Runtime {
     fn inbound_app_message(
         &mut self,
         key: &DelegateKey,
+        params: &Parameters,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
             return Ok(results);
         }
-        let running = self.prepare_delegate_call(key, 4096)?;
+        let running = self.prepare_delegate_call(params, key, 4096)?;
         let process_func: TypedFunction<i64, i64> = running
             .instance
             .exports
@@ -345,7 +347,7 @@ mod test {
 
         let delegate = {
             let bytes = crate::tests::get_test_module(name)?;
-            Delegate::from(bytes)
+            Delegate::from((&bytes.into(), &vec![].into()))
         };
         let _ = runtime.delegate_store.store_delegate(delegate.clone());
 
@@ -374,7 +376,8 @@ mod test {
         let create_inbox_request_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
-        let outbound = runtime.inbound_app_message(delegate.key(), vec![inbound])?;
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
 
@@ -390,7 +393,8 @@ mod test {
         let please_sign_message_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundDelegateMsg::ApplicationMessage(please_sign_message_msg);
-        let outbound = runtime.inbound_app_message(delegate.key(), vec![inbound])?;
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
         assert_eq!(outbound.len(), 1);

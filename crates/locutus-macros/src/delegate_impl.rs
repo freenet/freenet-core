@@ -27,8 +27,16 @@ impl ImplStruct {
         let set_logger = crate::common::set_logger();
         quote! {
             #[no_mangle]
-            pub extern "C" fn process(inbound: i64) -> #ret {
+            pub extern "C" fn process(parameters: i64, inbound: i64) -> #ret {
                 #set_logger
+                let parameters = unsafe {
+                    let param_buf = &*(parameters as *const ::locutus_stdlib::buf::BufferBuilder);
+                    let bytes = &*std::ptr::slice_from_raw_parts(
+                        param_buf.start(),
+                        param_buf.written(None),
+                    );
+                    Parameters::from(bytes)
+                };
                 let inbound = unsafe {
                     let inbound_buf = &mut *(inbound as *mut ::locutus_stdlib::buf::BufferBuilder);
                     let bytes =
@@ -41,7 +49,8 @@ impl ImplStruct {
                     }
                 };
                 let result =<#type_name as ::locutus_stdlib::prelude::DelegateInterface>::process(
-                   inbound
+                    parameters,
+                    inbound
                 );
                 ::locutus_stdlib::prelude::DelegateInterfaceResult::from(result).into_raw()
             }

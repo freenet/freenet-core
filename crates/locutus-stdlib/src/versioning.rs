@@ -7,11 +7,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::client_api::{TryFromTsStd, WsApiError};
+use crate::parameters::Parameters;
 use crate::prelude::WrappedContract;
-use crate::{
-    contract_interface::ContractKey,
-    prelude::{ContractCode, Parameters, TryFromTsStd, WsApiError},
-};
+use crate::{contract_interface::ContractKey, prelude::ContractCode};
 
 /// Wrapper that allows contract versioning. This enum maintains the types of contracts that are
 /// allowed and their corresponding version.

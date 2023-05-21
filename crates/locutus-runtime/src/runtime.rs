@@ -179,17 +179,19 @@ impl Runtime {
 
     pub(crate) fn prepare_delegate_call(
         &mut self,
+        params: &Parameters,
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
         let module = if let Some(module) = self.delegate_modules.get(key) {
             module
         } else {
-            let contract = self
+            // FIXME
+            let delegate = self
                 .delegate_store
-                .fetch_delegate(key)
+                .fetch_delegate(key, &params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
-            let module = Module::new(&self.wasm_store, contract.as_ref())?;
+            let module = Module::new(&self.wasm_store, delegate.code().as_ref())?;
             self.delegate_modules.insert(key.clone(), module);
             self.delegate_modules.get(key).unwrap()
         }

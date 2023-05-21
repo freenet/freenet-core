@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, iter::FromIterator, path::PathBuf, sync::Arc};
 
 use dashmap::DashMap;
-use locutus_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+use locutus_stdlib::prelude::{CodeHash, ContractCode, Parameters, WrappedContract};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
@@ -11,15 +11,13 @@ use crate::{error::RuntimeInnerError, ContractContainer, RuntimeResult, WasmAPIV
 
 use super::ContractKey;
 
-type ContractCodeKey = [u8; 32];
-
 #[derive(Serialize, Deserialize, Default)]
-struct KeyToCodeMap(Vec<(ContractKey, ContractCodeKey)>);
+struct KeyToCodeMap(Vec<(ContractKey, CodeHash)>);
 
 impl StoreEntriesContainer for KeyToCodeMap {
-    type MemContainer = Arc<DashMap<ContractKey, ContractCodeKey>>;
+    type MemContainer = Arc<DashMap<ContractKey, CodeHash>>;
     type Key = ContractKey;
-    type Value = ContractCodeKey;
+    type Value = CodeHash;
 
     fn update(self, container: &mut Self::MemContainer) {
         for (k, v) in self.0 {
@@ -36,11 +34,11 @@ impl StoreEntriesContainer for KeyToCodeMap {
     }
 }
 
-impl From<&DashMap<ContractKey, ContractCodeKey>> for KeyToCodeMap {
-    fn from(vals: &DashMap<ContractKey, ContractCodeKey>) -> Self {
+impl From<&DashMap<ContractKey, CodeHash>> for KeyToCodeMap {
+    fn from(vals: &DashMap<ContractKey, CodeHash>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
-            map.push((r.key().clone(), *r.value()));
+            map.push((r.key().clone(), r.value().clone()));
         }
         Self(map)
     }
@@ -49,8 +47,8 @@ impl From<&DashMap<ContractKey, ContractCodeKey>> for KeyToCodeMap {
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
     contracts_dir: PathBuf,
-    contract_cache: Cache<ContractCodeKey, Arc<ContractCode<'static>>>,
-    key_to_code_part: Arc<DashMap<ContractKey, ContractCodeKey>>,
+    contract_cache: Cache<CodeHash, Arc<ContractCode<'static>>>,
+    key_to_code_part: Arc<DashMap<ContractKey, CodeHash>>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total speed used under a configured threshold
@@ -124,10 +122,7 @@ impl ContractStore {
 
         self.key_to_code_part.get(key).and_then(|key| {
             let code_hash = key.value();
-            let path = bs58::encode(code_hash.as_slice())
-                .with_alphabet(bs58::Alphabet::BITCOIN)
-                .into_string()
-                .to_lowercase();
+            let path = code_hash.encode();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
             let ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract {
                 data, params, ..
@@ -139,7 +134,8 @@ impl ContractStore {
                 .ok()?;
             // add back the contract part to the mem store
             let size = data.data().len() as i64;
-            self.contract_cache.insert(*code_hash, data.clone(), size);
+            self.contract_cache
+                .insert(code_hash.clone(), data.clone(), size);
             Some(ContractContainer::Wasm(WasmAPIVersion::V1(
                 WrappedContract::new(data, params),
             )))
@@ -153,31 +149,28 @@ impl ContractStore {
                 (contract_v1.key().clone(), contract_v1.code().clone())
             }
         };
-        let contract_hash = key.code_hash().ok_or_else(|| {
+        let code_hash = key.code_hash().ok_or_else(|| {
             tracing::warn!("trying to store partially unspecified contract `{}`", key);
             RuntimeInnerError::UnwrapContract
         })?;
-        if self.contract_cache.get(contract_hash).is_some() {
+        if self.contract_cache.get(code_hash).is_some() {
             return Ok(());
         }
 
         Self::update(
             &mut self.key_to_code_part,
             key.clone(),
-            *contract_hash,
+            code_hash.clone(),
             KEY_FILE_PATH.get().unwrap(),
             LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
 
-        let key_path = bs58::encode(contract_hash)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into_string()
-            .to_lowercase();
+        let key_path = code_hash.encode();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
         if let Ok((code, _ver)) = ContractCode::load_versioned(&key_path) {
             let size = code.data().len() as i64;
             self.contract_cache
-                .insert(*contract_hash, Arc::new(code), size);
+                .insert(code_hash.clone(), Arc::new(code), size);
             return Ok(());
         }
 
@@ -185,7 +178,7 @@ impl ContractStore {
         let size = code.data().len() as i64;
         let data = code.data().to_vec();
         self.contract_cache
-            .insert(*contract_hash, Arc::new(ContractCode::from(data)), size);
+            .insert(code_hash.clone(), Arc::new(ContractCode::from(data)), size);
 
         let version: Version = Version::from(contract);
         let output: Vec<u8> = code.to_bytes_versioned(&version)?;
@@ -197,22 +190,18 @@ impl ContractStore {
 
     pub fn get_contract_path(&mut self, key: &ContractKey) -> RuntimeResult<PathBuf> {
         let contract_hash = match key.code_hash() {
-            Some(k) => *k,
+            Some(k) => k.clone(),
             None => self.code_hash_from_key(key).ok_or_else(|| {
                 tracing::warn!("trying to store partially unspecified contract `{key}`");
                 RuntimeInnerError::UnwrapContract
             })?,
         };
-
-        let key_path = bs58::encode(contract_hash)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into_string()
-            .to_lowercase();
+        let key_path = contract_hash.encode();
         Ok(self.contracts_dir.join(key_path).with_extension("wasm"))
     }
 
-    pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<ContractCodeKey> {
-        self.key_to_code_part.get(key).map(|r| *r.value())
+    pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {
+        self.key_to_code_part.get(key).map(|r| r.value().clone())
     }
 }
 
