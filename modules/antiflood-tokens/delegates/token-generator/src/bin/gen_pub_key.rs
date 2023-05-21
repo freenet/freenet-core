@@ -33,7 +33,7 @@ fn main() {
         .map_err(|e| format!("{e}"))
         .unwrap();
     let params_file_name = format!("generator_pub_key_{}", key_id);
-    std::fs::create_dir_all(inbox_path.join("examples"))?;
+    std::fs::create_dir_all(inbox_path.join("examples")).unwrap();
     std::fs::write(
         inbox_path.join("examples").join(params_file_name),
         params.into_bytes(),

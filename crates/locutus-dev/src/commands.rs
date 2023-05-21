@@ -9,7 +9,7 @@ use locutus_runtime::{
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
 use crate::{
-    config::{BaseConfig, PutConfig, UpdateConfig},
+    config::{BaseConfig, PackageType, PutConfig, UpdateConfig},
     DynError,
 };
 
@@ -18,6 +18,13 @@ const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
 // #[track_caller]
 pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
+    match config.package_type {
+        PackageType::Contract => put_contract(config, other).await,
+        PackageType::Delegate => todo!(),
+    }
+}
+
+pub async fn put_contract(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
     if config.release {
         return Err("Cannot publish contracts in the network yet".into());
     }
