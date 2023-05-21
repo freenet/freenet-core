@@ -184,7 +184,7 @@ fn allocate_token(
                         records,
                     };
                     OutboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, msg.serialize()?).with_context(context),
+                        ApplicationMessage::new(app, msg.serialize()?).processed(true).with_context(context),
                     )
                 }
                 Response::NotAllowed => {

@@ -58,7 +58,6 @@ impl Runtime {
         process_func: &TypedFunction<(i64, i64), i64>,
         instance: &Instance,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
-
         let param_buf_ptr = {
             let mut param_buf = self.init_buf(instance, params)?;
             param_buf.write(params)?;
@@ -113,7 +112,7 @@ impl Runtime {
                     if retries >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
-                    let new_msgs = self.exec_inbound(&params,&inbound, process_func, instance)?;
+                    let new_msgs = self.exec_inbound(&params, &inbound, process_func, instance)?;
                     retries += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Error trying to update the context from the secret".to_string()).into())));
@@ -185,7 +184,8 @@ impl Runtime {
                     let mut bytes = vec![0; bytes];
                     util::generate_random_bytes(&mut bytes);
                     let inbound = InboundDelegateMsg::RandomBytes(bytes);
-                    let new_outbound_msgs = self.exec_inbound(&params, &inbound, process_func, instance)?;
+                    let new_outbound_msgs =
+                        self.exec_inbound(&params, &inbound, process_func, instance)?;
                     for msg in new_outbound_msgs.into_iter() {
                         outbound_msgs.push_back(msg);
                     }
