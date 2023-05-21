@@ -172,7 +172,7 @@ be used with Typescript/JavaScript to facilitate the development of web
 applications and interfacing with your local node, so we will make our
 `package.json` contains the dependency:
 
-```
+```json
 {
   "dependencies": {
     "@locutus/locutus-stdlib": "0.0.2"
@@ -399,7 +399,7 @@ npm install webpack-cli --save-dev
 If, however, you prefer to follow a different workflow, you can write your own
 by enabling/disabling certain parameters or using a blank template. For example:
 
-```
+```toml
 [contract]
 lang = "rust"
 
@@ -410,7 +410,7 @@ files = ["my_packaged_web.tar.xz"]
 Would just delegate the work of building the packaged `tar` to the developer.
 Or:
 
-```
+```toml
 [contract]
 type = "webapp"
 lang = "rust"
