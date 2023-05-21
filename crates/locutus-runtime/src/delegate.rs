@@ -2,7 +2,7 @@ use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
     ApplicationMessage, ClientResponse, Delegate, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
-    OutboundDelegateMsg, SetSecretRequest,
+    OutboundDelegateMsg, Parameters, SetSecretRequest,
 };
 
 use crate::error::RuntimeInnerError;
@@ -37,6 +37,7 @@ pub trait DelegateRuntimeInterface {
     fn inbound_app_message(
         &mut self,
         key: &DelegateKey,
+        params: &Parameters,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
@@ -194,13 +195,14 @@ impl DelegateRuntimeInterface for Runtime {
     fn inbound_app_message(
         &mut self,
         key: &DelegateKey,
+        params: &Parameters,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
             return Ok(results);
         }
-        let running = self.prepare_delegate_call(key, 4096)?;
+        let running = self.prepare_delegate_call(params, key, 4096)?;
         let process_func: TypedFunction<i64, i64> = running
             .instance
             .exports
@@ -375,7 +377,8 @@ mod test {
         let create_inbox_request_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
-        let outbound = runtime.inbound_app_message(delegate.key(), vec![inbound])?;
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
 
@@ -391,7 +394,8 @@ mod test {
         let please_sign_message_msg = ApplicationMessage::new(app, payload);
 
         let inbound = InboundDelegateMsg::ApplicationMessage(please_sign_message_msg);
-        let outbound = runtime.inbound_app_message(delegate.key(), vec![inbound])?;
+        let outbound =
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
         assert_eq!(outbound.len(), 1);

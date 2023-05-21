@@ -242,7 +242,10 @@ impl Display for SecretsId {
 pub trait DelegateInterface {
     /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the delegate must be stored using the secret mechanism.
-    fn process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError>;
+    fn process(
+        parameters: Parameters<'static>,
+        message: InboundDelegateMsg,
+    ) -> Result<Vec<OutboundDelegateMsg>, DelegateError>;
 }
 
 #[non_exhaustive]

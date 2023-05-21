@@ -5,8 +5,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::{
     delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
     prelude::{
-        ContractKey, RelatedContracts, StateSummary, TryFromTsStd, UpdateData, WrappedState,
-        WsApiError,
+        ContractKey, Parameters, RelatedContracts, StateSummary, TryFromTsStd, UpdateData,
+        WrappedState, WsApiError,
     },
     versioning::ContractContainer,
 };
@@ -232,6 +232,7 @@ impl<'a> From<DelegateRequest<'a>> for ClientRequest<'a> {
 pub enum DelegateRequest<'a> {
     ApplicationMessages {
         key: DelegateKey,
+        params: Parameters<'a>,
         inbound: Vec<InboundDelegateMsg<'a>>,
     },
     RegisterDelegate {
@@ -246,12 +247,15 @@ pub enum DelegateRequest<'a> {
 impl DelegateRequest<'_> {
     pub fn into_owned(self) -> DelegateRequest<'static> {
         match self {
-            DelegateRequest::ApplicationMessages { key, inbound } => {
-                DelegateRequest::ApplicationMessages {
-                    key,
-                    inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
-                }
-            }
+            DelegateRequest::ApplicationMessages {
+                key,
+                inbound,
+                params,
+            } => DelegateRequest::ApplicationMessages {
+                key,
+                params: params.into_owned(),
+                inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
+            },
             DelegateRequest::RegisterDelegate {
                 delegate,
                 cipher,

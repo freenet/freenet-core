@@ -179,6 +179,7 @@ impl Runtime {
 
     pub(crate) fn prepare_delegate_call(
         &mut self,
+        params: &Parameters,
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
@@ -186,7 +187,6 @@ impl Runtime {
             module
         } else {
             // FIXME
-            let params = Parameters::from(vec![]);
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, &params)

@@ -378,9 +378,14 @@ impl Executor {
                     }
                 }
             }
-            DelegateRequest::ApplicationMessages { key, inbound } => {
+            DelegateRequest::ApplicationMessages {
+                key,
+                inbound,
+                params,
+            } => {
                 match self.runtime.inbound_app_message(
                     &key,
+                    &params,
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)
