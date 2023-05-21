@@ -383,17 +383,13 @@ This means that you have installed either globally or at the directory level,
 e.g. globally:
 
 ```bash
-npm install -g typescript
-npm install -g webpack
-npm install -g webpack-cli
+npm install -g typescript webpack webpack-cli
 ```
 
 or locally (make sure your `package.json` file has the required dependencies):
 
 ```bash
-npm install typescript --save-dev
-npm install webpack --save-dev
-npm install webpack-cli --save-dev
+npm install --save-dev typescript webpack webpack-cli
 ```
 
 If, however, you prefer to follow a different workflow, you can write your own
