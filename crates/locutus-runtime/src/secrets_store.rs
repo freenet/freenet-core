@@ -200,7 +200,7 @@ mod test {
 
         let mut store = SecretsStore::new(secrets_dir)?;
 
-        let delegate = Delegate::from(vec![0, 1, 2]);
+        let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
 
         let cipher = XChaCha20Poly1305::new(&XChaCha20Poly1305::generate_key(&mut OsRng));
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);

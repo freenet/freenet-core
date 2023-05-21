@@ -5,7 +5,7 @@ use stretto::Cache;
 
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
-use locutus_stdlib::prelude::{CodeHash, Delegate, DelegateKey};
+use locutus_stdlib::prelude::{CodeHash, Delegate, DelegateCode, DelegateKey, Parameters};
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
 
@@ -44,7 +44,7 @@ impl From<&DashMap<DelegateKey, CodeHash>> for KeyToCodeMap {
 
 pub struct DelegateStore {
     delegates_dir: PathBuf,
-    delegate_cache: Cache<CodeHash, Delegate<'static>>,
+    delegate_cache: Cache<CodeHash, DelegateCode<'static>>,
     key_to_delegate_part: Arc<DashMap<DelegateKey, CodeHash>>,
 }
 
@@ -94,54 +94,62 @@ impl DelegateStore {
     }
 
     // Returns a copy of the delegate bytes if available, none otherwise.
-    pub fn fetch_delegate(&self, key: &DelegateKey) -> Option<Delegate<'static>> {
-        if let Some(delegate) = self.delegate_cache.get(key.code_hash()) {
-            return Some(delegate.value().clone());
+    pub fn fetch_delegate(
+        &self,
+        key: &DelegateKey,
+        params: &Parameters<'_>,
+    ) -> Option<Delegate<'static>> {
+        if let Some(delegate_code) = self.delegate_cache.get(key.code_hash()) {
+            return Some(Delegate::from((delegate_code.value(), params)).into_owned());
         }
-        self.key_to_delegate_part.get(key).and_then(|_| {
-            let delegate_path = self.delegates_dir.join(key.encode()).with_extension("wasm");
-            let delegate = Delegate::try_from(delegate_path.as_path()).ok()?;
-            let size = delegate.as_ref().len() as i64;
+        self.key_to_delegate_part.get(key).and_then(|code_part| {
+            let delegate_code_path = self
+                .delegates_dir
+                .join(code_part.value().encode())
+                .with_extension("wasm");
+            let delegate_code = DelegateCode::load(delegate_code_path.as_path()).ok()?;
+            let size = delegate_code.as_ref().len() as i64;
+            let delegate = Delegate::from((&delegate_code, &params.clone().into_owned()));
             self.delegate_cache
-                .insert(key.code_hash().clone(), delegate.clone(), size);
+                .insert(key.code_hash().clone(), delegate_code, size);
             Some(delegate)
         })
     }
 
     pub fn store_delegate(&mut self, delegate: Delegate<'_>) -> RuntimeResult<()> {
-        let key = delegate.key();
-        let delegate_hash = delegate.hash();
-        if self.delegate_cache.get(delegate_hash).is_some() {
+        let code_hash = delegate.code_hash();
+        if self.delegate_cache.get(code_hash).is_some() {
             return Ok(());
         }
 
+        let key = delegate.key();
         Self::update(
             &mut self.key_to_delegate_part,
             key.clone(),
-            delegate_hash.clone(),
+            code_hash.clone(),
             KEY_FILE_PATH.get().unwrap(),
             LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
 
-        let delegate_path = self.delegates_dir.join(key.encode()).with_extension("wasm");
-        if let Ok(delegate) = Delegate::try_from(delegate_path.as_path()) {
-            let size = delegate.as_ref().len() as i64;
-            self.delegate_cache
-                .insert(delegate_hash.clone(), delegate.clone(), size);
+        let key_path = code_hash.encode();
+        let delegate_path = self.delegates_dir.join(key_path).with_extension("wasm");
+        if let Ok(code) = DelegateCode::load(delegate_path.as_path()) {
+            let size = delegate.code().size() as i64;
+            self.delegate_cache.insert(code_hash.clone(), code, size);
             return Ok(());
         }
 
         // insert in the memory cache
-        let data = delegate.as_ref();
+        let data = delegate.code().as_ref();
         let code_size = data.len() as i64;
         self.delegate_cache.insert(
-            delegate_hash.clone(),
-            Delegate::from(data.to_vec()),
+            code_hash.clone(),
+            delegate.code().clone().into_owned(),
             code_size,
         );
 
         let mut output: Vec<u8> = Vec::with_capacity(code_size as usize);
-        output.append(&mut delegate.as_ref().to_vec());
+        output.append(&mut delegate.code().as_ref().to_vec());
         let mut file = File::create(delegate_path)?;
         file.write_all(output.as_slice())?;
 
@@ -191,9 +199,9 @@ mod test {
             .join("delegates-store-test");
         std::fs::create_dir_all(&cdelegate_dir)?;
         let mut store = DelegateStore::new(cdelegate_dir, 10_000)?;
-        let delegate = Delegate::from(vec![0, 1, 2]);
+        let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
         store.store_delegate(delegate.clone())?;
-        let f = store.fetch_delegate(&delegate.key());
+        let f = store.fetch_delegate(delegate.key(), &vec![].into());
         assert!(f.is_some());
         Ok(())
     }

@@ -164,9 +164,9 @@ impl Runtime {
                     let response: Response = serde_json::from_slice(&user_response)
                         .map_err(|err| DelegateError::Deser(format!("{err}")))
                         .unwrap();
-                    let req_id = req.request_id.clone();
+                    let req_id = req.request_id;
                     let mut context: Context =
-                        bincode::deserialize(&last_context.0.as_slice()).unwrap();
+                        bincode::deserialize(last_context.0.as_slice()).unwrap();
                     context.waiting_for_user_input.remove(&req_id);
                     context.user_response.insert(req_id, response);
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
@@ -346,7 +346,7 @@ mod test {
 
         let delegate = {
             let bytes = crate::tests::get_test_module(name)?;
-            Delegate::from(bytes)
+            Delegate::from((&bytes.into(), &vec![].into()))
         };
         let _ = runtime.delegate_store.store_delegate(delegate.clone());
 

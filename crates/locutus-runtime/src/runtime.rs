@@ -185,11 +185,13 @@ impl Runtime {
         let module = if let Some(module) = self.delegate_modules.get(key) {
             module
         } else {
-            let contract = self
+            // FIXME
+            let params = Parameters::from(vec![]);
+            let delegate = self
                 .delegate_store
-                .fetch_delegate(key)
+                .fetch_delegate(key, &params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
-            let module = Module::new(&self.wasm_store, contract.as_ref())?;
+            let module = Module::new(&self.wasm_store, delegate.code().as_ref())?;
             self.delegate_modules.insert(key.clone(), module);
             self.delegate_modules.get(key).unwrap()
         }

@@ -466,6 +466,7 @@ pub struct Contract<'a> {
     pub parameters: Parameters<'a>,
     #[serde(borrow)]
     pub data: ContractCode<'a>,
+    // todo: skip serializing and instead compute it
     key: ContractKey,
 }
 
@@ -782,6 +783,7 @@ pub struct ContractCode<'a> {
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     data: Cow<'a, [u8]>,
+    // todo: skip serializing and instead compute it
     hash: CodeHash,
 }
 
