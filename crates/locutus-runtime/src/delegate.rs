@@ -170,7 +170,6 @@ impl Runtime {
                     context.waiting_for_user_input.remove(&req_id);
                     context.user_response.insert(req_id, response);
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
-                    break;
                 }
                 OutboundDelegateMsg::RandomBytesRequest(bytes) => {
                     let mut bytes = vec![0; bytes];

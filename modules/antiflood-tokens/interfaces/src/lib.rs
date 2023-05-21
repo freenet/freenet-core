@@ -645,8 +645,7 @@ impl TokenAssignment {
         to_be_signed[cursor..cursor + Self::TS_SIZE].copy_from_slice(&timestamp.to_le_bytes());
         cursor += Self::TS_SIZE;
         let key = bincode::serialize(&assigned_to).unwrap();
-        to_be_signed[cursor..].copy_from_slice(&key);
-
+        to_be_signed[cursor..cursor+key.len()].copy_from_slice(key.as_slice());
         to_be_signed
     }
 

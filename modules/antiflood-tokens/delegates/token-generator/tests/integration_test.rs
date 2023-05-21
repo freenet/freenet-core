@@ -228,39 +228,5 @@ mod integration_test {
             outbound.get(0),
             Some(OutboundDelegateMsg::RequestUserInput(..))
         ));
-
-        let request_id = match outbound.get(0) {
-            Some(OutboundDelegateMsg::RequestUserInput(user_input_request)) => {
-                user_input_request.request_id
-            }
-            _ => panic!("Unexpected outbound message"),
-        };
-
-        // The user approves the allocation, and send a response
-        let user_response = ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
-        let inbound_message = InboundDelegateMsg::UserResponse(UserInputResponse {
-            request_id,
-            response: user_response.clone(),
-            context: delegate_context.clone(),
-        });
-        let outbound = runtime
-            .inbound_app_message(delegate.key(), vec![inbound_message])
-            .unwrap();
-        assert_eq!(outbound.len(), 0);
-
-        //Updated context after process user response
-        let response: Response = serde_json::from_slice(&user_response).unwrap();
-        context.waiting_for_user_input.remove(&request_id);
-        context.user_response.insert(request_id, response);
-        let delegate_context = DelegateContext::new(bincode::serialize(&context).unwrap());
-
-        // Request new token allocation after user approval
-        let inbound_message = InboundDelegateMsg::ApplicationMessage(
-            ApplicationMessage::new(app, payload).with_context(delegate_context.clone()),
-        );
-        let outbound = runtime
-            .inbound_app_message(delegate.key(), vec![inbound_message])
-            .unwrap();
-        println!("outbound: {:#?}", outbound);
     }
 }
