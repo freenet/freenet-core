@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/freenet/locutus"
 
 [dependencies]
+bs58 = { workspace = true }
 atty = "0.2"
 # byteorder = "1"
 clap = { workspace = true, features = ["derive", "env"] }

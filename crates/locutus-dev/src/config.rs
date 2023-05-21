@@ -1,6 +1,6 @@
 use std::{fmt::Display, path::PathBuf};
 
-use crate::local_node::LocalNodeCliConfig;
+use crate::{commands::PutType, local_node::LocalNodeCliConfig};
 use clap::ValueEnum;
 use locutus_core::OperationMode;
 use locutus_stdlib::prelude::Version;
@@ -65,28 +65,25 @@ pub struct UpdateConfig {
     pub(crate) release: bool,
 }
 
-/// Publishes a new contract to the network.
+/// Publishes a new contract or delegate to the network.
+// todo: make some of this options exclusive depending on the value of `package_type`
 #[derive(clap::Parser, Clone)]
 pub struct PutConfig {
-    /// A path to the compiled WASM code file.
+    /// A path to the compiled WASM code file. This must be a valid packaged contract or component,
+    /// (built using the `ldt` tool). Not an arbitrary WASM file.
     #[arg(long)]
     pub(crate) code: PathBuf,
-    /// A path to the file parameters for the contract. If not specified, the contract
-    /// will be published with empty parameters.
+    /// A path to the file parameters for the contract/delegate. If not specified, will be published
+    /// with empty parameters.
     #[arg(long)]
     pub(crate) parameters: Option<PathBuf>,
-    /// A path to the initial state for the contract being published.
-    #[arg(long)]
-    pub(crate) state: PathBuf,
     /// Whether this contract will be released into the network or is just a dry run
     /// to be executed in local mode only. By default puts are performed in local.
     #[arg(long)]
     pub(crate) release: bool,
-    /// A path to a JSON file listing the related contracts.
-    #[arg(long)]
-    pub(crate) related_contracts: Option<PathBuf>,
-    #[arg(long, default_value_t = PackageType::default())]
-    pub(crate) package_type: PackageType,
+    /// Type of put to perform.
+    #[clap(subcommand)]
+    pub(crate) package_type: PutType,
 }
 
 /// Builds and packages a contract.
