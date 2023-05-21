@@ -6,8 +6,16 @@ The stdlib offers a series of facilities in which you will be able to communicat
 
 Here is a minimal example of how you could write your application to interact with the node:
 
-```
-import { LocutusWsApi } from "@locutus/locutus-stdlib/webSocketInterface";
+```typescript
+import {
+  GetResponse,
+  HostError,
+  Key,
+  LocutusWsApi,
+  PutResponse,
+  UpdateNotification,
+  UpdateResponse,
+} from "@locutus/locutus-stdlib/webSocketInterface";
 
 const handler = {
   onPut: (_response: PutResponse) => {},

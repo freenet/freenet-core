@@ -192,7 +192,15 @@ Here is an example of how you could write your application to interact with the
 node:
 
 ```typescript
-import { LocutusWsApi } from "@locutus/locutus-stdlib/webSocketInterface";
+import {
+  GetResponse,
+  HostError,
+  Key,
+  LocutusWsApi,
+  PutResponse,
+  UpdateNotification,
+  UpdateResponse,
+} from "@locutus/locutus-stdlib/webSocketInterface";
 
 const handler = {
   onPut: (_response: PutResponse) => {},
