@@ -12,7 +12,7 @@ This will install a Rust development environment including cargo on Linux or a
 Mac (for Windows see [here](https://rustup.rs)):
 
 ```bash
-$ curl https://sh.rustup.rs -sSf | sh
+curl https://sh.rustup.rs -sSf | sh
 ```
 
 ### Locutus Dev Tool (LTD)
@@ -21,7 +21,7 @@ Once you have a working installation of Cargo you can install the Locutus dev
 tools:
 
 ```bash
-$ cargo install locutus
+cargo install locutus
 ```
 
 This command will install `ldt` (Locutus Dev Tool) and a working Freenet kernel that can
@@ -33,8 +33,8 @@ To build user interfaces in JavaScript or TypeScript, you need to have Node.js
 and npm installed. On Linux or Mac:
 
 ```bash
-$ sudo apt update
-$ sudo apt install nodejs npm
+sudo apt update
+sudo apt install nodejs npm
 ```
 
 For Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
@@ -43,13 +43,13 @@ Once Node.js and npm are installed, you can install TypeScript globally on your
 system, which includes the `tsc` command:
 
 ```bash
-$ sudo npm install -g typescript
+sudo npm install -g typescript
 ```
 
 You can verify the installation by checking the version of `tsc`:
 
 ```bash
-$ tsc --version
+tsc --version
 ```
 
 This command should output the version of TypeScript that you installed.
@@ -76,10 +76,10 @@ technological stacks are supported (more to be added in the future):
 We will need to create a directory that will hold our web app and initialize it:
 
 ```bash
-$ mkdir -p my-app/web
-$ mkdir -p my-app/backend
-$ cd my-app/web
-$ ldt new web-app
+mkdir -p my-app/web
+mkdir -p my-app/backend
+cd my-app/web
+ldt new web-app
 ```
 
 will create the skeleton for a web application and its container contract for
@@ -95,7 +95,7 @@ The `new` command has created the source ready to be modified for us, in your
 favorite editor open the following file:
 
 ```bash
-$ ./container/src/lib.rs
+./container/src/lib.rs
 ```
 
 In this case, and for simplicity's sake, the contract won't be performing any
@@ -269,8 +269,8 @@ a back end where we will be storing all the information, requires another
 contract. So we will create a new contract in a different directory for it:
 
 ```bash
-$ cd ../backend
-$ ldt new contract
+cd ../backend
+ldt new contract
 ```
 
 This will create a regular contract, and we will need to implement the interface
@@ -382,18 +382,18 @@ installed.
 This means that you have installed either globally or at the directory level,
 e.g. globally:
 
-```
-$ npm install -g typescript
-$ npm install -g webpack
-$ npm install -g webpack-cli
+```bash
+npm install -g typescript
+npm install -g webpack
+npm install -g webpack-cli
 ```
 
 or locally (make sure your `package.json` file has the required dependencies):
 
-```
-$ npm install typescript --save-dev
-$ npm install webpack --save-dev
-$ npm install webpack-cli --save-dev
+```bash
+npm install typescript --save-dev
+npm install webpack --save-dev
+npm install webpack-cli --save-dev
 ```
 
 If, however, you prefer to follow a different workflow, you can write your own
@@ -428,7 +428,7 @@ Now that we understand the details, and after making any necessary changes, in
 each contract directory we run the following commands:
 
 ```bash
-$ ldt build
+ldt build
 ```
 
 This command will read your contract manifest file (`locutus.toml`) and take
@@ -459,7 +459,7 @@ is running by running the following command as a background process or in
 another terminal; since we have installed it:
 
 ```bash
-$ locutus-node
+locutus-node
 ```
 
 You should see some logs printed via the stdout of the process indicating that
@@ -469,8 +469,8 @@ Once the HTTP gateway is running, we are ready to publish the contracts to our
 local Locutus node:
 
 ```bash
-$ cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
-$ cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
+cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
+cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
 ```
 
 In this case, we're not passing any parameters (so our parameters will be an
