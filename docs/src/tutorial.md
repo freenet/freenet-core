@@ -331,7 +331,7 @@ render them in our browser. We can do that, for example, using the API:
 ```typescript
 function getUpdateNotification(notification: UpdateNotification) {
   let decoder = new TextDecoder("utf8");
-  let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
+  let updatesBox = document.getElementById("updates") as HTMLPreElement;
   let newUpdate = decoder.decode(Uint8Array.from(notification.update));
   let newUpdateJson = JSON.parse(newUpdate);
   updatesBox.textContent = updatesBox.textContent + newUpdateJson;
