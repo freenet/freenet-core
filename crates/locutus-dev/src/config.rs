@@ -65,21 +65,23 @@ pub struct UpdateConfig {
     pub(crate) release: bool,
 }
 
-/// Publishes a new contract to the network.
+/// Publishes a new contract or delegate to the network.
 // todo: make some of this options exclusive depending on the value of `package_type`
 #[derive(clap::Parser, Clone)]
 pub struct PutConfig {
-    /// A path to the compiled WASM code file.
+    /// A path to the compiled WASM code file. This must be a valid packaged contract or component,
+    /// (built using the `ldt` tool). Not an arbitrary WASM file.
     #[arg(long)]
     pub(crate) code: PathBuf,
-    /// A path to the file parameters for the contract. If not specified, the contract
-    /// will be published with empty parameters.
+    /// A path to the file parameters for the contract/delegate. If not specified, will be published
+    /// with empty parameters.
     #[arg(long)]
     pub(crate) parameters: Option<PathBuf>,
     /// Whether this contract will be released into the network or is just a dry run
     /// to be executed in local mode only. By default puts are performed in local.
     #[arg(long)]
     pub(crate) release: bool,
+    /// Type of put to perform.
     #[clap(subcommand)]
     pub(crate) package_type: PutType,
 }

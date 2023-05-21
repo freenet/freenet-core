@@ -19,7 +19,9 @@ const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
+    /// Puts a new contract
     Contract(PutContract),
+    /// Puts a new delegate
     Delegate(PutDelegate),
 }
 
@@ -35,10 +37,10 @@ pub(crate) struct PutContract {
 
 #[derive(clap::Parser, Clone, Debug)]
 pub(crate) struct PutDelegate {
-    /// Base58 encoded nonce
+    /// Base58 encoded nonce. If empty the default value will be used, this is only allowed in local mode.
     #[arg(long, env = "DELEGATE_NONCE", default_value_t = String::new())]
     pub(crate) nonce: String,
-    /// Base58 encoded cipher
+    /// Base58 encoded cipher. If empty the default value will be used, this is only allowed in local mode.
     #[arg(long, env = "DELEGATE_CIPHER", default_value_t = String::new())]
     pub(crate) cipher: String,
 }
