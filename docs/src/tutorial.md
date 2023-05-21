@@ -422,7 +422,7 @@ lang = "typescript"
 webpack =  false
 ```
 
-would disable usign `webpack` at all.
+would disable using `webpack` at all.
 
 Now that we understand the details, and after making any necessary changes, in
 each contract directory we run the following commands:
