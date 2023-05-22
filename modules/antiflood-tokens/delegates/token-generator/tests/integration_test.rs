@@ -152,7 +152,8 @@ mod integration_test {
 
         let delegate = {
             let bytes = get_test_module("delegates", delegate_name, "node")?;
-            let params = Parameters::from(serde_json::to_vec(&private_key.clone())?);
+            let delegate_params = DelegateParameters::new(private_key.clone());
+            let params = Parameters::from(serde_json::to_vec(&delegate_params)?);
             let code = DelegateCode::from(bytes);
             Delegate::from((&code, &params))
         };
@@ -217,11 +218,28 @@ mod integration_test {
             ApplicationMessage::new(app, payload.clone()).with_context(delegate_context.clone()),
         );
 
-        let delegate_params = DelegateParameters::new(private_key);
+        let delegate_params = DelegateParameters::new(private_key.clone());
         let params = Parameters::from(serde_json::to_vec(&delegate_params).unwrap());
         let outbound = runtime
             .inbound_app_message(delegate.key(), &params, vec![inbound_message])
             .unwrap();
         assert_eq!(outbound.len(), 1);
+
+        let result_msg = match outbound.get(0) {
+            Some(OutboundDelegateMsg::ApplicationMessage( ApplicationMessage {app, payload, context, processed, ..})) => {
+                let msg: TokenDelegateMessage = bincode::deserialize(payload.as_ref()).unwrap();
+                msg
+            }
+            _ => panic!("Unexpected outbound message"),
+        };
+
+        match result_msg {
+            TokenDelegateMessage::AllocatedToken {delegate_id, assignment, records} => {
+                assert_eq!(assignment.tier, Tier::Day1);
+                assert_eq!(assignment.token_record, ContractInstanceId::from(contract_key));
+                assert_eq!(assignment.assignee, private_key.to_public_key());
+            }
+            _ => panic!("Unexpected token delegate message"),
+        }
     }
 }
