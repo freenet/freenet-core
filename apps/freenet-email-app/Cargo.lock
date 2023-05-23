@@ -3345,6 +3345,7 @@ version = "0.0.3"
 dependencies = [
  "atty",
  "bincode",
+ "bs58",
  "clap",
  "either",
  "futures",

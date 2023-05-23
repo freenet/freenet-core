@@ -238,7 +238,7 @@ pub enum DelegateRequest<'a> {
     RegisterDelegate {
         #[serde(borrow)]
         delegate: Delegate<'a>,
-        cipher: [u8; 24],
+        cipher: [u8; 32],
         nonce: [u8; 24],
     },
     UnregisterDelegate(DelegateKey),

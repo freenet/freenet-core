@@ -31,8 +31,8 @@ build-inbox: \
 build-token-allocation: \
 	build-token-allocation-contract-0 publish-token-allocation-contract-0 \
 	build-token-allocation-contract-1 publish-token-allocation-contract-1 \
-	build-token-generator-0 publish-token-generator 0 \
-	build-token-generator-1 publish-token-generator 1 \
+	build-token-generator-0 publish-token-generator-delegate-0 \
+	build-token-generator-1 publish-token-generator-delegate-1 \
 	generate-token-allocation-code-hash
 
 build-tool:
@@ -45,7 +45,7 @@ build-inbox-%:
 	cd $(INBOX_DIR) && ldt build --features contract
 
 publish-inbox-%:
-	cd $(INBOX_DIR) && ldt publish --code build/locutus/freenet_email_inbox --state build/locutus/contract-state --parameters examples/inbox_key_$*
+	cd $(INBOX_DIR) && ldt publish --code build/locutus/freenet_email_inbox --parameters examples/inbox_key_$* contract --state build/locutus/contract-state
 
 build-token-allocation-contract-%:
 	cd $(AFT_RECORD)
@@ -54,15 +54,15 @@ build-token-allocation-contract-%:
 	ldt build
 
 publish-token-allocation-contract-%:
-	cd $(AFT_RECORD) && ldt publish --code build/locutus/locutus_token_allocation_record --state build/locutus/contract-state --parameters examples/generator_pub_key_$*
+	cd $(AFT_RECORD) && ldt publish --code build/locutus/locutus_token_allocation_record --parameters examples/generator_pub_key_$* contract --state build/locutus/contract-state
 
 build-token-generator-%:
 	cd $(AFT_GENERATOR)
 	cargo run --bin gen_pub_key -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
-	ldt build --package-type delegate
+	ldt build --package-type delegate --features node
 
 publish-token-generator-delegate-%:
-	cd $(AFT_RECORD) && ldt publish --code build/locutus/locutus_token_allocation_record --parameters examples/generator_pub_key_$*
+	cd $(AFT_GENERATOR) && ldt publish --code build/locutus/locutus_token_generator --parameters examples/generator_pub_key_$* delegate
 
 generate-inbox-contract-code-hash:
 	cd $(INBOX_DIR)
@@ -73,6 +73,11 @@ generate-token-allocation-code-hash:
 	cd $(AFT_RECORD)
 	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
 	echo -n $$hash > $(WEB_DIR_SRC)/../build/token_allocation_record_code_hash
+
+generate-token-generator-delegate-code-hash:
+	cd $(AFT_GENERATOR)
+	hash=$$(bash -c "ldt inspect build/locutus/locutus-token-generator code | grep 'code hash:' | cut -d' ' -f3")
+	echo -n $$hash > $(WEB_DIR_SRC)/../build/token-generator_code_hash
 
 run-node:
 	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,info locutus-node local

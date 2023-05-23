@@ -406,6 +406,7 @@ impl InboxModel {
         let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, params)?;
         let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
             key,
+            params,
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(inbox_key.into(), vec![]),
             )],
