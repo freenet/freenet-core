@@ -437,6 +437,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "771fe0050b883fcc3ea2359b1a96bcfbc090b7116eae7c3c512c7a083fdf23d3"
 
 [[package]]
+name = "bs58"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5353f36341f7451062466f0b755b96ac3a9547e4d7f6b70d603fc721a7d7896"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2087,7 +2096,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c4178afd65bf7c56744b4e0a6cfa6e9b694fe666efba596e03a46f79454d8d"
 dependencies = [
  "asn1_der",
- "bs58",
+ "bs58 0.4.0",
  "ed25519-dalek",
  "either",
  "fnv",
@@ -2404,7 +2413,7 @@ dependencies = [
  "axum",
  "bincode",
  "blake2 0.10.6",
- "bs58",
+ "bs58 0.5.0",
  "chacha20poly1305 0.10.1",
  "clap",
  "config",
@@ -2490,7 +2499,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "blake2 0.10.6",
- "bs58",
+ "bs58 0.5.0",
  "byteorder",
  "chacha20poly1305 0.10.1",
  "chrono",
@@ -2526,7 +2535,7 @@ dependencies = [
  "arrayvec",
  "bincode",
  "blake2 0.10.6",
- "bs58",
+ "bs58 0.5.0",
  "byteorder",
  "chrono",
  "futures",
@@ -2716,7 +2725,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48ee4ea82141951ac6379f964f71b20876d43712bea8faf6dd1a375e08a46499"
 dependencies = [
  "arrayref",
- "bs58",
+ "bs58 0.4.0",
  "byteorder",
  "data-encoding",
  "multihash",

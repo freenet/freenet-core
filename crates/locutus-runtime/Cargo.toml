@@ -14,7 +14,7 @@ arrayvec = { version = "0.7", features = ["serde"] }
 async-trait = "0.1"
 bincode = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
-bs58 = "0.4"
+bs58 = "0.5"
 byteorder = "1"
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
