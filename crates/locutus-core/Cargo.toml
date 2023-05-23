@@ -20,7 +20,7 @@ chacha20poly1305 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 config = { version = "0.13.0", features = [ "toml" ] } 
 crossbeam = "0.8.2"
-ctrlc = { version = "3.0", features = ["termination"] }
+ctrlc = { version = "3.3", features = ["termination"] }
 dashmap = "^5.1"
 directories = "5"
 either = { workspace = true , features = ["serde"] }
