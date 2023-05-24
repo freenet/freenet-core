@@ -40,7 +40,9 @@ pub struct Executor {
 
 impl Executor {
     pub async fn new(
-        store: ContractStore,
+        contract_store: ContractStore,
+        delegate_store: DelegateStore,
+        secret_store: SecretsStore,
         contract_state: StateStore<Storage>,
         ctrl_handler: impl FnOnce(),
         mode: OperationMode,
@@ -49,13 +51,7 @@ impl Executor {
 
         Ok(Self {
             mode,
-            runtime: Runtime::build(
-                store,
-                DelegateStore::default(),
-                SecretsStore::default(),
-                false,
-            )
-            .unwrap(),
+            runtime: Runtime::build(contract_store, delegate_store, secret_store, false).unwrap(),
             contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
@@ -516,6 +512,8 @@ mod test {
         let mut counter = 0;
         Executor::new(
             contract_store,
+            DelegateStore::default(),
+            SecretsStore::default(),
             state_store,
             || {
                 counter += 1;

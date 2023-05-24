@@ -5,7 +5,7 @@ use locutus_core::{
 };
 use locutus_runtime::{
     ContractContainer, ContractInstanceId, ContractStore, Delegate, DelegateCode, DelegateRequest,
-    Parameters, StateStore,
+    DelegateStore, Parameters, SecretsStore, StateStore,
 };
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
@@ -16,6 +16,7 @@ use crate::{
 
 const MAX_MEM_CACHE: u32 = 10_000_000;
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
+const DEFAULT_MAX_DELEGATE_SIZE: i64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
@@ -154,13 +155,29 @@ async fn execute_command(
     request: ClientRequest<'static>,
     other: BaseConfig,
 ) -> Result<(), DynError> {
-    let data_path = other
+    let contracts_data_path = other
         .contract_data_dir
         .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
-    let contract_store = ContractStore::new(data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
+    let delegates_data_path = other
+        .delegate_data_dir
+        .unwrap_or_else(|| Config::get_conf().config_paths.local_delegates_dir());
+    let secrets_data_path = other
+        .secret_data_dir
+        .unwrap_or_else(|| Config::get_conf().config_paths.local_secrets_dir());
+
+    let contract_store = ContractStore::new(contracts_data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
+    let delegate_store = DelegateStore::new(delegates_data_path, DEFAULT_MAX_DELEGATE_SIZE)?;
+    let secret_store = SecretsStore::new(secrets_data_path)?;
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
-    let mut executor =
-        Executor::new(contract_store, state_store, || {}, OperationMode::Local).await?;
+    let mut executor = Executor::new(
+        contract_store,
+        delegate_store,
+        secret_store,
+        state_store,
+        || {},
+        OperationMode::Local,
+    )
+    .await?;
 
     executor
         .handle_request(ClientId::new(0), request, None)

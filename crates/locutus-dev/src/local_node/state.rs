@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, sync::Arc};
 
 use locutus_core::{Config, Executor, OperationMode, Storage};
-use locutus_runtime::{ContractStore, StateStore};
+use locutus_runtime::{ContractStore, DelegateStore, SecretsStore, StateStore};
 use tokio::sync::RwLock;
 
 use crate::{local_node::DeserializationFmt, DynError};
@@ -25,6 +25,8 @@ impl AppState {
             local_node: Arc::new(RwLock::new(
                 Executor::new(
                     contract_store,
+                    DelegateStore::default(),
+                    SecretsStore::default(),
                     state_store,
                     || {
                         locutus_core::util::set_cleanup_on_exit().unwrap();

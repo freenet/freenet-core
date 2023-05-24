@@ -21,6 +21,12 @@ pub struct BaseConfig {
     /// Overrides the default data directory where Locutus contract files are stored.
     #[arg(long)]
     pub(crate) contract_data_dir: Option<PathBuf>,
+    /// Overrides the default data directory where Locutus delegate files are stored.
+    #[arg(long)]
+    pub(crate) delegate_data_dir: Option<PathBuf>,
+    /// Overrides the default data directory where Locutus secret files are stored.
+    #[arg(long)]
+    pub(crate) secret_data_dir: Option<PathBuf>,
     /// Node operation mode.
     #[arg(value_enum, default_value_t=OperationMode::Local)]
     pub(crate) mode: OperationMode,

@@ -1,4 +1,5 @@
 use clap::Parser;
+use locutus_core::locutus_runtime::{DelegateStore, SecretsStore};
 use locutus_core::{
     locutus_runtime::{ContractStore, StateStore},
     Config, Executor, OperationMode, Storage,
@@ -30,6 +31,8 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
     let executor = Executor::new(
         contract_store,
+        DelegateStore::default(),
+        SecretsStore::default(),
         state_store,
         || {
             locutus_core::util::set_cleanup_on_exit().unwrap();
