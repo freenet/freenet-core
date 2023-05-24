@@ -3,7 +3,8 @@
 Delegates, contracts, and user interfaces (UIs) each serve distinct roles in the
 Freenet ecosystem. Contracts control public data, or "shared state". Delegates
 act as the user's agent and can store private data on the user's behalf, while
-UIs provide an interface between these and the user through a web browser.
+UIs provide an interface between these and the user through a web browser. UIs
+are distributed through the P2P network via contracts.
 
 ![Architectural Primitives Diagram](components.svg)
 
@@ -24,8 +25,7 @@ can
 ## User Interface
 
 On the normal web, a user might visit https://gmail.com/, their browser
-will download the Gmail user interface which then runs in their browser and connects
-back to the Gmail servers. 
+will download the Gmail user interface which then runs in their browser and connects back to the Gmail servers. 
 
 On Freenet the user interface is downloaded from a Freenet contract, and it
 interacts with contracts and delegates through the Freenet kernel.
