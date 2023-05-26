@@ -8,9 +8,7 @@ use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
-use locutus_stdlib::prelude::{
-    blake2, blake2::Digest, ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg,
-};
+use locutus_stdlib::prelude::{blake2, blake2::Digest, ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg, Parameters};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
@@ -35,6 +33,7 @@ use freenet_email_inbox::{
 
 pub(crate) static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
 static TOKEN_RECORD_CODE_HASH: &str = include_str!("../build/token_allocation_record_code_hash");
+static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str = include_str!("../build/token_generator_code_hash");
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -201,39 +200,7 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let token = {
             let key = pub_key.clone();
-            //TODO: Use the delegate instead of hardcoding the TokenAssignment.
-            //InboxModel::assign_token(client, key).await?
-            const TEST_TIER: Tier = Tier::Day1;
-            const MAX_DURATION_1Y: std::time::Duration =
-                std::time::Duration::from_secs(365 * 24 * 3600);
-            let naive = NaiveDate::from_ymd_opt(2023, 1, 25)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap();
-            let slot = DateTime::<Utc>::from_utc(naive, Utc);
-
-            let record_params = TokenParameters::new(generator_public_key);
-            let token_record: ContractInstanceId =
-                ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
-                    .unwrap()
-                    .into();
-
-            crate::log::log(
-                format!(
-                    "Sending update request message with token record key: {}",
-                    token_record.clone()
-                )
-                .as_str(),
-            );
-
-            TokenAssignment {
-                tier: TEST_TIER,
-                time_slot: slot,
-                assignee: key,
-                signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
-                assignment_hash: [0; 32],
-                token_record,
-            }
+            InboxModel::assign_token(client, key, generator_public_key).await?
         };
         let params = InboxParams { pub_key }
             .try_into()
@@ -397,22 +364,56 @@ impl InboxModel {
     async fn assign_token(
         client: &mut WebApiRequestClient,
         recipient_key: RsaPublicKey,
+        generator_public_key: RsaPublicKey,
     ) -> Result<TokenAssignment, DynError> {
-        let key = DelegateKey::new(&[]); // TODO: this should be the AFT component key
-        let params = InboxParams {
-            pub_key: recipient_key,
+        let params: Parameters = InboxParams {
+            pub_key: recipient_key.clone(),
         }
         .try_into()?;
-        let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, params)?;
+        //FIXME: Fix get DelegateKey from params
+        //let delegate_key = DelegateKey::from_params(TOKEN_GENERATOR_DELEGATE_CODE_HASH, params.clone())?;
+        let delegate_key = DelegateKey::from_params("".to_string(), Parameters::from(vec![]))?;
+        let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, params.clone())?;
         let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
-            key,
+            key: delegate_key,
             params,
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(inbox_key.into(), vec![]),
             )],
         });
-        client.send(request).await?;
-        todo!()
+        //TODO: Fix send and use the received delegate instead of hardcoding the TokenAssignment.
+        //client.send(request).await?;
+        const TEST_TIER: Tier = Tier::Day1;
+        const MAX_DURATION_1Y: std::time::Duration =
+            std::time::Duration::from_secs(365 * 24 * 3600);
+        let naive = NaiveDate::from_ymd_opt(2023, 1, 25)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let slot = DateTime::<Utc>::from_utc(naive, Utc);
+
+        let record_params = TokenParameters::new(generator_public_key);
+        let token_record: ContractInstanceId =
+            ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
+                .unwrap()
+                .into();
+
+        crate::log::log(
+            format!(
+                "Sending update request message with token record key: {}",
+                token_record.clone()
+            )
+                .as_str(),
+        );
+
+        Ok(TokenAssignment {
+            tier: TEST_TIER,
+            time_slot: slot,
+            assignee: recipient_key,
+            signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
+            assignment_hash: [0; 32],
+            token_record,
+        })
     }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {

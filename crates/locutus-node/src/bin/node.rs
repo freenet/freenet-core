@@ -29,10 +29,12 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
     // TODO: Generate delegates and secrets store from config
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
+    let delegate_store = DelegateStore::default();
+    let secret_store = SecretsStore::default();
     let executor = Executor::new(
         contract_store,
-        DelegateStore::default(),
-        SecretsStore::default(),
+        delegate_store,
+        secret_store,
         state_store,
         || {
             locutus_core::util::set_cleanup_on_exit().unwrap();

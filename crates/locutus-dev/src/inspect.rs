@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use locutus_stdlib::prelude::ContractCode;
+use locutus_stdlib::prelude::{ContractCode, DelegateCode};
 
 use crate::{DynError, Error};
 
@@ -38,7 +38,11 @@ contract API version: {version}
 "#
             );
         }
-        FileType::Delegate => todo!(),
+        FileType::Delegate => {
+            let code = DelegateCode::load(&config.file)?;
+            let hash = code.hash_str();
+            println!(r#"code hash: {hash}"#);
+        }
         FileType::Contract => todo!(),
     }
 

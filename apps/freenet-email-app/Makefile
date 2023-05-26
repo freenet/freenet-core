@@ -33,7 +33,7 @@ build-token-allocation: \
 	build-token-allocation-contract-1 publish-token-allocation-contract-1 \
 	build-token-generator-0 publish-token-generator-delegate-0 \
 	build-token-generator-1 publish-token-generator-delegate-1 \
-	generate-token-allocation-code-hash
+	generate-token-allocation-code-hash generate-token-generator-delegate-code-hash
 
 build-tool:
 	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
@@ -76,8 +76,8 @@ generate-token-allocation-code-hash:
 
 generate-token-generator-delegate-code-hash:
 	cd $(AFT_GENERATOR)
-	hash=$$(bash -c "ldt inspect build/locutus/locutus-token-generator code | grep 'code hash:' | cut -d' ' -f3")
-	echo -n $$hash > $(WEB_DIR_SRC)/../build/token-generator_code_hash
+	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_generator delegate | grep 'code hash:' | cut -d' ' -f3")
+	echo -n $$hash > $(WEB_DIR_SRC)/../build/token_generator_code_hash
 
 run-node:
 	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,info locutus-node local

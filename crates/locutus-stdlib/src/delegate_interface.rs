@@ -96,6 +96,17 @@ impl DelegateCode<'_> {
         }
     }
 
+    pub fn hash_str(&self) -> String {
+        Self::encode_hash(&self.code_hash.0)
+    }
+
+    /// Returns the `Base58` string representation of a hash.
+    pub fn encode_hash(hash: &[u8; DELEGATE_HASH_LENGTH]) -> String {
+        bs58::encode(hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
+    }
+
     pub fn size(&self) -> usize {
         self.code.len()
     }
@@ -156,6 +167,29 @@ impl DelegateKey {
 
     pub fn code_hash(&self) -> &CodeHash {
         &self.code_hash
+    }
+
+    pub fn from_params(
+        code_hash: impl Into<String>,
+        parameters: Parameters,
+    ) -> Result<Self, bs58::decode::Error> {
+        let mut code_key = [0; DELEGATE_HASH_LENGTH];
+        bs58::decode(code_hash.into())
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into(&mut code_key)?;
+        let mut hasher = Blake2s256::new();
+        hasher.update(code_key);
+        hasher.update(parameters.as_ref());
+        let full_key_arr = hasher.finalize();
+
+        debug_assert_eq!(full_key_arr[..].len(), DELEGATE_HASH_LENGTH);
+        let mut key = [0; DELEGATE_HASH_LENGTH];
+        key.copy_from_slice(&full_key_arr);
+
+        Ok(Self {
+            key,
+            code_hash: CodeHash(code_key),
+        })
     }
 }
 
