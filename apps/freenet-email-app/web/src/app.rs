@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+use std::hash::Hasher;
 use std::sync::{Arc, Mutex};
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
@@ -408,11 +409,17 @@ impl User {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pub id: UserId,
     pub key: RsaPrivateKey,
     pub alias: String,
+}
+
+impl std::hash::Hash for Identity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state)
+    }
 }
 
 #[derive(Debug, Clone, Eq, Props)]

@@ -147,6 +147,15 @@ pub struct DelegateKey {
     code_hash: CodeHash,
 }
 
+impl From<DelegateKey> for SecretsId {
+    fn from(key: DelegateKey) -> SecretsId {
+        SecretsId {
+            hash: key.key,
+            key: vec![],
+        }
+    }
+}
+
 impl DelegateKey {
     pub fn new<'a>(
         wasm_code: impl AsRef<DelegateCode<'a>>,
@@ -193,6 +202,14 @@ impl DelegateKey {
     }
 }
 
+impl Deref for DelegateKey {
+    type Target = [u8; DELEGATE_HASH_LENGTH];
+
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
 impl<'a, T, U> From<(T, U)> for DelegateKey
 where
     T: Borrow<Parameters<'a>>,
@@ -206,6 +223,21 @@ where
             code_hash: code_data.hash().clone(),
         }
     }
+}
+
+impl Display for DelegateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.encode())
+    }
+}
+
+/// Type of errors during interaction with a delegate.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
+pub enum DelegateError {
+    #[error("de/serialization error: {0}")]
+    Deser(String),
+    #[error("{0}")]
+    Other(String),
 }
 
 fn generate_id<'a>(
@@ -223,21 +255,6 @@ fn generate_id<'a>(
     let mut key = [0; DELEGATE_HASH_LENGTH];
     key.copy_from_slice(&full_key_arr);
     key
-}
-
-impl Display for DelegateKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.encode())
-    }
-}
-
-/// Type of errors during interaction with a delegate.
-#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
-pub enum DelegateError {
-    #[error("de/serialization error: {0}")]
-    Deser(String),
-    #[error("{0}")]
-    Other(String),
 }
 
 #[serde_as]
@@ -265,8 +282,7 @@ impl SecretsId {
             .into_string()
     }
 
-    /// Returns the hash of the contract key only.
-    pub fn code_hash(&self) -> &[u8; 32] {
+    pub fn hash(&self) -> &[u8; 32] {
         &self.hash
     }
 }

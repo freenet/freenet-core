@@ -6,8 +6,12 @@ use chacha20poly1305::{
 use chrono::{DateTime, NaiveDate, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
+use locutus_aft_interface::{
+    AllocationCriteria, RequestNewToken, Tier, TokenAllocationRecord, TokenAssignment,
+    TokenDelegateMessage, TokenParameters,
+};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
+use locutus_stdlib::prelude::SecretsId;
 use locutus_stdlib::prelude::{
     blake2, blake2::Digest, ApplicationMessage, ContractInstanceId, DelegateKey,
     InboundDelegateMsg, Parameters,
@@ -24,8 +28,9 @@ use rsa::{
     Pkcs1v15Encrypt, PublicKey, RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use crate::app::{error_handling, TryNodeAction};
@@ -110,38 +115,9 @@ pub(crate) struct DecryptedMessage {
 
 impl DecryptedMessage {
     fn to_stored(&self, mut token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
-        // FIXME: use a real source of entropy
-        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
-        let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
-
-        // Generate a random 256-bit XChaCha20Poly1305 key
-        let chacha_key = XChaCha20Poly1305::generate_key(&mut OsRng);
-        let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-
-        // Encrypt the data using XChaCha20Poly1305
-        let cipher = XChaCha20Poly1305::new(&chacha_key);
-        let encrypted_data = cipher
-            .encrypt(&chacha_nonce, decrypted_content.as_slice())
-            .unwrap();
-
-        // Encrypt the XChaCha20Poly1305 key using RSA
-        let encrypted_key = token_assignment
-            .assignee
-            .encrypt(&mut rng, Pkcs1v15Encrypt, &chacha_key)
-            .map_err(|e| format!("{e}"))?;
-
-        // Concatenate the nonce, encrypted XChaCha20Poly1305 key and encrypted data
-        let mut content =
-            Vec::with_capacity(chacha_nonce.len() + encrypted_key.len() + encrypted_data.len());
-        content.extend(&chacha_nonce);
-        content.extend(encrypted_key);
-        content.extend(encrypted_data);
-
-        let mut hasher = blake2::Blake2s256::new();
-        hasher.update(&content);
-        let assignment_hash: [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
-        token_assignment.assignment_hash = assignment_hash;
-
+        let (hash, content) =
+            self.assignment_hash_and_signed_content(&token_assignment.assignee)?;
+        token_assignment.assignment_hash = hash;
         Ok::<_, DynError>(StoredMessage {
             content,
             token_assignment,
@@ -170,6 +146,42 @@ impl DecryptedMessage {
         let content: DecryptedMessage = serde_json::from_slice(&decrypted_content).unwrap();
         content
     }
+
+    fn assignment_hash_and_signed_content(
+        &self,
+        assignee: &RsaPublicKey,
+    ) -> Result<([u8; 32], Vec<u8>), DynError> {
+        // FIXME: use a real source of entropy
+        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
+
+        // Generate a random 256-bit XChaCha20Poly1305 key
+        let chacha_key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        // Encrypt the data using XChaCha20Poly1305
+        let cipher = XChaCha20Poly1305::new(&chacha_key);
+        let encrypted_data = cipher
+            .encrypt(&chacha_nonce, decrypted_content.as_slice())
+            .unwrap();
+
+        // Encrypt the XChaCha20Poly1305 key using RSA
+        let encrypted_key = assignee
+            .encrypt(&mut rng, Pkcs1v15Encrypt, &chacha_key)
+            .map_err(|e| format!("{e}"))?;
+
+        // Concatenate the nonce, encrypted XChaCha20Poly1305 key and encrypted data
+        let mut content =
+            Vec::with_capacity(chacha_nonce.len() + encrypted_key.len() + encrypted_data.len());
+        content.extend(&chacha_nonce);
+        content.extend(encrypted_key);
+        content.extend(encrypted_data);
+
+        let mut hasher = blake2::Blake2s256::new();
+        hasher.update(&content);
+        let assignment_hash: [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
+        Ok((assignment_hash, content))
+    }
 }
 
 /// Inbox state
@@ -193,7 +205,6 @@ impl InboxModel {
         let contract_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         InboxModel::get_state(client, contract_key.clone()).await?;
-        // InboxModel::subscribe(client, contract_key.clone()).await?;
         Ok(contract_key)
     }
 
@@ -205,7 +216,8 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let token = {
             let key = recipient_key.clone();
-            InboxModel::assign_token(client, key, from_id).await?
+            let (k, _) = content.assignment_hash_and_signed_content(&recipient_key)?;
+            InboxModel::assign_token(client, key, from_id, k).await?
         };
         let params = InboxParams {
             pub_key: recipient_key,
@@ -371,7 +383,9 @@ impl InboxModel {
         client: &mut WebApiRequestClient,
         recipient_key: RsaPublicKey,
         generator_id: Identity,
+        assignment_hash: [u8; 32],
     ) -> Result<TokenAssignment, DynError> {
+        static REQUEST_ID: AtomicU32 = AtomicU32::default();
         let inbox_params: Parameters = InboxParams {
             pub_key: recipient_key.clone(),
         }
@@ -380,19 +394,44 @@ impl InboxModel {
             DelegateKey::from_params(TOKEN_GENERATOR_DELEGATE_CODE_HASH, inbox_params.clone())?;
         crate::log::log(format!("{delegate_key:?}"));
         let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, inbox_params.clone())?;
-        let delegate_params = locutus_aft_interface::DelegateParameters::new(generator_id.key);
+        let delegate_params =
+            locutus_aft_interface::DelegateParameters::new(generator_id.key.clone());
+        let delegate_id = delegate_key.encode();
+
+        let record_params = TokenParameters::new(generator_id.key.to_public_key());
+        let token_record: ContractInstanceId =
+            ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
+                .unwrap()
+                .into();
+        // todo: the criteria should come from the recipient inbox really
+        let criteria = AllocationCriteria::new(
+            Tier::Day1,
+            std::time::Duration::from_secs(365 * 24 * 3600),
+            token_record,
+        )?;
+        // fixme: should be using the state of the record contract here instead:
+        let records = TokenAllocationRecord::new(HashMap::default());
+        let token_request = TokenDelegateMessage::RequestNewToken(RequestNewToken {
+            request_id: REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            delegate_id: delegate_key.clone().into(),
+            criteria,
+            records,
+            assignee: recipient_key,
+            assignment_hash,
+        });
         let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key,
             params: delegate_params.try_into()?,
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
-                ApplicationMessage::new(inbox_key.into(), vec![]),
+                ApplicationMessage::new(inbox_key.into(), token_request.serialize()?),
             )],
         });
         client.send(request).await?;
+
         let t = std::time::Instant::now();
         let mut token = None;
         while t.elapsed() < Duration::from_secs(10) {
-            token = crate::api::recv_token().await;
+            token = crate::api::recv_token(&delegate_id).await;
         }
         if let Some(token) = token {
             todo!()
@@ -409,12 +448,6 @@ impl InboxModel {
         //     .and_hms_opt(0, 0, 0)
         //     .unwrap();
         // let slot = DateTime::<Utc>::from_utc(naive, Utc);
-
-        // let record_params = TokenParameters::new(generator_public_key);
-        // let token_record: ContractInstanceId =
-        //     ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
-        //         .unwrap()
-        //         .into();
 
         // crate::log::log(
         //     format!(

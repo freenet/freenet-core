@@ -1,5 +1,4 @@
-use std::borrow::BorrowMut;
-use std::cell::RefCell;
+use std::{borrow::BorrowMut, cell::RefCell, collections::HashMap};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_aft_interface::{TokenAssignment, TokenDelegateMessage};
@@ -280,10 +279,12 @@ pub(crate) async fn node_comms(
                                 } => {
                                     // todo: check that the assignment belongs to the delegate requesting this
                                     TOKEN.with(|t| {
-                                        let mut tr = t.borrow_mut();
-                                        *tr = Some(assignment);
+                                        let mut tr = &mut *t.borrow_mut();
+                                        tr.entry(delegate_id.encode())
+                                            .or_default()
+                                            .push(assignment);
                                     })
-                                },
+                                }
                                 TokenDelegateMessage::Failure(reason) => crate::log::error(
                                     format!("{reason}"),
                                     Some(TryNodeAction::SendMessage),
@@ -334,12 +335,16 @@ pub(crate) async fn node_comms(
     }
 }
 
+/// Must be the encoded delegate key which will match with the encoded secrets ids stored in the node.
+type DelegateId = String;
+
 thread_local! {
-    // todo: probably need to keep the assignments per delegate making request and keep multiple of them
-    // eg. RefCell<HashMap<Identity, Vec<TokenAssignment>>>
-    static TOKEN: RefCell<Option<TokenAssignment>> = RefCell::new(None);
+    static TOKEN: RefCell<HashMap<DelegateId, Vec<TokenAssignment>>> = RefCell::new(HashMap::new());
 }
 
-pub(crate) async fn recv_token() -> Option<TokenAssignment> {
-    TOKEN.with(|t| t.borrow_mut().take())
+pub(crate) async fn recv_token(id: &DelegateId) -> Option<TokenAssignment> {
+    TOKEN.with(|t| {
+        let ids = &mut *t.borrow_mut();
+        ids.get_mut(id).and_then(|v| v.pop())
+    })
 }
