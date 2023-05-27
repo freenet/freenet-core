@@ -1,4 +1,8 @@
+use std::borrow::BorrowMut;
+use std::cell::RefCell;
+
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
+use locutus_aft_interface::{TokenAssignment, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 
@@ -139,7 +143,7 @@ pub(crate) async fn node_comms(
     contracts: Vec<crate::app::Identity>,
     mut inboxes: crate::app::InboxesData,
 ) {
-    use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+    use std::{collections::HashMap, rc::Rc, sync::Arc};
 
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
@@ -263,6 +267,39 @@ pub(crate) async fn node_comms(
                 _ => unreachable!(),
             },
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => {}
+            HostResponse::DelegateResponse { key, values } => {
+                for msg in values {
+                    match msg {
+                        locutus_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
+                            let token = TokenDelegateMessage::try_from(msg.payload.as_slice())?;
+                            match token {
+                                TokenDelegateMessage::AllocatedToken {
+                                    delegate_id,
+                                    assignment,
+                                    records,
+                                } => {
+                                    // todo: check that the assignment belongs to the delegate requesting this
+                                    TOKEN.with(|t| {
+                                        let mut tr = t.borrow_mut();
+                                        *tr = Some(assignment);
+                                    })
+                                },
+                                TokenDelegateMessage::Failure(reason) => crate::log::error(
+                                    format!("{reason}"),
+                                    Some(TryNodeAction::SendMessage),
+                                ),
+                                TokenDelegateMessage::RequestNewToken(_) => unreachable!(),
+                            }
+                        }
+                        other => {
+                            crate::log::error(
+                                format!("received wrong delegate msg: {other:?}"),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
             _ => todo!(),
         }
     }
@@ -295,4 +332,14 @@ pub(crate) async fn node_comms(
             }
         }
     }
+}
+
+thread_local! {
+    // todo: probably need to keep the assignments per delegate making request and keep multiple of them
+    // eg. RefCell<HashMap<Identity, Vec<TokenAssignment>>>
+    static TOKEN: RefCell<Option<TokenAssignment>> = RefCell::new(None);
+}
+
+pub(crate) async fn recv_token() -> Option<TokenAssignment> {
+    TOKEN.with(|t| t.borrow_mut().take())
 }

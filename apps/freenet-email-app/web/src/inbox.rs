@@ -26,6 +26,7 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
+use std::time::Duration;
 
 use crate::app::{error_handling, TryNodeAction};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
@@ -212,7 +213,6 @@ impl InboxModel {
         .try_into()
         .map_err(|e| format!("{e}"))?;
         let key = ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-
         let delta = UpdateInbox::AddMessages {
             messages: vec![content.to_stored(token)?],
         };
@@ -389,8 +389,18 @@ impl InboxModel {
             )],
         });
         client.send(request).await?;
-        todo!()
-
+        let t = std::time::Instant::now();
+        let mut token = None;
+        while t.elapsed() < Duration::from_secs(10) {
+            token = crate::api::recv_token().await;
+        }
+        if let Some(token) = token {
+            todo!()
+        } else {
+            let err = format!("failed trying to get a token for `{}`", generator_id.alias);
+            crate::log::error(&err, Some(TryNodeAction::SendMessage));
+            return Err(err.into());
+        }
         // const TEST_TIER: Tier = Tier::Day1;
         // const MAX_DURATION_1Y: std::time::Duration =
         //     std::time::Duration::from_secs(365 * 24 * 3600);

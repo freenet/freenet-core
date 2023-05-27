@@ -240,7 +240,8 @@ impl Inbox {
         {
             crate::log::log(format!("sending message from {from}"));
             for recipient_encoded_key in content.to.iter() {
-                let recipient_key = RsaPublicKey::from_pkcs1_pem(recipient_encoded_key).map_err(|e| format!("{e}"))?;
+                let recipient_key = RsaPublicKey::from_pkcs1_pem(recipient_encoded_key)
+                    .map_err(|e| format!("{e}"))?;
                 let content = content.clone();
                 let mut client = client.clone();
                 let from_id = INBOX_TO_ID
@@ -249,12 +250,10 @@ impl Inbox {
                     .values()
                     .find_map(|id| (id.alias == from).then(|| id.clone()))
                     .unwrap();
-                // let from_key = {
-                //     let from = ALIAS_MAP.get(from).unwrap();
-                //     RsaPublicKey::from_pkcs1_pem(from).map_err(|e| format!("{e}"))?
-                // };
                 let f = async move {
-                    let res = InboxModel::send_message(&mut client, content, recipient_key, from_id).await;
+                    let res =
+                        InboxModel::send_message(&mut client, content, recipient_key, from_id)
+                            .await;
                     error_handling(client.into(), res, TryNodeAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());

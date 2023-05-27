@@ -1,19 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use locutus_aft_interface::{AllocationCriteria, DelegateParameters, TokenAllocationRecord, TokenAssignment, TokenParameters};
+use locutus_aft_interface::*;
 use locutus_stdlib::prelude::*;
 use rsa::pkcs1v15::SigningKey;
 use rsa::sha2::Sha256;
-use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey, RsaPublicKey};
+use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod tests;
-
-type Assignee = RsaPublicKey;
-
-type AssignmentHash = [u8; 32];
 
 struct TokenDelegate;
 
@@ -64,20 +60,9 @@ impl DelegateInterface for TokenDelegate {
                 let context: DelegateContext = (&context).try_into()?;
                 Ok(vec![OutboundDelegateMsg::ContextUpdated(context)])
             }
-            InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                key,
-                value,
-                context,
-            }) => {
-                let mut context = Context::try_from(context)?;
-                let secret = value.ok_or_else(|| {
-                    DelegateError::Other(format!("secret not found for key: {key}"))
-                })?;
-                let keypair: RsaPrivateKey = bincode::deserialize(&secret)
-                    .map_err(|err| DelegateError::Deser(format!("{err}")))?;
-                let context: DelegateContext = (&context).try_into()?;
-                Ok(vec![OutboundDelegateMsg::ContextUpdated(context)])
-            }
+            InboundDelegateMsg::GetSecretResponse(GetSecretResponse { .. }) => Err(
+                DelegateError::Other("unexpected message type: get secret".into()),
+            ),
             InboundDelegateMsg::RandomBytes(_) => Err(DelegateError::Other(
                 "unexpected message type: radom bytes".into(),
             )),
@@ -184,7 +169,9 @@ fn allocate_token(
                         records,
                     };
                     OutboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, msg.serialize()?).processed(true).with_context(context),
+                        ApplicationMessage::new(app, msg.serialize()?)
+                            .processed(true)
+                            .with_context(context),
                     )
                 }
                 Response::NotAllowed => {
@@ -199,46 +186,6 @@ fn allocate_token(
             Ok(vec![application_response])
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum TokenDelegateMessage {
-    RequestNewToken(RequestNewToken),
-    AllocatedToken {
-        delegate_id: SecretsId,
-        assignment: TokenAssignment,
-        /// An updated version of the record with the newly allocated token included
-        records: TokenAllocationRecord,
-    },
-    Failure(FailureReason),
-}
-
-impl TokenDelegateMessage {
-    fn serialize(self) -> Result<Vec<u8>, DelegateError> {
-        bincode::serialize(&self).map_err(|err| DelegateError::Deser(format!("{err}")))
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum FailureReason {
-    /// The user didn't accept to allocate the tokens.
-    UserPermissionDenied,
-    /// No free slot to allocate with the requested criteria
-    NoFreeSlot {
-        delegate_id: SecretsId,
-        criteria: AllocationCriteria,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RequestNewToken {
-    request_id: u32,
-    delegate_id: SecretsId,
-    criteria: AllocationCriteria,
-    records: TokenAllocationRecord,
-    /// The public key
-    assignee: Assignee,
-    assignment_hash: AssignmentHash,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -271,14 +218,6 @@ impl TryFrom<&Context> for DelegateContext {
     }
 }
 
-impl TryFrom<&[u8]> for TokenDelegateMessage {
-    type Error = DelegateError;
-
-    fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
-        bincode::deserialize(payload).map_err(|err| DelegateError::Deser(format!("{err}")))
-    }
-}
-
 /// This is used internally by the delegate to allocate new tokens on behave of the requesting client app.
 ///  
 /// Conflicting assignments for the same time slot are not permitted and indicate that the generator is broken or malicious.
@@ -302,9 +241,9 @@ trait TokenAssignmentInternal {
 }
 
 impl TokenAssignmentInternal for TokenAllocationRecord {
-    #[cfg(feature = "node")]
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
+    #[cfg(feature = "node")]
     fn assign(
         &mut self,
         assignee: Assignee,
@@ -331,6 +270,17 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         };
         self.append_unchecked(assignment.clone());
         Some(assignment)
+    }
+
+    #[cfg(not(feature = "node"))]
+    fn assign(
+        &mut self,
+        _assignee: Assignee,
+        _criteria: &AllocationCriteria,
+        _key: &RsaPrivateKey,
+        _assignment_hash: AssignmentHash,
+    ) -> Option<TokenAssignment> {
+        None
     }
 
     fn next_free_assignment(
