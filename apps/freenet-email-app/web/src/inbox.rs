@@ -1,49 +1,48 @@
+use std::{
+    collections::{HashMap, HashSet},
+    io::{Cursor, Read},
+    sync::atomic::AtomicU32,
+    time::Duration,
+};
+
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     XChaCha20Poly1305,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{
     AllocationCriteria, RequestNewToken, Tier, TokenAllocationRecord, TokenAssignment,
     TokenDelegateMessage, TokenParameters,
 };
-use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
-use locutus_stdlib::prelude::SecretsId;
-use locutus_stdlib::prelude::{
-    blake2, blake2::Digest, ApplicationMessage, ContractInstanceId, DelegateKey,
-    InboundDelegateMsg, Parameters,
-};
 use locutus_stdlib::{
-    client_api::ContractRequest,
-    prelude::{ContractKey, State, UpdateData},
+    client_api::{ClientRequest, ContractRequest, DelegateRequest},
+    prelude::{
+        blake2::{self, Digest},
+        ApplicationMessage, ContractInstanceId, ContractKey, DelegateKey, InboundDelegateMsg,
+        Parameters, State, UpdateData,
+    },
 };
 use rand_chacha::rand_core::SeedableRng;
 use rsa::{
-    pkcs1v15::{Signature, SigningKey},
-    sha2::Sha256,
-    signature::Signer,
-    Pkcs1v15Encrypt, PublicKey, RsaPrivateKey, RsaPublicKey,
+    pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, PublicKey,
+    RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read};
-use std::sync::atomic::AtomicU32;
-use std::time::Duration;
 
-use crate::app::{error_handling, TryNodeAction};
-use crate::{api::WebApiRequestClient, app::Identity, DynError};
+use crate::{
+    api::WebApiRequestClient,
+    app::{error_handling, Identity, TryNodeAction},
+    DynError,
+};
 use freenet_email_inbox::{
     Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
     UpdateInbox,
 };
 
 pub(crate) static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
-static TOKEN_RECORD_CODE_HASH: &str = include_str!("../build/token_allocation_record_code_hash");
-static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
-    include_str!("../build/token_generator_code_hash");
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -195,10 +194,10 @@ pub(crate) struct InboxModel {
 impl InboxModel {
     pub(crate) async fn load(
         client: &mut WebApiRequestClient,
-        contract: &Identity,
+        id: &Identity,
     ) -> Result<ContractKey, DynError> {
         let params = InboxParams {
-            pub_key: contract.key.to_public_key(),
+            pub_key: id.key.to_public_key(),
         }
         .try_into()
         .map_err(|e| format!("{e}"))?;
@@ -216,8 +215,8 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let token = {
             let key = recipient_key.clone();
-            let (k, _) = content.assignment_hash_and_signed_content(&recipient_key)?;
-            InboxModel::assign_token(client, key, from_id, k).await?
+            let (hash, _) = content.assignment_hash_and_signed_content(&recipient_key)?;
+            InboxModel::assign_token(client, key, from_id, hash).await?
         };
         let params = InboxParams {
             pub_key: recipient_key,
@@ -385,13 +384,15 @@ impl InboxModel {
         generator_id: Identity,
         assignment_hash: [u8; 32],
     ) -> Result<TokenAssignment, DynError> {
-        static REQUEST_ID: AtomicU32 = AtomicU32::default();
+        static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
         let inbox_params: Parameters = InboxParams {
             pub_key: recipient_key.clone(),
         }
         .try_into()?;
-        let delegate_key =
-            DelegateKey::from_params(TOKEN_GENERATOR_DELEGATE_CODE_HASH, inbox_params.clone())?;
+        let delegate_key = DelegateKey::from_params(
+            crate::aft::TOKEN_GENERATOR_DELEGATE_CODE_HASH,
+            inbox_params.clone(),
+        )?;
         crate::log::log(format!("{delegate_key:?}"));
         let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, inbox_params.clone())?;
         let delegate_params =
@@ -399,17 +400,19 @@ impl InboxModel {
         let delegate_id = delegate_key.encode();
 
         let record_params = TokenParameters::new(generator_id.key.to_public_key());
-        let token_record: ContractInstanceId =
-            ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
-                .unwrap()
-                .into();
+        let token_record: ContractInstanceId = ContractKey::from_params(
+            crate::aft::TOKEN_RECORD_CODE_HASH,
+            record_params.try_into()?,
+        )
+        .unwrap()
+        .into();
         // todo: the criteria should come from the recipient inbox really
         let criteria = AllocationCriteria::new(
             Tier::Day1,
             std::time::Duration::from_secs(365 * 24 * 3600),
             token_record,
         )?;
-        // fixme: should be using the state of the record contract here instead:
+        // fixme: should be using the state of the aft record contract here instead:
         let records = TokenAllocationRecord::new(HashMap::default());
         let token_request = TokenDelegateMessage::RequestNewToken(RequestNewToken {
             request_id: REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -433,38 +436,11 @@ impl InboxModel {
         while t.elapsed() < Duration::from_secs(10) {
             token = crate::api::recv_token(&delegate_id).await;
         }
-        if let Some(token) = token {
-            todo!()
-        } else {
+        token.ok_or_else(|| {
             let err = format!("failed trying to get a token for `{}`", generator_id.alias);
             crate::log::error(&err, Some(TryNodeAction::SendMessage));
-            return Err(err.into());
-        }
-        // const TEST_TIER: Tier = Tier::Day1;
-        // const MAX_DURATION_1Y: std::time::Duration =
-        //     std::time::Duration::from_secs(365 * 24 * 3600);
-        // let naive = NaiveDate::from_ymd_opt(2023, 1, 25)
-        //     .unwrap()
-        //     .and_hms_opt(0, 0, 0)
-        //     .unwrap();
-        // let slot = DateTime::<Utc>::from_utc(naive, Utc);
-
-        // crate::log::log(
-        //     format!(
-        //         "Sending update request message with token record key: {}",
-        //         token_record.clone()
-        //     )
-        //     .as_str(),
-        // );
-
-        // Ok(TokenAssignment {
-        //     tier: TEST_TIER,
-        //     time_slot: slot,
-        //     assignee: recipient_key,
-        //     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
-        //     assignment_hash: [0; 32],
-        //     token_record,
-        // })
+            err.into()
+        })
     }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {

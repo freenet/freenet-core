@@ -177,7 +177,7 @@ impl Inbox {
     }
 
     pub(crate) async fn load_all(
-        client: WebApiRequestClient,
+        client: &mut WebApiRequestClient,
         contracts: &[Identity],
         contract_to_id: &mut HashMap<ContractKey, Identity>,
     ) {
@@ -624,7 +624,6 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 
     let emails = inbox.messages.borrow();
-    if let Some(id) = &user.read().active_id {}
     let is_email = menu_selection.read().email();
     if let Some(email_id) = is_email {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();

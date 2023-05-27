@@ -1,4 +1,4 @@
-use std::{borrow::BorrowMut, cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_aft_interface::{TokenAssignment, TokenDelegateMessage};
@@ -142,7 +142,7 @@ pub(crate) async fn node_comms(
     contracts: Vec<crate::app::Identity>,
     mut inboxes: crate::app::InboxesData,
 ) {
-    use std::{collections::HashMap, rc::Rc, sync::Arc};
+    use std::{rc::Rc, sync::Arc};
 
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
@@ -162,9 +162,11 @@ pub(crate) async fn node_comms(
         })
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
-    crate::app::Inbox::load_all(api.sender_half(), &contracts, &mut contract_to_id).await;
+    let mut req_sender = api.sender_half();
+    crate::app::Inbox::load_all(&mut req_sender, &contracts, &mut contract_to_id).await;
+    crate::aft::AftRecords::load_all(&mut req_sender, &contracts).await;
     crate::log::log("requested inboxes");
-    WEB_API_SENDER.set(api.sender_half()).unwrap();
+    WEB_API_SENDER.set(req_sender).unwrap();
 
     async fn handle_action(
         req: NodeAction,
@@ -212,7 +214,7 @@ pub(crate) async fn node_comms(
                         "loaded inbox {key} with {} messages",
                         updated_model.messages.len()
                     ));
-                    let mut current = loaded_models[pos].borrow_mut();
+                    let mut current = (*loaded_models[pos]).borrow_mut();
                     *current = updated_model;
                 } else {
                     crate::log::log(format!("updated inbox {key}"));
@@ -245,10 +247,11 @@ pub(crate) async fn node_comms(
                     let mut found = false;
                     for inbox in loaded_models.as_slice() {
                         if inbox.clone().borrow().key == key {
-                            inbox.borrow_mut().merge(updated_model);
+                            let mut inbox = (**inbox).borrow_mut();
+                            inbox.merge(updated_model);
                             crate::log::log(format!(
                                 "updated inbox {key} with {} messages",
-                                inbox.borrow().messages.len()
+                                inbox.messages.len()
                             ));
                             found = true;
                             break;
@@ -270,19 +273,27 @@ pub(crate) async fn node_comms(
                 for msg in values {
                     match msg {
                         locutus_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
-                            let token = TokenDelegateMessage::try_from(msg.payload.as_slice())?;
+                            let token = match TokenDelegateMessage::try_from(msg.payload.as_slice())
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    crate::log::error(
+                                        format!("error deserializing delegate msg: {e}"),
+                                        None,
+                                    );
+                                    return;
+                                }
+                            };
                             match token {
                                 TokenDelegateMessage::AllocatedToken {
-                                    delegate_id,
                                     assignment,
                                     records,
+                                    ..
                                 } => {
                                     // todo: check that the assignment belongs to the delegate requesting this
                                     TOKEN.with(|t| {
-                                        let mut tr = &mut *t.borrow_mut();
-                                        tr.entry(delegate_id.encode())
-                                            .or_default()
-                                            .push(assignment);
+                                        let tr = &mut *t.borrow_mut();
+                                        tr.entry(key.encode()).or_default().push(assignment);
                                     })
                                 }
                                 TokenDelegateMessage::Failure(reason) => crate::log::error(
