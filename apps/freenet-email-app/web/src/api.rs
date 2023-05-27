@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
-use locutus_aft_interface::{TokenAssignment, TokenDelegateMessage};
+use locutus_aft_interface::TokenDelegateMessage;
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 
@@ -150,11 +150,15 @@ pub(crate) async fn node_comms(
     use locutus_stdlib::{client_api::ContractResponse, prelude::ContractKey};
 
     use crate::{
+        aft::AftRecords,
         app::{error_handling, Identity, NodeAction, TryNodeAction, WEB_API_SENDER},
         inbox::InboxModel,
     };
 
-    let mut contract_to_id = HashMap::new();
+    // todo: move this to app::Inbox and use a thread local and static methods to access/update the data
+    // see crate::aft::AftRecords ; this may free is from having to pass InboxesData and instead
+    // accessing data through the static methods where needed
+    let mut inbox_contract_to_id = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -163,7 +167,7 @@ pub(crate) async fn node_comms(
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
     let mut req_sender = api.sender_half();
-    crate::app::Inbox::load_all(&mut req_sender, &contracts, &mut contract_to_id).await;
+    crate::app::Inbox::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id).await;
     crate::aft::AftRecords::load_all(&mut req_sender, &contracts).await;
     crate::log::log("requested inboxes");
     WEB_API_SENDER.set(req_sender).unwrap();
@@ -285,16 +289,8 @@ pub(crate) async fn node_comms(
                                 }
                             };
                             match token {
-                                TokenDelegateMessage::AllocatedToken {
-                                    assignment,
-                                    records,
-                                    ..
-                                } => {
-                                    // todo: check that the assignment belongs to the delegate requesting this
-                                    TOKEN.with(|t| {
-                                        let tr = &mut *t.borrow_mut();
-                                        tr.entry(key.encode()).or_default().push(assignment);
-                                    })
+                                TokenDelegateMessage::AllocatedToken { assignment, .. } => {
+                                    AftRecords::allocated_assignment(&key, &assignment);
                                 }
                                 TokenDelegateMessage::Failure(reason) => crate::log::error(
                                     format!("{reason}"),
@@ -319,7 +315,7 @@ pub(crate) async fn node_comms(
     loop {
         match api.host_responses.try_recv() {
             Ok(res) => {
-                handle_response(res, &mut contract_to_id, &mut inboxes).await;
+                handle_response(res, &mut inbox_contract_to_id, &mut inboxes).await;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -329,7 +325,7 @@ pub(crate) async fn node_comms(
         futures::select! {
             req = rx.next() => {
                 let Some(req) = req else { panic!("async action ch closed") };
-                handle_action(req, &api, &mut contract_to_id).await;
+                handle_action(req, &api, &mut inbox_contract_to_id).await;
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };
@@ -344,18 +340,4 @@ pub(crate) async fn node_comms(
             }
         }
     }
-}
-
-/// Must be the encoded delegate key which will match with the encoded secrets ids stored in the node.
-type DelegateId = String;
-
-thread_local! {
-    static TOKEN: RefCell<HashMap<DelegateId, Vec<TokenAssignment>>> = RefCell::new(HashMap::new());
-}
-
-pub(crate) async fn recv_token(id: &DelegateId) -> Option<TokenAssignment> {
-    TOKEN.with(|t| {
-        let ids = &mut *t.borrow_mut();
-        ids.get_mut(id).and_then(|v| v.pop())
-    })
 }

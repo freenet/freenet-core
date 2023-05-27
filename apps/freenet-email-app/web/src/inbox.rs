@@ -33,6 +33,7 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    aft::AftRecords,
     api::WebApiRequestClient,
     app::{error_handling, Identity, TryNodeAction},
     DynError,
@@ -213,11 +214,12 @@ impl InboxModel {
         recipient_key: RsaPublicKey,
         from_id: Identity,
     ) -> Result<(), DynError> {
-        let token = {
+        let (delegate_key, token) = {
             let key = recipient_key.clone();
             let (hash, _) = content.assignment_hash_and_signed_content(&recipient_key)?;
             InboxModel::assign_token(client, key, from_id, hash).await?
         };
+        crate::aft::AftRecords::allocated_assignment(&delegate_key, &token);
         let params = InboxParams {
             pub_key: recipient_key,
         }
@@ -383,7 +385,7 @@ impl InboxModel {
         recipient_key: RsaPublicKey,
         generator_id: Identity,
         assignment_hash: [u8; 32],
-    ) -> Result<TokenAssignment, DynError> {
+    ) -> Result<(DelegateKey, TokenAssignment), DynError> {
         static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
         let inbox_params: Parameters = InboxParams {
             pub_key: recipient_key.clone(),
@@ -397,7 +399,6 @@ impl InboxModel {
         let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, inbox_params.clone())?;
         let delegate_params =
             locutus_aft_interface::DelegateParameters::new(generator_id.key.clone());
-        let delegate_id = delegate_key.encode();
 
         let record_params = TokenParameters::new(generator_id.key.to_public_key());
         let token_record: ContractInstanceId = ContractKey::from_params(
@@ -423,7 +424,7 @@ impl InboxModel {
             assignment_hash,
         });
         let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
-            key: delegate_key,
+            key: delegate_key.clone(),
             params: delegate_params.try_into()?,
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(inbox_key.into(), token_request.serialize()?),
@@ -434,13 +435,15 @@ impl InboxModel {
         let t = std::time::Instant::now();
         let mut token = None;
         while t.elapsed() < Duration::from_secs(10) {
-            token = crate::api::recv_token(&delegate_id).await;
+            token = AftRecords::recv_token(&delegate_key).await;
         }
-        token.ok_or_else(|| {
-            let err = format!("failed trying to get a token for `{}`", generator_id.alias);
-            crate::log::error(&err, Some(TryNodeAction::SendMessage));
-            err.into()
-        })
+        token
+            .ok_or_else(|| {
+                let err = format!("failed trying to get a token for `{}`", generator_id.alias);
+                crate::log::error(&err, Some(TryNodeAction::SendMessage));
+                err.into()
+            })
+            .map(|t| (delegate_key, t))
     }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
