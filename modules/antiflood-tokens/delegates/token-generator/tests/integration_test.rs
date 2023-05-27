@@ -13,13 +13,18 @@ mod integration_test {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
-    use locutus_aft_interface::{AllocationCriteria, DelegateParameters, Tier, TokenAllocationRecord, TokenAssignment};
+    use locutus_aft_interface::{
+        AllocationCriteria, DelegateParameters, Tier, TokenAllocationRecord, TokenAssignment,
+    };
     use locutus_runtime::{
         ApplicationMessage, ContractContainer, ContractInstanceId, ContractKey, ContractStore,
         DelegateRuntimeInterface, DelegateStore, InboundDelegateMsg, Runtime, SecretsId,
         SecretsStore, WasmAPIVersion,
     };
-    use locutus_stdlib::prelude::{ClientResponse, ContractCode, Delegate, DelegateCode, DelegateContext, OutboundDelegateMsg, Parameters, UserInputResponse, WrappedContract};
+    use locutus_stdlib::prelude::{
+        ContractCode, Delegate, DelegateCode, DelegateContext, OutboundDelegateMsg, Parameters,
+        WrappedContract,
+    };
 
     static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
@@ -189,7 +194,7 @@ mod integration_test {
         let (delegate, secret_id, contract_key, mut runtime) =
             set_up_aft(&private_key, "token-allocation-record", "token-generator").unwrap();
         let app = ContractInstanceId::try_from(contract_key.to_string()).unwrap();
-        let mut context: Context = Context {
+        let context: Context = Context {
             waiting_for_user_input: HashSet::default(),
             user_response: HashMap::default(),
         };
@@ -215,7 +220,7 @@ mod integration_test {
 
         // The application request new token allocation
         let inbound_message = InboundDelegateMsg::ApplicationMessage(
-            ApplicationMessage::new(app, payload.clone()).with_context(delegate_context.clone()),
+            ApplicationMessage::new(app, payload).with_context(delegate_context),
         );
 
         let delegate_params = DelegateParameters::new(private_key.clone());
@@ -226,7 +231,9 @@ mod integration_test {
         assert_eq!(outbound.len(), 1);
 
         let result_msg = match outbound.get(0) {
-            Some(OutboundDelegateMsg::ApplicationMessage( ApplicationMessage {app, payload, context, processed, ..})) => {
+            Some(OutboundDelegateMsg::ApplicationMessage(ApplicationMessage {
+                payload, ..
+            })) => {
                 let msg: TokenDelegateMessage = bincode::deserialize(payload.as_ref()).unwrap();
                 msg
             }
@@ -234,9 +241,12 @@ mod integration_test {
         };
 
         match result_msg {
-            TokenDelegateMessage::AllocatedToken {delegate_id, assignment, records} => {
+            TokenDelegateMessage::AllocatedToken { assignment, .. } => {
                 assert_eq!(assignment.tier, Tier::Day1);
-                assert_eq!(assignment.token_record, ContractInstanceId::from(contract_key));
+                assert_eq!(
+                    assignment.token_record,
+                    ContractInstanceId::from(contract_key)
+                );
                 assert_eq!(assignment.assignee, private_key.to_public_key());
             }
             _ => panic!("Unexpected token delegate message"),

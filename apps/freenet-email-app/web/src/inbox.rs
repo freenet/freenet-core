@@ -8,7 +8,10 @@ use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment, TokenParameters};
 use locutus_stdlib::client_api::{ClientRequest, DelegateRequest};
-use locutus_stdlib::prelude::{blake2, blake2::Digest, ApplicationMessage, ContractInstanceId, DelegateKey, InboundDelegateMsg, Parameters};
+use locutus_stdlib::prelude::{
+    blake2, blake2::Digest, ApplicationMessage, ContractInstanceId, DelegateKey,
+    InboundDelegateMsg, Parameters,
+};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{ContractKey, State, UpdateData},
@@ -23,6 +26,7 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
+use std::time::Duration;
 
 use crate::app::{error_handling, TryNodeAction};
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
@@ -33,7 +37,8 @@ use freenet_email_inbox::{
 
 pub(crate) static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
 static TOKEN_RECORD_CODE_HASH: &str = include_str!("../build/token_allocation_record_code_hash");
-static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str = include_str!("../build/token_generator_code_hash");
+static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
+    include_str!("../build/token_generator_code_hash");
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -195,18 +200,19 @@ impl InboxModel {
     pub(crate) async fn send_message(
         client: &mut WebApiRequestClient,
         content: DecryptedMessage,
-        pub_key: RsaPublicKey,
-        generator_public_key: RsaPublicKey,
+        recipient_key: RsaPublicKey,
+        from_id: Identity,
     ) -> Result<(), DynError> {
         let token = {
-            let key = pub_key.clone();
-            InboxModel::assign_token(client, key, generator_public_key).await?
+            let key = recipient_key.clone();
+            InboxModel::assign_token(client, key, from_id).await?
         };
-        let params = InboxParams { pub_key }
-            .try_into()
-            .map_err(|e| format!("{e}"))?;
+        let params = InboxParams {
+            pub_key: recipient_key,
+        }
+        .try_into()
+        .map_err(|e| format!("{e}"))?;
         let key = ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-
         let delta = UpdateInbox::AddMessages {
             messages: vec![content.to_stored(token)?],
         };
@@ -364,56 +370,68 @@ impl InboxModel {
     async fn assign_token(
         client: &mut WebApiRequestClient,
         recipient_key: RsaPublicKey,
-        generator_public_key: RsaPublicKey,
+        generator_id: Identity,
     ) -> Result<TokenAssignment, DynError> {
-        let params: Parameters = InboxParams {
+        let inbox_params: Parameters = InboxParams {
             pub_key: recipient_key.clone(),
         }
         .try_into()?;
-        //FIXME: Fix get DelegateKey from params
-        //let delegate_key = DelegateKey::from_params(TOKEN_GENERATOR_DELEGATE_CODE_HASH, params.clone())?;
-        let delegate_key = DelegateKey::from_params("".to_string(), Parameters::from(vec![]))?;
-        let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, params.clone())?;
+        let delegate_key =
+            DelegateKey::from_params(TOKEN_GENERATOR_DELEGATE_CODE_HASH, inbox_params.clone())?;
+        crate::log::log(format!("{delegate_key:?}"));
+        let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, inbox_params.clone())?;
+        let delegate_params = locutus_aft_interface::DelegateParameters::new(generator_id.key);
         let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key,
-            params,
+            params: delegate_params.try_into()?,
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(inbox_key.into(), vec![]),
             )],
         });
-        //TODO: Fix send and use the received delegate instead of hardcoding the TokenAssignment.
-        //client.send(request).await?;
-        const TEST_TIER: Tier = Tier::Day1;
-        const MAX_DURATION_1Y: std::time::Duration =
-            std::time::Duration::from_secs(365 * 24 * 3600);
-        let naive = NaiveDate::from_ymd_opt(2023, 1, 25)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap();
-        let slot = DateTime::<Utc>::from_utc(naive, Utc);
+        client.send(request).await?;
+        let t = std::time::Instant::now();
+        let mut token = None;
+        while t.elapsed() < Duration::from_secs(10) {
+            token = crate::api::recv_token().await;
+        }
+        if let Some(token) = token {
+            todo!()
+        } else {
+            let err = format!("failed trying to get a token for `{}`", generator_id.alias);
+            crate::log::error(&err, Some(TryNodeAction::SendMessage));
+            return Err(err.into());
+        }
+        // const TEST_TIER: Tier = Tier::Day1;
+        // const MAX_DURATION_1Y: std::time::Duration =
+        //     std::time::Duration::from_secs(365 * 24 * 3600);
+        // let naive = NaiveDate::from_ymd_opt(2023, 1, 25)
+        //     .unwrap()
+        //     .and_hms_opt(0, 0, 0)
+        //     .unwrap();
+        // let slot = DateTime::<Utc>::from_utc(naive, Utc);
 
-        let record_params = TokenParameters::new(generator_public_key);
-        let token_record: ContractInstanceId =
-            ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
-                .unwrap()
-                .into();
+        // let record_params = TokenParameters::new(generator_public_key);
+        // let token_record: ContractInstanceId =
+        //     ContractKey::from_params(TOKEN_RECORD_CODE_HASH, record_params.try_into()?)
+        //         .unwrap()
+        //         .into();
 
-        crate::log::log(
-            format!(
-                "Sending update request message with token record key: {}",
-                token_record.clone()
-            )
-                .as_str(),
-        );
+        // crate::log::log(
+        //     format!(
+        //         "Sending update request message with token record key: {}",
+        //         token_record.clone()
+        //     )
+        //     .as_str(),
+        // );
 
-        Ok(TokenAssignment {
-            tier: TEST_TIER,
-            time_slot: slot,
-            assignee: recipient_key,
-            signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
-            assignment_hash: [0; 32],
-            token_record,
-        })
+        // Ok(TokenAssignment {
+        //     tier: TEST_TIER,
+        //     time_slot: slot,
+        //     assignee: recipient_key,
+        //     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
+        //     assignment_hash: [0; 32],
+        //     token_record,
+        // })
     }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {

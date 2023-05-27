@@ -65,7 +65,7 @@ pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
     map
 });
 
-static ALIAS_MAP3: Lazy<Mutex<HashMap<ContractKey, UserId>>> =
+static INBOX_TO_ID: Lazy<Mutex<HashMap<ContractKey, Identity>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
@@ -194,8 +194,8 @@ impl Inbox {
             let contract_key = ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
                 .map_err(|e| format!("{e}"))?;
             {
-                let mut l = ALIAS_MAP3.lock().unwrap();
-                l.insert(contract_key.clone(), identity.id);
+                let mut l = INBOX_TO_ID.lock().unwrap();
+                l.insert(contract_key.clone(), identity.clone());
             }
             crate::log::log(format!(
                 "subscribed to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
@@ -230,7 +230,7 @@ impl Inbox {
         let content = DecryptedMessage {
             title: title.to_owned(),
             content: content.to_owned(),
-            from: "".to_owned(),
+            from: from.to_owned(),
             to: vec![to.to_owned()],
             cc: vec![],
             time: Utc::now(),
@@ -239,16 +239,21 @@ impl Inbox {
         #[cfg(feature = "use-node")]
         {
             crate::log::log(format!("sending message from {from}"));
-            for k in content.to.iter() {
-                let key = RsaPublicKey::from_pkcs1_pem(k).map_err(|e| format!("{e}"))?;
+            for recipient_encoded_key in content.to.iter() {
+                let recipient_key = RsaPublicKey::from_pkcs1_pem(recipient_encoded_key)
+                    .map_err(|e| format!("{e}"))?;
                 let content = content.clone();
                 let mut client = client.clone();
-                let from_key = {
-                    let from = ALIAS_MAP.get(from).unwrap();
-                    RsaPublicKey::from_pkcs1_pem(from).map_err(|e| format!("{e}"))?
-                };
+                let from_id = INBOX_TO_ID
+                    .try_lock()
+                    .unwrap()
+                    .values()
+                    .find_map(|id| (id.alias == from).then(|| id.clone()))
+                    .unwrap();
                 let f = async move {
-                    let res = InboxModel::send_message(&mut client, content, key, from_key).await;
+                    let res =
+                        InboxModel::send_message(&mut client, content, recipient_key, from_id)
+                            .await;
                     error_handling(client.into(), res, TryNodeAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());
@@ -284,14 +289,14 @@ impl Inbox {
                 removed_messages.push(m);
             }
         }
-        // todo: persist in a sidekick `removed_messages`
+        // todo: persist in a delegate `removed_messages`
         self.remove_messages(client, ids)
     }
 
     #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
     fn load_messages(&self, id: &Identity) -> Result<(), DynError> {
         let emails = {
-            if id.id == 0 {
+            if id.id == UserId(0) {
                 vec![
                     Message {
                         id: 0,
@@ -391,7 +396,6 @@ impl User {
     // #[cfg(all(not(feature = "ui-testing"), feature = "use-node"))]
     // fn new() -> Self {
     //     // TODO: here we should load the user identities from the identity component
-    //     todo!()
     // }
 
     fn logged_id(&self) -> Option<&Identity> {
@@ -408,7 +412,7 @@ impl User {
 pub(crate) struct Identity {
     pub id: UserId,
     pub key: RsaPrivateKey,
-    alias: String,
+    pub alias: String,
 }
 
 #[derive(Debug, Clone, Eq, Props)]
@@ -592,28 +596,28 @@ fn InboxComponent(cx: Scope) -> Element {
         let current_active_id: UserId = user.read().active_id.unwrap();
         // reload if there were new emails received
         let all_data = inbox.inbox_data.load();
-        let lock = ALIAS_MAP3.lock().unwrap();
-        if let Some(current_model) = all_data.iter().find(|ib| {
+        let lock = INBOX_TO_ID.lock().unwrap();
+        if let Some((current_model, id)) = all_data.iter().find_map(|ib| {
             let id = lock.get(&ib.borrow().key).unwrap();
-            *id == current_active_id
+            (id.id == current_active_id).then(|| (ib, id))
         }) {
-            crate::log::log(format!("reloading inbox messages {:?}", current_active_id));
-            std::mem::drop(lock);
             let mut emails = inbox.messages.borrow_mut();
             emails.clear();
             for msg in &current_model.borrow().messages {
                 let m = Message::from(msg.clone());
                 emails.push(m);
             }
+            crate::log::log(format!(
+                "active id: {:?}; emails number: {}",
+                id.alias,
+                emails.len()
+            ));
+            std::mem::drop(lock);
         }
     }
 
     let emails = inbox.messages.borrow();
-    crate::log::log(format!(
-        "active id: {:?}; emails number: {}",
-        user.read().active_id,
-        emails.len()
-    ));
+    if let Some(id) = &user.read().active_id {}
     let is_email = menu_selection.read().email();
     if let Some(email_id) = is_email {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();

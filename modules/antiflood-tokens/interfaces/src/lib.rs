@@ -7,7 +7,75 @@ use rsa::{pkcs1v15::Signature, RsaPrivateKey, RsaPublicKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::Display;
 
-type Assignment = RsaPublicKey;
+pub type Assignee = RsaPublicKey;
+
+pub type AssignmentHash = [u8; 32];
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TokenDelegateMessage {
+    RequestNewToken(RequestNewToken),
+    AllocatedToken {
+        delegate_id: SecretsId,
+        assignment: TokenAssignment,
+        /// An updated version of the record with the newly allocated token included
+        records: TokenAllocationRecord,
+    },
+    Failure(FailureReason),
+}
+
+impl TryFrom<&[u8]> for TokenDelegateMessage {
+    type Error = DelegateError;
+
+    fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
+        bincode::deserialize(payload).map_err(|err| DelegateError::Deser(format!("{err}")))
+    }
+}
+
+impl TokenDelegateMessage {
+    pub fn serialize(self) -> Result<Vec<u8>, DelegateError> {
+        bincode::serialize(&self).map_err(|err| DelegateError::Deser(format!("{err}")))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FailureReason {
+    /// The user didn't accept to allocate the tokens.
+    UserPermissionDenied,
+    /// No free slot to allocate with the requested criteria
+    NoFreeSlot {
+        delegate_id: SecretsId,
+        criteria: AllocationCriteria,
+    },
+}
+
+impl Display for FailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FailureReason::UserPermissionDenied => {
+                write!(f, "user disallowed token allocation for this application")
+            }
+            FailureReason::NoFreeSlot {
+                delegate_id,
+                criteria,
+            } => {
+                write!(
+                    f,
+                    "no free slot found for delegate `{delegate_id}` with criteria {criteria}"
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RequestNewToken {
+    pub request_id: u32,
+    pub delegate_id: SecretsId,
+    pub criteria: AllocationCriteria,
+    pub records: TokenAllocationRecord,
+    pub assignee: Assignee,
+    pub assignment_hash: AssignmentHash,
+}
 
 /// Contracts making use of the allocation must implement a type with this trait that allows
 /// extracting the criteria for the given contract.
@@ -468,6 +536,17 @@ impl AllocationCriteria {
     }
 }
 
+impl Display for AllocationCriteria {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frequency: {}; max age: {} secs",
+            self.frequency,
+            self.max_age.as_secs()
+        )
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenAllocationRecord {
@@ -620,7 +699,7 @@ pub struct TokenAssignment {
     pub time_slot: DateTime<Utc>,
     /// The assignment, the recipient decides whether this assignment is valid based on this field.
     /// This will often be a public key.
-    pub assignee: Assignment,
+    pub assignee: Assignee,
     #[serde(with = "token_sig_ser")]
     /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
     pub signature: Signature,
@@ -661,7 +740,7 @@ impl TokenAssignment {
     /// The `(tier, issue_time, assignee)` tuple that has to be verified as bytes.
     pub fn signature_content(
         issue_time: &DateTime<Utc>,
-        assigned_to: &Assignment,
+        assigned_to: &Assignee,
         tier: Tier,
     ) -> [u8; Self::SIGNED_MSG_SIZE] {
         let mut cursor = Self::TIER_SIZE;
@@ -672,7 +751,7 @@ impl TokenAssignment {
         to_be_signed[cursor..cursor + Self::TS_SIZE].copy_from_slice(&timestamp.to_le_bytes());
         cursor += Self::TS_SIZE;
         let key = bincode::serialize(&assigned_to).unwrap();
-        to_be_signed[cursor..cursor+key.len()].copy_from_slice(key.as_slice());
+        to_be_signed[cursor..cursor + key.len()].copy_from_slice(key.as_slice());
         to_be_signed
     }
 

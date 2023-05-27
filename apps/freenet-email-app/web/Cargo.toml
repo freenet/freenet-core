@@ -20,8 +20,6 @@ chrono = { workspace = true }
 crossbeam = "0.8"
 dioxus = { version = "0.3" }
 futures = "0.3"
-locutus-stdlib = { workspace = true, features = ["net"] }
-locutus-aft-interface = { workspace = true }
 rsa = { workspace = true }
 chacha20poly1305 = "0.10"
 serde = { workspace = true }
@@ -33,6 +31,8 @@ once_cell = "1"
 
 freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 locutus-dev = { path = "../../../crates/locutus-dev", optional = true }
+locutus-stdlib = { workspace = true, features = ["net"] }
+locutus-aft-interface = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 dioxus-web = { version = "0.3" }
