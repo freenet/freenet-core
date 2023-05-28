@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use locutus_aft_interface::{TokenAllocationRecord, TokenAssignment, TokenParameters};
-use locutus_stdlib::prelude::{ContractKey, ContractRequest, DelegateKey, State};
+use locutus_stdlib::prelude::{ContractKey, ContractRequest, DelegateKey, State, StateDelta};
 
 use crate::{
     api::WebApiRequestClient,
@@ -76,13 +76,6 @@ impl AftRecords {
         });
     }
 
-    // todo: should wait for aft record update confirmation before doing anything with the token
-    async fn register_allocation(key: &DelegateKey, assignment: TokenAssignment) {
-        // TODO: update the token record in the node so it can be verified that the token was allocated
-        // to avoid double-spending
-        todo!()
-    }
-
     pub fn set(identity: Identity, state: State<'_>) -> Result<(), DynError> {
         let record = TokenAllocationRecord::try_from(state)?;
         RECORDS.with(|recs| {
@@ -90,6 +83,22 @@ impl AftRecords {
             recs.insert(identity, record);
         });
         Ok(())
+    }
+
+    pub fn update_record(identity: Identity, delta: StateDelta<'_>) -> Result<(), DynError> {
+        let record = TokenAllocationRecord::try_from(delta)?;
+        RECORDS.with(|recs| {
+            let recs = &mut *recs.borrow_mut();
+            recs.insert(identity, record);
+        });
+        Ok(())
+    }
+
+    // todo: should wait for aft record update confirmation before doing anything with the token
+    async fn register_allocation(key: &DelegateKey, assignment: TokenAssignment) {
+        // TODO: update the token record in the node so it can be verified that the token was allocated
+        // to avoid double-spending
+        todo!()
     }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {

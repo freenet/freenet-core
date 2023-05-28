@@ -92,7 +92,6 @@ enum VerificationError {
     InvalidInboxKey,
     InvalidMessageHash,
     WrongSignature,
-    Other(String),
 }
 
 impl From<VerificationError> for ContractError {
@@ -118,9 +117,6 @@ impl Display for VerificationError {
             }
             VerificationError::WrongSignature => {
                 write!(f, "Wrong signature")
-            }
-            VerificationError::Other(msg) => {
-                write!(f, "{}", msg)
             }
         }
     }
@@ -438,6 +434,8 @@ impl ContractInterface for Inbox {
         state: State<'static>,
         _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
+        // FIXME: we are not doing this because there is a problem in the node impl where we are handling in
+        // wrong summary representations
         let inbox = Inbox::try_from(&state)?;
         // let summary = InboxSummary::try_from(summary)?;
         // let delta = inbox.delta(summary);
