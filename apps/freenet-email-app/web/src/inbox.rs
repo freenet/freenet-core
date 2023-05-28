@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     io::{Cursor, Read},
     sync::atomic::AtomicU32,
@@ -27,8 +28,8 @@ use locutus_stdlib::{
 };
 use rand_chacha::rand_core::SeedableRng;
 use rsa::{
-    pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, PublicKey,
-    RsaPrivateKey, RsaPublicKey,
+    pkcs1::EncodeRsaPublicKey, pkcs1v15::SigningKey, sha2::Sha256, signature::Signer,
+    Pkcs1v15Encrypt, PublicKey, RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +44,7 @@ use freenet_email_inbox::{
     UpdateInbox,
 };
 
-pub(crate) static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
+static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -184,6 +185,11 @@ impl DecryptedMessage {
     }
 }
 
+thread_local! {
+    static INBOX_TO_ID: RefCell<HashMap<ContractKey, Identity>> =
+        RefCell::new(HashMap::new());
+}
+
 /// Inbox state
 #[derive(Debug, Clone)]
 pub(crate) struct InboxModel {
@@ -193,7 +199,52 @@ pub(crate) struct InboxModel {
 }
 
 impl InboxModel {
-    pub(crate) async fn load(
+    pub async fn load_all(
+        client: &mut WebApiRequestClient,
+        contracts: &[Identity],
+        contract_to_id: &mut HashMap<ContractKey, Identity>,
+    ) {
+        async fn subscribe(
+            client: &mut WebApiRequestClient,
+            identity: &Identity,
+        ) -> Result<(), DynError> {
+            let pub_key = identity.key.to_public_key();
+            let alias = crate::app::ALIAS_MAP2
+                .get(&pub_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap())
+                .unwrap();
+            let params = freenet_email_inbox::InboxParams { pub_key }
+                .try_into()
+                .map_err(|e| format!("{e}"))?;
+            let contract_key = ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
+                .map_err(|e| format!("{e}"))?;
+            {
+                INBOX_TO_ID.with(|map| {
+                    map.borrow_mut()
+                        .insert(contract_key.clone(), identity.clone());
+                });
+            }
+            crate::log::log(format!(
+                "subscribed to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
+            ));
+            InboxModel::subscribe(client, contract_key.clone()).await?;
+            Ok(())
+        }
+
+        for identity in contracts {
+            let mut client = client.clone();
+            let res = subscribe(&mut client, identity).await;
+            error_handling(client.clone().into(), res, TryNodeAction::LoadInbox).await;
+            let res = InboxModel::load(&mut client, identity).await.map(|key| {
+                contract_to_id
+                    .entry(key.clone())
+                    .or_insert(identity.clone());
+                key
+            });
+            error_handling(client.into(), res.map(|_| ()), TryNodeAction::LoadInbox).await;
+        }
+    }
+
+    pub async fn load(
         client: &mut WebApiRequestClient,
         id: &Identity,
     ) -> Result<ContractKey, DynError> {
@@ -208,18 +259,30 @@ impl InboxModel {
         Ok(contract_key)
     }
 
-    pub(crate) async fn send_message(
+    pub fn id_for_alias(alias: &str) -> Option<Identity> {
+        INBOX_TO_ID.with(|map| {
+            map.borrow()
+                .values()
+                .find_map(|id| (id.alias() == alias).then(|| id.clone()))
+        })
+    }
+
+    pub fn contract_identity(key: &ContractKey) -> Option<Identity> {
+        INBOX_TO_ID.with(|map| map.borrow().get(key).cloned())
+    }
+
+    pub async fn send_message(
         client: &mut WebApiRequestClient,
         content: DecryptedMessage,
         recipient_key: RsaPublicKey,
-        from_id: Identity,
+        from: &Identity,
     ) -> Result<(), DynError> {
         let (delegate_key, token) = {
             let key = recipient_key.clone();
             let (hash, _) = content.assignment_hash_and_signed_content(&recipient_key)?;
-            InboxModel::assign_token(client, key, from_id, hash).await?
+            InboxModel::assign_token(client, key, from, hash).await?
         };
-        crate::aft::AftRecords::allocated_assignment(&delegate_key, &token);
+        crate::aft::AftRecords::allocated_assignment(&delegate_key, &token).await;
         let params = InboxParams {
             pub_key: recipient_key,
         }
@@ -237,7 +300,7 @@ impl InboxModel {
         Ok(())
     }
 
-    pub(crate) fn remove_messages(
+    pub fn remove_messages(
         &mut self,
         mut client: WebApiRequestClient,
         ids: &[u64],
@@ -278,7 +341,7 @@ impl InboxModel {
         }
     }
 
-    pub(crate) fn merge(&mut self, other: InboxModel) {
+    pub fn merge(&mut self, other: InboxModel) {
         for m in other.messages {
             if !self
                 .messages
@@ -303,7 +366,7 @@ impl InboxModel {
         Ok(serialized.into())
     }
 
-    pub(crate) fn from_state(
+    pub fn from_state(
         private_key: rsa::RsaPrivateKey,
         state: StoredInbox,
         key: ContractKey,
@@ -383,7 +446,7 @@ impl InboxModel {
     async fn assign_token(
         client: &mut WebApiRequestClient,
         recipient_key: RsaPublicKey,
-        generator_id: Identity,
+        generator_id: &Identity,
         assignment_hash: [u8; 32],
     ) -> Result<(DelegateKey, TokenAssignment), DynError> {
         static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
@@ -439,7 +502,10 @@ impl InboxModel {
         }
         token
             .ok_or_else(|| {
-                let err = format!("failed trying to get a token for `{}`", generator_id.alias);
+                let err = format!(
+                    "failed trying to get a token for `{}`",
+                    generator_id.alias()
+                );
                 crate::log::error(&err, Some(TryNodeAction::SendMessage));
                 err.into()
             })
@@ -455,10 +521,7 @@ impl InboxModel {
         Ok(())
     }
 
-    pub(crate) async fn subscribe(
-        client: &mut WebApiRequestClient,
-        key: ContractKey,
-    ) -> Result<(), DynError> {
+    async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
         let request = ContractRequest::Subscribe { key };
         client.send(request.into()).await?;
         Ok(())

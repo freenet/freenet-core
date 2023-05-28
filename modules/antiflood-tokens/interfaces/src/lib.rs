@@ -647,6 +647,16 @@ impl TryFrom<State<'_>> for TokenAllocationRecord {
     }
 }
 
+impl TryFrom<StateDelta<'_>> for TokenAllocationRecord {
+    type Error = ContractError;
+
+    fn try_from(delta: StateDelta<'_>) -> Result<Self, Self::Error> {
+        let this = bincode::deserialize_from(delta.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(this)
+    }
+}
+
 impl TryFrom<TokenAllocationRecord> for State<'static> {
     type Error = ContractError;
 

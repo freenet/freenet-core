@@ -4,6 +4,7 @@ use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_aft_interface::TokenDelegateMessage;
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
+use once_cell::sync::OnceCell;
 
 use crate::app::AsyncActionResult;
 
@@ -11,6 +12,8 @@ type ClientRequester = UnboundedSender<ClientRequest<'static>>;
 type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
 
 pub(crate) type NodeResponses = UnboundedSender<AsyncActionResult>;
+
+pub(crate) static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
 
 #[cfg(feature = "use-node")]
 struct WebApi {
@@ -140,6 +143,9 @@ impl From<WebApiRequestClient> for NodeResponses {
 pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::NodeAction>,
     contracts: Vec<crate::app::Identity>,
+    // todo: refactor: instead of passing this arround,
+    // where necessary we could be gettign thef resh data via static methods calls to InboxModel
+    // and store the information there in thread locals
     mut inboxes: crate::app::InboxesData,
 ) {
     use std::{rc::Rc, sync::Arc};
@@ -151,14 +157,12 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{error_handling, Identity, NodeAction, TryNodeAction, WEB_API_SENDER},
+        app::{error_handling, Identity, NodeAction, TryNodeAction},
         inbox::InboxModel,
     };
 
-    // todo: move this to app::Inbox and use a thread local and static methods to access/update the data
-    // see crate::aft::AftRecords ; this may free is from having to pass InboxesData and instead
-    // accessing data through the static methods where needed
     let mut inbox_contract_to_id = HashMap::new();
+    let mut token_contract_to_id = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -167,8 +171,9 @@ pub(crate) async fn node_comms(
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
     let mut req_sender = api.sender_half();
-    crate::app::Inbox::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id).await;
-    crate::aft::AftRecords::load_all(&mut req_sender, &contracts).await;
+    crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id)
+        .await;
+    crate::aft::AftRecords::load_all(&mut req_sender, &contracts, &mut token_contract_to_id).await;
     crate::log::log("requested inboxes");
     WEB_API_SENDER.set(req_sender).unwrap();
 
@@ -191,7 +196,8 @@ pub(crate) async fn node_comms(
 
     async fn handle_response(
         res: Result<HostResponse, ClientError>,
-        contract_to_id: &mut HashMap<ContractKey, Identity>,
+        inbox_to_id: &mut HashMap<ContractKey, Identity>,
+        token_to_id: &mut HashMap<ContractKey, Identity>,
         inboxes: &mut crate::app::InboxesData,
     ) {
         let res = match res {
@@ -205,73 +211,103 @@ pub(crate) async fn node_comms(
             HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key, state, ..
             }) => {
-                let state: StoredInbox = serde_json::from_slice(state.as_ref()).unwrap();
-                let Some(identity) = contract_to_id.remove(&key) else { unreachable!("tried to get wrong contract key: {key}") };
-                let updated_model =
-                    InboxModel::from_state(identity.key.clone(), state, key.clone()).unwrap();
-                let loaded_models = inboxes.load();
-                if let Some(pos) = loaded_models.iter().position(|e| {
-                    let x = e.borrow();
-                    x.key == key
-                }) {
-                    crate::log::log(format!(
-                        "loaded inbox {key} with {} messages",
-                        updated_model.messages.len()
-                    ));
-                    let mut current = (*loaded_models[pos]).borrow_mut();
-                    *current = updated_model;
-                } else {
-                    crate::log::log(format!("updated inbox {key}"));
-                    let mut with_new = (***loaded_models).to_vec();
-                    std::mem::drop(loaded_models);
-                    with_new.push(Rc::new(RefCell::new(updated_model)));
-                    {
-                        let keys = with_new
-                            .iter()
-                            .map(|i| format!("{}", i.borrow().key))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        crate::log::log(format!("loaded inboxes: {keys}"));
+                if let Some(identity) = inbox_to_id.remove(&key) {
+                    // is an inbox contract
+                    let state: StoredInbox = serde_json::from_slice(state.as_ref()).unwrap();
+                    let updated_model =
+                        InboxModel::from_state(identity.key.clone(), state, key.clone()).unwrap();
+                    let loaded_models = inboxes.load();
+                    if let Some(pos) = loaded_models.iter().position(|e| {
+                        let x = e.borrow();
+                        x.key == key
+                    }) {
+                        crate::log::log(format!(
+                            "loaded inbox {key} with {} messages",
+                            updated_model.messages.len()
+                        ));
+                        let mut current = (*loaded_models[pos]).borrow_mut();
+                        *current = updated_model;
+                    } else {
+                        crate::log::log(format!("updated inbox {key}"));
+                        let mut with_new = (***loaded_models).to_vec();
+                        std::mem::drop(loaded_models);
+                        with_new.push(Rc::new(RefCell::new(updated_model)));
+                        {
+                            let keys = with_new
+                                .iter()
+                                .map(|i| format!("{}", i.borrow().key))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            crate::log::log(format!("loaded inboxes: {keys}"));
+                        }
+                        inboxes.store(Arc::new(with_new));
                     }
-                    inboxes.store(Arc::new(with_new));
+                    inbox_to_id.insert(key, identity);
+                } else if let Some(identity) = token_to_id.remove(&key) {
+                    // is a AFT record contract
+                    if let Err(e) = AftRecords::set(identity.clone(), state.into()) {
+                        crate::log::error(format!("error setting an AFT record: {e}"), None);
+                    }
+                    token_to_id.insert(key, identity);
+                } else {
+                    unreachable!("tried to get wrong contract key: {key}")
                 }
-                contract_to_id.insert(key, identity);
             }
             HostResponse::ContractResponse(ContractResponse::UpdateNotification {
                 key,
                 update,
-            }) => match update {
-                UpdateData::Delta(delta) => {
-                    crate::log::log("recieved update delta");
-                    let delta: StoredInbox = serde_json::from_slice(delta.as_ref()).unwrap();
-                    let Some(identity) = contract_to_id.remove(&key) else { unreachable!("tried to get wrong contract key: {key}") };
-                    let updated_model =
-                        InboxModel::from_state(identity.key.clone(), delta, key.clone()).unwrap();
-                    let loaded_models = inboxes.load();
-                    let mut found = false;
-                    for inbox in loaded_models.as_slice() {
-                        if inbox.clone().borrow().key == key {
-                            let mut inbox = (**inbox).borrow_mut();
-                            inbox.merge(updated_model);
-                            crate::log::log(format!(
-                                "updated inbox {key} with {} messages",
-                                inbox.messages.len()
-                            ));
-                            found = true;
-                            break;
+            }) => {
+                if let Some(identity) = inbox_to_id.remove(&key) {
+                    match update {
+                        UpdateData::Delta(delta) => {
+                            let delta: StoredInbox =
+                                serde_json::from_slice(delta.as_ref()).unwrap();
+                            let updated_model =
+                                InboxModel::from_state(identity.key.clone(), delta, key.clone())
+                                    .unwrap();
+                            let loaded_models = inboxes.load();
+                            let mut found = false;
+                            for inbox in loaded_models.as_slice() {
+                                if inbox.clone().borrow().key == key {
+                                    let mut inbox = (**inbox).borrow_mut();
+                                    inbox.merge(updated_model);
+                                    crate::log::log(format!(
+                                        "updated inbox {key} with {} messages",
+                                        inbox.messages.len()
+                                    ));
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            assert!(found);
+                            inbox_to_id.insert(key, identity);
                         }
+                        // UpdateData::State(_) => {
+                        //     crate::log::error("recieved update state", None);
+                        // }
+                        // UpdateData::StateAndDelta { .. } => {
+                        //     crate::log::error("recieved update state delta", None);
+                        // }
+                        _ => unreachable!(),
                     }
-                    assert!(found);
-                    contract_to_id.insert(key, identity);
+                } else if let Some(identity) = token_to_id.remove(&key) {
+                    // is a AFT record contract
+                    match update {
+                        UpdateData::Delta(delta) => {
+                            if let Err(e) = AftRecords::update_record(identity.clone(), delta) {
+                                crate::log::error(
+                                    format!("error updating an AFT record: {e}"),
+                                    None,
+                                );
+                            }
+                            token_to_id.insert(key, identity);
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    unreachable!("tried to get wrong contract key: {key}")
                 }
-                UpdateData::State(_) => {
-                    crate::log::error("recieved update state", None);
-                }
-                UpdateData::StateAndDelta { .. } => {
-                    crate::log::error("recieved update state delta", None);
-                }
-                _ => unreachable!(),
-            },
+            }
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => {}
             HostResponse::DelegateResponse { key, values } => {
                 for msg in values {
@@ -290,7 +326,7 @@ pub(crate) async fn node_comms(
                             };
                             match token {
                                 TokenDelegateMessage::AllocatedToken { assignment, .. } => {
-                                    AftRecords::allocated_assignment(&key, &assignment);
+                                    AftRecords::allocated_assignment(&key, &assignment).await;
                                 }
                                 TokenDelegateMessage::Failure(reason) => crate::log::error(
                                     format!("{reason}"),
@@ -315,7 +351,13 @@ pub(crate) async fn node_comms(
     loop {
         match api.host_responses.try_recv() {
             Ok(res) => {
-                handle_response(res, &mut inbox_contract_to_id, &mut inboxes).await;
+                handle_response(
+                    res,
+                    &mut inbox_contract_to_id,
+                    &mut token_contract_to_id,
+                    &mut inboxes,
+                )
+                .await;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {

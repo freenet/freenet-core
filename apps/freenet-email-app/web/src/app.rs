@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 use std::hash::Hasher;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use arc_swap::ArcSwap;
@@ -8,8 +8,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, SinkExt};
-use locutus_stdlib::prelude::ContractKey;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
     pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, pkcs8::LineEnding, RsaPrivateKey,
@@ -66,9 +65,6 @@ pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
     map
 });
 
-static INBOX_TO_ID: Lazy<Mutex<HashMap<ContractKey, Identity>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
     LoadMessages(Identity),
@@ -77,6 +73,7 @@ pub(crate) enum NodeAction {
 #[derive(Clone, Debug)]
 pub(crate) enum TryNodeAction {
     LoadInbox,
+    LoadTokenRecord,
     SendMessage,
     RemoveMessages,
     GetAlias,
@@ -86,14 +83,13 @@ impl std::fmt::Display for TryNodeAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TryNodeAction::LoadInbox => write!(f, "loading messages"),
+            TryNodeAction::LoadTokenRecord => write!(f, "loading token record"),
             TryNodeAction::SendMessage => write!(f, "sending message"),
             TryNodeAction::RemoveMessages => write!(f, "removing messages"),
             TryNodeAction::GetAlias => write!(f, "get alias"),
         }
     }
 }
-
-pub(crate) static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
 
 pub(crate) fn App(cx: Scope) -> Element {
     crate::log::log("render app");
@@ -176,49 +172,6 @@ impl Inbox {
         *id = user;
     }
 
-    pub(crate) async fn load_all(
-        client: &mut WebApiRequestClient,
-        contracts: &[Identity],
-        contract_to_id: &mut HashMap<ContractKey, Identity>,
-    ) {
-        async fn subscribe(
-            client: &mut WebApiRequestClient,
-            identity: &Identity,
-        ) -> Result<(), DynError> {
-            let pub_key = identity.key.to_public_key();
-            let alias = ALIAS_MAP2
-                .get(&pub_key.to_pkcs1_pem(LineEnding::LF).unwrap())
-                .unwrap();
-            let params = freenet_email_inbox::InboxParams { pub_key }
-                .try_into()
-                .map_err(|e| format!("{e}"))?;
-            let contract_key = ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
-                .map_err(|e| format!("{e}"))?;
-            {
-                let mut l = INBOX_TO_ID.lock().unwrap();
-                l.insert(contract_key.clone(), identity.clone());
-            }
-            crate::log::log(format!(
-                "subscribed to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
-            ));
-            InboxModel::subscribe(client, contract_key.clone()).await?;
-            Ok(())
-        }
-
-        for identity in contracts {
-            let mut client = client.clone();
-            let res = subscribe(&mut client, identity).await;
-            error_handling(client.clone().into(), res, TryNodeAction::LoadInbox).await;
-            let res = InboxModel::load(&mut client, identity).await.map(|key| {
-                contract_to_id
-                    .entry(key.clone())
-                    .or_insert(identity.clone());
-                key
-            });
-            error_handling(client.into(), res.map(|_| ()), TryNodeAction::LoadInbox).await;
-        }
-    }
-
     fn send_message(
         &self,
         client: WebApiRequestClient,
@@ -241,20 +194,17 @@ impl Inbox {
         {
             crate::log::log(format!("sending message from {from}"));
             for recipient_encoded_key in content.to.iter() {
-                let recipient_key = RsaPublicKey::from_pkcs1_pem(recipient_encoded_key)
-                    .map_err(|e| format!("{e}"))?;
                 let content = content.clone();
                 let mut client = client.clone();
-                let from_id = INBOX_TO_ID
-                    .try_lock()
-                    .unwrap()
-                    .values()
-                    .find_map(|id| (id.alias == from).then(|| id.clone()))
-                    .unwrap();
+                let recipient_key = RsaPublicKey::from_pkcs1_pem(recipient_encoded_key)
+                    .map_err(|e| format!("{e}"))?;
+                let Some(id) = crate::inbox::InboxModel::id_for_alias(from) else {
+                    crate::log::error(format!("alias `{from}` not stored"), Some(TryNodeAction::SendMessage));
+                    continue;
+                };
                 let f = async move {
                     let res =
-                        InboxModel::send_message(&mut client, content, recipient_key, from_id)
-                            .await;
+                        InboxModel::send_message(&mut client, content, recipient_key, &id).await;
                     error_handling(client.into(), res, TryNodeAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());
@@ -381,12 +331,12 @@ impl User {
             active_id: None,
             identities: vec![
                 Identity {
-                    alias: "address1".to_owned(),
+                    alias: "address1".into(),
                     id: UserId(0),
                     key: key0,
                 },
                 Identity {
-                    alias: "address2".to_owned(),
+                    alias: "address2".into(),
                     id: UserId(1),
                     key: key1,
                 },
@@ -413,7 +363,13 @@ impl User {
 pub(crate) struct Identity {
     pub id: UserId,
     pub key: RsaPrivateKey,
-    pub alias: String,
+    alias: Rc<str>,
+}
+
+impl Identity {
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
 }
 
 impl std::hash::Hash for Identity {
@@ -603,9 +559,8 @@ fn InboxComponent(cx: Scope) -> Element {
         let current_active_id: UserId = user.read().active_id.unwrap();
         // reload if there were new emails received
         let all_data = inbox.inbox_data.load();
-        let lock = INBOX_TO_ID.lock().unwrap();
         if let Some((current_model, id)) = all_data.iter().find_map(|ib| {
-            let id = lock.get(&ib.borrow().key).unwrap();
+            let id = crate::inbox::InboxModel::contract_identity(&ib.borrow().key).unwrap();
             (id.id == current_active_id).then(|| (ib, id))
         }) {
             let mut emails = inbox.messages.borrow_mut();
@@ -619,7 +574,6 @@ fn InboxComponent(cx: Scope) -> Element {
                 id.alias,
                 emails.len()
             ));
-            std::mem::drop(lock);
         }
     }
 
@@ -688,7 +642,7 @@ fn InboxComponent(cx: Scope) -> Element {
 
 fn OpenMessage(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
-    let client = WEB_API_SENDER.get().unwrap();
+    let client = crate::api::WEB_API_SENDER.get().unwrap();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let email = cx.props;
     let email_id = [cx.props.id];
@@ -736,11 +690,11 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
 
 fn NewMessageWindow(cx: Scope) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
-    let client = WEB_API_SENDER.get().unwrap();
+    let client = crate::api::WEB_API_SENDER.get().unwrap();
     let inbox = use_context::<Inbox>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();
-    let user_alias = user.logged_id().unwrap().alias.as_str();
+    let user_alias = &*user.logged_id().unwrap().alias;
     let to = use_state(cx, String::new);
     let title = use_state(cx, String::new);
     let content = use_state(cx, String::new);
