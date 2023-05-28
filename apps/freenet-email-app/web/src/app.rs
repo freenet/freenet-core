@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+use std::hash::Hasher;
 use std::sync::{Arc, Mutex};
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
@@ -176,7 +177,7 @@ impl Inbox {
     }
 
     pub(crate) async fn load_all(
-        client: WebApiRequestClient,
+        client: &mut WebApiRequestClient,
         contracts: &[Identity],
         contract_to_id: &mut HashMap<ContractKey, Identity>,
     ) {
@@ -408,11 +409,17 @@ impl User {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pub id: UserId,
     pub key: RsaPrivateKey,
     pub alias: String,
+}
+
+impl std::hash::Hash for Identity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state)
+    }
 }
 
 #[derive(Debug, Clone, Eq, Props)]
@@ -617,7 +624,6 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 
     let emails = inbox.messages.borrow();
-    if let Some(id) = &user.read().active_id {}
     let is_email = menu_selection.read().email();
     if let Some(email_id) = is_email {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();

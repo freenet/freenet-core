@@ -1,8 +1,7 @@
-use std::borrow::BorrowMut;
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
-use locutus_aft_interface::{TokenAssignment, TokenDelegateMessage};
+use locutus_aft_interface::TokenDelegateMessage;
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 
@@ -143,7 +142,7 @@ pub(crate) async fn node_comms(
     contracts: Vec<crate::app::Identity>,
     mut inboxes: crate::app::InboxesData,
 ) {
-    use std::{collections::HashMap, rc::Rc, sync::Arc};
+    use std::{rc::Rc, sync::Arc};
 
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
@@ -151,11 +150,15 @@ pub(crate) async fn node_comms(
     use locutus_stdlib::{client_api::ContractResponse, prelude::ContractKey};
 
     use crate::{
+        aft::AftRecords,
         app::{error_handling, Identity, NodeAction, TryNodeAction, WEB_API_SENDER},
         inbox::InboxModel,
     };
 
-    let mut contract_to_id = HashMap::new();
+    // todo: move this to app::Inbox and use a thread local and static methods to access/update the data
+    // see crate::aft::AftRecords ; this may free is from having to pass InboxesData and instead
+    // accessing data through the static methods where needed
+    let mut inbox_contract_to_id = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -163,9 +166,11 @@ pub(crate) async fn node_comms(
         })
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
-    crate::app::Inbox::load_all(api.sender_half(), &contracts, &mut contract_to_id).await;
+    let mut req_sender = api.sender_half();
+    crate::app::Inbox::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id).await;
+    crate::aft::AftRecords::load_all(&mut req_sender, &contracts).await;
     crate::log::log("requested inboxes");
-    WEB_API_SENDER.set(api.sender_half()).unwrap();
+    WEB_API_SENDER.set(req_sender).unwrap();
 
     async fn handle_action(
         req: NodeAction,
@@ -213,7 +218,7 @@ pub(crate) async fn node_comms(
                         "loaded inbox {key} with {} messages",
                         updated_model.messages.len()
                     ));
-                    let mut current = loaded_models[pos].borrow_mut();
+                    let mut current = (*loaded_models[pos]).borrow_mut();
                     *current = updated_model;
                 } else {
                     crate::log::log(format!("updated inbox {key}"));
@@ -246,10 +251,11 @@ pub(crate) async fn node_comms(
                     let mut found = false;
                     for inbox in loaded_models.as_slice() {
                         if inbox.clone().borrow().key == key {
-                            inbox.borrow_mut().merge(updated_model);
+                            let mut inbox = (**inbox).borrow_mut();
+                            inbox.merge(updated_model);
                             crate::log::log(format!(
                                 "updated inbox {key} with {} messages",
-                                inbox.borrow().messages.len()
+                                inbox.messages.len()
                             ));
                             found = true;
                             break;
@@ -271,19 +277,21 @@ pub(crate) async fn node_comms(
                 for msg in values {
                     match msg {
                         locutus_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
-                            let token = TokenDelegateMessage::try_from(msg.payload.as_slice())?;
+                            let token = match TokenDelegateMessage::try_from(msg.payload.as_slice())
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    crate::log::error(
+                                        format!("error deserializing delegate msg: {e}"),
+                                        None,
+                                    );
+                                    return;
+                                }
+                            };
                             match token {
-                                TokenDelegateMessage::AllocatedToken {
-                                    delegate_id,
-                                    assignment,
-                                    records,
-                                } => {
-                                    // todo: check that the assignment belongs to the delegate requesting this
-                                    TOKEN.with(|t| {
-                                        let mut tr = t.borrow_mut();
-                                        *tr = Some(assignment);
-                                    })
-                                },
+                                TokenDelegateMessage::AllocatedToken { assignment, .. } => {
+                                    AftRecords::allocated_assignment(&key, &assignment);
+                                }
                                 TokenDelegateMessage::Failure(reason) => crate::log::error(
                                     format!("{reason}"),
                                     Some(TryNodeAction::SendMessage),
@@ -307,7 +315,7 @@ pub(crate) async fn node_comms(
     loop {
         match api.host_responses.try_recv() {
             Ok(res) => {
-                handle_response(res, &mut contract_to_id, &mut inboxes).await;
+                handle_response(res, &mut inbox_contract_to_id, &mut inboxes).await;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -317,7 +325,7 @@ pub(crate) async fn node_comms(
         futures::select! {
             req = rx.next() => {
                 let Some(req) = req else { panic!("async action ch closed") };
-                handle_action(req, &api, &mut contract_to_id).await;
+                handle_action(req, &api, &mut inbox_contract_to_id).await;
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };
@@ -332,14 +340,4 @@ pub(crate) async fn node_comms(
             }
         }
     }
-}
-
-thread_local! {
-    // todo: probably need to keep the assignments per delegate making request and keep multiple of them
-    // eg. RefCell<HashMap<Identity, Vec<TokenAssignment>>>
-    static TOKEN: RefCell<Option<TokenAssignment>> = RefCell::new(None);
-}
-
-pub(crate) async fn recv_token() -> Option<TokenAssignment> {
-    TOKEN.with(|t| t.borrow_mut().take())
 }

@@ -1,6 +1,7 @@
+pub(crate) mod aft;
 mod api;
 mod app;
-pub mod inbox;
+pub(crate) mod inbox;
 pub(crate) mod log;
 #[cfg(test)]
 pub(crate) mod test_util;

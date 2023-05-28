@@ -134,7 +134,7 @@ impl SecretsStore {
     ) -> RuntimeResult<()> {
         let delegate_path = self.base_path.join(delegate.encode());
         let secret_file_path = delegate_path.join(key.encode());
-        let secret_key = *key.code_hash();
+        let secret_key = *key.hash();
 
         let encryption = self
             .ciphers
