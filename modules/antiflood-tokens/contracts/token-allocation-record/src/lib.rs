@@ -101,13 +101,13 @@ impl ContractInterface for TokenAllocContract {
     fn get_state_delta(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        summary: StateSummary<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
         // FIXME: this will be broken because problem with node
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let summary = TokenAllocationSummary::try_from(summary)?;
-        let delta = assigned_tokens.delta(&summary);
-        delta.try_into()
+        //let summary = TokenAllocationSummary::try_from(summary)?;
+        //let delta = assigned_tokens.delta(&summary);
+        assigned_tokens.try_into()
     }
 }
 

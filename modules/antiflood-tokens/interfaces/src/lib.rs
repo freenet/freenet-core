@@ -641,7 +641,7 @@ impl TryFrom<State<'_>> for TokenAllocationRecord {
     type Error = ContractError;
 
     fn try_from(state: State<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(state.as_ref())
+        let this = serde_json::from_slice(state.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)
     }
@@ -651,7 +651,7 @@ impl TryFrom<StateDelta<'_>> for TokenAllocationRecord {
     type Error = ContractError;
 
     fn try_from(delta: StateDelta<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(delta.as_ref())
+        let this = serde_json::from_slice(delta.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)
     }
@@ -662,7 +662,7 @@ impl TryFrom<TokenAllocationRecord> for State<'static> {
 
     fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
         let serialized =
-            bincode::serialize(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
+            serde_json::to_vec(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(State::from(serialized))
     }
 }
@@ -672,7 +672,7 @@ impl TryFrom<TokenAllocationRecord> for StateDelta<'static> {
 
     fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
         let serialized =
-            bincode::serialize(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
+            serde_json::to_vec(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(StateDelta::from(serialized))
     }
 }
@@ -684,7 +684,7 @@ impl TryFrom<StateSummary<'_>> for TokenAllocationSummary {
     type Error = ContractError;
 
     fn try_from(state: StateSummary<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(state.as_ref())
+        let this = serde_json::from_slice(state.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)
     }
@@ -695,7 +695,7 @@ impl TryFrom<TokenAllocationSummary> for StateSummary<'static> {
 
     fn try_from(summary: TokenAllocationSummary) -> Result<Self, Self::Error> {
         let serialized =
-            bincode::serialize(&summary).map_err(|err| ContractError::Deser(format!("{err}")))?;
+            serde_json::to_vec(&summary).map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(StateSummary::from(serialized))
     }
 }
@@ -760,7 +760,7 @@ impl TokenAssignment {
         let timestamp = issue_time.timestamp();
         to_be_signed[cursor..cursor + Self::TS_SIZE].copy_from_slice(&timestamp.to_le_bytes());
         cursor += Self::TS_SIZE;
-        let key = bincode::serialize(&assigned_to).unwrap();
+        let key = serde_json::to_vec(&assigned_to).unwrap();
         to_be_signed[cursor..cursor + key.len()].copy_from_slice(key.as_slice());
         to_be_signed
     }
@@ -802,7 +802,7 @@ impl TryFrom<StateDelta<'_>> for TokenAssignment {
     type Error = ContractError;
 
     fn try_from(state: StateDelta<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(state.as_ref())
+        let this = serde_json::from_slice(state.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)
     }

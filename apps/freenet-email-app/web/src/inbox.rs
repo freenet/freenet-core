@@ -282,7 +282,7 @@ impl InboxModel {
             let (hash, _) = content.assignment_hash_and_signed_content(&recipient_key)?;
             InboxModel::assign_token(client, key, from, hash).await?
         };
-        crate::aft::AftRecords::allocated_assignment(&delegate_key, &token).await;
+        crate::aft::AftRecords::allocated_assignment(client, &from, &delegate_key, &token).await?;
         let params = InboxParams {
             pub_key: recipient_key,
         }

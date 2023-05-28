@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap};
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_aft_interface::TokenDelegateMessage;
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
-use locutus_stdlib::prelude::UpdateData;
+use locutus_stdlib::prelude::{DelegateKey, UpdateData};
 use once_cell::sync::OnceCell;
 
 use crate::app::AsyncActionResult;
@@ -163,6 +163,7 @@ pub(crate) async fn node_comms(
 
     let mut inbox_contract_to_id = HashMap::new();
     let mut token_contract_to_id = HashMap::new();
+    let mut token_delegate_to_id = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -198,8 +199,11 @@ pub(crate) async fn node_comms(
         res: Result<HostResponse, ClientError>,
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_to_id: &mut HashMap<ContractKey, Identity>,
+        delegate_to_id: &mut HashMap<DelegateKey, Identity>,
         inboxes: &mut crate::app::InboxesData,
+        api: &WebApi,
     ) {
+        let mut client = api.sender_half();
         let res = match res {
             Ok(r) => r,
             Err(e) => {
@@ -326,7 +330,15 @@ pub(crate) async fn node_comms(
                             };
                             match token {
                                 TokenDelegateMessage::AllocatedToken { assignment, .. } => {
-                                    AftRecords::allocated_assignment(&key, &assignment).await;
+                                    let token_contract_key = ContractKey::from(assignment.token_record);
+                                    if let Some(identity) = token_to_id.remove(&token_contract_key) {
+                                        if let Err(e) = AftRecords::allocated_assignment(&mut client, &identity, &key, &assignment).await {
+                                            crate::log::error(format!("error registering the token assignment: {e}"), None);
+                                        }
+                                        token_to_id.insert(token_contract_key, identity);
+                                    } else {
+                                        unreachable!("tried to get wrong contract key: {key}")
+                                    }
                                 }
                                 TokenDelegateMessage::Failure(reason) => crate::log::error(
                                     format!("{reason}"),
@@ -355,7 +367,9 @@ pub(crate) async fn node_comms(
                     res,
                     &mut inbox_contract_to_id,
                     &mut token_contract_to_id,
+                    &mut token_delegate_to_id,
                     &mut inboxes,
+                    &api,
                 )
                 .await;
             }

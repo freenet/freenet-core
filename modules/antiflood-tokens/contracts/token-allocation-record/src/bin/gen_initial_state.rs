@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokens
     };
     let token_allocation_record: TokenAllocationRecord = TokenAllocationRecord::new(tokens);
-    let state: Vec<u8> = bincode::serialize(&token_allocation_record)?;
+    let state: Vec<u8> = serde_json::to_vec(&token_allocation_record)?;
     std::fs::write(inbox_path.join("examples").join("initial_state"), state)?;
     Ok(())
 }

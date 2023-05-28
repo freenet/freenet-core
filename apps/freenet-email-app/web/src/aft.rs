@@ -1,7 +1,8 @@
 use std::{cell::RefCell, collections::HashMap};
+use std::time::Duration;
 
 use locutus_aft_interface::{TokenAllocationRecord, TokenAssignment, TokenParameters};
-use locutus_stdlib::prelude::{ContractKey, ContractRequest, DelegateKey, State, StateDelta};
+use locutus_stdlib::prelude::{ContractKey, ContractRequest, DelegateKey, State, StateDelta, UpdateData};
 
 use crate::{
     api::WebApiRequestClient,
@@ -62,8 +63,8 @@ impl AftRecords {
         })
     }
 
-    pub async fn allocated_assignment(key: &DelegateKey, assignment: &TokenAssignment) {
-        Self::register_allocation(key, assignment.clone()).await;
+    pub async fn allocated_assignment(client: &mut WebApiRequestClient, identity: &Identity, key: &DelegateKey, assignment: &TokenAssignment) -> Result<(), DynError> {
+        Self::register_allocation(client, identity, assignment.clone()).await?;
         TOKEN.with(|t| {
             let tr = &mut *t.borrow_mut();
             // tr.entry(key.encode()).or_default().push(assignment);
@@ -74,6 +75,7 @@ impl AftRecords {
                 }
             }
         });
+        Ok(())
     }
 
     pub fn set(identity: Identity, state: State<'_>) -> Result<(), DynError> {
@@ -95,10 +97,25 @@ impl AftRecords {
     }
 
     // todo: should wait for aft record update confirmation before doing anything with the token
-    async fn register_allocation(key: &DelegateKey, assignment: TokenAssignment) {
-        // TODO: update the token record in the node so it can be verified that the token was allocated
-        // to avoid double-spending
-        todo!()
+    async fn register_allocation(client: &mut WebApiRequestClient, identity: &Identity, assignment: TokenAssignment) -> Result<(), DynError> {
+        // todo: if a collision occurs, the operation should be retried until there are no more tokens available
+        let key = ContractKey::from(assignment.token_record);
+        let request = ContractRequest::Update {
+            key,
+            data: UpdateData::Delta(serde_json::to_vec(&assignment)?.into()),
+        };
+        client.send(request.into()).await?;
+        let t = std::time::Instant::now();
+        while t.elapsed() < Duration::from_secs(10) {
+            RECORDS.with(|recs| {
+                let recs = &mut *recs.borrow_mut();
+                if let Some(record) = recs.get(&identity) {
+                    assert!(record.assignment_exists(&assignment))
+                }
+            });
+        }
+
+        Ok(())
     }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
