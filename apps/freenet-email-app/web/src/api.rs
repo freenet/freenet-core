@@ -4,6 +4,7 @@ use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_aft_interface::TokenDelegateMessage;
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
+use once_cell::sync::OnceCell;
 
 use crate::app::AsyncActionResult;
 
@@ -11,6 +12,8 @@ type ClientRequester = UnboundedSender<ClientRequest<'static>>;
 type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
 
 pub(crate) type NodeResponses = UnboundedSender<AsyncActionResult>;
+
+pub(crate) static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
 
 #[cfg(feature = "use-node")]
 struct WebApi {
@@ -140,6 +143,9 @@ impl From<WebApiRequestClient> for NodeResponses {
 pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::NodeAction>,
     contracts: Vec<crate::app::Identity>,
+    // todo: refactor: instead of passing this arround,
+    // where necessary we could be gettign thef resh data via static methods calls to InboxModel
+    // and store the information there in thread locals
     mut inboxes: crate::app::InboxesData,
 ) {
     use std::{rc::Rc, sync::Arc};
@@ -151,14 +157,12 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{error_handling, Identity, NodeAction, TryNodeAction, WEB_API_SENDER},
+        app::{error_handling, Identity, NodeAction, TryNodeAction},
         inbox::InboxModel,
     };
 
-    // todo: move this to app::Inbox and use a thread local and static methods to access/update the data
-    // see crate::aft::AftRecords ; this may free is from having to pass InboxesData and instead
-    // accessing data through the static methods where needed
     let mut inbox_contract_to_id = HashMap::new();
+    let mut token_contract_to_id = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -167,8 +171,9 @@ pub(crate) async fn node_comms(
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
     let mut req_sender = api.sender_half();
-    crate::app::Inbox::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id).await;
-    crate::aft::AftRecords::load_all(&mut req_sender, &contracts).await;
+    crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id)
+        .await;
+    crate::aft::AftRecords::load_all(&mut req_sender, &contracts, &mut token_contract_to_id).await;
     crate::log::log("requested inboxes");
     WEB_API_SENDER.set(req_sender).unwrap();
 
@@ -290,7 +295,7 @@ pub(crate) async fn node_comms(
                             };
                             match token {
                                 TokenDelegateMessage::AllocatedToken { assignment, .. } => {
-                                    AftRecords::allocated_assignment(&key, &assignment);
+                                    AftRecords::allocated_assignment(&key, &assignment).await;
                                 }
                                 TokenDelegateMessage::Failure(reason) => crate::log::error(
                                     format!("{reason}"),
