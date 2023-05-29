@@ -4,6 +4,7 @@
 
 - [Components](components.md)
 - [P2P Network](p2p-network.md)
+- [Intelligent Routing](irouting.md)
 
 # Developer Guide
 
