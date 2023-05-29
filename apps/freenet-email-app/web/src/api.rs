@@ -201,9 +201,8 @@ pub(crate) async fn node_comms(
         token_to_id: &mut HashMap<ContractKey, Identity>,
         delegate_to_id: &mut HashMap<DelegateKey, Identity>,
         inboxes: &mut crate::app::InboxesData,
-        api: &WebApi,
     ) {
-        let mut client = api.sender_half();
+        let mut client = WEB_API_SENDER.get().unwrap().clone();
         let res = match res {
             Ok(r) => r,
             Err(e) => {
@@ -330,10 +329,25 @@ pub(crate) async fn node_comms(
                             };
                             match token {
                                 TokenDelegateMessage::AllocatedToken { assignment, .. } => {
-                                    let token_contract_key = ContractKey::from(assignment.token_record);
-                                    if let Some(identity) = token_to_id.remove(&token_contract_key) {
-                                        if let Err(e) = AftRecords::allocated_assignment(&mut client, &identity, &key, &assignment).await {
-                                            crate::log::error(format!("error registering the token assignment: {e}"), None);
+                                    let token_contract_key =
+                                        ContractKey::from(assignment.token_record);
+                                    if let Some(identity) = token_to_id.remove(&token_contract_key)
+                                    {
+                                        if let Err(e) = AftRecords::allocated_assignment(
+                                            &mut client,
+                                            &identity,
+                                            &key,
+                                            assignment,
+                                        )
+                                        .await
+                                        {
+                                            // todo: if a collision occurs, the operation should be retried until there are no more tokens available
+                                            crate::log::error(
+                                                format!(
+                                                    "error registering the token assignment: {e}"
+                                                ),
+                                                None,
+                                            );
                                         }
                                         token_to_id.insert(token_contract_key, identity);
                                     } else {
@@ -369,7 +383,6 @@ pub(crate) async fn node_comms(
                     &mut token_contract_to_id,
                     &mut token_delegate_to_id,
                     &mut inboxes,
-                    &api,
                 )
                 .await;
             }

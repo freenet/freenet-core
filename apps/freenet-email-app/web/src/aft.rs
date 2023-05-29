@@ -1,8 +1,10 @@
-use std::{cell::RefCell, collections::HashMap};
 use std::time::Duration;
+use std::{cell::RefCell, collections::HashMap};
 
 use locutus_aft_interface::{TokenAllocationRecord, TokenAssignment, TokenParameters};
-use locutus_stdlib::prelude::{ContractKey, ContractRequest, DelegateKey, State, StateDelta, UpdateData};
+use locutus_stdlib::prelude::{
+    ContractKey, ContractRequest, DelegateKey, State, StateDelta, UpdateData,
+};
 
 use crate::{
     api::WebApiRequestClient,
@@ -63,15 +65,19 @@ impl AftRecords {
         })
     }
 
-    pub async fn allocated_assignment(client: &mut WebApiRequestClient, identity: &Identity, key: &DelegateKey, assignment: &TokenAssignment) -> Result<(), DynError> {
-        Self::register_allocation(client, identity, assignment.clone()).await?;
+    pub async fn allocated_assignment(
+        client: &mut WebApiRequestClient,
+        identity: &Identity,
+        key: &DelegateKey,
+        assignment: TokenAssignment,
+    ) -> Result<(), DynError> {
+        Self::register_allocation(client, identity, &assignment).await?;
         TOKEN.with(|t| {
             let tr = &mut *t.borrow_mut();
-            // tr.entry(key.encode()).or_default().push(assignment);
             match tr.get_mut(key) {
-                Some(tokens) => tokens.push(assignment.clone()),
+                Some(tokens) => tokens.push(assignment),
                 None => {
-                    tr.insert(key.clone(), vec![assignment.clone()]);
+                    tr.insert(key.clone(), vec![assignment]);
                 }
             }
         });
@@ -96,9 +102,11 @@ impl AftRecords {
         Ok(())
     }
 
-    // todo: should wait for aft record update confirmation before doing anything with the token
-    async fn register_allocation(client: &mut WebApiRequestClient, identity: &Identity, assignment: TokenAssignment) -> Result<(), DynError> {
-        // todo: if a collision occurs, the operation should be retried until there are no more tokens available
+    async fn register_allocation(
+        client: &mut WebApiRequestClient,
+        identity: &Identity,
+        assignment: &TokenAssignment,
+    ) -> Result<(), DynError> {
         let key = ContractKey::from(assignment.token_record);
         let request = ContractRequest::Update {
             key,
@@ -106,16 +114,28 @@ impl AftRecords {
         };
         client.send(request.into()).await?;
         let t = std::time::Instant::now();
+        let mut allocated = false;
         while t.elapsed() < Duration::from_secs(10) {
-            RECORDS.with(|recs| {
+            allocated = RECORDS.with(|recs| {
                 let recs = &mut *recs.borrow_mut();
-                if let Some(record) = recs.get(&identity) {
-                    assert!(record.assignment_exists(&assignment))
+                if let Some(record) = recs.get(identity) {
+                    if record.assignment_exists(assignment) {
+                        return true;
+                    }
                 }
+                false
             });
+            if allocated {
+                break;
+            }
         }
-
-        Ok(())
+        if allocated {
+            Ok(())
+        } else {
+            // todo: if a collision occurs, the operation should be retried until there are no more tokens available
+            // return an error to signal that
+            todo!()
+        }
     }
 
     async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {

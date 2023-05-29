@@ -277,12 +277,11 @@ impl InboxModel {
         recipient_key: RsaPublicKey,
         from: &Identity,
     ) -> Result<(), DynError> {
-        let (delegate_key, token) = {
+        let (_delegate_key, token) = {
             let key = recipient_key.clone();
             let (hash, _) = content.assignment_hash_and_signed_content(&recipient_key)?;
             InboxModel::assign_token(client, key, from, hash).await?
         };
-        crate::aft::AftRecords::allocated_assignment(client, &from, &delegate_key, &token).await?;
         let params = InboxParams {
             pub_key: recipient_key,
         }
