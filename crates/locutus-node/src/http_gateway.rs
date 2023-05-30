@@ -314,7 +314,7 @@ impl HttpGateway {
             }
             ClientConnection::Request {
                 client_id,
-                req: ClientRequest::ContractOp(ContractRequest::Subscribe { key }),
+                req: ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary }),
             } => {
                 // intercept subscription messages because they require a callback subscription channel
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -326,8 +326,11 @@ impl HttpGateway {
                     })
                     .map_err(|_| ErrorKind::ChannelClosed)?;
                     Ok(Some(
-                        OpenRequest::new(client_id, ContractRequest::Subscribe { key }.into())
-                            .with_notification(tx),
+                        OpenRequest::new(
+                            client_id,
+                            ContractRequest::Subscribe { key, summary }.into(),
+                        )
+                        .with_notification(tx),
                     ))
                 } else {
                     tracing::warn!("client: {client_id} not found");

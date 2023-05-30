@@ -104,7 +104,10 @@ impl ClientRequest<'_> {
                         key,
                         fetch_contract,
                     },
-                    ContractRequest::Subscribe { key } => ContractRequest::Subscribe { key },
+                    ContractRequest::Subscribe { key, summary } => ContractRequest::Subscribe {
+                        key,
+                        summary: summary.map(StateSummary::into_owned),
+                    },
                 };
                 owned.into()
             }
@@ -148,7 +151,10 @@ pub enum ContractRequest<'a> {
     },
     /// Subscribe to the changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
-    Subscribe { key: ContractKey },
+    Subscribe {
+        key: ContractKey,
+        summary: Option<StateSummary<'a>>,
+    },
 }
 
 impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
@@ -205,9 +211,14 @@ impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
                         fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
                     },
-                    ["key"] => ContractRequest::Subscribe {
+                    ["key", "summary"] => ContractRequest::Subscribe {
                         key: ContractKey::try_decode(*value_map.get("key").unwrap())
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                        summary: value_map
+                            .get("summary")
+                            .unwrap()
+                            .as_slice()
+                            .map(|s| StateSummary::from(s).into_owned()),
                     },
                     _ => unreachable!(),
                 }

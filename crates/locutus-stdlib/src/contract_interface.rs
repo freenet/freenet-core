@@ -707,7 +707,7 @@ impl<'a> DerefMut for StateDelta<'a> {
 /// between two contracts as part of the state synchronization mechanism. The format of a state
 /// summary is determined by the state's contract.
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct StateSummary<'a>(
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]

@@ -226,7 +226,7 @@ pub(crate) mod test {
                             // self.non_owned_contracts[contract_no]
                             todo!("fixme")
                         };
-                        break ContractRequest::Subscribe { key }.into();
+                        break ContractRequest::Subscribe { key, summary: None }.into();
                     }
                     0 => {}
                     1 => {}

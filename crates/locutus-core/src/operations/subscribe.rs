@@ -464,6 +464,7 @@ mod test {
 
         let event = ContractRequest::Subscribe {
             key: contract_key.clone(),
+            summary: None,
         }
         .into();
         let first_node = NodeSpecification {

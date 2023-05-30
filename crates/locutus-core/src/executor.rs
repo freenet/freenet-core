@@ -35,7 +35,7 @@ pub struct Executor {
     runtime: Runtime,
     contract_state: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
-    subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, StateSummary<'static>>>,
+    subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
 }
 
 impl Executor {
@@ -63,7 +63,7 @@ impl Executor {
         key: ContractKey,
         cli_id: ClientId,
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
-        summary: StateSummary<'static>,
+        summary: Option<StateSummary<'_>>,
     ) -> Result<(), RequestError> {
         let channels = self.update_notifications.entry(key.clone()).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
@@ -82,7 +82,7 @@ impl Executor {
             .subscriber_summaries
             .entry(key.clone())
             .or_default()
-            .insert(cli_id, summary)
+            .insert(cli_id, summary.map(StateSummary::into_owned))
             .is_some()
         {
             tracing::warn!(
@@ -330,10 +330,10 @@ impl Executor {
                 key,
                 fetch_contract: contract,
             } => self.perform_get(contract, key).await.map_err(Either::Left),
-            ContractRequest::Subscribe { key } => {
+            ContractRequest::Subscribe { key, summary } => {
                 let updates =
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
-                self.register_contract_notifier(key.clone(), id, updates, [].as_ref().into())
+                self.register_contract_notifier(key.clone(), id, updates, summary)
                     .map_err(Either::Left)?;
                 tracing::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
@@ -413,26 +413,31 @@ impl Executor {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
-                let update = self
-                    .runtime
-                    .get_state_delta(key, params, new_state, &*peer_summary)
-                    .map_err(|err| {
-                        tracing::error!("{err}");
-                        match err {
-                            err if err.is_contract_exec_error() => Either::Left(
-                                CoreContractError::Put {
-                                    key: key.clone(),
-                                    cause: format!("{err}"),
-                                }
-                                .into(),
-                            ),
-                            other => Either::Right(other.into()),
-                        }
-                    })?;
+                let update = match peer_summary {
+                    Some(summary) => self
+                        .runtime
+                        .get_state_delta(key, params, new_state, &*summary)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            match err {
+                                err if err.is_contract_exec_error() => Either::Left(
+                                    CoreContractError::Put {
+                                        key: key.clone(),
+                                        cause: format!("{err}"),
+                                    }
+                                    .into(),
+                                ),
+                                other => Either::Right(other.into()),
+                            }
+                        })?
+                        .to_owned()
+                        .into(),
+                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                };
                 notifier
                     .send(Ok(ContractResponse::UpdateNotification {
                         key: key.clone(),
-                        update: update.to_owned().into(),
+                        update,
                     }
                     .into()))
                     .map_err(|err| {

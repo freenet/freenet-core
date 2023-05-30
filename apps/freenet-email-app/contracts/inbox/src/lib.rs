@@ -239,6 +239,15 @@ impl Inbox {
         Ok(StateSummary::from(serialized))
     }
 
+    fn merge(&mut self, other: Self, params: &InboxParams) -> Result<(), ContractError> {
+        if self.messages.is_empty() && self.last_update < other.last_update {
+            for m in other.messages {
+                self.add_message(m, params)?;
+            }
+        }
+        Ok(())
+    }
+
     fn delta(self, InboxSummary(messages): InboxSummary) -> Inbox {
         let delta = self
             .messages
@@ -369,6 +378,10 @@ impl ContractInterface for Inbox {
         let mut allocation_records = HashMap::new();
         for update in updates {
             match update {
+                UpdateData::State(state) => {
+                    let full_inbox = Inbox::try_from(&state)?;
+                    inbox.merge(full_inbox, &params)?;
+                }
                 UpdateData::Delta(d) => match UpdateInbox::try_from(d)? {
                     UpdateInbox::AddMessages { mut messages } => {
                         for m in &messages {
@@ -434,11 +447,10 @@ impl ContractInterface for Inbox {
         state: State<'static>,
         _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        // FIXME: we are not doing this because there is a problem in the node impl where we are handling in
         // wrong summary representations
         let inbox = Inbox::try_from(&state)?;
-        // let summary = InboxSummary::try_from(summary)?;
-        // let delta = inbox.delta(summary);
+        let summary = InboxSummary::try_from(summary)?;
+        let delta = inbox.delta(summary);
         inbox.try_into()
     }
 }
