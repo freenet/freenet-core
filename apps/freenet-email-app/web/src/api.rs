@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap};
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use locutus_aft_interface::TokenDelegateMessage;
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
-use locutus_stdlib::prelude::{DelegateKey, UpdateData};
+use locutus_stdlib::prelude::UpdateData;
 use once_cell::sync::OnceCell;
 
 use crate::app::AsyncActionResult;
@@ -163,7 +163,6 @@ pub(crate) async fn node_comms(
 
     let mut inbox_contract_to_id = HashMap::new();
     let mut token_contract_to_id = HashMap::new();
-    let mut token_delegate_to_id = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -199,7 +198,6 @@ pub(crate) async fn node_comms(
         res: Result<HostResponse, ClientError>,
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_to_id: &mut HashMap<ContractKey, Identity>,
-        delegate_to_id: &mut HashMap<DelegateKey, Identity>,
         inboxes: &mut crate::app::InboxesData,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
@@ -381,7 +379,6 @@ pub(crate) async fn node_comms(
                     res,
                     &mut inbox_contract_to_id,
                     &mut token_contract_to_id,
-                    &mut token_delegate_to_id,
                     &mut inboxes,
                 )
                 .await;

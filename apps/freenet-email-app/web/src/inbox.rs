@@ -521,7 +521,8 @@ impl InboxModel {
     }
 
     async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
-        let request = ContractRequest::Subscribe { key };
+        // todo: send the proper summary from the current state
+        let request = ContractRequest::Subscribe { key, summary: None };
         client.send(request.into()).await?;
         Ok(())
     }

@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::{DelegateError, DelegateInterface, InboundDelegateMsg, OutboundDelegateMsg, Parameters};
+use locutus_stdlib::prelude::*;
 
 struct IdentityManagementDelegate;
 
