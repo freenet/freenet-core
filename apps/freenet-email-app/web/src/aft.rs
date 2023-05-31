@@ -1,6 +1,6 @@
-use std::time::Duration;
 use std::{cell::RefCell, collections::HashMap};
 
+use chrono::Utc;
 use locutus_aft_interface::{TokenAllocationRecord, TokenAssignment, TokenParameters};
 use locutus_stdlib::prelude::{
     ContractKey, ContractRequest, DelegateKey, State, StateDelta, UpdateData,
@@ -113,9 +113,10 @@ impl AftRecords {
             data: UpdateData::Delta(serde_json::to_vec(&assignment)?.into()),
         };
         client.send(request.into()).await?;
-        let t = std::time::Instant::now();
+        let start = Utc::now();
         let mut allocated = false;
-        while t.elapsed() < Duration::from_secs(10) {
+        let timeout = chrono::Duration::milliseconds(100);
+        while (Utc::now() - start) < timeout {
             allocated = RECORDS.with(|recs| {
                 let recs = &mut *recs.borrow_mut();
                 if let Some(record) = recs.get(identity) {

@@ -16,7 +16,7 @@ name = "app"
 [dependencies]
 arc-swap = "1.6"
 rand_chacha = "0.3"
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["wasmbind"] }
 crossbeam = "0.8"
 dioxus = { version = "0.3" }
 futures = "0.3"

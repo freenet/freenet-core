@@ -457,7 +457,6 @@ impl InboxModel {
             crate::aft::TOKEN_GENERATOR_DELEGATE_CODE_HASH,
             inbox_params.clone(),
         )?;
-        crate::log::log(format!("{delegate_key:?}"));
         let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, inbox_params.clone())?;
         let delegate_params =
             locutus_aft_interface::DelegateParameters::new(generator_id.key.clone());
@@ -494,9 +493,10 @@ impl InboxModel {
         });
         client.send(request).await?;
 
-        let t = std::time::Instant::now();
+        let start = Utc::now();
         let mut token = None;
-        while t.elapsed() < Duration::from_secs(10) {
+        let timeout = chrono::Duration::milliseconds(100);
+        while (start - Utc::now()) < timeout {
             token = AftRecords::recv_token(&delegate_key).await;
         }
         token
@@ -564,7 +564,6 @@ mod tests {
                 token_assignment: crate::test_util::test_assignment(),
             });
         }
-        eprintln!("started {}", chrono::Utc::now());
         let t0 = std::time::Instant::now();
         for id in 2500..7500 {
             inbox.remove_received_message(&[id]);
