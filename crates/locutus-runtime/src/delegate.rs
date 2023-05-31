@@ -112,7 +112,7 @@ impl Runtime {
                     if retries >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
-                    let new_msgs = self.exec_inbound(&params, &inbound, process_func, instance)?;
+                    let new_msgs = self.exec_inbound(params, &inbound, process_func, instance)?;
                     retries += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Error trying to update the context from the secret".to_string()).into())));
@@ -146,7 +146,7 @@ impl Runtime {
                         panic!();
                     }
                     let outbound = self.exec_inbound(
-                        &params,
+                        params,
                         &InboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(msg.app, msg.payload)
                                 .processed(msg.processed)
@@ -185,7 +185,7 @@ impl Runtime {
                     util::generate_random_bytes(&mut bytes);
                     let inbound = InboundDelegateMsg::RandomBytes(bytes);
                     let new_outbound_msgs =
-                        self.exec_inbound(&params, &inbound, process_func, instance)?;
+                        self.exec_inbound(params, &inbound, process_func, instance)?;
                     for msg in new_outbound_msgs.into_iter() {
                         outbound_msgs.push_back(msg);
                     }
@@ -238,7 +238,7 @@ impl DelegateRuntimeInterface for Runtime {
                 }) => {
                     let mut outbound = VecDeque::from(
                         self.exec_inbound(
-                            &params,
+                            params,
                             &InboundDelegateMsg::ApplicationMessage(
                                 ApplicationMessage::new(app, payload)
                                     .processed(processed)
@@ -254,14 +254,14 @@ impl DelegateRuntimeInterface for Runtime {
                         key,
                         &running.instance,
                         &process_func,
-                        &params,
+                        params,
                         &mut outbound,
                         &mut results,
                     )?;
                 }
                 InboundDelegateMsg::UserResponse(response) => {
                     let mut outbound = VecDeque::from(self.exec_inbound(
-                        &params,
+                        params,
                         &InboundDelegateMsg::UserResponse(response),
                         &process_func,
                         &running.instance,
@@ -270,7 +270,7 @@ impl DelegateRuntimeInterface for Runtime {
                         key,
                         &running.instance,
                         &process_func,
-                        &params,
+                        params,
                         &mut outbound,
                         &mut results,
                     )?;
@@ -280,7 +280,7 @@ impl DelegateRuntimeInterface for Runtime {
                 }
                 InboundDelegateMsg::RandomBytes(bytes) => {
                     let mut outbound = VecDeque::from(self.exec_inbound(
-                        &params,
+                        params,
                         &InboundDelegateMsg::RandomBytes(bytes),
                         &process_func,
                         &running.instance,
@@ -289,7 +289,7 @@ impl DelegateRuntimeInterface for Runtime {
                         key,
                         &running.instance,
                         &process_func,
-                        &params,
+                        params,
                         &mut outbound,
                         &mut results,
                     )?;

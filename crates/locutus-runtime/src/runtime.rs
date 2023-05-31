@@ -189,7 +189,7 @@ impl Runtime {
             // FIXME
             let delegate = self
                 .delegate_store
-                .fetch_delegate(key, &params)
+                .fetch_delegate(key, params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let module = Module::new(&self.wasm_store, delegate.code().as_ref())?;
             self.delegate_modules.insert(key.clone(), module);
