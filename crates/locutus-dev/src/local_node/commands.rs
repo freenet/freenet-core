@@ -85,7 +85,7 @@ async fn execute_command(
             }
             _ => unreachable!(),
         },
-        ClientRequest::ComponentOp(op) => {
+        ClientRequest::DelegateOp(op) => {
             match node.handle_request(ClientId::FIRST, op.into(), None).await {
                 Ok(_res) => todo!(),
                 Err(either::Either::Left(err)) => {

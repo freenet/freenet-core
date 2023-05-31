@@ -386,7 +386,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         todo!()
                     }
                 },
-                ClientRequest::ComponentOp(_op) => todo!("FIXME: component op"),
+                ClientRequest::DelegateOp(_op) => todo!("FIXME: component op"),
                 ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
                 ClientRequest::Disconnect { .. } => unreachable!(),
             }
@@ -537,7 +537,7 @@ where
 pub struct PeerKey(PeerId);
 
 impl PeerKey {
-    // #[cfg(test)]
+    #[cfg(test)]
     pub fn random() -> Self {
         use libp2p::identity::Keypair;
         PeerKey::from(Keypair::generate_ed25519().public())

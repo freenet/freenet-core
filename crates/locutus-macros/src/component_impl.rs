@@ -35,15 +35,15 @@ impl ImplStruct {
                         &*std::ptr::slice_from_raw_parts(inbound_buf.start(), inbound_buf.written(None));
                     match ::locutus_stdlib::prelude::bincode::deserialize(bytes) {
                         Ok(v) => v,
-                        Err(err) => return ::locutus_stdlib::prelude::ComponentInterfaceResult::from(
-                            Err::<::std::vec::Vec<::locutus_stdlib::prelude::OutboundComponentMsg>, _>(::locutus_stdlib::prelude::ComponentError::Deser(format!("{}", err)))
+                        Err(err) => return ::locutus_stdlib::prelude::DelegateInterfaceResult::from(
+                            Err::<::std::vec::Vec<::locutus_stdlib::prelude::OutboundDelegateMsg>, _>(::locutus_stdlib::prelude::DelegateError::Deser(format!("{}", err)))
                         ).into_raw(),
                     }
                 };
-                let result =<#type_name as ::locutus_stdlib::prelude::ComponentInterface>::process(
+                let result =<#type_name as ::locutus_stdlib::prelude::DelegateInterface>::process(
                    inbound
                 );
-                ::locutus_stdlib::prelude::ComponentInterfaceResult::from(result).into_raw()
+                ::locutus_stdlib::prelude::DelegateInterfaceResult::from(result).into_raw()
             }
         }
     }

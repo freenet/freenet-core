@@ -12,8 +12,7 @@ use crate::{
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
-    ring::{PeerKeyLocation, RingError},
-    Location,
+    ring::{Location, PeerKeyLocation, RingError},
 };
 
 use super::{OpEnum, OpError, OperationResult};

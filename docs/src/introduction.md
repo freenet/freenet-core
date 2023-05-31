@@ -1,29 +1,19 @@
 # Introduction
 
-## The Internet's dangerous design flaw
+Freenet is a distributed, decentralized alternative to the centralized World
+Wide Web, designed to unleash a new era of innovation and competition, while
+protecting freedom of speech and privacy. 
 
-In the early days of the Internet, each computer had an IP address and could
-establish connections with others, resembling a peer-to-peer network. However,
-as the Internet evolved, centralized client-server architectures became the
-norm, with HTTP, SMTP, and FTP protocols dominating the scene. Among these,
-HTTP has emerged as the most widely used, overshadowing the others.
+At the core of Freenet is a small piece of software known as the Freenet kernel,
+which runs on users' computers, smartphones, or other devices. The kernel is
+tiny, less than 5 MB, allowing it to be installed installed in a matter of
+seconds and is compatible with a wide range of hardware.
 
-While this centralized approach initially posed little risk, over time, it has
-enabled a few large companies to amass an alarming amount of power. Although
-these companies were initially neutral platforms, they have increasingly used
-their power to censor and punish users, often in collaboration with
-governments. This concentration of power poses an existential threat to
-democracy and freedom of speech.
+![Freenet in Context](freenet_in_context.svg)
 
-To address this issue we're building a new Freenet, an alternative to the
-client-server oligarchy, a decentralized platform that empowers users and
-serves their interests, rather than those of the powerful.
+Freenet is a peer-to-peer network, which means that nodes self-organize into a
+global network without any central authority, and the work of hosting services
+is distributed among the users.
 
-## Our solution: A new Freenet
-
-Freenet is software that runs on your computer and gives you access to an
-alternate decentralized Internet, but using familiar tools like web browsers.
-
-
-
-
+This user manual is primarily intended for developers who wish to build
+decentralized software systems on the Freenet platform.

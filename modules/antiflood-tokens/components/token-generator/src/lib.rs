@@ -12,12 +12,12 @@ type Assignee = ed25519_dalek::PublicKey;
 
 type AssignmentHash = [u8; 32];
 
-struct TokenComponent;
+struct TokenDelegate;
 
-impl ComponentInterface for TokenComponent {
-    fn process(message: InboundComponentMsg) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
+impl DelegateInterface for TokenDelegate {
+    fn process(message: InboundDelegateMsg) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
-            InboundComponentMsg::ApplicationMessage(ApplicationMessage {
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
                 app,
                 payload,
                 context,
@@ -25,25 +25,25 @@ impl ComponentInterface for TokenComponent {
                 ..
             }) => {
                 if processed {
-                    return Err(ComponentError::Other(
+                    return Err(DelegateError::Other(
                         "cannot process an already processed message".into(),
                     ));
                 }
                 let mut context = Context::try_from(context)?;
-                let msg = TokenComponentMessage::try_from(&*payload)?;
+                let msg = TokenDelegateMessage::try_from(&*payload)?;
                 match msg {
-                    TokenComponentMessage::RequestNewToken(req) => {
+                    TokenDelegateMessage::RequestNewToken(req) => {
                         allocate_token(&mut context, app, req)
                     }
-                    TokenComponentMessage::Failure { .. } => Err(ComponentError::Other(
+                    TokenDelegateMessage::Failure { .. } => Err(DelegateError::Other(
                         "unexpected message type: failure".into(),
                     )),
-                    TokenComponentMessage::AllocatedToken { .. } => Err(ComponentError::Other(
+                    TokenDelegateMessage::AllocatedToken { .. } => Err(DelegateError::Other(
                         "unexpected message type: allocated token".into(),
                     )),
                 }
             }
-            InboundComponentMsg::UserResponse(UserInputResponse {
+            InboundDelegateMsg::UserResponse(UserInputResponse {
                 request_id,
                 response,
                 context,
@@ -51,27 +51,27 @@ impl ComponentInterface for TokenComponent {
                 let mut context = Context::try_from(context)?;
                 context.waiting_for_user_input.remove(&request_id);
                 let response = serde_json::from_slice(&response)
-                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                    .map_err(|err| DelegateError::Deser(format!("{err}")))?;
                 context.user_response.insert(request_id, response);
-                let context: ComponentContext = (&context).try_into()?;
-                Ok(vec![OutboundComponentMsg::ContextUpdated(context)])
+                let context: DelegateContext = (&context).try_into()?;
+                Ok(vec![OutboundDelegateMsg::ContextUpdated(context)])
             }
-            InboundComponentMsg::GetSecretResponse(GetSecretResponse {
+            InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                 key,
                 value,
                 context,
             }) => {
                 let mut context = Context::try_from(context)?;
                 let secret = value.ok_or_else(|| {
-                    ComponentError::Other(format!("secret not found for key: {key}"))
+                    DelegateError::Other(format!("secret not found for key: {key}"))
                 })?;
                 let keypair = Keypair::from_bytes(&secret)
-                    .map_err(|err| ComponentError::Deser(format!("{err}")))?;
+                    .map_err(|err| DelegateError::Deser(format!("{err}")))?;
                 context.key_pair = Some(keypair);
-                let context: ComponentContext = (&context).try_into()?;
-                Ok(vec![OutboundComponentMsg::ContextUpdated(context)])
+                let context: DelegateContext = (&context).try_into()?;
+                Ok(vec![OutboundDelegateMsg::ContextUpdated(context)])
             }
-            InboundComponentMsg::RandomBytes(_) => Err(ComponentError::Other(
+            InboundDelegateMsg::RandomBytes(_) => Err(DelegateError::Other(
                 "unexpected message type: radom bytes".into(),
             )),
         }
@@ -103,7 +103,7 @@ fn allocate_token(
         assignee,
         assignment_hash,
     }: RequestNewToken,
-) -> Result<Vec<OutboundComponentMsg>, ComponentError> {
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let request = context
         .waiting_for_user_input
         .iter()
@@ -113,7 +113,7 @@ fn allocate_token(
     match (&context.key_pair, request, response) {
         (None, _, _) => {
             // lacks keys; ask for keys
-            let context: ComponentContext = (&*context).try_into()?;
+            let context: DelegateContext = (&*context).try_into()?;
             let request_secret = {
                 GetSecretRequest {
                     key: component_id.clone(),
@@ -123,7 +123,7 @@ fn allocate_token(
                 .into()
             };
             let req_allocation = {
-                let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
+                let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
                     component_id,
                     criteria,
@@ -131,7 +131,7 @@ fn allocate_token(
                     assignee,
                     assignment_hash,
                 });
-                OutboundComponentMsg::ApplicationMessage(
+                OutboundDelegateMsg::ApplicationMessage(
                     ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
                 )
             };
@@ -140,10 +140,10 @@ fn allocate_token(
         (Some(_), None, None) => {
             // request user input and add to waiting queue
             context.waiting_for_user_input.insert(request_id);
-            let context: ComponentContext = (&*context).try_into()?;
+            let context: DelegateContext = (&*context).try_into()?;
             let message = user_input(&criteria, &assignee);
             let req_allocation = {
-                let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
+                let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
                     component_id,
                     criteria,
@@ -151,11 +151,11 @@ fn allocate_token(
                     assignee,
                     assignment_hash,
                 });
-                OutboundComponentMsg::ApplicationMessage(
+                OutboundDelegateMsg::ApplicationMessage(
                     ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
                 )
             };
-            let request_user_input = OutboundComponentMsg::RequestUserInput(UserInputRequest {
+            let request_user_input = OutboundDelegateMsg::RequestUserInput(UserInputRequest {
                 request_id,
                 responses: RESPONSES
                     .iter()
@@ -167,9 +167,9 @@ fn allocate_token(
         }
         (Some(_), Some(_), _) => {
             // waiting for response
-            let context: ComponentContext = (&*context).try_into()?;
+            let context: DelegateContext = (&*context).try_into()?;
             let req_allocation = {
-                let msg = TokenComponentMessage::RequestNewToken(RequestNewToken {
+                let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
                     component_id,
                     criteria,
@@ -177,7 +177,7 @@ fn allocate_token(
                     assignee,
                     assignment_hash,
                 });
-                OutboundComponentMsg::ApplicationMessage(
+                OutboundDelegateMsg::ApplicationMessage(
                     ApplicationMessage::new(app, msg.serialize()?, false).with_context(context),
                 )
             };
@@ -187,26 +187,26 @@ fn allocate_token(
             // got response, check if allocation is allowed and return to application
             let application_response = match response {
                 Response::Allowed => {
-                    let context: ComponentContext = (&*context).try_into()?;
+                    let context: DelegateContext = (&*context).try_into()?;
                     let Some(assignment) = records.assign(assignee, &criteria, keypair, assignment_hash) else {
-                        let msg = TokenComponentMessage::Failure(FailureReason::NoFreeSlot { component_id, criteria } );
-                        return Ok(vec![OutboundComponentMsg::ApplicationMessage(
+                        let msg = TokenDelegateMessage::Failure(FailureReason::NoFreeSlot { component_id, criteria } );
+                        return Ok(vec![OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
                         )]);
                     };
-                    let msg = TokenComponentMessage::AllocatedToken {
+                    let msg = TokenDelegateMessage::AllocatedToken {
                         component_id,
                         assignment,
                         records,
                     };
-                    OutboundComponentMsg::ApplicationMessage(
+                    OutboundDelegateMsg::ApplicationMessage(
                         ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
                     )
                 }
                 Response::NotAllowed => {
-                    let context: ComponentContext = (&*context).try_into()?;
-                    let msg = TokenComponentMessage::Failure(FailureReason::UserPermissionDenied);
-                    OutboundComponentMsg::ApplicationMessage(
+                    let context: DelegateContext = (&*context).try_into()?;
+                    let msg = TokenDelegateMessage::Failure(FailureReason::UserPermissionDenied);
+                    OutboundDelegateMsg::ApplicationMessage(
                         ApplicationMessage::new(app, msg.serialize()?, true).with_context(context),
                     )
                 }
@@ -218,7 +218,7 @@ fn allocate_token(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum TokenComponentMessage {
+enum TokenDelegateMessage {
     RequestNewToken(RequestNewToken),
     AllocatedToken {
         component_id: SecretsId,
@@ -229,9 +229,9 @@ enum TokenComponentMessage {
     Failure(FailureReason),
 }
 
-impl TokenComponentMessage {
-    fn serialize(self) -> Result<Vec<u8>, ComponentError> {
-        bincode::serialize(&self).map_err(|err| ComponentError::Deser(format!("{err}")))
+impl TokenDelegateMessage {
+    fn serialize(self) -> Result<Vec<u8>, DelegateError> {
+        bincode::serialize(&self).map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
 
@@ -270,29 +270,29 @@ pub enum Response {
     NotAllowed,
 }
 
-impl TryFrom<ComponentContext> for Context {
-    type Error = ComponentError;
+impl TryFrom<DelegateContext> for Context {
+    type Error = DelegateError;
 
-    fn try_from(value: ComponentContext) -> Result<Self, Self::Error> {
-        bincode::deserialize(&value.0).map_err(|err| ComponentError::Deser(format!("{err}")))
+    fn try_from(value: DelegateContext) -> Result<Self, Self::Error> {
+        bincode::deserialize(&value.0).map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
 
-impl TryFrom<&Context> for ComponentContext {
-    type Error = ComponentError;
+impl TryFrom<&Context> for DelegateContext {
+    type Error = DelegateError;
 
     fn try_from(value: &Context) -> Result<Self, Self::Error> {
         bincode::serialize(value)
-            .map(ComponentContext::new)
-            .map_err(|err| ComponentError::Deser(format!("{err}")))
+            .map(DelegateContext::new)
+            .map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
 
-impl TryFrom<&[u8]> for TokenComponentMessage {
-    type Error = ComponentError;
+impl TryFrom<&[u8]> for TokenDelegateMessage {
+    type Error = DelegateError;
 
     fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
-        bincode::deserialize(payload).map_err(|err| ComponentError::Deser(format!("{err}")))
+        bincode::deserialize(payload).map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
 

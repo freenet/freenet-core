@@ -22,7 +22,7 @@ config = { version = "0.13.0", features = [ "toml" ] }
 crossbeam = "0.8.2"
 ctrlc = { version = "3.0", features = ["termination"] }
 dashmap = "^5.1"
-directories = "4"
+directories = "5"
 either = { workspace = true , features = ["serde"] }
 futures = "0.3.21"
 libp2p = { version = "0.42.2", features = [
@@ -51,9 +51,13 @@ sqlx = { version = "0.6", features = ["sqlite", "runtime-tokio-rustls"], optiona
 # TODO(kakoc): clang should be installed for rocksdb; write about that in prerequisites/dev guide
 rocksdb = { version = "0.20.0", default-features = false, optional = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
+pav_regression = "0.4.0"
+itertools = "0.10.5"
+ordered-float = "3.6.0"
+
 
 # Tracing deps
-tower-http = { version = "0.3", features = ["trace"] }
+tower-http = { version = "0.4", features = ["trace"] }
 tracing = { version = "0.1", optional = true }
 opentelemetry = { version = "0.19.0" , default-features = false, features = ["rt-tokio", "trace"], optional = true }
 opentelemetry-jaeger = { version = "0.17.0", features = ["rt-tokio","collector_client", "isahc"], optional = true }

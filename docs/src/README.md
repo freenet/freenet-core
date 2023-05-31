@@ -6,10 +6,10 @@
 
 Locutus is a global, [observable](https://en.wikipedia.org/wiki/Small-world_network), decentralized key-value store. Values are arbitrary blocks of data, called the contract's "state." Keys are cryptographic contracts that specify:
 
-* Whether a given state is permitted under this contract
-* How the state can be modified over time
-* How two valid states can be merged
-* How to efficiently synchronize a contract's state between peers
+- Whether a given state is permitted under this contract
+- How the state can be modified over time
+- How two valid states can be merged
+- How to efficiently synchronize a contract's state between peers
 
 Locutus is a true decentralized peer-to-peer network, and is robust and scalable, through its use of a [small-world network](https://en.wikipedia.org/wiki/Small-world_network).
 
@@ -49,7 +49,7 @@ Through this the application can:
 
 Contracts are extremely flexible. they can be used to create decentralized data structures like hashmaps, inverted indices for keyword search, or efficient buffers for streaming audio and video.
 
-## Component Ecosystem
+## Delegate Ecosystem
 
 Applications in Locutus don't need to be built from scratch, they can be built on top of components provided by us or others.
 
