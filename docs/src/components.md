@@ -1,9 +1,10 @@
-# Anatomy of a Decentralized Application
+# Building Decentralized Applications on Freenet
 
 Delegates, contracts, and user interfaces (UIs) each serve distinct roles in the
 Freenet ecosystem. Contracts control public data, or "shared state". Delegates
 act as the user's agent and can store private data on the user's behalf, while
-UIs provide an interface between these and the user through a web browser.
+UIs provide an interface between these and the user through a web browser. UIs
+are distributed through the P2P network via contracts.
 
 ![Architectural Primitives Diagram](components.svg)
 
@@ -15,17 +16,16 @@ computer. It's responsible for:
 * Providing a user-friendly interface to access Freenet via a web browser
 * Host the user's [delegates](#delegates) and the private data they store
 * Host [contracts](#contracts) and their associated data on behalf of the network
-* Manage communication between contracts, delegates, and UI componets
+* Manage communication between contracts, delegates, and UI components
 
 The kernel is written in Rust and is designed to be small (hopefully less than 5
 MB), efficient, and able to run on a wide range of devices like smartphones, desktop
 computers, and embedded devices.
-
+can 
 ## User Interface
 
 On the normal web, a user might visit https://gmail.com/, their browser
-will download the Gmail user interface which then runs in their browser and connects
-back to the Gmail servers. 
+will download the Gmail user interface which then runs in their browser and connects back to the Gmail servers. 
 
 On Freenet the user interface is downloaded from a Freenet contract, and it
 interacts with contracts and delegates through the Freenet kernel.
@@ -58,7 +58,9 @@ Contracts also outline how to merge two valid states, creating a new state that
 incorporates both. This process ensures [eventual
 consistency](https://en.wikipedia.org/wiki/Eventual_consistency) of the state in
 Freenet, using an approach akin to
-[CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
+[CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type). The contract
+defines a [commutative monoid](https://en.wikipedia.org/wiki/Monoid#Commutative_monoid)
+on the contract's state.
 
 Each contract is identified by a cryptographic hash, which is a combination of
 its code and parameters, also referred to as its "key". This key is used to
@@ -77,8 +79,7 @@ key.
 ## Delegates
 
 Delegates are WebAssembly code that act as user avatars on Freenet, they
-must implement the
-[ComponentInterface](https://github.com/freenet/locutus/blob/f1c8075e173f171c17ffa8d08803b2c9aea4ddf3/crates/locutus-stdlib/src/component_interface.rs#L121).
+must implement the [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121).
 
 Delegates run in the Freenet kernel and manage private data and interact with
 other Freenet entities like contracts, apps, and other delegates on behalf of

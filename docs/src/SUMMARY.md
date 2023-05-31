@@ -4,10 +4,12 @@
 
 - [Components](components.md)
 - [P2P Network](p2p-network.md)
+- [Intelligent Routing](irouting.md)
 
 # Developer Guide
 
 - [Tutorial: Create an App](tutorial.md)
+  - [Contract interfaces](contract-interface.md)
 - [locutus.toml format](manifest.md)
 
 # Examples

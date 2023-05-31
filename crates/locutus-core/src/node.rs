@@ -537,7 +537,7 @@ where
 pub struct PeerKey(PeerId);
 
 impl PeerKey {
-    // #[cfg(test)]
+    #[cfg(test)]
     pub fn random() -> Self {
         use libp2p::identity::Keypair;
         PeerKey::from(Keypair::generate_ed25519().public())

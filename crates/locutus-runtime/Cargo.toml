@@ -35,7 +35,7 @@ tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 thiserror = "1"
 walkdir = "2.3.2"
-wasmer = { workspace = true, default-features = false, features = [ "sys"] }
+wasmer = { workspace = true, features = [ "sys"] }
 varuint = "0.6"
 
 # internal
