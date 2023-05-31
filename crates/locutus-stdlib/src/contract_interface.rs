@@ -421,6 +421,16 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for UpdateData<'a> {
 /// }
 /// ```
 // ANCHOR: contractifce
+/// # ContractInterface
+///
+/// This trait defines the core functionality for managing and updating a contract's state.
+/// Implementations must ensure that state delta updates are *commutative*. In other words,
+/// when applying multiple delta updates to a state, the order in which these updates are
+/// applied should not affect the final state. Once all deltas are applied, the resulting
+/// state should be the same, regardless of the order in which the deltas were applied.
+///
+/// Noncompliant behavior, such as failing to obey the commutativity rule, may result
+/// in the contract being deprioritized or removed from the p2p network.
 pub trait ContractInterface {
     /// Verify that the state is valid, given the parameters.
     fn validate_state(
@@ -547,7 +557,7 @@ impl std::fmt::Display for Contract<'_> {
     }
 }
 
-#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
+#[cfg(all(any(test, feature = "testing"), any(unix, windows)))]
 impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let contract: ContractCode = u.arbitrary()?;
@@ -623,7 +633,7 @@ impl<'a> AsRef<[u8]> for Parameters<'a> {
     }
 }
 
-/// Data associated with a contract that can be retrieved by Applications and Components.
+/// Data associated with a contract that can be retrieved by Applications and Delegates.
 ///
 /// For efficiency and flexibility, contract state is represented as a simple [u8] byte array.
 #[serde_as]
@@ -827,7 +837,7 @@ impl<'a> DerefMut for StateSummary<'a> {
     }
 }
 
-#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
+#[cfg(all(any(test, feature = "testing"), any(unix, windows)))]
 impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
@@ -931,7 +941,7 @@ impl PartialEq for ContractCode<'_> {
 
 impl Eq for ContractCode<'_> {}
 
-#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
+#[cfg(all(any(test, feature = "testing"), any(unix, windows)))]
 impl<'a> arbitrary::Arbitrary<'a> for ContractCode<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
@@ -961,7 +971,7 @@ impl std::fmt::Display for ContractCode<'_> {
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 #[cfg_attr(
-    all(any(test, feature = "testing"), target_family = "unix"),
+    all(any(test, feature = "testing"), any(unix, windows)),
     derive(arbitrary::Arbitrary)
 )]
 #[repr(transparent)]
@@ -1022,7 +1032,7 @@ impl Display for ContractInstanceId {
 #[serde_as]
 #[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(
-    all(any(test, feature = "testing"), target_family = "unix"),
+    all(any(test, feature = "testing"), any(unix, windows)),
     derive(arbitrary::Arbitrary)
 )]
 pub struct ContractKey {
@@ -1681,7 +1691,7 @@ pub(crate) mod wasm_interface {
     conversion!(Result<StateDelta<'static>, ContractError>: ResultKind::StateDelta);
 }
 
-#[cfg(all(test, target_family = "unix"))]
+#[cfg(all(test, any(unix, windows)))]
 mod test {
     use super::*;
     use once_cell::sync::Lazy;

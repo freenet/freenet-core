@@ -33,15 +33,15 @@ xz2 = { version = "0.1", optional = true }
 # internal
 locutus-macros = { path = "../locutus-macros", version = "0.0.3" }
 
-[target.'cfg(target_family = "unix")'.dependencies]
+[target.'cfg(any(unix, windows))'.dependencies]
 tokio = { version = "1", optional = true, features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.18", optional = true } 
 
-[target.'cfg(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"))'.dependencies]
-serde-wasm-bindgen = { version = "0.4", optional = true }
+[target.'cfg(target_family = "wasm")'.dependencies]
+serde-wasm-bindgen = { version = "0.5", optional = true }
 wasm-bindgen = { version = "0.2", features = ["serde-serialize"], optional = true }
 
-[target.'cfg(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"))'.dependencies.web-sys]
+[target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 version = "0.3"
 features = [
   "BinaryType",
@@ -54,7 +54,7 @@ features = [
 ]
 optional = true
 
-[target.'cfg(target_family = "unix")'.dev-dependencies]
+[target.'cfg(any(unix, windows))'.dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 bincode = "1"
 wasmer = { version = "3", features = [ "sys-default"] }

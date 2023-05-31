@@ -7,7 +7,7 @@ use locutus_stdlib::{
 use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
 
 use crate::{
-    component_store::ComponentStore, contract_store::ContractStore, error::RuntimeInnerError,
+    contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
     native_api, secrets_store::SecretsStore, RuntimeResult,
 };
 
@@ -72,9 +72,9 @@ pub struct Runtime {
     pub(crate) enable_wasi: bool,
 
     pub(crate) secret_store: SecretsStore,
-    pub(crate) component_store: ComponentStore,
+    pub(crate) component_store: DelegateStore,
     /// loaded component modules
-    pub(crate) component_modules: HashMap<ComponentKey, Module>,
+    pub(crate) component_modules: HashMap<DelegateKey, Module>,
 
     /// Local contract storage.
     pub contract_store: ContractStore,
@@ -85,7 +85,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn build(
         contract_store: ContractStore,
-        component_store: ComponentStore,
+        component_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
     ) -> RuntimeResult<Self> {
@@ -179,7 +179,7 @@ impl Runtime {
 
     pub(crate) fn prepare_component_call(
         &mut self,
-        key: &ComponentKey,
+        key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
         let module = if let Some(module) = self.component_modules.get(key) {
@@ -188,7 +188,7 @@ impl Runtime {
             let contract = self
                 .component_store
                 .fetch_component(key)
-                .ok_or_else(|| RuntimeInnerError::ComponentNotFound(key.clone()))?;
+                .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let module = Module::new(&self.wasm_store, contract.as_ref())?;
             self.component_modules.insert(key.clone(), module);
             self.component_modules.get(key).unwrap()

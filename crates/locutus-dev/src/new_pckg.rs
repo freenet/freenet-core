@@ -128,8 +128,18 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
     Ok(())
 }
 
+#[cfg(windows)]
+const NPM: &str = "npm.cmd";
+#[cfg(unix)]
+const NPM: &str = "npm";
+
+#[cfg(windows)]
+const TSC: &str = "tsc.cmd";
+#[cfg(unix)]
+const TSC: &str = "tsc";
+
 fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
-    let child = Command::new("npm")
+    let child = Command::new(NPM)
         .args(["init", "--force"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -143,7 +153,7 @@ fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
     // todo: change pacakge.json:
     // - include dependencies: locutus-stdlib
 
-    let child = Command::new("tsc")
+    let child = Command::new(TSC)
         .args(["--init", "--pretty"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
