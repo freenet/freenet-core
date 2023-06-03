@@ -205,7 +205,7 @@ impl Inbox {
                 let f = async move {
                     crate::log::log("sending message 1");
                     let res =
-                        InboxModel::send_message(&mut client, content, recipient_key, &id).await;
+                        InboxModel::start_sending(&mut client, content, recipient_key, &id).await;
                     error_handling(client.into(), res, TryNodeAction::SendMessage).await;
                 };
                 futs.push(f.boxed_local());

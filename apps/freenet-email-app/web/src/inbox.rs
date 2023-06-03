@@ -270,7 +270,7 @@ impl InboxModel {
         INBOX_TO_ID.with(|map| map.borrow().get(key).cloned())
     }
 
-    pub async fn send_message(
+    pub async fn start_sending(
         client: &mut WebApiRequestClient,
         content: DecryptedMessage,
         recipient_key: RsaPublicKey,
@@ -287,6 +287,10 @@ impl InboxModel {
         let inbox_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         AftRecords::pending_assignment(delegate_key, inbox_key);
+        Ok(())
+    }
+
+    pub async fn finish_sending(client: &mut WebApiRequestClient, assignment: TokenAssignment) {
         // let delta = UpdateInbox::AddMessages {
         //     messages: vec![content.to_stored(token)?],
         // };
@@ -295,7 +299,9 @@ impl InboxModel {
         //     data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
         // };
         // client.send(request.into()).await?;
-        Ok(())
+        // todo: event after sending, we may fail to update, must keep this in mind in case we receive no confirmation
+        // meaning that we will need to retry, and likely need an other token for now at least, so restart from 0
+        todo!()
     }
 
     pub fn remove_messages(
