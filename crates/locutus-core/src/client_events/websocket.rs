@@ -12,8 +12,9 @@ use tower_http::trace::TraceLayer;
 
 use axum::routing::get;
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
-use locutus_runtime::prelude::TryFromTsStd;
-use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind, HostResponse};
+use locutus_stdlib::client_api::{
+    ClientRequest, ContractRequest, ErrorKind, HostResponse, TryFromTsStd,
+};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};

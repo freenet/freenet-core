@@ -9,6 +9,15 @@ pub(crate) fn log(msg: impl AsRef<str>) {
     let _ = msg;
 }
 
+pub(crate) fn debug(msg: impl AsRef<str>) {
+    let msg = msg.as_ref();
+    #[cfg(target_family = "wasm")]
+    {
+        web_sys::console::debug_1(&serde_wasm_bindgen::to_value(&msg).unwrap());
+    }
+    let _ = msg;
+}
+
 pub(crate) fn error(msg: impl AsRef<str>, action: Option<TryNodeAction>) {
     let error = msg.as_ref();
     if let Some(action) = action {

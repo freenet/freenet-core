@@ -18,7 +18,6 @@ pub mod web;
 /// Locutus stdlib prelude.
 pub mod prelude {
     pub use super::WasmLinearMem;
-    pub use crate::client_api::*;
     pub use crate::code_hash::*;
     pub use crate::contract_interface::wasm_interface::*;
     pub use crate::contract_interface::*;
