@@ -34,10 +34,8 @@ enum HostCallbackResult {
 pub mod local_node {
     use std::net::SocketAddr;
 
-    use locutus_core::{
-        either, ClientEventsProxy, Executor, OpenRequest, RequestError, WebSocketProxy,
-    };
-    use locutus_stdlib::client_api::{ClientError, ErrorKind};
+    use locutus_core::{either, ClientEventsProxy, Executor, OpenRequest, WebSocketProxy};
+    use locutus_stdlib::client_api::{ErrorKind, RequestError};
 
     use crate::{DynError, HttpGateway};
 
@@ -69,10 +67,7 @@ pub mod local_node {
                 Err(either::Left(err)) => {
                     tracing::error!("{err}");
                     http_handle
-                        .send(
-                            id,
-                            Err(ClientError::from(ErrorKind::Other(format!("{err}")))),
-                        )
+                        .send(id, Err(ErrorKind::from(err).into()))
                         .await?;
                 }
                 Err(either::Right(err)) => {

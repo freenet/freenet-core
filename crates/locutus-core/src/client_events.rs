@@ -1,11 +1,9 @@
 use futures::future::BoxFuture;
-use locutus_runtime::{ContractInstanceId, DelegateKey};
 use locutus_stdlib::client_api::ClientRequest;
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
 use std::fmt::Display;
 
-use locutus_runtime::prelude::ContractKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -83,39 +81,6 @@ pub trait ClientEventsProxy {
         response: Result<HostResponse, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>>;
 }
-
-#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
-pub enum RequestError {
-    #[error(transparent)]
-    ContractError(#[from] ContractError),
-    #[error(transparent)]
-    DelegateError(#[from] DelegateError),
-    #[error("client disconnect")]
-    Disconnect,
-}
-
-#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
-pub enum DelegateError {
-    #[error("error while registering delegate: {0}")]
-    RegisterError(DelegateKey),
-    #[error("execution error, cause: {0}")]
-    ExecutionError(String),
-}
-
-#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
-pub enum ContractError {
-    #[error("failed to get contract {key}, reason: {cause}")]
-    Get { key: ContractKey, cause: String },
-    #[error("put error for contract {key}, reason: {cause}")]
-    Put { key: ContractKey, cause: String },
-    #[error("update error for contract {key}, reason: {cause}")]
-    Update { key: ContractKey, cause: String },
-    #[error("failed to subscribe for contract {key}, reason: {cause}")]
-    Subscribe { key: ContractKey, cause: String },
-    #[error("missing related contract: {key}")]
-    MissingRelated { key: ContractInstanceId },
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     #![allow(unused)]
@@ -126,9 +91,10 @@ pub(crate) mod test {
 
     use futures::FutureExt;
     use locutus_runtime::{
-        ContractCode, ContractContainer, Parameters, RelatedContracts, TryFromTsStd, WasmAPIVersion,
+        prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId, DelegateKey,
+        Parameters, RelatedContracts, WasmAPIVersion,
     };
-    use locutus_stdlib::client_api::ContractRequest;
+    use locutus_stdlib::client_api::{ContractRequest, TryFromTsStd};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 

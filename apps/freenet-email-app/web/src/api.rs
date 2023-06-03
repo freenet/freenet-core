@@ -153,7 +153,10 @@ pub(crate) async fn node_comms(
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
     use futures::StreamExt;
-    use locutus_stdlib::{client_api::ContractResponse, prelude::ContractKey};
+    use locutus_stdlib::{
+        client_api::{ContractError, ContractResponse, ErrorKind, RequestError},
+        prelude::ContractKey,
+    };
 
     use crate::{
         aft::AftRecords,
@@ -197,13 +200,26 @@ pub(crate) async fn node_comms(
     async fn handle_response(
         res: Result<HostResponse, ClientError>,
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
-        token_to_id: &mut HashMap<ContractKey, Identity>,
+        token_rec_to_id: &mut HashMap<ContractKey, Identity>,
         inboxes: &mut crate::app::InboxesData,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
         let res = match res {
             Ok(r) => r,
             Err(e) => {
+                if let ErrorKind::RequestError(err) = e.kind() {
+                    // FIXME: handle the different possible errors
+                    match err {
+                        RequestError::ContractError(ContractError::Update { key, .. }) => {
+                            // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
+                            // we should reject that pending assignment
+                            todo!()
+                        }
+                        RequestError::ContractError(e) => todo!(),
+                        RequestError::DelegateError(_) => todo!(),
+                        RequestError::Disconnect => todo!(),
+                    }
+                }
                 crate::log::error(format!("received error: {e}"), None);
                 return;
             }
@@ -244,12 +260,12 @@ pub(crate) async fn node_comms(
                         inboxes.store(Arc::new(with_new));
                     }
                     inbox_to_id.insert(key, identity);
-                } else if let Some(identity) = token_to_id.remove(&key) {
+                } else if let Some(identity) = token_rec_to_id.remove(&key) {
                     // is a AFT record contract
                     if let Err(e) = AftRecords::set(identity.clone(), state.into()) {
                         crate::log::error(format!("error setting an AFT record: {e}"), None);
                     }
-                    token_to_id.insert(key, identity);
+                    token_rec_to_id.insert(key, identity);
                 } else {
                     unreachable!("tried to get wrong contract key: {key}")
                 }
@@ -291,7 +307,7 @@ pub(crate) async fn node_comms(
                         // }
                         _ => unreachable!(),
                     }
-                } else if let Some(identity) = token_to_id.remove(&key) {
+                } else if let Some(identity) = token_rec_to_id.remove(&key) {
                     // is a AFT record contract
                     match update {
                         UpdateData::Delta(delta) => {
@@ -301,7 +317,7 @@ pub(crate) async fn node_comms(
                                     None,
                                 );
                             }
-                            token_to_id.insert(key, identity);
+                            token_rec_to_id.insert(key, identity);
                         }
                         _ => unreachable!(),
                     }
@@ -309,7 +325,11 @@ pub(crate) async fn node_comms(
                     unreachable!("tried to get wrong contract key: {key}")
                 }
             }
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => {}
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
+                if let Some(identity) = token_rec_to_id.remove(&key) {
+                    // fixme: this may be a confirmation that a new token assignment has been appended to the record
+                }
+            }
             HostResponse::DelegateResponse { key, values } => {
                 for msg in values {
                     match msg {
@@ -329,12 +349,13 @@ pub(crate) async fn node_comms(
                                 TokenDelegateMessage::AllocatedToken { assignment, .. } => {
                                     let token_contract_key =
                                         ContractKey::from(assignment.token_record);
-                                    if let Some(identity) = token_to_id.remove(&token_contract_key)
+                                    if let Some(identity) =
+                                        token_rec_to_id.remove(&token_contract_key)
                                     {
                                         if let Err(e) = AftRecords::allocated_assignment(
                                             &mut client,
-                                            &identity,
-                                            &key,
+                                            identity.clone(),
+                                            key.clone(),
                                             assignment,
                                         )
                                         .await
@@ -347,7 +368,7 @@ pub(crate) async fn node_comms(
                                                 None,
                                             );
                                         }
-                                        token_to_id.insert(token_contract_key, identity);
+                                        token_rec_to_id.insert(token_contract_key, identity);
                                     } else {
                                         unreachable!("tried to get wrong contract key: {key}")
                                     }
@@ -395,6 +416,7 @@ pub(crate) async fn node_comms(
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };
+                crate::log::debug(format!("sending request to API: {req:?}"));
                 api.api.send(req).await.unwrap();
             }
             error = api.client_errors.next() => {

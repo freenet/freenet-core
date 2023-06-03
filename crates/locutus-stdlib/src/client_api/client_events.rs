@@ -4,12 +4,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
     delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
-    prelude::{
-        ContractKey, Parameters, RelatedContracts, StateSummary, TryFromTsStd, UpdateData,
-        WrappedState, WsApiError,
-    },
+    prelude::{ContractKey, Parameters, RelatedContracts, StateSummary, UpdateData, WrappedState},
     versioning::ContractContainer,
 };
+
+use super::{TryFromTsStd, WsApiError};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientError {
@@ -48,14 +47,14 @@ pub enum ErrorKind {
     IncorrectState(ContractKey),
     #[error("node not available")]
     NodeUnavailable,
-    #[error("undhandled error: {0}")]
-    Other(String),
     #[error("lost the connection with the protocol hanling connections")]
     TransportProtocolDisconnect,
     #[error("unhandled error: {cause}")]
     Unhandled { cause: String },
     #[error("unknown client id: {0}")]
     UnknownClient(usize),
+    #[error(transparent)]
+    RequestError(#[from] RequestError),
 }
 
 impl Display for ClientError {
@@ -65,6 +64,42 @@ impl Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+pub enum RequestError {
+    #[error(transparent)]
+    ContractError(#[from] ContractError),
+    #[error(transparent)]
+    DelegateError(#[from] DelegateError),
+    #[error("client disconnect")]
+    Disconnect,
+}
+
+/// Errors that may happen while interacting with delegates.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+pub enum DelegateError {
+    #[error("error while registering delegate: {0}")]
+    RegisterError(DelegateKey),
+    #[error("execution error, cause: {0}")]
+    ExecutionError(String),
+}
+
+/// Errors that may happen while interacting with contracts.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+pub enum ContractError {
+    #[error("failed to get contract {key}, reason: {cause}")]
+    Get { key: ContractKey, cause: String },
+    #[error("put error for contract {key}, reason: {cause}")]
+    Put { key: ContractKey, cause: String },
+    #[error("update error for contract {key}, reason: {cause}")]
+    Update { key: ContractKey, cause: String },
+    #[error("failed to subscribe for contract {key}, reason: {cause}")]
+    Subscribe { key: ContractKey, cause: String },
+    #[error("missing related contract: {key}")]
+    MissingRelated {
+        key: crate::contract_interface::ContractInstanceId,
+    },
+}
 
 /// A request from a client application to the host.
 #[derive(Serialize, Deserialize, Debug, Clone)]
