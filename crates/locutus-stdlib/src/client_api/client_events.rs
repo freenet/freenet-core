@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display, io::Cursor};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
@@ -278,6 +278,10 @@ impl<'a> From<DelegateRequest<'a>> for ClientRequest<'a> {
 pub enum DelegateRequest<'a> {
     ApplicationMessages {
         key: DelegateKey,
+        #[serde(
+            serialize_with = "DelegateRequest::ser_params",
+            deserialize_with = "DelegateRequest::deser_params"
+        )]
         params: Parameters<'a>,
         inbound: Vec<InboundDelegateMsg<'a>>,
     },
@@ -313,6 +317,21 @@ impl DelegateRequest<'_> {
             },
             DelegateRequest::UnregisterDelegate(key) => DelegateRequest::UnregisterDelegate(key),
         }
+    }
+
+    fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+    {
+        data.serialize(ser)
+    }
+
+    fn deser_params<'de, 'a, D>(deser: D) -> Result<Parameters<'a>, D::Error>
+        where
+            D: Deserializer<'de>,
+    {
+        let bytes_vec: Vec<u8> = Deserialize::deserialize(deser)?;
+        Ok(Parameters::from(bytes_vec))
     }
 }
 
