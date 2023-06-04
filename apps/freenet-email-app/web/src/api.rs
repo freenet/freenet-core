@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
-use locutus_aft_interface::TokenDelegateMessage;
+use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 use once_cell::sync::OnceCell;
@@ -213,9 +213,12 @@ pub(crate) async fn node_comms(
                         RequestError::ContractError(ContractError::Update { key, .. }) => {
                             // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
                             // we should reject that pending assignment
+
+                            // FIXME: in case this is for an inbox contract we were trying to update, this means
+                            // the message wasn't delivered successfully, so may need to try again and/or notify the user
                             todo!()
                         }
-                        RequestError::ContractError(e) => todo!(),
+                        RequestError::ContractError(_) => todo!(),
                         RequestError::DelegateError(_) => todo!(),
                         RequestError::Disconnect => todo!(),
                     }
@@ -327,7 +330,11 @@ pub(crate) async fn node_comms(
             }
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
                 if let Some(identity) = token_rec_to_id.remove(&key) {
-                    // fixme: this may be a confirmation that a new token assignment has been appended to the record
+                    let summary = TokenAllocationSummary::try_from(summary).unwrap();
+                    AftRecords::confirm_allocation(&mut client, key.id(), summary)
+                        .await
+                        .unwrap();
+                    token_rec_to_id.insert(key, identity);
                 }
             }
             HostResponse::DelegateResponse { key, values } => {
@@ -354,7 +361,6 @@ pub(crate) async fn node_comms(
                                     {
                                         if let Err(e) = AftRecords::allocated_assignment(
                                             &mut client,
-                                            identity.clone(),
                                             key.clone(),
                                             assignment,
                                         )
@@ -373,10 +379,13 @@ pub(crate) async fn node_comms(
                                         unreachable!("tried to get wrong contract key: {key}")
                                     }
                                 }
-                                TokenDelegateMessage::Failure(reason) => crate::log::error(
-                                    format!("{reason}"),
-                                    Some(TryNodeAction::SendMessage),
-                                ),
+                                TokenDelegateMessage::Failure(reason) => {
+                                    // FIXME: this may mean a pending message waiting for a token has failed, and need to notify that in the UI
+                                    crate::log::error(
+                                        format!("{reason}"),
+                                        Some(TryNodeAction::SendMessage),
+                                    )
+                                }
                                 TokenDelegateMessage::RequestNewToken(_) => unreachable!(),
                             }
                         }

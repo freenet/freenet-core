@@ -1,10 +1,15 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use chrono::{DateTime, Utc};
-use locutus_aft_interface::{TokenAllocationRecord, TokenAssignment, TokenParameters};
+use locutus_aft_interface::{
+    TokenAllocationRecord, TokenAllocationSummary, TokenAssignment, TokenParameters,
+};
 use locutus_stdlib::client_api::ContractRequest;
-use locutus_stdlib::prelude::{ContractKey, DelegateKey, State, StateDelta, UpdateData};
+use locutus_stdlib::prelude::{
+    ContractInstanceId, ContractKey, DelegateKey, State, StateDelta, UpdateData,
+};
 
+use crate::inbox::InboxModel;
 use crate::{
     api::WebApiRequestClient,
     app::{error_handling, Identity, TryNodeAction},
@@ -19,25 +24,29 @@ pub(crate) static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
 pub(crate) struct AftRecords {}
 
 type InboxContract = ContractKey;
-
+type AftRecord = ContractInstanceId;
 type AftDelegate = DelegateKey;
 
 thread_local! {
     static RECORDS: RefCell<HashMap<Identity, TokenAllocationRecord>> = RefCell::new(HashMap::new());
     /// Contracts that require a token assingment still for a pending message.
-    static PENDING_TOKEN_ASSIGNMENT: RefCell<HashMap<DelegateKey, Vec<InboxContract>>> = RefCell::new(HashMap::new());
+    static PENDING_TOKEN_ASSIGNMENT: RefCell<HashMap<AftDelegate, Vec<InboxContract>>> = RefCell::new(HashMap::new());
     /// Assignments obtained from the delegate that need to be inserted in the record still.
-    static PENDING_CONFIRMED_ASSIGNMENTS: RefCell<HashMap<AftDelegate, Vec<PendingAssignmentRegister>>> = RefCell::new(HashMap::new());
+    static PENDING_CONFIRMED_ASSIGNMENTS: RefCell<HashMap<AftRecord, Vec<PendingAssignmentRegister>>> = RefCell::new(HashMap::new());
     /// A token which has been confirmed as valid by a contract update.
-    static VALID_TOKEN: RefCell<HashMap<DelegateKey, Vec<TokenAssignment>>> = RefCell::new(HashMap::new());
+    static VALID_TOKEN: RefCell<HashMap<AftDelegate, Vec<TokenAssignment>>> = RefCell::new(HashMap::new());
 }
 
+// FIXME: we should check time to time in the API coroutine if any of the pending assignments
+// have not been verified; if that's the case we may need to request again and cannot guarantee
+// that a message has been delivered
 struct PendingAssignmentRegister {
     /// time at which the request started
     start: DateTime<Utc>,
-    time_slot: DateTime<Utc>,
-    tier: locutus_aft_interface::Tier,
-    requester: Identity,
+    // time_slot: DateTime<Utc>,
+    // tier: locutus_aft_interface::Tier,
+    record: TokenAssignment,
+    requester: AftDelegate,
 }
 
 impl AftRecords {
@@ -81,73 +90,56 @@ impl AftRecords {
         })
     }
 
-    fn recv_token(id: &DelegateKey) -> Option<TokenAssignment> {
-        VALID_TOKEN.with(|t| {
-            let ids = &mut *t.borrow_mut();
-            ids.get_mut(id).and_then(|v| v.pop())
-        })
+    pub async fn confirm_allocation(
+        client: &mut WebApiRequestClient,
+        aft_record: AftRecord,
+        summary: TokenAllocationSummary,
+    ) -> Result<(), DynError> {
+        let Some(confirmed) = PENDING_CONFIRMED_ASSIGNMENTS.with(|pending| {
+            let pending = &mut *pending.borrow_mut();
+            pending.get_mut(&aft_record).and_then(|registers| {
+                registers
+                    .iter()
+                    .position(|r| {
+                        // fixme: the summary should also have the assignment hash
+                        if summary.contains_alloc(r.record.tier, r.record.time_slot) {
+                            return true;
+                        }
+                        false
+                    })
+                    .map(|idx| registers.remove(idx))
+            })
+        }) else { return Ok(()) };
+        // we have a valid token now, so we can update the inbox contract
+        InboxModel::finish_sending(client, confirmed.record).await;
+        Ok(())
     }
 
     pub async fn allocated_assignment(
         client: &mut WebApiRequestClient,
-        identity: Identity,
         delegate_key: DelegateKey,
-        assignment: TokenAssignment,
+        record: TokenAssignment,
     ) -> Result<(), DynError> {
         // update the token record contract for this delegate.
-        let key = ContractKey::from(assignment.token_record);
+        let key = ContractKey::from(record.token_record);
         let request = ContractRequest::Update {
             key,
-            data: UpdateData::Delta(serde_json::to_vec(&assignment)?.into()),
+            data: UpdateData::Delta(serde_json::to_vec(&record)?.into()),
         };
         client.send(request.into()).await?;
+        let token_record = record.token_record;
         let pending_register = PendingAssignmentRegister {
             start: Utc::now(),
-            time_slot: assignment.time_slot,
-            tier: assignment.tier,
-            requester: identity,
+            record,
+            requester: delegate_key,
         };
         PENDING_CONFIRMED_ASSIGNMENTS.with(|pending| {
             let pending = &mut *pending.borrow_mut();
             pending
-                .entry(delegate_key)
+                .entry(token_record)
                 .or_default()
                 .push(pending_register);
         });
-        // TOKEN.with(|t| {
-        //     let tr = &mut *t.borrow_mut();
-        //     match tr.get_mut(delegate_key) {
-        //         Some(tokens) => tokens.push(assignment),
-        //         None => {
-        //             tr.insert(delegate_key.clone(), vec![assignment]);
-        //         }
-        //     }
-        // });
-
-        // let start = Utc::now();
-        // let mut allocated = false;
-        // let timeout = chrono::Duration::milliseconds(100);
-        // while (Utc::now() - start) > timeout {
-        //     allocated = RECORDS.with(|recs| {
-        //         let recs = &mut *recs.borrow_mut();
-        //         if let Some(record) = recs.get(identity) {
-        //             if record.assignment_exists(assignment) {
-        //                 return true;
-        //             }
-        //         }
-        //         false
-        //     });
-        //     if allocated {
-        //         break;
-        //     }
-        // }
-        // if allocated {
-        //     Ok(())
-        // } else {
-        //     // todo: if a collision occurs, the operation should be retried until there are no more tokens available
-        //     // return an error to signal that
-        //     todo!()
-        // }
         Ok(())
     }
 

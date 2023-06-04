@@ -1137,6 +1137,10 @@ impl ContractKey {
     pub fn encoded_contract_id(&self) -> String {
         self.instance.encode()
     }
+
+    pub fn id(&self) -> ContractInstanceId {
+        self.instance
+    }
 }
 
 impl Deref for ContractKey {

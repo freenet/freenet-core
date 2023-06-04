@@ -680,6 +680,23 @@ impl TryFrom<TokenAllocationRecord> for StateDelta<'static> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenAllocationSummary(HashMap<Tier, Vec<i64>>);
 
+impl TokenAllocationSummary {
+    pub fn contains_alloc(&self, tier: Tier, slot: DateTime<Utc>) -> bool {
+        self.0
+            .get(&tier)
+            .and_then(|assignments| {
+                let slot = slot.timestamp();
+                for ts in assignments {
+                    if *ts == slot {
+                        return Some(());
+                    }
+                }
+                return None;
+            })
+            .is_some()
+    }
+}
+
 impl TryFrom<StateSummary<'_>> for TokenAllocationSummary {
     type Error = ContractError;
 
