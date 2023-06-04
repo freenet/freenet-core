@@ -166,6 +166,7 @@ pub(crate) async fn node_comms(
 
     let mut inbox_contract_to_id = HashMap::new();
     let mut token_contract_to_id = HashMap::new();
+    let mut id_to_token_contract = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -174,7 +175,7 @@ pub(crate) async fn node_comms(
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
     let mut req_sender = api.sender_half();
-    crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id)
+    crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id, &mut id_to_token_contract)
         .await;
     crate::aft::AftRecords::load_all(&mut req_sender, &contracts, &mut token_contract_to_id).await;
     crate::log::log("requested inboxes");
@@ -201,6 +202,7 @@ pub(crate) async fn node_comms(
         res: Result<HostResponse, ClientError>,
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_rec_to_id: &mut HashMap<ContractKey, Identity>,
+        id_to_token_contract: &mut HashMap<Identity, ContractKey>,
         inboxes: &mut crate::app::InboxesData,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
@@ -330,11 +332,14 @@ pub(crate) async fn node_comms(
             }
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
                 if let Some(identity) = token_rec_to_id.remove(&key) {
-                    let summary = TokenAllocationSummary::try_from(summary).unwrap();
-                    AftRecords::confirm_allocation(&mut client, key.id(), summary)
-                        .await
-                        .unwrap();
-                    token_rec_to_id.insert(key, identity);
+                    if let Some(inbox_contract) = id_to_token_contract.remove(&identity){
+                        let summary = TokenAllocationSummary::try_from(summary).unwrap();
+                        AftRecords::confirm_allocation(&mut client, key.id(), summary, inbox_contract)
+                            .await
+                            .unwrap();
+                        token_rec_to_id.insert(key.clone(), identity.clone());
+                        id_to_token_contract.insert(identity, key);
+                    }
                 }
             }
             HostResponse::DelegateResponse { key, values } => {
@@ -409,6 +414,7 @@ pub(crate) async fn node_comms(
                     res,
                     &mut inbox_contract_to_id,
                     &mut token_contract_to_id,
+                    &mut id_to_token_contract,
                     &mut inboxes,
                 )
                 .await;

@@ -94,6 +94,7 @@ impl AftRecords {
         client: &mut WebApiRequestClient,
         aft_record: AftRecord,
         summary: TokenAllocationSummary,
+        inbox_contract: ContractKey,
     ) -> Result<(), DynError> {
         let Some(confirmed) = PENDING_CONFIRMED_ASSIGNMENTS.with(|pending| {
             let pending = &mut *pending.borrow_mut();
@@ -111,7 +112,7 @@ impl AftRecords {
             })
         }) else { return Ok(()) };
         // we have a valid token now, so we can update the inbox contract
-        InboxModel::finish_sending(client, confirmed.record).await;
+        InboxModel::finish_sending(client, confirmed.record, inbox_contract).await?;
         Ok(())
     }
 

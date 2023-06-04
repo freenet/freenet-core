@@ -43,7 +43,13 @@ use freenet_email_inbox::{
     UpdateInbox,
 };
 
+type InboxContract = ContractKey;
+
 static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
+
+thread_local! {
+    static PENDING_INBOXES_UPDATE: RefCell<HashMap<InboxContract, Vec<DecryptedMessage>>> = RefCell::new(HashMap::new());
+}
 
 #[derive(Debug, Clone)]
 struct InternalSettings {
@@ -202,6 +208,7 @@ impl InboxModel {
         client: &mut WebApiRequestClient,
         contracts: &[Identity],
         contract_to_id: &mut HashMap<ContractKey, Identity>,
+        id_to_token_contract: &mut HashMap<Identity, ContractKey>,
     ) {
         async fn subscribe(
             client: &mut WebApiRequestClient,
@@ -237,6 +244,9 @@ impl InboxModel {
                 contract_to_id
                     .entry(key.clone())
                     .or_insert(identity.clone());
+                id_to_token_contract
+                    .entry(identity.clone())
+                    .or_insert(key.clone());
                 key
             });
             error_handling(client.into(), res.map(|_| ()), TryNodeAction::LoadInbox).await;
@@ -286,22 +296,47 @@ impl InboxModel {
         .map_err(|e| format!("{e}"))?;
         let inbox_key =
             ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-        AftRecords::pending_assignment(delegate_key, inbox_key);
+        AftRecords::pending_assignment(delegate_key, inbox_key.clone());
+
+        PENDING_INBOXES_UPDATE.with(|map| {
+            let map = &mut *map.borrow_mut();
+            map.entry(inbox_key).or_insert_with(Vec::new).push(content);
+        });
+
         Ok(())
     }
 
-    pub async fn finish_sending(client: &mut WebApiRequestClient, assignment: TokenAssignment) {
-        // let delta = UpdateInbox::AddMessages {
-        //     messages: vec![content.to_stored(token)?],
-        // };
-        // let request = ContractRequest::Update {
-        //     key,
-        //     data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
-        // };
-        // client.send(request.into()).await?;
-        // todo: event after sending, we may fail to update, must keep this in mind in case we receive no confirmation
-        // meaning that we will need to retry, and likely need an other token for now at least, so restart from 0
-        todo!()
+    pub async fn finish_sending(client: &mut WebApiRequestClient, assignment: TokenAssignment, inbox_contract: ContractKey) -> Result<(), DynError> {
+        let pending_update = PENDING_INBOXES_UPDATE.with(|map| {
+            let map = &mut *map.borrow_mut();
+            let update = map.get_mut(&inbox_contract).and_then(|messages| {
+                if !messages.is_empty() {
+                    Some(messages.remove(0))
+                } else {
+                    None
+                }
+            });
+            if let Some(messages) = map.get(&inbox_contract) {
+                if messages.is_empty() {
+                    map.remove(&inbox_contract);
+                }
+            }
+            update
+        });
+
+        if let Some(update) = pending_update {
+            let delta = UpdateInbox::AddMessages {
+                messages: vec![update.to_stored(assignment)?],
+            };
+            let request = ContractRequest::Update {
+                key: inbox_contract,
+                data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
+            };
+            client.send(request.into()).await?;
+            // todo: event after sending, we may fail to update, must keep this in mind in case we receive no confirmation
+            // meaning that we will need to retry, and likely need an other token for now at least, so restart from 0
+        }
+        Ok(())
     }
 
     pub fn remove_messages(
@@ -489,14 +524,14 @@ impl InboxModel {
             assignee: recipient_key.clone(),
             assignment_hash,
         });
-        let request = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+        let request = DelegateRequest::ApplicationMessages {
             key: delegate_key.clone(),
             params: delegate_params.try_into()?,
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(inbox_key.into(), token_request.serialize()?),
             )],
-        });
-        client.send(request).await?;
+        };
+        client.send(request.into()).await?;
 
         // let start = Utc::now();
         // let mut token = None;
