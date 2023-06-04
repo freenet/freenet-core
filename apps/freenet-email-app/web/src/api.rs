@@ -52,7 +52,7 @@ impl WebApi {
         let (tx, rx) = futures::channel::oneshot::channel();
         let onopen_handler = move || {
             tx.send(());
-            crate::log::log("connected to websocket");
+            crate::log::debug!("connected to websocket");
         };
         let mut api = locutus_stdlib::client_api::WebApi::start(
             conn,
@@ -166,7 +166,7 @@ pub(crate) async fn node_comms(
 
     let mut inbox_contract_to_id = HashMap::new();
     let mut token_contract_to_id = HashMap::new();
-    let mut id_to_token_contract = HashMap::new();
+    // let mut id_to_token_contract = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -175,10 +175,9 @@ pub(crate) async fn node_comms(
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
     let mut req_sender = api.sender_half();
-    crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id, &mut id_to_token_contract)
+    crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id)
         .await;
     crate::aft::AftRecords::load_all(&mut req_sender, &contracts, &mut token_contract_to_id).await;
-    crate::log::log("requested inboxes");
     WEB_API_SENDER.set(req_sender).unwrap();
 
     async fn handle_action(
@@ -202,7 +201,6 @@ pub(crate) async fn node_comms(
         res: Result<HostResponse, ClientError>,
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_rec_to_id: &mut HashMap<ContractKey, Identity>,
-        id_to_token_contract: &mut HashMap<Identity, ContractKey>,
         inboxes: &mut crate::app::InboxesData,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
@@ -243,14 +241,14 @@ pub(crate) async fn node_comms(
                         let x = e.borrow();
                         x.key == key
                     }) {
-                        crate::log::log(format!(
+                        crate::log::debug!(
                             "loaded inbox {key} with {} messages",
                             updated_model.messages.len()
-                        ));
+                        );
                         let mut current = (*loaded_models[pos]).borrow_mut();
                         *current = updated_model;
                     } else {
-                        crate::log::log(format!("updated inbox {key}"));
+                        crate::log::debug!("updated inbox {key}");
                         let mut with_new = (***loaded_models).to_vec();
                         std::mem::drop(loaded_models);
                         with_new.push(Rc::new(RefCell::new(updated_model)));
@@ -260,7 +258,7 @@ pub(crate) async fn node_comms(
                                 .map(|i| format!("{}", i.borrow().key))
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            crate::log::log(format!("loaded inboxes: {keys}"));
+                            crate::log::debug!("loaded inboxes: {keys}");
                         }
                         inboxes.store(Arc::new(with_new));
                     }
@@ -293,10 +291,10 @@ pub(crate) async fn node_comms(
                                 if inbox.clone().borrow().key == key {
                                     let mut inbox = (**inbox).borrow_mut();
                                     inbox.merge(updated_model);
-                                    crate::log::log(format!(
+                                    crate::log::debug!(
                                         "updated inbox {key} with {} messages",
                                         inbox.messages.len()
-                                    ));
+                                    );
                                     found = true;
                                     break;
                                 }
@@ -332,14 +330,11 @@ pub(crate) async fn node_comms(
             }
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
                 if let Some(identity) = token_rec_to_id.remove(&key) {
-                    if let Some(inbox_contract) = id_to_token_contract.remove(&identity){
-                        let summary = TokenAllocationSummary::try_from(summary).unwrap();
-                        AftRecords::confirm_allocation(&mut client, key.id(), summary, inbox_contract)
-                            .await
-                            .unwrap();
-                        token_rec_to_id.insert(key.clone(), identity.clone());
-                        id_to_token_contract.insert(identity, key);
-                    }
+                    let summary = TokenAllocationSummary::try_from(summary).unwrap();
+                    AftRecords::confirm_allocation(&mut client, key.id(), summary)
+                        .await
+                        .unwrap();
+                    token_rec_to_id.insert(key, identity.clone());
                 }
             }
             HostResponse::DelegateResponse { key, values } => {
@@ -403,7 +398,10 @@ pub(crate) async fn node_comms(
                     }
                 }
             }
-            _ => todo!(),
+            HostResponse::Ok => {}
+            other => {
+                crate::log::error(format!("message not handled: {other:?}"), None);
+            }
         }
     }
 
@@ -414,7 +412,6 @@ pub(crate) async fn node_comms(
                     res,
                     &mut inbox_contract_to_id,
                     &mut token_contract_to_id,
-                    &mut id_to_token_contract,
                     &mut inboxes,
                 )
                 .await;
@@ -431,7 +428,7 @@ pub(crate) async fn node_comms(
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };
-                crate::log::debug(format!("sending request to API: {req:?}"));
+                crate::log::debug!("sending request to API: {req:?}");
                 api.api.send(req).await.unwrap();
             }
             error = api.client_errors.next() => {

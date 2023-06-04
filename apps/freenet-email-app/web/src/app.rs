@@ -92,7 +92,7 @@ impl std::fmt::Display for TryNodeAction {
 }
 
 pub(crate) fn App(cx: Scope) -> Element {
-    crate::log::log("render app");
+    crate::log::debug!("rendering app");
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
 
@@ -192,7 +192,7 @@ impl Inbox {
         let mut futs = Vec::with_capacity(content.to.len());
         #[cfg(feature = "use-node")]
         {
-            crate::log::log(format!("sending message from {from}"));
+            crate::log::debug!("sending message from {from}");
             for recipient_encoded_key in content.to.iter() {
                 let content = content.clone();
                 let mut client = client.clone();
@@ -203,7 +203,6 @@ impl Inbox {
                     continue;
                 };
                 let f = async move {
-                    crate::log::log("sending message 1");
                     let res =
                         InboxModel::start_sending(&mut client, content, recipient_key, &id).await;
                     error_handling(client.into(), res, TryNodeAction::SendMessage).await;
@@ -211,7 +210,6 @@ impl Inbox {
                 futs.push(f.boxed_local());
             }
         }
-        crate::log::log("create future");
         let _ = client;
         Ok(futs)
     }
@@ -571,11 +569,7 @@ fn InboxComponent(cx: Scope) -> Element {
                 let m = Message::from(msg.clone());
                 emails.push(m);
             }
-            crate::log::log(format!(
-                "active id: {:?}; emails number: {}",
-                id.alias,
-                emails.len()
-            ));
+            crate::log::debug!("active id: {:?}; emails number: {}", id.alias, emails.len());
         }
     }
 
