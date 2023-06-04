@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use locutus_stdlib::prelude::*;
+use serde::{Deserialize, Serialize};
 
 struct AliasAllocationDelegate;
 

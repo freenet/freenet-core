@@ -1,6 +1,6 @@
 use crate::app::TryNodeAction;
 
-pub(crate) fn log(msg: impl AsRef<str>) {
+pub(crate) fn _log(msg: impl AsRef<str>) {
     let msg = msg.as_ref();
     #[cfg(target_family = "wasm")]
     {
@@ -9,7 +9,19 @@ pub(crate) fn log(msg: impl AsRef<str>) {
     let _ = msg;
 }
 
-pub(crate) fn debug(msg: impl AsRef<str>) {
+macro_rules! debug {
+    ($($msg:tt)*) => {{
+        #[cfg(debug_assertions)]
+        {
+            let msg = format!($($msg)*);
+            crate::log::__debug_internal(msg)
+        }
+    }};
+}
+
+pub(crate) use debug;
+
+pub(crate) fn __debug_internal(msg: impl AsRef<str>) {
     let msg = msg.as_ref();
     #[cfg(target_family = "wasm")]
     {
