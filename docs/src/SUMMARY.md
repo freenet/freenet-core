@@ -23,5 +23,5 @@
 
 # Reference
 
-- [FAQ](faq.md)
 - [Glossary](glossary.md)
+- [FAQ](https://freenet.org/faq)
