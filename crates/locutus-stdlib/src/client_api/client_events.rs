@@ -320,15 +320,15 @@ impl DelegateRequest<'_> {
     }
 
     fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
+    where
+        S: Serializer,
     {
         data.serialize(ser)
     }
 
     fn deser_params<'de, 'a, D>(deser: D) -> Result<Parameters<'a>, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         let bytes_vec: Vec<u8> = Deserialize::deserialize(deser)?;
         Ok(Parameters::from(bytes_vec))

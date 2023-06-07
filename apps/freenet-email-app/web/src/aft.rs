@@ -170,25 +170,30 @@ impl AftRecords {
 
     pub async fn assign_token(
         client: &mut WebApiRequestClient,
-        recipient_key: RsaPublicKey,
         generator_id: &Identity,
         assignment_hash: [u8; 32],
     ) -> Result<DelegateKey, DynError> {
         static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
-        let inbox_params: Parameters = InboxParams {
-            pub_key: recipient_key.clone(),
-        }
-        .try_into()?;
+        let sender_key = generator_id.key.to_public_key();
+        let token_params: Parameters = TokenParameters::new(sender_key.clone())
+            .try_into()
+            .map_err(|e| format!("{e}"))
+            .unwrap();
         let delegate_key = DelegateKey::from_params(
             crate::aft::TOKEN_GENERATOR_DELEGATE_CODE_HASH,
-            inbox_params.clone(),
+            token_params.clone(),
         )?;
+
+        let inbox_params: Parameters = InboxParams {
+            pub_key: sender_key.clone(),
+        }
+        .try_into()?;
         let inbox_key =
             ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, inbox_params.clone())?;
         let delegate_params =
             locutus_aft_interface::DelegateParameters::new(generator_id.key.clone());
 
-        let record_params = TokenParameters::new(generator_id.key.to_public_key());
+        let record_params = TokenParameters::new(sender_key.clone());
         let token_record: ContractInstanceId = ContractKey::from_params(
             crate::aft::TOKEN_RECORD_CODE_HASH,
             record_params.try_into()?,
@@ -208,7 +213,7 @@ impl AftRecords {
             delegate_id: delegate_key.clone().into(),
             criteria,
             records,
-            assignee: recipient_key.clone(),
+            assignee: sender_key.clone(),
             assignment_hash,
         });
         let request = DelegateRequest::ApplicationMessages {

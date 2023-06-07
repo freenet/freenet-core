@@ -127,8 +127,11 @@ async fn put_delegate(
         (cipher, nonce)
     };
 
+    let delegate = Delegate::from((&code, &params));
+    println!("Putting delegate {} ", delegate.key().encode());
+
     let request = DelegateRequest::RegisterDelegate {
-        delegate: Delegate::from((&code, &params)),
+        delegate,
         cipher,
         nonce,
     }
