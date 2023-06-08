@@ -51,7 +51,7 @@ impl WebApi {
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         let onopen_handler = move || {
-            tx.send(());
+            let _ = tx.send(());
             crate::log::debug!("connected to websocket");
         };
         let mut api = locutus_stdlib::client_api::WebApi::start(

@@ -23,6 +23,11 @@ all:
 	$(MAKE) run-web &
 	wait
 
+build: \
+	build-tool \
+	build-inbox \
+	build-token-allocation
+
 build-inbox: \
 	build-inbox-0 publish-inbox-0 \
 	build-inbox-1 publish-inbox-1 \
