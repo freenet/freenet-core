@@ -37,8 +37,8 @@ impl DelegateInterface for TokenDelegate {
                     TokenDelegateMessage::RequestNewToken(req) => {
                         allocate_token(params, &mut context, app, req)
                     }
-                    TokenDelegateMessage::Failure { .. } => Err(DelegateError::Other(
-                        "unexpected message type: failure".into(),
+                    TokenDelegateMessage::Failure(reason) => Err(DelegateError::Other(
+                        format!("unexpected message type: failure; reason: {reason}"),
                     )),
                     TokenDelegateMessage::AllocatedToken { .. } => Err(DelegateError::Other(
                         "unexpected message type: allocated token".into(),
