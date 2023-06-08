@@ -361,7 +361,6 @@ pub(crate) async fn node_comms(
                                     {
                                         if let Err(e) = AftRecords::allocated_assignment(
                                             &mut client,
-                                            key.clone(),
                                             assignment,
                                         )
                                         .await

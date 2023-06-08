@@ -75,7 +75,7 @@ run-node:
 run-web:
 	cd $(INBOX_WEB_DIR)
 	trunk build --features use-node --no-default-features
-	trunk serve --features use-node --no-default-features
+	trunk serve --features use-node --no-default-features --port 57616
 
 clean:
 	rm -rf $(CARGO_TARGET_DIR)

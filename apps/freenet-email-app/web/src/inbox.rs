@@ -276,7 +276,8 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let sender_key = from.key.to_public_key();
         let (hash, _) = content.assignment_hash_and_signed_content(&sender_key)?;
-        let delegate_key = AftRecords::assign_token(client, from, hash).await?;
+        let delegate_key =
+            AftRecords::assign_token(client, recipient_key.clone(), from, hash).await?;
         let params = InboxParams {
             pub_key: recipient_key,
         }
