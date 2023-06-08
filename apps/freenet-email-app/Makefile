@@ -67,16 +67,19 @@ publish-token-generator-delegate-%:
 generate-inbox-contract-code-hash:
 	cd $(INBOX_DIR)
 	hash=$$(bash -c "ldt inspect build/locutus/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
+	mkdir -p $(WEB_DIR_SRC)/../build
 	echo -n $$hash > $(WEB_DIR_SRC)/../build/inbox_code_hash
 
 generate-token-allocation-code-hash:
 	cd $(AFT_RECORD)
 	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
+	mkdir -p $(WEB_DIR_SRC)/../build
 	echo -n $$hash > $(WEB_DIR_SRC)/../build/token_allocation_record_code_hash
 
 generate-token-generator-delegate-code-hash:
 	cd $(AFT_GENERATOR)
 	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_generator delegate | grep 'code hash:' | cut -d' ' -f3")
+	mkdir -p $(WEB_DIR_SRC)/../build
 	echo -n $$hash > $(WEB_DIR_SRC)/../build/token_generator_code_hash
 
 run-node:
