@@ -3,8 +3,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use locutus_aft_interface::*;
 use locutus_stdlib::prelude::*;
-use rsa::pkcs1v15::SigningKey;
-use rsa::sha2::Sha256;
 use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 
@@ -246,7 +244,7 @@ trait TokenAssignmentInternal {
 impl TokenAssignmentInternal for TokenAllocationRecord {
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
-    #[cfg(feature = "node")]
+    #[cfg(all(feature = "node", target_arch = "wasm"))]
     fn assign(
         &mut self,
         assignee: Assignee,
@@ -254,6 +252,8 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::sha2::Sha256;
         use rsa::signature::Signer;
         #[cfg(target_arch = "wasm")]
         #[inline(always)]
@@ -284,7 +284,7 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         Some(assignment)
     }
 
-    #[cfg(not(feature = "node"))]
+    #[cfg(any(not(target_arch = "wasm"), not(feature = "node")))]
     fn assign(
         &mut self,
         _assignee: Assignee,

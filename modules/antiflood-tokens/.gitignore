@@ -1,1 +1,2 @@
 **/**/build
+!contracts/token-allocation-record/build
