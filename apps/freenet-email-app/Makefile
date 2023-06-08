@@ -23,6 +23,11 @@ all:
 	$(MAKE) run-web &
 	wait
 
+build: \
+	build-tool \
+	build-inbox \
+	build-token-allocation
+
 build-inbox: \
 	build-inbox-0 publish-inbox-0 \
 	build-inbox-1 publish-inbox-1 \
@@ -32,8 +37,7 @@ build-token-allocation: \
 	build-token-allocation-contract-0 publish-token-allocation-contract-0 \
 	build-token-allocation-contract-1 publish-token-allocation-contract-1 \
 	build-token-generator-0 publish-token-generator-delegate-0 \
-	build-token-generator-1 publish-token-generator-delegate-1 \
-	generate-token-allocation-code-hash generate-token-generator-delegate-code-hash
+	build-token-generator-1 publish-token-generator-delegate-1 
 
 build-tool:
 	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
@@ -67,17 +71,8 @@ publish-token-generator-delegate-%:
 generate-inbox-contract-code-hash:
 	cd $(INBOX_DIR)
 	hash=$$(bash -c "ldt inspect build/locutus/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
+	mkdir -p $(WEB_DIR_SRC)/../build
 	echo -n $$hash > $(WEB_DIR_SRC)/../build/inbox_code_hash
-
-generate-token-allocation-code-hash:
-	cd $(AFT_RECORD)
-	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
-	echo -n $$hash > $(WEB_DIR_SRC)/../build/token_allocation_record_code_hash
-
-generate-token-generator-delegate-code-hash:
-	cd $(AFT_GENERATOR)
-	hash=$$(bash -c "ldt inspect build/locutus/locutus_token_generator delegate | grep 'code hash:' | cut -d' ' -f3")
-	echo -n $$hash > $(WEB_DIR_SRC)/../build/token_generator_code_hash
 
 run-node:
 	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,info locutus-node local
@@ -85,7 +80,7 @@ run-node:
 run-web:
 	cd $(INBOX_WEB_DIR)
 	trunk build --features use-node --no-default-features
-	trunk serve --features use-node --no-default-features
+	trunk serve --features use-node --no-default-features --port 57616
 
 clean:
 	rm -rf $(CARGO_TARGET_DIR)

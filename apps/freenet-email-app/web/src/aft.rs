@@ -22,9 +22,10 @@ use crate::{
 };
 
 pub(crate) static TOKEN_RECORD_CODE_HASH: &str =
-    include_str!("../build/token_allocation_record_code_hash");
+    include_str!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/token_allocation_record_code_hash");
+
 pub(crate) static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
-    include_str!("../build/token_generator_code_hash");
+    include_str!("../../../../modules/antiflood-tokens/delegates/token-generator/build/token_generator_code_hash");
 
 pub(crate) struct AftRecords {}
 
@@ -55,7 +56,6 @@ struct PendingAssignmentRegister {
     // time_slot: DateTime<Utc>,
     // tier: locutus_aft_interface::Tier,
     record: TokenAssignment,
-    requester: AftDelegate,
     inbox: InboxContract,
 }
 
@@ -127,7 +127,6 @@ impl AftRecords {
 
     pub async fn allocated_assignment(
         client: &mut WebApiRequestClient,
-        delegate_key: AftDelegate,
         record: TokenAssignment,
     ) -> Result<(), DynError> {
         let Some(inbox) = PENDING_INBOXES_UPDATES.with(|queue| {
@@ -155,7 +154,6 @@ impl AftRecords {
         let pending_register = PendingAssignmentRegister {
             start: Utc::now(),
             record,
-            requester: delegate_key,
             inbox,
         };
         PENDING_CONFIRMED_ASSIGNMENTS.with(|pending| {
@@ -170,6 +168,7 @@ impl AftRecords {
 
     pub async fn assign_token(
         client: &mut WebApiRequestClient,
+        recipient_key: RsaPublicKey,
         generator_id: &Identity,
         assignment_hash: [u8; 32],
     ) -> Result<DelegateKey, DynError> {
@@ -185,7 +184,7 @@ impl AftRecords {
         )?;
 
         let inbox_params: Parameters = InboxParams {
-            pub_key: sender_key.clone(),
+            pub_key: recipient_key.clone(),
         }
         .try_into()?;
         let inbox_key =
@@ -213,14 +212,16 @@ impl AftRecords {
             delegate_id: delegate_key.clone().into(),
             criteria,
             records,
-            assignee: sender_key.clone(),
+            assignee: recipient_key.clone(),
             assignment_hash,
         });
+        // FIXME: this should come from the contract which is distributiong this app, just a stub
+        const DISTRIBUTION_APP_KEY: ContractInstanceId = ContractInstanceId::new([1; 32]);
         let request = DelegateRequest::ApplicationMessages {
             key: delegate_key.clone(),
             params: delegate_params.try_into()?,
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
-                ApplicationMessage::new(inbox_key.clone().into(), token_request.serialize()?),
+                ApplicationMessage::new(DISTRIBUTION_APP_KEY, token_request.serialize()?),
             )],
         };
         PENDING_INBOXES_UPDATES.with(|queue| {

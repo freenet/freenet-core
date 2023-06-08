@@ -9,7 +9,7 @@ mod delegate_interface;
 pub(crate) mod global;
 mod parameters;
 pub mod rand;
-#[cfg(feature = "time")]
+#[cfg(all(feature = "time", target_family = "wasm"))]
 pub mod time;
 mod versioning;
 #[cfg(feature = "archive")]

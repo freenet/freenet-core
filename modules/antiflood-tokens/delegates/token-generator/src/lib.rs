@@ -3,8 +3,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use locutus_aft_interface::*;
 use locutus_stdlib::prelude::*;
-use rsa::pkcs1v15::SigningKey;
-use rsa::sha2::Sha256;
 use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 
@@ -204,6 +202,9 @@ impl TryFrom<DelegateContext> for Context {
     type Error = DelegateError;
 
     fn try_from(value: DelegateContext) -> Result<Self, Self::Error> {
+        if value == DelegateContext::default() {
+            return Ok(Self::default());
+        }
         bincode::deserialize(&value.0).map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
@@ -243,7 +244,7 @@ trait TokenAssignmentInternal {
 impl TokenAssignmentInternal for TokenAllocationRecord {
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
-    #[cfg(feature = "node")]
+    #[cfg(all(feature = "node", target_arch = "wasm"))]
     fn assign(
         &mut self,
         assignee: Assignee,
@@ -251,9 +252,20 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
-        use locutus_stdlib::time;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::sha2::Sha256;
         use rsa::signature::Signer;
-        let current = time::now();
+        #[cfg(target_arch = "wasm")]
+        #[inline(always)]
+        fn current() -> DateTime<Utc> {
+            locutus_stdlib::time::now()
+        }
+        #[cfg(not(target_arch = "wasm"))]
+        #[inline(always)]
+        fn current() -> DateTime<Utc> {
+            Utc::now()
+        }
+        let current = current();
         let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
             let msg = TokenAssignment::signature_content(&time_slot, &assignee, criteria.frequency);
@@ -272,7 +284,7 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         Some(assignment)
     }
 
-    #[cfg(not(feature = "node"))]
+    #[cfg(any(not(target_arch = "wasm"), not(feature = "node")))]
     fn assign(
         &mut self,
         _assignee: Assignee,

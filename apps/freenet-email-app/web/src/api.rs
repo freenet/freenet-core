@@ -51,7 +51,7 @@ impl WebApi {
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         let onopen_handler = move || {
-            tx.send(());
+            let _ = tx.send(());
             crate::log::debug!("connected to websocket");
         };
         let mut api = locutus_stdlib::client_api::WebApi::start(
@@ -219,7 +219,12 @@ pub(crate) async fn node_comms(
                             todo!()
                         }
                         RequestError::ContractError(_) => todo!(),
-                        RequestError::DelegateError(_) => todo!(),
+                        RequestError::DelegateError(error) => {
+                            crate::log::error(
+                                format!("received delagte request error: {error}"),
+                                None,
+                            );
+                        }
                         RequestError::Disconnect => todo!(),
                     }
                 }
@@ -361,7 +366,6 @@ pub(crate) async fn node_comms(
                                     {
                                         if let Err(e) = AftRecords::allocated_assignment(
                                             &mut client,
-                                            key.clone(),
                                             assignment,
                                         )
                                         .await

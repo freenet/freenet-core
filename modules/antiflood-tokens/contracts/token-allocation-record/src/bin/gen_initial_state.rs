@@ -14,9 +14,7 @@ use rsa::{sha2::Sha256, Pkcs1v15Sign, RsaPrivateKey};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
-static TOKEN_RECORD_CODE_HASH: &str = include_str!(
-    "../../../../../../apps/freenet-email-app/web/build/token_allocation_record_code_hash"
-);
+static TOKEN_RECORD_CODE_HASH: &str = include_str!("../../build/token_allocation_record_code_hash");
 
 struct Args {
     _key_id: String,

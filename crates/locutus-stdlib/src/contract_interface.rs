@@ -975,6 +975,10 @@ impl std::fmt::Display for ContractCode<'_> {
 pub struct ContractInstanceId(#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] [u8; CONTRACT_KEY_SIZE]);
 
 impl ContractInstanceId {
+    pub const fn new(key: [u8; CONTRACT_KEY_SIZE]) -> Self {
+        Self(key)
+    }
+
     /// `Base58` string representation of the `contract id`.
     pub fn encode(&self) -> String {
         bs58::encode(self.0)
