@@ -219,7 +219,12 @@ pub(crate) async fn node_comms(
                             todo!()
                         }
                         RequestError::ContractError(_) => todo!(),
-                        RequestError::DelegateError(_) => todo!(),
+                        RequestError::DelegateError(error) => {
+                            crate::log::error(
+                                format!("received delagte request error: {error}"),
+                                None,
+                            );
+                        }
                         RequestError::Disconnect => todo!(),
                     }
                 }

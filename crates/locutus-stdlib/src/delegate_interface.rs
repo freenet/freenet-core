@@ -303,7 +303,7 @@ pub trait DelegateInterface {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegateContext(pub Vec<u8>);
 
 impl DelegateContext {
@@ -371,6 +371,12 @@ impl InboundDelegateMsg<'_> {
             }
             _ => None,
         }
+    }
+}
+
+impl From<ApplicationMessage> for InboundDelegateMsg<'_> {
+    fn from(value: ApplicationMessage) -> Self {
+        Self::ApplicationMessage(value)
     }
 }
 

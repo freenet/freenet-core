@@ -691,7 +691,7 @@ impl TokenAllocationSummary {
                         return Some(());
                     }
                 }
-                return None;
+                None
             })
             .is_some()
     }

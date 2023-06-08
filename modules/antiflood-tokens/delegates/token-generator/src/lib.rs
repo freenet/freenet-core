@@ -204,6 +204,9 @@ impl TryFrom<DelegateContext> for Context {
     type Error = DelegateError;
 
     fn try_from(value: DelegateContext) -> Result<Self, Self::Error> {
+        if value == DelegateContext::default() {
+            return Ok(Self::default());
+        }
         bincode::deserialize(&value.0).map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
@@ -251,9 +254,18 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
-        use locutus_stdlib::time;
         use rsa::signature::Signer;
-        let current = time::now();
+        #[cfg(target_arch = "wasm")]
+        #[inline(always)]
+        fn current() -> DateTime<Utc> {
+            locutus_stdlib::time::now()
+        }
+        #[cfg(not(target_arch = "wasm"))]
+        #[inline(always)]
+        fn current() -> DateTime<Utc> {
+            Utc::now()
+        }
+        let current = current();
         let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
             let msg = TokenAssignment::signature_content(&time_slot, &assignee, criteria.frequency);
