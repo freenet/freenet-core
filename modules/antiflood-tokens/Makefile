@@ -31,7 +31,7 @@ build-token-allocation-contract:
 
 build-token-generator:
 	cd $(AFT_GENERATOR)
-	ldt build --package-type delegate --features node
+	ldt build --package-type delegate
 
 generate-token-allocation-code-hash:
 	cd $(AFT_RECORD)

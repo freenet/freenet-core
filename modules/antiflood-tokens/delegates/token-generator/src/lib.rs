@@ -37,9 +37,9 @@ impl DelegateInterface for TokenDelegate {
                     TokenDelegateMessage::RequestNewToken(req) => {
                         allocate_token(params, &mut context, app, req)
                     }
-                    TokenDelegateMessage::Failure(reason) => Err(DelegateError::Other(
-                        format!("unexpected message type: failure; reason: {reason}"),
-                    )),
+                    TokenDelegateMessage::Failure(reason) => Err(DelegateError::Other(format!(
+                        "unexpected message type: failure; reason: {reason}"
+                    ))),
                     TokenDelegateMessage::AllocatedToken { .. } => Err(DelegateError::Other(
                         "unexpected message type: allocated token".into(),
                     )),
@@ -244,7 +244,6 @@ trait TokenAssignmentInternal {
 impl TokenAssignmentInternal for TokenAllocationRecord {
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
-    #[cfg(all(feature = "node", target_arch = "wasm"))]
     fn assign(
         &mut self,
         assignee: Assignee,
@@ -255,12 +254,12 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         use rsa::pkcs1v15::SigningKey;
         use rsa::sha2::Sha256;
         use rsa::signature::Signer;
-        #[cfg(target_arch = "wasm")]
+        #[cfg(target_family = "wasm")]
         #[inline(always)]
         fn current() -> DateTime<Utc> {
             locutus_stdlib::time::now()
         }
-        #[cfg(not(target_arch = "wasm"))]
+        #[cfg(not(target_family = "wasm"))]
         #[inline(always)]
         fn current() -> DateTime<Utc> {
             Utc::now()
@@ -282,17 +281,6 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         };
         self.append_unchecked(assignment.clone());
         Some(assignment)
-    }
-
-    #[cfg(any(not(target_arch = "wasm"), not(feature = "node")))]
-    fn assign(
-        &mut self,
-        _assignee: Assignee,
-        _criteria: &AllocationCriteria,
-        _key: &RsaPrivateKey,
-        _assignment_hash: AssignmentHash,
-    ) -> Option<TokenAssignment> {
-        None
     }
 
     fn next_free_assignment(

@@ -63,7 +63,7 @@ publish-token-allocation-contract-%:
 build-token-generator-%:
 	cd $(AFT_GENERATOR)
 	cargo run --bin gen_pub_key -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
-	ldt build --package-type delegate --features node
+	ldt build --package-type delegate
 
 publish-token-generator-delegate-%:
 	cd $(AFT_GENERATOR) && ldt publish --code build/locutus/locutus_token_generator --parameters examples/generator_pub_key_$* delegate

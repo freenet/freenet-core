@@ -1,6 +1,5 @@
 use locutus_aft_interface::{
-    AllocationError, TokenAllocationRecord, TokenAllocationSummary, TokenAssignment,
-    TokenParameters,
+    AllocationError, TokenAllocationRecord, TokenAssignment, TokenParameters,
 };
 use locutus_stdlib::prelude::*;
 use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256};
