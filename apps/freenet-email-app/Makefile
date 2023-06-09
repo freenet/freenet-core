@@ -54,7 +54,7 @@ publish-inbox-%:
 build-token-allocation-contract-%:
 	cd $(AFT_RECORD)
 	cargo run --bin gen_pub_key -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
-	cargo run --bin gen_initial_state -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem" "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"; \
+	cargo run --bin gen_initial_state -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem" "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
 	ldt build
 
 publish-token-allocation-contract-%:
@@ -63,7 +63,7 @@ publish-token-allocation-contract-%:
 build-token-generator-%:
 	cd $(AFT_GENERATOR)
 	cargo run --bin gen_pub_key -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"
-	ldt build --package-type delegate --features node
+	ldt build --package-type delegate
 
 publish-token-generator-delegate-%:
 	cd $(AFT_GENERATOR) && ldt publish --code build/locutus/locutus_token_generator --parameters examples/generator_pub_key_$* delegate

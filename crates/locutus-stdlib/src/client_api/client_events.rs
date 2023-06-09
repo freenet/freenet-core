@@ -344,7 +344,7 @@ impl Display for ClientRequest<'_> {
                 } => {
                     write!(f, "put request for contract {contract} with state {state}")
                 }
-                ContractRequest::Update { key, .. } => write!(f, "Update request for {key}"),
+                ContractRequest::Update { key, .. } => write!(f, "update request for {key}"),
                 ContractRequest::Get {
                     key,
                     fetch_contract: contract,

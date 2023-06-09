@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.dependencies]
 bincode = { version = "1" }
 bs58 = "0.4"
-chrono = { version = "0.4.23", default-features = false, features = ["alloc", "serde"] }
+chrono = { version = "0.4.23", default-features = false }
 locutus-stdlib = { version = "0.0.3", path = "../../crates/locutus-stdlib" }
 rsa = { version = "0.8.2", default-features = false, features = ["serde", "pem"] }
 serde = { version = "1" }

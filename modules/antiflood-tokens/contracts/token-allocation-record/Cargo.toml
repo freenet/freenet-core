@@ -15,4 +15,4 @@ pico-args = "0.5"
 locutus-aft-interface = { path = "../../interfaces" }
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]

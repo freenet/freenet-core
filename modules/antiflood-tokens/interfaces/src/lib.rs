@@ -220,7 +220,13 @@ impl Tier {
                     && time.nanosecond() == 0;
                 if !is_rounded {
                     let duration = chrono::Duration::from_std(self.tier_duration()).unwrap();
-                    time = time.with_second(0).unwrap().with_minute(0).unwrap();
+                    time = time
+                        .with_second(0)
+                        .unwrap()
+                        .with_minute(0)
+                        .unwrap()
+                        .with_hour(0)
+                        .unwrap();
                     time = time.trunc_subsecs(0);
                     time += duration;
                 }
@@ -280,7 +286,13 @@ impl Tier {
             && time.nanosecond() == 0
             && delta.num_days() % base_day == 0;
         if !is_rounded {
-            time = time.with_second(0).unwrap().with_minute(0).unwrap();
+            time = time
+                .with_second(0)
+                .unwrap()
+                .with_minute(0)
+                .unwrap()
+                .with_hour(0)
+                .unwrap();
             time = time.trunc_subsecs(0);
             let days_in_time = delta.num_days();
             let remainder_days = (days_in_time % base_day) as u32;
@@ -332,6 +344,10 @@ mod tier_tests {
 
     #[test]
     fn is_correct_day() {
+        let day1_tier = Tier::Day1;
+        assert!(day1_tier.is_valid_slot(get_date(2023, 1, 8)));
+        assert!(!day1_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(12).unwrap()));
+
         let day7_tier = Tier::Day7;
         assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
         assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
@@ -474,14 +490,23 @@ impl TryFrom<DelegateParameters> for Parameters<'static> {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum InvalidReason {
+    #[error("invalid slot")]
+    InvalidSlot,
+    #[error("invalid signature")]
+    SignatureMismatch,
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct AllocationError(Box<AllocationErrorInner>);
 
 impl AllocationError {
-    pub fn invalid_assignment(assignment: TokenAssignment) -> Self {
-        Self(Box::new(AllocationErrorInner::InvalidAssignment(
-            assignment,
-        )))
+    pub fn invalid_assignment(record: TokenAssignment, reason: InvalidReason) -> Self {
+        Self(Box::new(AllocationErrorInner::InvalidAssignment {
+            record,
+            reason,
+        }))
     }
 
     pub fn allocated_slot(assignment: &TokenAssignment) -> Self {
@@ -505,8 +530,11 @@ enum AllocationErrorInner {
     AllocatedSlot { tier: Tier, slot: DateTime<Utc> },
     #[error("the max age allowed is 730 days")]
     IncorrectMaxAge,
-    #[error("the following assignment is incorrect: {0}")]
-    InvalidAssignment(TokenAssignment),
+    #[error("the following assignment is incorrect: {record}, reason: {reason}")]
+    InvalidAssignment {
+        record: TokenAssignment,
+        reason: InvalidReason,
+    },
 }
 
 #[non_exhaustive]
@@ -724,8 +752,8 @@ pub type TokenAssignmentHash = [u8; 32];
 pub struct TokenAssignment {
     pub tier: Tier,
     pub time_slot: DateTime<Utc>,
-    /// The assignment, the recipient decides whether this assignment is valid based on this field.
-    /// This will often be a public key.
+    /// The assignee of the token, the recipient decides whether this assignment is valid based on this field.
+    /// This will tipically be the public key of the token generator.
     pub assignee: Assignee,
     #[serde(with = "token_sig_ser")]
     /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
@@ -827,12 +855,13 @@ impl TryFrom<StateDelta<'_>> for TokenAssignment {
 
 impl Display for TokenAssignment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let assignment = bs58::encode(self.assignment_hash).into_string();
         write!(
             f,
-            "{{ {tier} @ {slot} for {assignee:?}}}",
+            "{{ {tier} @ {slot} for assignment `{assignment}`, record: {record}}}",
             tier = self.tier,
             slot = self.time_slot,
-            assignee = self.assignee
+            record = self.token_record
         )
     }
 }
