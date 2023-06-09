@@ -187,7 +187,10 @@ async fn execute_command(
         .await
         .map_err(|e| match e {
             either::Either::Right(e) => e,
-            either::Either::Left(_) => unreachable!(),
+            either::Either::Left(e) => {
+                tracing::error!("{e}");
+                e.into()
+            }
         })?;
 
     Ok(())

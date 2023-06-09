@@ -119,7 +119,7 @@ pub(crate) struct DecryptedMessage {
 impl DecryptedMessage {
     fn to_stored(&self, mut token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
         let (hash, content) =
-            self.assignment_hash_and_signed_content(&token_assignment.assignee)?;
+            self.assignment_hash_and_signed_content(&token_assignment.generator)?;
         token_assignment.assignment_hash = hash;
         Ok::<_, DynError>(StoredMessage {
             content,

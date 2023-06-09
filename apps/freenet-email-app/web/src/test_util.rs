@@ -10,7 +10,7 @@ pub(crate) fn test_assignment() -> TokenAssignment {
     TokenAssignment {
         tier: Tier::Day1,
         time_slot: Default::default(),
-        assignee: key.to_public_key(),
+        generator: key.to_public_key(),
         signature: rsa::pkcs1v15::Signature::from(vec![1; 64].into_boxed_slice()),
         assignment_hash: [0; 32],
         token_record: ContractInstanceId::from_str("7MxRGrYiBBK2rHCVpP25SxqBLco2h4zpb2szsTS7XXgg")

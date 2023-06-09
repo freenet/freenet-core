@@ -248,6 +248,8 @@ impl Executor {
                         .map_err(Either::Right)?
                         .clone();
                     let mut retrieved_contracts = Vec::new();
+                    tracing::info!("update: {data:?}");
+                    tracing::info!("params: {parameters:?}");
                     retrieved_contracts.push(data);
                     loop {
                         let update_modification = self
