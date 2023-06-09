@@ -93,7 +93,6 @@ fn allocate_token(
         delegate_id,
         criteria,
         mut records,
-        assignee,
         assignment_hash,
     }: RequestNewToken,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
@@ -108,14 +107,13 @@ fn allocate_token(
             // request user input and add to waiting queue
             context.waiting_for_user_input.insert(request_id);
             let context: DelegateContext = (&*context).try_into()?;
-            let message = user_input(&criteria, &assignee);
+            let message = user_input(&criteria, &params.generator_private_key.to_public_key());
             let req_allocation = {
                 let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
                     delegate_id,
                     criteria,
                     records,
-                    assignee,
                     assignment_hash,
                 });
                 OutboundDelegateMsg::ApplicationMessage(
@@ -141,7 +139,6 @@ fn allocate_token(
                     delegate_id,
                     criteria,
                     records,
-                    assignee,
                     assignment_hash,
                 });
                 OutboundDelegateMsg::ApplicationMessage(
@@ -155,7 +152,7 @@ fn allocate_token(
             let application_response = match response {
                 Response::Allowed => {
                     let context: DelegateContext = (&*context).try_into()?;
-                    let Some(assignment) = records.assign(assignee, &criteria, &params.generator_private_key, assignment_hash) else {
+                    let Some(assignment) = records.assign(&criteria, &params.generator_private_key, assignment_hash) else {
                         let msg = TokenDelegateMessage::Failure(FailureReason::NoFreeSlot { delegate_id, criteria } );
                         return Ok(vec![OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app, msg.serialize()?).with_context(context),
@@ -225,7 +222,6 @@ impl TryFrom<&Context> for DelegateContext {
 trait TokenAssignmentInternal {
     fn assign(
         &mut self,
-        assignee: Assignee,
         criteria: &AllocationCriteria,
         private_key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
@@ -246,9 +242,8 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
     fn assign(
         &mut self,
-        assignee: Assignee,
         criteria: &AllocationCriteria,
-        key: &RsaPrivateKey,
+        generator_pk: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
         use rsa::pkcs1v15::SigningKey;
@@ -267,13 +262,17 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         let current = current();
         let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
-            let msg = TokenAssignment::signature_content(&time_slot, &assignee, criteria.frequency);
-            let signing_key = SigningKey::<Sha256>::new_with_prefix(key.clone());
+            let msg = TokenAssignment::signature_content(
+                &time_slot,
+                criteria.frequency,
+                &assignment_hash,
+            );
+            let signing_key = SigningKey::<Sha256>::new_with_prefix(generator_pk.clone());
             let signature = signing_key.sign(&msg);
             TokenAssignment {
                 tier: criteria.frequency,
                 time_slot,
-                assignee,
+                generator: generator_pk.to_public_key(),
                 signature,
                 assignment_hash,
                 token_record: criteria.contract,

@@ -197,9 +197,9 @@ impl Inbox {
             if !records.assignment_exists(&message.token_assignment) {
                 return Err(VerificationError::TokenAssignmentMismatch);
             }
-            (message.token_assignment.assignee == params.pub_key)
-                .then_some(())
-                .ok_or(VerificationError::InvalidInboxKey)?;
+            // (message.token_assignment.assignee == params.pub_key)
+            //     .then_some(())
+            //     .ok_or(VerificationError::InvalidInboxKey)?;
         }
         if !missing.is_empty() {
             return Err(VerificationError::MissingContracts(missing));
@@ -212,9 +212,9 @@ impl Inbox {
         message: Message,
         params: &InboxParams,
     ) -> Result<(), VerificationError> {
-        (message.token_assignment.assignee == params.pub_key)
-            .then_some(())
-            .ok_or(VerificationError::InvalidInboxKey)?;
+        // (message.token_assignment.assignee == params.pub_key)
+        //     .then_some(())
+        //     .ok_or(VerificationError::InvalidInboxKey)?;
         self.messages.push(message);
         Ok(())
     }

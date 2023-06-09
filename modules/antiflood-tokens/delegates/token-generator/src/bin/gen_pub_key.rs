@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-use locutus_aft_interface::TokenParameters;
+use locutus_aft_interface::TokenDelegateParameters;
 use locutus_stdlib::prelude::Parameters;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 
@@ -28,7 +28,7 @@ fn main() {
     let private_key = RsaPrivateKey::from_pkcs1_pem(private_key_str).unwrap();
     let generator_public_key = private_key.to_public_key();
     let inbox_path = PathBuf::from(MANIFEST);
-    let params: Parameters = TokenParameters::new(generator_public_key)
+    let params: Parameters = TokenDelegateParameters::new(generator_public_key)
         .try_into()
         .map_err(|e| format!("{e}"))
         .unwrap();

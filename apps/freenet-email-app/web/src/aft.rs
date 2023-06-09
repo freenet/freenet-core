@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use freenet_email_inbox::InboxParams;
 use locutus_aft_interface::{
     AllocationCriteria, RequestNewToken, Tier, TokenAllocationRecord, TokenAllocationSummary,
-    TokenAssignment, TokenDelegateMessage, TokenParameters,
+    TokenAssignment, TokenDelegateMessage, TokenDelegateParameters,
 };
 use locutus_stdlib::client_api::{ContractRequest, DelegateRequest};
 use locutus_stdlib::prelude::{
@@ -84,7 +84,7 @@ impl AftRecords {
         client: &mut WebApiRequestClient,
         identity: &Identity,
     ) -> Result<AftRecord, DynError> {
-        let params = TokenParameters::new(identity.key.to_public_key())
+        let params = TokenDelegateParameters::new(identity.key.to_public_key())
             .try_into()
             .map_err(|e| format!("{e}"))?;
         let contract_key =
@@ -187,7 +187,7 @@ impl AftRecords {
     ) -> Result<DelegateKey, DynError> {
         static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
         let sender_key = generator_id.key.to_public_key();
-        let token_params: Parameters = TokenParameters::new(sender_key.clone())
+        let token_params: Parameters = TokenDelegateParameters::new(sender_key.clone())
             .try_into()
             .map_err(|e| format!("{e}"))
             .unwrap();
@@ -205,7 +205,7 @@ impl AftRecords {
         let delegate_params =
             locutus_aft_interface::DelegateParameters::new(generator_id.key.clone());
 
-        let record_params = TokenParameters::new(sender_key.clone());
+        let record_params = TokenDelegateParameters::new(sender_key.clone());
         let token_record: ContractInstanceId = ContractKey::from_params(
             crate::aft::TOKEN_RECORD_CODE_HASH,
             record_params.try_into()?,
@@ -225,7 +225,6 @@ impl AftRecords {
             delegate_id: delegate_key.clone().into(),
             criteria,
             records,
-            assignee: sender_key.clone(),
             assignment_hash,
         });
         // FIXME: this should come from the contract which is distributiong this app, just a stub
@@ -241,31 +240,6 @@ impl AftRecords {
             queue.borrow_mut().push((inbox_key, assignment_hash));
         });
         client.send(request.into()).await?;
-
-        // const TEST_TIER: Tier = Tier::Day1;
-        // let naive = chrono::NaiveDate::from_ymd_opt(2023, 1, 25)
-        //     .unwrap()
-        //     .and_hms_opt(0, 0, 0)
-        //     .unwrap();
-        // let slot = DateTime::<Utc>::from_utc(naive, Utc);
-        // crate::log::log(
-        //     format!(
-        //         "Sending update request message with token record key: {}",
-        //         token_record.clone()
-        //     )
-        //     .as_str(),
-        // );
-        // Ok((
-        //     delegate_key,
-        //     TokenAssignment {
-        //         tier: TEST_TIER,
-        //         time_slot: slot,
-        //         assignee: recipient_key,
-        //         signature: rsa::pkcs1v15::Signature::from(vec![1u8; 64].into_boxed_slice()),
-        //         assignment_hash: [0; 32],
-        //         token_record,
-        //     },
-        // ))
         Ok(delegate_key)
     }
 

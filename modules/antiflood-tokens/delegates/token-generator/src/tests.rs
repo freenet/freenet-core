@@ -36,7 +36,7 @@ mod token_assignment {
             vec![TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: get_assignment_date(2023, 1, 25),
-                assignee: PK.clone(),
+                generator: PK.clone(),
                 signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                 assignment_hash: [0; 32],
                 token_record: *ID,
@@ -57,7 +57,7 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: PK.clone(),
+                    generator: PK.clone(),
                     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
@@ -65,7 +65,7 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2023, 1, 26),
-                    assignee: PK.clone(),
+                    generator: PK.clone(),
                     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
@@ -87,7 +87,7 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: PK.clone(),
+                    generator: PK.clone(),
                     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
@@ -95,7 +95,7 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 29),
-                    assignee: PK.clone(),
+                    generator: PK.clone(),
                     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
@@ -114,7 +114,7 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: PK.clone(),
+                    generator: PK.clone(),
                     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
@@ -122,7 +122,7 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 28),
-                    assignee: PK.clone(),
+                    generator: PK.clone(),
                     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
@@ -130,7 +130,7 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 30),
-                    assignee: PK.clone(),
+                    generator: PK.clone(),
                     signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,

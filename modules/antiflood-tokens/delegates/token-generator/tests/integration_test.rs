@@ -247,7 +247,6 @@ mod integration_test {
                     assignment.token_record,
                     ContractInstanceId::from(contract_key)
                 );
-                assert_eq!(assignment.assignee, private_key.to_public_key());
             }
             _ => panic!("Unexpected token delegate message"),
         }
