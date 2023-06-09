@@ -211,11 +211,14 @@ pub(crate) async fn node_comms(
                     // FIXME: handle the different possible errors
                     match err {
                         RequestError::ContractError(ContractError::Update { key, .. }) => {
-                            // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
-                            // we should reject that pending assignment
-
-                            // FIXME: in case this is for an inbox contract we were trying to update, this means
-                            crate::log::error("the message wasn't delivered successfully, so may need to try again and/or notify the user", None)
+                            if token_rec_to_id.get(&key).is_some() {
+                                // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
+                                // we should reject that pending assignment
+                                // FIXME: in case this is for an inbox contract we were trying to update, this means
+                                crate::log::error(format!("the message for {key} wasn't delivered successfully, so may need to try again and/or notify the user"), None)
+                            } else {
+                                todo!()
+                            }
                         }
                         RequestError::ContractError(err) => {
                             crate::log::error(format!("FIXME: {err}"), None)

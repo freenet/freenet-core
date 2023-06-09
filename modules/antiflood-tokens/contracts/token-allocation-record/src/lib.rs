@@ -1,10 +1,10 @@
 use locutus_aft_interface::{
-    AllocationError, TokenAllocationRecord, TokenAssignment, TokenParameters,
+    AllocationError, InvalidReason, TokenAllocationRecord, TokenAssignment, TokenParameters,
 };
 use locutus_stdlib::prelude::*;
 use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256};
 
-struct TokenAllocContract;
+pub struct TokenAllocContract;
 
 #[contract]
 impl ContractInterface for TokenAllocContract {
@@ -35,7 +35,7 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<bool, ContractError> {
         let assigned_token = TokenAssignment::try_from(delta)?;
         let params = TokenParameters::try_from(parameters)?;
-        Ok(assigned_token.is_valid(&params))
+        Ok(assigned_token.is_valid(&params).is_ok())
     }
 
     fn update_state(
@@ -119,22 +119,22 @@ impl ContractInterface for TokenAllocContract {
 }
 
 trait TokenAssignmentExt {
-    fn is_valid(&self, params: &TokenParameters) -> bool;
+    fn is_valid(&self, params: &TokenParameters) -> Result<(), InvalidReason>;
 }
 
 impl TokenAssignmentExt for TokenAssignment {
-    fn is_valid(&self, params: &TokenParameters) -> bool {
+    fn is_valid(&self, params: &TokenParameters) -> Result<(), InvalidReason> {
         use rsa::signature::Verifier;
         if !self.tier.is_valid_slot(self.time_slot) {
-            return false;
+            return Err(InvalidReason::InvalidSlot);
         }
         let msg = TokenAssignment::signature_content(&self.time_slot, &self.assignee, self.tier);
         let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
         if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator
-            return false;
+            return Err(InvalidReason::SignatureMismatch);
         }
-        true
+        Ok(())
     }
 }
 
@@ -165,12 +165,13 @@ impl TokenAllocationRecordExt for TokenAllocationRecord {
         match self.get_mut_tier(&assignment.tier) {
             Some(list) => {
                 if list.binary_search(&assignment).is_err() {
-                    if assignment.is_valid(params) {
-                        list.push(assignment);
-                        list.sort_unstable();
-                        Ok(())
-                    } else {
-                        Err(AllocationError::invalid_assignment(assignment))
+                    match assignment.is_valid(params) {
+                        Ok(_) => {
+                            list.push(assignment);
+                            list.sort_unstable();
+                            Ok(())
+                        }
+                        Err(err) => Err(AllocationError::invalid_assignment(assignment, err)),
                     }
                 } else {
                     Err(AllocationError::allocated_slot(&assignment))
