@@ -221,7 +221,7 @@ impl InboxModel {
                 });
             }
             crate::log::debug!(
-                "subscribed to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
+                "subscribing to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
             );
             InboxModel::subscribe(client, contract_key.clone()).await?;
             Ok(())
@@ -276,6 +276,10 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let sender_key = from.key.to_public_key();
         let (hash, _) = content.assignment_hash_and_signed_content(&sender_key)?;
+        crate::log::debug!(
+            "requesting token for assignment hash: {}",
+            bs58::encode(hash).into_string()
+        );
         let delegate_key =
             AftRecords::assign_token(client, recipient_key.clone(), from, hash).await?;
         let params = InboxParams {

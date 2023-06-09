@@ -215,20 +215,22 @@ pub(crate) async fn node_comms(
                             // we should reject that pending assignment
 
                             // FIXME: in case this is for an inbox contract we were trying to update, this means
-                            // the message wasn't delivered successfully, so may need to try again and/or notify the user
-                            todo!()
+                            crate::log::error("the message wasn't delivered successfully, so may need to try again and/or notify the user", None)
                         }
-                        RequestError::ContractError(_) => todo!(),
+                        RequestError::ContractError(err) => {
+                            crate::log::error(format!("FIXME: {err}"), None)
+                        }
                         RequestError::DelegateError(error) => {
                             crate::log::error(
-                                format!("received delagte request error: {error}"),
+                                format!("received delegate request error: {error}"),
                                 None,
                             );
                         }
-                        RequestError::Disconnect => todo!(),
+                        RequestError::Disconnect => {
+                            todo!("lost connection to node, should retry connecting")
+                        }
                     }
                 }
-                crate::log::error(format!("received error: {e}"), None);
                 return;
             }
         };
@@ -386,7 +388,7 @@ pub(crate) async fn node_comms(
                                 TokenDelegateMessage::Failure(reason) => {
                                     // FIXME: this may mean a pending message waiting for a token has failed, and need to notify that in the UI
                                     crate::log::error(
-                                        format!("{reason}"),
+                                        format!("token assignment failure: {reason}"),
                                         Some(TryNodeAction::SendMessage),
                                     )
                                 }
@@ -432,7 +434,7 @@ pub(crate) async fn node_comms(
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };
-                crate::log::debug!("sending request to API: {req:?}");
+                crate::log::debug!("sending request to API: {req}");
                 api.api.send(req).await.unwrap();
             }
             error = api.client_errors.next() => {

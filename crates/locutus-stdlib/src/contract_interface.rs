@@ -38,6 +38,8 @@ pub enum ContractError {
     Deser(String),
     #[error("invalid contract update")]
     InvalidUpdate,
+    #[error("invalid contract update, reason: {reason}")]
+    InvalidUpdateWithInfo { reason: String },
     #[error("trying to read an invalid state")]
     InvalidState,
     #[error("trying to read an invalid delta")]

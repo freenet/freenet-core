@@ -53,7 +53,9 @@ impl ContractInterface for TokenAllocContract {
                         .merge(new_assigned_tokens, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                 }
                 UpdateData::Delta(d) => {
@@ -62,7 +64,9 @@ impl ContractInterface for TokenAllocContract {
                         .append(new_assigned_token, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                 }
                 UpdateData::StateAndDelta { state, delta } => {
@@ -71,14 +75,18 @@ impl ContractInterface for TokenAllocContract {
                         .merge(new_assigned_tokens, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                     let new_assigned_token = TokenAssignment::try_from(delta)?;
                     assigned_tokens
                         .append(new_assigned_token, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                 }
                 _ => unreachable!(),

@@ -724,8 +724,8 @@ pub type TokenAssignmentHash = [u8; 32];
 pub struct TokenAssignment {
     pub tier: Tier,
     pub time_slot: DateTime<Utc>,
-    /// The assignment, the recipient decides whether this assignment is valid based on this field.
-    /// This will often be a public key.
+    /// The assignee of the token, the recipient decides whether this assignment is valid based on this field.
+    /// This will tipically be the public key of the token generator.
     pub assignee: Assignee,
     #[serde(with = "token_sig_ser")]
     /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
@@ -827,12 +827,13 @@ impl TryFrom<StateDelta<'_>> for TokenAssignment {
 
 impl Display for TokenAssignment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let assignment = bs58::encode(self.assignment_hash).into_string();
         write!(
             f,
-            "{{ {tier} @ {slot} for {assignee:?}}}",
+            "{{ {tier} @ {slot} for assignment `{assignment}`, record: {record}}}",
             tier = self.tier,
             slot = self.time_slot,
-            assignee = self.assignee
+            record = self.token_record
         )
     }
 }
