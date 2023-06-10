@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     aft::AftRecords,
-    api::WebApiRequestClient,
-    app::{error_handling, Identity, TryNodeAction},
+    api::{node_response_error_handling, TryNodeAction, WebApiRequestClient},
+    app::Identity,
     DynError,
 };
 use freenet_email_inbox::{
@@ -104,6 +104,43 @@ impl MessageModel {
             token_assignment: self.token_assignment.clone(),
         })
     }
+
+    pub async fn finish_sending(
+        client: &mut WebApiRequestClient,
+        assignment: TokenAssignment,
+        inbox_contract: InboxContract,
+    ) -> Result<(), DynError> {
+        let pending_update = PENDING_INBOXES_UPDATE.with(|map| {
+            let map = &mut *map.borrow_mut();
+            let update = map.get_mut(&inbox_contract).and_then(|messages| {
+                if !messages.is_empty() {
+                    Some(messages.remove(0))
+                } else {
+                    None
+                }
+            });
+            if let Some(messages) = map.get(&inbox_contract) {
+                if messages.is_empty() {
+                    map.remove(&inbox_contract);
+                }
+            }
+            update
+        });
+
+        if let Some(update) = pending_update {
+            let delta = UpdateInbox::AddMessages {
+                messages: vec![update.to_stored(assignment)?],
+            };
+            let request = ContractRequest::Update {
+                key: inbox_contract,
+                data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
+            };
+            client.send(request.into()).await?;
+            // todo: event after sending, we may fail to update, must keep this in mind in case we receive no confirmation
+            // meaning that we will need to retry, and likely need an other token for now at least, so restart from 0
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -117,6 +154,38 @@ pub(crate) struct DecryptedMessage {
 }
 
 impl DecryptedMessage {
+    pub async fn start_sending(
+        self,
+        client: &mut WebApiRequestClient,
+        recipient_key: RsaPublicKey,
+        from: &Identity,
+    ) -> Result<(), DynError> {
+        let content = self;
+        let sender_key = from.key.to_public_key();
+        let (hash, _) = content.assignment_hash_and_signed_content(&sender_key)?;
+        crate::log::debug!(
+            "requesting token for assignment hash: {}",
+            bs58::encode(hash).into_string()
+        );
+        let delegate_key =
+            AftRecords::assign_token(client, recipient_key.clone(), from, hash).await?;
+        let params = InboxParams {
+            pub_key: recipient_key,
+        }
+        .try_into()
+        .map_err(|e| format!("{e}"))?;
+        let inbox_key =
+            ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
+        AftRecords::pending_assignment(delegate_key, inbox_key.clone());
+
+        PENDING_INBOXES_UPDATE.with(|map| {
+            let map = &mut *map.borrow_mut();
+            map.entry(inbox_key).or_insert_with(Vec::new).push(content);
+        });
+
+        Ok(())
+    }
+
     fn to_stored(&self, mut token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
         let (hash, content) =
             self.assignment_hash_and_signed_content(&token_assignment.generator)?;
@@ -230,14 +299,16 @@ impl InboxModel {
         for identity in contracts {
             let mut client = client.clone();
             let res = subscribe(&mut client, identity).await;
-            error_handling(client.clone().into(), res, TryNodeAction::LoadInbox).await;
+            node_response_error_handling(client.clone().into(), res, TryNodeAction::LoadInbox)
+                .await;
             let res = InboxModel::load(&mut client, identity).await.map(|key| {
                 contract_to_id
                     .entry(key.clone())
                     .or_insert(identity.clone());
                 key
             });
-            error_handling(client.into(), res.map(|_| ()), TryNodeAction::LoadInbox).await;
+            node_response_error_handling(client.into(), res.map(|_| ()), TryNodeAction::LoadInbox)
+                .await;
         }
     }
 
@@ -268,74 +339,6 @@ impl InboxModel {
         INBOX_TO_ID.with(|map| map.borrow().get(key).cloned())
     }
 
-    pub async fn start_sending(
-        client: &mut WebApiRequestClient,
-        content: DecryptedMessage,
-        recipient_key: RsaPublicKey,
-        from: &Identity,
-    ) -> Result<(), DynError> {
-        let sender_key = from.key.to_public_key();
-        let (hash, _) = content.assignment_hash_and_signed_content(&sender_key)?;
-        crate::log::debug!(
-            "requesting token for assignment hash: {}",
-            bs58::encode(hash).into_string()
-        );
-        let delegate_key =
-            AftRecords::assign_token(client, recipient_key.clone(), from, hash).await?;
-        let params = InboxParams {
-            pub_key: recipient_key,
-        }
-        .try_into()
-        .map_err(|e| format!("{e}"))?;
-        let inbox_key =
-            ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
-        AftRecords::pending_assignment(delegate_key, inbox_key.clone());
-
-        PENDING_INBOXES_UPDATE.with(|map| {
-            let map = &mut *map.borrow_mut();
-            map.entry(inbox_key).or_insert_with(Vec::new).push(content);
-        });
-
-        Ok(())
-    }
-
-    pub async fn finish_sending(
-        client: &mut WebApiRequestClient,
-        assignment: TokenAssignment,
-        inbox_contract: InboxContract,
-    ) -> Result<(), DynError> {
-        let pending_update = PENDING_INBOXES_UPDATE.with(|map| {
-            let map = &mut *map.borrow_mut();
-            let update = map.get_mut(&inbox_contract).and_then(|messages| {
-                if !messages.is_empty() {
-                    Some(messages.remove(0))
-                } else {
-                    None
-                }
-            });
-            if let Some(messages) = map.get(&inbox_contract) {
-                if messages.is_empty() {
-                    map.remove(&inbox_contract);
-                }
-            }
-            update
-        });
-
-        if let Some(update) = pending_update {
-            let delta = UpdateInbox::AddMessages {
-                messages: vec![update.to_stored(assignment)?],
-            };
-            let request = ContractRequest::Update {
-                key: inbox_contract,
-                data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
-            };
-            client.send(request.into()).await?;
-            // todo: event after sending, we may fail to update, must keep this in mind in case we receive no confirmation
-            // meaning that we will need to retry, and likely need an other token for now at least, so restart from 0
-        }
-        Ok(())
-    }
-
     pub fn remove_messages(
         &mut self,
         mut client: WebApiRequestClient,
@@ -362,7 +365,7 @@ impl InboxModel {
             };
             let f = async move {
                 let r = client.send(request.into()).await;
-                error_handling(
+                node_response_error_handling(
                     client.into(),
                     r.map_err(Into::into),
                     TryNodeAction::RemoveMessages,

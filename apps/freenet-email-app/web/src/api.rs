@@ -1,12 +1,13 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
+use futures::SinkExt;
 use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 use once_cell::sync::OnceCell;
 
-use crate::app::AsyncActionResult;
+use crate::DynError;
 
 type ClientRequester = UnboundedSender<ClientRequest<'static>>;
 type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
@@ -160,7 +161,7 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{error_handling, Identity, NodeAction, TryNodeAction},
+        app::{Identity, NodeAction},
         inbox::InboxModel,
     };
 
@@ -189,7 +190,8 @@ pub(crate) async fn node_comms(
         let mut client = api.sender_half();
         match InboxModel::load(&mut client, &identity).await {
             Err(err) => {
-                error_handling(client.into(), Err(err), TryNodeAction::LoadInbox).await;
+                node_response_error_handling(client.into(), Err(err), TryNodeAction::LoadInbox)
+                    .await;
             }
             Ok(key) => {
                 waiting_updates.entry(key).or_insert(identity);
@@ -447,6 +449,48 @@ pub(crate) async fn node_comms(
                     None => panic!("error ch closed"),
                 }
             }
+        }
+    }
+}
+
+pub(crate) type AsyncActionResult = Result<(), (DynError, TryNodeAction)>;
+
+pub(crate) async fn node_response_error_handling(
+    mut error_channel: NodeResponses,
+    res: Result<(), DynError>,
+    action: TryNodeAction,
+) {
+    if let Err(error) = res {
+        crate::log::error(format!("{error}"), Some(action.clone()));
+        error_channel
+            .send(Err((error, action)))
+            .await
+            .expect("error channel closed");
+    } else {
+        error_channel
+            .send(Ok(()))
+            .await
+            .expect("error channel closed");
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TryNodeAction {
+    LoadInbox,
+    LoadTokenRecord,
+    SendMessage,
+    RemoveMessages,
+    GetAlias,
+}
+
+impl std::fmt::Display for TryNodeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryNodeAction::LoadInbox => write!(f, "loading messages"),
+            TryNodeAction::LoadTokenRecord => write!(f, "loading token record"),
+            TryNodeAction::SendMessage => write!(f, "sending message"),
+            TryNodeAction::RemoveMessages => write!(f, "removing messages"),
+            TryNodeAction::GetAlias => write!(f, "get alias"),
         }
     }
 }

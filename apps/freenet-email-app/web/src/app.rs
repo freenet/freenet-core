@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
@@ -7,7 +6,7 @@ use arc_swap::ArcSwap;
 use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
-use futures::{FutureExt, SinkExt};
+use futures::FutureExt;
 use once_cell::sync::Lazy;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
@@ -16,15 +15,14 @@ use rsa::{
 };
 use std::collections::HashMap;
 
+use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::{
-    api::{NodeResponses, WebApiRequestClient},
+    api::WebApiRequestClient,
     inbox::{DecryptedMessage, InboxModel, MessageModel},
     DynError,
 };
 
 mod login;
-
-pub(crate) type AsyncActionResult = Result<(), (DynError, TryNodeAction)>;
 
 // todo: simplify this whole alias map stuff mapping identities to contract keys
 pub(crate) static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
@@ -70,34 +68,13 @@ pub(crate) enum NodeAction {
     LoadMessages(Identity),
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum TryNodeAction {
-    LoadInbox,
-    LoadTokenRecord,
-    SendMessage,
-    RemoveMessages,
-    GetAlias,
-}
-
-impl std::fmt::Display for TryNodeAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TryNodeAction::LoadInbox => write!(f, "loading messages"),
-            TryNodeAction::LoadTokenRecord => write!(f, "loading token record"),
-            TryNodeAction::SendMessage => write!(f, "sending message"),
-            TryNodeAction::RemoveMessages => write!(f, "removing messages"),
-            TryNodeAction::GetAlias => write!(f, "get alias"),
-        }
-    }
-}
-
-pub(crate) fn App(cx: Scope) -> Element {
+pub(crate) fn app(cx: Scope) -> Element {
     crate::log::debug!("rendering app");
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
 
-    use_context_provider(cx, Inbox::new);
-    let inbox = use_context::<Inbox>(cx).unwrap();
+    use_context_provider(cx, InboxView::new);
+    let inbox = use_context::<InboxView>(cx).unwrap();
     let inbox_data = inbox.inbox_data.clone();
 
     #[cfg(feature = "use-node")]
@@ -109,7 +86,7 @@ pub(crate) fn App(cx: Scope) -> Element {
 
     if !user.read().identified {
         cx.render(rsx! {
-            login::GetOrCreateIndentity {}
+            login::get_or_create_indentity {}
         })
     } else if let Some(id) = user.read().logged_id() {
         #[cfg(feature = "use-node")]
@@ -121,11 +98,11 @@ pub(crate) fn App(cx: Scope) -> Element {
             inbox.load_messages(id).unwrap();
         }
         cx.render(rsx! {
-           UserInbox {}
+           user_inbox {}
         })
     } else {
         cx.render(rsx! {
-           login::IdentifiersList {}
+           login::identifiers_list {}
         })
     }
 }
@@ -133,7 +110,8 @@ pub(crate) fn App(cx: Scope) -> Element {
 pub(crate) type InboxesData = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
 
 #[derive(Debug, Clone)]
-pub struct Inbox {
+pub struct InboxView {
+    /// a reference to the model data
     inbox_data: InboxesData,
     /// loaded messages for the currently selected `active_id`
     messages: Rc<RefCell<Vec<Message>>>,
@@ -158,7 +136,7 @@ impl std::ops::Deref for UserId {
     }
 }
 
-impl Inbox {
+impl InboxView {
     fn new() -> Self {
         Self {
             inbox_data: Arc::new(ArcSwap::from_pointee(vec![])),
@@ -203,9 +181,9 @@ impl Inbox {
                     continue;
                 };
                 let f = async move {
-                    let res =
-                        InboxModel::start_sending(&mut client, content, recipient_key, &id).await;
-                    error_handling(client.into(), res, TryNodeAction::SendMessage).await;
+                    let res = content.start_sending(&mut client, recipient_key, &id).await;
+                    node_response_error_handling(client.into(), res, TryNodeAction::SendMessage)
+                        .await;
                 };
                 futs.push(f.boxed_local());
             }
@@ -457,24 +435,24 @@ mod menu {
     }
 }
 
-fn UserInbox(cx: Scope) -> Element {
+fn user_inbox(cx: Scope) -> Element {
     use_shared_state_provider(cx, menu::MenuSelection::default);
     cx.render(rsx!(
         div {
             class: "columns",
             nav {
                 class: "column is-one-fifth menu",
-                UserMenuComponent {}
+                user_menu_component {}
             }
             div {
                 class: "column",
-                InboxComponent {}
+                inbox_component {}
             }
         }
     ))
 }
 
-fn UserMenuComponent(cx: Scope) -> Element {
+fn user_menu_component(cx: Scope) -> Element {
     let user = use_shared_state::<User>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
 
@@ -525,13 +503,13 @@ fn UserMenuComponent(cx: Scope) -> Element {
     ))
 }
 
-fn InboxComponent(cx: Scope) -> Element {
-    let inbox = use_context::<Inbox>(cx).unwrap();
+fn inbox_component(cx: Scope) -> Element {
+    let inbox = use_context::<InboxView>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
 
     #[inline_props]
-    fn EmailLink<'a>(
+    fn email_link<'a>(
         cx: Scope<'a>,
         sender: Cow<'a, str>,
         title: Cow<'a, str>,
@@ -579,7 +557,7 @@ fn InboxComponent(cx: Scope) -> Element {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();
         let email = &emails[id_p];
         cx.render(rsx! {
-            OpenMessage {
+            open_message {
                 id: email.id,
                 from: email.from.clone(),
                 title: email.title.clone(),
@@ -589,11 +567,11 @@ fn InboxComponent(cx: Scope) -> Element {
         })
     } else if menu_selection.read().is_new_msg() {
         cx.render(rsx! {
-            NewMessageWindow {}
+            new_message_window {}
         })
     } else {
         let links = emails.iter().map(|email| {
-            rsx!(EmailLink {
+            rsx!(email_link {
                 sender: email.from.clone(),
                 title: email.title.clone()
                 read: email.read,
@@ -636,10 +614,10 @@ fn InboxComponent(cx: Scope) -> Element {
     }
 }
 
-fn OpenMessage(cx: Scope<Message>) -> Element {
+fn open_message(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
-    let inbox = use_context::<Inbox>(cx).unwrap();
+    let inbox = use_context::<InboxView>(cx).unwrap();
     let email = cx.props;
     let email_id = [cx.props.id];
 
@@ -684,10 +662,10 @@ fn OpenMessage(cx: Scope<Message>) -> Element {
     })
 }
 
-fn NewMessageWindow(cx: Scope) -> Element {
+fn new_message_window(cx: Scope) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
-    let inbox = use_context::<Inbox>(cx).unwrap();
+    let inbox = use_context::<InboxView>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();
     let user_alias = &*user.logged_id().unwrap().alias;
@@ -762,23 +740,4 @@ fn NewMessageWindow(cx: Scope) -> Element {
             }
         }
     })
-}
-
-pub(crate) async fn error_handling(
-    mut error_channel: NodeResponses,
-    res: Result<(), DynError>,
-    action: TryNodeAction,
-) {
-    if let Err(error) = res {
-        crate::log::error(format!("{error}"), Some(action.clone()));
-        error_channel
-            .send(Err((error, action)))
-            .await
-            .expect("error channel closed");
-    } else {
-        error_channel
-            .send(Ok(()))
-            .await
-            .expect("error channel closed");
-    }
 }
