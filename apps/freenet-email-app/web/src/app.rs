@@ -14,6 +14,7 @@ use rsa::{
     RsaPublicKey,
 };
 use std::collections::HashMap;
+use wasm_bindgen::JsValue;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::{
@@ -80,7 +81,10 @@ pub(crate) fn app(cx: Scope) -> Element {
     #[cfg(feature = "use-node")]
     {
         let _sync = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
-            crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
+            let fut = crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
+                .map(|_| Ok(JsValue::TRUE));
+            let _ = wasm_bindgen_futures::future_to_promise(fut);
+            async {}.boxed_local()
         });
     }
 

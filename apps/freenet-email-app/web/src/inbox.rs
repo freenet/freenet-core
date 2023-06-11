@@ -21,11 +21,11 @@ use locutus_stdlib::{
     },
 };
 use rand_chacha::rand_core::SeedableRng;
+use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
     pkcs1::EncodeRsaPublicKey, pkcs1v15::SigningKey, sha2::Sha256, signature::Signer,
     Pkcs1v15Encrypt, PublicKey, RsaPrivateKey, RsaPublicKey,
 };
-use rsa::pkcs1::DecodeRsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -240,10 +240,10 @@ impl DecryptedMessage {
 
         // Encrypt the XChaCha20Poly1305 key using RSA
         let receiver_pub_key = self.to.get(0).ok_or("receiver key not found")?;
-        let receiver_pub_key = RsaPublicKey::from_pkcs1_pem(receiver_pub_key)
-            .map_err(|e| format!("{e}"))?;
+        let receiver_pub_key =
+            RsaPublicKey::from_pkcs1_pem(receiver_pub_key).map_err(|e| format!("{e}"))?;
         let encrypted_key = receiver_pub_key
-            .encrypt(&mut rng, Pkcs1v15Encrypt, &chacha_key)
+            .encrypt(&mut rng, Pkcs1v15Encrypt, chacha_key.as_slice())
             .map_err(|e| format!("{e}"))?;
 
         // Concatenate the nonce, encrypted XChaCha20Poly1305 key and encrypted data
