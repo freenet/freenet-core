@@ -10,8 +10,9 @@ use locutus_aft_interface::{
 use locutus_stdlib::client_api::{ContractRequest, DelegateRequest};
 use locutus_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, ContractKey, DelegateKey, InboundDelegateMsg,
-    Parameters, State, StateDelta, UpdateData,
+    Parameters, StateDelta, UpdateData, State
 };
+use locutus_stdlib::prelude::UpdateData::{Delta, State as StateUpdate};
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPublicKey;
 
@@ -252,8 +253,12 @@ impl AftRecords {
         Ok(())
     }
 
-    pub fn update_record(identity: Identity, delta: StateDelta<'_>) -> Result<(), DynError> {
-        let record = TokenAllocationRecord::try_from(delta)?;
+    pub fn update_record(identity: Identity, update_data: UpdateData) -> Result<(), DynError> {
+        let record = match update_data {
+            StateUpdate(state) => TokenAllocationRecord::try_from(state)?,
+            Delta(delta) => TokenAllocationRecord::try_from(delta)?,
+            _ => return Err(DynError::from("Unexpected update data type while updating the record"))
+        };
         RECORDS.with(|recs| {
             let recs = &mut *recs.borrow_mut();
             recs.insert(identity, record);

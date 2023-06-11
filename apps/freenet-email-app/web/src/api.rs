@@ -324,18 +324,13 @@ pub(crate) async fn node_comms(
                     }
                 } else if let Some(identity) = token_rec_to_id.remove(&key) {
                     // is a AFT record contract
-                    match update {
-                        UpdateData::Delta(delta) => {
-                            if let Err(e) = AftRecords::update_record(identity.clone(), delta) {
-                                crate::log::error(
-                                    format!("error updating an AFT record: {e}"),
-                                    None,
-                                );
-                            }
-                            token_rec_to_id.insert(key, identity);
-                        }
-                        _ => unreachable!(),
+                    if let Err(e) = AftRecords::update_record(identity.clone(), update) {
+                        crate::log::error(
+                            format!("error updating an AFT record from delta: {e}"),
+                            None,
+                        );
                     }
+                    token_rec_to_id.insert(key, identity);
                 } else {
                     unreachable!("tried to get wrong contract key: {key}")
                 }

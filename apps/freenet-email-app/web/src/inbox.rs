@@ -25,6 +25,7 @@ use rsa::{
     pkcs1::EncodeRsaPublicKey, pkcs1v15::SigningKey, sha2::Sha256, signature::Signer,
     Pkcs1v15Encrypt, PublicKey, RsaPrivateKey, RsaPublicKey,
 };
+use rsa::pkcs1::DecodeRsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -238,7 +239,10 @@ impl DecryptedMessage {
             .unwrap();
 
         // Encrypt the XChaCha20Poly1305 key using RSA
-        let encrypted_key = assignee
+        let receiver_pub_key = self.to.get(0).ok_or("receiver key not found")?;
+        let receiver_pub_key = RsaPublicKey::from_pkcs1_pem(receiver_pub_key)
+            .map_err(|e| format!("{e}"))?;
+        let encrypted_key = receiver_pub_key
             .encrypt(&mut rng, Pkcs1v15Encrypt, &chacha_key)
             .map_err(|e| format!("{e}"))?;
 
