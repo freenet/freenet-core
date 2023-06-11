@@ -41,7 +41,7 @@ pub fn main() {
         "#;
 
         dioxus_desktop::launch_cfg(
-            app::App,
+            app::app,
             Config::new()
                 .with_root_name(MAIN_ELEMENT_ID)
                 .with_custom_index(INDEX.to_string())
@@ -58,6 +58,6 @@ pub fn main() {
     #[cfg(target_family = "wasm")]
     {
         use dioxus_web::Config;
-        dioxus_web::launch_cfg(app::App, Config::new().rootname(MAIN_ELEMENT_ID));
+        dioxus_web::launch_cfg(app::app, Config::new().rootname(MAIN_ELEMENT_ID));
     }
 }

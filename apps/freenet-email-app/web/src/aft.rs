@@ -15,12 +15,9 @@ use locutus_stdlib::prelude::{
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPublicKey;
 
-use crate::inbox::InboxModel;
-use crate::{
-    api::WebApiRequestClient,
-    app::{error_handling, Identity, TryNodeAction},
-    DynError,
-};
+use crate::api::{node_response_error_handling, TryNodeAction};
+use crate::inbox::{InboxModel, MessageModel};
+use crate::{api::WebApiRequestClient, app::Identity, DynError};
 
 pub(crate) static TOKEN_RECORD_CODE_HASH: &str =
     include_str!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/token_allocation_record_code_hash");
@@ -71,7 +68,7 @@ impl AftRecords {
             if let Ok(key) = &r {
                 contract_to_id.insert(key.clone(), identity.clone());
             }
-            error_handling(
+            node_response_error_handling(
                 client.clone().into(),
                 r.map(|_| ()),
                 TryNodeAction::LoadTokenRecord,
@@ -134,7 +131,7 @@ impl AftRecords {
             })
         }) else { return Ok(()) };
         // we have a valid token now, so we can update the inbox contract
-        InboxModel::finish_sending(client, confirmed.record, confirmed.inbox).await?;
+        MessageModel::finish_sending(client, confirmed.record, confirmed.inbox).await?;
         Ok(())
     }
 
