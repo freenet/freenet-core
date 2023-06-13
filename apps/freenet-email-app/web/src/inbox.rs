@@ -162,8 +162,7 @@ impl DecryptedMessage {
         from: &Identity,
     ) -> Result<(), DynError> {
         let content = self;
-        let sender_key = from.key.to_public_key();
-        let (hash, _) = content.assignment_hash_and_signed_content(&sender_key)?;
+        let (hash, _) = content.assignment_hash_and_signed_content()?;
         crate::log::debug!(
             "requesting token for assignment hash: {}",
             bs58::encode(hash).into_string()
@@ -188,8 +187,7 @@ impl DecryptedMessage {
     }
 
     fn to_stored(&self, mut token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
-        let (hash, content) =
-            self.assignment_hash_and_signed_content(&token_assignment.generator)?;
+        let (hash, content) = self.assignment_hash_and_signed_content()?;
         token_assignment.assignment_hash = hash;
         Ok::<_, DynError>(StoredMessage {
             content,
@@ -220,10 +218,7 @@ impl DecryptedMessage {
         content
     }
 
-    fn assignment_hash_and_signed_content(
-        &self,
-        assignee: &RsaPublicKey,
-    ) -> Result<([u8; 32], Vec<u8>), DynError> {
+    fn assignment_hash_and_signed_content(&self) -> Result<([u8; 32], Vec<u8>), DynError> {
         // FIXME: use a real source of entropy
         let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
         let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
