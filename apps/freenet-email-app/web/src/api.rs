@@ -107,7 +107,6 @@ impl WebApiRequestClient {
         &mut self,
         request: locutus_stdlib::client_api::ClientRequest<'static>,
     ) -> Result<(), locutus_stdlib::client_api::Error> {
-        use futures::SinkExt;
         self.sender
             .send(request)
             .await
@@ -145,7 +144,7 @@ pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::NodeAction>,
     contracts: Vec<crate::app::Identity>,
     // todo: refactor: instead of passing this arround,
-    // where necessary we could be gettign thef resh data via static methods calls to InboxModel
+    // where necessary we could be getting the fresh data via static methods calls to Inbox
     // and store the information there in thread locals
     mut inboxes: crate::app::InboxesData,
 ) {
@@ -239,6 +238,7 @@ pub(crate) async fn node_comms(
                 return;
             }
         };
+        crate::log::debug!("got node response: {res}");
         match res {
             HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key, state, ..
@@ -488,4 +488,16 @@ impl std::fmt::Display for TryNodeAction {
             TryNodeAction::GetAlias => write!(f, "get alias"),
         }
     }
+}
+
+#[test]
+fn deser() {
+    const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+    let bytes = String::from_utf8(
+        std::fs::read(std::path::PathBuf::from(MANIFEST).join("examples/response.txt")).unwrap(),
+    )
+    .unwrap();
+    let other: Result<Vec<u8>, _> = bytes.split(',').map(|b| b.parse()).collect();
+    let other = other.unwrap();
+    // let parsed = rmp_serde
 }

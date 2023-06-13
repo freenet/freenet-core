@@ -400,16 +400,16 @@ impl std::fmt::Display for HostResponse {
         match self {
             HostResponse::ContractResponse(res) => match res {
                 ContractResponse::PutResponse { key } => {
-                    f.write_fmt(format_args!("put response: {key}"))
+                    f.write_fmt(format_args!("put response for `{key}`"))
                 }
                 ContractResponse::UpdateResponse { key, .. } => {
-                    f.write_fmt(format_args!("update response ({key})"))
+                    f.write_fmt(format_args!("update response for `{key}`"))
                 }
-                ContractResponse::GetResponse { state, .. } => {
-                    f.write_fmt(format_args!("get response: {state}"))
+                ContractResponse::GetResponse { key, .. } => {
+                    f.write_fmt(format_args!("get response for `{key}`"))
                 }
                 ContractResponse::UpdateNotification { key, .. } => {
-                    f.write_fmt(format_args!("update notification (key: {key})"))
+                    f.write_fmt(format_args!("update notification for `{key}`"))
                 }
             },
             HostResponse::DelegateResponse { .. } => write!(f, "delegate responses"),
