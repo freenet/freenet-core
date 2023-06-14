@@ -335,7 +335,7 @@ impl Executor {
                     .map_err(Either::Left)?;
                 tracing::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
-                self.perform_get(true, key).await.map_err(Either::Left)
+                self.perform_get(false, key).await.map_err(Either::Left)
                 // todo: in network mode, also send a subscribe to keep up to date
             }
         }

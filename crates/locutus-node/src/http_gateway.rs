@@ -277,7 +277,7 @@ async fn process_host_response(
                     Err(err)
                 }
             };
-            let res = rmp_serde::to_vec(&result)?;
+            let res = serde_json::to_vec(&result)?;
             tracing::debug!(bytes = ?&res[0..100], "sending bytes");
             tx.send(Message::Binary(res)).await?;
             Ok(None)
