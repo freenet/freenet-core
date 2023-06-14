@@ -276,6 +276,7 @@ pub(crate) async fn node_comms(
                     }
                     inbox_to_id.insert(key, identity);
                 } else if let Some(identity) = token_rec_to_id.remove(&key) {
+                    crate::log::debug!("updating AFT record for {identity}");
                     // is a AFT record contract
                     if let Err(e) = AftRecords::set(identity.clone(), state.into()) {
                         crate::log::error(format!("error setting an AFT record: {e}"), None);
@@ -490,14 +491,16 @@ impl std::fmt::Display for TryNodeAction {
     }
 }
 
-#[test]
-fn deser() {
-    const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
-    let bytes = String::from_utf8(
-        std::fs::read(std::path::PathBuf::from(MANIFEST).join("examples/response.txt")).unwrap(),
-    )
-    .unwrap();
-    let other: Result<Vec<u8>, _> = bytes.split(',').map(|b| b.parse()).collect();
-    let other = other.unwrap();
-    // let parsed = rmp_serde
-}
+// #[test]
+// fn deser() {
+//     const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+//     let bytes = String::from_utf8(
+//         std::fs::read(std::path::PathBuf::from(MANIFEST).join("examples/response.txt")).unwrap(),
+//     )
+//     .unwrap();
+//     let msg: Result<Vec<u8>, _> = bytes.split(',').map(|b| b.parse()).collect();
+//     let msg = msg.unwrap();
+//     let parsed: Result<HostResponse, ClientError> =
+//         locutus_stdlib::prelude::serde_json::from_slice(&msg).unwrap();
+//     eprintln!("{parsed:?}");
+// }

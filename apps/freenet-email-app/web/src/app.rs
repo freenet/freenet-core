@@ -360,6 +360,12 @@ impl std::hash::Hash for Identity {
     }
 }
 
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &*self.alias)
+    }
+}
+
 #[derive(Debug, Clone, Eq, Props)]
 struct Message {
     id: u64,

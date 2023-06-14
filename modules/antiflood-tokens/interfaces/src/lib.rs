@@ -3,7 +3,11 @@ use std::fmt::Display;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SubsecRound, Timelike, Utc};
 use locutus_stdlib::prelude::*;
-use rsa::{pkcs1v15::Signature, RsaPrivateKey, RsaPublicKey};
+use rsa::{
+    pkcs1v15::{Signature, VerifyingKey},
+    sha2::Sha256,
+    RsaPrivateKey, RsaPublicKey,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::Display;
 
@@ -814,6 +818,21 @@ impl TokenAssignment {
 
     pub fn previous_slot(&self) -> DateTime<Utc> {
         self.time_slot - Duration::from_std(self.tier.tier_duration()).unwrap()
+    }
+
+    pub fn is_valid(&self, verifying_key: &VerifyingKey<Sha256>) -> Result<(), InvalidReason> {
+        use rsa::signature::Verifier;
+        if !self.tier.is_valid_slot(self.time_slot) {
+            return Err(InvalidReason::InvalidSlot);
+        }
+        let msg =
+            TokenAssignment::signature_content(&self.time_slot, self.tier, &self.assignment_hash);
+        // let verifying_key = VerifyingKey::<Sha256>::from(generator_key);
+        if verifying_key.verify(&msg, &self.signature).is_err() {
+            // not signed by the private key of this generator
+            return Err(InvalidReason::SignatureMismatch);
+        }
+        Ok(())
     }
 }
 
