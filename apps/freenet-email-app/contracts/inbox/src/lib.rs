@@ -239,7 +239,7 @@ impl Inbox {
         Ok(StateSummary::from(serialized))
     }
 
-    fn merge(&mut self, other: Self, params: &InboxParams) -> Result<(), ContractError> {
+    fn merge(&mut self, other: Self) -> Result<(), ContractError> {
         if self.messages.is_empty() && self.last_update < other.last_update {
             for m in other.messages {
                 self.add_message(m)?;
@@ -380,7 +380,7 @@ impl ContractInterface for Inbox {
             match update {
                 UpdateData::State(state) => {
                     let full_inbox = Inbox::try_from(&state)?;
-                    inbox.merge(full_inbox, &params)?;
+                    inbox.merge(full_inbox)?;
                 }
                 UpdateData::Delta(d) => match UpdateInbox::try_from(d)? {
                     UpdateInbox::AddMessages { mut messages } => {

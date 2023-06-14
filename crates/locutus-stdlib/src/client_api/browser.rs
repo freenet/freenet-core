@@ -45,14 +45,22 @@ impl WebApi {
                     .dyn_into::<js_sys::ArrayBuffer>()
                     .unwrap();
                 let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
-                let response: HostResult = match rmp_serde::from_slice(&bytes) {
+                let response: HostResult = match serde_json::from_slice(&bytes) {
                     Ok(val) => val,
                     Err(err) => {
-                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
-                            "error": format!("{err}"),
-                            "source": "host response deserialization",
-                            "bytes": bytes
-                        })));
+                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({})));
+                        if let Ok(untyped) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
+                                "error": format!("{err}"),
+                                "source": "host response deserialization",
+                                "json": format!("{untyped}")
+                            })));
+                        } else {
+                            eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
+                                "error": format!("{err}"),
+                                "source": "host response deserialization"
+                            })));
+                        }
                         return;
                     }
                 };
