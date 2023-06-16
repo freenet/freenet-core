@@ -152,7 +152,7 @@ pub(crate) async fn node_comms(
 
     use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
-    use futures::StreamExt;
+    use futures::{future, FutureExt, StreamExt};
     use locutus_stdlib::{
         client_api::{ContractError, ContractResponse, ErrorKind, RequestError},
         prelude::ContractKey,
@@ -428,7 +428,46 @@ pub(crate) async fn node_comms(
                 panic!("response ch closed");
             }
         }
+        let ch = api.host_responses.clone();
+        let f = async move {
+            #[allow(unused)]
+            let closure: wasm_bindgen::prelude::Closure<dyn FnMut()> =
+                wasm_bindgen::prelude::Closure::new(|| {});
+            loop {
+                #[allow(clippy::single_match)]
+                match ch.try_recv() {
+                    Ok(res) => break res,
+                    _ => {
+                        #[cfg(target_family = "wasm")]
+                        {
+                            use wasm_bindgen::JsCast;
+                            // let promise = wasm_bindgen_futures::future_to_promise(async {
+                            // let _ = web_sys::window()
+                            //     .unwrap()
+                            //     .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            //         closure.as_ref().unchecked_ref(),
+                            //         100,
+                            //     );
+                            // });
+                            // promise.await;
+                        }
+                    }
+                }
+            }
+        };
+        let f = futures::future::maybe_done(f);
+        futures::pin_mut!(f);
         futures::select! {
+            // _ = f => {
+            //     let res: Result<HostResponse, _> = f.as_mut().take_output().unwrap();
+            //     handle_response(
+            //         res,
+            //         &mut inbox_contract_to_id,
+            //         &mut token_contract_to_id,
+            //         &mut inboxes,
+            //     )
+            //     .await;
+            // }
             req = rx.next() => {
                 let Some(req) = req else { panic!("async action ch closed") };
                 handle_action(req, &api, &mut inbox_contract_to_id).await;
