@@ -6,11 +6,12 @@ use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 use once_cell::sync::OnceCell;
+use wasm_bindgen::JsValue;
 
 use crate::DynError;
 
 type ClientRequester = UnboundedSender<ClientRequest<'static>>;
-type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
+type HostResponses = UnboundedReceiver<Result<HostResponse, ClientError>>;
 
 pub(crate) type NodeResponses = UnboundedSender<AsyncActionResult>;
 
@@ -45,10 +46,14 @@ impl WebApi {
     fn new() -> Result<Self, String> {
         use futures::{SinkExt, StreamExt};
         let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
-        let (send_host_responses, host_responses) = crossbeam::channel::unbounded();
+        let (send_host_responses, host_responses) = futures::channel::mpsc::unbounded();
         let (send_half, requests) = futures::channel::mpsc::unbounded();
         let result_handler = move |result: Result<HostResponse, ClientError>| {
-            send_host_responses.send(result).expect("channel open");
+            let mut send_host_responses_clone = send_host_responses.clone();
+            wasm_bindgen_futures::future_to_promise(async move {
+                send_host_responses_clone.send(result).await.expect("channel open");
+                Ok(JsValue::TRUE)
+            });
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         let onopen_handler = move || {
@@ -413,8 +418,9 @@ pub(crate) async fn node_comms(
     }
 
     loop {
-        match api.host_responses.try_recv() {
-            Ok(res) => {
+        futures::select! {
+            r = api.host_responses.next() => {
+                let Some(res) = r else { panic!("async action ch closed") };
                 handle_response(
                     res,
                     &mut inbox_contract_to_id,
@@ -423,12 +429,6 @@ pub(crate) async fn node_comms(
                 )
                 .await;
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                panic!("response ch closed");
-            }
-        }
-        futures::select! {
             req = rx.next() => {
                 let Some(req) = req else { panic!("async action ch closed") };
                 handle_action(req, &api, &mut inbox_contract_to_id).await;
