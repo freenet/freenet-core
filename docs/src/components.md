@@ -100,9 +100,7 @@ Delegates are used for:
 - Storing user data
   - e.g., contacts, messages
 
-### Security Model
-
-### Security Framework
+### Security Model: Sender Attestation
 
 Delegates utilize a messaging system akin to the [actor
 model](https://en.wikipedia.org/wiki/Actor_model) to interact with contracts,
