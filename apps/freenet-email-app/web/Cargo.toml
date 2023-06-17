@@ -18,7 +18,6 @@ bs58 = "0.5"
 arc-swap = "1.6"
 rand_chacha = "0.3"
 chrono = { workspace = true, features = ["wasmbind"] }
-crossbeam = "0.8"
 dioxus = { git = "https://github.com/DioxusLabs/dioxus.git", rev = "0fec47d" }
 futures = "0.3"
 rsa = { workspace = true }
