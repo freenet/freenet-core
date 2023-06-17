@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 
 use chrono::{DateTime, Utc};
-use locutus_aft_interface::{Tier, TokenAllocationRecord, TokenAssignment, TokenAssignmentHash};
+use locutus_aft_interface::{
+    InvalidReason as TokenInvalidReason, Tier, TokenAllocationRecord, TokenAssignment,
+    TokenAssignmentHash,
+};
 use locutus_stdlib::prelude::{blake2::Digest, *};
 use rsa::{
     pkcs1v15::{SigningKey, VerifyingKey},
@@ -89,7 +92,7 @@ pub struct Inbox {
 enum VerificationError {
     MissingContracts(Vec<ContractInstanceId>),
     TokenAssignmentMismatch,
-    InvalidInboxKey,
+    InvalidToken(TokenInvalidReason),
     InvalidMessageHash,
     WrongSignature,
 }
@@ -104,13 +107,21 @@ impl Display for VerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VerificationError::MissingContracts(ids) => {
-                write!(f, "Missing contracts: {:?}", ids)
+                write!(
+                    f,
+                    "Missing contracts: {}",
+                    ids.iter()
+                        .map(|c| format!("{c}"))
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                        .join(",")
+                )
             }
             VerificationError::TokenAssignmentMismatch => {
                 write!(f, "Token assignment mismatch")
             }
-            VerificationError::InvalidInboxKey => {
-                write!(f, "Invalid inbox key")
+            VerificationError::InvalidToken(reason) => {
+                write!(f, "Invalid token: {reason}")
             }
             VerificationError::InvalidMessageHash => {
                 write!(f, "Invalid message hash")
@@ -200,7 +211,7 @@ impl Inbox {
             message
                 .token_assignment
                 .is_valid(&verifying_key)
-                .map_err(|_| VerificationError::InvalidInboxKey)?;
+                .map_err(VerificationError::InvalidToken)?;
         }
         if !missing.is_empty() {
             return Err(VerificationError::MissingContracts(missing));
@@ -214,7 +225,7 @@ impl Inbox {
         message
             .token_assignment
             .is_valid(&verifying_key)
-            .map_err(|_| VerificationError::InvalidInboxKey)?;
+            .map_err(VerificationError::InvalidToken)?;
         self.messages.push(message);
         Ok(())
     }

@@ -827,7 +827,6 @@ impl TokenAssignment {
         }
         let msg =
             TokenAssignment::signature_content(&self.time_slot, self.tier, &self.assignment_hash);
-        // let verifying_key = VerifyingKey::<Sha256>::from(generator_key);
         if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator
             return Err(InvalidReason::SignatureMismatch);

@@ -24,8 +24,27 @@ impl Drop for RunningInstance {
     }
 }
 
+pub(crate) struct InstanceInfo {
+    pub start_ptr: i64,
+    key: Key,
+}
+
+impl InstanceInfo {
+    pub fn key(&self) -> String {
+        match &self.key {
+            Key::Contract(k) => k.encode(),
+            Key::Delegate(k) => k.encode(),
+        }
+    }
+}
+
+enum Key {
+    Contract(ContractInstanceId),
+    Delegate(DelegateKey),
+}
+
 impl RunningInstance {
-    fn new(rt: &mut Runtime, instance: Instance) -> RuntimeResult<Self> {
+    fn new(rt: &mut Runtime, instance: Instance, key: Key) -> RuntimeResult<Self> {
         let memory = rt
             .host_memory
             .as_ref()
@@ -38,7 +57,13 @@ impl RunningInstance {
         let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         set_id.call(&mut rt.wasm_store, id).unwrap();
         let ptr = memory.view(&rt.wasm_store).data_ptr() as i64;
-        native_api::MEM_ADDR.insert(id, ptr);
+        native_api::MEM_ADDR.insert(
+            id,
+            InstanceInfo {
+                start_ptr: ptr,
+                key,
+            },
+        );
         Ok(Self { instance, id })
     }
 }
@@ -102,6 +127,7 @@ impl Runtime {
             (None, imports! {})
         };
         native_api::time::prepare_export(&mut store, &mut top_level_imports);
+        native_api::log::prepare_export(&mut store, &mut top_level_imports);
 
         Ok(Self {
             wasm_store: store,
@@ -174,7 +200,7 @@ impl Runtime {
         .clone();
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
-        RunningInstance::new(self, instance)
+        RunningInstance::new(self, instance, Key::Contract(key.id()))
     }
 
     pub(crate) fn prepare_delegate_call(
@@ -198,7 +224,7 @@ impl Runtime {
         .clone();
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
-        RunningInstance::new(self, instance)
+        RunningInstance::new(self, instance, Key::Delegate(key.clone()))
     }
 
     fn set_instance_mem(&mut self, req_bytes: usize, instance: &Instance) -> RuntimeResult<()> {
