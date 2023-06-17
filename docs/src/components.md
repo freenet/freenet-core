@@ -100,19 +100,16 @@ Delegates are used for:
 - Storing user data
   - e.g., contacts, messages
 
-### Origin Attestation
+### Security Model
 
-Delegates communicate with apps and other delegates using messages, similar to
-the [actor model](https://en.wikipedia.org/wiki/Actor_model). A crucial
-aspect of which is the delegate's ability to identify the origin of a message.
-The origin is identified by the key associated with the app, contract, or other
-delegate that sent the message. This key is generated cryptographically based on
-the code and configuration parameters of the sender, enabling delegates to
-verify the behavior of other delegates or apps with which they interact.
+### Security Framework
 
-This allows for highly flexible composability, as components can trust the
-behavior of the components they communicate with by verifying their code and
-configuration parameters.
+Delegates utilize a messaging system akin to the [actor
+model](https://en.wikipedia.org/wiki/Actor_model) to interact with contracts,
+other delegates, and applications. Regardless of whether the message
+originates from another delegate, a User Interface (UI), or as a state update
+from a contract, Freenet ensures that the recipient can verify the sender's
+identity for each and every message. This is known as "sender attestation".
 
 ### Delegate Use Cases
 
