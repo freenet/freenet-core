@@ -102,7 +102,8 @@ Delegates are used for:
 
 ### Origin Attestation
 
-Delegates communicate with apps and other delegates using messages, a crucial
+Delegates communicate with apps and other delegates using messages, similar to
+the [actor model](https://en.wikipedia.org/wiki/Actor_model). A crucial
 aspect of which is the delegate's ability to identify the origin of a message.
 The origin is identified by the key associated with the app, contract, or other
 delegate that sent the message. This key is generated cryptographically based on
