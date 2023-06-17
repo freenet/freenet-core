@@ -6,7 +6,6 @@ use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 use once_cell::sync::OnceCell;
-use wasm_bindgen::JsValue;
 
 use crate::DynError;
 
@@ -50,9 +49,12 @@ impl WebApi {
         let (send_half, requests) = futures::channel::mpsc::unbounded();
         let result_handler = move |result: Result<HostResponse, ClientError>| {
             let mut send_host_responses_clone = send_host_responses.clone();
-            wasm_bindgen_futures::future_to_promise(async move {
-                send_host_responses_clone.send(result).await.expect("channel open");
-                Ok(JsValue::TRUE)
+            let _ = wasm_bindgen_futures::future_to_promise(async move {
+                send_host_responses_clone
+                    .send(result)
+                    .await
+                    .expect("channel open");
+                Ok(wasm_bindgen::JsValue::NULL)
             });
         };
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -155,7 +157,6 @@ pub(crate) async fn node_comms(
 ) {
     use std::{rc::Rc, sync::Arc};
 
-    use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
     use futures::StreamExt;
     use locutus_stdlib::{
@@ -221,9 +222,13 @@ pub(crate) async fn node_comms(
                                 // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
                                 // we should reject that pending assignment
                                 // FIXME: in case this is for an inbox contract we were trying to update, this means
-                                crate::log::error(format!("the message for {key} wasn't delivered successfully, so may need to try again and/or notify the user"), None)
-                            } else {
-                                todo!()
+                                let id = token_rec_to_id.get(&key).unwrap();
+                                let alias = id.alias();
+                                crate::log::error(format!("the message for {alias} (aft contract: {key}) wasn't delivered successfully, so may need to try again and/or notify the user"), None);
+                            } else if inbox_to_id.get(&key).is_some() {
+                                let id = inbox_to_id.get(&key).unwrap();
+                                let alias = id.alias();
+                                crate::log::error(format!("the message for {alias} (inbox contract: {key}) wasn't delievered succesffully, so may need to try again and/or notify the user"), None);
                             }
                         }
                         RequestError::ContractError(err) => {
@@ -490,17 +495,3 @@ impl std::fmt::Display for TryNodeAction {
         }
     }
 }
-
-// #[test]
-// fn deser() {
-//     const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
-//     let bytes = String::from_utf8(
-//         std::fs::read(std::path::PathBuf::from(MANIFEST).join("examples/response.txt")).unwrap(),
-//     )
-//     .unwrap();
-//     let msg: Result<Vec<u8>, _> = bytes.split(',').map(|b| b.parse()).collect();
-//     let msg = msg.unwrap();
-//     let parsed: Result<HostResponse, ClientError> =
-//         locutus_stdlib::prelude::serde_json::from_slice(&msg).unwrap();
-//     eprintln!("{parsed:?}");
-// }
