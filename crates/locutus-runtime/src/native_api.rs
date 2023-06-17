@@ -60,6 +60,9 @@ pub(crate) mod log {
         );
     }
 
+    // TODO: this API right now is just a patch, ideally we want to impl a tracing subscriber
+    // that can be used in wasm and that under the hood will just pass data to the host via
+    // functions like this in a structured way
     fn info(id: i64, ptr: i64, len: i32) {
         if id == -1 {
             panic!("unset module id");
@@ -68,6 +71,6 @@ pub(crate) mod log {
         let ptr = compute_ptr::<u8>(ptr, info.start_ptr);
         let msg =
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as _)) };
-        tracing::info!(target: "native-api", key = %info.value().key(), "{msg}");
+        tracing::info!(target: "contract", key = %info.value().key(), "{msg}");
     }
 }
