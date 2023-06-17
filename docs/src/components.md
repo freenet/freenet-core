@@ -1,4 +1,4 @@
-# Building Decentralized Applications on Freenet
+# Components of Decentralized Software on Freenet
 
 Delegates, contracts, and user interfaces (UIs) each serve distinct roles in the
 Freenet ecosystem. Contracts control public data, or "shared state". Delegates
