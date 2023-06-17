@@ -7,6 +7,8 @@ mod code_hash;
 mod contract_interface;
 mod delegate_interface;
 pub(crate) mod global;
+#[cfg(all(feature = "log", target_family = "wasm"))]
+pub mod log;
 mod parameters;
 pub mod rand;
 #[cfg(all(feature = "time", target_family = "wasm"))]
