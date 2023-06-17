@@ -15,5 +15,4 @@ strum = { version = "0.24", features = ["derive"] }
 thiserror = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# FIXME: addign rand here pulls rand for transitive deps and gets included in the final wasm32 bin
 rand = "0.8"

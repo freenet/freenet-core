@@ -15,7 +15,8 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<ValidateResult, ContractError> {
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
-        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key);
+        #[allow(clippy::redundant_clone)]
+        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
         for (_tier, assignments) in (&assigned_tokens).into_iter() {
             for assignment in assignments {
                 if assignment.is_valid(&verifying_key).is_err() {
@@ -35,8 +36,21 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<bool, ContractError> {
         let assigned_token = TokenAssignment::try_from(delta)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
-        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key);
-        Ok(assigned_token.is_valid(&verifying_key).is_ok())
+        #[allow(clippy::redundant_clone)]
+        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
+        let verification = assigned_token.is_valid(&verifying_key);
+        #[cfg(target_family = "wasm")]
+        {
+            use rsa::pkcs8::EncodePublicKey;
+            if let Err(err) = &verification {
+                let pk = params
+                    .generator_public_key
+                    .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+                    .unwrap();
+                locutus_stdlib::log::info(&format!("verification pub key: {pk}"));
+            }
+        }
+        Ok(verification.is_ok())
     }
 
     fn update_state(

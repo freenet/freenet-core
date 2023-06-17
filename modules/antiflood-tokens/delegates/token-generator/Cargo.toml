@@ -15,7 +15,7 @@ locutus-aft-interface = { path = "../../interfaces" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 chrono = { workspace = true, features = ["alloc", "serde"] }
-locutus-stdlib = { workspace = true, features = ["time"] }
+locutus-stdlib = { workspace = true, features = ["contract"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 chrono = { workspace = true, features = ["clock", "alloc", "serde"]}
@@ -24,7 +24,6 @@ chrono = { workspace = true, features = ["clock", "alloc", "serde"]}
 arbitrary = "1"
 once_cell = "1"
 chacha20poly1305 = "0.10"
-# FIXME: adding rand here pulls rand for transitive deps and gets included in the final wasm32 bin
 rand = { version = "0.8", features = ["std"] }
 rand_chacha = { version = "0.3" }
 locutus-stdlib = { workspace = true, features = ["testing"] }
