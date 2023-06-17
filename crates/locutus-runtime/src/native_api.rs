@@ -16,8 +16,7 @@ type InstanceId = i64;
 
 #[inline(always)]
 fn compute_ptr<T>(ptr: i64, start_ptr: i64) -> *mut T {
-    let start_ptr: *mut T = start_ptr as _;
-    unsafe { start_ptr.offset(ptr as _) }
+    (start_ptr + ptr) as _
 }
 
 pub(crate) mod time {
