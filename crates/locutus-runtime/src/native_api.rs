@@ -70,6 +70,6 @@ pub(crate) mod log {
         let ptr = compute_ptr::<u8>(ptr, info.start_ptr);
         let msg =
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as _)) };
-        tracing::info!(target: "contract", key = %info.value().key(), "{msg}");
+        tracing::info!(target: "contract", contract = %info.value().key(), "{msg}");
     }
 }

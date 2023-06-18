@@ -829,6 +829,13 @@ impl TokenAssignment {
             TokenAssignment::signature_content(&self.time_slot, self.tier, &self.assignment_hash);
         if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator
+            #[cfg(target_family = "wasm")]
+            {
+                locutus_stdlib::log::info(&format!(
+                    "failed verification of message `{msg:?}` with signature: `{sig}`",
+                    sig = self.signature
+                ));
+            }
             return Err(InvalidReason::SignatureMismatch);
         }
         Ok(())
