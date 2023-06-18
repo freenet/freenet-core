@@ -225,7 +225,26 @@ impl Inbox {
         message
             .token_assignment
             .is_valid(&verifying_key)
-            .map_err(VerificationError::InvalidToken)?;
+            .map_err(|e| {
+                #[cfg(target_family = "wasm")]
+                {
+                    match &e {
+                        TokenInvalidReason::SignatureMismatch => {
+                            use rsa::pkcs8::EncodePublicKey;
+                            let pk = message
+                                .token_assignment
+                                .generator
+                                .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+                                .unwrap()
+                                .split_whitespace()
+                                .collect::<String>();
+                            locutus_stdlib::log::info(&format!("veryifying key inbox: `{pk}`"));
+                        }
+                        _ => {}
+                    }
+                }
+                VerificationError::InvalidToken(e)
+            })?;
         self.messages.push(message);
         Ok(())
     }

@@ -7,7 +7,7 @@ edition = "2021"
 bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
-locutus-stdlib = { workspace = true }
+locutus-stdlib = { workspace = true, features = ["contract"] }
 rsa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -2,7 +2,7 @@ use locutus_aft_interface::{
     AllocationError, TokenAllocationRecord, TokenAssignment, TokenDelegateParameters,
 };
 use locutus_stdlib::prelude::*;
-use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256};
+use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256, RsaPublicKey};
 
 pub struct TokenAllocContract;
 
@@ -20,6 +20,7 @@ impl ContractInterface for TokenAllocContract {
         for (_tier, assignments) in (&assigned_tokens).into_iter() {
             for assignment in assignments {
                 if assignment.is_valid(&verifying_key).is_err() {
+                    log_verification_err(&params.generator_public_key, "validate state");
                     return Ok(ValidateResult::Invalid);
                 }
             }
@@ -39,16 +40,8 @@ impl ContractInterface for TokenAllocContract {
         #[allow(clippy::redundant_clone)]
         let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
         let verification = assigned_token.is_valid(&verifying_key);
-        #[cfg(target_family = "wasm")]
-        {
-            use rsa::pkcs8::EncodePublicKey;
-            if let Err(err) = &verification {
-                let pk = params
-                    .generator_public_key
-                    .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-                    .unwrap();
-                locutus_stdlib::log::info(&format!("verification pub key: {pk}"));
-            }
+        if verification.is_err() {
+            log_verification_err(&params.generator_public_key, "validate delta");
         }
         Ok(verification.is_ok())
     }
@@ -60,7 +53,7 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<UpdateModification<'static>, ContractError> {
         let mut assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
-        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key);
+        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
         for update in data {
             match update {
                 UpdateData::State(s) => {
@@ -80,6 +73,10 @@ impl ContractInterface for TokenAllocContract {
                         .append(new_assigned_token, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (delta)",
+                            );
                             ContractError::InvalidUpdateWithInfo {
                                 reason: format!("{err}"),
                             }
@@ -91,6 +88,10 @@ impl ContractInterface for TokenAllocContract {
                         .merge(new_assigned_tokens, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (state and delta)",
+                            );
                             ContractError::InvalidUpdateWithInfo {
                                 reason: format!("{err}"),
                             }
@@ -132,6 +133,21 @@ impl ContractInterface for TokenAllocContract {
         //let delta = assigned_tokens.delta(&summary);
         assigned_tokens.try_into()
     }
+}
+
+fn log_verification_err(pub_key: &RsaPublicKey, target: &str) {
+    #[cfg(target_family = "wasm")]
+    {
+        use rsa::pkcs8::EncodePublicKey;
+        let pk = pub_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .split_whitespace()
+            .collect::<String>();
+        locutus_stdlib::log::info(&format!("erroneous verification with key: {pk} @ {target}"));
+    }
+    let _ = pub_key;
+    let _ = target;
 }
 
 trait TokenAllocationRecordExt {
