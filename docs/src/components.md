@@ -104,9 +104,9 @@ Delegates are used for:
 
 Delegates utilize a messaging system akin to the [actor
 model](https://en.wikipedia.org/wiki/Actor_model) to interact with contracts,
-other delegates, and applications. Regardless of whether the message
-originates from another delegate, a User Interface (UI), or as a state update
-from a contract, Freenet ensures that the recipient can verify the sender's
+other delegates, and applications. Regardless of whether the message originates
+from another delegate, a User Interface (UI), or as a state update from a
+contract, the Freenet kernel ensures that the recipient can verify the sender's
 identity for any incoming message. This is known as "sender attestation".
 
 ### Delegate Use Cases
