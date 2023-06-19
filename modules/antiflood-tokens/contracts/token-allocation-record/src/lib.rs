@@ -16,7 +16,7 @@ impl ContractInterface for TokenAllocContract {
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
         #[allow(clippy::redundant_clone)]
-        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(params.generator_public_key.clone());
         for (_tier, assignments) in (&assigned_tokens).into_iter() {
             for assignment in assignments {
                 if assignment.is_valid(&verifying_key).is_err() {
@@ -38,7 +38,7 @@ impl ContractInterface for TokenAllocContract {
         let assigned_token = TokenAssignment::try_from(delta)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
         #[allow(clippy::redundant_clone)]
-        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(params.generator_public_key.clone());
         let verification = assigned_token.is_valid(&verifying_key);
         if verification.is_err() {
             log_verification_err(&params.generator_public_key, "validate delta");
@@ -53,7 +53,7 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<UpdateModification<'static>, ContractError> {
         let mut assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
-        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(params.generator_public_key.clone());
         for update in data {
             match update {
                 UpdateData::State(s) => {
