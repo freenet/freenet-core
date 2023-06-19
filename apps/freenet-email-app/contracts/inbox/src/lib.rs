@@ -177,12 +177,6 @@ impl Inbox {
             if !records.assignment_exists(&message.token_assignment) {
                 return Err(VerificationError::TokenAssignmentMismatch);
             }
-            let mut hasher = blake2::Blake2s256::new();
-            hasher.update(&message.content);
-            let hash = hasher.finalize();
-            if message.token_assignment.assignment_hash != hash.as_slice() {
-                return Err(VerificationError::InvalidMessageHash);
-            }
             self.add_message(message)?;
         }
         Ok(())

@@ -161,8 +161,7 @@ impl DecryptedMessage {
         recipient_key: RsaPublicKey,
         from: &Identity,
     ) -> Result<(), DynError> {
-        let content = self;
-        let (hash, _) = content.assignment_hash_and_signed_content()?;
+        let (hash, _) = self.assignment_hash_and_signed_content()?;
         crate::log::debug!(
             "requesting token for assignment hash: {}",
             bs58::encode(hash).into_string()
@@ -180,15 +179,13 @@ impl DecryptedMessage {
 
         PENDING_INBOXES_UPDATE.with(|map| {
             let map = &mut *map.borrow_mut();
-            map.entry(inbox_key).or_insert_with(Vec::new).push(content);
+            map.entry(inbox_key).or_insert_with(Vec::new).push(self);
         });
-
         Ok(())
     }
 
-    fn to_stored(&self, mut token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
-        let (hash, content) = self.assignment_hash_and_signed_content()?;
-        token_assignment.assignment_hash = hash;
+    fn to_stored(&self, token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
+        let (_, content) = self.assignment_hash_and_signed_content()?;
         Ok::<_, DynError>(StoredMessage {
             content,
             token_assignment,
