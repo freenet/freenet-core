@@ -256,8 +256,14 @@ impl AftRecords {
 
     pub fn update_record(identity: Identity, update_data: UpdateData) -> Result<(), DynError> {
         let record = match update_data {
-            StateUpdate(state) => TokenAllocationRecord::try_from(state)?,
-            Delta(delta) => TokenAllocationRecord::try_from(delta)?,
+            StateUpdate(state) => {
+                crate::log::debug!("updating record with state: {:?}", serde_json::to_vec(&state)?);
+                TokenAllocationRecord::try_from(state)?
+            }
+            Delta(delta) => {
+                crate::log::debug!("updating record with delta: {delta:?}");
+                TokenAllocationRecord::try_from(delta)?
+            }
             _ => {
                 return Err(DynError::from(
                     "Unexpected update data type while updating the record",
