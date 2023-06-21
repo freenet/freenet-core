@@ -1,11 +1,15 @@
 - [Introduction](introduction.md)
 
+# Concepts
+
+- [Overview](concepts/overview.md)
+- [Kernel](concepts/kernel.md)
+- [Contracts](concepts/contracts.md)
+- [Delegates](concepts/delegates.md)
+- [User Interfaces](concepts/ui.md)
+
 # Architecture
 
-- [Overview](architecture/overview.md)
-- [Contracts](architecture/contracts.md)
-- [Delegates](architecture/delegates.md)
-- [User Interfaces](architecture/ui.md)
 - [P2P Network](architecture/p2p-network.md)
 - [Intelligent Routing](architecture/irouting.md)
 
