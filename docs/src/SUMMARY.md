@@ -1,15 +1,22 @@
 - [Introduction](introduction.md)
 
+# Concepts
+
+- [Overview](concepts/overview.md)
+- [Kernel](concepts/kernel.md)
+- [Contracts](concepts/contracts.md)
+- [Delegates](concepts/delegates.md)
+- [User Interfaces](concepts/ui.md)
+
 # Architecture
 
-- [Components](components.md)
-- [P2P Network](p2p-network.md)
-- [Intelligent Routing](irouting.md)
+- [P2P Network](architecture/p2p-network.md)
+- [Intelligent Routing](architecture/irouting.md)
 
 # Developer Guide
 
 - [Tutorial: Create an App](tutorial.md)
-  - [Contract interfaces](contract-interface.md)
+- [Contract interfaces](contract-interface.md)
 - [locutus.toml format](manifest.md)
 
 # Examples
