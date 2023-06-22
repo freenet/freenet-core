@@ -7,7 +7,7 @@ edition = "2021"
 bincode = { workspace = true }
 bs58 = { workspace = true }
 locutus-stdlib = { workspace = true }
-rsa = { workspace = true, features = ["sha2"] }
+rsa = { workspace = true, features = ["sha2", "pem"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
