@@ -61,8 +61,7 @@ network.
 
 ## Similarity to Service Workers
 
-Delegates have much in common with [Service
-Workers](https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API) in
+Delegates have much in common with [Service Workers](https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API) in
 the web browser ecosystem. Both are self-contained software modules, running
 independently of the user interface and performing complex tasks on behalf of
 the user.
