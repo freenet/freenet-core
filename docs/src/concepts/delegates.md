@@ -16,11 +16,13 @@ tokens, and passwords. They can also be created by UI components or other
 delegates. They perform actions on the user's behalf on Freenet, like consuming
 received messages in an inbox, or storing user data like contacts and messages.
 
-Like a much more powerful version of a web browser's [web
-storage](https://en.wikipedia.org/wiki/Web_storage), Delegates offer a higher
-level of discernment and trust. For instance, a Delegate tasked with managing a
-private key could be asked to sign a document with that key. However, the
-decision to do so may depend on the identity of the requester.
+Like a generalized version of [web
+storage](https://en.wikipedia.org/wiki/Web_storage), Delegates offer much more
+flexibility and control. For example, a Delegate tasked with managing a private
+key could be asked to sign a document with that key instead of just revealing
+the key to some other code that does the signing. The delegate's decision to do
+so may depend on the identity of the requester, the state of a contract, among
+many other factors.
 
 ## Actor Model and Message Passing
 
