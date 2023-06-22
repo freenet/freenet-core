@@ -24,7 +24,7 @@ use rand_chacha::rand_core::SeedableRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
     pkcs1::EncodeRsaPublicKey, pkcs1v15::SigningKey, sha2::Sha256, signature::Signer,
-    Pkcs1v15Encrypt, PublicKey, RsaPrivateKey, RsaPublicKey,
+    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -351,8 +351,7 @@ impl InboxModel {
         }
         #[cfg(feature = "use-node")]
         {
-            let signing_key =
-                SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
+            let signing_key = SigningKey::<Sha256>::new(self.settings.private_key.clone());
             let signature = signing_key.sign(&signed).into();
             let delta = UpdateInbox::RemoveMessages { signature, ids };
             let request = ContractRequest::Update {
@@ -464,7 +463,7 @@ impl InboxModel {
     ) -> Result<(), DynError> {
         let settings = self.settings.to_stored()?;
         let serialized = serde_json::to_vec(&settings)?;
-        let signing_key = SigningKey::<Sha256>::new_with_prefix(self.settings.private_key.clone());
+        let signing_key = SigningKey::<Sha256>::new(self.settings.private_key.clone());
         let signature = signing_key.sign(&serialized).into();
         let delta = UpdateInbox::ModifySettings {
             signature,

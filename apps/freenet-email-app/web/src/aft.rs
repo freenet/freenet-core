@@ -257,7 +257,10 @@ impl AftRecords {
     pub fn update_record(identity: Identity, update_data: UpdateData) -> Result<(), DynError> {
         let record = match update_data {
             StateUpdate(state) => {
-                crate::log::debug!("updating record with state: {:?}", serde_json::to_vec(&state)?);
+                crate::log::debug!(
+                    "updating record with state: {:?}",
+                    serde_json::to_vec(&state)?
+                );
                 TokenAllocationRecord::try_from(state)?
             }
             Delta(delta) => {

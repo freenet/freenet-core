@@ -16,8 +16,7 @@ impl ContractInterface for TokenAllocContract {
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
         #[allow(clippy::redundant_clone)]
-        let verifying_key =
-            VerifyingKey::<Sha256>::new_with_prefix(params.generator_public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new(params.generator_public_key.clone());
         for (_tier, assignments) in (&assigned_tokens).into_iter() {
             for assignment in assignments {
                 if assignment.is_valid(&verifying_key).is_err() {
@@ -39,12 +38,12 @@ impl ContractInterface for TokenAllocContract {
         let assigned_token = TokenAssignment::try_from(delta)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
         #[allow(clippy::redundant_clone)]
-        let verifying_key =
-            VerifyingKey::<Sha256>::new_with_prefix(params.generator_public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new(params.generator_public_key.clone());
         let verification = assigned_token.is_valid(&verifying_key);
         if verification.is_err() {
             log_verification_err(&params.generator_public_key, "validate delta");
         }
+        log_succesful_ver(&params.generator_public_key, "validate delta");
         Ok(verification.is_ok())
     }
 
@@ -55,8 +54,7 @@ impl ContractInterface for TokenAllocContract {
     ) -> Result<UpdateModification<'static>, ContractError> {
         let mut assigned_tokens = TokenAllocationRecord::try_from(state)?;
         let params = TokenDelegateParameters::try_from(parameters)?;
-        let verifying_key =
-            VerifyingKey::<Sha256>::new_with_prefix(params.generator_public_key.clone());
+        let verifying_key = VerifyingKey::<Sha256>::new(params.generator_public_key.clone());
         for update in data {
             match update {
                 UpdateData::State(s) => {
@@ -65,10 +63,15 @@ impl ContractInterface for TokenAllocContract {
                         .merge(new_assigned_tokens, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (state)",
+                            );
                             ContractError::InvalidUpdateWithInfo {
                                 reason: format!("{err}"),
                             }
                         })?;
+                    log_succesful_ver(&params.generator_public_key, "update state (state)")
                 }
                 UpdateData::Delta(d) => {
                     let new_assigned_token = TokenAssignment::try_from(d)?;
@@ -84,6 +87,7 @@ impl ContractInterface for TokenAllocContract {
                                 reason: format!("{err}"),
                             }
                         })?;
+                    log_succesful_ver(&params.generator_public_key, "update state (delta)")
                 }
                 UpdateData::StateAndDelta { state, delta } => {
                     let new_assigned_tokens = TokenAllocationRecord::try_from(state)?;
@@ -104,10 +108,18 @@ impl ContractInterface for TokenAllocContract {
                         .append(new_assigned_token, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (state and delta)",
+                            );
                             ContractError::InvalidUpdateWithInfo {
                                 reason: format!("{err}"),
                             }
                         })?;
+                    log_succesful_ver(
+                        &params.generator_public_key,
+                        "update state (state and delta)",
+                    )
                 }
                 _ => unreachable!(),
             }
@@ -136,6 +148,23 @@ impl ContractInterface for TokenAllocContract {
         //let delta = assigned_tokens.delta(&summary);
         assigned_tokens.try_into()
     }
+}
+
+fn log_succesful_ver(pub_key: &RsaPublicKey, target: &str) {
+    #[cfg(target_family = "wasm")]
+    {
+        use rsa::pkcs8::EncodePublicKey;
+        let pk = pub_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .split_whitespace()
+            .collect::<String>();
+        locutus_stdlib::log::info(&format!(
+            "successful verification with key: {pk} @ {target}"
+        ));
+    }
+    let _ = pub_key;
+    let _ = target;
 }
 
 fn log_verification_err(pub_key: &RsaPublicKey, target: &str) {
