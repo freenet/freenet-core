@@ -1,7 +1,6 @@
 - [Introduction](introduction.md)
 
 # Concepts
-
 - [Overview](concepts/overview.md)
 - [Kernel](concepts/kernel.md)
 - [Contracts](concepts/contracts.md)

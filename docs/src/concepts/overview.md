@@ -7,7 +7,21 @@ data on the user's behalf, while [User Interfaces](ui.md) provide an interface
 between these and the user through a web browser. UIs are distributed through
 the P2P network via contracts.
 
-All of this occurs within the [Freenet Kernel](kernel.md), the software
-that runs on the user's computer so it can join the Freenet network.
+
 
 ![Architectural Primitives Diagram](components.svg)
+
+## Freenet Kernel
+
+The Freenet Kernel is the software that enables a user's computer to connect to
+the Freenet network. Its primary functions are:
+
+* Providing a user-friendly interface to access Freenet via a web browser
+* Host the user's [delegates](delegates.md) and the private data they store
+* Host [contracts](contracts.md) and their associated data on behalf of the
+  network
+* Manage communication between contracts, delegates, and UI components
+
+Built with Rust, the kernel is designed to be compact (ideally under 5 MB),
+efficient, and capable of running on a variety of devices such as smartphones,
+desktop computers, and embedded devices.
