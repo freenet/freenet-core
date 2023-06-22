@@ -16,7 +16,7 @@ tokens, and passwords. They can also be created by UI components or other
 delegates. They perform actions on the user's behalf on Freenet, like consuming
 received messages in an inbox, or storing user data like contacts and messages.
 
-Functioning in a way akin to a more evolved version of a web browser's [web
+Like a much more powerful version of a web browser's [web
 storage](https://en.wikipedia.org/wiki/Web_storage), Delegates offer a higher
 level of discernment and trust. For instance, a Delegate tasked with managing a
 private key could be asked to sign a document with that key. However, the
