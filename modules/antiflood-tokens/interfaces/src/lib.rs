@@ -579,7 +579,7 @@ impl Display for AllocationCriteria {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TokenAllocationRecord {
     /// A list of issued tokens.
     ///

@@ -217,8 +217,11 @@ impl AftRecords {
             std::time::Duration::from_secs(365 * 24 * 3600),
             token_record,
         )?;
-        // fixme: should be using the state of the aft record contract here instead:
-        let records = TokenAllocationRecord::new(HashMap::default());
+        // todo: optimize so we don't clone the whole record and instead use a smart pointer
+        let Some(records) = RECORDS.with(|recs| recs.borrow().get(generator_id).cloned()) else {
+            // todo: somehow propagate this to the UI so the user retries /or we retry automatically/ later
+            return Err(format!("failed to get token record for id: {}", generator_id.alias()).into())
+        };
         let token_request = TokenDelegateMessage::RequestNewToken(RequestNewToken {
             request_id: REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             delegate_id: delegate_key.clone().into(),
