@@ -150,6 +150,7 @@ impl ContractInterface for TokenAllocContract {
     }
 }
 
+#[allow(unused)]
 fn log_succesful_ver(pub_key: &RsaPublicKey, target: &str) {
     #[cfg(target_family = "wasm")]
     {
@@ -159,14 +160,13 @@ fn log_succesful_ver(pub_key: &RsaPublicKey, target: &str) {
             .unwrap()
             .split_whitespace()
             .collect::<String>();
-        locutus_stdlib::log::info(&format!(
-            "successful verification with key: {pk} @ {target}"
-        ));
+        // locutus_stdlib::log::info(&format!(
+        //     "successful verification with key: {pk} @ {target}"
+        // ));
     }
-    let _ = pub_key;
-    let _ = target;
 }
 
+#[allow(unused)]
 fn log_verification_err(pub_key: &RsaPublicKey, target: &str) {
     #[cfg(target_family = "wasm")]
     {
@@ -178,8 +178,6 @@ fn log_verification_err(pub_key: &RsaPublicKey, target: &str) {
             .collect::<String>();
         locutus_stdlib::log::info(&format!("erroneous verification with key: {pk} @ {target}"));
     }
-    let _ = pub_key;
-    let _ = target;
 }
 
 trait TokenAllocationRecordExt {

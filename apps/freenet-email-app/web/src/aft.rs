@@ -261,13 +261,13 @@ impl AftRecords {
         let record = match update_data {
             StateUpdate(state) => {
                 crate::log::debug!(
-                    "updating record with state: {:?}",
-                    serde_json::to_vec(&state)?
+                    "updating aft record for `{}` with whole state",
+                    identity.alias()
                 );
                 TokenAllocationRecord::try_from(state)?
             }
             Delta(delta) => {
-                crate::log::debug!("updating record with delta: {delta:?}");
+                crate::log::debug!("updating aft record for `{}` with delta", identity.alias());
                 TokenAllocationRecord::try_from(delta)?
             }
             _ => {

@@ -227,7 +227,7 @@ impl Inbox {
                                 .unwrap()
                                 .split_whitespace()
                                 .collect::<String>();
-                            locutus_stdlib::log::info(&format!("veryifying key inbox: `{pk}`"));
+                            // locutus_stdlib::log::info(&format!("veryifying key inbox: `{pk}`"));
                         }
                         _ => {}
                     }

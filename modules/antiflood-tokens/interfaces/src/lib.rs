@@ -840,13 +840,6 @@ impl TokenAssignment {
             }
             return Err(InvalidReason::SignatureMismatch);
         }
-        #[cfg(target_family = "wasm")]
-        {
-            locutus_stdlib::log::info(&format!(
-                "successful verification of message `{msg:?}` with signature: `{sig}`",
-                sig = self.signature
-            ));
-        }
         Ok(())
     }
 }

@@ -277,9 +277,9 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
                     .unwrap()
                     .split_whitespace()
                     .collect::<String>();
-                locutus_stdlib::log::info(&format!(
-                    "signed message {msg:?} with pub key: `{pk}`, signature: {signature}"
-                ));
+                // locutus_stdlib::log::info(&format!(
+                //     "signed message {msg:?} with pub key: `{pk}`, signature: {signature}"
+                // ));
             }
             TokenAssignment {
                 tier: criteria.frequency,

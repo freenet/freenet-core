@@ -432,22 +432,14 @@ impl Executor {
                         .into(),
                     None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
                 };
-                notifier
-                    .send(Ok(ContractResponse::UpdateNotification {
-                        key: key.clone(),
-                        update,
-                    }
-                    .into()))
-                    .map_err(|err| {
-                        tracing::error!("{err}");
-                        Either::Left(
-                            CoreContractError::Update {
-                                key: key.clone(),
-                                cause: format!("{err}"),
-                            }
-                            .into(),
-                        )
-                    })?;
+                if let Err(err) = notifier.send(Ok(ContractResponse::UpdateNotification {
+                    key: key.clone(),
+                    update,
+                }
+                .into()))
+                {
+                    tracing::error!("{err}");
+                }
             }
         }
         Ok(())
