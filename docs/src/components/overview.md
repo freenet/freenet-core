@@ -1,4 +1,4 @@
-# Concepts Overview
+# Components of Decentralized Software
 
 Delegates, contracts, and user interfaces (UIs) each serve distinct roles in the
 Freenet ecosystem. [Contracts](contracts.md) control public data, or "shared

@@ -1,11 +1,11 @@
 - [Introduction](introduction.md)
 
-# Concepts
-- [Overview](concepts/overview.md)
-- [Kernel](concepts/kernel.md)
-- [Contracts](concepts/contracts.md)
-- [Delegates](concepts/delegates.md)
-- [User Interfaces](concepts/ui.md)
+# Components
+- [Overview](components/overview.md)
+- [Kernel](components/kernel.md)
+- [Contracts](components/contracts.md)
+- [Delegates](components/delegates.md)
+- [User Interfaces](components/ui.md)
 
 # Architecture
 
