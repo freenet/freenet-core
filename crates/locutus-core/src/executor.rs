@@ -407,9 +407,11 @@ impl Executor {
         params: &Parameters<'a>,
         new_state: &WrappedState,
     ) -> Result<(), Either<RequestError, DynError>> {
-        if let Some(notifiers) = self.update_notifications.get(key) {
+        if let Some(notifiers) = self.update_notifications.get_mut(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
-            for (peer_key, notifier) in notifiers {
+            // in general there should be less than 32 failures
+            let mut failures = arrayvec::ArrayVec::<_, 32>::new();
+            for (peer_key, notifier) in notifiers.iter() {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
                 let update = match peer_summary {
                     Some(summary) => self
@@ -438,8 +440,12 @@ impl Executor {
                 }
                 .into()))
                 {
-                    tracing::error!("{err}");
+                    let _ = failures.try_push(*peer_key);
+                    tracing::error!(cli_id = %peer_key, "{err}");
                 }
+            }
+            if !failures.is_empty() {
+                notifiers.retain(|(c, _)| !failures.contains(c));
             }
         }
         Ok(())
