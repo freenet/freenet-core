@@ -333,7 +333,6 @@ impl Executor {
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
                 self.register_contract_notifier(key.clone(), id, updates, summary)
                     .map_err(Either::Left)?;
-                tracing::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
                 self.perform_get(false, key).await.map_err(Either::Left)
                 // todo: in network mode, also send a subscribe to keep up to date
@@ -407,9 +406,12 @@ impl Executor {
         params: &Parameters<'a>,
         new_state: &WrappedState,
     ) -> Result<(), Either<RequestError, DynError>> {
-        if let Some(notifiers) = self.update_notifications.get(key) {
+        tracing::debug!(contract = %key, "notify of contract update");
+        if let Some(notifiers) = self.update_notifications.get_mut(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
-            for (peer_key, notifier) in notifiers {
+            // in general there should be less than 32 failures
+            let mut failures = arrayvec::ArrayVec::<_, 32>::new();
+            for (peer_key, notifier) in notifiers.iter() {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
                 let update = match peer_summary {
                     Some(summary) => self
@@ -432,22 +434,20 @@ impl Executor {
                         .into(),
                     None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
                 };
-                notifier
-                    .send(Ok(ContractResponse::UpdateNotification {
-                        key: key.clone(),
-                        update,
-                    }
-                    .into()))
-                    .map_err(|err| {
-                        tracing::error!("{err}");
-                        Either::Left(
-                            CoreContractError::Update {
-                                key: key.clone(),
-                                cause: format!("{err}"),
-                            }
-                            .into(),
-                        )
-                    })?;
+                if let Err(err) = notifier.send(Ok(ContractResponse::UpdateNotification {
+                    key: key.clone(),
+                    update,
+                }
+                .into()))
+                {
+                    let _ = failures.try_push(*peer_key);
+                    tracing::error!(cli_id = %peer_key, "{err}");
+                } else {
+                    tracing::debug!(cli_id = %peer_key, contract = %key, "notified of update");
+                }
+            }
+            if !failures.is_empty() {
+                notifiers.retain(|(c, _)| !failures.contains(c));
             }
         }
         Ok(())

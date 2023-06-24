@@ -579,7 +579,7 @@ impl Display for AllocationCriteria {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TokenAllocationRecord {
     /// A list of issued tokens.
     ///
@@ -839,13 +839,6 @@ impl TokenAssignment {
                 ));
             }
             return Err(InvalidReason::SignatureMismatch);
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            locutus_stdlib::log::info(&format!(
-                "successful verification of message `{msg:?}` with signature: `{sig}`",
-                sig = self.signature
-            ));
         }
         Ok(())
     }

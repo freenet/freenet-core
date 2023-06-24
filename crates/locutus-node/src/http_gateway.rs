@@ -129,30 +129,40 @@ async fn websocket_interface(
     let (mut tx, mut rx) = ws.split();
     let listeners: Arc<Mutex<Vec<(_, UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(Vec::new()));
-    loop {
+
+    let mut listener_responses = {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let active_listeners = listeners.clone();
         let listeners_task = async move {
             loop {
-                let active_listeners = &mut *active_listeners.lock().await;
+                let mut lock = active_listeners.lock().await;
+                let active_listeners = &mut *lock;
                 for _ in 0..active_listeners.len() {
                     let (key, mut listener) = active_listeners.swap_remove(0);
                     match listener.try_recv() {
                         Ok(r) => {
+                            tracing::debug!(cli_id = %client_id, contract = %key, "got pending notification");
                             active_listeners.push((key, listener));
-                            return Ok(r);
+                            let _ = tx.send(Ok(r));
                         }
                         Err(TryRecvError::Empty) => {
                             active_listeners.push((key, listener));
                         }
                         Err(err @ TryRecvError::Disconnected) => {
-                            return Err(Box::new(err) as DynError)
+                            tracing::debug!(cli_id = %client_id, contract = %key, "disconnected notification channel");
+                            let _ = tx.send(Err(Box::new(err) as DynError));
                         }
                     }
                 }
+                std::mem::drop(lock);
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
+        tokio::task::spawn(listeners_task);
+        rx
+    };
 
+    loop {
         let client_req_task = async {
             let next_msg = match rx
                 .next()
@@ -168,10 +178,11 @@ async fn websocket_interface(
             process_client_request(client_id, next_msg, &request_sender).await
         };
 
-        let active_listeners = listeners.clone();
         tokio::select! { biased;
             msg = async { process_host_response(response_rx.recv().await, client_id, &mut tx).await } => {
+                let active_listeners = listeners.clone();
                 if let Some(NewSubscription { key, callback }) = msg? {
+                    tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
                     let active_listeners = &mut *active_listeners.lock().await;
                     active_listeners.push((key, callback));
                 }
@@ -186,8 +197,8 @@ async fn websocket_interface(
                     Err(Some(err)) => return Err(err),
                 }
             }
-            response = listeners_task => {
-                let response = response?;
+            response = listener_responses.recv() => {
+                let response = response.ok_or_else(|| ClientError::from(ErrorKind::Disconnect))??;
                 match &response {
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
@@ -285,7 +296,11 @@ async fn process_host_response(
             debug_assert_eq!(id, client_id);
             Ok(Some(NewSubscription { key, callback }))
         }
-        _ => {
+        Some(HostCallbackResult::NewId(cli_id)) => {
+            tracing::debug!(%cli_id, "new client registered");
+            Ok(None)
+        }
+        None => {
             let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
                 ErrorKind::NodeUnavailable.into(),
             ))?;

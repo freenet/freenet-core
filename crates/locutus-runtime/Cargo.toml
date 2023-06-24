@@ -10,7 +10,7 @@ repository = "https://github.com/freenet/locutus"
 
 [dependencies]
 arbitrary = { version = "1", features = ["derive"], optional = true }
-arrayvec = { version = "0.7", features = ["serde"] }
+arrayvec = { workspace = true }
 async-trait = "0.1"
 bincode = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
