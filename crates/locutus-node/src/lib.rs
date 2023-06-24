@@ -55,7 +55,7 @@ pub mod local_node {
                 notification_channel,
                 ..
             } = http_handle.recv().await?;
-            tracing::debug!("client {id}, req -> {request}");
+            tracing::trace!(cli_id = %id, "got request -> {request}");
             match executor
                 .handle_request(id, request, notification_channel)
                 .await

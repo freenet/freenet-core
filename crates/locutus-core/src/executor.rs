@@ -333,7 +333,6 @@ impl Executor {
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
                 self.register_contract_notifier(key.clone(), id, updates, summary)
                     .map_err(Either::Left)?;
-                tracing::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
                 self.perform_get(false, key).await.map_err(Either::Left)
                 // todo: in network mode, also send a subscribe to keep up to date
@@ -407,6 +406,7 @@ impl Executor {
         params: &Parameters<'a>,
         new_state: &WrappedState,
     ) -> Result<(), Either<RequestError, DynError>> {
+        tracing::debug!(contract = %key, "notify of contract update");
         if let Some(notifiers) = self.update_notifications.get_mut(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             // in general there should be less than 32 failures
@@ -442,6 +442,8 @@ impl Executor {
                 {
                     let _ = failures.try_push(*peer_key);
                     tracing::error!(cli_id = %peer_key, "{err}");
+                } else {
+                    tracing::debug!(cli_id = %peer_key, contract = %key, "notified of update");
                 }
             }
             if !failures.is_empty() {
