@@ -6,10 +6,11 @@ tables in a database, or memory locations in a globally shared memory. Contracts
 define the circumstances under which state can be modified and whether a given
 state is allowed.
 
-Contracts and their associated state reside on the Freenet network on peers
-determined by the contract's location, which is derived from its WebAssembly
-code and parameters. While a user's delegates are hosted on their local Freenet
-peer, contracts are hosted on the network as a whole.
+Contracts and their associated state reside on the Freenet
+[network](../architecture/p2p-network.md) on peers determined by the contract's
+location, which is derived from its WebAssembly code and parameters. While a
+user's delegates are hosted on their local Freenet peer, contracts are hosted on
+the network as a whole.
 
 Contracts also outline how to merge two valid states, creating a new state that
 incorporates both. This process ensures [eventual

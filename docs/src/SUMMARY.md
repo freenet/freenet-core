@@ -29,4 +29,3 @@
 # Reference
 
 - [Glossary](glossary.md)
-- [FAQ](https://freenet.org/faq)
