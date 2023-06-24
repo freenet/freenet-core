@@ -2,7 +2,6 @@
 
 # Components
 - [Overview](components/overview.md)
-- [Kernel](components/kernel.md)
 - [Contracts](components/contracts.md)
 - [Delegates](components/delegates.md)
 - [User Interfaces](components/ui.md)
