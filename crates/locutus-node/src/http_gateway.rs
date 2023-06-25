@@ -13,6 +13,7 @@ use locutus_stdlib::client_api::{
 };
 use rmp_serde::Deserializer;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::{
     collections::HashMap,
     sync::{
@@ -127,23 +128,22 @@ async fn websocket_interface(
 ) -> Result<(), DynError> {
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     let (mut tx, mut rx) = ws.split();
-    let listeners: Arc<Mutex<Vec<(_, UnboundedReceiver<HostResult>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let listeners: Arc<Mutex<VecDeque<(_, UnboundedReceiver<HostResult>)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
     loop {
         let active_listeners = listeners.clone();
         let listeners_task = async move {
             loop {
                 let mut lock = active_listeners.lock().await;
                 let active_listeners = &mut *lock;
-                for _ in 0..active_listeners.len() {
-                    let (key, mut listener) = active_listeners.remove(0);
+                while let Some((key, mut listener)) = active_listeners.pop_front() {
                     match listener.try_recv() {
                         Ok(r) => {
-                            active_listeners.push((key, listener));
+                            active_listeners.push_back((key, listener));
                             return Ok(r);
                         }
                         Err(TryRecvError::Empty) => {
-                            active_listeners.push((key, listener));
+                            active_listeners.push_back((key, listener));
                         }
                         Err(err @ TryRecvError::Disconnected) => {
                             return Err(Box::new(err) as DynError)
@@ -176,7 +176,7 @@ async fn websocket_interface(
                 if let Some(NewSubscription { key, callback }) = msg? {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
                     let active_listeners = &mut *active_listeners.lock().await;
-                    active_listeners.push((key, callback));
+                    active_listeners.push_back((key, callback));
                 }
             }
             process_client_request = client_req_task => {
