@@ -1,9 +1,8 @@
+use std::collections::HashMap;
+
 use locutus_stdlib::prelude::*;
 use p384::{FieldBytes, Scalar, SecretKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-#[derive(Deserialize, Serialize)]
-struct IdentityManagement;
 
 #[derive(Serialize, Deserialize)]
 pub struct IdentityParams {
@@ -39,6 +38,14 @@ impl TryFrom<Parameters<'_>> for IdentityParams {
     }
 }
 
+type Key = Vec<u8>;
+type Alias = String;
+
+#[derive(Deserialize, Serialize)]
+struct IdentityManagement {
+    identities: HashMap<Alias, Key>,
+}
+
 impl TryFrom<&[u8]> for IdentityManagement {
     type Error = DelegateError;
 
@@ -56,19 +63,68 @@ impl DelegateInterface for IdentityManagement {
         let params = IdentityParams::try_from(params)?;
         match message {
             InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
-                app,
                 payload,
                 processed: false,
                 ..
-            }) => {}
-            InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                value: Some(value), ..
             }) => {
-                let manager = IdentityManagement::try_from(&*value)?;
+                let msg = IdentityMsg::try_from(&*payload)?;
+                let action = match msg {
+                    IdentityMsg::CreateIdentity { alias, key } => {
+                        serde_json::to_vec(&IdentityMsg::CreateIdentity { alias, key }).unwrap()
+                    }
+                    IdentityMsg::DeleteIdentity { alias } => {
+                        serde_json::to_vec(&IdentityMsg::DeleteIdentity { alias }).unwrap()
+                    }
+                };
+                let context = DelegateContext::new(action);
+                let get_secret = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+                    key: SecretsId::new(serde_json::to_vec(&params).unwrap()),
+                    context,
+                    processed: false,
+                });
+                Ok(vec![get_secret])
             }
-            InboundDelegateMsg::UserResponse(_) => todo!(),
+            InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                value: Some(value),
+                context,
+                ..
+            }) => {
+                if !context.as_ref().is_empty() {
+                    let context = IdentityMsg::try_from(context.as_ref()).unwrap();
+                    let mut manager = IdentityManagement::try_from(&*value)?;
+                    match context {
+                        IdentityMsg::CreateIdentity { alias, key } => {
+                            manager.identities.insert(alias, key);
+                        }
+                        IdentityMsg::DeleteIdentity { alias } => {
+                            manager.identities.remove(&alias);
+                        }
+                    };
+                    let outbound = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
+                        key: SecretsId::new(serde_json::to_vec(&params).unwrap()),
+                        value: Some(serde_json::to_vec(&manager).unwrap()),
+                    });
+                    Ok(vec![outbound])
+                } else {
+                    todo!()
+                }
+            }
             _ => unreachable!(),
         }
-        todo!()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum IdentityMsg {
+    CreateIdentity { alias: String, key: Key },
+    DeleteIdentity { alias: String },
+}
+
+impl TryFrom<&[u8]> for IdentityMsg {
+    type Error = DelegateError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let msg = serde_json::from_slice(value).unwrap();
+        Ok(msg)
     }
 }

@@ -304,7 +304,7 @@ pub trait DelegateInterface {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DelegateContext(pub Vec<u8>);
+pub struct DelegateContext(Vec<u8>);
 
 impl DelegateContext {
     pub const MAX_SIZE: usize = 4096 * 10 * 10;
@@ -325,18 +325,19 @@ impl DelegateContext {
     }
 }
 
+impl AsRef<[u8]> for DelegateContext {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum InboundDelegateMsg<'a> {
     ApplicationMessage(ApplicationMessage),
     GetSecretResponse(GetSecretResponse),
     RandomBytes(Vec<u8>),
     UserResponse(#[serde(borrow)] UserInputResponse<'a>),
-    // GetContractResponse {
-    //     contract_id: ContractInstanceId,
-    //     #[serde(borrow)]
-    //     update_data: UpdateData<'static>,
-    //     context: Context
-    // },
+    GetSecretRequest(GetSecretRequest),
 }
 
 impl InboundDelegateMsg<'_> {
@@ -346,6 +347,7 @@ impl InboundDelegateMsg<'_> {
             InboundDelegateMsg::GetSecretResponse(r) => InboundDelegateMsg::GetSecretResponse(r),
             InboundDelegateMsg::RandomBytes(b) => InboundDelegateMsg::RandomBytes(b),
             InboundDelegateMsg::UserResponse(r) => InboundDelegateMsg::UserResponse(r.into_owned()),
+            InboundDelegateMsg::GetSecretRequest(_) => todo!(),
         }
     }
 
@@ -451,6 +453,7 @@ pub enum OutboundDelegateMsg {
     //     mode: RelatedMode,
     //     contract_id: ContractInstanceId,
     // },
+    GetSecretResponse(GetSecretResponse),
 }
 
 impl From<GetSecretRequest> for OutboundDelegateMsg {
@@ -474,6 +477,7 @@ impl OutboundDelegateMsg {
             OutboundDelegateMsg::SetSecretRequest(_) => false,
             OutboundDelegateMsg::RequestUserInput(_) => true,
             OutboundDelegateMsg::ContextUpdated(_) => true,
+            OutboundDelegateMsg::GetSecretResponse(_) => true,
         }
     }
 
@@ -510,7 +514,7 @@ where
     Ok(value.into_owned())
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetSecretRequest {
     pub key: SecretsId,
     pub context: DelegateContext,

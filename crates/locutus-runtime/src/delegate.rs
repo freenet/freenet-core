@@ -133,6 +133,9 @@ impl Runtime {
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
                     last_context = context;
                 }
+                OutboundDelegateMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
+                    last_context = context;
+                }
                 OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
                     if let Some(plaintext) = value {
                         self.secret_store
@@ -174,8 +177,7 @@ impl Runtime {
                         .map_err(|err| DelegateError::Deser(format!("{err}")))
                         .unwrap();
                     let req_id = req.request_id;
-                    let mut context: Context =
-                        bincode::deserialize(last_context.0.as_slice()).unwrap();
+                    let mut context: Context = bincode::deserialize(last_context.as_ref()).unwrap();
                     context.waiting_for_user_input.remove(&req_id);
                     context.user_response.insert(req_id, response);
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
@@ -294,6 +296,20 @@ impl DelegateRuntimeInterface for Runtime {
                         &mut results,
                     )?;
                 }
+                InboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+                    key: secret_key,
+                    processed,
+                    ..
+                }) if !processed => {
+                    let secret = self.secret_store.get_secret(key, &secret_key)?;
+                    let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                        key: secret_key,
+                        value: Some(secret),
+                        context: Default::default(),
+                    });
+                    results.push(msg);
+                }
+                _ => {}
             }
         }
         Ok(results)
