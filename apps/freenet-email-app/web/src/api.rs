@@ -325,9 +325,29 @@ pub(crate) async fn node_comms(
                             assert!(found);
                             inbox_to_id.insert(key, identity);
                         }
-                        // UpdateData::State(_) => {
-                        //     crate::log::error("recieved update state", None);
-                        // }
+                        UpdateData::State(state) => {
+                            let delta: StoredInbox =
+                                serde_json::from_slice(state.as_ref()).unwrap();
+                            let updated_model =
+                                InboxModel::from_state(identity.key.clone(), delta, key.clone())
+                                    .unwrap();
+                            let loaded_models = inboxes.load();
+                            let mut found = false;
+                            for inbox in loaded_models.as_slice() {
+                                if inbox.clone().borrow().key == key {
+                                    let mut inbox = (**inbox).borrow_mut();
+                                    *inbox = updated_model;
+                                    crate::log::debug!(
+                                        "updated inbox {key} (whole state) with {} messages",
+                                        inbox.messages.len()
+                                    );
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            assert!(found);
+                            inbox_to_id.insert(key, identity);
+                        }
                         // UpdateData::StateAndDelta { .. } => {
                         //     crate::log::error("recieved update state delta", None);
                         // }

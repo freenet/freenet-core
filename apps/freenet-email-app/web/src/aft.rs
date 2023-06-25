@@ -85,7 +85,6 @@ impl AftRecords {
         let params = TokenDelegateParameters::new(identity.key.to_public_key())
             .try_into()
             .map_err(|e| format!("{e}"))?;
-        crate::log::debug!("AFT record hash: {}", TOKEN_RECORD_CODE_HASH);
         let contract_key =
             ContractKey::from_params(TOKEN_RECORD_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         Self::get_state(client, contract_key.clone()).await?;
