@@ -136,17 +136,19 @@ async fn websocket_interface(
             loop {
                 let mut lock = active_listeners.lock().await;
                 let active_listeners = &mut *lock;
-                while let Some((key, mut listener)) = active_listeners.pop_front() {
-                    match listener.try_recv() {
-                        Ok(r) => {
-                            active_listeners.push_back((key, listener));
-                            return Ok(r);
-                        }
-                        Err(TryRecvError::Empty) => {
-                            active_listeners.push_back((key, listener));
-                        }
-                        Err(err @ TryRecvError::Disconnected) => {
-                            return Err(Box::new(err) as DynError)
+                for _ in 0..active_listeners.len() {
+                    if let Some((key, mut listener)) = active_listeners.pop_front() {
+                        match listener.try_recv() {
+                            Ok(r) => {
+                                active_listeners.push_back((key, listener));
+                                return Ok(r);
+                            }
+                            Err(TryRecvError::Empty) => {
+                                active_listeners.push_back((key, listener));
+                            }
+                            Err(err @ TryRecvError::Disconnected) => {
+                                return Err(Box::new(err) as DynError)
+                            }
                         }
                     }
                 }
