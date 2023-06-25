@@ -1,0 +1,19 @@
+[package]
+name = "identity-management"
+version = "0.0.1"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+ecdsa = "0.16"
+p384 =  { version = "0.13", features = ["serde"] }
+locutus-stdlib = { version = "0.0.3", path = "../../crates/locutus-stdlib" }
+serde = "1"
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
+
+[lib]
+crate-type = ["cdylib"]
