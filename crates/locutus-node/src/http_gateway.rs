@@ -129,28 +129,24 @@ async fn websocket_interface(
     let (mut tx, mut rx) = ws.split();
     let listeners: Arc<Mutex<Vec<(_, UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(Vec::new()));
-
-    let mut listener_responses = {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    loop {
         let active_listeners = listeners.clone();
         let listeners_task = async move {
             loop {
                 let mut lock = active_listeners.lock().await;
                 let active_listeners = &mut *lock;
                 for _ in 0..active_listeners.len() {
-                    let (key, mut listener) = active_listeners.swap_remove(0);
+                    let (key, mut listener) = active_listeners.remove(0);
                     match listener.try_recv() {
                         Ok(r) => {
-                            tracing::debug!(cli_id = %client_id, contract = %key, "got pending notification");
                             active_listeners.push((key, listener));
-                            let _ = tx.send(Ok(r));
+                            return Ok(r);
                         }
                         Err(TryRecvError::Empty) => {
                             active_listeners.push((key, listener));
                         }
                         Err(err @ TryRecvError::Disconnected) => {
-                            tracing::debug!(cli_id = %client_id, contract = %key, "disconnected notification channel");
-                            let _ = tx.send(Err(Box::new(err) as DynError));
+                            return Err(Box::new(err) as DynError)
                         }
                     }
                 }
@@ -158,11 +154,7 @@ async fn websocket_interface(
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        tokio::task::spawn(listeners_task);
-        rx
-    };
 
-    loop {
         let client_req_task = async {
             let next_msg = match rx
                 .next()
@@ -197,8 +189,8 @@ async fn websocket_interface(
                     Err(Some(err)) => return Err(err),
                 }
             }
-            response = listener_responses.recv() => {
-                let response = response.ok_or_else(|| ClientError::from(ErrorKind::Disconnect))??;
+            response = listeners_task => {
+                let response = response?;
                 match &response {
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
