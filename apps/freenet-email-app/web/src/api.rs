@@ -6,6 +6,7 @@ use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 use once_cell::sync::OnceCell;
+use crate::app::AlertMessage;
 
 use crate::DynError;
 
@@ -154,6 +155,7 @@ pub(crate) async fn node_comms(
     // where necessary we could be getting the fresh data via static methods calls to Inbox
     // and store the information there in thread locals
     mut inboxes: crate::app::InboxesData,
+    mut alerts_sender: UnboundedSender<crate::app::AlertMessage>,
 ) {
     use std::{rc::Rc, sync::Arc};
 
@@ -209,6 +211,7 @@ pub(crate) async fn node_comms(
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_rec_to_id: &mut HashMap<ContractKey, Identity>,
         inboxes: &mut crate::app::InboxesData,
+        mut alerts_sender: UnboundedSender<AlertMessage>,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
         let res = match res {
@@ -418,6 +421,17 @@ pub(crate) async fn node_comms(
                                 }
                                 TokenDelegateMessage::Failure(reason) => {
                                     // FIXME: this may mean a pending message waiting for a token has failed, and need to notify that in the UI
+                                    let mut alerts_sender_clone = alerts_sender.clone();
+                                    let _ = wasm_bindgen_futures::future_to_promise(async move {
+                                        let alert_message = format!(
+                                            "Token assignment failure"
+                                        );
+                                        alerts_sender_clone
+                                            .send(crate::app::AlertMessage::TokenAllocationError(alert_message))
+                                            .await
+                                            .expect("channel open");
+                                        Ok(wasm_bindgen::JsValue::NULL)
+                                    });
                                     crate::log::error(
                                         format!("token assignment failure: {reason}"),
                                         Some(TryNodeAction::SendMessage),
@@ -451,6 +465,7 @@ pub(crate) async fn node_comms(
                     &mut inbox_contract_to_id,
                     &mut token_contract_to_id,
                     &mut inboxes,
+                    alerts_sender.clone(),
                 )
                 .await;
             }

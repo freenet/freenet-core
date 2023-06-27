@@ -69,6 +69,11 @@ pub(crate) enum NodeAction {
     LoadMessages(Identity),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum AlertMessage {
+    TokenAllocationError(String),
+}
+
 pub(crate) fn app(cx: Scope) -> Element {
     crate::log::debug!("rendering app");
     use_shared_state_provider(cx, User::new);
@@ -78,10 +83,12 @@ pub(crate) fn app(cx: Scope) -> Element {
     let inbox = use_context::<InboxView>(cx).unwrap();
     let inbox_data = inbox.inbox_data.clone();
 
+    let (alerts_sender, alerts_receiver) = futures::channel::mpsc::unbounded();
+
     #[cfg(feature = "use-node")]
     {
         let _sync = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
-            let fut = crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
+            let fut = crate::api::node_comms(rx, user.read().identities.clone(), inbox_data, alerts_sender)
                 .map(|_| Ok(JsValue::NULL));
             let _ = wasm_bindgen_futures::future_to_promise(fut);
             async {}.boxed_local()
