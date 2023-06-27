@@ -7,6 +7,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
+use locutus_stdlib::prelude::Parameters;
 use once_cell::sync::Lazy;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
@@ -63,6 +64,12 @@ pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
     map.insert(pub_key1, "address2".to_string());
     map
 });
+
+async fn load_aliases() {
+    const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
+    let params = identity_management::IdentityParams::try_from(ID_MANAGER_KEY).unwrap();
+    
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {

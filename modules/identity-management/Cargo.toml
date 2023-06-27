@@ -7,13 +7,14 @@ edition = "2021"
 
 [dependencies]
 ecdsa = "0.16"
-p384 =  { version = "0.13", features = ["serde"] }
+p384 =  { version = "0.13", features = ["serde", "pem", "pkcs8"] }
 locutus-stdlib = { version = "0.0.3", path = "../../crates/locutus-stdlib" }
 serde = "1"
 serde_json = "1"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pico-args = "0.5"
+rand = "0.8"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]

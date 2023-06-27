@@ -10,7 +10,6 @@ locutus-stdlib = { workspace = true, features = ["contract"] }
 rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-pico-args = "0.5"
 
 locutus-aft-interface = { path = "../../interfaces" }
 

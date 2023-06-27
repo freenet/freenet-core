@@ -7,6 +7,7 @@ INBOX_WEB_DIR := $(LOCUTUS_DIR)/apps/freenet-email-app/web
 INBOX_DIR := $(LOCUTUS_DIR)/apps/freenet-email-app/contracts/inbox
 AFT_RECORD := $(LOCUTUS_DIR)/modules/antiflood-tokens/contracts/token-allocation-record
 AFT_GENERATOR := $(LOCUTUS_DIR)/modules/antiflood-tokens/delegates/token-generator
+IDENTITY_DELEGATE := $(LOCUTUS_DIR)/modules/identity-management
 WEB_DIR_SRC := $(LOCUTUS_DIR)/apps/freenet-email-app/web/src
 
 ifeq ($(CARGO_TARGET_DIR),)
@@ -25,6 +26,7 @@ all:
 
 build: \
 	build-tool \
+	build-id-manager \
 	build-inbox \
 	build-token-allocation
 
@@ -38,6 +40,12 @@ build-token-allocation: \
 	build-token-allocation-contract-1 publish-token-allocation-contract-1 \
 	build-token-generator-0 publish-token-generator-delegate-0 \
 	build-token-generator-1 publish-token-generator-delegate-1 
+
+build-id-manager:
+	FILE="$(INBOX_WEB_DIR)/build/identity-manager-key.private.pem"
+	if [ ! -f $$FILE ]; then
+		cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(INBOX_WEB_DIR)/build/"
+	fi
 
 build-tool:
 	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release

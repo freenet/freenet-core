@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub struct IdentityParams {
     #[serde(serialize_with = "IdentityParams::pk_serialize")]
     #[serde(deserialize_with = "IdentityParams::pk_deserialize")]
-    secret_key: SecretKey,
+    pub secret_key: SecretKey,
 }
 
 impl IdentityParams {
@@ -33,8 +33,27 @@ impl TryFrom<Parameters<'_>> for IdentityParams {
     type Error = DelegateError;
 
     fn try_from(value: Parameters<'_>) -> Result<Self, Self::Error> {
-        let deser: Self = serde_json::from_slice(value.as_ref()).unwrap();
+        let deser: Self = Self::try_from(value.as_ref())?;
         Ok(deser)
+    }
+}
+
+impl TryFrom<&[u8]> for IdentityParams {
+    type Error = DelegateError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let deser: Self =
+            serde_json::from_slice(value).map_err(|e| DelegateError::Deser(format!("{e}")))?;
+        Ok(deser)
+    }
+}
+
+impl TryFrom<IdentityParams> for Parameters<'static> {
+    type Error = DelegateError;
+
+    fn try_from(value: IdentityParams) -> Result<Self, Self::Error> {
+        let ser = serde_json::to_vec(&value).map_err(|e| DelegateError::Deser(format!("{e}")))?;
+        Ok(Parameters::from(ser))
     }
 }
 
@@ -106,7 +125,7 @@ impl DelegateInterface for IdentityManagement {
                     });
                     Ok(vec![outbound])
                 } else {
-                    todo!()
+                    Err(DelegateError::Other("invalid request".into()))
                 }
             }
             _ => unreachable!(),
