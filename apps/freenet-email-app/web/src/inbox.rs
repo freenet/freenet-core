@@ -5,8 +5,9 @@ use std::{
 };
 
 use chacha20poly1305::aead::generic_array::GenericArray;
+use rand::rngs::OsRng;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, AeadCore, KeyInit},
     XChaCha20Poly1305,
 };
 use chrono::{DateTime, Utc};
@@ -103,8 +104,7 @@ pub(crate) struct MessageModel {
 
 impl MessageModel {
     fn to_stored(&self, key: &RsaPrivateKey) -> Result<StoredMessage, DynError> {
-        // FIXME: use a real source of entropy
-        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let mut rng = OsRng;
         let decrypted_content = serde_json::to_vec(&self.content)?;
         let content = key
             .to_public_key()
@@ -226,13 +226,12 @@ impl DecryptedMessage {
     }
 
     fn assignment_hash_and_signed_content(&self) -> Result<([u8; 32], Vec<u8>), DynError> {
-        // FIXME: use a real source of entropy
-        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let mut rng = OsRng;
         let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
 
         // Generate a random 256-bit XChaCha20Poly1305 key
-        let chacha_key = XChaCha20Poly1305::generate_key(&mut OsRng);
-        let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let chacha_key = XChaCha20Poly1305::generate_key(&mut rng);
+        let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut rng);
 
         // Encrypt the data using XChaCha20Poly1305
         let cipher = XChaCha20Poly1305::new(&chacha_key);
