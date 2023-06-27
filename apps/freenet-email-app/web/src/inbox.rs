@@ -12,7 +12,7 @@ use chacha20poly1305::{
 use chrono::{DateTime, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use locutus_aft_interface::{Tier, TokenAssignment};
+use locutus_aft_interface::{Tier, TokenAssignment, TokenAssignmentHash};
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{
@@ -20,6 +20,7 @@ use locutus_stdlib::{
         ContractKey, State, UpdateData,
     },
 };
+use locutus_stdlib::prelude::StateSummary;
 use rand_chacha::rand_core::SeedableRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
@@ -62,6 +63,15 @@ struct InternalSettings {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredDecryptedSettings {}
+
+#[derive(Serialize, Deserialize)]
+struct InboxSummary(HashSet<TokenAssignmentHash>);
+
+impl InboxSummary {
+    pub fn new(messages: HashSet<TokenAssignmentHash>) -> Self {
+        Self(messages)
+    }
+}
 
 impl InternalSettings {
     fn from_stored(
@@ -488,7 +498,8 @@ impl InboxModel {
 
     async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
-        let request = ContractRequest::Subscribe { key, summary: None };
+        let summary: StateSummary = serde_json::to_vec(&InboxSummary::new(HashSet::new()))?.into();
+        let request = ContractRequest::Subscribe { key, summary: Some(summary) };
         client.send(request.into()).await?;
         Ok(())
     }
