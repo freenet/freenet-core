@@ -32,7 +32,7 @@ pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), D
 
 fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
     let package_type = cli_config.package_type;
-    const RUST_TARGET_ARGS: &[&str] = &["build", "--release", "--target"];
+    const RUST_TARGET_ARGS: &[&str] = &["build", "--release", "--lib", "--target"];
     let target = cli_config.wasi.then(|| WASI_TARGET).unwrap_or(WASM_TARGET);
     if target == WASI_TARGET {
         println!("Enabling WASI extension");

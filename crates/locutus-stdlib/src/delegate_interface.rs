@@ -180,7 +180,7 @@ impl DelegateKey {
 
     pub fn from_params(
         code_hash: impl Into<String>,
-        parameters: Parameters,
+        parameters: &Parameters,
     ) -> Result<Self, bs58::decode::Error> {
         let mut code_key = [0; DELEGATE_HASH_LENGTH];
         bs58::decode(code_hash.into())
@@ -376,6 +376,12 @@ impl InboundDelegateMsg<'_> {
     }
 }
 
+impl From<GetSecretRequest> for InboundDelegateMsg<'_> {
+    fn from(value: GetSecretRequest) -> Self {
+        Self::GetSecretRequest(value)
+    }
+}
+
 impl From<ApplicationMessage> for InboundDelegateMsg<'_> {
     fn from(value: ApplicationMessage) -> Self {
         Self::ApplicationMessage(value)
@@ -519,6 +525,16 @@ pub struct GetSecretRequest {
     pub key: SecretsId,
     pub context: DelegateContext,
     pub processed: bool,
+}
+
+impl GetSecretRequest {
+    pub fn new(key: SecretsId) -> Self {
+        Self {
+            key,
+            context: Default::default(),
+            processed: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]

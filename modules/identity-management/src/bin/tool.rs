@@ -6,10 +6,11 @@ use p384::SecretKey;
 
 const HELP: &str = r#"
 Options:
- -h --help	Prints this command
+ -h --help	    Prints this command
  -p --path  	Directory where to save the output (generated params and/or key).
-		If not set will use current working directory.
- -k --key 	Key path, if not set one will be generated  
+		        If not set will use current working directory
+ -k --key 	    Key path, if not set one will be generated  
+ -c --code      Compiles the contract and saves the code hash
 "#;
 
 type DynError = Box<dyn std::error::Error>;
@@ -48,7 +49,8 @@ fn main() -> Result<(), DynError> {
         None => {
             let mut rng = rand::rngs::OsRng;
             let key = SecretKey::random(&mut rng);
-            let as_doc: ecdsa::elliptic_curve::zeroize::Zeroizing<String> = key.to_sec1_pem(p384::pkcs8::LineEnding::LF)?;
+            let as_doc: ecdsa::elliptic_curve::zeroize::Zeroizing<String> =
+                key.to_sec1_pem(p384::pkcs8::LineEnding::LF)?;
             const ID_FILE_NAME: &str = "identity-manager-key";
             println!("storing private key file: `{ID_FILE_NAME}.private.pem`");
             std::fs::write(

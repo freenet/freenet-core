@@ -30,6 +30,16 @@ build: \
 	build-inbox \
 	build-token-allocation
 
+build-tool:
+	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
+	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
+
+build-id-manager:
+	FILE="$(INBOX_WEB_DIR)/build/identity-manager-key.private.pem"
+	if [ ! -f $$FILE ]; then
+		cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(INBOX_WEB_DIR)/build/"
+	fi
+
 build-inbox: \
 	build-inbox-0 publish-inbox-0 \
 	build-inbox-1 publish-inbox-1 \
@@ -40,16 +50,6 @@ build-token-allocation: \
 	build-token-allocation-contract-1 publish-token-allocation-contract-1 \
 	build-token-generator-0 publish-token-generator-delegate-0 \
 	build-token-generator-1 publish-token-generator-delegate-1 
-
-build-id-manager:
-	FILE="$(INBOX_WEB_DIR)/build/identity-manager-key.private.pem"
-	if [ ! -f $$FILE ]; then
-		cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(INBOX_WEB_DIR)/build/"
-	fi
-
-build-tool:
-	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
-	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
 build-inbox-%:
 	cd $(INBOX_DIR) && cargo run --bin gen_initial_state -- $* "$(WEB_DIR_SRC)/../examples/rsa4096-id-$*-priv.pem"

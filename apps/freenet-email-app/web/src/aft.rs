@@ -20,10 +20,10 @@ use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::inbox::MessageModel;
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
 
-pub(crate) static TOKEN_RECORD_CODE_HASH: &str =
+pub(crate) const TOKEN_RECORD_CODE_HASH: &str =
     include_str!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/token_allocation_record_code_hash");
 
-pub(crate) static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
+pub(crate) const TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
     include_str!("../../../../modules/antiflood-tokens/delegates/token-generator/build/token_generator_code_hash");
 
 pub(crate) struct AftRecords {}
@@ -191,7 +191,7 @@ impl AftRecords {
             .unwrap();
         let delegate_key = DelegateKey::from_params(
             crate::aft::TOKEN_GENERATOR_DELEGATE_CODE_HASH,
-            token_params.clone(),
+            &token_params,
         )?;
 
         let inbox_params: Parameters = InboxParams {

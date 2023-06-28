@@ -41,7 +41,7 @@ use freenet_email_inbox::{
 
 type InboxContract = ContractKey;
 
-pub(crate) static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
+pub(crate) const INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
 
 thread_local! {
     static PENDING_INBOXES_UPDATE: RefCell<HashMap<InboxContract, Vec<DecryptedMessage>>> = RefCell::new(HashMap::new());

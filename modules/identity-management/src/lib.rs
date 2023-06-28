@@ -12,6 +12,13 @@ pub struct IdentityParams {
 }
 
 impl IdentityParams {
+    pub fn as_secret_id(&self) -> SecretsId {
+        // SecretsId::new(serde_json::to_vec(&params).unwrap())
+        todo!()
+    }
+}
+
+impl IdentityParams {
     fn pk_deserialize<'de, D>(deser: D) -> Result<SecretKey, D::Error>
     where
         D: Deserializer<'de>,
@@ -120,7 +127,7 @@ impl DelegateInterface for IdentityManagement {
                         }
                     };
                     let outbound = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
-                        key: SecretsId::new(serde_json::to_vec(&params).unwrap()),
+                        key: params.as_secret_id(),
                         value: Some(serde_json::to_vec(&manager).unwrap()),
                     });
                     Ok(vec![outbound])
