@@ -7,8 +7,6 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use locutus_stdlib::client_api::DelegateRequest;
-use locutus_stdlib::prelude::{DelegateKey, GetSecretRequest, InboundDelegateMsg, SecretsId};
 use once_cell::sync::Lazy;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
@@ -26,6 +24,7 @@ use crate::{
 };
 
 mod login;
+pub(crate) use login::set_aliases;
 
 // todo: simplify this whole alias map stuff mapping identities to contract keys
 pub(crate) static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
@@ -66,26 +65,15 @@ pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
     map
 });
 
-async fn load_aliases(client: &mut WebApiRequestClient) -> Result<(), DynError> {
-    const ID_MANAGER_CODE_HASH: &str =
-        include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
-    const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
-    let params = identity_management::IdentityParams::try_from(ID_MANAGER_KEY)?;
-    let secret_id = params.as_secret_id();
-    let params = params.try_into()?;
-    let key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
-    let request = DelegateRequest::ApplicationMessages {
-        params,
-        inbound: vec![GetSecretRequest::new(secret_id).into()],
-        key,
-    };
-    client.send(request.into()).await?;
-    Ok(())
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
     LoadMessages(Identity),
+    LoadIdentities,
+    CreateIdentity {
+        alias: String,
+        key: Vec<u8>,
+        extra: String,
+    },
 }
 
 pub(crate) fn app(cx: Scope) -> Element {
@@ -602,7 +590,7 @@ fn inbox_component(cx: Scope) -> Element {
         let links = emails.iter().map(|email| {
             rsx!(email_link {
                 sender: email.from.clone(),
-                title: email.title.clone()
+                title: email.title.clone(),
                 read: email.read,
                 id: email.id,
             })

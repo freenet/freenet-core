@@ -78,10 +78,12 @@ pub enum RequestError {
 /// Errors that may happen while interacting with delegates.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum DelegateError {
-    #[error("error while registering delegate: {0}")]
+    #[error("error while registering delegate {0}")]
     RegisterError(DelegateKey),
-    #[error("execution error, cause: {0}")]
+    #[error("execution error, cause {0}")]
     ExecutionError(String),
+    #[error("missing delegate {0}")]
+    Missing(DelegateKey),
 }
 
 /// Errors that may happen while interacting with contracts.

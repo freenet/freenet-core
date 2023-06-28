@@ -391,6 +391,10 @@ impl Executor {
                             CoreDelegateError::ExecutionError(format!("{err}")).into(),
                         ))
                     }
+                    Err(err) if err.delegate_is_missing() => {
+                        tracing::error!("delegate not found `{key}`");
+                        Err(Either::Left(CoreDelegateError::Missing(key).into()))
+                    }
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
                         Ok(HostResponse::Ok)

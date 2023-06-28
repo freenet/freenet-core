@@ -13,8 +13,7 @@ pub struct IdentityParams {
 
 impl IdentityParams {
     pub fn as_secret_id(&self) -> SecretsId {
-        // SecretsId::new(serde_json::to_vec(&params).unwrap())
-        todo!()
+        SecretsId::new(serde_json::to_vec(self).unwrap())
     }
 }
 
@@ -66,10 +65,35 @@ impl TryFrom<IdentityParams> for Parameters<'static> {
 
 type Key = Vec<u8>;
 type Alias = String;
+type Extra = String;
 
-#[derive(Deserialize, Serialize)]
-struct IdentityManagement {
-    identities: HashMap<Alias, Key>,
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+pub struct AliasInfo {
+    pub key: Key,
+    pub extra: Option<Extra>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+pub struct IdentityManagement {
+    identities: HashMap<Alias, AliasInfo>,
+}
+
+impl IdentityManagement {
+    pub fn is_empty(&self) -> bool {
+        self.identities.is_empty()
+    }
+
+    pub fn get_info(&self) -> impl Iterator<Item = (&Alias, &AliasInfo)> {
+        self.identities.iter()
+    }
+
+    pub fn into_info(self) -> impl Iterator<Item = (Alias, AliasInfo)> {
+        self.identities.into_iter()
+    }
+
+    pub fn remove(&mut self, alias: &str) -> Option<AliasInfo> {
+        self.identities.remove(alias)
+    }
 }
 
 impl TryFrom<&[u8]> for IdentityManagement {
@@ -95,8 +119,9 @@ impl DelegateInterface for IdentityManagement {
             }) => {
                 let msg = IdentityMsg::try_from(&*payload)?;
                 let action = match msg {
-                    IdentityMsg::CreateIdentity { alias, key } => {
-                        serde_json::to_vec(&IdentityMsg::CreateIdentity { alias, key }).unwrap()
+                    IdentityMsg::CreateIdentity { alias, key, extra } => {
+                        serde_json::to_vec(&IdentityMsg::CreateIdentity { alias, key, extra })
+                            .unwrap()
                     }
                     IdentityMsg::DeleteIdentity { alias } => {
                         serde_json::to_vec(&IdentityMsg::DeleteIdentity { alias }).unwrap()
@@ -119,8 +144,8 @@ impl DelegateInterface for IdentityManagement {
                     let context = IdentityMsg::try_from(context.as_ref()).unwrap();
                     let mut manager = IdentityManagement::try_from(&*value)?;
                     match context {
-                        IdentityMsg::CreateIdentity { alias, key } => {
-                            manager.identities.insert(alias, key);
+                        IdentityMsg::CreateIdentity { alias, key, extra } => {
+                            manager.identities.insert(alias, AliasInfo { key, extra });
                         }
                         IdentityMsg::DeleteIdentity { alias } => {
                             manager.identities.remove(&alias);
@@ -141,9 +166,15 @@ impl DelegateInterface for IdentityManagement {
 }
 
 #[derive(Serialize, Deserialize)]
-enum IdentityMsg {
-    CreateIdentity { alias: String, key: Key },
-    DeleteIdentity { alias: String },
+pub enum IdentityMsg {
+    CreateIdentity {
+        alias: String,
+        key: Key,
+        extra: Option<String>,
+    },
+    DeleteIdentity {
+        alias: String,
+    },
 }
 
 impl TryFrom<&[u8]> for IdentityMsg {
@@ -151,6 +182,15 @@ impl TryFrom<&[u8]> for IdentityMsg {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         let msg = serde_json::from_slice(value).unwrap();
+        Ok(msg)
+    }
+}
+
+impl TryFrom<&IdentityMsg> for Vec<u8> {
+    type Error = DelegateError;
+
+    fn try_from(value: &IdentityMsg) -> Result<Self, Self::Error> {
+        let msg = serde_json::to_vec(&value).unwrap();
         Ok(msg)
     }
 }

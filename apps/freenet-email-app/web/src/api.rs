@@ -1,11 +1,9 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use futures::SinkExt;
 use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
-use locutus_stdlib::prelude::UpdateData;
-use once_cell::sync::OnceCell;
 
 use crate::DynError;
 
@@ -14,7 +12,7 @@ type HostResponses = UnboundedReceiver<Result<HostResponse, ClientError>>;
 
 pub(crate) type NodeResponses = UnboundedSender<AsyncActionResult>;
 
-pub(crate) static WEB_API_SENDER: OnceCell<WebApiRequestClient> = OnceCell::new();
+pub(crate) static WEB_API_SENDER: OnceLock<WebApiRequestClient> = OnceLock::new();
 
 #[cfg(feature = "use-node")]
 struct WebApi {
@@ -159,14 +157,18 @@ pub(crate) async fn node_comms(
 
     use freenet_email_inbox::Inbox as StoredInbox;
     use futures::StreamExt;
+    use identity_management::*;
     use locutus_stdlib::{
-        client_api::{ContractError, ContractResponse, ErrorKind, RequestError},
-        prelude::ContractKey,
+        client_api::{
+            ContractError, ContractResponse, DelegateError, DelegateRequest, ErrorKind,
+            RequestError,
+        },
+        prelude::*,
     };
 
     use crate::{
         aft::AftRecords,
-        app::{Identity, NodeAction},
+        app::{set_aliases, Identity, NodeAction},
         inbox::InboxModel,
     };
 
@@ -184,22 +186,97 @@ pub(crate) async fn node_comms(
     crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id)
         .await;
     crate::aft::AftRecords::load_all(&mut req_sender, &contracts, &mut token_contract_to_id).await;
+    let identities_key = load_aliases(&mut req_sender).await.unwrap();
     WEB_API_SENDER.set(req_sender).unwrap();
+
+    static IDENTITIES_KEY: OnceLock<DelegateKey> = OnceLock::new();
+    IDENTITIES_KEY.set(identities_key.clone()).unwrap();
+
+    async fn load_aliases(client: &mut WebApiRequestClient) -> Result<DelegateKey, DynError> {
+        use identity_management::*;
+        const ID_MANAGER_CODE_HASH: &str = include_str!(
+            "../../../../modules/identity-management/build/identity_management_code_hash"
+        );
+        const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
+        let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
+        let secret_id = params.as_secret_id();
+        let params = params.try_into()?;
+        let key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
+        crate::log::debug!("loading aliases ({key})");
+        let request = DelegateRequest::ApplicationMessages {
+            params,
+            inbound: vec![GetSecretRequest::new(secret_id).into()],
+            key: key.clone(),
+        };
+        client.send(request.into()).await?;
+        Ok(key)
+    }
 
     async fn handle_action(
         req: NodeAction,
         api: &WebApi,
         waiting_updates: &mut HashMap<ContractKey, Identity>,
     ) {
-        let NodeAction::LoadMessages(identity) = req;
         let mut client = api.sender_half();
-        match InboxModel::load(&mut client, &identity).await {
-            Err(err) => {
-                node_response_error_handling(client.into(), Err(err), TryNodeAction::LoadInbox)
-                    .await;
+
+        async fn create_alias(
+            client: &mut WebApiRequestClient,
+            alias: String,
+            key: Vec<u8>,
+            extra: String,
+        ) -> Result<DelegateKey, DynError> {
+            crate::log::debug!("creating {alias}");
+            use identity_management::*;
+            const ID_MANAGER_CODE_HASH: &str = include_str!(
+                "../../../../modules/identity-management/build/identity_management_code_hash"
+            );
+            const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
+            let params = IdentityParams::try_from(ID_MANAGER_KEY)?.try_into()?;
+            let delegate_key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
+            let msg = IdentityMsg::CreateIdentity {
+                alias,
+                key,
+                extra: Some(extra),
+            };
+            let request = DelegateRequest::ApplicationMessages {
+                params,
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(ContractInstanceId::new([0; 32]), (&msg).try_into()?),
+                )],
+                key: delegate_key.clone(),
+            };
+            client.send(request.into()).await?;
+            Ok(delegate_key)
+        }
+
+        match req {
+            NodeAction::LoadMessages(identity) => {
+                match InboxModel::load(&mut client, &identity).await {
+                    Err(err) => {
+                        node_response_error_handling(
+                            client.into(),
+                            Err(err),
+                            TryNodeAction::LoadInbox,
+                        )
+                        .await;
+                    }
+                    Ok(key) => {
+                        waiting_updates.entry(key).or_insert(identity);
+                    }
+                }
             }
-            Ok(key) => {
-                waiting_updates.entry(key).or_insert(identity);
+            NodeAction::LoadIdentities => match load_aliases(&mut client).await {
+                Ok(_) => {}
+                Err(e) => crate::log::error(format!("{e}"), Some(TryNodeAction::LoadAliases)),
+            },
+            NodeAction::CreateIdentity { alias, key, extra } => {
+                match create_alias(&mut client, alias.clone(), key, extra).await {
+                    Ok(_) => {}
+                    Err(e) => crate::log::error(
+                        format!("{e}"),
+                        Some(TryNodeAction::CreateIdentity(alias)),
+                    ),
+                }
             }
         }
     }
@@ -233,6 +310,11 @@ pub(crate) async fn node_comms(
                         }
                         RequestError::ContractError(err) => {
                             crate::log::error(format!("FIXME: {err}"), None)
+                        }
+                        RequestError::DelegateError(DelegateError::Missing(key))
+                            if &key == IDENTITIES_KEY.get().unwrap() =>
+                        {
+                            todo!("create the delegate")
                         }
                         RequestError::DelegateError(error) => {
                             crate::log::error(
@@ -426,6 +508,16 @@ pub(crate) async fn node_comms(
                                 TokenDelegateMessage::RequestNewToken(_) => unreachable!(),
                             }
                         }
+                        OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                            value: Some(payload),
+                            ..
+                        }) => {
+                            if &key == IDENTITIES_KEY.get().unwrap() {
+                                let manager =
+                                    IdentityManagement::try_from(payload.as_ref()).unwrap();
+                                set_aliases(manager);
+                            }
+                        }
                         other => {
                             crate::log::error(
                                 format!("received wrong delegate msg: {other:?}"),
@@ -502,6 +594,8 @@ pub(crate) enum TryNodeAction {
     SendMessage,
     RemoveMessages,
     GetAlias,
+    LoadAliases,
+    CreateIdentity(String),
 }
 
 impl std::fmt::Display for TryNodeAction {
@@ -512,6 +606,8 @@ impl std::fmt::Display for TryNodeAction {
             TryNodeAction::SendMessage => write!(f, "sending message"),
             TryNodeAction::RemoveMessages => write!(f, "removing messages"),
             TryNodeAction::GetAlias => write!(f, "get alias"),
+            TryNodeAction::LoadAliases => write!(f, "load aliases"),
+            TryNodeAction::CreateIdentity(alias) => write!(f, "create alias {alias}"),
         }
     }
 }

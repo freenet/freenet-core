@@ -17,6 +17,10 @@ impl ContractError {
     pub fn is_delegate_exec_error(&self) -> bool {
         matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
     }
+
+    pub fn delegate_is_missing(&self) -> bool {
+        matches!(&*self.0, RuntimeInnerError::DelegateNotFound(_))
+    }
 }
 
 impl Display for ContractError {

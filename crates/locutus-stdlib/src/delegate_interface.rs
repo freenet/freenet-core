@@ -347,7 +347,7 @@ impl InboundDelegateMsg<'_> {
             InboundDelegateMsg::GetSecretResponse(r) => InboundDelegateMsg::GetSecretResponse(r),
             InboundDelegateMsg::RandomBytes(b) => InboundDelegateMsg::RandomBytes(b),
             InboundDelegateMsg::UserResponse(r) => InboundDelegateMsg::UserResponse(r.into_owned()),
-            InboundDelegateMsg::GetSecretRequest(_) => todo!(),
+            InboundDelegateMsg::GetSecretRequest(r) => InboundDelegateMsg::GetSecretRequest(r),
         }
     }
 
