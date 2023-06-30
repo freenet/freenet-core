@@ -139,6 +139,16 @@ impl From<Vec<u8>> for DelegateCode<'static> {
     }
 }
 
+impl<'a> From<&'a [u8]> for DelegateCode<'a> {
+    fn from(data: &'a [u8]) -> Self {
+        let key = CodeHash::new(data);
+        DelegateCode {
+            code: Cow::from(data),
+            code_hash: key,
+        }
+    }
+}
+
 #[serde_as]
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct DelegateKey {

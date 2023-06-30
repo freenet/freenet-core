@@ -297,6 +297,16 @@ pub enum DelegateRequest<'a> {
 }
 
 impl DelegateRequest<'_> {
+    pub const DEFAULT_CIPHER: [u8; 32] = [
+        0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164, 58, 161,
+        64, 108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    pub const DEFAULT_NONCE: [u8; 24] = [
+        57, 18, 79, 116, 63, 134, 93, 39, 208, 161, 156, 229, 222, 247, 111, 79, 210, 126, 127, 55,
+        224, 150, 139, 80,
+    ];
+
     pub fn into_owned(self) -> DelegateRequest<'static> {
         match self {
             DelegateRequest::ApplicationMessages {
