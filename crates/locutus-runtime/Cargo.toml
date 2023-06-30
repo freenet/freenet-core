@@ -24,7 +24,7 @@ futures = "0.3"
 notify = "5"
 once_cell = "1"
 serde = { version = "1", features = ["rc", "derive"] }
-serde_bytes = "0.11"
+serde_bytes = { workspace = true }
 rand = { workspace = true }
 rsa = {  version = "0.8.2", default-features = false, features = ["serde", "sha2"] }
 rmpv = "1"

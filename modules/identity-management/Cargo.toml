@@ -11,7 +11,7 @@ locutus-stdlib = { version = "0.0.3", path = "../../crates/locutus-stdlib" }
 serde = "1"
 serde_json = "1"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 p384 = { version = "0.13", default-features = true }
 ecdsa = "0.16"
 pico-args = "0.5"

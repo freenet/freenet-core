@@ -6,7 +6,7 @@ use locutus_aft_interface::{
     InvalidReason as TokenInvalidReason, Tier, TokenAllocationRecord, TokenAssignment,
     TokenAssignmentHash,
 };
-use locutus_stdlib::prelude::{blake2::Digest, *};
+use locutus_stdlib::prelude::*;
 use rsa::{
     pkcs1v15::{SigningKey, VerifyingKey},
     sha2::Sha256,
@@ -500,6 +500,7 @@ mod tests {
         .map_err(|e| format!("{e}"))
         .unwrap();
 
+        use locutus_stdlib::prelude::blake2::Digest;
         let digest = Sha256::digest(STATE_UPDATE).to_vec();
         let signature = private_key
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)

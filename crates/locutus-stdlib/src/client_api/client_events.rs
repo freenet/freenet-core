@@ -194,6 +194,37 @@ pub enum ContractRequest<'a> {
     },
 }
 
+impl ContractRequest<'_> {
+    pub fn into_owned(self) -> ContractRequest<'static> {
+        match self {
+            Self::Put {
+                contract,
+                state,
+                related_contracts,
+            } => ContractRequest::Put {
+                contract,
+                state,
+                related_contracts: related_contracts.into_owned(),
+            },
+            Self::Update { key, data } => ContractRequest::Update {
+                key,
+                data: data.into_owned(),
+            },
+            Self::Get {
+                key,
+                fetch_contract,
+            } => ContractRequest::Get {
+                key,
+                fetch_contract,
+            },
+            Self::Subscribe { key, summary } => ContractRequest::Subscribe {
+                key,
+                summary: summary.map(StateSummary::into_owned),
+            },
+        }
+    }
+}
+
 impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
     fn from(op: ContractRequest<'a>) -> Self {
         ClientRequest::ContractOp(op)
@@ -350,11 +381,14 @@ impl DelegateRequest<'_> {
 impl Display for ClientRequest<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientRequest::ContractOp(ops) => match ops {
+            ClientRequest::ContractOp(op) => match op {
                 ContractRequest::Put {
                     contract, state, ..
                 } => {
-                    write!(f, "put request for contract {contract} with state {state}")
+                    write!(
+                        f,
+                        "put request for contract `{contract}` with state {state}"
+                    )
                 }
                 ContractRequest::Update { key, .. } => write!(f, "update request for {key}"),
                 ContractRequest::Get {
@@ -362,11 +396,30 @@ impl Display for ClientRequest<'_> {
                     fetch_contract: contract,
                     ..
                 } => {
-                    write!(f, "get request for {key} (fetch full contract: {contract})")
+                    write!(
+                        f,
+                        "get request for `{key}` (fetch full contract: {contract})"
+                    )
                 }
-                ContractRequest::Subscribe { key, .. } => write!(f, "subscribe request for {key}"),
+                ContractRequest::Subscribe { key, .. } => {
+                    write!(f, "subscribe request for `{key}`")
+                }
             },
-            ClientRequest::DelegateOp(_op) => write!(f, "delegate request"),
+            ClientRequest::DelegateOp(op) => match op {
+                DelegateRequest::ApplicationMessages { key, inbound, .. } => {
+                    write!(
+                        f,
+                        "delegate app request for `{key}` with {} messages",
+                        inbound.len()
+                    )
+                }
+                DelegateRequest::RegisterDelegate { delegate, .. } => {
+                    write!(f, "delegate register request for `{}`", delegate.key())
+                }
+                DelegateRequest::UnregisterDelegate(key) => {
+                    write!(f, "delegate unregister request for `{key}`")
+                }
+            },
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
             ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }

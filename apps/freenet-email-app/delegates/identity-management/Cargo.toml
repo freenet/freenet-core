@@ -8,7 +8,7 @@ locutus-stdlib = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 locutus-stdlib = { workspace = true, features = ["testing"] }
 locutus-runtime = { path = "../../../../crates/locutus-runtime", version = "0.0.3" }
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }

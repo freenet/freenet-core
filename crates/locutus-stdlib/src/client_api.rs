@@ -17,19 +17,9 @@ mod regular;
 #[cfg(all(target_family = "unix", feature = "net"))]
 pub use regular::*;
 
-#[cfg(all(
-    target_arch = "wasm32",
-    target_vendor = "unknown",
-    target_os = "unknown",
-    feature = "net"
-))]
+#[cfg(all(target_family = "wasm", feature = "net"))]
 mod browser;
-#[cfg(all(
-    target_arch = "wasm32",
-    target_vendor = "unknown",
-    target_os = "unknown",
-    feature = "net"
-))]
+#[cfg(all(target_family = "wasm", feature = "net"))]
 pub use browser::*;
 
 pub use client_events::*;
@@ -40,9 +30,7 @@ type HostResult = Result<HostResponse, ClientError>;
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error(transparent)]
-    Deserialization(#[from] rmp_serde::decode::Error),
-    #[error(transparent)]
-    Serialization(#[from] rmp_serde::encode::Error),
+    Deserialization(#[from] bincode::Error),
     #[error("channel closed")]
     ChannelClosed,
     #[cfg(all(target_family = "unix", feature = "net"))]

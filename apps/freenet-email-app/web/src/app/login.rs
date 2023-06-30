@@ -72,9 +72,9 @@ pub(super) fn identifiers_list(cx: Scope) -> Element {
     let aliases = get_aliases();
     let aliases_list = aliases.borrow();
     let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
-    if aliases_list.is_empty() {
-        actions.send(NodeAction::LoadIdentities);
-    }
+    // if aliases_list.is_empty() {
+    //     actions.send(NodeAction::LoadIdentities);
+    // }
 
     #[inline_props]
     fn identity_entry(cx: Scope, alias: Rc<str>, info: Rc<AliasInfo>, id: UserId) -> Element {

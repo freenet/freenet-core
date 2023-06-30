@@ -353,7 +353,7 @@ impl Executor {
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
-
+                tracing::debug!("registering delegate `{key}");
                 match self.runtime.register_delegate(delegate, cipher, nonce) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {

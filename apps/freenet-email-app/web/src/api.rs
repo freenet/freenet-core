@@ -165,12 +165,15 @@ mod identity_management {
     }
 
     pub(super) async fn create_delegate(client: &mut WebApiRequestClient) -> Result<(), DynError> {
-        let (_key, _, params) = identity_manager_key()?;
+        let (key, _, params) = identity_manager_key()?;
+        let delegate = Delegate::from((&DelegateCode::from(ID_MANAGER_CODE), &params));
+        assert_eq!(&key, delegate.key());
         let request = ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
-            delegate: Delegate::from((&DelegateCode::from(ID_MANAGER_CODE), &params)),
+            delegate,
             cipher: DelegateRequest::DEFAULT_CIPHER,
             nonce: DelegateRequest::DEFAULT_NONCE,
         });
+        crate::log::debug!("creating identity manager with key: {key}");
         client.send(request).await?;
         Ok(())
     }
