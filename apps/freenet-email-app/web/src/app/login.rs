@@ -12,6 +12,8 @@ const DEFAULT_ID_ICON: &str = "data:image/x-icon;base64,iVBORw0KGgoAAAANSUhEUgAA
 
 struct ImportId(bool);
 
+struct CreateAlias(bool);
+
 fn login_header(cx: Scope) -> Element {
     cx.render(rsx! {
         div {
@@ -69,12 +71,34 @@ pub(crate) fn get_aliases() -> Rc<RefCell<Vec<Alias>>> {
 }
 
 pub(super) fn identifiers_list(cx: Scope) -> Element {
+    use_shared_state_provider::<CreateAlias>(cx, || CreateAlias(false));
+    let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
+    let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
+
+    cx.render(rsx! {
+        login_header {}
+        div {
+            class: "columns",
+            div { class: "column is-3" }
+            div {
+                class: "column is-6",
+                div {
+                    class: "card has-background-light is-small mt-2",
+                    if create_alias_form.read().0 {
+                        create_alias(cx, actions)
+                    } else {
+                        identities(cx)
+                    }
+                }
+            }
+        }
+    })
+}
+
+pub(super) fn identities(cx: Scope) -> Element {
     let aliases = get_aliases();
     let aliases_list = aliases.borrow();
-    let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
-    // if aliases_list.is_empty() {
-    //     actions.send(NodeAction::LoadIdentities);
-    // }
+    let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
 
     #[inline_props]
     fn identity_entry(cx: Scope, alias: Rc<str>, info: Rc<AliasInfo>, id: UserId) -> Element {
@@ -119,79 +143,173 @@ pub(super) fn identifiers_list(cx: Scope) -> Element {
     });
 
     cx.render(rsx! {
-        login_header {}
+        identities
+        // div {
+        //     class: "card-content",
+        //     div {
+        //         class: "media",
+        //         div {
+        //             class: "media-left",
+        //             figure { class: "image is-48x48", img { src: DEFAULT_ID_ICON } }
+        //         }
+        //         div {
+        //             class: "media-content",
+        //             p {
+        //                 class: "title is-4",
+        //                 a {
+        //                     style: "color: inherit",
+        //                     onclick: move |_| {
+        //                         let id = UserId::new(0);
+        //                         user.write().set_logged_id(id);
+        //                         inbox.set_active_id(id);
+        //                     },
+        //                     "Ian Clarke"
+        //                 }
+        //             },
+        //             p { class: "subtitle is-6", "ian.clarke@freenet.org" }
+        //         }
+        //     }
+        // },
+        // div {
+        //     class: "card-content",
+        //     div {
+        //         class: "media",
+        //         div {
+        //             class: "media-left",
+        //             figure { class: "image is-48x48", img { src: DEFAULT_ID_ICON } }
+        //         }
+        //         div {
+        //             class: "media-content",
+        //             p {
+        //                 class: "title is-4",
+        //                 a {
+        //                     style: "color: inherit",
+        //                     onclick: move |_| {
+        //                         let id = UserId::new(1);
+        //                         user.write().set_logged_id(id);
+        //                         inbox.set_active_id(id);
+        //                     },
+        //                     "Ian's Other Account"
+        //                 }
+        //             },
+        //             p { class: "subtitle is-6", "other.stuff@freenet.org" }
+        //         }
+        //     }
+        // },
         div {
-            class: "columns",
-            div { class: "column is-3" }
+            class: "card-content columns",
+            div { class: "column is-4" }
+            a {
+                class: "column is-4 is-link",
+                onclick: move |_| {
+                    create_alias_form.write().0 = true;
+                },
+                "Create new alias"
+            }
+        }
+    })
+}
+
+pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>) -> Element<'x> {
+    let create_alias_form: &UseSharedState<CreateAlias> =
+        use_shared_state::<CreateAlias>(cx).unwrap();
+
+    let generate = use_state(cx, || true);
+    let address = use_state(cx, String::new);
+    let description = use_state(cx, String::new);
+    let key_path = use_state(cx, || {
+        std::iter::repeat('\u{80}')
+            .take(100)
+            .chain(std::iter::repeat('.').take(300))
+            .collect::<String>()
+    });
+
+    cx.render(rsx! {
+        div {
+            class: "box has-background-primary is-small mt-2",
             div {
-                class: "column is-6",
+                class: "field",
+                label { "Alias" }
                 div {
-                    class: "card has-background-light is-small mt-2",
-                    identities
-                    // div {
-                    //     class: "card-content",
-                    //     div {
-                    //         class: "media",
-                    //         div {
-                    //             class: "media-left",
-                    //             figure { class: "image is-48x48", img { src: DEFAULT_ID_ICON } }
-                    //         }
-                    //         div {
-                    //             class: "media-content",
-                    //             p {
-                    //                 class: "title is-4",
-                    //                 a {
-                    //                     style: "color: inherit",
-                    //                     onclick: move |_| {
-                    //                         let id = UserId::new(0);
-                    //                         user.write().set_logged_id(id);
-                    //                         inbox.set_active_id(id);
-                    //                     },
-                    //                     "Ian Clarke"
-                    //                 }
-                    //             },
-                    //             p { class: "subtitle is-6", "ian.clarke@freenet.org" }
-                    //         }
-                    //     }
-                    // },
-                    // div {
-                    //     class: "card-content",
-                    //     div {
-                    //         class: "media",
-                    //         div {
-                    //             class: "media-left",
-                    //             figure { class: "image is-48x48", img { src: DEFAULT_ID_ICON } }
-                    //         }
-                    //         div {
-                    //             class: "media-content",
-                    //             p {
-                    //                 class: "title is-4",
-                    //                 a {
-                    //                     style: "color: inherit",
-                    //                     onclick: move |_| {
-                    //                         let id = UserId::new(1);
-                    //                         user.write().set_logged_id(id);
-                    //                         inbox.set_active_id(id);
-                    //                     },
-                    //                     "Ian's Other Account"
-                    //                 }
-                    //             },
-                    //             p { class: "subtitle is-6", "other.stuff@freenet.org" }
-                    //         }
-                    //     }
-                    // },
+                    class: "control has-icons-left",
+                    input {
+                        class: "input",
+                        placeholder: "Address",
+                        value: "{address}",
+                        oninput: move |evt| address.set(evt.value.clone())
+                    }
+                    span { class: "icon is-small is-left", i { class: "fas fa-envelope" } }
+                }
+            }
+            div {
+                class: "field",
+                label { "Description" }
+                div {
+                    class: "control has-icons-left",
+                    input {
+                        class: "input",
+                        placeholder: "",
+                        value: "{description}",
+                        oninput: move |evt| description.set(evt.value.clone())
+                    }
+                    span { class: "icon is-small is-left", i { class: "fas fa-envelope" } }
+                }
+            }
+            div {
+                class: "columns mb-2 mt-2",
+                div {
+                    class: "column is-two-fifths",
                     div {
-                        class: "card-content columns",
-                        div { class: "column is-4" }
-                        a {
-                            class: "column is-4 is-link",
-                            onclick: move |_| {
-                                actions.send(NodeAction::CreateIdentity { alias: "random".into(), key: vec![], extra: "some@address.com".into() })
-                            },
-                            "Create new identity"
+                        class: "file is-small has-name",
+                        label {
+                        class: "file-label",
+                        input { class: "file-input", r#type: "file", name: "keypair-file" }
+                        span {
+                            class: "file-cta",
+                            span { class: "file-icon", i { class: "fas fa-upload" } }
+                            span { class: "file-label", "Import key file" }
+                        }
+                        span { class: "file-name has-background-white", "{key_path}" }
                         }
                     }
                 }
+                div {
+                    class:"column is-one-fifth" ,
+                    p { class: "has-text-centered", "or" }
+                }
+                div {
+                    class: "column is-two-fifths",
+                    // a {
+                    //     class: "button has-text-centered is-size-7",
+                    //     onclick: move |_| {
+                    //         generate.set(true);
+                    //     },
+                    //     "Generate"
+                    // }
+                    label {
+                        class: "checkbox",
+                        input {
+                            r#type: "checkbox",
+                            checked: true,
+                            onclick: move |_| {
+                                let current = generate.get();
+                                generate.set(!current);
+                            }
+                        },
+                        "  generate"
+                    }
+                }
+            }
+            a {
+                class: "button",
+                onclick: move |_|  {
+                    create_alias_form.write().0 = false;
+                    let alias: String = address.get().into();
+                    let key: Vec<u8> = vec![];
+                    let description = description.get().into();
+                    actions.send(NodeAction::CreateIdentity { alias, key, description });
+                },
+                "Create"
             }
         }
     })

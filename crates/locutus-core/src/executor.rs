@@ -385,7 +385,7 @@ impl Executor {
                         .collect(),
                 ) {
                     Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                    Err(err) if err.is_delegate_exec_error() => {
+                    Err(err) if err.is_delegate_exec_error() | err.is_execution_error() => {
                         tracing::error!("failed processing messages for delegate `{key}`: {err}");
                         Err(Either::Left(
                             CoreDelegateError::ExecutionError(format!("{err}")).into(),
@@ -397,7 +397,9 @@ impl Executor {
                     }
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
-                        Ok(HostResponse::Ok)
+                        Err(Either::Right(
+                            format!("uncontrolled error while executing `{key}`").into(),
+                        ))
                     }
                 }
             }

@@ -292,7 +292,11 @@ pub(crate) async fn node_comms(
                     Err(e) => crate::log::error(format!("{e}"), Some(TryNodeAction::LoadAliases)),
                 }
             }
-            NodeAction::CreateIdentity { alias, key, extra } => {
+            NodeAction::CreateIdentity {
+                alias,
+                key,
+                description: extra,
+            } => {
                 match identity_management::create_alias(&mut client, alias.clone(), key, extra)
                     .await
                 {

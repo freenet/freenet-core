@@ -72,7 +72,7 @@ pub(crate) enum NodeAction {
     CreateIdentity {
         alias: String,
         key: Vec<u8>,
-        extra: String,
+        description: String,
     },
 }
 
@@ -94,6 +94,11 @@ pub(crate) fn app(cx: Scope) -> Element {
             async {}.boxed_local()
         });
     }
+    #[cfg(not(feature = "use-node"))]
+    {
+        let _sync = use_coroutine::<NodeAction, _, _>(cx, move |rx| async {});
+    }
+    let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
 
     if !user.read().identified {
         cx.render(rsx! {
@@ -102,7 +107,7 @@ pub(crate) fn app(cx: Scope) -> Element {
     } else if let Some(id) = user.read().logged_id() {
         #[cfg(feature = "use-node")]
         {
-            inbox.load_messages(cx, id).expect("load messages");
+            inbox.load_messages(id, actions).expect("load messages");
         }
         #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
         {
@@ -285,8 +290,11 @@ impl InboxView {
     }
 
     #[cfg(feature = "use-node")]
-    fn load_messages(&self, cx: Scope, id: &Identity) -> Result<(), DynError> {
-        let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
+    fn load_messages(
+        &self,
+        id: &Identity,
+        actions: &Coroutine<NodeAction>,
+    ) -> Result<(), DynError> {
         actions.send(NodeAction::LoadMessages(id.clone()));
         Ok(())
     }

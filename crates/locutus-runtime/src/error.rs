@@ -18,6 +18,14 @@ impl ContractError {
         matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
     }
 
+    pub fn is_execution_error(&self) -> bool {
+        use RuntimeInnerError::*;
+        matches!(
+            &*self.0,
+            WasmInstantiationError(_) | WasmExportError(_) | WasmCompileError(_)
+        )
+    }
+
     pub fn delegate_is_missing(&self) -> bool {
         matches!(&*self.0, RuntimeInnerError::DelegateNotFound(_))
     }

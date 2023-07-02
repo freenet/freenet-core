@@ -105,6 +105,7 @@ impl TryFrom<&[u8]> for IdentityManagement {
     }
 }
 
+// #[delegate]
 impl DelegateInterface for IdentityManagement {
     fn process(
         params: Parameters<'static>,
