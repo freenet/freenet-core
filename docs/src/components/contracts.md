@@ -6,11 +6,10 @@ tables in a database, or memory locations in a globally shared memory. Contracts
 define the circumstances under which state can be modified and whether a given
 state is allowed.
 
-Contracts and their associated state reside on the Freenet
-[network](../architecture/p2p-network.md) on peers determined by the contract's
-location, which is derived from its WebAssembly code and parameters. While a
-user's delegates are hosted on their local Freenet peer, contracts are hosted on
-the network as a whole.
+Contracts and their associated state reside on the Freenet network on peers
+determined by the contract's location, which is derived from its WebAssembly
+code and parameters. While a user's delegates are hosted on their local Freenet
+peer, contracts are hosted on the network as a whole.
 
 Each contract is identified by a cryptographic hash, which is a combination of
 its code and parameters, also referred to as its "key". This key is used to
@@ -66,7 +65,3 @@ to the blog's state, removing older posts if necessary.
 Rust contracts must implement the `ContractInterface` trait, which defines the
 functions that the kernel calls to interact with the contract. This trait is
 defined in the [locutus-stdlib](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/contract_interface.rs#L424).
-
-```rust,no_run,noplayground
-{{#include ../../../crates/locutus-stdlib/src/contract_interface.rs:contractifce}}
-```
