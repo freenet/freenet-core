@@ -1,8 +1,17 @@
-use chacha20poly1305::{aead::Aead, Error as EncryptionError, XChaCha20Poly1305, XNonce};
+use blake2::digest::generic_array::GenericArray;
+use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20Poly1305, XNonce};
 use dashmap::DashMap;
+use locutus_stdlib::client_api::DelegateRequest;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::{collections::HashMap, fs, fs::File, iter::FromIterator, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::Write,
+    iter::FromIterator,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
@@ -47,6 +56,8 @@ pub enum SecretStoreError {
     IO(#[from] std::io::Error),
     #[error("missing cipher")]
     MissingCipher,
+    #[error("missing secret: {0}")]
+    MissingSecret(SecretsId),
 }
 
 impl From<&DashMap<DelegateKey, Vec<SecretKey>>> for KeyToEncryptionMap {
@@ -76,6 +87,19 @@ static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::Onc
 static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
 impl StoreFsManagement<KeyToEncryptionMap> for SecretsStore {}
+
+static DEFAULT_CIPHER: Lazy<XChaCha20Poly1305> = Lazy::new(|| {
+    let arr = GenericArray::from_slice(&DelegateRequest::DEFAULT_CIPHER);
+    XChaCha20Poly1305::new(arr)
+});
+
+static DEFAULT_NONCE: Lazy<XNonce> =
+    Lazy::new(|| GenericArray::from_slice(&DelegateRequest::DEFAULT_NONCE).to_owned());
+
+static DEFAULT_ENCRYPTION: Lazy<Encryption> = Lazy::new(|| Encryption {
+    cipher: (*DEFAULT_CIPHER).clone(),
+    nonce: *DEFAULT_NONCE,
+});
 
 impl SecretsStore {
     pub fn new(secrets_dir: PathBuf) -> RuntimeResult<Self> {
@@ -121,8 +145,10 @@ impl SecretsStore {
         nonce: XNonce,
     ) -> Result<(), SecretStoreError> {
         // FIXME: store/initialize the cyphers from disc
-        let encryption = Encryption { cipher, nonce };
-        self.ciphers.insert(delegate, encryption);
+        if nonce != *DEFAULT_NONCE {
+            let encryption = Encryption { cipher, nonce };
+            self.ciphers.insert(delegate, encryption);
+        }
         Ok(())
     }
 
@@ -135,20 +161,24 @@ impl SecretsStore {
         let delegate_path = self.base_path.join(delegate.encode());
         let secret_file_path = delegate_path.join(key.encode());
         let secret_key = *key.hash();
+        let encryption = self.ciphers.get(delegate).unwrap_or(&*DEFAULT_ENCRYPTION);
 
-        let encryption = self
-            .ciphers
-            .get(delegate)
-            .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = encryption
             .cipher
             .encrypt(&encryption.nonce, plaintext.as_ref())
-            .map_err(SecretStoreError::Encryption)?;
+            .map_err(|err| {
+                if encryption.nonce == *DEFAULT_NONCE {
+                    SecretStoreError::MissingCipher
+                } else {
+                    SecretStoreError::Encryption(err)
+                }
+            })?;
 
         self.key_to_secret_part
             .insert(delegate.clone(), vec![secret_key]);
 
         fs::create_dir_all(&delegate_path)?;
+        tracing::debug!("storing secret `{key}` at {secret_file_path:?}");
         let mut file = File::create(secret_file_path)?;
         file.write_all(&ciphertext)?;
         Ok(())
@@ -173,15 +203,20 @@ impl SecretsStore {
         key: &SecretsId,
     ) -> Result<Vec<u8>, SecretStoreError> {
         let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
-        let encryption = self
-            .ciphers
-            .get(delegate)
-            .ok_or(SecretStoreError::MissingCipher)?;
-        let ciphertext = fs::read(secret_path)?;
+        let encryption = self.ciphers.get(delegate).unwrap_or(&*DEFAULT_ENCRYPTION);
+
+        let ciphertext =
+            fs::read(secret_path).map_err(|_| SecretStoreError::MissingSecret(key.clone()))?;
         let plaintext = encryption
             .cipher
             .decrypt(&encryption.nonce, ciphertext.as_ref())
-            .map_err(SecretStoreError::Encryption)?;
+            .map_err(|err| {
+                if encryption.nonce == *DEFAULT_NONCE {
+                    SecretStoreError::MissingCipher
+                } else {
+                    SecretStoreError::Encryption(err)
+                }
+            })?;
         Ok(plaintext)
     }
 }

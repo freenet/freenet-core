@@ -100,11 +100,10 @@ async fn put_delegate(
 ) -> Result<(), DynError> {
     let code = DelegateCode::load(&config.code)?;
 
-    let (cipher, nonce) = if other.mode == OperationMode::Local
-        && delegate_config.cipher.is_empty()
-        && delegate_config.nonce.is_empty()
-    {
-        println!("Using default cipher and nonce. This is only allowed in local mode, don't reuse those for network mode.");
+    let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
+        println!(
+"Using default cipher and nonce. 
+For additional hardening is recommended to use a different cipher and nonce to encrypt secrets in storage.");
         (
             ::locutus_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
             ::locutus_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,

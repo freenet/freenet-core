@@ -395,6 +395,16 @@ impl Executor {
                         tracing::error!("delegate not found `{key}`");
                         Err(Either::Left(CoreDelegateError::Missing(key).into()))
                     }
+                    Err(err) if err.secret_is_missing() => {
+                        tracing::error!("secret not found `{key}`");
+                        Err(Either::Left(
+                            CoreDelegateError::MissingSecret {
+                                key,
+                                secret: err.get_secret_id(),
+                            }
+                            .into(),
+                        ))
+                    }
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
                         Err(Either::Right(

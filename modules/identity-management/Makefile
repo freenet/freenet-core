@@ -25,7 +25,7 @@ build: \
 
 build-delegate:
 	cd $(DELEGATE_DIR)
-	ldt build --package-type delegate
+	ldt build --package-type delegate --features contract
 
 generate-delegate-code-hash:
 	cd $(DELEGATE_DIR)

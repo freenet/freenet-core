@@ -92,7 +92,7 @@ impl Runtime {
     ) -> RuntimeResult<DelegateContext> {
         const MAX_ITERATIONS: usize = 100;
 
-        let mut retries = 0;
+        let mut recurssion = 0;
         let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned()) else {
             return Ok(DelegateContext::default());
         };
@@ -109,11 +109,11 @@ impl Runtime {
                         value: Some(secret),
                         context,
                     });
-                    if retries >= MAX_ITERATIONS {
+                    if recurssion >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
                     let new_msgs = self.exec_inbound(params, &inbound, process_func, instance)?;
-                    retries += 1;
+                    recurssion += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Error trying to update the context from the secret".to_string()).into())));
                     };
@@ -145,8 +145,11 @@ impl Runtime {
                     }
                 }
                 OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
-                    if retries >= MAX_ITERATIONS {
-                        panic!();
+                    if recurssion >= MAX_ITERATIONS {
+                        return Err(DelegateExecError::DelegateError(DelegateError::Other(
+                            "max recurssion (100) limit hit".into(),
+                        ))
+                        .into());
                     }
                     let outbound = self.exec_inbound(
                         params,
@@ -158,9 +161,9 @@ impl Runtime {
                         process_func,
                         instance,
                     )?;
-                    retries += 1;
-                    for m in outbound {
-                        outbound_msgs.push_back(m);
+                    recurssion += 1;
+                    for msg in outbound {
+                        outbound_msgs.push_back(msg);
                     }
                 }
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {

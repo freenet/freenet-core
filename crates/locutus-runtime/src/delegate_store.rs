@@ -107,7 +107,9 @@ impl DelegateStore {
                 .delegates_dir
                 .join(code_part.value().encode())
                 .with_extension("wasm");
+            tracing::debug!("loading delegate `{key}` from {delegate_code_path:?}");
             let delegate_code = DelegateCode::load(delegate_code_path.as_path()).ok()?;
+            tracing::debug!("loaded `{key}` from path");
             let size = delegate_code.as_ref().len() as i64;
             let delegate = Delegate::from((&delegate_code, &params.clone().into_owned()));
             self.delegate_cache

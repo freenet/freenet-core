@@ -6,7 +6,7 @@ use std::{
 
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, AeadCore, OsRng},
     XChaCha20Poly1305,
 };
 use chrono::{DateTime, Utc};
@@ -206,6 +206,7 @@ impl DecryptedMessage {
             .map_err(|e| format!("{e}"))
             .unwrap();
 
+        use chacha20poly1305::aead::KeyInit;
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
         let decrypted_content = cipher
             .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
@@ -221,11 +222,17 @@ impl DecryptedMessage {
         let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
 
         // Generate a random 256-bit XChaCha20Poly1305 key
-        let chacha_key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let chacha_key = {
+            use chacha20poly1305::aead::KeyInit;
+            XChaCha20Poly1305::generate_key(&mut OsRng)
+        };
         let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
 
         // Encrypt the data using XChaCha20Poly1305
-        let cipher = XChaCha20Poly1305::new(&chacha_key);
+        let cipher = {
+            use chacha20poly1305::aead::KeyInit;
+            XChaCha20Poly1305::new(&chacha_key)
+        };
         let encrypted_data = cipher
             .encrypt(&chacha_nonce, decrypted_content.as_slice())
             .unwrap();

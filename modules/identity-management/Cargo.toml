@@ -19,3 +19,7 @@ rand = "0.8"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+contract = ["locutus-stdlib/contract"]

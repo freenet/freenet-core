@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use locutus_stdlib::prelude::{ContractKey, DelegateKey};
+use locutus_stdlib::prelude::{ContractKey, DelegateKey, SecretsId};
 
 use crate::{delegate, runtime, secrets_store};
 
@@ -28,6 +28,22 @@ impl ContractError {
 
     pub fn delegate_is_missing(&self) -> bool {
         matches!(&*self.0, RuntimeInnerError::DelegateNotFound(_))
+    }
+
+    pub fn secret_is_missing(&self) -> bool {
+        matches!(
+            &*self.0,
+            RuntimeInnerError::SecretStoreError(secrets_store::SecretStoreError::MissingSecret(_))
+        )
+    }
+
+    pub fn get_secret_id(&self) -> SecretsId {
+        match &*self.0 {
+            RuntimeInnerError::SecretStoreError(
+                secrets_store::SecretStoreError::MissingSecret(id),
+            ) => id.clone(),
+            _ => panic!(),
+        }
     }
 }
 

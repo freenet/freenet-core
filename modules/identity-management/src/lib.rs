@@ -105,7 +105,7 @@ impl TryFrom<&[u8]> for IdentityManagement {
     }
 }
 
-// #[delegate]
+#[delegate]
 impl DelegateInterface for IdentityManagement {
     fn process(
         params: Parameters<'static>,
@@ -126,6 +126,26 @@ impl DelegateInterface for IdentityManagement {
                     }
                     IdentityMsg::DeleteIdentity { alias } => {
                         serde_json::to_vec(&IdentityMsg::DeleteIdentity { alias }).unwrap()
+                    }
+                    IdentityMsg::Init => {
+                        #[cfg(all(target_family = "wasm", feature = "contract"))]
+                        {
+                            locutus_stdlib::log::info(&format!(
+                                "initialize secret {}",
+                                params.as_secret_id()
+                            ));
+                        }
+                        let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
+                            key: params.as_secret_id(),
+                            value: Some(
+                                serde_json::to_vec(&IdentityManagement::default()).unwrap(),
+                            ),
+                        });
+                        #[cfg(all(target_family = "wasm", feature = "contract"))]
+                        {
+                            locutus_stdlib::log::info(&format!("initialized secret"));
+                        }
+                        return Ok(vec![set_secret]);
                     }
                 };
                 let context = DelegateContext::new(action);
@@ -151,6 +171,9 @@ impl DelegateInterface for IdentityManagement {
                         IdentityMsg::DeleteIdentity { alias } => {
                             manager.identities.remove(&alias);
                         }
+                        IdentityMsg::Init => {
+                            unreachable!()
+                        }
                     };
                     let outbound = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
                         key: params.as_secret_id(),
@@ -168,6 +191,7 @@ impl DelegateInterface for IdentityManagement {
 
 #[derive(Serialize, Deserialize)]
 pub enum IdentityMsg {
+    Init,
     CreateIdentity {
         alias: String,
         key: Key,

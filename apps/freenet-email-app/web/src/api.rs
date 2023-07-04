@@ -175,6 +175,17 @@ mod identity_management {
         });
         crate::log::debug!("creating identity manager with key: {key}");
         client.send(request).await?;
+        let request = DelegateRequest::ApplicationMessages {
+            params,
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(
+                    ContractInstanceId::new([0; 32]),
+                    (&IdentityMsg::Init).try_into()?,
+                ),
+            )],
+            key,
+        };
+        client.send(request.into()).await?;
         Ok(())
     }
 
@@ -320,44 +331,53 @@ pub(crate) async fn node_comms(
         let res = match res {
             Ok(r) => r,
             Err(e) => {
-                if let ErrorKind::RequestError(err) = e.kind() {
-                    // FIXME: handle the different possible errors
-                    match err {
-                        RequestError::ContractError(ContractError::Update { key, .. }) => {
-                            if token_rec_to_id.get(&key).is_some() {
-                                // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
-                                // we should reject that pending assignment
-                                // FIXME: in case this is for an inbox contract we were trying to update, this means
-                                let id = token_rec_to_id.get(&key).unwrap();
-                                let alias = id.alias();
-                                crate::log::error(format!("the message for {alias} (aft contract: {key}) wasn't delivered successfully, so may need to try again and/or notify the user"), None);
-                            } else if inbox_to_id.get(&key).is_some() {
-                                let id = inbox_to_id.get(&key).unwrap();
-                                let alias = id.alias();
-                                crate::log::error(format!("the message for {alias} (inbox contract: {key}) wasn't delievered succesffully, so may need to try again and/or notify the user"), None);
+                match e.kind() {
+                    ErrorKind::RequestError(e) => {
+                        // FIXME: handle the different possible errors
+                        match e {
+                            RequestError::ContractError(ContractError::Update { key, .. }) => {
+                                if token_rec_to_id.get(&key).is_some() {
+                                    // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
+                                    // we should reject that pending assignment
+                                    // FIXME: in case this is for an inbox contract we were trying to update, this means
+                                    let id = token_rec_to_id.get(&key).unwrap();
+                                    let alias = id.alias();
+                                    crate::log::error(format!("the message for {alias} (aft contract: {key}) wasn't delivered successfully, so may need to try again and/or notify the user"), None);
+                                } else if inbox_to_id.get(&key).is_some() {
+                                    let id = inbox_to_id.get(&key).unwrap();
+                                    let alias = id.alias();
+                                    crate::log::error(format!("the message for {alias} (inbox contract: {key}) wasn't delievered succesffully, so may need to try again and/or notify the user"), None);
+                                }
                             }
-                        }
-                        RequestError::ContractError(err) => {
-                            crate::log::error(format!("FIXME: {err}"), None)
-                        }
-                        RequestError::DelegateError(DelegateError::Missing(key))
-                            if &key == IDENTITIES_KEY.get().unwrap() =>
-                        {
-                            if let Err(e) = identity_management::create_delegate(&mut client).await
+                            RequestError::ContractError(err) => {
+                                crate::log::error(format!("FIXME: {err}"), None)
+                            }
+                            RequestError::DelegateError(DelegateError::Missing(key))
+                                if &key == IDENTITIES_KEY.get().unwrap() =>
                             {
-                                crate::log::error(format!("{e}"), None);
+                                if let Err(e) =
+                                    identity_management::create_delegate(&mut client).await
+                                {
+                                    crate::log::error(format!("{e}"), None);
+                                }
                             }
-                        }
-                        RequestError::DelegateError(error) => {
-                            crate::log::error(
-                                format!("received delegate request error: {error}"),
-                                None,
-                            );
-                        }
-                        RequestError::Disconnect => {
-                            todo!("lost connection to node, should retry connecting")
+                            RequestError::DelegateError(error) => {
+                                // if let DelegateError::MissingSecret { key, secret } = &error {
+                                // }
+                                crate::log::error(
+                                    format!("received delegate request error: {error}"),
+                                    None,
+                                );
+                            }
+                            RequestError::Disconnect => {
+                                todo!("lost connection to node, should retry connecting")
+                            }
                         }
                     }
+                    ErrorKind::Unhandled { cause } => {
+                        crate::log::error(format!("unhandled error, cause: {cause}"), None);
+                    }
+                    _ => {}
                 }
                 return;
             }

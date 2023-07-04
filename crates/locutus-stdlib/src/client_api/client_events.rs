@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializ
 
 use crate::{
     delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
-    prelude::{ContractKey, Parameters, RelatedContracts, StateSummary, UpdateData, WrappedState},
+    prelude::{ContractKey, Parameters, RelatedContracts, StateSummary, UpdateData, WrappedState, SecretsId},
     versioning::ContractContainer,
 };
 
@@ -84,6 +84,8 @@ pub enum DelegateError {
     ExecutionError(String),
     #[error("missing delegate {0}")]
     Missing(DelegateKey),
+    #[error("missing secret `{secret}` for delegate {key}")]
+    MissingSecret { key: DelegateKey, secret: SecretsId },
 }
 
 /// Errors that may happen while interacting with contracts.

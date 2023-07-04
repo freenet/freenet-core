@@ -229,12 +229,6 @@ async fn process_client_request(
         Ok(client_request) => client_request.into_owned(),
         Err(error) => {
             tracing::error!(%error, "error decoding request json");
-            // if tracing::enabled!(tracing::Level::DEBUG) {
-            //     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&msg) {
-            //         let f = std::env::temp_dir().join(format!("locutus.req.cli-{client_id}"));
-            //         let _ = std::fs::write(f, serde_json::to_string_pretty(&json).unwrap());
-            //     }
-            // }
             match ContractRequest::try_decode(&msg) {
                 Ok(r) => r.to_owned().into(),
                 Err(e) => {
