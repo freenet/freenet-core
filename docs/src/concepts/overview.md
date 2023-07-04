@@ -7,8 +7,6 @@ data on the user's behalf, while [User Interfaces](ui.md) provide an interface
 between these and the user through a web browser. UIs are distributed through
 the P2P network via contracts.
 
-
-
 ![Architectural Primitives Diagram](components.svg)
 
 ## Freenet Kernel
