@@ -10,7 +10,7 @@ tables in a database, or memory locations in a globally shared memory. Contracts
 define the circumstances under which state can be modified and whether a given
 state is permitted.
 
-Contracts can also act as realtiem communication conduits between
+Contracts can also act as realtime communication conduits between
 [delegates](delegates.md) and [user interfaces](ui.md).
 
 Contracts and their corresponding state reside on the Freenet network on peers
