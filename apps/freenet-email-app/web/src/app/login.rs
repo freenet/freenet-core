@@ -24,7 +24,7 @@ fn login_header(cx: Scope) -> Element {
 
 pub(super) fn identifiers_list(cx: Scope) -> Element {
     let user = use_shared_state::<User>(cx).unwrap();
-    let inbox = use_context::<InboxView>(cx).unwrap();
+    let inbox = use_shared_state::<InboxView>(cx).unwrap();
     cx.render(rsx! {
         login_header {}
         div {
@@ -51,7 +51,7 @@ pub(super) fn identifiers_list(cx: Scope) -> Element {
                                         onclick: move |_| {
                                             let id = UserId::new(0);
                                             user.write().set_logged_id(id);
-                                            inbox.set_active_id(id);
+                                            inbox.write().set_active_id(id);
                                         },
                                         "Ian Clarke"
                                     }
@@ -77,7 +77,7 @@ pub(super) fn identifiers_list(cx: Scope) -> Element {
                                         onclick: move |_| {
                                             let id = UserId::new(1);
                                             user.write().set_logged_id(id);
-                                            inbox.set_active_id(id);
+                                            inbox.write().set_active_id(id);
                                         },
                                         "Ian's Other Account"
                                     }
