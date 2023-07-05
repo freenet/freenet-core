@@ -11,7 +11,8 @@ define the circumstances under which state can be modified and whether a given
 state is permitted.
 
 Contracts can also act as realtime communication conduits between
-[delegates](delegates.md) and [user interfaces](ui.md).
+[delegates](delegates.md) and [user interfaces](ui.md), where the contract's
+state is used as a message buffer.
 
 Contracts and their corresponding state reside on the Freenet network on peers
 determined by the contract's location, which is derived from its WebAssembly
