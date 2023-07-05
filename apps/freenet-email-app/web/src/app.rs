@@ -69,27 +69,22 @@ pub(crate) enum NodeAction {
     LoadMessages(Identity),
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum AlertMessage {
-    TokenAllocationError(String),
-}
-
 pub(crate) fn app(cx: Scope) -> Element {
     crate::log::debug!("rendering app");
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
 
-    use_context_provider(cx, InboxView::new);
-    let inbox = use_context::<InboxView>(cx).unwrap();
-    let inbox_data = inbox.inbox_data.clone();
-
-    let (alerts_sender, alerts_receiver) = futures::channel::mpsc::unbounded();
+    use_shared_state_provider(cx, InboxView::new);
+    let controller = use_shared_state::<InboxView>(cx).unwrap();
+    let inbox_data = controller.read().inbox_data.clone();
 
     #[cfg(feature = "use-node")]
     {
-        let _sync = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
-            let fut = crate::api::node_comms(rx, user.read().identities.clone(), inbox_data, alerts_sender)
-                .map(|_| Ok(JsValue::NULL));
+        let _sync: &Coroutine<NodeAction> = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
+            to_owned![controller];
+            let fut =
+                crate::api::node_comms(rx, controller, user.read().identities.clone(), inbox_data)
+                    .map(|_| Ok(JsValue::NULL));
             let _ = wasm_bindgen_futures::future_to_promise(fut);
             async {}.boxed_local()
         });
@@ -102,11 +97,14 @@ pub(crate) fn app(cx: Scope) -> Element {
     } else if let Some(id) = user.read().logged_id() {
         #[cfg(feature = "use-node")]
         {
-            inbox.load_messages(cx, id).expect("load messages");
+            controller
+                .read()
+                .load_messages(cx, id)
+                .expect("load messages");
         }
         #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
         {
-            inbox.load_messages(id).unwrap();
+            controller.load_messages(id).unwrap();
         }
         cx.render(rsx! {
            user_inbox {}
@@ -127,6 +125,7 @@ pub struct InboxView {
     /// loaded messages for the currently selected `active_id`
     messages: Rc<RefCell<Vec<Message>>>,
     active_id: Rc<RefCell<UserId>>,
+    pub message_counter: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,16 +152,17 @@ impl InboxView {
             inbox_data: Arc::new(ArcSwap::from_pointee(vec![])),
             messages: Rc::new(RefCell::new(vec![])),
             active_id: Rc::new(RefCell::new(UserId(0))),
+            message_counter: 0,
         }
     }
 
-    fn set_active_id(&self, user: UserId) {
+    fn set_active_id(&mut self, user: UserId) {
         let mut id = self.active_id.borrow_mut();
         *id = user;
     }
 
     fn send_message(
-        &self,
+        &mut self,
         client: WebApiRequestClient,
         from: &str,
         to: &str,
@@ -204,7 +204,7 @@ impl InboxView {
     }
 
     fn remove_messages(
-        &self,
+        &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
@@ -216,17 +216,19 @@ impl InboxView {
 
     // Remove the messages from the inbox contract, and move them to local storage
     fn mark_as_read(
-        &self,
+        &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
-        let messages = &mut *self.messages.borrow_mut();
-        let mut removed_messages = Vec::with_capacity(ids.len());
-        for e in messages {
-            if ids.contains(&e.id) {
-                e.read = true;
-                let m = e.clone();
-                removed_messages.push(m);
+        {
+            let messages = &mut *self.messages.borrow_mut();
+            let mut removed_messages = Vec::with_capacity(ids.len());
+            for e in messages {
+                if ids.contains(&e.id) {
+                    e.read = true;
+                    let m = e.clone();
+                    removed_messages.push(m);
+                }
             }
         }
         // todo: persist in a delegate `removed_messages`
@@ -521,9 +523,17 @@ fn user_menu_component(cx: Scope) -> Element {
 }
 
 fn inbox_component(cx: Scope) -> Element {
-    let inbox = use_context::<InboxView>(cx).unwrap();
+    let inbox = use_shared_state::<InboxView>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
+
+    // use_effect(cx, (&inbox.message_num,), |(msg,)| {
+    //     to_owned![changed];
+    //     async move {
+    //         crate::log::debug!("counter: {msg:?}");
+    //         changed.with_mut(|v| v.0 = true);
+    //     }
+    // });
 
     #[inline_props]
     fn email_link<'a>(
@@ -553,11 +563,13 @@ fn inbox_component(cx: Scope) -> Element {
     {
         let current_active_id: UserId = user.read().active_id.unwrap();
         // reload if there were new emails received
-        let all_data = inbox.inbox_data.load();
+        let all_data = inbox.read().inbox_data.load();
+        crate::log::debug!("rendering");
         if let Some((current_model, id)) = all_data.iter().find_map(|ib| {
             let id = crate::inbox::InboxModel::contract_identity(&ib.borrow().key).unwrap();
             (id.id == current_active_id).then(|| (ib, id))
         }) {
+            let inbox = inbox.read();
             let mut emails = inbox.messages.borrow_mut();
             emails.clear();
             for msg in &current_model.borrow().messages {
@@ -568,6 +580,7 @@ fn inbox_component(cx: Scope) -> Element {
         }
     }
 
+    let inbox = inbox.read();
     let emails = inbox.messages.borrow();
     let is_email = menu_selection.read().email();
     if let Some(email_id) = is_email {
@@ -634,15 +647,21 @@ fn inbox_component(cx: Scope) -> Element {
 fn open_message(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
-    let inbox = use_context::<InboxView>(cx).unwrap();
+    let inbox = use_shared_state::<InboxView>(cx).unwrap();
     let email = cx.props;
     let email_id = [cx.props.id];
 
-    let result = inbox.mark_as_read(client.clone(), &email_id).unwrap();
+    let result = inbox
+        .write()
+        .mark_as_read(client.clone(), &email_id)
+        .unwrap();
     cx.spawn(result);
 
     let delete = move |_| {
-        let result = inbox.remove_messages(client.clone(), &email_id).unwrap();
+        let result = inbox
+            .write()
+            .remove_messages(client.clone(), &email_id)
+            .unwrap();
         cx.spawn(result);
         menu_selection.write().at_inbox_list();
     };
@@ -682,7 +701,7 @@ fn open_message(cx: Scope<Message>) -> Element {
 fn new_message_window(cx: Scope) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
-    let inbox = use_context::<InboxView>(cx).unwrap();
+    let inbox = use_shared_state::<InboxView>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
     let user = user.read();
     let user_alias = &*user.logged_id().unwrap().alias;
@@ -692,14 +711,14 @@ fn new_message_window(cx: Scope) -> Element {
 
     let alias = user_alias.to_string();
     let send_msg = move |_| {
-        let receiver_public_key = match inbox.get_public_key_from_alias(to.get()) {
+        let receiver_public_key = match inbox.read().get_public_key_from_alias(to.get()) {
             Ok(v) => v,
             Err(e) => {
                 crate::log::error(format!("{e}"), Some(TryNodeAction::GetAlias));
                 return;
             }
         };
-        match inbox.send_message(
+        match inbox.write().send_message(
             client.clone(),
             &alias,
             receiver_public_key.as_str(),
