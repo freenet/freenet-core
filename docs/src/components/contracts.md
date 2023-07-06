@@ -1,9 +1,5 @@
 ## Contracts
 
-<!-- toc -->
-
-### Overview
-
 Freenet is a global decentralized key-value store, where the keys are
 [WebAssembly](https://webassembly.org) code called contracts.
 
@@ -14,6 +10,8 @@ contract, or subscribe to be notified of changes to the state.
 Contracts are identified by a hash of their code, which means that their identity
 is tied to their functionality.
 
+<!-- toc -->
+
 ## Contract Operation
 
 ### State synchronization and merging
@@ -22,8 +20,8 @@ is tied to their functionality.
 
 Contracts need to provide a mechanism to merge any two valid states, creating a
 new state that integrates both. This process ensures the eventual consistency of
-contract states in Freenet, a concept similar to Conflict-free Replicated Data Types
-(CRDTs).
+contract states in Freenet, a concept similar to [Conflict-free Replicated Data
+Types](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 
 In the language of mathematics, the contract outlines a commutative monoid on
 the contract's state. For example, if the contract's state is a single number,
@@ -49,7 +47,7 @@ public key included in the contract's parameters.
 
 In this scenario, the contract's code would define the merging of two states as
 taking the union of the two lists of posts. A maximum limit could be imposed on
-the number of posts maintained in the state, with the oldest posts being removed
+the number of posts retained in the state, with the oldest posts being removed
 first.
 
 ### Writing a Contract in Rust
