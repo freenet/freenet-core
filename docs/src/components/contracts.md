@@ -4,7 +4,7 @@
 
 ### Overview
 
-Freenet is a global decentralized key-value store, where they keys are
+Freenet is a global decentralized key-value store, where the keys are
 [WebAssembly](https://webassembly.org) code called contracts.
 
 A contract has associated data called its state, which is publicly readable and
