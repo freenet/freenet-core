@@ -4,24 +4,15 @@
 
 ### Overview
 
-Contracts in Freenet are [WebAssembly](https://webassembly.org) components that
-manage and regulate public state. They can be likened to inodes in a filesystem,
-tables in a database, or memory locations in a globally shared memory. Contracts
-define the circumstances under which state can be modified and whether a given
-state is permitted.
+Freenet is a global decentralized key-value store, where they keys are
+[WebAssembly](https://webassembly.org) code called contracts.
 
-Contracts can also act as realtiem communication conduits between
-[delegates](delegates.md) and [user interfaces](ui.md).
+A contract has associated data called its state, which is publicly readable and
+can be modified if permitted by the contract. Anyone can read the state of a
+contract, or subscribe to be notified of changes to the state.
 
-Contracts and their corresponding state reside on the Freenet network on peers
-determined by the contract's location, which is derived from its WebAssembly
-code and parameters. While a user's delegates are hosted on their local Freenet
-peer, contracts are hosted on the network and their state is publicly readable.
-
-Each contract is identified by a cryptographic hash, generated from a
-combination of its code and parameters, also referred to as its "key". This key
-is used to identify the contract and to verify that the contract's code and
-parameters have not been tampered with.
+Contracts are identified by a hash of their code, which means that their identity
+is tied to their functionality.
 
 ## Contract Operation
 
