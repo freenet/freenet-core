@@ -8,8 +8,15 @@ use crate::prelude::*;
 /// The trait provides an abstraction over the lower-level `ContractInterface`, by automatically
 /// handling the serialization and deserialization of data using bincode.
 ///
-/// Any type implementing this trait is assumed to handle state changes in a commutative manner.
+/// Implementations must ensure that state delta updates are *commutative*. In other words,
+/// when applying multiple delta updates to a state, the order in which these updates are
+/// applied should not affect the final state. Once all deltas are applied, the resulting
+/// state should be the same, regardless of the order in which the deltas were applied.
 ///
+/// Noncompliant behavior, such as failing to obey the commutativity rule, may result
+/// in the contract being deprioritized or removed from the p2p network.
+///
+/// 
 /// # Examples
 ///
 /// Let's assume we have a contract type `MyContract`.
