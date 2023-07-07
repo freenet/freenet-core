@@ -4,8 +4,56 @@ use serde::{Serialize, Deserialize};
 
 use crate::prelude::*;
 
-/// This trait provides an abstraction over the ContractInterface, where data types are serialized
-/// and deserialized using bincode.
+/// `ContractInterfaceBincode` is a higher-level interface for interacting with contracts.
+/// The trait provides an abstraction over the lower-level `ContractInterface`, by automatically
+/// handling the serialization and deserialization of data using bincode.
+///
+/// Any type implementing this trait is assumed to handle state changes in a commutative manner.
+///
+/// # Examples
+///
+/// Let's assume we have a contract type `MyContract`.
+/// ```
+/// pub struct MyContract;
+/// ```
+///
+/// We would implement `ContractInterfaceBincode` for `MyContract` like this:
+/// ```
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct MyParameters {
+///     // ... fields for the parameters ...
+/// }
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct MyState {
+///     // ... fields for the state ...
+/// }
+///
+/// // Similar structs for `MyStateDelta` and `MyStateSummary`...
+///
+/// impl ContractInterfaceBincode for MyContract {
+///     type Parameters = MyParameters;
+///     type State = MyState;
+///     // ... and so on for `StateDelta` and `StateSummary`...
+///
+///     fn validate_state(
+///         parameters: Self::Parameters,
+///         state: Self::State,
+///         related: RelatedContracts<'static>,
+///     ) -> Result<ValidateResult, ContractError> {
+///         // Implement your contract logic here
+///     }
+///
+///     // ... and so on for the other functions...
+/// }
+/// ```
+/// With `ContractInterfaceBincode` implemented for `MyContract`, we can now call functions on it with
+/// parameters of our custom types.
+/// ```
+/// let parameters = MyParameters { /* ... */ };
+/// let state = MyState { /* ... */ };
+/// let result = MyContract::validate_state(parameters, state, related);
+/// ```
 pub trait ContractInterfaceBincode {
     type Parameters: Serialize + for<'de> Deserialize<'de>;
     type State: Serialize + for<'de> Deserialize<'de>;
