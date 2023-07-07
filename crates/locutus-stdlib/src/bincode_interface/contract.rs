@@ -5,7 +5,7 @@ use serde::{Serialize, Deserialize};
 use crate::prelude::*;
 
 /// `ContractInterfaceBincode` is a higher-level interface for interacting with contracts.
-/// The trait provides an abstraction over the lower-level `ContractInterface`, by automatically
+/// The trait provides an abstraction over the lower-level [ContractInterface], by automatically
 /// handling the serialization and deserialization of data using bincode.
 ///
 /// Implementations must ensure that state delta updates are *commutative*. In other words,
