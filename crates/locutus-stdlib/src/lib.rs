@@ -4,6 +4,7 @@ pub mod buf;
 #[cfg(all(feature = "net", any(unix, windows, target_family = "wasm")))]
 pub mod client_api;
 mod contract_interface;
+mod bincode_interface;
 mod delegate_interface;
 pub(crate) mod global;
 #[cfg(target_family = "wasm")]
