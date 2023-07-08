@@ -41,9 +41,9 @@ allow states to be synchronized efficiently between peers.
 ### Contract Use Cases
 
 Consider a public blog contract. The state of this contract would be the blog's
-content, including a list of blog posts. The contract's code stipulates that new
-posts can only be added if they are signed by the blog's owner, with the owner's
-public key included in the contract's parameters.
+content, including a list of blog posts. The contract's code requires that new
+posts can only be added if they are signed by the blog's owner, the owner's
+public key is part of the contract's parameters.
 
 In this scenario, the contract's code would define the merging of two states as
 taking the union of the two lists of posts. A maximum limit could be imposed on
