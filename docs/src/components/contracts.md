@@ -23,7 +23,7 @@ new state that integrates both. This process ensures the eventual consistency of
 contract states in Freenet, a concept similar to [Conflict-free Replicated Data
 Types](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 
-In the language of mathematics, the contract outlines a commutative monoid on
+In the language of mathematics, the contract defines a commutative monoid on
 the contract's state. For example, if the contract's state is a single number,
 then the contract could define the merging of two states as the sum of the two
 numbers. However, these basic operations are too simple on their own but can be
