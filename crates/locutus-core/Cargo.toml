@@ -47,7 +47,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs"] 
 unsigned-varint = "0.7"
 uuid = { version = "1", features = ["serde", "v4", "v1"] }
 rmp-serde = { workspace = true, optional = true }
-sqlx = { version = "0.6", features = ["sqlite", "runtime-tokio-rustls"], optional = true }
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"], optional = true }
 # TODO(kakoc): clang should be installed for rocksdb; write about that in prerequisites/dev guide
 rocksdb = { version = "0.21.0", default-features = false, optional = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
