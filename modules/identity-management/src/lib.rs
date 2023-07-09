@@ -141,10 +141,6 @@ impl DelegateInterface for IdentityManagement {
                                 serde_json::to_vec(&IdentityManagement::default()).unwrap(),
                             ),
                         });
-                        #[cfg(all(target_family = "wasm", feature = "contract"))]
-                        {
-                            locutus_stdlib::log::info(&format!("initialized secret"));
-                        }
                         return Ok(vec![set_secret]);
                     }
                 };
