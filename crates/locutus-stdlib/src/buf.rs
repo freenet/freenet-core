@@ -336,7 +336,7 @@ pub fn initiate_buffer(capacity: u32) -> i64 {
     buffer as i64
 }
 
-#[cfg(all(test, target_family = "unix"))]
+#[cfg(all(test, any(unix, windows)))]
 mod test {
     use super::*;
     use wasmer::{

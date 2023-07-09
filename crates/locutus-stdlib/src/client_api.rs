@@ -12,22 +12,14 @@
 //!               (In order to use this client from JS/Typescript refer to the Typescript std lib).
 mod client_events;
 
-#[cfg(target_family = "unix")]
+#[cfg(any(unix, windows))]
 mod regular;
-#[cfg(target_family = "unix")]
+#[cfg(any(unix, windows))]
 pub use regular::*;
 
-#[cfg(all(
-    target_arch = "wasm32",
-    target_vendor = "unknown",
-    target_os = "unknown"
-))]
+#[cfg(target_family = "wasm")]
 mod browser;
-#[cfg(all(
-    target_arch = "wasm32",
-    target_vendor = "unknown",
-    target_os = "unknown"
-))]
+#[cfg(target_family = "wasm")]
 pub use browser::*;
 
 pub use client_events::*;
@@ -42,7 +34,7 @@ pub enum Error {
     Serialization(#[from] rmp_serde::encode::Error),
     #[error("channel closed")]
     ChannelClosed,
-    #[cfg(target_family = "unix")]
+    #[cfg(any(unix, windows))]
     #[error(transparent)]
     ConnectionError(#[from] tokio_tungstenite::tungstenite::Error),
     #[cfg(target_family = "wasm")]
