@@ -293,6 +293,22 @@ impl Display for SecretsId {
     }
 }
 
+/// A Delegate is a webassembly code designed to act as an agent for the user on
+/// Freenet. Delegates can:
+/// 
+///  * Store private data on behalf of the user
+///  * Create, read, and modify contracts
+///  * Create other delegates
+///  * Send and receive messages from other delegates and user interfaces
+///  * Ask the user questions and receive answers
+/// 
+/// Example use cases:
+/// 
+///  * A delegate stores a private key for the user, other components can ask
+///    the delegate to sign messages, it will ask the user for permission
+///  * A delegate monitors an inbox contract and downloads new messages when
+///    they arrive
+
 pub trait DelegateInterface {
     /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the delegate must be stored using the secret mechanism.
