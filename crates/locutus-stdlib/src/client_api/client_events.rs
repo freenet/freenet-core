@@ -4,7 +4,10 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializ
 
 use crate::{
     delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
-    prelude::{ContractKey, Parameters, RelatedContracts, StateSummary, UpdateData, WrappedState, SecretsId},
+    prelude::{
+        ContractKey, GetSecretRequest, Parameters, RelatedContracts, SecretsId, StateSummary,
+        UpdateData, WrappedState,
+    },
     versioning::ContractContainer,
 };
 
@@ -320,6 +323,11 @@ pub enum DelegateRequest<'a> {
         params: Parameters<'a>,
         inbound: Vec<InboundDelegateMsg<'a>>,
     },
+    GetSecretRequest {
+        key: DelegateKey,
+        params: Parameters<'a>,
+        get_request: GetSecretRequest,
+    },
     RegisterDelegate {
         #[serde(borrow)]
         delegate: Delegate<'a>,
@@ -350,6 +358,15 @@ impl DelegateRequest<'_> {
                 key,
                 params: params.into_owned(),
                 inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
+            },
+            DelegateRequest::GetSecretRequest {
+                key,
+                get_request,
+                params,
+            } => DelegateRequest::GetSecretRequest {
+                key,
+                get_request,
+                params: params.into_owned(),
             },
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -414,6 +431,13 @@ impl Display for ClientRequest<'_> {
                         "delegate app request for `{key}` with {} messages",
                         inbound.len()
                     )
+                }
+                DelegateRequest::GetSecretRequest {
+                    get_request: GetSecretRequest { key: secret_id, .. },
+                    key,
+                    ..
+                } => {
+                    write!(f, "get delegate secret `{secret_id}` for `{key}`")
                 }
                 DelegateRequest::RegisterDelegate { delegate, .. } => {
                     write!(f, "delegate register request for `{}`", delegate.key())

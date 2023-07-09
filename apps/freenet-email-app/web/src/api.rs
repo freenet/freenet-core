@@ -195,10 +195,10 @@ mod identity_management {
     ) -> Result<DelegateKey, DynError> {
         let (key, secret_id, params) = identity_manager_key()?;
         crate::log::debug!("loading aliases ({key})");
-        let request = DelegateRequest::ApplicationMessages {
+        let request = DelegateRequest::GetSecretRequest {
             params,
-            inbound: vec![GetSecretRequest::new(secret_id).into()],
             key: key.clone(),
+            get_request: GetSecretRequest::new(secret_id),
         };
         client.send(request.into()).await?;
         Ok(key)
@@ -250,7 +250,7 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{set_aliases, Identity, InboxView, InboxesData, NodeAction},
+        app::{set_aliases, Identity, InboxesData, NodeAction},
         inbox::InboxModel,
     };
 

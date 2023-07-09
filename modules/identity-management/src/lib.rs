@@ -121,6 +121,13 @@ impl DelegateInterface for IdentityManagement {
                 let msg = IdentityMsg::try_from(&*payload)?;
                 let action = match msg {
                     IdentityMsg::CreateIdentity { alias, key, extra } => {
+                        #[cfg(all(target_family = "wasm", feature = "contract"))]
+                        {
+                            locutus_stdlib::log::info(&format!(
+                                "create alias new {alias} for {}",
+                                params.as_secret_id()
+                            ));
+                        }
                         serde_json::to_vec(&IdentityMsg::CreateIdentity { alias, key, extra })
                             .unwrap()
                     }
@@ -141,10 +148,6 @@ impl DelegateInterface for IdentityManagement {
                                 serde_json::to_vec(&IdentityManagement::default()).unwrap(),
                             ),
                         });
-                        #[cfg(all(target_family = "wasm", feature = "contract"))]
-                        {
-                            locutus_stdlib::log::info(&format!("initialized secret"));
-                        }
                         return Ok(vec![set_secret]);
                     }
                 };
@@ -161,6 +164,13 @@ impl DelegateInterface for IdentityManagement {
                 context,
                 ..
             }) => {
+                #[cfg(all(target_family = "wasm", feature = "contract"))]
+                {
+                    locutus_stdlib::log::info(&format!(
+                        "got request for {}",
+                        params.as_secret_id()
+                    ));
+                }
                 if !context.as_ref().is_empty() {
                     let context = IdentityMsg::try_from(context.as_ref()).unwrap();
                     let mut manager = IdentityManagement::try_from(&*value)?;
