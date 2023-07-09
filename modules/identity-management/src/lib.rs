@@ -125,7 +125,7 @@ impl DelegateInterface for IdentityManagement {
                         {
                             locutus_stdlib::log::info(&format!(
                                 "create alias new {alias} for {}",
-                                params.as_secret()
+                                params.as_secret_id()
                             ));
                         }
                         serde_json::to_vec(&IdentityMsg::CreateIdentity { alias, key, extra })
@@ -166,7 +166,10 @@ impl DelegateInterface for IdentityManagement {
             }) => {
                 #[cfg(all(target_family = "wasm", feature = "contract"))]
                 {
-                    locutus_stdlib::log::info(&format!("got request for {}", params.as_secret()));
+                    locutus_stdlib::log::info(&format!(
+                        "got request for {}",
+                        params.as_secret_id()
+                    ));
                 }
                 if !context.as_ref().is_empty() {
                     let context = IdentityMsg::try_from(context.as_ref()).unwrap();

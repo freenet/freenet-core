@@ -250,7 +250,7 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{set_aliases, Identity, InboxView, InboxesData, NodeAction},
+        app::{set_aliases, Identity, InboxesData, NodeAction},
         inbox::InboxModel,
     };
 
