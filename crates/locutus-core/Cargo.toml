@@ -52,7 +52,7 @@ sqlx = { version = "0.6", features = ["sqlite", "runtime-tokio-rustls"], optiona
 rocksdb = { version = "0.21.0", default-features = false, optional = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
 pav_regression = "0.4.0"
-itertools = "0.10.5"
+itertools = "0.11.0"
 ordered-float = "3.6.0"
 
 
@@ -71,7 +71,7 @@ locutus-runtime = { path = "../locutus-runtime", version = "0.0.3" }
 [dev-dependencies]
 tracing = "0.1"
 arbitrary = { version = "1", features = ["derive"] }
-itertools = "0.10"
+itertools = "0.11"
 pico-args = "0.5"
 locutus-runtime = { path = "../locutus-runtime", features = ["testing"] }
 locutus-stdlib = { path = "../locutus-stdlib", features = ["testing", "net"] }
