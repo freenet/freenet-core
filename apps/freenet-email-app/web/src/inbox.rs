@@ -21,8 +21,6 @@ use locutus_stdlib::{
         ContractKey, State, UpdateData,
     },
 };
-use rand::rngs::OsRng;
-use rand_chacha::rand_core::SeedableRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
     pkcs1::EncodeRsaPublicKey, pkcs1v15::SigningKey, sha2::Sha256, signature::Signer,

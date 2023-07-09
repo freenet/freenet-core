@@ -105,7 +105,7 @@ pub(super) fn identities(cx: Scope) -> Element {
     #[inline_props]
     fn identity_entry(cx: Scope, alias: Rc<str>, info: Rc<AliasInfo>, id: UserId) -> Element {
         let user = use_shared_state::<User>(cx).unwrap();
-        let inbox = use_context::<InboxView>(cx).unwrap();
+        let inbox = use_shared_state::<InboxView>(cx).unwrap();
         let description = info.extra.as_deref().unwrap_or("");
         cx.render(rsx! {
             div {
