@@ -12,7 +12,8 @@ use chacha20poly1305::{
 use chrono::{DateTime, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use locutus_aft_interface::{Tier, TokenAssignment};
+use locutus_aft_interface::{Tier, TokenAssignment, TokenAssignmentHash};
+use locutus_stdlib::prelude::StateSummary;
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{
@@ -20,6 +21,7 @@ use locutus_stdlib::{
         ContractKey, State, UpdateData,
     },
 };
+use rand::rngs::OsRng;
 use rand_chacha::rand_core::SeedableRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
@@ -63,6 +65,15 @@ struct InternalSettings {
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredDecryptedSettings {}
 
+#[derive(Serialize, Deserialize)]
+struct InboxSummary(HashSet<TokenAssignmentHash>);
+
+impl InboxSummary {
+    pub fn new(messages: HashSet<TokenAssignmentHash>) -> Self {
+        Self(messages)
+    }
+}
+
 impl InternalSettings {
     fn from_stored(
         stored_settings: StoredSettings,
@@ -93,8 +104,7 @@ pub(crate) struct MessageModel {
 
 impl MessageModel {
     fn to_stored(&self, key: &RsaPrivateKey) -> Result<StoredMessage, DynError> {
-        // FIXME: use a real source of entropy
-        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let mut rng = OsRng;
         let decrypted_content = serde_json::to_vec(&self.content)?;
         let content = key
             .to_public_key()
@@ -217,8 +227,7 @@ impl DecryptedMessage {
     }
 
     fn assignment_hash_and_signed_content(&self) -> Result<([u8; 32], Vec<u8>), DynError> {
-        // FIXME: use a real source of entropy
-        let mut rng = rand_chacha::ChaChaRng::seed_from_u64(1);
+        let mut rng = OsRng;
         let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
 
         // Generate a random 256-bit XChaCha20Poly1305 key
@@ -495,7 +504,11 @@ impl InboxModel {
 
     async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
-        let request = ContractRequest::Subscribe { key, summary: None };
+        let summary: StateSummary = serde_json::to_vec(&InboxSummary::new(HashSet::new()))?.into();
+        let request = ContractRequest::Subscribe {
+            key,
+            summary: Some(summary),
+        };
         client.send(request.into()).await?;
         Ok(())
     }
