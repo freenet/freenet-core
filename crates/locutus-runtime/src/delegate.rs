@@ -209,7 +209,7 @@ impl DelegateRuntimeInterface for Runtime {
         &mut self,
         delegate_key: &DelegateKey,
         params: &Parameters,
-        mut inbound: Vec<InboundDelegateMsg>,
+        inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
@@ -259,7 +259,7 @@ impl DelegateRuntimeInterface for Runtime {
                     for outbound in outbound {
                         match outbound {
                             OutboundDelegateMsg::SetSecretRequest(set) => {
-                                non_processed.push(OutboundDelegateMsg::SetSecretRequest((set)));
+                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
                             }
                             msg => real_outbound.push_back(msg),
                         }

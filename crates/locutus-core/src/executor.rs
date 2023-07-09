@@ -371,6 +371,20 @@ impl Executor {
                     }
                 }
             }
+            DelegateRequest::GetSecretRequest {
+                key,
+                params,
+                get_request,
+            } => match self.runtime.inbound_app_message(
+                &key,
+                &params,
+                vec![InboundDelegateMsg::GetSecretRequest(get_request)],
+            ) {
+                Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                Err(err) => Err(Either::Right(
+                    format!("uncontrolled error while getting secret for `{key}`: {err}").into(),
+                )),
+            },
             DelegateRequest::ApplicationMessages {
                 key,
                 inbound,
