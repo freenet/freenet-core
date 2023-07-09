@@ -2,6 +2,7 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
+use arc_swap::access::{Access, DynAccess};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use dioxus::prelude::*;
@@ -71,25 +72,37 @@ pub(crate) enum NodeAction {
 
 pub(crate) fn app(cx: Scope) -> Element {
     crate::log::debug!("rendering app");
+
+    // Initialize and fetch shared state for User, InboxController, and InboxView
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
-
+    use_shared_state_provider(cx, InboxController::new);
+    let controller = use_shared_state::<InboxController>(cx).unwrap();
     use_shared_state_provider(cx, InboxView::new);
-    let controller = use_shared_state::<InboxView>(cx).unwrap();
-    let inbox_data = controller.read().inbox_data.clone();
+    let inbox = use_shared_state::<InboxView>(cx).unwrap();
+    use_context_provider(cx, || {
+        let inbox_data_context: InboxesData = Arc::new(ArcSwap::from_pointee(vec![]));
+        inbox_data_context
+    });
+    let inbox_data = use_context::<InboxesData>(cx).unwrap();
 
     #[cfg(feature = "use-node")]
     {
         let _sync: &Coroutine<NodeAction> = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
             to_owned![controller];
-            let fut =
-                crate::api::node_comms(rx, controller, user.read().identities.clone(), inbox_data)
-                    .map(|_| Ok(JsValue::NULL));
+            let fut = crate::api::node_comms(
+                rx,
+                controller,
+                user.read().identities.clone(),
+                inbox_data.clone(),
+            )
+            .map(|_| Ok(JsValue::NULL));
             let _ = wasm_bindgen_futures::future_to_promise(fut);
             async {}.boxed_local()
         });
     }
 
+    // Render login page if user not identified, otherwise render the inbox or identifiers list based on user's logged in state
     if !user.read().identified {
         cx.render(rsx! {
             login::get_or_create_indentity {}
@@ -97,10 +110,7 @@ pub(crate) fn app(cx: Scope) -> Element {
     } else if let Some(id) = user.read().logged_id() {
         #[cfg(feature = "use-node")]
         {
-            controller
-                .read()
-                .load_messages(cx, id)
-                .expect("load messages");
+            inbox.read().load_messages(cx, id).expect("load messages");
         }
         #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
         {
@@ -120,12 +130,14 @@ pub(crate) type InboxesData = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
 
 #[derive(Debug, Clone)]
 pub struct InboxView {
-    /// a reference to the model data
-    inbox_data: InboxesData,
+    active_id: Rc<RefCell<UserId>>,
     /// loaded messages for the currently selected `active_id`
     messages: Rc<RefCell<Vec<Message>>>,
-    active_id: Rc<RefCell<UserId>>,
-    pub message_counter: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboxController {
+    pub updated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,13 +158,17 @@ impl std::ops::Deref for UserId {
     }
 }
 
+impl InboxController {
+    pub fn new() -> Self {
+        Self { updated: false }
+    }
+}
+
 impl InboxView {
     fn new() -> Self {
         Self {
-            inbox_data: Arc::new(ArcSwap::from_pointee(vec![])),
             messages: Rc::new(RefCell::new(vec![])),
             active_id: Rc::new(RefCell::new(UserId(0))),
-            message_counter: 0,
         }
     }
 
@@ -207,9 +223,9 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
+        inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>>,
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
-        let inbox_data = self.inbox_data.load();
         let mut inbox = inbox_data[**self.active_id.borrow()].borrow_mut();
         inbox.remove_messages(client, ids)
     }
@@ -219,6 +235,7 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
+        inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>>,
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         {
             let messages = &mut *self.messages.borrow_mut();
@@ -232,7 +249,7 @@ impl InboxView {
             }
         }
         // todo: persist in a delegate `removed_messages`
-        self.remove_messages(client, ids)
+        self.remove_messages(client, ids, inbox_data)
     }
 
     #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
@@ -524,6 +541,8 @@ fn user_menu_component(cx: Scope) -> Element {
 
 fn inbox_component(cx: Scope) -> Element {
     let inbox = use_shared_state::<InboxView>(cx).unwrap();
+    let controller = use_shared_state::<InboxController>(cx).unwrap();
+    let inbox_data = use_context::<InboxesData>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
 
@@ -563,7 +582,7 @@ fn inbox_component(cx: Scope) -> Element {
     {
         let current_active_id: UserId = user.read().active_id.unwrap();
         // reload if there were new emails received
-        let all_data = inbox.read().inbox_data.load();
+        let all_data = inbox_data.load_full();
         crate::log::debug!("rendering");
         if let Some((current_model, id)) = all_data.iter().find_map(|ib| {
             let id = crate::inbox::InboxModel::contract_identity(&ib.borrow().key).unwrap();
@@ -578,6 +597,11 @@ fn inbox_component(cx: Scope) -> Element {
             }
             crate::log::debug!("active id: {:?}; emails number: {}", id.alias, emails.len());
         }
+    }
+
+    // Mark updated as false after after the inbox has been refreshed
+    if controller.read().updated {
+        controller.write().updated = false;
     }
 
     let inbox = inbox.read();
@@ -648,19 +672,21 @@ fn open_message(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
     let inbox = use_shared_state::<InboxView>(cx).unwrap();
+    let inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>> =
+        use_context::<InboxesData>(cx).unwrap().load_full();
     let email = cx.props;
     let email_id = [cx.props.id];
 
     let result = inbox
         .write()
-        .mark_as_read(client.clone(), &email_id)
+        .mark_as_read(client.clone(), &email_id, inbox_data.clone())
         .unwrap();
     cx.spawn(result);
 
     let delete = move |_| {
         let result = inbox
             .write()
-            .remove_messages(client.clone(), &email_id)
+            .remove_messages(client.clone(), &email_id, inbox_data.clone())
             .unwrap();
         cx.spawn(result);
         menu_selection.write().at_inbox_list();

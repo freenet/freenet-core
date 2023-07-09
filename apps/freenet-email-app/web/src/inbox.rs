@@ -5,7 +5,6 @@ use std::{
 };
 
 use chacha20poly1305::aead::generic_array::GenericArray;
-use rand::rngs::OsRng;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit},
     XChaCha20Poly1305,
@@ -14,6 +13,7 @@ use chrono::{DateTime, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use locutus_aft_interface::{Tier, TokenAssignment, TokenAssignmentHash};
+use locutus_stdlib::prelude::StateSummary;
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{
@@ -21,7 +21,7 @@ use locutus_stdlib::{
         ContractKey, State, UpdateData,
     },
 };
-use locutus_stdlib::prelude::StateSummary;
+use rand::rngs::OsRng;
 use rand_chacha::rand_core::SeedableRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
@@ -498,7 +498,10 @@ impl InboxModel {
     async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
         let summary: StateSummary = serde_json::to_vec(&InboxSummary::new(HashSet::new()))?.into();
-        let request = ContractRequest::Subscribe { key, summary: Some(summary) };
+        let request = ContractRequest::Subscribe {
+            key,
+            summary: Some(summary),
+        };
         client.send(request.into()).await?;
         Ok(())
     }
