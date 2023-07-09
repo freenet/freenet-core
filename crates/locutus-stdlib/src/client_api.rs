@@ -12,9 +12,9 @@
 //!               (In order to use this client from JS/Typescript refer to the Typescript std lib).
 mod client_events;
 
-#[cfg(all(target_family = "unix", feature = "net"))]
+#[cfg(all(any(unix, windows), feature = "net"))]
 mod regular;
-#[cfg(all(target_family = "unix", feature = "net"))]
+#[cfg(all(any(unix, windows), feature = "net"))]
 pub use regular::*;
 
 #[cfg(all(target_family = "wasm", feature = "net"))]
@@ -33,7 +33,7 @@ pub enum Error {
     Deserialization(#[from] bincode::Error),
     #[error("channel closed")]
     ChannelClosed,
-    #[cfg(all(target_family = "unix", feature = "net"))]
+    #[cfg(all(any(unix, windows), feature = "net"))]
     #[error(transparent)]
     ConnectionError(#[from] tokio_tungstenite::tungstenite::Error),
     #[cfg(all(target_family = "wasm", feature = "net"))]

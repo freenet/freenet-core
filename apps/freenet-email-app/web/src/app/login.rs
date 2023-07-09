@@ -71,6 +71,8 @@ pub(crate) fn get_aliases() -> Rc<RefCell<Vec<Alias>>> {
 }
 
 pub(super) fn identifiers_list(cx: Scope) -> Element {
+    let user = use_shared_state::<User>(cx).unwrap();
+    let inbox = use_shared_state::<InboxView>(cx).unwrap();
     use_shared_state_provider::<CreateAlias>(cx, || CreateAlias(false));
     let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
     let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
@@ -103,7 +105,7 @@ pub(super) fn identities(cx: Scope) -> Element {
     #[inline_props]
     fn identity_entry(cx: Scope, alias: Rc<str>, info: Rc<AliasInfo>, id: UserId) -> Element {
         let user = use_shared_state::<User>(cx).unwrap();
-        let inbox = use_context::<InboxView>(cx).unwrap();
+        let inbox = use_shared_state::<InboxView>(cx).unwrap();
         let description = info.extra.as_deref().unwrap_or("");
         cx.render(rsx! {
             div {
@@ -122,7 +124,7 @@ pub(super) fn identities(cx: Scope) -> Element {
                                 style: "color: inherit",
                                 onclick: move |_| {
                                     user.write().set_logged_id(*id);
-                                    inbox.set_active_id(*id);
+                                    inbox.write().set_active_id(*id);
                                 },
                                 "{alias}"
                             }

@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
 
+use crate::app::InboxController;
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use futures::SinkExt;
 use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
@@ -231,6 +232,7 @@ mod identity_management {
 #[cfg(feature = "use-node")]
 pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::NodeAction>,
+    inbox_controller: dioxus::prelude::UseSharedState<crate::app::InboxController>,
     contracts: Vec<crate::app::Identity>,
     // todo: refactor: instead of passing this arround,
     // where necessary we could be getting the fresh data via static methods calls to Inbox
@@ -248,7 +250,7 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{set_aliases, Identity, NodeAction},
+        app::{set_aliases, Identity, InboxView, InboxesData, NodeAction},
         inbox::InboxModel,
     };
 
@@ -325,7 +327,8 @@ pub(crate) async fn node_comms(
         res: Result<HostResponse, ClientError>,
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_rec_to_id: &mut HashMap<ContractKey, Identity>,
-        inboxes: &mut crate::app::InboxesData,
+        inboxes: &mut InboxesData,
+        inbox_controller: &dioxus::prelude::UseSharedState<InboxController>,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
         let res = match res {
@@ -447,6 +450,8 @@ pub(crate) async fn node_comms(
                             for inbox in loaded_models.as_slice() {
                                 if inbox.clone().borrow().key == key {
                                     let mut inbox = (**inbox).borrow_mut();
+                                    let controller = &mut *inbox_controller.write();
+                                    controller.updated = true;
                                     inbox.merge(updated_model);
                                     crate::log::debug!(
                                         "updated inbox {key} with {} messages",
@@ -470,6 +475,8 @@ pub(crate) async fn node_comms(
                             for inbox in loaded_models.as_slice() {
                                 if inbox.clone().borrow().key == key {
                                     let mut inbox = (**inbox).borrow_mut();
+                                    let controller = &mut *inbox_controller.write();
+                                    controller.updated = true;
                                     *inbox = updated_model;
                                     crate::log::debug!(
                                         "updated inbox {key} (whole state) with {} messages",
@@ -597,6 +604,7 @@ pub(crate) async fn node_comms(
                     &mut inbox_contract_to_id,
                     &mut token_contract_to_id,
                     &mut inboxes,
+                    &inbox_controller
                 )
                 .await;
             }
