@@ -91,7 +91,6 @@ impl Runtime {
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<DelegateContext> {
         const MAX_ITERATIONS: usize = 100;
-
         let mut recurssion = 0;
         let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned()) else {
             return Ok(DelegateContext::default());
@@ -99,15 +98,13 @@ impl Runtime {
         while let Some(outbound) = outbound_msgs.pop_front() {
             match outbound {
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                    key,
-                    context,
-                    processed,
+                    key, processed, ..
                 }) if !processed => {
                     let secret = self.secret_store.get_secret(delegate_key, &key)?;
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
                         value: Some(secret),
-                        context,
+                        context: last_context.clone(),
                     });
                     if recurssion >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
@@ -117,20 +114,24 @@ impl Runtime {
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Error trying to update the context from the secret".to_string()).into())));
                     };
-                    let Some(new_last_context) = last_msg.get_context() else {
-                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Last messsage ".to_string()).into())));
+                    let mut updated = false;
+                    if let Some(new_last_context) = last_msg.get_context() {
+                        last_context = new_last_context.clone();
+                        updated = true;
                     };
-                    last_context = new_last_context.clone();
                     for mut pending in new_msgs {
-                        if let Some(ctx) = pending.get_mut_context() {
-                            *ctx = last_context.clone();
-                        };
+                        if updated {
+                            if let Some(ctx) = pending.get_mut_context() {
+                                *ctx = last_context.clone();
+                            };
+                        }
                         if !pending.processed() {
                             outbound_msgs.push_back(pending);
                         }
                     }
                 }
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
+                    tracing::debug!("get secret, processed");
                     last_context = context;
                 }
                 OutboundDelegateMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
@@ -261,6 +262,7 @@ impl DelegateRuntimeInterface for Runtime {
                             OutboundDelegateMsg::SetSecretRequest(set) => {
                                 non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
                             }
+                            // msg if !msg.processed() {}
                             msg => real_outbound.push_back(msg),
                         }
                     }
@@ -319,6 +321,7 @@ impl DelegateRuntimeInterface for Runtime {
                 InboundDelegateMsg::GetSecretRequest(GetSecretRequest {
                     key: secret_key, ..
                 }) => {
+                    // FIXME: here only allow this if the application is trusted
                     let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
                     let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key: secret_key,

@@ -2,7 +2,6 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
-use arc_swap::access::{Access, DynAccess};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use dioxus::prelude::*;
@@ -25,7 +24,7 @@ use crate::{
 };
 
 mod login;
-pub(crate) use login::set_aliases;
+pub(crate) use login::{set_aliases, LoginController};
 
 // todo: simplify this whole alias map stuff mapping identities to contract keys
 pub(crate) static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
@@ -80,11 +79,13 @@ pub(crate) enum NodeAction {
 pub(crate) fn app(cx: Scope) -> Element {
     crate::log::debug!("rendering app");
 
+    use_shared_state_provider(cx, login::LoginController::new);
+    let login_controller = use_shared_state::<login::LoginController>(cx).unwrap();
     // Initialize and fetch shared state for User, InboxController, and InboxView
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
     use_shared_state_provider(cx, InboxController::new);
-    let controller = use_shared_state::<InboxController>(cx).unwrap();
+    let inbox_controller = use_shared_state::<InboxController>(cx).unwrap();
     use_shared_state_provider(cx, InboxView::new);
     let inbox = use_shared_state::<InboxView>(cx).unwrap();
     use_context_provider(cx, || {
@@ -96,10 +97,12 @@ pub(crate) fn app(cx: Scope) -> Element {
     #[cfg(feature = "use-node")]
     {
         let _sync: &Coroutine<NodeAction> = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
-            to_owned![controller];
+            to_owned![inbox_controller];
+            to_owned![login_controller];
             let fut = crate::api::node_comms(
                 rx,
-                controller,
+                inbox_controller,
+                login_controller,
                 user.read().identities.clone(),
                 inbox_data.clone(),
             )
@@ -122,11 +125,14 @@ pub(crate) fn app(cx: Scope) -> Element {
     } else if let Some(id) = user.read().logged_id() {
         #[cfg(feature = "use-node")]
         {
-            inbox.read().load_messages(id, actions).expect("load messages");
+            inbox
+                .read()
+                .load_messages(id, actions)
+                .expect("load messages");
         }
         #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
         {
-            controller.load_messages(id).unwrap();
+            inbox_controller.load_messages(id).unwrap();
         }
         cx.render(rsx! {
            user_inbox {}
@@ -560,14 +566,6 @@ fn inbox_component(cx: Scope) -> Element {
     let inbox_data = use_context::<InboxesData>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
-
-    // use_effect(cx, (&inbox.message_num,), |(msg,)| {
-    //     to_owned![changed];
-    //     async move {
-    //         crate::log::debug!("counter: {msg:?}");
-    //         changed.with_mut(|v| v.0 = true);
-    //     }
-    // });
 
     #[inline_props]
     fn email_link<'a>(
