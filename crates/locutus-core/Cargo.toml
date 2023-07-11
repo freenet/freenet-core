@@ -21,7 +21,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 config = { version = "0.13.0", features = [ "toml" ] } 
 crossbeam = "0.8.2"
 ctrlc = { version = "3.0", features = ["termination"] }
-dashmap = "^5.1"
+dashmap = "^5.5"
 directories = "5"
 either = { workspace = true , features = ["serde"] }
 futures = "0.3.21"
