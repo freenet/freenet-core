@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 use identity_management::{AliasInfo, IdentityManagement};
 use once_cell::unsync::Lazy;
 use rsa::RsaPrivateKey;
+use rand::rngs::OsRng;
 
 use crate::app::{User, UserId};
 
@@ -332,9 +333,16 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                     create_alias_form.write().0 = false;
                     let alias: String = address.get().into();
                     // FIXME: generate keypair (RSA)
+                    let mut key = vec![];
+                    if *generate.get() {
+                        let private_key = RsaPrivateKey::new(&mut OsRng, 4096).expect("failed to generate keypair");
+                        let key = serde_json::to_vec(&private_key).unwrap();
+                        crate::log::debug!("generated keypair {:?}", key);
+                    } else {
+                        crate::log::debug!("importing keypair");
+                     }
                     // - create inbox contract
                     // - create AFT delegate && contract
-                    let key: Vec<u8> = vec![];
                     let description = description.get().into();
                     actions.send(NodeAction::CreateIdentity { alias, key, description });
                 },
