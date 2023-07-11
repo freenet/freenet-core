@@ -3,6 +3,7 @@ use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicUsize};
 use dioxus::prelude::*;
 use identity_management::{AliasInfo, IdentityManagement};
 use once_cell::unsync::Lazy;
+use rsa::RsaPrivateKey;
 
 use crate::app::{User, UserId};
 
@@ -28,51 +29,75 @@ fn login_header(cx: Scope) -> Element {
     })
 }
 
-#[derive(PartialEq, Eq)]
-pub(crate) struct Alias {
-    alias: Rc<str>,
-    id: UserId,
-    info: Rc<AliasInfo>,
-}
-
 thread_local! {
     static ALIASES: Lazy<Rc<RefCell<Vec<Alias>>>> = Lazy::new(|| {
         Rc::new(RefCell::new(Vec::default()))
     });
 }
 
-pub(crate) fn set_aliases(mut new_aliases: IdentityManagement) {
-    static ID: AtomicUsize = AtomicUsize::new(0);
-    ALIASES.with(|aliases| {
-        let aliases = &mut *aliases.borrow_mut();
-        let mut to_add = Vec::new();
-        for alias in &*aliases {
-            if let Some(info) = new_aliases.remove(&alias.alias) {
-                to_add.push(Alias {
-                    alias: alias.alias.clone(),
-                    id: alias.id,
-                    info: Rc::new(info),
-                });
-            }
-        }
-        new_aliases.into_info().for_each(|(alias, info)| {
-            to_add.push(Alias {
-                alias: alias.into(),
-                id: UserId::new(ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)),
-                info: Rc::new(info),
-            })
-        });
-        *aliases = to_add;
-    });
+#[derive(PartialEq, Eq, Clone)]
+pub(crate) struct Alias {
+    pub alias: Rc<str>,
+    id: UserId,
+    info: Rc<AliasInfo>,
+    pub key: RsaPrivateKey,
 }
 
-pub(crate) fn get_aliases() -> Rc<RefCell<Vec<Alias>>> {
-    ALIASES.with(|manager| (**manager).clone())
+impl Alias {
+    pub(crate) fn set_aliases(mut new_aliases: IdentityManagement) {
+        static ID: AtomicUsize = AtomicUsize::new(0);
+        ALIASES.with(|aliases| {
+            let aliases = &mut *aliases.borrow_mut();
+            let mut to_add = Vec::new();
+            for alias in &*aliases {
+                let key: RsaPrivateKey = serde_json::from_slice(&alias.info.key).unwrap();
+                if let Some(info) = new_aliases.remove(&alias.alias) {
+                    to_add.push(Alias {
+                        alias: alias.alias.clone(),
+                        id: alias.id,
+                        info: Rc::new(info),
+                        key,
+                    });
+                }
+            }
+            new_aliases.into_info().for_each(|(alias, info)| {
+                let key: RsaPrivateKey = serde_json::from_slice(&info.key).unwrap();
+                to_add.push(Alias {
+                    alias: alias.into(),
+                    id: UserId::new(ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)),
+                    info: Rc::new(info),
+                    key,
+                })
+            });
+            *aliases = to_add;
+        });
+    }
+
+    pub(crate) fn get_aliases() -> Rc<RefCell<Vec<Alias>>> {
+        ALIASES.with(|aliases| (**aliases).clone())
+    }
+
+    pub(crate) fn get_alias(alias: impl AsRef<str>) -> Option<Alias> {
+        let alias = alias.as_ref();
+        ALIASES.with(|aliases: &Lazy<Rc<RefCell<Vec<Alias>>>>| {
+            let aliases = &*aliases.borrow();
+            aliases.iter().find(|a| &*a.alias == alias).cloned()
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoginController {
+    pub updated: bool,
+}
+
+impl LoginController {
+    pub fn new() -> Self {
+        Self { updated: false }
+    }
 }
 
 pub(super) fn identifiers_list(cx: Scope) -> Element {
-    let user = use_shared_state::<User>(cx).unwrap();
-    let inbox = use_shared_state::<InboxView>(cx).unwrap();
     use_shared_state_provider::<CreateAlias>(cx, || CreateAlias(false));
     let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
     let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
@@ -86,10 +111,9 @@ pub(super) fn identifiers_list(cx: Scope) -> Element {
                 class: "column is-6",
                 div {
                     class: "card has-background-light is-small mt-2",
+                    identities(cx)
                     if create_alias_form.read().0 {
                         create_alias(cx, actions)
-                    } else {
-                        identities(cx)
                     }
                 }
             }
@@ -98,9 +122,14 @@ pub(super) fn identifiers_list(cx: Scope) -> Element {
 }
 
 pub(super) fn identities(cx: Scope) -> Element {
-    let aliases = get_aliases();
+    let aliases = Alias::get_aliases();
     let aliases_list = aliases.borrow();
     let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
+    let login_controller = use_shared_state::<LoginController>(cx).unwrap();
+
+    if login_controller.read().updated {
+        login_controller.write().updated = false;
+    }
 
     #[inline_props]
     fn identity_entry(cx: Scope, alias: Rc<str>, info: Rc<AliasInfo>, id: UserId) -> Element {
@@ -215,6 +244,7 @@ pub(super) fn identities(cx: Scope) -> Element {
 pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>) -> Element<'x> {
     let create_alias_form: &UseSharedState<CreateAlias> =
         use_shared_state::<CreateAlias>(cx).unwrap();
+    crate::log::debug!("create alias state");
 
     let generate = use_state(cx, || true);
     let address = use_state(cx, String::new);
@@ -225,6 +255,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
             .chain(std::iter::repeat('.').take(300))
             .collect::<String>()
     });
+    crate::log::debug!("other state");
 
     cx.render(rsx! {
         div {
@@ -238,7 +269,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                         class: "input",
                         placeholder: "Address",
                         value: "{address}",
-                        oninput: move |evt| address.set(evt.value.clone())
+                        oninput: move |evt| address.modify(|_| evt.value.clone())
                     }
                     span { class: "icon is-small is-left", i { class: "fas fa-envelope" } }
                 }
@@ -252,7 +283,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                         class: "input",
                         placeholder: "",
                         value: "{description}",
-                        oninput: move |evt| description.set(evt.value.clone())
+                        oninput: move |evt| description.modify(|_| evt.value.clone())
                     }
                     span { class: "icon is-small is-left", i { class: "fas fa-envelope" } }
                 }
@@ -264,14 +295,14 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                     div {
                         class: "file is-small has-name",
                         label {
-                        class: "file-label",
-                        input { class: "file-input", r#type: "file", name: "keypair-file" }
-                        span {
-                            class: "file-cta",
-                            span { class: "file-icon", i { class: "fas fa-upload" } }
-                            span { class: "file-label", "Import key file" }
-                        }
-                        span { class: "file-name has-background-white", "{key_path}" }
+                            class: "file-label",
+                            input { class: "file-input", r#type: "file", name: "keypair-file" }
+                            span {
+                                class: "file-cta",
+                                span { class: "file-icon", i { class: "fas fa-upload" } }
+                                span { class: "file-label", "Import key file" }
+                            }
+                            span { class: "file-name has-background-white", "{key_path}" }
                         }
                     }
                 }
@@ -281,21 +312,14 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                 }
                 div {
                     class: "column is-two-fifths",
-                    // a {
-                    //     class: "button has-text-centered is-size-7",
-                    //     onclick: move |_| {
-                    //         generate.set(true);
-                    //     },
-                    //     "Generate"
-                    // }
+
                     label {
                         class: "checkbox",
                         input {
                             r#type: "checkbox",
                             checked: true,
                             onclick: move |_| {
-                                let current = generate.get();
-                                generate.set(!current);
+                                generate.modify(|current| !current);
                             }
                         },
                         "  generate"
@@ -307,6 +331,9 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                 onclick: move |_|  {
                     create_alias_form.write().0 = false;
                     let alias: String = address.get().into();
+                    // FIXME: generate keypair (RSA)
+                    // - create inbox contract
+                    // - create AFT delegate && contract
                     let key: Vec<u8> = vec![];
                     let description = description.get().into();
                     actions.send(NodeAction::CreateIdentity { alias, key, description });

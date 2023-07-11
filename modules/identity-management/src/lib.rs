@@ -67,13 +67,13 @@ type Key = Vec<u8>;
 type Alias = String;
 type Extra = String;
 
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
 pub struct AliasInfo {
     pub key: Key,
     pub extra: Option<Extra>,
 }
 
-#[derive(Deserialize, Serialize, Default)]
+#[derive(Deserialize, Serialize, Default, Debug)]
 pub struct IdentityManagement {
     identities: HashMap<Alias, AliasInfo>,
 }
@@ -151,7 +151,7 @@ impl DelegateInterface for IdentityManagement {
                         return Ok(vec![set_secret]);
                     }
                 };
-                let context = DelegateContext::new(action);
+                let context: DelegateContext = DelegateContext::new(action);
                 let get_secret = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
                     key: SecretsId::new(serde_json::to_vec(&params).unwrap()),
                     context,
@@ -166,10 +166,7 @@ impl DelegateInterface for IdentityManagement {
             }) => {
                 #[cfg(all(target_family = "wasm", feature = "contract"))]
                 {
-                    locutus_stdlib::log::info(&format!(
-                        "got request for {}",
-                        params.as_secret_id()
-                    ));
+                    locutus_stdlib::log::info(&format!("got request for ", params.as_secret_id()));
                 }
                 if !context.as_ref().is_empty() {
                     let context = IdentityMsg::try_from(context.as_ref()).unwrap();

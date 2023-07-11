@@ -233,6 +233,7 @@ mod identity_management {
 pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::NodeAction>,
     inbox_controller: dioxus::prelude::UseSharedState<crate::app::InboxController>,
+    login_controller: dioxus::prelude::UseSharedState<crate::app::LoginController>,
     contracts: Vec<crate::app::Identity>,
     // todo: refactor: instead of passing this arround,
     // where necessary we could be getting the fresh data via static methods calls to Inbox
@@ -250,7 +251,7 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{set_aliases, Identity, InboxesData, NodeAction},
+        app::{Identity, InboxesData, NodeAction},
         inbox::InboxModel,
     };
 
@@ -329,6 +330,7 @@ pub(crate) async fn node_comms(
         token_rec_to_id: &mut HashMap<ContractKey, Identity>,
         inboxes: &mut InboxesData,
         inbox_controller: &dioxus::prelude::UseSharedState<InboxController>,
+        login_controller: &dioxus::prelude::UseSharedState<crate::app::LoginController>,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
         let res = match res {
@@ -568,6 +570,7 @@ pub(crate) async fn node_comms(
                             }
                         }
                         OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                            key: secret_key,
                             value: Some(payload),
                             ..
                         }) => {
@@ -576,7 +579,14 @@ pub(crate) async fn node_comms(
                                     payload.as_ref(),
                                 )
                                 .unwrap();
-                                set_aliases(manager);
+                                crate::log::debug!("received identities: {manager:?}");
+                                login_controller.write().updated = true;
+                                crate::app::Alias::set_aliases(manager);
+                            } else {
+                                crate::log::error(
+                                    format!("received unexpected secret {secret_key} for delegate {key}"),
+                                    None,
+                                );
                             }
                         }
                         other => {
@@ -604,7 +614,8 @@ pub(crate) async fn node_comms(
                     &mut inbox_contract_to_id,
                     &mut token_contract_to_id,
                     &mut inboxes,
-                    &inbox_controller
+                    &inbox_controller,
+                    &login_controller
                 )
                 .await;
             }

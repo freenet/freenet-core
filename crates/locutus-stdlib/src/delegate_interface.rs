@@ -330,6 +330,7 @@ pub trait DelegateInterface {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+// todo: add serde_as(Bytes)
 pub struct DelegateContext(Vec<u8>);
 
 impl DelegateContext {
@@ -419,7 +420,6 @@ impl From<ApplicationMessage> for InboundDelegateMsg<'_> {
 pub struct GetSecretResponse {
     pub key: SecretsId,
     pub value: Option<Secret>,
-    #[serde(skip)]
     pub context: DelegateContext,
 }
 
