@@ -251,7 +251,7 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{set_aliases, Identity, InboxesData, NodeAction},
+        app::{Identity, InboxesData, NodeAction},
         inbox::InboxModel,
     };
 
@@ -581,7 +581,7 @@ pub(crate) async fn node_comms(
                                 .unwrap();
                                 crate::log::debug!("received identities: {manager:?}");
                                 login_controller.write().updated = true;
-                                set_aliases(manager);
+                                crate::app::Alias::set_aliases(manager);
                             } else {
                                 crate::log::error(
                                     format!("received unexpected secret {secret_key} for delegate {key}"),

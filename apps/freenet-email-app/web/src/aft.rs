@@ -13,7 +13,6 @@ use locutus_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, ContractKey, DelegateKey, InboundDelegateMsg,
     Parameters, State, UpdateData,
 };
-use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPublicKey;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
@@ -88,15 +87,7 @@ impl AftRecords {
         let contract_key =
             ContractKey::from_params(TOKEN_RECORD_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         Self::get_state(client, contract_key.clone()).await?;
-        let alias = crate::app::ALIAS_MAP2
-            .get(
-                &identity
-                    .key
-                    .to_public_key()
-                    .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-                    .unwrap(),
-            )
-            .unwrap();
+        let alias = identity.alias();
         crate::log::debug!(
             "subscribing to AFT updates for `{contract_key}`, belonging to alias `{alias}`"
         );

@@ -24,46 +24,7 @@ use crate::{
 };
 
 mod login;
-pub(crate) use login::{set_aliases, LoginController};
-
-// todo: simplify this whole alias map stuff mapping identities to contract keys
-pub(crate) static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
-    const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
-    const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-    let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let mut map = HashMap::new();
-    map.insert("address1".to_string(), pub_key0);
-    map.insert("address2".to_string(), pub_key1);
-    map
-});
-
-pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
-    const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
-    const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-    let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let mut map = HashMap::new();
-    map.insert(pub_key0, "address1".to_string());
-    map.insert(pub_key1, "address2".to_string());
-    map
-});
+pub(crate) use login::{Alias, LoginController};
 
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
@@ -199,7 +160,7 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         from: &str,
-        to: &str,
+        to: RsaPublicKey,
         title: &str,
         content: &str,
     ) -> Result<Vec<LocalBoxFuture<'static, ()>>, DynError> {
@@ -208,7 +169,7 @@ impl InboxView {
             title: title.to_owned(),
             content: content.to_owned(),
             from: from.to_owned(),
-            to: vec![to.to_owned()],
+            to: vec![to],
             cc: vec![],
             time: Utc::now(),
         };
@@ -219,14 +180,13 @@ impl InboxView {
             for recipient_encoded_key in content.to.iter() {
                 let content = content.clone();
                 let mut client = client.clone();
-                let recipient_key = RsaPublicKey::from_pkcs1_pem(recipient_encoded_key)
-                    .map_err(|e| format!("{e}"))?;
                 let Some(id) = crate::inbox::InboxModel::id_for_alias(from) else {
                     crate::log::error(format!("alias `{from}` not stored"), Some(TryNodeAction::SendMessage));
                     continue;
                 };
+                let to = recipient_encoded_key.clone();
                 let f = async move {
-                    let res = content.start_sending(&mut client, recipient_key, &id).await;
+                    let res = content.start_sending(&mut client, to, &id).await;
                     node_response_error_handling(client.into(), res, TryNodeAction::SendMessage)
                         .await;
                 };
@@ -329,12 +289,6 @@ impl InboxView {
     ) -> Result<(), DynError> {
         actions.send(NodeAction::LoadMessages(id.clone()));
         Ok(())
-    }
-
-    // #[cfg(feature = "use-node")]
-    fn get_public_key_from_alias(&self, alias: &str) -> Result<String, DynError> {
-        let pub_key = ALIAS_MAP.get(alias).ok_or("alias not found")?;
-        Ok(pub_key.to_string())
     }
 }
 
@@ -750,17 +704,22 @@ fn new_message_window(cx: Scope) -> Element {
 
     let alias = user_alias.to_string();
     let send_msg = move |_| {
-        let receiver_public_key = match inbox.read().get_public_key_from_alias(to.get()) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::log::error(format!("{e}"), Some(TryNodeAction::GetAlias));
+        let to = to.get();
+        // fixme: this will   ahve to come from the address book in the future
+        let receiver_public_key = match Alias::get_alias(to) {
+            Some(v) => v.key.to_public_key(),
+            None => {
+                crate::log::error(
+                    format!("couldn't find key for `{to}`"),
+                    Some(TryNodeAction::GetAlias),
+                );
                 return;
             }
         };
         match inbox.write().send_message(
             client.clone(),
             &alias,
-            receiver_public_key.as_str(),
+            receiver_public_key,
             title.get(),
             content.get(),
         ) {

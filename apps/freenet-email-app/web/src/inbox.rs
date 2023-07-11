@@ -21,10 +21,9 @@ use locutus_stdlib::{
         ContractKey, State, UpdateData,
     },
 };
-use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
-    pkcs1::EncodeRsaPublicKey, pkcs1v15::SigningKey, sha2::Sha256, signature::Signer,
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+    pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, RsaPrivateKey,
+    RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -157,7 +156,7 @@ pub(crate) struct DecryptedMessage {
     pub title: String,
     pub content: String,
     pub from: String,
-    pub to: Vec<String>,
+    pub to: Vec<RsaPublicKey>,
     pub cc: Vec<String>,
     pub time: DateTime<Utc>,
 }
@@ -246,8 +245,6 @@ impl DecryptedMessage {
 
         // Encrypt the XChaCha20Poly1305 key using RSA
         let receiver_pub_key = self.to.get(0).ok_or("receiver key not found")?;
-        let receiver_pub_key =
-            RsaPublicKey::from_pkcs1_pem(receiver_pub_key).map_err(|e| format!("{e}"))?;
         let encrypted_key = receiver_pub_key
             .encrypt(&mut rng, Pkcs1v15Encrypt, chacha_key.as_slice())
             .map_err(|e| format!("{e}"))?;
@@ -285,9 +282,7 @@ impl InboxModel {
             identity: &Identity,
         ) -> Result<(), DynError> {
             let pub_key = identity.key.to_public_key();
-            let alias = crate::app::ALIAS_MAP2
-                .get(&pub_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap())
-                .unwrap();
+            let alias = identity.alias();
             let params = freenet_email_inbox::InboxParams { pub_key }
                 .try_into()
                 .map_err(|e| format!("{e}"))?;
