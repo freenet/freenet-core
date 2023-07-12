@@ -7,6 +7,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
+use locutus_stdlib::prelude::{ContractContainer, RelatedContracts, WrappedState};
 use once_cell::sync::Lazy;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{
@@ -34,6 +35,11 @@ pub(crate) enum NodeAction {
         alias: String,
         key: Vec<u8>,
         description: String,
+    },
+    CreateContract {
+        contract: ContractContainer,
+        state: WrappedState,
+        related_contracts: RelatedContracts<'static>,
     },
 }
 

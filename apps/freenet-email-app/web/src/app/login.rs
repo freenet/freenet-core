@@ -1,10 +1,12 @@
-use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicUsize};
+use std::{cell::RefCell, fs::File, io::Read, path::PathBuf, rc::Rc, sync::atomic::AtomicUsize};
 
 use dioxus::prelude::*;
+use freenet_email_inbox::InboxParams;
 use identity_management::{AliasInfo, IdentityManagement};
+use locutus_stdlib::prelude::{ContractContainer, Parameters};
 use once_cell::unsync::Lazy;
-use rsa::RsaPrivateKey;
 use rand::rngs::OsRng;
+use rsa::RsaPrivateKey;
 
 use crate::app::{User, UserId};
 
@@ -342,6 +344,11 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                         crate::log::debug!("importing keypair");
                      }
                     // - create inbox contract
+                    // FIXME: do it in node action handler
+                    let contract_code = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/freenet_email_inbox");
+                    let contract_state = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/contract-state");
+                    let contract_action = get_create_contract_action(key.clone(), contract_code, contract_state);
+                    actions.send(contract_action);
                     // - create AFT delegate && contract
                     let description = description.get().into();
                     actions.send(NodeAction::CreateIdentity { alias, key, description });
@@ -350,6 +357,27 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
             }
         }
     })
+}
+
+fn get_create_contract_action(key: Vec<u8>, code: PathBuf, state: PathBuf) -> NodeAction {
+    let private_key: RsaPrivateKey = serde_json::from_slice(&key).unwrap();
+    let pub_key = private_key.to_public_key();
+    let params: Parameters = InboxParams { pub_key }.try_into().unwrap();
+    let contract = ContractContainer::try_from((code.as_path(), params)).unwrap();
+    let state = {
+        let mut buf = vec![];
+        File::open(state.as_path())
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        buf.into()
+    };
+
+    NodeAction::CreateContract {
+        contract,
+        state,
+        related_contracts: Default::default(),
+    }
 }
 
 pub(super) fn get_or_create_indentity(cx: Scope) -> Element {

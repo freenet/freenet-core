@@ -149,6 +149,7 @@ impl From<WebApiRequestClient> for NodeResponses {
 mod identity_management {
     use super::*;
     use ::identity_management::*;
+    use locutus_stdlib::client_api::ContractRequest;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
 
     const ID_MANAGER_CODE_HASH: &str =
@@ -223,6 +224,21 @@ mod identity_management {
                 ApplicationMessage::new(ContractInstanceId::new([0; 32]), (&msg).try_into()?),
             )],
             key: delegate_key.clone(),
+        };
+        client.send(request.into()).await?;
+        Ok(())
+    }
+
+    pub(super) async fn create_contract(
+        client: &mut WebApiRequestClient,
+        contract: ContractContainer,
+        state: WrappedState,
+        related_contracts: RelatedContracts<'static>,
+    ) -> Result<(), DynError> {
+        let request = ContractRequest::Put {
+            contract,
+            state,
+            related_contracts,
         };
         client.send(request.into()).await?;
         Ok(())
@@ -321,6 +337,26 @@ pub(crate) async fn node_comms(
                     ),
                 }
             }
+            NodeAction::CreateContract {
+                contract,
+                state,
+                related_contracts,
+            } => match identity_management::create_contract(
+                &mut client,
+                contract.clone(),
+                state,
+                related_contracts,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => crate::log::error(
+                    format!("{e}"),
+                    Some(TryNodeAction::CreateContract(
+                        contract.clone().key().encoded_contract_id(),
+                    )),
+                ),
+            },
         }
     }
 
@@ -669,6 +705,7 @@ pub(crate) enum TryNodeAction {
     GetAlias,
     LoadAliases,
     CreateIdentity(String),
+    CreateContract(String),
 }
 
 impl std::fmt::Display for TryNodeAction {
@@ -681,6 +718,9 @@ impl std::fmt::Display for TryNodeAction {
             TryNodeAction::GetAlias => write!(f, "get alias"),
             TryNodeAction::LoadAliases => write!(f, "load aliases"),
             TryNodeAction::CreateIdentity(alias) => write!(f, "create alias {alias}"),
+            TryNodeAction::CreateContract(contract_id) => {
+                write!(f, "create contract {contract_id}")
+            }
         }
     }
 }
