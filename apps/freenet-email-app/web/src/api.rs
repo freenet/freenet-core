@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
+use std::{cell::RefCell, collections::HashMap, io::Read, sync::OnceLock};
 
 use crate::app::InboxController;
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
@@ -149,8 +149,12 @@ impl From<WebApiRequestClient> for NodeResponses {
 mod identity_management {
     use super::*;
     use ::identity_management::*;
+    use freenet_email_inbox::InboxParams;
     use locutus_stdlib::client_api::ContractRequest;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
+    use rsa::RsaPrivateKey;
+    use std::fs::File;
+    use std::path::PathBuf;
 
     const ID_MANAGER_CODE_HASH: &str =
         include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
@@ -231,14 +235,27 @@ mod identity_management {
 
     pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
-        contract: ContractContainer,
-        state: WrappedState,
-        related_contracts: RelatedContracts<'static>,
+        key: Vec<u8>,
+        code_path: PathBuf,
+        state_path: PathBuf,
     ) -> Result<(), DynError> {
+        // Get keypair
+        let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
+        let pub_key = private_key.to_public_key();
+
+        let params: Parameters = InboxParams { pub_key }.try_into()?;
+        let contract = ContractContainer::try_from((code_path.as_path(), params))?;
+        let state = {
+            let mut buf = vec![];
+            File::open(state_path.as_path())
+                .unwrap()
+                .read_to_end(&mut buf)?;
+            buf.into()
+        };
         let request = ContractRequest::Put {
             contract,
             state,
-            related_contracts,
+            related_contracts: Default::default(),
         };
         client.send(request.into()).await?;
         Ok(())
@@ -338,25 +355,19 @@ pub(crate) async fn node_comms(
                 }
             }
             NodeAction::CreateContract {
-                contract,
-                state,
-                related_contracts,
-            } => match identity_management::create_contract(
-                &mut client,
-                contract.clone(),
-                state,
-                related_contracts,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(e) => crate::log::error(
-                    format!("{e}"),
-                    Some(TryNodeAction::CreateContract(
-                        contract.clone().key().encoded_contract_id(),
-                    )),
-                ),
-            },
+                key,
+                code_path,
+                state_path,
+            } => {
+                match identity_management::create_contract(&mut client, key, code_path, state_path)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        crate::log::error(format!("{e}"), Some(TryNodeAction::CreateContract))
+                    }
+                }
+            }
         }
     }
 
@@ -705,7 +716,7 @@ pub(crate) enum TryNodeAction {
     GetAlias,
     LoadAliases,
     CreateIdentity(String),
-    CreateContract(String),
+    CreateContract,
 }
 
 impl std::fmt::Display for TryNodeAction {
@@ -718,8 +729,8 @@ impl std::fmt::Display for TryNodeAction {
             TryNodeAction::GetAlias => write!(f, "get alias"),
             TryNodeAction::LoadAliases => write!(f, "load aliases"),
             TryNodeAction::CreateIdentity(alias) => write!(f, "create alias {alias}"),
-            TryNodeAction::CreateContract(contract_id) => {
-                write!(f, "create contract {contract_id}")
+            TryNodeAction::CreateContract => {
+                write!(f, "creating contract")
             }
         }
     }

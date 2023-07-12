@@ -7,14 +7,9 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use locutus_stdlib::prelude::{ContractContainer, RelatedContracts, WrappedState};
-use once_cell::sync::Lazy;
 use rsa::pkcs1::EncodeRsaPublicKey;
-use rsa::{
-    pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, pkcs8::LineEnding, RsaPrivateKey,
-    RsaPublicKey,
-};
-use std::collections::HashMap;
+use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, RsaPrivateKey, RsaPublicKey};
+use std::path::PathBuf;
 use wasm_bindgen::JsValue;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
@@ -37,9 +32,9 @@ pub(crate) enum NodeAction {
         description: String,
     },
     CreateContract {
-        contract: ContractContainer,
-        state: WrappedState,
-        related_contracts: RelatedContracts<'static>,
+        key: Vec<u8>,
+        code_path: PathBuf,
+        state_path: PathBuf,
     },
 }
 

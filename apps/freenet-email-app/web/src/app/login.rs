@@ -1,18 +1,18 @@
-use std::{cell::RefCell, fs::File, io::Read, path::PathBuf, rc::Rc, sync::atomic::AtomicUsize};
+use std::{cell::RefCell, io::Read, path::PathBuf, rc::Rc, sync::atomic::AtomicUsize};
 
 use dioxus::prelude::*;
-use freenet_email_inbox::InboxParams;
 use identity_management::{AliasInfo, IdentityManagement};
-use locutus_stdlib::prelude::{ContractContainer, Parameters};
 use once_cell::unsync::Lazy;
 use rand::rngs::OsRng;
 use rsa::RsaPrivateKey;
 
 use crate::app::{User, UserId};
+use crate::DynError;
 
 use super::{InboxView, NodeAction};
 
 const DEFAULT_ID_ICON: &str = "data:image/x-icon;base64,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";
+const RSA_KEY_SIZE: usize = 4096;
 
 struct ImportId(bool);
 
@@ -334,21 +334,22 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                 onclick: move |_|  {
                     create_alias_form.write().0 = false;
                     let alias: String = address.get().into();
-                    // FIXME: generate keypair (RSA)
-                    let mut key = vec![];
-                    if *generate.get() {
-                        let private_key = RsaPrivateKey::new(&mut OsRng, 4096).expect("failed to generate keypair");
-                        let key = serde_json::to_vec(&private_key).unwrap();
-                        crate::log::debug!("generated keypair {:?}", key);
-                    } else {
-                        crate::log::debug!("importing keypair");
-                     }
+                    // Generate or import keypair
+                    let key = match get_key(generate) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            crate::log::debug!("Failed to generate or import key: {:?}", e);
+                            vec![]
+                        }
+                    };
                     // - create inbox contract
-                    // FIXME: do it in node action handler
-                    let contract_code = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/freenet_email_inbox");
-                    let contract_state = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/contract-state");
-                    let contract_action = get_create_contract_action(key.clone(), contract_code, contract_state);
-                    actions.send(contract_action);
+                    let code_path = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/freenet_email_inbox");
+                    let state_path = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/contract-state");
+                    actions.send(NodeAction::CreateContract {
+                        key: key.clone(),
+                        code_path,
+                        state_path,
+                    });
                     // - create AFT delegate && contract
                     let description = description.get().into();
                     actions.send(NodeAction::CreateIdentity { alias, key, description });
@@ -359,25 +360,17 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
     })
 }
 
-fn get_create_contract_action(key: Vec<u8>, code: PathBuf, state: PathBuf) -> NodeAction {
-    let private_key: RsaPrivateKey = serde_json::from_slice(&key).unwrap();
-    let pub_key = private_key.to_public_key();
-    let params: Parameters = InboxParams { pub_key }.try_into().unwrap();
-    let contract = ContractContainer::try_from((code.as_path(), params)).unwrap();
-    let state = {
-        let mut buf = vec![];
-        File::open(state.as_path())
-            .unwrap()
-            .read_to_end(&mut buf)
-            .unwrap();
-        buf.into()
-    };
-
-    NodeAction::CreateContract {
-        contract,
-        state,
-        related_contracts: Default::default(),
+fn get_key(generate: &UseState<bool>) -> Result<Vec<u8>, DynError> {
+    let mut key = vec![];
+    if *generate.get() {
+        let private_key =
+            RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate key");
+        key = serde_json::to_vec(&private_key)?;
+        crate::log::debug!("generated keypair {:?}", key);
+    } else {
+        crate::log::debug!("importing keypair");
     }
+    Ok(key)
 }
 
 pub(super) fn get_or_create_indentity(cx: Scope) -> Element {
