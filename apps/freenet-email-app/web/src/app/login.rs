@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io::Read, path::PathBuf, rc::Rc, sync::atomic::AtomicUsize};
+use std::{cell::RefCell, io::Read, rc::Rc, sync::atomic::AtomicUsize};
 
 use dioxus::prelude::*;
 use identity_management::{AliasInfo, IdentityManagement};
@@ -7,7 +7,7 @@ use rand::rngs::OsRng;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPrivateKey;
 
-use crate::app::{User, UserId};
+use crate::app::{ContractType, DelegateType, User, UserId};
 use crate::DynError;
 
 use super::{InboxView, NodeAction};
@@ -347,14 +347,20 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                         }
                     };
                     // - create inbox contract
-                    let code_path = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/freenet_email_inbox");
-                    let state_path = PathBuf::from("/home/minion/workspace/locutus/apps/freenet-email-app/contracts/inbox/build/locutus/contract-state");
                     actions.send(NodeAction::CreateContract {
                         key: key.clone(),
-                        code_path,
-                        state_path,
+                        contract_type: ContractType::InboxContract,
                     });
                     // - create AFT delegate && contract
+                    actions.send(NodeAction::CreateDelegate {
+                        key: key.clone(),
+                        delegate_type: DelegateType::AFTDelegate,
+                    });
+                    actions.send(NodeAction::CreateContract {
+                        key: key.clone(),
+                        contract_type: ContractType::AFTContract,
+                    });
+
                     let description = description.get().into();
                     actions.send(NodeAction::CreateIdentity { alias, key, description });
                 },

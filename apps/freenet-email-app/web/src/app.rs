@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
@@ -30,10 +31,43 @@ pub(crate) enum NodeAction {
         description: String,
     },
     CreateContract {
+        contract_type: ContractType,
         key: Vec<u8>,
-        code_path: PathBuf,
-        state_path: PathBuf,
     },
+    CreateDelegate {
+        delegate_type: DelegateType,
+        key: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ContractType {
+    InboxContract,
+    AFTContract,
+}
+
+impl Display for ContractType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContractType::InboxContract => write!(f, "InboxContract"),
+            ContractType::AFTContract => write!(f, "AFTContract"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum DelegateType {
+    AFTDelegate,
+    IdentityDelegate,
+}
+
+impl Display for DelegateType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelegateType::AFTDelegate => write!(f, "AFTDelegate"),
+            DelegateType::IdentityDelegate => write!(f, "IdentityDelegate"),
+        }
+    }
 }
 
 pub(crate) fn app(cx: Scope) -> Element {

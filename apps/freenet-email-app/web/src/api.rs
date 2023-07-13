@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, io::Read, sync::OnceLock};
 
-use crate::app::InboxController;
+use crate::app::{ContractType, DelegateType, InboxController};
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use futures::SinkExt;
 use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
@@ -146,33 +146,42 @@ impl From<WebApiRequestClient> for NodeResponses {
 }
 
 #[cfg(feature = "use-node")]
-mod identity_management {
+mod contract_management {
+    use super::*;
+    use locutus_stdlib::{client_api::ContractRequest, prelude::*};
+
+    pub async fn create_contract(
+        client: &mut WebApiRequestClient,
+        contract_code: &[u8],
+        contract_state: &[u8],
+        params: &Parameters<'static>,
+    ) -> Result<(), DynError> {
+        let contract = ContractContainer::try_from((contract_code.to_vec(), params))?;
+        let state = contract_state.to_vec().into();
+        let request = ContractRequest::Put {
+            contract,
+            state,
+            related_contracts: Default::default(),
+        };
+        client.send(request.into()).await?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "use-node")]
+mod delegate_management {
     use super::*;
     use ::identity_management::*;
-    use freenet_email_inbox::InboxParams;
-    use locutus_stdlib::client_api::ContractRequest;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
-    use rsa::RsaPrivateKey;
-    use std::fs::File;
-    use std::path::PathBuf;
 
-    const ID_MANAGER_CODE_HASH: &str =
-        include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
-    const ID_MANAGER_CODE: &[u8] =
-        include_bytes!("../../../../modules/identity-management/build/locutus/identity_management");
-    const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
-
-    fn identity_manager_key() -> Result<(DelegateKey, SecretsId, Parameters<'static>), DynError> {
-        let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
-        let secret_id = params.as_secret_id();
-        let params = params.try_into()?;
-        let key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
-        Ok((key, secret_id, params))
-    }
-
-    pub(super) async fn create_delegate(client: &mut WebApiRequestClient) -> Result<(), DynError> {
-        let (key, _, params) = identity_manager_key()?;
-        let delegate = Delegate::from((&DelegateCode::from(ID_MANAGER_CODE), &params));
+    pub async fn create_delegate(
+        client: &mut WebApiRequestClient,
+        delegate_code_hash: &str,
+        delegate_code: Vec<u8>,
+        params: &Parameters<'static>,
+    ) -> Result<(), DynError> {
+        let key = DelegateKey::from_params(delegate_code_hash, &params)?;
+        let delegate = Delegate::from((&DelegateCode::from(delegate_code), params));
         assert_eq!(&key, delegate.key());
         let request = ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
             delegate,
@@ -182,7 +191,7 @@ mod identity_management {
         crate::log::debug!("creating identity manager with key: {key}");
         client.send(request).await?;
         let request = DelegateRequest::ApplicationMessages {
-            params,
+            params: params.clone(),
             inbound: vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(
                     ContractInstanceId::new([0; 32]),
@@ -194,11 +203,118 @@ mod identity_management {
         client.send(request.into()).await?;
         Ok(())
     }
+}
+
+#[cfg(feature = "use-node")]
+mod inbox_management {
+    use super::*;
+    use freenet_email_inbox::InboxParams;
+    use locutus_stdlib::prelude::*;
+    use rsa::RsaPrivateKey;
+
+    const INBOX_CODE: &[u8] =
+        include_bytes!("../../contracts/inbox/build/locutus/freenet_email_inbox");
+    const INBOX_STATE: &[u8] = include_bytes!("../../contracts/inbox/build/locutus/contract-state");
+
+    pub(super) async fn create_contract(
+        client: &mut WebApiRequestClient,
+        key: Vec<u8>,
+    ) -> Result<(), DynError> {
+        let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
+        let pub_key = private_key.to_public_key();
+        let params: Parameters = InboxParams { pub_key }.try_into()?;
+
+        contract_management::create_contract(client, INBOX_CODE, INBOX_STATE, &params).await
+    }
+}
+
+#[cfg(feature = "use-node")]
+mod token_allocation_management {
+    use super::*;
+    use locutus_aft_interface::TokenDelegateParameters;
+    use locutus_stdlib::prelude::*;
+    use rsa::RsaPrivateKey;
+
+    const TOKEN_ALLOCATION_CODE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/locutus/locutus_token_allocation_record");
+    const TOKEN_ALLOCATION_STATE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/locutus/contract-state");
+
+    pub(super) async fn create_contract(
+        client: &mut WebApiRequestClient,
+        key: Vec<u8>,
+    ) -> Result<(), DynError> {
+        let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
+        let pub_key = private_key.to_public_key();
+        let params: Parameters = TokenDelegateParameters::new(pub_key).try_into()?;
+
+        contract_management::create_contract(
+            client,
+            TOKEN_ALLOCATION_CODE,
+            TOKEN_ALLOCATION_STATE,
+            &params,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "use-node")]
+mod token_generator_management {
+    use super::*;
+    use locutus_aft_interface::DelegateParameters;
+    use rsa::RsaPrivateKey;
+
+    const ID_MANAGER_CODE_HASH: &str =
+        include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
+    const ID_MANAGER_CODE: &[u8] =
+        include_bytes!("../../../../modules/identity-management/build/locutus/identity_management");
+
+    pub(super) async fn create_delegate(
+        client: &mut WebApiRequestClient,
+        key: Vec<u8>,
+    ) -> Result<(), DynError> {
+        let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
+        let params = DelegateParameters::new(private_key).try_into()?;
+        delegate_management::create_delegate(
+            client,
+            ID_MANAGER_CODE_HASH,
+            ID_MANAGER_CODE.to_vec(),
+            &params,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "use-node")]
+mod identity_management {
+    use super::*;
+    use crate::app::DelegateType;
+    use ::identity_management::*;
+    use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
+
+    const ID_MANAGER_CODE_HASH: &str =
+        include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
+    const ID_MANAGER_CODE: &[u8] =
+        include_bytes!("../../../../modules/identity-management/build/locutus/identity_management");
+    const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
+
+    pub(super) async fn create_delegate(client: &mut WebApiRequestClient) -> Result<(), DynError> {
+        let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
+        let params = params.try_into()?;
+        delegate_management::create_delegate(
+            client,
+            ID_MANAGER_CODE_HASH,
+            ID_MANAGER_CODE.to_vec(),
+            &params,
+        )
+        .await
+    }
 
     pub(super) async fn load_aliases(
         client: &mut WebApiRequestClient,
     ) -> Result<DelegateKey, DynError> {
-        let (key, secret_id, params) = identity_manager_key()?;
+        let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
+        let secret_id = params.as_secret_id();
+        let params = params.try_into()?;
+        let key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
         crate::log::debug!("loading aliases ({key})");
         let request = DelegateRequest::GetSecretRequest {
             params,
@@ -216,7 +332,9 @@ mod identity_management {
         extra: String,
     ) -> Result<(), DynError> {
         crate::log::debug!("creating {alias}");
-        let (delegate_key, _, params) = identity_manager_key()?;
+        let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
+        let params = params.try_into()?;
+        let delegate_key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
         let msg = IdentityMsg::CreateIdentity {
             alias,
             key,
@@ -228,34 +346,6 @@ mod identity_management {
                 ApplicationMessage::new(ContractInstanceId::new([0; 32]), (&msg).try_into()?),
             )],
             key: delegate_key.clone(),
-        };
-        client.send(request.into()).await?;
-        Ok(())
-    }
-
-    pub(super) async fn create_contract(
-        client: &mut WebApiRequestClient,
-        key: Vec<u8>,
-        code_path: PathBuf,
-        state_path: PathBuf,
-    ) -> Result<(), DynError> {
-        // Get keypair
-        let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
-        let pub_key = private_key.to_public_key();
-
-        let params: Parameters = InboxParams { pub_key }.try_into()?;
-        let contract = ContractContainer::try_from((code_path.as_path(), params))?;
-        let state = {
-            let mut buf = vec![];
-            File::open(state_path.as_path())
-                .unwrap()
-                .read_to_end(&mut buf)?;
-            buf.into()
-        };
-        let request = ContractRequest::Put {
-            contract,
-            state,
-            related_contracts: Default::default(),
         };
         client.send(request.into()).await?;
         Ok(())
@@ -349,20 +439,46 @@ pub(crate) async fn node_comms(
                     ),
                 }
             }
-            NodeAction::CreateContract {
-                key,
-                code_path,
-                state_path,
-            } => {
-                match identity_management::create_contract(&mut client, key, code_path, state_path)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        crate::log::error(format!("{e}"), Some(TryNodeAction::CreateContract))
+            NodeAction::CreateContract { key, contract_type } => match contract_type {
+                ContractType::InboxContract => {
+                    match inbox_management::create_contract(&mut client, key).await {
+                        Ok(_) => {}
+                        Err(e) => crate::log::error(
+                            format!("{e}"),
+                            Some(TryNodeAction::CreateContract(contract_type)),
+                        ),
                     }
                 }
-            }
+                ContractType::AFTContract => {
+                    match token_allocation_management::create_contract(&mut client, key).await {
+                        Ok(_) => {}
+                        Err(e) => crate::log::error(
+                            format!("{e}"),
+                            Some(TryNodeAction::CreateContract(contract_type)),
+                        ),
+                    }
+                }
+            },
+            NodeAction::CreateDelegate { key, delegate_type } => match delegate_type {
+                DelegateType::AFTDelegate => {
+                    match token_generator_management::create_delegate(&mut client, key).await {
+                        Ok(_) => {}
+                        Err(e) => crate::log::error(
+                            format!("{e}"),
+                            Some(TryNodeAction::CreateDelegate(delegate_type)),
+                        ),
+                    }
+                }
+                DelegateType::IdentityDelegate => {
+                    match identity_management::create_delegate(&mut client).await {
+                        Ok(_) => {}
+                        Err(e) => crate::log::error(
+                            format!("{e}"),
+                            Some(TryNodeAction::CreateDelegate(delegate_type)),
+                        ),
+                    }
+                }
+            },
         }
     }
 
@@ -725,7 +841,8 @@ pub(crate) enum TryNodeAction {
     GetAlias,
     LoadAliases,
     CreateIdentity(String),
-    CreateContract,
+    CreateContract(ContractType),
+    CreateDelegate(DelegateType),
 }
 
 impl std::fmt::Display for TryNodeAction {
@@ -738,8 +855,11 @@ impl std::fmt::Display for TryNodeAction {
             TryNodeAction::GetAlias => write!(f, "get alias"),
             TryNodeAction::LoadAliases => write!(f, "load aliases"),
             TryNodeAction::CreateIdentity(alias) => write!(f, "create alias {alias}"),
-            TryNodeAction::CreateContract => {
-                write!(f, "creating contract")
+            TryNodeAction::CreateContract(contract_type) => {
+                write!(f, "creating contract {contract_type}")
+            }
+            TryNodeAction::CreateDelegate(delegate_type) => {
+                write!(f, "creating delegate {delegate_type}")
             }
         }
     }
