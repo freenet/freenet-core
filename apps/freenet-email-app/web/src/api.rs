@@ -305,6 +305,7 @@ pub(crate) async fn node_comms(
     let identities_key = identity_management::load_aliases(&mut req_sender)
         .await
         .unwrap();
+    //todo don't unwrap, propagate errors to the UI somehow
     WEB_API_SENDER.set(req_sender).unwrap();
 
     static IDENTITIES_KEY: OnceLock<DelegateKey> = OnceLock::new();
@@ -331,12 +332,6 @@ pub(crate) async fn node_comms(
                     Ok(key) => {
                         waiting_updates.entry(key).or_insert(identity);
                     }
-                }
-            }
-            NodeAction::LoadIdentities => {
-                match identity_management::load_aliases(&mut client).await {
-                    Ok(_) => {}
-                    Err(e) => crate::log::error(format!("{e}"), Some(TryNodeAction::LoadAliases)),
                 }
             }
             NodeAction::CreateIdentity {
@@ -566,6 +561,13 @@ pub(crate) async fn node_comms(
                 }
             }
             HostResponse::DelegateResponse { key, values } => {
+                if values.is_empty() {
+                    // may have updated with new alias, refresh identities
+                    identity_management::load_aliases(&mut client)
+                        .await
+                        .unwrap();
+                    //todo don't unwrap, propagate errors to the UI somehow
+                }
                 for msg in values {
                     match msg {
                         locutus_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
@@ -626,7 +628,13 @@ pub(crate) async fn node_comms(
                                     payload.as_ref(),
                                 )
                                 .unwrap();
-                                crate::log::debug!("received identities: {manager:?}");
+                                crate::log::debug!(
+                                    "received identities: {:?}",
+                                    manager
+                                        .get_info()
+                                        .map(|(alias, _)| alias)
+                                        .collect::<Vec<_>>()
+                                );
                                 login_controller.write().updated = true;
                                 crate::app::Alias::set_aliases(manager);
                             } else {
@@ -693,6 +701,7 @@ pub(crate) async fn node_response_error_handling(
     res: Result<(), DynError>,
     action: TryNodeAction,
 ) {
+    // todo: all errors should be handled properly and propagated to the UI if fitting
     if let Err(error) = res {
         crate::log::error(format!("{error}"), Some(action.clone()));
         error_channel

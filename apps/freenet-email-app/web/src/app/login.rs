@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 use identity_management::{AliasInfo, IdentityManagement};
 use once_cell::unsync::Lazy;
 use rand::rngs::OsRng;
+use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPrivateKey;
 
 use crate::app::{User, UserId};
@@ -131,7 +132,7 @@ pub(super) fn identities(cx: Scope) -> Element {
     let login_controller = use_shared_state::<LoginController>(cx).unwrap();
 
     if login_controller.read().updated {
-        login_controller.write().updated = false;
+        login_controller.write_silent().updated = false;
     }
 
     #[inline_props]
@@ -247,7 +248,11 @@ pub(super) fn identities(cx: Scope) -> Element {
 pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>) -> Element<'x> {
     let create_alias_form: &UseSharedState<CreateAlias> =
         use_shared_state::<CreateAlias>(cx).unwrap();
-    crate::log::debug!("create alias state");
+    let login_controller = use_shared_state::<LoginController>(cx).unwrap();
+
+    if login_controller.read().updated {
+        login_controller.write_silent().updated = false;
+    }
 
     let generate = use_state(cx, || true);
     let address = use_state(cx, String::new);
@@ -258,7 +263,6 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
             .chain(std::iter::repeat('.').take(300))
             .collect::<String>()
     });
-    crate::log::debug!("other state");
 
     cx.render(rsx! {
         div {
@@ -363,10 +367,17 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
 fn get_key(generate: &UseState<bool>) -> Result<Vec<u8>, DynError> {
     let mut key = vec![];
     if *generate.get() {
+        crate::log::debug!("generating keypair");
         let private_key =
-            RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate key");
+            RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate keypair");
+        crate::log::debug!(
+            "generated public key: {key}",
+            key = private_key
+                .to_public_key()
+                .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+        );
         key = serde_json::to_vec(&private_key)?;
-        crate::log::debug!("generated keypair {:?}", key);
     } else {
         crate::log::debug!("importing keypair");
     }

@@ -7,8 +7,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use rsa::pkcs1::EncodeRsaPublicKey;
-use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, RsaPrivateKey, RsaPublicKey};
+use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
 use std::path::PathBuf;
 use wasm_bindgen::JsValue;
 
@@ -25,7 +24,6 @@ pub(crate) use login::{Alias, LoginController};
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
     LoadMessages(Identity),
-    LoadIdentities,
     CreateIdentity {
         alias: String,
         key: Vec<u8>,
@@ -569,7 +567,7 @@ fn inbox_component(cx: Scope) -> Element {
 
     // Mark updated as false after after the inbox has been refreshed
     if controller.read().updated {
-        controller.write().updated = false;
+        controller.write_silent().updated = false;
     }
 
     let inbox = inbox.read();
