@@ -381,6 +381,10 @@ impl Executor {
                 vec![InboundDelegateMsg::GetSecretRequest(get_request)],
             ) {
                 Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                Err(err) if err.delegate_is_missing() => {
+                    tracing::error!("delegate not found `{key}`");
+                    Err(Either::Left(CoreDelegateError::Missing(key).into()))
+                }
                 Err(err) => Err(Either::Right(
                     format!("uncontrolled error while getting secret for `{key}`: {err}").into(),
                 )),
