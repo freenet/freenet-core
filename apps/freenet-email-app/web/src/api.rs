@@ -146,11 +146,11 @@ impl From<WebApiRequestClient> for NodeResponses {
 }
 
 #[cfg(feature = "use-node")]
-mod contract_management {
+mod contract_api {
     use super::*;
     use locutus_stdlib::{client_api::ContractRequest, prelude::*};
 
-    pub async fn create_contract(
+    pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
         contract_code: &[u8],
         contract_state: &[u8],
@@ -169,18 +169,18 @@ mod contract_management {
 }
 
 #[cfg(feature = "use-node")]
-mod delegate_management {
+mod delegate_api {
     use super::*;
     use ::identity_management::*;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
 
-    pub async fn create_delegate(
+    pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
         delegate_code_hash: &str,
         delegate_code: Vec<u8>,
         params: &Parameters<'static>,
     ) -> Result<(), DynError> {
-        let key = DelegateKey::from_params(delegate_code_hash, &params)?;
+        let key = DelegateKey::from_params(delegate_code_hash, params)?;
         let delegate = Delegate::from((&DelegateCode::from(delegate_code), params));
         assert_eq!(&key, delegate.key());
         let request = ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
@@ -188,7 +188,6 @@ mod delegate_management {
             cipher: DelegateRequest::DEFAULT_CIPHER,
             nonce: DelegateRequest::DEFAULT_NONCE,
         });
-        crate::log::debug!("creating identity manager with key: {key}");
         client.send(request).await?;
         let request = DelegateRequest::ApplicationMessages {
             params: params.clone(),
@@ -224,7 +223,7 @@ mod inbox_management {
         let pub_key = private_key.to_public_key();
         let params: Parameters = InboxParams { pub_key }.try_into()?;
 
-        contract_management::create_contract(client, INBOX_CODE, INBOX_STATE, &params).await
+        contract_api::create_contract(client, INBOX_CODE, INBOX_STATE, &params).await
     }
 }
 
@@ -246,7 +245,7 @@ mod token_allocation_management {
         let pub_key = private_key.to_public_key();
         let params: Parameters = TokenDelegateParameters::new(pub_key).try_into()?;
 
-        contract_management::create_contract(
+        contract_api::create_contract(
             client,
             TOKEN_ALLOCATION_CODE,
             TOKEN_ALLOCATION_STATE,
@@ -273,7 +272,7 @@ mod token_generator_management {
     ) -> Result<(), DynError> {
         let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
         let params = DelegateParameters::new(private_key).try_into()?;
-        delegate_management::create_delegate(
+        delegate_api::create_delegate(
             client,
             ID_MANAGER_CODE_HASH,
             ID_MANAGER_CODE.to_vec(),
@@ -299,7 +298,7 @@ mod identity_management {
     pub(super) async fn create_delegate(client: &mut WebApiRequestClient) -> Result<(), DynError> {
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let params = params.try_into()?;
-        delegate_management::create_delegate(
+        delegate_api::create_delegate(
             client,
             ID_MANAGER_CODE_HASH,
             ID_MANAGER_CODE.to_vec(),

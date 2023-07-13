@@ -70,7 +70,7 @@ impl StdInput {
             })
             .transpose()?
             .unwrap_or_default();
-        let (contract_code, _ver) = ContractCode::load_versioned(&config.contract)?;
+        let (contract_code, _ver) = ContractCode::load_versioned_from_path(&config.contract)?;
         let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
             Arc::new(contract_code),
             params.into(),

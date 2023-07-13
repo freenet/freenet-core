@@ -167,7 +167,7 @@ impl ContractStore {
 
         let key_path = code_hash.encode();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
-        if let Ok((code, _ver)) = ContractCode::load_versioned(&key_path) {
+        if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
             let size = code.data().len() as i64;
             self.contract_cache
                 .insert(code_hash.clone(), Arc::new(code), size);
