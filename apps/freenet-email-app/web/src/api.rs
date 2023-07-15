@@ -215,6 +215,10 @@ mod inbox_management {
     const INBOX_CODE: &[u8] =
         include_bytes!("../../contracts/inbox/build/locutus/freenet_email_inbox");
 
+    thread_local! {
+        pub(super) static CREATED_INBOX: RefCell<Vec<ContractKey>> = RefCell::new(Vec::new());
+    }
+
     pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
         key: Vec<u8>,
@@ -239,6 +243,10 @@ mod token_record_management {
     use rsa::RsaPrivateKey;
 
     const TOKEN_RECORD_CODE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/locutus/locutus_token_allocation_record");
+
+    thread_local! {
+        pub(super) static CREATED_AFT_RECORD: RefCell<Vec<ContractKey>> = RefCell::new(Vec::new());
+    }
 
     pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
@@ -269,6 +277,10 @@ mod token_generator_management {
         include_str!("../../../../modules/antiflood-tokens/delegates/token-generator/build/token_generator_code_hash");
     const TOKEN_GEN_CODE: &[u8] =
         include_bytes!("../../../../modules/antiflood-tokens/delegates/token-generator/build/locutus/locutus_token_generator");
+
+    thread_local! {
+        pub(super) static CREATED_AFT_GEN: RefCell<Vec<DelegateKey>> = RefCell::new(Vec::new());
+    }
 
     pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
@@ -434,7 +446,11 @@ pub(crate) async fn node_comms(
             NodeAction::CreateContract { key, contract_type } => match contract_type {
                 ContractType::InboxContract => {
                     match inbox_management::create_contract(&mut client, key).await {
-                        Ok(key) => {}
+                        Ok(key) => {
+                            inbox_management::CREATED_INBOX.with(|k| {
+                                k.borrow_mut().push(key);
+                            });
+                        }
                         Err(e) => crate::log::error(
                             format!("{e}"),
                             Some(TryNodeAction::CreateContract(contract_type)),
@@ -443,7 +459,11 @@ pub(crate) async fn node_comms(
                 }
                 ContractType::AFTContract => {
                     match token_record_management::create_contract(&mut client, key).await {
-                        Ok(key) => {}
+                        Ok(key) => {
+                            token_record_management::CREATED_AFT_RECORD.with(|k| {
+                                k.borrow_mut().push(key);
+                            });
+                        }
                         Err(e) => crate::log::error(
                             format!("{e}"),
                             Some(TryNodeAction::CreateContract(contract_type)),
@@ -453,7 +473,11 @@ pub(crate) async fn node_comms(
             },
             NodeAction::CreateDelegate { key } => {
                 match token_generator_management::create_delegate(&mut client, key).await {
-                    Ok(key) => {}
+                    Ok(key) => {
+                        token_generator_management::CREATED_AFT_GEN.with(|k| {
+                            k.borrow_mut().push(key);
+                        });
+                    }
                     Err(e) => {
                         crate::log::error(format!("{e}"), Some(TryNodeAction::CreateDelegate))
                     }
@@ -505,8 +529,6 @@ pub(crate) async fn node_comms(
                                 }
                             }
                             RequestError::DelegateError(error) => {
-                                // if let DelegateError::MissingSecret { key, secret } = &error {
-                                // }
                                 crate::log::error(
                                     format!("received delegate request error: {error}"),
                                     None,
@@ -656,13 +678,53 @@ pub(crate) async fn node_comms(
                     token_rec_to_id.insert(key, identity.clone());
                 }
             }
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                let found = inbox_management::CREATED_INBOX.with(|keys| {
+                    let pos = keys.borrow().iter().position(|k| k == &key);
+                    if let Some(pos) = pos {
+                        let key = keys.borrow_mut().remove(pos);
+                        crate::log::debug!("contract {key} put");
+                        return true;
+                    }
+                    false
+                });
+                if found {
+                    // todo: take into account while confirming alias was created and if compelte, register the identity
+                    return;
+                }
+                let found = token_record_management::CREATED_AFT_RECORD.with(|keys| {
+                    let pos = keys.borrow().iter().position(|k| k == &key);
+                    if let Some(pos) = pos {
+                        let key = keys.borrow_mut().remove(pos);
+                        crate::log::debug!("contract {key} put");
+                        return true;
+                    }
+                    false
+                });
+                if found {
+                    // todo: take into account while confirming alias was created and if compelte, register the identity
+                }
+            }
             HostResponse::DelegateResponse { key, values } => {
-                if values.is_empty() {
+                if values.is_empty() && &key == IDENTITIES_KEY.get().unwrap() {
                     // may have updated with new alias, refresh identities
                     identity_management::load_aliases(&mut client)
                         .await
                         .unwrap();
                     //todo don't unwrap, propagate errors to the UI somehow
+                } else if values.is_empty() {
+                    let found = token_generator_management::CREATED_AFT_GEN.with(|keys| {
+                        let pos = keys.borrow().iter().position(|k| k == &key);
+                        if let Some(pos) = pos {
+                            let key = keys.borrow_mut().remove(pos);
+                            crate::log::debug!("delegate {key} put");
+                            return true;
+                        }
+                        false
+                    });
+                    if found {
+                        // todo: take into account while confirming alias was created and if compelte, register the identity
+                    }
                 }
                 for msg in values {
                     match msg {

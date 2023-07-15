@@ -385,6 +385,7 @@ fn get_key(generate: &UseState<bool>) -> Result<Vec<u8>, DynError> {
         key = serde_json::to_vec(&private_key)?;
     } else {
         crate::log::debug!("importing keypair");
+        return Err("importing not implemented yet".into());
     }
     Ok(key)
 }
