@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io::Read, rc::Rc, sync::atomic::AtomicUsize};
+use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicUsize};
 
 use dioxus::prelude::*;
 use identity_management::{AliasInfo, IdentityManagement};
@@ -7,7 +7,7 @@ use rand::rngs::OsRng;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPrivateKey;
 
-use crate::app::{ContractType, DelegateType, User, UserId};
+use crate::app::{ContractType, User, UserId};
 use crate::DynError;
 
 use super::{InboxView, NodeAction};
@@ -354,7 +354,6 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                     // - create AFT delegate && contract
                     actions.send(NodeAction::CreateDelegate {
                         key: key.clone(),
-                        delegate_type: DelegateType::AFTDelegate,
                     });
                     actions.send(NodeAction::CreateContract {
                         key: key.clone(),

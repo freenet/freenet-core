@@ -64,6 +64,15 @@ pub struct InboxSettings {
     pub private: EncryptedContent,
 }
 
+impl Default for InboxSettings {
+    fn default() -> Self {
+        Self {
+            minimum_tier: Tier::Min30,
+            private: Default::default(),
+        }
+    }
+}
+
 impl TryFrom<StateDelta<'static>> for UpdateInbox {
     type Error = ContractError;
     fn try_from(state: StateDelta<'static>) -> Result<Self, Self::Error> {
@@ -139,6 +148,10 @@ impl Inbox {
             last_update: Utc::now(),
             inbox_signature,
         }
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, ContractError> {
+        serde_json::to_vec(self).map_err(|err| ContractError::Deser(format!("{err}")))
     }
 
     pub fn sign(key: &RsaPrivateKey) -> Signature {
@@ -451,8 +464,7 @@ impl ContractInterface for Inbox {
             inbox.remove_messages(rm_messages);
             // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
             //inbox.last_update = locutus_stdlib::time::now();
-            let serialized =
-                serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;
+            let serialized = inbox.serialize()?;
             Ok(UpdateModification::valid(serialized.into()))
         } else {
             Ok(UpdateModification::requires(missing_related))
