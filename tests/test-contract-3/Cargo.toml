@@ -1,0 +1,16 @@
+[package]
+name = "test-contract-3"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+serde = { version = "1.0", features = ["derive"] }
+
+[features]
+trace = ["locutus-stdlib/trace"]
