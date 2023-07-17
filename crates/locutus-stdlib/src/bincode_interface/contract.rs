@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 
@@ -75,7 +75,7 @@ pub trait ContractInterfaceBincode {
     /// - `related`: Related contracts that may previously have been returned as a [ContractError].
     ///
     /// # Returns
-    /// - `Result<ValidateResult, ContractError>`: The result of the validation. 
+    /// - `Result<ValidateResult, ContractError>`: The result of the validation.
     fn validate_state(
         parameters: Self::Parameters,
         state: Self::State,
@@ -88,7 +88,7 @@ pub trait ContractInterfaceBincode {
         delta: Self::StateDelta,
     ) -> Result<bool, ContractError>;
 
-    /// 
+    ///
     fn update_state(
         parameters: Self::Parameters,
         state: Self::State,
@@ -117,10 +117,9 @@ impl<T: ContractInterfaceBincode> ContractInterface for BincodeContractAdapter<T
     ) -> Result<ValidateResult, ContractError> {
         let deserialized_params: T::Parameters = bincode::deserialize(parameters.as_ref())?;
         let deserialized_state: T::State = bincode::deserialize(state.as_ref())?;
-    
+
         T::validate_state(deserialized_params, deserialized_state, related)
     }
-    
 
     fn validate_delta(
         parameters: Parameters<'static>,

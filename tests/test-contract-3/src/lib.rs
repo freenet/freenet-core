@@ -1,5 +1,6 @@
 use locutus_stdlib::prelude::*;
 use serde::{Serialize, Deserialize};
+use locutus_stdlib::prelude::layer1::*;
 
 // Don't get excited, not a cryptocurrency.
 
@@ -53,12 +54,22 @@ impl ContractAdapter for Wallet {
         state: Self::State,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        Ok(UpdateModification {
-            mew_state: Option::Some(WalletState {
-                balance: 0,
-            },
-            related: vec![],
-    })}
+        todo!()
+    }
+
+    fn summarize_state(
+        parameters: Self::Parameters,
+        state: Self::State,
+    ) -> Result<Self::StateSummary, ContractError> {
+        todo!()
+    }
+
+    fn get_state_delta(
+        parameters: Self::Parameters,
+        state: Self::State,
+        summary: Self::StateSummary,
+    ) -> Result<Self::StateDelta, ContractError> {
+        todo!()
     }
 }
 
