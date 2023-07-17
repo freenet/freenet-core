@@ -27,7 +27,7 @@ pub trait ContractAdapter {
         parameters: Self::Parameters,
         state: Self::State,
         data: Vec<UpdateData<'static>>,
-    ) -> Result<UpdateModification<State>, ContractError>;
+    ) -> Result<L1UpdateModification<Self::State>, ContractError>;
 
     fn summarize_state(
         parameters: Self::Parameters,
@@ -41,7 +41,7 @@ pub trait ContractAdapter {
     ) -> Result<Self::StateDelta, ContractError>;
 }
 
-pub struct UpdateModification<State>
+pub struct L1UpdateModification<State>
 where
     State: Serialize + DeserializeOwned,
 {
@@ -127,7 +127,7 @@ where
         parameters: Parameters<'static>,
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
-    ) -> Result<UpdateModification<'static>, ContractError> {
+    ) -> Result<crate::contract_interface::UpdateModification<'static>, ContractError> {
         let parameters: <Self as ContractAdapter>::Parameters =
             <Self as Encoder>::deserialize(parameters.as_ref()).map_err(Into::into)?;
         let state: <Self as ContractAdapter>::State =

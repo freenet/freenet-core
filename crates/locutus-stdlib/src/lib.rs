@@ -1,5 +1,4 @@
 //! Standard library provided by the Freenet project to be able to write Locutus-compatible contracts.
-mod bincode_interface;
 #[doc(hidden)]
 pub mod buf;
 #[cfg(all(feature = "net", any(unix, windows, target_family = "wasm")))]
