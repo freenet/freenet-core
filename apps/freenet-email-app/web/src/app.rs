@@ -8,9 +8,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use rsa::pkcs1::EncodeRsaPublicKey;
-use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, RsaPrivateKey, RsaPublicKey};
-use std::path::PathBuf;
+use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
 use wasm_bindgen::JsValue;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
@@ -25,19 +23,19 @@ pub(crate) use login::{Alias, LoginController};
 
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
-    LoadMessages(Identity),
-    LoadIdentities,
+    LoadMessages(Box<Identity>),
     CreateIdentity {
-        alias: String,
+        alias: Rc<str>,
         key: Vec<u8>,
         description: String,
     },
     CreateContract {
+        alias: Rc<str>,
         contract_type: ContractType,
         key: Vec<u8>,
     },
     CreateDelegate {
-        delegate_type: DelegateType,
+        alias: Rc<str>,
         key: Vec<u8>,
     },
 }
@@ -53,21 +51,6 @@ impl Display for ContractType {
         match self {
             ContractType::InboxContract => write!(f, "InboxContract"),
             ContractType::AFTContract => write!(f, "AFTContract"),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum DelegateType {
-    AFTDelegate,
-    IdentityDelegate,
-}
-
-impl Display for DelegateType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DelegateType::AFTDelegate => write!(f, "AFTDelegate"),
-            DelegateType::IdentityDelegate => write!(f, "IdentityDelegate"),
         }
     }
 }
@@ -322,7 +305,7 @@ impl InboxView {
         id: &Identity,
         actions: &Coroutine<NodeAction>,
     ) -> Result<(), DynError> {
-        actions.send(NodeAction::LoadMessages(id.clone()));
+        actions.send(NodeAction::LoadMessages(Box::new(id.clone())));
         Ok(())
     }
 }
@@ -603,7 +586,7 @@ fn inbox_component(cx: Scope) -> Element {
 
     // Mark updated as false after after the inbox has been refreshed
     if controller.read().updated {
-        controller.write().updated = false;
+        controller.write_silent().updated = false;
     }
 
     let inbox = inbox.read();

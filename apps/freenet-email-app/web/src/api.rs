@@ -1,6 +1,6 @@
-use std::{cell::RefCell, collections::HashMap, io::Read, sync::OnceLock};
+use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
 
-use crate::app::{ContractType, DelegateType, InboxController};
+use crate::app::{ContractType, InboxController};
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use futures::SinkExt;
 use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
@@ -146,49 +146,49 @@ impl From<WebApiRequestClient> for NodeResponses {
 }
 
 #[cfg(feature = "use-node")]
-mod contract_management {
+mod contract_api {
     use super::*;
     use locutus_stdlib::{client_api::ContractRequest, prelude::*};
 
-    pub async fn create_contract(
+    pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
         contract_code: &[u8],
-        contract_state: &[u8],
+        contract_state: impl Into<Vec<u8>>,
         params: &Parameters<'static>,
-    ) -> Result<(), DynError> {
+    ) -> Result<ContractKey, DynError> {
         let contract = ContractContainer::try_from((contract_code.to_vec(), params))?;
-        let state = contract_state.to_vec().into();
+        let key = contract.key();
+        let state = contract_state.into().into();
         let request = ContractRequest::Put {
             contract,
             state,
             related_contracts: Default::default(),
         };
         client.send(request.into()).await?;
-        Ok(())
+        Ok(key)
     }
 }
 
 #[cfg(feature = "use-node")]
-mod delegate_management {
+mod delegate_api {
     use super::*;
     use ::identity_management::*;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
 
-    pub async fn create_delegate(
+    pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
         delegate_code_hash: &str,
-        delegate_code: Vec<u8>,
+        delegate_code: impl Into<Vec<u8>>,
         params: &Parameters<'static>,
-    ) -> Result<(), DynError> {
-        let key = DelegateKey::from_params(delegate_code_hash, &params)?;
-        let delegate = Delegate::from((&DelegateCode::from(delegate_code), params));
+    ) -> Result<DelegateKey, DynError> {
+        let key = DelegateKey::from_params(delegate_code_hash, params)?;
+        let delegate = Delegate::from((&DelegateCode::from(delegate_code.into()), params));
         assert_eq!(&key, delegate.key());
         let request = ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
             delegate,
             cipher: DelegateRequest::DEFAULT_CIPHER,
             nonce: DelegateRequest::DEFAULT_NONCE,
         });
-        crate::log::debug!("creating identity manager with key: {key}");
         client.send(request).await?;
         let request = DelegateRequest::ApplicationMessages {
             params: params.clone(),
@@ -198,61 +198,83 @@ mod delegate_management {
                     (&IdentityMsg::Init).try_into()?,
                 ),
             )],
-            key,
+            key: key.clone(),
         };
         client.send(request.into()).await?;
-        Ok(())
+        Ok(key)
     }
 }
 
 #[cfg(feature = "use-node")]
 mod inbox_management {
     use super::*;
-    use freenet_email_inbox::InboxParams;
+    use freenet_email_inbox::{InboxParams, InboxSettings};
     use locutus_stdlib::prelude::*;
     use rsa::RsaPrivateKey;
 
     const INBOX_CODE: &[u8] =
         include_bytes!("../../contracts/inbox/build/locutus/freenet_email_inbox");
-    const INBOX_STATE: &[u8] = include_bytes!("../../contracts/inbox/build/locutus/contract-state");
+
+    thread_local! {
+        pub(super) static CREATED_INBOX: RefCell<Vec<ContractKey>> = RefCell::new(Vec::new());
+    }
 
     pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
         key: Vec<u8>,
-    ) -> Result<(), DynError> {
+    ) -> Result<ContractKey, DynError> {
         let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
         let pub_key = private_key.to_public_key();
         let params: Parameters = InboxParams { pub_key }.try_into()?;
-
-        contract_management::create_contract(client, INBOX_CODE, INBOX_STATE, &params).await
+        let state = {
+            let inbox =
+                freenet_email_inbox::Inbox::new(&private_key, InboxSettings::default(), Vec::new());
+            inbox.serialize()?
+        };
+        let key = contract_api::create_contract(client, INBOX_CODE, state, &params).await?;
+        super::identity_management::PENDING_CONFIRMATION.with(|pend| {
+            let pend = &mut *pend.borrow_mut();
+            let pend = pend.entry(private_key).or_default();
+            pend.inbox_key = Some(key.clone());
+        });
+        Ok(key)
     }
 }
 
 #[cfg(feature = "use-node")]
-mod token_allocation_management {
+mod token_record_management {
     use super::*;
-    use locutus_aft_interface::TokenDelegateParameters;
+    use locutus_aft_interface::{TokenAllocationRecord, TokenDelegateParameters};
     use locutus_stdlib::prelude::*;
     use rsa::RsaPrivateKey;
 
-    const TOKEN_ALLOCATION_CODE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/locutus/locutus_token_allocation_record");
-    const TOKEN_ALLOCATION_STATE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/locutus/contract-state");
+    const TOKEN_RECORD_CODE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/locutus/locutus_token_allocation_record");
+
+    thread_local! {
+        pub(super) static CREATED_AFT_RECORD: RefCell<Vec<ContractKey>> = RefCell::new(Vec::new());
+    }
 
     pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
         key: Vec<u8>,
-    ) -> Result<(), DynError> {
+    ) -> Result<ContractKey, DynError> {
         let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
         let pub_key = private_key.to_public_key();
         let params: Parameters = TokenDelegateParameters::new(pub_key).try_into()?;
 
-        contract_management::create_contract(
+        let key = contract_api::create_contract(
             client,
-            TOKEN_ALLOCATION_CODE,
-            TOKEN_ALLOCATION_STATE,
+            TOKEN_RECORD_CODE,
+            TokenAllocationRecord::default().serialized()?,
             &params,
         )
-        .await
+        .await?;
+        super::identity_management::PENDING_CONFIRMATION.with(|pend| {
+            let pend = &mut *pend.borrow_mut();
+            let pend = pend.entry(private_key).or_default();
+            pend.aft_rec = Some(key.clone());
+        });
+        Ok(key)
     }
 }
 
@@ -260,35 +282,44 @@ mod token_allocation_management {
 mod token_generator_management {
     use super::*;
     use locutus_aft_interface::DelegateParameters;
+    use locutus_stdlib::prelude::DelegateKey;
     use rsa::RsaPrivateKey;
 
-    const ID_MANAGER_CODE_HASH: &str =
-        include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
-    const ID_MANAGER_CODE: &[u8] =
-        include_bytes!("../../../../modules/identity-management/build/locutus/identity_management");
+    const TOKEN_GEN_CODE_HASH: &str =
+        include_str!("../../../../modules/antiflood-tokens/delegates/token-generator/build/token_generator_code_hash");
+    const TOKEN_GEN_CODE: &[u8] =
+        include_bytes!("../../../../modules/antiflood-tokens/delegates/token-generator/build/locutus/locutus_token_generator");
+
+    thread_local! {
+        pub(super) static CREATED_AFT_GEN: RefCell<Vec<DelegateKey>> = RefCell::new(Vec::new());
+    }
 
     pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
         key: Vec<u8>,
-    ) -> Result<(), DynError> {
+    ) -> Result<DelegateKey, DynError> {
         let private_key: RsaPrivateKey = serde_json::from_slice(&key)?;
-        let params = DelegateParameters::new(private_key).try_into()?;
-        delegate_management::create_delegate(
-            client,
-            ID_MANAGER_CODE_HASH,
-            ID_MANAGER_CODE.to_vec(),
-            &params,
-        )
-        .await
+        let params = DelegateParameters::new(private_key.clone()).try_into()?;
+        let key =
+            delegate_api::create_delegate(client, TOKEN_GEN_CODE_HASH, TOKEN_GEN_CODE, &params)
+                .await?;
+        super::identity_management::PENDING_CONFIRMATION.with(|pend| {
+            let pend = &mut *pend.borrow_mut();
+            let pend = pend.entry(private_key).or_default();
+            pend.aft_gen = Some(key.clone());
+        });
+        Ok(key)
     }
 }
 
 #[cfg(feature = "use-node")]
 mod identity_management {
+    use std::rc::Rc;
+
     use super::*;
-    use crate::app::DelegateType;
     use ::identity_management::*;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
+    use rsa::RsaPrivateKey;
 
     const ID_MANAGER_CODE_HASH: &str =
         include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
@@ -296,16 +327,12 @@ mod identity_management {
         include_bytes!("../../../../modules/identity-management/build/locutus/identity_management");
     const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
 
-    pub(super) async fn create_delegate(client: &mut WebApiRequestClient) -> Result<(), DynError> {
+    pub(super) async fn create_delegate(
+        client: &mut WebApiRequestClient,
+    ) -> Result<DelegateKey, DynError> {
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let params = params.try_into()?;
-        delegate_management::create_delegate(
-            client,
-            ID_MANAGER_CODE_HASH,
-            ID_MANAGER_CODE.to_vec(),
-            &params,
-        )
-        .await
+        delegate_api::create_delegate(client, ID_MANAGER_CODE_HASH, ID_MANAGER_CODE, &params).await
     }
 
     pub(super) async fn load_aliases(
@@ -327,7 +354,7 @@ mod identity_management {
 
     pub(super) async fn create_alias(
         client: &mut WebApiRequestClient,
-        alias: String,
+        alias: Rc<str>,
         key: Vec<u8>,
         extra: String,
     ) -> Result<(), DynError> {
@@ -336,7 +363,7 @@ mod identity_management {
         let params = params.try_into()?;
         let delegate_key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
         let msg = IdentityMsg::CreateIdentity {
-            alias,
+            alias: alias.to_string(),
             key,
             extra: Some(extra),
         };
@@ -349,6 +376,26 @@ mod identity_management {
         };
         client.send(request.into()).await?;
         Ok(())
+    }
+
+    #[derive(Default)]
+    pub(super) struct NewIdentity {
+        pub created_inbox: bool,
+        pub inbox_key: Option<ContractKey>,
+        pub created_aft_rec: bool,
+        pub aft_rec: Option<ContractKey>,
+        pub created_aft_gen: bool,
+        pub aft_gen: Option<DelegateKey>,
+    }
+
+    impl NewIdentity {
+        pub fn created(&self) -> bool {
+            self.created_inbox && self.created_aft_gen && self.created_aft_rec
+        }
+    }
+
+    thread_local! {
+        pub(super) static PENDING_CONFIRMATION: RefCell<HashMap<RsaPrivateKey, NewIdentity>> = RefCell::new(HashMap::new());
     }
 }
 
@@ -395,6 +442,7 @@ pub(crate) async fn node_comms(
     let identities_key = identity_management::load_aliases(&mut req_sender)
         .await
         .unwrap();
+    //todo don't unwrap, propagate errors to the UI somehow
     WEB_API_SENDER.set(req_sender).unwrap();
 
     static IDENTITIES_KEY: OnceLock<DelegateKey> = OnceLock::new();
@@ -419,14 +467,8 @@ pub(crate) async fn node_comms(
                         .await;
                     }
                     Ok(key) => {
-                        waiting_updates.entry(key).or_insert(identity);
+                        waiting_updates.entry(key).or_insert(*identity);
                     }
-                }
-            }
-            NodeAction::LoadIdentities => {
-                match identity_management::load_aliases(&mut client).await {
-                    Ok(_) => {}
-                    Err(e) => crate::log::error(format!("{e}"), Some(TryNodeAction::LoadAliases)),
                 }
             }
             NodeAction::CreateIdentity {
@@ -440,14 +482,22 @@ pub(crate) async fn node_comms(
                     Ok(_) => {}
                     Err(e) => crate::log::error(
                         format!("{e}"),
-                        Some(TryNodeAction::CreateIdentity(alias)),
+                        Some(TryNodeAction::CreateIdentity(alias.to_string())),
                     ),
                 }
             }
-            NodeAction::CreateContract { key, contract_type } => match contract_type {
+            NodeAction::CreateContract {
+                key,
+                contract_type,
+                alias,
+            } => match contract_type {
                 ContractType::InboxContract => {
                     match inbox_management::create_contract(&mut client, key).await {
-                        Ok(_) => {}
+                        Ok(key) => {
+                            inbox_management::CREATED_INBOX.with(|k| {
+                                k.borrow_mut().push(key);
+                            });
+                        }
                         Err(e) => crate::log::error(
                             format!("{e}"),
                             Some(TryNodeAction::CreateContract(contract_type)),
@@ -455,8 +505,12 @@ pub(crate) async fn node_comms(
                     }
                 }
                 ContractType::AFTContract => {
-                    match token_allocation_management::create_contract(&mut client, key).await {
-                        Ok(_) => {}
+                    match token_record_management::create_contract(&mut client, key).await {
+                        Ok(key) => {
+                            token_record_management::CREATED_AFT_RECORD.with(|k| {
+                                k.borrow_mut().push(key);
+                            });
+                        }
                         Err(e) => crate::log::error(
                             format!("{e}"),
                             Some(TryNodeAction::CreateContract(contract_type)),
@@ -464,26 +518,18 @@ pub(crate) async fn node_comms(
                     }
                 }
             },
-            NodeAction::CreateDelegate { key, delegate_type } => match delegate_type {
-                DelegateType::AFTDelegate => {
-                    match token_generator_management::create_delegate(&mut client, key).await {
-                        Ok(_) => {}
-                        Err(e) => crate::log::error(
-                            format!("{e}"),
-                            Some(TryNodeAction::CreateDelegate(delegate_type)),
-                        ),
+            NodeAction::CreateDelegate { key, alias } => {
+                match token_generator_management::create_delegate(&mut client, key).await {
+                    Ok(key) => {
+                        token_generator_management::CREATED_AFT_GEN.with(|k| {
+                            k.borrow_mut().push(key);
+                        });
+                    }
+                    Err(e) => {
+                        crate::log::error(format!("{e}"), Some(TryNodeAction::CreateDelegate))
                     }
                 }
-                DelegateType::IdentityDelegate => {
-                    match identity_management::create_delegate(&mut client).await {
-                        Ok(_) => {}
-                        Err(e) => crate::log::error(
-                            format!("{e}"),
-                            Some(TryNodeAction::CreateDelegate(delegate_type)),
-                        ),
-                    }
-                }
-            },
+            }
         }
     }
 
@@ -530,8 +576,6 @@ pub(crate) async fn node_comms(
                                 }
                             }
                             RequestError::DelegateError(error) => {
-                                // if let DelegateError::MissingSecret { key, secret } = &error {
-                                // }
                                 crate::log::error(
                                     format!("received delegate request error: {error}"),
                                     None,
@@ -681,7 +725,88 @@ pub(crate) async fn node_comms(
                     token_rec_to_id.insert(key, identity.clone());
                 }
             }
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                let found = inbox_management::CREATED_INBOX.with(|keys| {
+                    let pos = keys.borrow().iter().position(|k| k == &key);
+                    if let Some(pos) = pos {
+                        let key = keys.borrow_mut().remove(pos);
+                        crate::log::debug!("contract {key} put");
+                        return true;
+                    }
+                    false
+                });
+                if found {
+                    identity_management::PENDING_CONFIRMATION.with(|pend| {
+                        if let Some(id) = pend
+                            .borrow_mut()
+                            .values_mut()
+                            .find(|id| id.inbox_key.as_ref() == Some(&key))
+                        {
+                            id.created_inbox = true;
+                            if id.created() {
+                                crate::log::debug!("created identity");
+                            }
+                        }
+                    });
+                    return;
+                }
+                let found = token_record_management::CREATED_AFT_RECORD.with(|keys| {
+                    let pos = keys.borrow().iter().position(|k| k == &key);
+                    if let Some(pos) = pos {
+                        let key = keys.borrow_mut().remove(pos);
+                        crate::log::debug!("contract {key} put");
+                        return true;
+                    }
+                    false
+                });
+                if found {
+                    identity_management::PENDING_CONFIRMATION.with(|pend| {
+                        if let Some(id) = pend
+                            .borrow_mut()
+                            .values_mut()
+                            .find(|id| id.aft_rec.as_ref() == Some(&key))
+                        {
+                            id.created_aft_rec = true;
+                            crate::log::debug!("");
+                            if id.created() {
+                                crate::log::debug!("created identity");
+                            }
+                        }
+                    });
+                }
+            }
             HostResponse::DelegateResponse { key, values } => {
+                if values.is_empty() && &key == IDENTITIES_KEY.get().unwrap() {
+                    // may have updated with new alias, refresh identities
+                    identity_management::load_aliases(&mut client)
+                        .await
+                        .unwrap();
+                    //todo don't unwrap, propagate errors to the UI somehow
+                } else if values.is_empty() {
+                    let found = token_generator_management::CREATED_AFT_GEN.with(|keys| {
+                        let pos = keys.borrow().iter().position(|k| k == &key);
+                        if let Some(pos) = pos {
+                            let key = keys.borrow_mut().remove(pos);
+                            crate::log::debug!("delegate {key} put");
+                            return true;
+                        }
+                        false
+                    });
+                    if found {
+                        identity_management::PENDING_CONFIRMATION.with(|pend| {
+                            if let Some(id) = pend
+                                .borrow_mut()
+                                .values_mut()
+                                .find(|id| id.aft_gen.as_ref() == Some(&key))
+                            {
+                                id.created_aft_gen = true;
+                                if id.created() {
+                                    crate::log::debug!("created identity");
+                                }
+                            }
+                        });
+                    }
+                }
                 for msg in values {
                     match msg {
                         locutus_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
@@ -742,7 +867,13 @@ pub(crate) async fn node_comms(
                                     payload.as_ref(),
                                 )
                                 .unwrap();
-                                crate::log::debug!("received identities: {manager:?}");
+                                crate::log::debug!(
+                                    "received identities: {:?}",
+                                    manager
+                                        .get_info()
+                                        .map(|(alias, _)| alias)
+                                        .collect::<Vec<_>>()
+                                );
                                 login_controller.write().updated = true;
                                 crate::app::Alias::set_aliases(manager);
                             } else {
@@ -809,6 +940,7 @@ pub(crate) async fn node_response_error_handling(
     res: Result<(), DynError>,
     action: TryNodeAction,
 ) {
+    // todo: all errors should be handled properly and propagated to the UI if fitting
     if let Err(error) = res {
         crate::log::error(format!("{error}"), Some(action.clone()));
         error_channel
@@ -830,10 +962,9 @@ pub(crate) enum TryNodeAction {
     SendMessage,
     RemoveMessages,
     GetAlias,
-    LoadAliases,
     CreateIdentity(String),
     CreateContract(ContractType),
-    CreateDelegate(DelegateType),
+    CreateDelegate,
 }
 
 impl std::fmt::Display for TryNodeAction {
@@ -844,13 +975,12 @@ impl std::fmt::Display for TryNodeAction {
             TryNodeAction::SendMessage => write!(f, "sending message"),
             TryNodeAction::RemoveMessages => write!(f, "removing messages"),
             TryNodeAction::GetAlias => write!(f, "get alias"),
-            TryNodeAction::LoadAliases => write!(f, "load aliases"),
             TryNodeAction::CreateIdentity(alias) => write!(f, "create alias {alias}"),
             TryNodeAction::CreateContract(contract_type) => {
                 write!(f, "creating contract {contract_type}")
             }
-            TryNodeAction::CreateDelegate(delegate_type) => {
-                write!(f, "creating delegate {delegate_type}")
+            TryNodeAction::CreateDelegate => {
+                write!(f, "creating AFT delegate")
             }
         }
     }

@@ -166,7 +166,10 @@ impl DelegateInterface for IdentityManagement {
             }) => {
                 #[cfg(all(target_family = "wasm", feature = "contract"))]
                 {
-                    locutus_stdlib::log::info(&format!("got request for {}", params.as_secret_id()));
+                    locutus_stdlib::log::info(&format!(
+                        "got request for {}",
+                        params.as_secret_id()
+                    ));
                 }
                 if !context.as_ref().is_empty() {
                     let context = IdentityMsg::try_from(context.as_ref()).unwrap();
@@ -176,7 +179,7 @@ impl DelegateInterface for IdentityManagement {
                             manager.identities.insert(alias, AliasInfo { key, extra });
                         }
                         IdentityMsg::DeleteIdentity { alias } => {
-                            manager.identities.remove(&alias);
+                            manager.identities.remove(alias.as_str());
                         }
                         IdentityMsg::Init => {
                             unreachable!()

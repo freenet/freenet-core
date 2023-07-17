@@ -1,12 +1,13 @@
-use std::{cell::RefCell, io::Read, rc::Rc, sync::atomic::AtomicUsize};
+use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicUsize};
 
 use dioxus::prelude::*;
 use identity_management::{AliasInfo, IdentityManagement};
 use once_cell::unsync::Lazy;
 use rand::rngs::OsRng;
+use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPrivateKey;
 
-use crate::app::{ContractType, DelegateType, User, UserId};
+use crate::app::{ContractType, User, UserId};
 use crate::DynError;
 
 use super::{InboxView, NodeAction};
@@ -131,7 +132,7 @@ pub(super) fn identities(cx: Scope) -> Element {
     let login_controller = use_shared_state::<LoginController>(cx).unwrap();
 
     if login_controller.read().updated {
-        login_controller.write().updated = false;
+        login_controller.write_silent().updated = false;
     }
 
     #[inline_props]
@@ -247,7 +248,11 @@ pub(super) fn identities(cx: Scope) -> Element {
 pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>) -> Element<'x> {
     let create_alias_form: &UseSharedState<CreateAlias> =
         use_shared_state::<CreateAlias>(cx).unwrap();
-    crate::log::debug!("create alias state");
+    let login_controller = use_shared_state::<LoginController>(cx).unwrap();
+
+    if login_controller.read().updated {
+        login_controller.write_silent().updated = false;
+    }
 
     let generate = use_state(cx, || true);
     let address = use_state(cx, String::new);
@@ -258,7 +263,6 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
             .chain(std::iter::repeat('.').take(300))
             .collect::<String>()
     });
-    crate::log::debug!("other state");
 
     cx.render(rsx! {
         div {
@@ -333,7 +337,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                 class: "button",
                 onclick: move |_|  {
                     create_alias_form.write().0 = false;
-                    let alias: String = address.get().into();
+                    let alias: Rc<str> = address.get().to_owned().into();
                     // Generate or import keypair
                     let key = match get_key(generate) {
                         Ok(k) => k,
@@ -344,15 +348,17 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                     };
                     // - create inbox contract
                     actions.send(NodeAction::CreateContract {
+                        alias: alias.clone(),
                         key: key.clone(),
                         contract_type: ContractType::InboxContract,
                     });
                     // - create AFT delegate && contract
                     actions.send(NodeAction::CreateDelegate {
+                        alias: alias.clone(),
                         key: key.clone(),
-                        delegate_type: DelegateType::AFTDelegate,
                     });
                     actions.send(NodeAction::CreateContract {
+                        alias: alias.clone(),
                         key: key.clone(),
                         contract_type: ContractType::AFTContract,
                     });
@@ -367,16 +373,22 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
 }
 
 fn get_key(generate: &UseState<bool>) -> Result<Vec<u8>, DynError> {
-    let mut key = vec![];
     if *generate.get() {
+        crate::log::debug!("generating keypair");
         let private_key =
-            RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate key");
-        key = serde_json::to_vec(&private_key)?;
-        crate::log::debug!("generated keypair {:?}", key);
+            RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate keypair");
+        crate::log::debug!(
+            "generated public key: {key}",
+            key = private_key
+                .to_public_key()
+                .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+        );
+        Ok(serde_json::to_vec(&private_key)?)
     } else {
         crate::log::debug!("importing keypair");
+        Err("importing not implemented yet".into())
     }
-    Ok(key)
 }
 
 pub(super) fn get_or_create_indentity(cx: Scope) -> Element {

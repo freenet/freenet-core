@@ -64,7 +64,7 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
     fn try_from((path, params): (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
         const VERSION_0_0_1: Version = Version::new(0, 0, 1);
 
-        let (contract_code, version) = ContractCode::load_versioned(path)?;
+        let (contract_code, version) = ContractCode::load_versioned_from_path(path)?;
 
         match version {
             version if version == VERSION_0_0_1 => Ok(ContractContainer::Wasm(WasmAPIVersion::V1(
@@ -75,12 +75,14 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
     }
 }
 
-impl<'a> TryFrom<(Vec<u8>, Parameters<'static>)> for ContractContainer {
+impl<'a, P> TryFrom<(Vec<u8>, P)> for ContractContainer
+where
+    P: std::ops::Deref<Target = Parameters<'a>>,
+{
     type Error = std::io::Error;
 
-    fn try_from(
-        (versioned_contract_bytes, params): (Vec<u8>, Parameters<'static>),
-    ) -> Result<Self, Self::Error> {
+    fn try_from((versioned_contract_bytes, params): (Vec<u8>, P)) -> Result<Self, Self::Error> {
+        let params = params.deref().clone().into_owned();
         const VERSION_0_0_1: Version = Version::new(0, 0, 1);
 
         let (contract_code, version) =
@@ -94,6 +96,7 @@ impl<'a> TryFrom<(Vec<u8>, Parameters<'static>)> for ContractContainer {
         }
     }
 }
+
 impl TryFromTsStd<&rmpv::Value> for ContractContainer {
     fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
         let container_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
