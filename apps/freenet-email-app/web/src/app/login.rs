@@ -337,7 +337,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                 class: "button",
                 onclick: move |_|  {
                     create_alias_form.write().0 = false;
-                    let alias: String = address.get().into();
+                    let alias: Rc<str> = address.get().to_owned().into();
                     // Generate or import keypair
                     let key = match get_key(generate) {
                         Ok(k) => k,
@@ -348,14 +348,17 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                     };
                     // - create inbox contract
                     actions.send(NodeAction::CreateContract {
+                        alias: alias.clone(),
                         key: key.clone(),
                         contract_type: ContractType::InboxContract,
                     });
                     // - create AFT delegate && contract
                     actions.send(NodeAction::CreateDelegate {
+                        alias: alias.clone(),
                         key: key.clone(),
                     });
                     actions.send(NodeAction::CreateContract {
+                        alias: alias.clone(),
                         key: key.clone(),
                         contract_type: ContractType::AFTContract,
                     });
@@ -370,7 +373,6 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
 }
 
 fn get_key(generate: &UseState<bool>) -> Result<Vec<u8>, DynError> {
-    let mut key = vec![];
     if *generate.get() {
         crate::log::debug!("generating keypair");
         let private_key =
@@ -382,12 +384,11 @@ fn get_key(generate: &UseState<bool>) -> Result<Vec<u8>, DynError> {
                 .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
                 .unwrap()
         );
-        key = serde_json::to_vec(&private_key)?;
+        Ok(serde_json::to_vec(&private_key)?)
     } else {
         crate::log::debug!("importing keypair");
-        return Err("importing not implemented yet".into());
+        Err("importing not implemented yet".into())
     }
-    Ok(key)
 }
 
 pub(super) fn get_or_create_indentity(cx: Scope) -> Element {

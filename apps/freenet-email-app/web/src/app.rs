@@ -25,15 +25,17 @@ pub(crate) use login::{Alias, LoginController};
 pub(crate) enum NodeAction {
     LoadMessages(Box<Identity>),
     CreateIdentity {
-        alias: String,
+        alias: Rc<str>,
         key: Vec<u8>,
         description: String,
     },
     CreateContract {
+        alias: Rc<str>,
         contract_type: ContractType,
         key: Vec<u8>,
     },
     CreateDelegate {
+        alias: Rc<str>,
         key: Vec<u8>,
     },
 }
