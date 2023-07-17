@@ -21,7 +21,7 @@ use std::{
 
 use blake2::{Blake2s256, Digest};
 use byteorder::LittleEndian;
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 
 const CONTRACT_KEY_SIZE: usize = 32;

@@ -103,9 +103,6 @@ where
 
 impl From<Box<bincode::ErrorKind>> for L0::ContractError {
     fn from(error: Box<bincode::ErrorKind>) -> Self {
-        // Convert the `Box<bincode::ErrorKind>` into a `ContractError` here.
-        // This will depend on the structure of `ContractError`.
-        // For instance, if ContractError has a variant that wraps around bincode error:
         L0::ContractError::Deser(error.to_string())
     }
 }
