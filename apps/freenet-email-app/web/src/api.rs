@@ -796,21 +796,36 @@ pub(crate) async fn node_comms(
                     None
                 });
                 if let Some(alias) = found {
-                    identity_management::PENDING_CONFIRMATION.with(|pend| {
+                    let created = identity_management::PENDING_CONFIRMATION.with(|pend| {
                         if let Some(id) = pend
                             .borrow_mut()
                             .values_mut()
                             .find(|id| id.inbox_key.as_ref() == Some(&key))
                         {
                             id.created_inbox = true;
-                            if id.created() {
-                                crate::log::debug!(
-                                    "create identity, todo: call identity_management::create_alias"
-                                );
-                            }
+                            id.created()
+                        } else {
+                            false
                         }
                     });
-                    return;
+                    if created {
+                        crate::log::debug!("created identity {alias}");
+                        let private_key: RsaPrivateKey = serde_json::from_slice(&key).unwrap();
+                        let id = identity_management::PENDING_CONFIRMATION
+                            .with(|pend| pend.borrow_mut().remove(&private_key));
+                        match identity_management::create_alias(
+                            &mut client,
+                            id.and_then(|id| id.alias_info).unwrap(),
+                        )
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => crate::log::error(
+                                format!("{e}"),
+                                Some(TryNodeAction::CreateIdentity(alias.to_string())),
+                            ),
+                        }
+                    }
                 }
                 let found = token_record_management::CREATED_AFT_RECORD.with(|keys| {
                     let pos = keys.borrow().iter().position(|k| k == &key);
@@ -822,7 +837,7 @@ pub(crate) async fn node_comms(
                     false
                 });
                 if found {
-                    identity_management::PENDING_CONFIRMATION.with(|pend| {
+                    let created = identity_management::PENDING_CONFIRMATION.with(|pend| {
                         if let Some(id) = pend
                             .borrow_mut()
                             .values_mut()
@@ -830,13 +845,31 @@ pub(crate) async fn node_comms(
                         {
                             id.created_aft_rec = true;
                             crate::log::debug!("");
-                            if id.created() {
-                                crate::log::debug!(
-                                    "create identity, todo: call identity_management::create_alias"
-                                );
-                            }
+                            id.created()
+                        } else {
+                            false
                         }
                     });
+                    if created {
+                        let private_key: RsaPrivateKey = serde_json::from_slice(&key).unwrap();
+                        let id = identity_management::PENDING_CONFIRMATION
+                            .with(|pend| pend.borrow_mut().remove(&private_key)).unwrap();
+
+                        crate::log::debug!("created identity {}", id.alias);
+
+                        match identity_management::create_alias(
+                            &mut client,
+                            id.alias_info.unwrap(),
+                        )
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => crate::log::error(
+                                format!("{e}"),
+                                Some(TryNodeAction::CreateIdentity(id.alias.to_string())),
+                            ),
+                        }
+                    }
                 }
             }
             HostResponse::DelegateResponse { key, values } => {
@@ -857,18 +890,37 @@ pub(crate) async fn node_comms(
                         false
                     });
                     if found {
-                        identity_management::PENDING_CONFIRMATION.with(|pend| {
-                            if let Some(id) = pend
+                        let (created, private_key) = identity_management::PENDING_CONFIRMATION.with(|pend| {
+                            if let Some((pk, id)) = pend
                                 .borrow_mut()
-                                .values_mut()
-                                .find(|id| id.aft_gen.as_ref() == Some(&key))
+                                .iter_mut()
+                                .find(|(pk, id)| id.aft_gen.as_ref() == Some(&key))
                             {
                                 id.created_aft_gen = true;
-                                if id.created() {
-                                    crate::log::debug!("create identity, todo: call identity_management::create_alias");
-                                }
+                                (id.created(), Some(pk.clone()))
+                            } else {
+                                (false, None)
                             }
                         });
+                        if created {
+                            let id = identity_management::PENDING_CONFIRMATION
+                                .with(|pend| pend.borrow_mut().remove(&private_key.unwrap())).unwrap();
+
+                            crate::log::debug!("created identity {}", id.alias);
+
+                            match identity_management::create_alias(
+                                &mut client,
+                                id.alias_info.unwrap(),
+                            )
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(e) => crate::log::error(
+                                    format!("{e}"),
+                                    Some(TryNodeAction::CreateIdentity(id.alias.to_string())),
+                                ),
+                            }
+                        }
                     }
                 }
                 for msg in values {
