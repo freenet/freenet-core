@@ -190,17 +190,6 @@ mod delegate_api {
             nonce: DelegateRequest::DEFAULT_NONCE,
         });
         client.send(request).await?;
-        let request = DelegateRequest::ApplicationMessages {
-            params: params.clone(),
-            inbound: vec![InboundDelegateMsg::ApplicationMessage(
-                ApplicationMessage::new(
-                    ContractInstanceId::new([0; 32]),
-                    (&IdentityMsg::Init).try_into()?,
-                ),
-            )],
-            key: key.clone(),
-        };
-        client.send(request.into()).await?;
         Ok(key)
     }
 }
@@ -342,7 +331,21 @@ mod identity_management {
     ) -> Result<DelegateKey, DynError> {
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let params = params.try_into()?;
-        delegate_api::create_delegate(client, ID_MANAGER_CODE_HASH, ID_MANAGER_CODE, &params).await
+        let key =
+            delegate_api::create_delegate(client, ID_MANAGER_CODE_HASH, ID_MANAGER_CODE, &params)
+                .await?;
+        let request = DelegateRequest::ApplicationMessages {
+            params: params.clone(),
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(
+                    ContractInstanceId::new([0; 32]),
+                    (&IdentityMsg::Init).try_into()?,
+                ),
+            )],
+            key: key.clone(),
+        };
+        client.send(request.into()).await?;
+        Ok(key)
     }
 
     pub(super) async fn load_aliases(
