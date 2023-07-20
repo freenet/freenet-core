@@ -310,6 +310,8 @@ mod identity_management {
     use ::identity_management::*;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
     use rsa::RsaPrivateKey;
+    use crate::aft::AftRecords;
+    use crate::inbox::InboxModel;
 
     const ID_MANAGER_CODE_HASH: &str =
         include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
@@ -379,8 +381,16 @@ mod identity_management {
             key: private_key,
             alias: alias.clone(),
         };
-        inbox_to_id.insert(inbox_key.unwrap(), identity.clone());
-        token_rec_to_id.insert(aft_rec.unwrap(), identity);
+        inbox_to_id.insert(inbox_key.clone().unwrap(), identity.clone());
+        token_rec_to_id.insert(aft_rec.clone().unwrap(), identity);
+
+        // Send contract subscriptions after identity creation
+        InboxModel::subscribe(&mut client.clone(), inbox_key.unwrap())
+            .await
+            .unwrap();
+        AftRecords::subscribe(&mut client.clone(), aft_rec.unwrap())
+            .await
+            .unwrap();
 
         match identity_management::create_alias_api_call(client, alias_info.unwrap()).await {
             Ok(_) => {}
@@ -804,9 +814,6 @@ pub(crate) async fn node_comms(
                     false
                 });
                 if found {
-                    InboxModel::subscribe(&mut client, contract_key.clone())
-                        .await
-                        .unwrap();
                     let created = identity_management::PENDING_CONFIRMATION.with(|pend| {
                         if let Some(id) = pend
                             .borrow_mut()
@@ -842,9 +849,6 @@ pub(crate) async fn node_comms(
                     false
                 });
                 if found {
-                    AftRecords::subscribe(&mut client, contract_key.clone())
-                        .await
-                        .unwrap();
                     let created = identity_management::PENDING_CONFIRMATION.with(|pend| {
                         if let Some(id) = pend
                             .borrow_mut()

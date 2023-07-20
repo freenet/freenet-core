@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
+use locutus_stdlib::client_api::HostResponse::DelegateResponse;
 use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractError as CoreContractError, ContractRequest,
     ContractResponse, DelegateError as CoreDelegateError, DelegateRequest, HostResponse,
@@ -353,7 +354,11 @@ impl Executor {
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
                 tracing::debug!("registering delegate `{key}");
                 match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(HostResponse::Ok),
+                    Ok(_) => Ok(DelegateResponse {
+                        key,
+                        values: Vec::new(),
+                    }
+                    .into()),
                     Err(err) => {
                         tracing::error!("failed registering delegate `{key}`: {err}");
                         Err(Either::Left(CoreDelegateError::RegisterError(key).into()))
