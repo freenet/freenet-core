@@ -495,7 +495,10 @@ impl InboxModel {
         Ok(())
     }
 
-    async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
+    pub async fn subscribe(
+        client: &mut WebApiRequestClient,
+        key: ContractKey,
+    ) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
         let summary: StateSummary = serde_json::to_vec(&InboxSummary::new(HashSet::new()))?.into();
         let request = ContractRequest::Subscribe {

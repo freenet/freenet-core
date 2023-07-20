@@ -1,5 +1,6 @@
 use std::fmt::Display;
 use std::hash::Hasher;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
@@ -8,7 +9,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use wasm_bindgen::JsValue;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
@@ -142,8 +143,9 @@ pub struct InboxController {
 pub(crate) struct UserId(usize);
 
 impl UserId {
-    pub fn new(id: usize) -> Self {
-        Self(id)
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -368,7 +370,7 @@ impl User {
 pub(crate) struct Identity {
     pub id: UserId,
     pub key: RsaPrivateKey,
-    alias: Rc<str>,
+    pub alias: Rc<str>,
 }
 
 impl Identity {

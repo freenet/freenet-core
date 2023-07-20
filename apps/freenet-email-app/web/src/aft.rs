@@ -282,7 +282,10 @@ impl AftRecords {
         Ok(())
     }
 
-    async fn subscribe(client: &mut WebApiRequestClient, key: AftRecord) -> Result<(), DynError> {
+    pub async fn subscribe(
+        client: &mut WebApiRequestClient,
+        key: AftRecord,
+    ) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
         let request = ContractRequest::Subscribe { key, summary: None };
         client.send(request.into()).await?;
