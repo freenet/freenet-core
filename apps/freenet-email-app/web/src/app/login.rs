@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicUsize};
+use std::{cell::RefCell, rc::Rc};
 
 use dioxus::prelude::*;
 use identity_management::{AliasInfo, IdentityManagement};
@@ -49,7 +49,6 @@ pub(crate) struct Alias {
 
 impl Alias {
     pub(crate) fn set_aliases(mut new_aliases: IdentityManagement) {
-        static ID: AtomicUsize = AtomicUsize::new(0);
         ALIASES.with(|aliases| {
             let aliases = &mut *aliases.borrow_mut();
             let mut to_add = Vec::new();
@@ -68,7 +67,7 @@ impl Alias {
                 let key: RsaPrivateKey = serde_json::from_slice(&info.key).unwrap();
                 to_add.push(Alias {
                     alias: alias.into(),
-                    id: UserId::new(ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)),
+                    id: UserId::new(),
                     info: Rc::new(info),
                     key,
                 })

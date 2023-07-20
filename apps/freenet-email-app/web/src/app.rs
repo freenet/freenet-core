@@ -1,5 +1,6 @@
 use std::fmt::Display;
 use std::hash::Hasher;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
@@ -8,7 +9,7 @@ use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey, RsaPublicKey};
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use wasm_bindgen::JsValue;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
@@ -142,8 +143,9 @@ pub struct InboxController {
 pub(crate) struct UserId(usize);
 
 impl UserId {
-    pub fn new(id: usize) -> Self {
-        Self(id)
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -318,8 +320,7 @@ struct User {
 }
 
 impl User {
-    // todo: enable feature gates after impl the other `use-node` version
-    // #[cfg(feature = "ui-testing")]
+    #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
     fn new() -> Self {
         const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
         const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
@@ -345,10 +346,15 @@ impl User {
         }
     }
 
-    // #[cfg(all(not(feature = "ui-testing"), feature = "use-node"))]
-    // fn new() -> Self {
-    //     // TODO: here we should load the user identities from the identity component
-    // }
+    #[cfg(feature = "use-node")]
+    fn new() -> Self {
+        User {
+            logged: false,
+            identified: true,
+            active_id: None,
+            identities: vec![],
+        }
+    }
 
     fn logged_id(&self) -> Option<&Identity> {
         self.active_id.and_then(|id| self.identities.get(id.0))
@@ -364,7 +370,7 @@ impl User {
 pub(crate) struct Identity {
     pub id: UserId,
     pub key: RsaPrivateKey,
-    alias: Rc<str>,
+    pub alias: Rc<str>,
 }
 
 impl Identity {
@@ -723,7 +729,7 @@ fn new_message_window(cx: Scope) -> Element {
     let alias = user_alias.to_string();
     let send_msg = move |_| {
         let to = to.get();
-        // fixme: this will   ahve to come from the address book in the future
+        // fixme: this will have to come from the address book in the future
         let receiver_public_key = match Alias::get_alias(to) {
             Some(v) => v.key.to_public_key(),
             None => {
