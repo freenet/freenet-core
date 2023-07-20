@@ -723,7 +723,7 @@ fn new_message_window(cx: Scope) -> Element {
     let alias = user_alias.to_string();
     let send_msg = move |_| {
         let to = to.get();
-        // fixme: this will   ahve to come from the address book in the future
+        // fixme: this will have to come from the address book in the future
         let receiver_public_key = match Alias::get_alias(to) {
             Some(v) => v.key.to_public_key(),
             None => {

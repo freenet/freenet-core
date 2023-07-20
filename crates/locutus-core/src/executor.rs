@@ -170,8 +170,6 @@ impl Executor {
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
 
-                tracing::debug!("executing with params: {:?}", params);
-
                 if self.mode == OperationMode::Local {
                     for (id, related) in related_contracts.update() {
                         let Ok(contract) = self.contract_state.get(&(*id).into()).await else {

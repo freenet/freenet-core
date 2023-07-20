@@ -365,7 +365,22 @@ mod identity_management {
         Ok(key)
     }
 
-    pub(super) async fn create_alias(
+    pub(super) async fn alias_creation(client: &mut WebApiRequestClient, private_key: &[u8]) {
+        let private_key: RsaPrivateKey = serde_json::from_slice(private_key).unwrap();
+        let id = identity_management::PENDING_CONFIRMATION
+            .with(|pend| pend.borrow_mut().remove(&private_key));
+        let id = id.and_then(|id| id.alias_info).unwrap();
+        let alias = id.alias.clone();
+        match identity_management::create_alias_api_call(client, id).await {
+            Ok(_) => {}
+            Err(e) => crate::log::error(
+                format!("{e}"),
+                Some(TryNodeAction::CreateIdentity(alias.to_string())),
+            ),
+        }
+    }
+
+    async fn create_alias_api_call(
         client: &mut WebApiRequestClient,
         alias_info: AliasInfo,
     ) -> Result<(), DynError> {
@@ -424,7 +439,10 @@ mod identity_management {
         }
 
         pub fn created(&self) -> bool {
-            self.created_inbox && self.created_aft_gen && self.created_aft_rec
+            self.created_inbox
+                && self.created_aft_gen
+                && self.created_aft_rec
+                && self.alias_info.is_some()
         }
     }
 
@@ -452,7 +470,6 @@ pub(crate) async fn node_comms(
         client_api::{ContractError, ContractResponse, DelegateError, ErrorKind, RequestError},
         prelude::*,
     };
-    use rsa::RsaPrivateKey;
 
     use crate::{
         aft::AftRecords,
@@ -462,7 +479,6 @@ pub(crate) async fn node_comms(
 
     let mut inbox_contract_to_id = HashMap::new();
     let mut token_contract_to_id = HashMap::new();
-    // let mut id_to_token_contract = HashMap::new();
     let mut api = WebApi::new()
         .map_err(|err| {
             crate::log::error(format!("error while connecting to node: {err}"), None);
@@ -528,22 +544,7 @@ pub(crate) async fn node_comms(
                     }
                 });
                 if created {
-                    crate::log::debug!("created identity {alias}");
-                    let private_key: RsaPrivateKey = serde_json::from_slice(&key).unwrap();
-                    let id = identity_management::PENDING_CONFIRMATION
-                        .with(|pend| pend.borrow_mut().remove(&private_key));
-                    match identity_management::create_alias(
-                        &mut client,
-                        id.and_then(|id| id.alias_info).unwrap(),
-                    )
-                    .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => crate::log::error(
-                            format!("{e}"),
-                            Some(TryNodeAction::CreateIdentity(alias.to_string())),
-                        ),
-                    }
+                    identity_management::alias_creation(&mut client, &key).await;
                 }
             }
             NodeAction::CreateContract {
@@ -791,11 +792,11 @@ pub(crate) async fn node_comms(
                     if let Some(pos) = pos {
                         let (alias, key) = keys.borrow_mut().remove(pos);
                         crate::log::debug!("contract {key} for alias {alias} put");
-                        return Some(alias);
+                        return true;
                     }
-                    None
+                    false
                 });
-                if let Some(alias) = found {
+                if found {
                     let created = identity_management::PENDING_CONFIRMATION.with(|pend| {
                         if let Some(id) = pend
                             .borrow_mut()
@@ -803,28 +804,15 @@ pub(crate) async fn node_comms(
                             .find(|id| id.inbox_key.as_ref() == Some(&key))
                         {
                             id.created_inbox = true;
-                            id.created()
+                            id.created().then(|| {
+                                id.alias_info.as_ref().map(|info| info.key.clone()).unwrap()
+                            })
                         } else {
-                            false
+                            None
                         }
                     });
-                    if created {
-                        crate::log::debug!("created identity {alias}");
-                        let private_key: RsaPrivateKey = serde_json::from_slice(&key).unwrap();
-                        let id = identity_management::PENDING_CONFIRMATION
-                            .with(|pend| pend.borrow_mut().remove(&private_key));
-                        match identity_management::create_alias(
-                            &mut client,
-                            id.and_then(|id| id.alias_info).unwrap(),
-                        )
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => crate::log::error(
-                                format!("{e}"),
-                                Some(TryNodeAction::CreateIdentity(alias.to_string())),
-                            ),
-                        }
+                    if let Some(key) = created {
+                        identity_management::alias_creation(&mut client, &key).await;
                     }
                 }
                 let found = token_record_management::CREATED_AFT_RECORD.with(|keys| {
@@ -844,31 +832,15 @@ pub(crate) async fn node_comms(
                             .find(|id| id.aft_rec.as_ref() == Some(&key))
                         {
                             id.created_aft_rec = true;
-                            crate::log::debug!("");
-                            id.created()
+                            id.created().then(|| {
+                                id.alias_info.as_ref().map(|info| info.key.clone()).unwrap()
+                            })
                         } else {
-                            false
+                            None
                         }
                     });
-                    if created {
-                        let private_key: RsaPrivateKey = serde_json::from_slice(&key).unwrap();
-                        let id = identity_management::PENDING_CONFIRMATION
-                            .with(|pend| pend.borrow_mut().remove(&private_key)).unwrap();
-
-                        crate::log::debug!("created identity {}", id.alias);
-
-                        match identity_management::create_alias(
-                            &mut client,
-                            id.alias_info.unwrap(),
-                        )
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => crate::log::error(
-                                format!("{e}"),
-                                Some(TryNodeAction::CreateIdentity(id.alias.to_string())),
-                            ),
-                        }
+                    if let Some(key) = created {
+                        identity_management::alias_creation(&mut client, &key).await;
                     }
                 }
             }
@@ -890,36 +862,22 @@ pub(crate) async fn node_comms(
                         false
                     });
                     if found {
-                        let (created, private_key) = identity_management::PENDING_CONFIRMATION.with(|pend| {
-                            if let Some((pk, id)) = pend
+                        let private_key = identity_management::PENDING_CONFIRMATION.with(|pend| {
+                            if let Some(id) = pend
                                 .borrow_mut()
-                                .iter_mut()
-                                .find(|(pk, id)| id.aft_gen.as_ref() == Some(&key))
+                                .values_mut()
+                                .find(|id| id.aft_gen.as_ref() == Some(&key))
                             {
                                 id.created_aft_gen = true;
-                                (id.created(), Some(pk.clone()))
+                                id.created().then(|| {
+                                    id.alias_info.as_ref().map(|info| info.key.clone()).unwrap()
+                                })
                             } else {
-                                (false, None)
+                                None
                             }
                         });
-                        if created {
-                            let id = identity_management::PENDING_CONFIRMATION
-                                .with(|pend| pend.borrow_mut().remove(&private_key.unwrap())).unwrap();
-
-                            crate::log::debug!("created identity {}", id.alias);
-
-                            match identity_management::create_alias(
-                                &mut client,
-                                id.alias_info.unwrap(),
-                            )
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(e) => crate::log::error(
-                                    format!("{e}"),
-                                    Some(TryNodeAction::CreateIdentity(id.alias.to_string())),
-                                ),
-                            }
+                        if let Some(key) = private_key {
+                            identity_management::alias_creation(&mut client, &key).await;
                         }
                     }
                 }
