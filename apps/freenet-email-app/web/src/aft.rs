@@ -210,7 +210,11 @@ impl AftRecords {
         // todo: optimize so we don't clone the whole record and instead use a smart pointer
         let Some(records) = RECORDS.with(|recs| recs.borrow().get(generator_id).cloned()) else {
             // todo: somehow propagate this to the UI so the user retries /or we retry automatically/ later
-            return Err(format!("failed to get token record for id: {}", generator_id.alias()).into())
+            return Err(
+                format!("failed to get token record for alias `{alias}` ({key})", 
+                alias = generator_id.alias(), 
+                key = token_record).into()
+            )
         };
         let token_request = TokenDelegateMessage::RequestNewToken(RequestNewToken {
             request_id: REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -235,7 +239,11 @@ impl AftRecords {
         Ok(delegate_key)
     }
 
-    pub fn set(identity: Identity, state: State<'_>) -> Result<(), DynError> {
+    pub fn set(identity: Identity, state: State<'_>, key: &ContractKey) -> Result<(), DynError> {
+        crate::log::debug!(
+            "adding AFT record contract for `{alias}` ({key})",
+            alias = identity.alias
+        );
         let record = TokenAllocationRecord::try_from(state)?;
         RECORDS.with(|recs| {
             let recs = &mut *recs.borrow_mut();

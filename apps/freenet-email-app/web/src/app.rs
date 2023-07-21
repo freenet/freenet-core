@@ -57,8 +57,6 @@ impl Display for ContractType {
 }
 
 pub(crate) fn app(cx: Scope) -> Element {
-    crate::log::debug!("rendering app");
-
     use_shared_state_provider(cx, login::LoginController::new);
     let login_controller = use_shared_state::<login::LoginController>(cx).unwrap();
     // Initialize and fetch shared state for User, InboxController, and InboxView
@@ -68,10 +66,7 @@ pub(crate) fn app(cx: Scope) -> Element {
     let inbox_controller = use_shared_state::<InboxController>(cx).unwrap();
     use_shared_state_provider(cx, InboxView::new);
     let inbox = use_shared_state::<InboxView>(cx).unwrap();
-    use_context_provider(cx, || {
-        let inbox_data_context: InboxesData = Arc::new(ArcSwap::from_pointee(vec![]));
-        inbox_data_context
-    });
+    use_context_provider(cx, InboxesData::new);
     let inbox_data = use_context::<InboxesData>(cx).unwrap();
 
     #[cfg(feature = "use-node")]
@@ -125,7 +120,22 @@ pub(crate) fn app(cx: Scope) -> Element {
     }
 }
 
-pub(crate) type InboxesData = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
+#[derive(Clone)]
+pub(crate) struct InboxesData(Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>);
+
+impl InboxesData {
+    pub fn new() -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(vec![])))
+    }
+}
+
+impl std::ops::Deref for InboxesData {
+    type Target = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct InboxView {
@@ -222,9 +232,11 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
-        inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>>,
+        inbox_data: InboxesData,
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
+        // FIXME: indexing by id fails cause all not aliases inboxes has been loaded initially
+        let inbox_data = inbox_data.load_full();
         let mut inbox = inbox_data[**self.active_id.borrow()].borrow_mut();
         inbox.remove_messages(client, ids)
     }
@@ -234,7 +246,7 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
-        inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>>,
+        inbox_data: InboxesData,
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         {
             let messages = &mut *self.messages.borrow_mut();
@@ -575,8 +587,8 @@ fn inbox_component(cx: Scope) -> Element {
         let current_active_id: UserId = user.read().active_id.unwrap();
         // reload if there were new emails received
         let all_data = inbox_data.load_full();
-        crate::log::debug!("rendering");
         if let Some((current_model, id)) = all_data.iter().find_map(|ib| {
+            crate::log::debug!("trying to get identity for {key}", key = &ib.borrow().key);
             let id = crate::inbox::InboxModel::contract_identity(&ib.borrow().key).unwrap();
             (id.id == current_active_id).then(|| (ib, id))
         }) {
@@ -664,8 +676,7 @@ fn open_message(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
     let inbox = use_shared_state::<InboxView>(cx).unwrap();
-    let inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>> =
-        use_context::<InboxesData>(cx).unwrap().load_full();
+    let inbox_data = use_context::<InboxesData>(cx).unwrap();
     let email = cx.props;
     let email_id = [cx.props.id];
 

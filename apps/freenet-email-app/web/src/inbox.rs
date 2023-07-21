@@ -344,7 +344,11 @@ impl InboxModel {
         INBOX_TO_ID.with(|map| map.borrow().get(key).cloned())
     }
 
-    pub fn add_identity(key: InboxContract, identity: Identity) {
+    pub fn add_identity_contract(key: InboxContract, identity: Identity) {
+        crate::log::debug!(
+            "adding inbox contract for `{alias}` ({key})",
+            alias = identity.alias
+        );
         INBOX_TO_ID.with(|map| map.borrow_mut().insert(key, identity));
     }
 

@@ -731,7 +731,7 @@ pub(crate) async fn node_comms(
                         let mut current = (*loaded_models[pos]).borrow_mut();
                         *current = updated_model;
                     } else {
-                        crate::log::debug!("updated inbox {key}");
+                        crate::log::debug!("loaded inbox {key}");
                         let mut with_new = (***loaded_models).to_vec();
                         std::mem::drop(loaded_models);
                         with_new.push(Rc::new(RefCell::new(updated_model)));
@@ -744,12 +744,16 @@ pub(crate) async fn node_comms(
                             crate::log::debug!("loaded inboxes: {keys}");
                         }
                         inboxes.store(Arc::new(with_new));
+                        crate::inbox::InboxModel::add_identity_contract(
+                            key.clone(),
+                            identity.clone(),
+                        );
                     }
                     inbox_to_id.insert(key, identity);
                 } else if let Some(identity) = token_rec_to_id.remove(&key) {
                     crate::log::debug!("updating AFT record for {identity}");
                     // is a AFT record contract
-                    if let Err(e) = AftRecords::set(identity.clone(), state.into()) {
+                    if let Err(e) = AftRecords::set(identity.clone(), state.into(), &key) {
                         crate::log::error(format!("error setting an AFT record: {e}"), None);
                     }
                     token_rec_to_id.insert(key, identity);
@@ -1033,7 +1037,7 @@ pub(crate) async fn node_comms(
                                         )
                                         .unwrap();
                                     inbox_to_id.insert(inbox_key.clone(), identity.clone());
-                                    crate::inbox::InboxModel::add_identity(
+                                    crate::inbox::InboxModel::add_identity_contract(
                                         inbox_key,
                                         identity.clone(),
                                     );
