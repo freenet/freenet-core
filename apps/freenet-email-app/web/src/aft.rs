@@ -64,7 +64,7 @@ impl AftRecords {
         contract_to_id: &mut HashMap<AftRecord, Identity>,
     ) {
         for identity in contracts {
-            let r = Self::load_contract(client, identity).await;
+            let r = Self::load_contract(client, identity, contract_to_id).await;
             if let Ok(key) = &r {
                 contract_to_id.insert(key.clone(), identity.clone());
             }
@@ -80,6 +80,7 @@ impl AftRecords {
     async fn load_contract(
         client: &mut WebApiRequestClient,
         identity: &Identity,
+        contract_to_id: &HashMap<AftRecord, Identity>,
     ) -> Result<AftRecord, DynError> {
         let params = TokenDelegateParameters::new(identity.key.to_public_key())
             .try_into()
@@ -91,7 +92,9 @@ impl AftRecords {
         crate::log::debug!(
             "subscribing to AFT updates for `{contract_key}`, belonging to alias `{alias}`"
         );
-        Self::subscribe(client, contract_key.clone()).await?;
+        if !contract_to_id.contains_key(&contract_key) {
+            Self::subscribe(client, contract_key.clone()).await?;
+        }
         Ok(contract_key)
     }
 
@@ -212,7 +215,7 @@ impl AftRecords {
             // todo: somehow propagate this to the UI so the user retries /or we retry automatically/ later
             return Err(
                 format!("failed to get token record for alias `{alias}` ({key})", 
-                alias = generator_id.alias(), 
+                alias = generator_id.alias(),
                 key = token_record).into()
             )
         };
@@ -239,9 +242,13 @@ impl AftRecords {
         Ok(delegate_key)
     }
 
-    pub fn set(identity: Identity, state: State<'_>, key: &ContractKey) -> Result<(), DynError> {
+    pub fn set_identity_contract(
+        identity: Identity,
+        state: State<'_>,
+        key: &ContractKey,
+    ) -> Result<(), DynError> {
         crate::log::debug!(
-            "adding AFT record contract for `{alias}` ({key})",
+            "setting AFT record contract for `{alias}` ({key})",
             alias = identity.alias
         );
         let record = TokenAllocationRecord::try_from(state)?;

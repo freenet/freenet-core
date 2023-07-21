@@ -621,6 +621,9 @@ impl TryFrom<StateSummary<'_>> for TokenAllocationSummary {
     type Error = ContractError;
 
     fn try_from(state: StateSummary<'_>) -> Result<Self, Self::Error> {
+        if state.as_ref().is_empty() {
+            return Ok(TokenAllocationSummary(HashMap::new()))
+        }
         let this = serde_json::from_slice(state.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)

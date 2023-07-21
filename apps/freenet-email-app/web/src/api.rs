@@ -161,6 +161,7 @@ mod contract_api {
     ) -> Result<ContractKey, DynError> {
         let contract = ContractContainer::try_from((contract_code.to_vec(), params))?;
         let key = contract.key();
+        crate::log::debug!("putting contract {key}");
         let state = contract_state.into().into();
         let request = ContractRequest::Put {
             contract,
@@ -231,15 +232,6 @@ mod inbox_management {
         });
         Ok(contract_key)
     }
-
-    pub(super) fn contract_key_from_private_key(
-        private_key: &RsaPrivateKey,
-    ) -> Result<ContractKey, DynError> {
-        let pub_key = private_key.to_public_key();
-        let params: Parameters = InboxParams { pub_key }.try_into()?;
-        let code = ContractCode::from(INBOX_CODE);
-        Ok(ContractKey::from((params, code)))
-    }
 }
 
 #[cfg(feature = "use-node")]
@@ -275,15 +267,6 @@ mod token_record_management {
             pend.aft_rec = Some(contract_key.clone());
         });
         Ok(contract_key)
-    }
-
-    pub(super) fn contract_key_from_private_key(
-        private_key: &RsaPrivateKey,
-    ) -> Result<ContractKey, DynError> {
-        let pub_key = private_key.to_public_key();
-        let params: Parameters = TokenDelegateParameters::new(pub_key).try_into()?;
-        let code = ContractCode::from(TOKEN_RECORD_CODE);
-        Ok(ContractKey::from((params, code)))
     }
 }
 
@@ -735,25 +718,28 @@ pub(crate) async fn node_comms(
                         let mut with_new = (***loaded_models).to_vec();
                         std::mem::drop(loaded_models);
                         with_new.push(Rc::new(RefCell::new(updated_model)));
-                        {
-                            let keys = with_new
-                                .iter()
-                                .map(|i| format!("{}", i.borrow().key))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            crate::log::debug!("loaded inboxes: {keys}");
-                        }
+                        crate::log::debug!(
+                            "loaded inboxes: {keys}",
+                            keys = {
+                                with_new
+                                    .iter()
+                                    .map(|i| format!("{}", i.borrow().key))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        );
                         inboxes.store(Arc::new(with_new));
-                        crate::inbox::InboxModel::add_identity_contract(
+                        crate::inbox::InboxModel::set_contract_identity(
                             key.clone(),
                             identity.clone(),
                         );
                     }
                     inbox_to_id.insert(key, identity);
                 } else if let Some(identity) = token_rec_to_id.remove(&key) {
-                    crate::log::debug!("updating AFT record for {identity}");
                     // is a AFT record contract
-                    if let Err(e) = AftRecords::set(identity.clone(), state.into(), &key) {
+                    if let Err(e) =
+                        AftRecords::set_identity_contract(identity.clone(), state.into(), &key)
+                    {
                         crate::log::error(format!("error setting an AFT record: {e}"), None);
                     }
                     token_rec_to_id.insert(key, identity);
@@ -1030,25 +1016,19 @@ pub(crate) async fn node_comms(
                                 );
                                 login_controller.write().updated = true;
                                 let identities = crate::app::Alias::set_aliases(manager, user);
-                                for identity in identities {
-                                    let inbox_key =
-                                        inbox_management::contract_key_from_private_key(
-                                            &identity.key,
-                                        )
-                                        .unwrap();
-                                    inbox_to_id.insert(inbox_key.clone(), identity.clone());
-                                    crate::inbox::InboxModel::add_identity_contract(
-                                        inbox_key,
-                                        identity.clone(),
-                                    );
 
-                                    let aft_rec_key =
-                                        token_record_management::contract_key_from_private_key(
-                                            &identity.key,
-                                        )
-                                        .unwrap();
-                                    token_rec_to_id.insert(aft_rec_key, identity.clone());
-                                }
+                                crate::inbox::InboxModel::load_all(
+                                    &mut client,
+                                    &identities,
+                                    token_rec_to_id,
+                                )
+                                .await;
+                                crate::aft::AftRecords::load_all(
+                                    &mut client,
+                                    &identities,
+                                    token_rec_to_id,
+                                )
+                                .await;
                             } else {
                                 crate::log::error(
                                     format!("received unexpected secret {secret_key} for delegate {key}"),

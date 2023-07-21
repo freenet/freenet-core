@@ -279,21 +279,14 @@ impl InboxModel {
     ) {
         async fn subscribe(
             client: &mut WebApiRequestClient,
+            contract_key: &ContractKey,
             identity: &Identity,
         ) -> Result<(), DynError> {
-            let pub_key = identity.key.to_public_key();
             let alias = identity.alias();
-            let params = freenet_email_inbox::InboxParams { pub_key }
-                .try_into()
-                .map_err(|e| format!("{e}"))?;
-            let contract_key = ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
-                .map_err(|e| format!("{e}"))?;
-            {
-                INBOX_TO_ID.with(|map| {
-                    map.borrow_mut()
-                        .insert(contract_key.clone(), identity.clone());
-                });
-            }
+            INBOX_TO_ID.with(|map| {
+                map.borrow_mut()
+                    .insert(contract_key.clone(), identity.clone());
+            });
             crate::log::debug!(
                 "subscribing to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
             );
@@ -301,11 +294,34 @@ impl InboxModel {
             Ok(())
         }
 
+        fn get_key(identity: &Identity) -> Result<ContractKey, DynError> {
+            let pub_key = identity.key.to_public_key();
+            let params = freenet_email_inbox::InboxParams { pub_key }
+                .try_into()
+                .map_err(|e| format!("{e}"))?;
+            ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
+                .map_err(|e| format!("{e}").into())
+        }
+
         for identity in contracts {
             let mut client = client.clone();
-            let res = subscribe(&mut client, identity).await;
-            node_response_error_handling(client.clone().into(), res, TryNodeAction::LoadInbox)
-                .await;
+            let contract_key = match get_key(identity) {
+                Ok(v) => v,
+                Err(e) => {
+                    node_response_error_handling(
+                        client.clone().into(),
+                        Err(e),
+                        TryNodeAction::LoadInbox,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if !contract_to_id.contains_key(&contract_key) {
+                let res = subscribe(&mut client, &contract_key, identity).await;
+                node_response_error_handling(client.clone().into(), res, TryNodeAction::LoadInbox)
+                    .await;
+            }
             let res = InboxModel::load(&mut client, identity).await.map(|key| {
                 contract_to_id
                     .entry(key.clone())
@@ -344,7 +360,7 @@ impl InboxModel {
         INBOX_TO_ID.with(|map| map.borrow().get(key).cloned())
     }
 
-    pub fn add_identity_contract(key: InboxContract, identity: Identity) {
+    pub fn set_contract_identity(key: InboxContract, identity: Identity) {
         crate::log::debug!(
             "adding inbox contract for `{alias}` ({key})",
             alias = identity.alias

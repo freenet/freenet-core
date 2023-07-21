@@ -113,7 +113,7 @@ impl Alias {
             key: private_key.clone(),
             alias: alias_info.alias.clone(),
         };
-        crate::inbox::InboxModel::add_identity_contract(inbox_key, identity.clone());
+        crate::inbox::InboxModel::set_contract_identity(inbox_key, identity.clone());
         user.write().identities.push(identity.clone());
         ALIASES.with(|aliases| {
             let aliases = &mut *aliases.borrow_mut();
