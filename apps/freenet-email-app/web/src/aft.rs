@@ -235,9 +235,6 @@ impl AftRecords {
         Ok(delegate_key)
     }
 
-    // /// Add an inbox to the list of inboxes which is waiting for a valid token to complete an update.
-    // pub fn needs_token(inbox: InboxContract) {}
-
     pub fn set(identity: Identity, state: State<'_>) -> Result<(), DynError> {
         let record = TokenAllocationRecord::try_from(state)?;
         RECORDS.with(|recs| {

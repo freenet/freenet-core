@@ -11,6 +11,9 @@ use crate::DynError;
 type ClientRequester = UnboundedSender<ClientRequest<'static>>;
 type HostResponses = UnboundedReceiver<Result<HostResponse, ClientError>>;
 
+#[cfg(feature = "use-node")]
+pub(crate) use self::identity_management::AliasInfo;
+
 pub(crate) type NodeResponses = UnboundedSender<AsyncActionResult>;
 
 pub(crate) static WEB_API_SENDER: OnceLock<WebApiRequestClient> = OnceLock::new();
@@ -228,6 +231,15 @@ mod inbox_management {
         });
         Ok(contract_key)
     }
+
+    pub(super) fn contract_key_from_private_key(
+        private_key: &RsaPrivateKey,
+    ) -> Result<ContractKey, DynError> {
+        let pub_key = private_key.to_public_key();
+        let params: Parameters = InboxParams { pub_key }.try_into()?;
+        let code = ContractCode::from(INBOX_CODE);
+        Ok(ContractKey::from((params, code)))
+    }
 }
 
 #[cfg(feature = "use-node")]
@@ -264,6 +276,15 @@ mod token_record_management {
         });
         Ok(contract_key)
     }
+
+    pub(super) fn contract_key_from_private_key(
+        private_key: &RsaPrivateKey,
+    ) -> Result<ContractKey, DynError> {
+        let pub_key = private_key.to_public_key();
+        let params: Parameters = TokenDelegateParameters::new(pub_key).try_into()?;
+        let code = ContractCode::from(TOKEN_RECORD_CODE);
+        Ok(ContractKey::from((params, code)))
+    }
 }
 
 #[cfg(feature = "use-node")]
@@ -279,7 +300,7 @@ mod token_generator_management {
         include_bytes!("../../../../modules/antiflood-tokens/delegates/token-generator/build/locutus/locutus_token_generator");
 
     thread_local! {
-        pub(super) static CREATED_AFT_GEN: RefCell<Vec<DelegateKey>> = RefCell::new(Vec::new());
+        pub(super) static CREATED_AFT_GEN: RefCell<Vec<(Rc<str>, DelegateKey)>> = RefCell::new(Vec::new());
     }
 
     pub(super) async fn create_delegate(
@@ -304,14 +325,14 @@ mod token_generator_management {
 mod identity_management {
     use std::rc::Rc;
 
-    use crate::app::{Identity, UserId};
+    use crate::app::{Alias, Identity};
 
     use super::*;
+    use crate::aft::AftRecords;
+    use crate::inbox::InboxModel;
     use ::identity_management::*;
     use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
     use rsa::RsaPrivateKey;
-    use crate::aft::AftRecords;
-    use crate::inbox::InboxModel;
 
     const ID_MANAGER_CODE_HASH: &str =
         include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
@@ -363,6 +384,7 @@ mod identity_management {
         private_key: &[u8],
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_rec_to_id: &mut HashMap<ContractKey, Identity>,
+        user: &UseSharedState<crate::app::User>,
     ) {
         let private_key: RsaPrivateKey = serde_json::from_slice(private_key).unwrap();
         let id = identity_management::PENDING_CONFIRMATION
@@ -373,16 +395,16 @@ mod identity_management {
             aft_rec,
             ..
         } = id.unwrap();
-        let alias = alias_info.as_ref().unwrap().alias.clone();
+        let alias_info = alias_info.unwrap();
         // TODO: in reality we should wait to confirm the identity manager delegate has been properly updated
         // before adding the identity
-        let identity = Identity {
-            id: UserId::new(),
-            key: private_key,
-            alias: alias.clone(),
-        };
-        inbox_to_id.insert(inbox_key.clone().unwrap(), identity.clone());
-        token_rec_to_id.insert(aft_rec.clone().unwrap(), identity);
+        {
+            // update alias state where appropiate
+            let inbox_key = inbox_key.clone().unwrap();
+            let identity = Alias::set_alias(alias_info.clone(), inbox_key.clone(), user);
+            inbox_to_id.insert(inbox_key, identity.clone());
+            token_rec_to_id.insert(aft_rec.clone().unwrap(), identity);
+        }
 
         // Send contract subscriptions after identity creation
         InboxModel::subscribe(&mut client.clone(), inbox_key.unwrap())
@@ -392,13 +414,11 @@ mod identity_management {
             .await
             .unwrap();
 
-        match identity_management::create_alias_api_call(client, alias_info.unwrap()).await {
+        let alias = alias_info.alias.to_string();
+        match identity_management::create_alias_api_call(client, alias_info).await {
             Ok(_) => {}
             Err(e) => {
-                crate::log::error(
-                    format!("{e}"),
-                    Some(TryNodeAction::CreateIdentity(alias.to_string())),
-                );
+                crate::log::error(format!("{e}"), Some(TryNodeAction::CreateIdentity(alias)));
             }
         }
     }
@@ -428,10 +448,17 @@ mod identity_management {
     }
 
     // TODO: use this directly on NodeAction::CreateIdentity
+    #[derive(Eq, Clone)]
     pub(crate) struct AliasInfo {
         pub alias: Rc<str>,
         pub description: String,
         pub key: Vec<u8>,
+    }
+
+    impl PartialEq for AliasInfo {
+        fn eq(&self, other: &Self) -> bool {
+            self.key == other.key
+        }
     }
 
     #[derive(Default)]
@@ -460,18 +487,20 @@ mod identity_management {
 }
 
 #[cfg(feature = "use-node")]
+use dioxus::prelude::UseSharedState;
+
+#[cfg(feature = "use-node")]
 pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::NodeAction>,
-    inbox_controller: dioxus::prelude::UseSharedState<crate::app::InboxController>,
-    login_controller: dioxus::prelude::UseSharedState<crate::app::LoginController>,
-    contracts: Vec<crate::app::Identity>,
+    inbox_controller: UseSharedState<crate::app::InboxController>,
+    login_controller: UseSharedState<crate::app::LoginController>,
+    user: UseSharedState<crate::app::User>,
     // todo: refactor: instead of passing this arround,
     // where necessary we could be getting the fresh data via static methods calls to Inbox
     // and store the information there in thread locals
     mut inboxes: crate::app::InboxesData,
 ) {
-    use std::sync::Arc;
-
+    // todo don't unwrap inside this function, propagate errors to the UI somehow
     use freenet_email_inbox::Inbox as StoredInbox;
     use futures::StreamExt;
     use locutus_stdlib::{
@@ -479,6 +508,7 @@ pub(crate) async fn node_comms(
         prelude::*,
     };
     use rsa::RsaPrivateKey;
+    use std::sync::Arc;
 
     use crate::{
         aft::AftRecords,
@@ -496,13 +526,16 @@ pub(crate) async fn node_comms(
         .expect("open connection");
     api.connecting.take().unwrap().await.unwrap();
     let mut req_sender = api.sender_half();
-    crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id)
-        .await;
-    crate::aft::AftRecords::load_all(&mut req_sender, &contracts, &mut token_contract_to_id).await;
+    {
+        let contracts = user.read().identities.clone();
+        crate::inbox::InboxModel::load_all(&mut req_sender, &contracts, &mut inbox_contract_to_id)
+            .await;
+        crate::aft::AftRecords::load_all(&mut req_sender, &contracts, &mut token_contract_to_id)
+            .await;
+    }
     let identities_key = identity_management::load_aliases(&mut req_sender)
         .await
         .unwrap();
-    //todo don't unwrap, propagate errors to the UI somehow
     WEB_API_SENDER.set(req_sender).unwrap();
 
     static IDENTITIES_KEY: OnceLock<DelegateKey> = OnceLock::new();
@@ -513,6 +546,7 @@ pub(crate) async fn node_comms(
         api: &WebApi,
         inbox_to_id: &mut HashMap<ContractKey, Identity>,
         token_rec_to_id: &mut HashMap<ContractKey, Identity>,
+        user: &UseSharedState<crate::app::User>,
     ) {
         let mut client = api.sender_half();
         match req {
@@ -554,6 +588,7 @@ pub(crate) async fn node_comms(
                         &key,
                         inbox_to_id,
                         token_rec_to_id,
+                        user,
                     )
                     .await;
                 }
@@ -600,7 +635,7 @@ pub(crate) async fn node_comms(
                     Ok(key) => {
                         token_generator_management::CREATED_AFT_GEN.with(|k| {
                             crate::log::debug!("waiting AFT gen delegate for {alias}");
-                            k.borrow_mut().push(key);
+                            k.borrow_mut().push((alias, key));
                         });
                     }
                     Err(e) => {
@@ -618,6 +653,7 @@ pub(crate) async fn node_comms(
         inboxes: &mut InboxesData,
         inbox_controller: &dioxus::prelude::UseSharedState<InboxController>,
         login_controller: &dioxus::prelude::UseSharedState<crate::app::LoginController>,
+        user: &UseSharedState<crate::app::User>,
     ) {
         let mut client = WEB_API_SENDER.get().unwrap().clone();
         let res = match res {
@@ -631,11 +667,12 @@ pub(crate) async fn node_comms(
                                 if token_rec_to_id.get(&key).is_some() {
                                     // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
                                     // we should reject that pending assignment
-                                    // FIXME: in case this is for an inbox contract we were trying to update, this means
                                     let id = token_rec_to_id.get(&key).unwrap();
                                     let alias = id.alias();
                                     crate::log::error(format!("the message for {alias} (aft contract: {key}) wasn't delivered successfully, so may need to try again and/or notify the user"), None);
                                 } else if inbox_to_id.get(&key).is_some() {
+                                    // FIXME: in case this is for an inbox contract we were trying to update, this means that
+                                    // the message wasn't sent and should propgate that to the UI
                                     let id = inbox_to_id.get(&key).unwrap();
                                     let alias = id.alias();
                                     crate::log::error(format!("the message for {alias} (inbox contract: {key}) wasn't delievered succesffully, so may need to try again and/or notify the user"), None);
@@ -808,7 +845,7 @@ pub(crate) async fn node_comms(
                     let pos = keys.borrow().iter().position(|(_, k)| k == &contract_key);
                     if let Some(pos) = pos {
                         let (alias, key) = keys.borrow_mut().remove(pos);
-                        crate::log::debug!("inbox contract {key} for alias {alias} put");
+                        crate::log::debug!("inbox contract `{key}` for alias `{alias}` put");
                         return true;
                     }
                     false
@@ -834,6 +871,7 @@ pub(crate) async fn node_comms(
                             &private_key,
                             inbox_to_id,
                             token_rec_to_id,
+                            user,
                         )
                         .await;
                     }
@@ -843,7 +881,7 @@ pub(crate) async fn node_comms(
                     let pos = keys.borrow().iter().position(|(_, k)| k == &contract_key);
                     if let Some(pos) = pos {
                         let (alias, key) = keys.borrow_mut().remove(pos);
-                        crate::log::debug!("AFT record {key} for alias {alias} put");
+                        crate::log::debug!("AFT record `{key}` for alias `{alias}` put");
                         return true;
                     }
                     false
@@ -869,6 +907,7 @@ pub(crate) async fn node_comms(
                             &private_key,
                             inbox_to_id,
                             token_rec_to_id,
+                            user,
                         )
                         .await;
                     }
@@ -880,19 +919,17 @@ pub(crate) async fn node_comms(
                     identity_management::load_aliases(&mut client)
                         .await
                         .unwrap();
-                    //todo don't unwrap, propagate errors to the UI somehow
                 } else if values.is_empty() {
                     let found = token_generator_management::CREATED_AFT_GEN.with(|keys| {
-                        let pos = keys.borrow().iter().position(|k| k == &key);
+                        let pos = keys.borrow().iter().position(|(_, k)| k == &key);
                         if let Some(pos) = pos {
-                            let key = keys.borrow_mut().remove(pos);
-                            crate::log::debug!("delegate {key} put");
+                            let (alias, key) = keys.borrow_mut().remove(pos);
+                            crate::log::debug!("AFT gen delegate `{key}` for `{alias}` put");
                             return true;
                         }
                         false
                     });
                     if found {
-                        // FIXME: subscribe to this
                         let private_key = identity_management::PENDING_CONFIRMATION.with(|pend| {
                             if let Some(id) = pend
                                 .borrow_mut()
@@ -913,6 +950,7 @@ pub(crate) async fn node_comms(
                                 &key,
                                 inbox_to_id,
                                 token_rec_to_id,
+                                user,
                             )
                             .await;
                         }
@@ -978,6 +1016,7 @@ pub(crate) async fn node_comms(
                                     payload.as_ref(),
                                 )
                                 .unwrap();
+
                                 crate::log::debug!(
                                     "received identities: {:?}",
                                     manager
@@ -986,7 +1025,26 @@ pub(crate) async fn node_comms(
                                         .collect::<Vec<_>>()
                                 );
                                 login_controller.write().updated = true;
-                                crate::app::Alias::set_aliases(manager);
+                                let identities = crate::app::Alias::set_aliases(manager, user);
+                                for identity in identities {
+                                    let inbox_key =
+                                        inbox_management::contract_key_from_private_key(
+                                            &identity.key,
+                                        )
+                                        .unwrap();
+                                    inbox_to_id.insert(inbox_key.clone(), identity.clone());
+                                    crate::inbox::InboxModel::add_identity(
+                                        inbox_key,
+                                        identity.clone(),
+                                    );
+
+                                    let aft_rec_key =
+                                        token_record_management::contract_key_from_private_key(
+                                            &identity.key,
+                                        )
+                                        .unwrap();
+                                    token_rec_to_id.insert(aft_rec_key, identity.clone());
+                                }
                             } else {
                                 crate::log::error(
                                     format!("received unexpected secret {secret_key} for delegate {key}"),
@@ -1020,13 +1078,14 @@ pub(crate) async fn node_comms(
                     &mut token_contract_to_id,
                     &mut inboxes,
                     &inbox_controller,
-                    &login_controller
+                    &login_controller,
+                    &user
                 )
                 .await;
             }
             req = rx.next() => {
                 let Some(req) = req else { panic!("async action ch closed") };
-                handle_action(req, &api, &mut inbox_contract_to_id, &mut token_contract_to_id).await;
+                handle_action(req, &api, &mut inbox_contract_to_id, &mut token_contract_to_id, &user).await;
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };

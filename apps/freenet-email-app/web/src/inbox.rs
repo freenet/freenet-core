@@ -344,6 +344,10 @@ impl InboxModel {
         INBOX_TO_ID.with(|map| map.borrow().get(key).cloned())
     }
 
+    pub fn add_identity(key: InboxContract, identity: Identity) {
+        INBOX_TO_ID.with(|map| map.borrow_mut().insert(key, identity));
+    }
+
     pub fn remove_messages(
         &mut self,
         mut client: WebApiRequestClient,

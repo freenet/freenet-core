@@ -79,11 +79,12 @@ pub(crate) fn app(cx: Scope) -> Element {
         let _sync: &Coroutine<NodeAction> = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
             to_owned![inbox_controller];
             to_owned![login_controller];
+            to_owned![user];
             let fut = crate::api::node_comms(
                 rx,
                 inbox_controller,
                 login_controller,
-                user.read().identities.clone(),
+                user,
                 inbox_data.clone(),
             )
             .map(|_| Ok(JsValue::NULL));
@@ -312,11 +313,11 @@ impl InboxView {
     }
 }
 
-struct User {
+pub(crate) struct User {
     logged: bool,
     identified: bool,
     active_id: Option<UserId>,
-    identities: Vec<Identity>,
+    pub identities: Vec<Identity>,
 }
 
 impl User {
