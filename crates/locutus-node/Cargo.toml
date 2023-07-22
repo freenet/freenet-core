@@ -20,6 +20,7 @@ path = "src/bin/dev-tool.rs"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path"] }
+bincode = "1"
 bytes = "1"
 byteorder = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -32,9 +33,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 xz2 = "0.1"
 tower-http = { version = "0.3", features = ["trace"] }
-rmp = { workspace = true }
-rmpv = { workspace = true }
-rmp-serde = { workspace = true }
 
 # internal:
 locutus-core = { path = "../locutus-core", version = "0.0.3" }

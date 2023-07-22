@@ -6,7 +6,7 @@ use std::{
 
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit},
+    aead::{Aead, AeadCore, OsRng},
     XChaCha20Poly1305,
 };
 use chrono::{DateTime, Utc};
@@ -21,12 +21,9 @@ use locutus_stdlib::{
         ContractKey, State, UpdateData,
     },
 };
-use rand::rngs::OsRng;
-use rand_chacha::rand_core::SeedableRng;
-use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{
-    pkcs1::EncodeRsaPublicKey, pkcs1v15::SigningKey, sha2::Sha256, signature::Signer,
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+    pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, RsaPrivateKey,
+    RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +40,7 @@ use freenet_email_inbox::{
 
 type InboxContract = ContractKey;
 
-pub(crate) static INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
+pub(crate) const INBOX_CODE_HASH: &str = include_str!("../build/inbox_code_hash");
 
 thread_local! {
     static PENDING_INBOXES_UPDATE: RefCell<HashMap<InboxContract, Vec<DecryptedMessage>>> = RefCell::new(HashMap::new());
@@ -159,7 +156,7 @@ pub(crate) struct DecryptedMessage {
     pub title: String,
     pub content: String,
     pub from: String,
-    pub to: Vec<String>,
+    pub to: Vec<RsaPublicKey>,
     pub cc: Vec<String>,
     pub time: DateTime<Utc>,
 }
@@ -216,6 +213,7 @@ impl DecryptedMessage {
             .map_err(|e| format!("{e}"))
             .unwrap();
 
+        use chacha20poly1305::aead::KeyInit;
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
         let decrypted_content = cipher
             .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
@@ -230,19 +228,23 @@ impl DecryptedMessage {
         let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
 
         // Generate a random 256-bit XChaCha20Poly1305 key
-        let chacha_key = XChaCha20Poly1305::generate_key(&mut rng);
-        let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut rng);
+        let chacha_key = {
+            use chacha20poly1305::aead::KeyInit;
+            XChaCha20Poly1305::generate_key(&mut OsRng)
+        };
+        let chacha_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
 
         // Encrypt the data using XChaCha20Poly1305
-        let cipher = XChaCha20Poly1305::new(&chacha_key);
+        let cipher = {
+            use chacha20poly1305::aead::KeyInit;
+            XChaCha20Poly1305::new(&chacha_key)
+        };
         let encrypted_data = cipher
             .encrypt(&chacha_nonce, decrypted_content.as_slice())
             .unwrap();
 
         // Encrypt the XChaCha20Poly1305 key using RSA
         let receiver_pub_key = self.to.get(0).ok_or("receiver key not found")?;
-        let receiver_pub_key =
-            RsaPublicKey::from_pkcs1_pem(receiver_pub_key).map_err(|e| format!("{e}"))?;
         let encrypted_key = receiver_pub_key
             .encrypt(&mut rng, Pkcs1v15Encrypt, chacha_key.as_slice())
             .map_err(|e| format!("{e}"))?;
@@ -277,23 +279,14 @@ impl InboxModel {
     ) {
         async fn subscribe(
             client: &mut WebApiRequestClient,
+            contract_key: &ContractKey,
             identity: &Identity,
         ) -> Result<(), DynError> {
-            let pub_key = identity.key.to_public_key();
-            let alias = crate::app::ALIAS_MAP2
-                .get(&pub_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap())
-                .unwrap();
-            let params = freenet_email_inbox::InboxParams { pub_key }
-                .try_into()
-                .map_err(|e| format!("{e}"))?;
-            let contract_key = ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
-                .map_err(|e| format!("{e}"))?;
-            {
-                INBOX_TO_ID.with(|map| {
-                    map.borrow_mut()
-                        .insert(contract_key.clone(), identity.clone());
-                });
-            }
+            let alias = identity.alias();
+            INBOX_TO_ID.with(|map| {
+                map.borrow_mut()
+                    .insert(contract_key.clone(), identity.clone());
+            });
             crate::log::debug!(
                 "subscribing to inbox updates for `{contract_key}`, belonging to alias `{alias}`"
             );
@@ -301,11 +294,34 @@ impl InboxModel {
             Ok(())
         }
 
+        fn get_key(identity: &Identity) -> Result<ContractKey, DynError> {
+            let pub_key = identity.key.to_public_key();
+            let params = freenet_email_inbox::InboxParams { pub_key }
+                .try_into()
+                .map_err(|e| format!("{e}"))?;
+            ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, params)
+                .map_err(|e| format!("{e}").into())
+        }
+
         for identity in contracts {
             let mut client = client.clone();
-            let res = subscribe(&mut client, identity).await;
-            node_response_error_handling(client.clone().into(), res, TryNodeAction::LoadInbox)
-                .await;
+            let contract_key = match get_key(identity) {
+                Ok(v) => v,
+                Err(e) => {
+                    node_response_error_handling(
+                        client.clone().into(),
+                        Err(e),
+                        TryNodeAction::LoadInbox,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if !contract_to_id.contains_key(&contract_key) {
+                let res = subscribe(&mut client, &contract_key, identity).await;
+                node_response_error_handling(client.clone().into(), res, TryNodeAction::LoadInbox)
+                    .await;
+            }
             let res = InboxModel::load(&mut client, identity).await.map(|key| {
                 contract_to_id
                     .entry(key.clone())
@@ -342,6 +358,14 @@ impl InboxModel {
 
     pub fn contract_identity(key: &InboxContract) -> Option<Identity> {
         INBOX_TO_ID.with(|map| map.borrow().get(key).cloned())
+    }
+
+    pub fn set_contract_identity(key: InboxContract, identity: Identity) {
+        crate::log::debug!(
+            "adding inbox contract for `{alias}` ({key})",
+            alias = identity.alias
+        );
+        INBOX_TO_ID.with(|map| map.borrow_mut().insert(key, identity));
     }
 
     pub fn remove_messages(
@@ -495,7 +519,10 @@ impl InboxModel {
         Ok(())
     }
 
-    async fn subscribe(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
+    pub async fn subscribe(
+        client: &mut WebApiRequestClient,
+        key: ContractKey,
+    ) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
         let summary: StateSummary = serde_json::to_vec(&InboxSummary::new(HashSet::new()))?.into();
         let request = ContractRequest::Subscribe {

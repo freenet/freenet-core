@@ -13,17 +13,16 @@ use locutus_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, ContractKey, DelegateKey, InboundDelegateMsg,
     Parameters, State, UpdateData,
 };
-use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPublicKey;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::inbox::MessageModel;
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
 
-pub(crate) static TOKEN_RECORD_CODE_HASH: &str =
+pub(crate) const TOKEN_RECORD_CODE_HASH: &str =
     include_str!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/token_allocation_record_code_hash");
 
-pub(crate) static TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
+pub(crate) const TOKEN_GENERATOR_DELEGATE_CODE_HASH: &str =
     include_str!("../../../../modules/antiflood-tokens/delegates/token-generator/build/token_generator_code_hash");
 
 pub(crate) struct AftRecords {}
@@ -65,7 +64,7 @@ impl AftRecords {
         contract_to_id: &mut HashMap<AftRecord, Identity>,
     ) {
         for identity in contracts {
-            let r = Self::load_contract(client, identity).await;
+            let r = Self::load_contract(client, identity, contract_to_id).await;
             if let Ok(key) = &r {
                 contract_to_id.insert(key.clone(), identity.clone());
             }
@@ -81,6 +80,7 @@ impl AftRecords {
     async fn load_contract(
         client: &mut WebApiRequestClient,
         identity: &Identity,
+        contract_to_id: &HashMap<AftRecord, Identity>,
     ) -> Result<AftRecord, DynError> {
         let params = TokenDelegateParameters::new(identity.key.to_public_key())
             .try_into()
@@ -88,19 +88,13 @@ impl AftRecords {
         let contract_key =
             ContractKey::from_params(TOKEN_RECORD_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         Self::get_state(client, contract_key.clone()).await?;
-        let alias = crate::app::ALIAS_MAP2
-            .get(
-                &identity
-                    .key
-                    .to_public_key()
-                    .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-                    .unwrap(),
-            )
-            .unwrap();
+        let alias = identity.alias();
         crate::log::debug!(
             "subscribing to AFT updates for `{contract_key}`, belonging to alias `{alias}`"
         );
-        Self::subscribe(client, contract_key.clone()).await?;
+        if !contract_to_id.contains_key(&contract_key) {
+            Self::subscribe(client, contract_key.clone()).await?;
+        }
         Ok(contract_key)
     }
 
@@ -191,7 +185,7 @@ impl AftRecords {
             .unwrap();
         let delegate_key = DelegateKey::from_params(
             crate::aft::TOKEN_GENERATOR_DELEGATE_CODE_HASH,
-            token_params.clone(),
+            &token_params,
         )?;
 
         let inbox_params: Parameters = InboxParams {
@@ -219,7 +213,11 @@ impl AftRecords {
         // todo: optimize so we don't clone the whole record and instead use a smart pointer
         let Some(records) = RECORDS.with(|recs| recs.borrow().get(generator_id).cloned()) else {
             // todo: somehow propagate this to the UI so the user retries /or we retry automatically/ later
-            return Err(format!("failed to get token record for id: {}", generator_id.alias()).into())
+            return Err(
+                format!("failed to get token record for alias `{alias}` ({key})", 
+                alias = generator_id.alias(),
+                key = token_record).into()
+            )
         };
         let token_request = TokenDelegateMessage::RequestNewToken(RequestNewToken {
             request_id: REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -244,10 +242,15 @@ impl AftRecords {
         Ok(delegate_key)
     }
 
-    // /// Add an inbox to the list of inboxes which is waiting for a valid token to complete an update.
-    // pub fn needs_token(inbox: InboxContract) {}
-
-    pub fn set(identity: Identity, state: State<'_>) -> Result<(), DynError> {
+    pub fn set_identity_contract(
+        identity: Identity,
+        state: State<'_>,
+        key: &ContractKey,
+    ) -> Result<(), DynError> {
+        crate::log::debug!(
+            "setting AFT record contract for `{alias}` ({key})",
+            alias = identity.alias
+        );
         let record = TokenAllocationRecord::try_from(state)?;
         RECORDS.with(|recs| {
             let recs = &mut *recs.borrow_mut();
@@ -291,7 +294,10 @@ impl AftRecords {
         Ok(())
     }
 
-    async fn subscribe(client: &mut WebApiRequestClient, key: AftRecord) -> Result<(), DynError> {
+    pub async fn subscribe(
+        client: &mut WebApiRequestClient,
+        key: AftRecord,
+    ) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
         let request = ContractRequest::Subscribe { key, summary: None };
         client.send(request.into()).await?;

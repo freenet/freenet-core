@@ -52,7 +52,7 @@ impl Display for ContractContainer {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             ContractContainer::Wasm(wasm_version) => {
-                write!(f, "Wasm container {wasm_version}")
+                write!(f, "wasm container {wasm_version}")
             }
         }
     }
@@ -64,7 +64,29 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
     fn try_from((path, params): (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
         const VERSION_0_0_1: Version = Version::new(0, 0, 1);
 
-        let (contract_code, version) = ContractCode::load_versioned(path)?;
+        let (contract_code, version) = ContractCode::load_versioned_from_path(path)?;
+
+        match version {
+            version if version == VERSION_0_0_1 => Ok(ContractContainer::Wasm(WasmAPIVersion::V1(
+                WrappedContract::new(Arc::new(contract_code), params),
+            ))),
+            _ => Err(std::io::ErrorKind::InvalidData.into()),
+        }
+    }
+}
+
+impl<'a, P> TryFrom<(Vec<u8>, P)> for ContractContainer
+where
+    P: std::ops::Deref<Target = Parameters<'a>>,
+{
+    type Error = std::io::Error;
+
+    fn try_from((versioned_contract_bytes, params): (Vec<u8>, P)) -> Result<Self, Self::Error> {
+        let params = params.deref().clone().into_owned();
+        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
+
+        let (contract_code, version) =
+            ContractCode::load_versioned_from_bytes(versioned_contract_bytes)?;
 
         match version {
             version if version == VERSION_0_0_1 => Ok(ContractContainer::Wasm(WasmAPIVersion::V1(

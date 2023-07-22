@@ -35,6 +35,7 @@ freenet-email-inbox = { path = "../contracts/inbox", features = ["wasmbind"] }
 locutus-dev = { path = "../../../crates/locutus-dev", optional = true }
 locutus-stdlib = { workspace = true, features = ["net"] }
 locutus-aft-interface = { workspace = true }
+identity-management = { path = "../../../modules/identity-management" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 dioxus-web = { git = "https://github.com/DioxusLabs/dioxus.git", rev = "0fec47d" }

@@ -11,8 +11,6 @@ use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
     TryFromTsStd,
 };
-use rmp_serde::Deserializer;
-use serde::Deserialize;
 use std::collections::VecDeque;
 use std::{
     collections::HashMap,
@@ -197,7 +195,7 @@ async fn websocket_interface(
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
-                let msg = rmp_serde::to_vec(&response)?;
+                let msg = bincode::serialize(&response)?;
                 tx.send(Message::Binary(msg)).await?;
             }
         }
@@ -226,22 +224,25 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
 
-    let mut deserializer = Deserializer::new(&msg[..]);
-    let req: ClientRequest = match ClientRequest::deserialize(&mut deserializer) {
-        Ok(client_request) => client_request,
-        Err(_) => match ContractRequest::try_decode(&msg) {
-            Ok(r) => r.into(),
-            Err(e) => {
-                let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
-                    ErrorKind::DeserializationError {
-                        cause: format!("{e}"),
-                    }
-                    .into(),
-                ))
-                .map_err(|err| Some(err.into()))?;
-                return Ok(Some(Message::Binary(result_error)));
+    let req: Result<ClientRequest<'_>, _> = bincode::deserialize(&msg);
+    let req: ClientRequest = match req {
+        Ok(client_request) => client_request.into_owned(),
+        Err(error) => {
+            tracing::error!(%error, "error decoding request json");
+            match ContractRequest::try_decode(&msg) {
+                Ok(r) => r.to_owned().into(),
+                Err(e) => {
+                    let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+                        ErrorKind::DeserializationError {
+                            cause: format!("{e}"),
+                        }
+                        .into(),
+                    ))
+                    .map_err(|err| Some(err.into()))?;
+                    return Ok(Some(Message::Binary(result_error)));
+                }
             }
-        },
+        }
     };
 
     tracing::debug!(req = %req, "received client request");
@@ -282,7 +283,7 @@ async fn process_host_response(
                     Err(err)
                 }
             };
-            let res = rmp_serde::to_vec(&result)?;
+            let res = bincode::serialize(&result)?;
             tx.send(Message::Binary(res)).await?;
             Ok(None)
         }
@@ -295,7 +296,7 @@ async fn process_host_response(
             Ok(None)
         }
         None => {
-            let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+            let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
                 ErrorKind::NodeUnavailable.into(),
             ))?;
             tx.send(Message::Binary(result_error)).await?;

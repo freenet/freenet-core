@@ -64,6 +64,7 @@ impl DelegateInterface for TokenDelegate {
             InboundDelegateMsg::RandomBytes(_) => Err(DelegateError::Other(
                 "unexpected message type: radom bytes".into(),
             )),
+            InboundDelegateMsg::GetSecretRequest(_) => unreachable!(),
         }
     }
 }
@@ -202,7 +203,7 @@ impl TryFrom<DelegateContext> for Context {
         if value == DelegateContext::default() {
             return Ok(Self::default());
         }
-        bincode::deserialize(&value.0).map_err(|err| DelegateError::Deser(format!("{err}")))
+        bincode::deserialize(value.as_ref()).map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
 

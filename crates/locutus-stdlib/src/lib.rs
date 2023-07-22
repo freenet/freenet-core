@@ -1,19 +1,19 @@
 //! Standard library provided by the Freenet project to be able to write Locutus-compatible contracts.
 #[doc(hidden)]
 pub mod buf;
-pub mod client_api;
-
 mod code_hash;
 mod contract_interface;
 mod delegate_interface;
 pub(crate) mod global;
+mod parameters;
+mod versioning;
+
+pub mod client_api;
 #[cfg(all(feature = "log", target_family = "wasm"))]
 pub mod log;
-mod parameters;
 pub mod rand;
 #[cfg(all(feature = "time", target_family = "wasm"))]
 pub mod time;
-mod versioning;
 #[cfg(feature = "archive")]
 pub mod web;
 

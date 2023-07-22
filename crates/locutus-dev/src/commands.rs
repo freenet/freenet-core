@@ -100,20 +100,14 @@ async fn put_delegate(
 ) -> Result<(), DynError> {
     let code = DelegateCode::load(&config.code)?;
 
-    let (cipher, nonce) = if other.mode == OperationMode::Local
-        && delegate_config.cipher.is_empty()
-        && delegate_config.nonce.is_empty()
-    {
-        println!("Using default cipher and nonce. This is only allowed in local mode, don't reuse those for network mode.");
-        const CIPHER: [u8; 32] = [
-            0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164, 58,
-            161, 64, 108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        const NONCE: [u8; 24] = [
-            57, 18, 79, 116, 63, 134, 93, 39, 208, 161, 156, 229, 222, 247, 111, 79, 210, 126, 127,
-            55, 224, 150, 139, 80,
-        ];
-        (CIPHER, NONCE)
+    let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
+        println!(
+"Using default cipher and nonce. 
+For additional hardening is recommended to use a different cipher and nonce to encrypt secrets in storage.");
+        (
+            ::locutus_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+            ::locutus_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+        )
     } else {
         let mut cipher = [0; 32];
         bs58::decode(delegate_config.cipher.as_bytes())

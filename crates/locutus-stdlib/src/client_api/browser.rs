@@ -45,7 +45,7 @@ impl WebApi {
                     .dyn_into::<js_sys::ArrayBuffer>()
                     .unwrap();
                 let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
-                let response: HostResult = match rmp_serde::from_slice(&bytes) {
+                let response: HostResult = match bincode::deserialize(&bytes) {
                     Ok(val) => val,
                     Err(err) => {
                         eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({})));
@@ -118,7 +118,7 @@ impl WebApi {
         //     "request": format!("{request:?}"),
         //     "action": "sending request"
         // })));
-        let send = rmp_serde::to_vec(&request)?;
+        let send = bincode::serialize(&request)?;
         self.conn.send_with_u8_array(&send).map_err(|err| {
             let err: serde_json::Value = match serde_wasm_bindgen::from_value(err) {
                 Ok(e) => e,

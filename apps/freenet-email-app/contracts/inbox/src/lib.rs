@@ -6,7 +6,7 @@ use locutus_aft_interface::{
     InvalidReason as TokenInvalidReason, Tier, TokenAllocationRecord, TokenAssignment,
     TokenAssignmentHash,
 };
-use locutus_stdlib::prelude::{blake2::Digest, *};
+use locutus_stdlib::prelude::*;
 use rsa::{
     pkcs1v15::{SigningKey, VerifyingKey},
     sha2::Sha256,
@@ -62,6 +62,15 @@ pub struct InboxSettings {
     pub minimum_tier: Tier,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::default")]
     pub private: EncryptedContent,
+}
+
+impl Default for InboxSettings {
+    fn default() -> Self {
+        Self {
+            minimum_tier: Tier::Min30,
+            private: Default::default(),
+        }
+    }
 }
 
 impl TryFrom<StateDelta<'static>> for UpdateInbox {
@@ -139,6 +148,10 @@ impl Inbox {
             last_update: Utc::now(),
             inbox_signature,
         }
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, ContractError> {
+        serde_json::to_vec(self).map_err(|err| ContractError::Deser(format!("{err}")))
     }
 
     pub fn sign(key: &RsaPrivateKey) -> Signature {
@@ -451,8 +464,7 @@ impl ContractInterface for Inbox {
             inbox.remove_messages(rm_messages);
             // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
             //inbox.last_update = locutus_stdlib::time::now();
-            let serialized =
-                serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;
+            let serialized = inbox.serialize()?;
             Ok(UpdateModification::valid(serialized.into()))
         } else {
             Ok(UpdateModification::requires(missing_related))
@@ -500,6 +512,7 @@ mod tests {
         .map_err(|e| format!("{e}"))
         .unwrap();
 
+        use locutus_stdlib::prelude::blake2::Digest;
         let digest = Sha256::digest(STATE_UPDATE).to_vec();
         let signature = private_key
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)

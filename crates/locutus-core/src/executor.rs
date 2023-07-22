@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
+use locutus_stdlib::client_api::HostResponse::DelegateResponse;
 use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractError as CoreContractError, ContractRequest,
     ContractResponse, DelegateError as CoreDelegateError, DelegateRequest, HostResponse,
@@ -169,8 +170,6 @@ impl Executor {
                     .store_contract(contract.clone())
                     .map_err(Into::into)
                     .map_err(Either::Right)?;
-
-                tracing::debug!("executing with params: {:?}", params);
 
                 if self.mode == OperationMode::Local {
                     for (id, related) in related_contracts.update() {
@@ -353,9 +352,13 @@ impl Executor {
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
-
+                tracing::debug!("registering delegate `{key}");
                 match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(HostResponse::Ok),
+                    Ok(_) => Ok(DelegateResponse {
+                        key,
+                        values: Vec::new(),
+                    }
+                    .into()),
                     Err(err) => {
                         tracing::error!("failed registering delegate `{key}`: {err}");
                         Err(Either::Left(CoreDelegateError::RegisterError(key).into()))
@@ -371,6 +374,24 @@ impl Executor {
                     }
                 }
             }
+            DelegateRequest::GetSecretRequest {
+                key,
+                params,
+                get_request,
+            } => match self.runtime.inbound_app_message(
+                &key,
+                &params,
+                vec![InboundDelegateMsg::GetSecretRequest(get_request)],
+            ) {
+                Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                Err(err) if err.delegate_is_missing() => {
+                    tracing::error!("delegate not found `{key}`");
+                    Err(Either::Left(CoreDelegateError::Missing(key).into()))
+                }
+                Err(err) => Err(Either::Right(
+                    format!("uncontrolled error while getting secret for `{key}`: {err}").into(),
+                )),
+            },
             DelegateRequest::ApplicationMessages {
                 key,
                 inbound,
@@ -385,15 +406,31 @@ impl Executor {
                         .collect(),
                 ) {
                     Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                    Err(err) if err.is_delegate_exec_error() => {
+                    Err(err) if err.is_delegate_exec_error() | err.is_execution_error() => {
                         tracing::error!("failed processing messages for delegate `{key}`: {err}");
                         Err(Either::Left(
                             CoreDelegateError::ExecutionError(format!("{err}")).into(),
                         ))
                     }
+                    Err(err) if err.delegate_is_missing() => {
+                        tracing::error!("delegate not found `{key}`");
+                        Err(Either::Left(CoreDelegateError::Missing(key).into()))
+                    }
+                    Err(err) if err.secret_is_missing() => {
+                        tracing::error!("secret not found `{key}`");
+                        Err(Either::Left(
+                            CoreDelegateError::MissingSecret {
+                                key,
+                                secret: err.get_secret_id(),
+                            }
+                            .into(),
+                        ))
+                    }
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
-                        Ok(HostResponse::Ok)
+                        Err(Either::Right(
+                            format!("uncontrolled error while executing `{key}`").into(),
+                        ))
                     }
                 }
             }

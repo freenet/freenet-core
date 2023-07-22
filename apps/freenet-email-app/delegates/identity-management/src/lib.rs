@@ -1,9 +1,9 @@
 use locutus_stdlib::prelude::*;
 
-struct IdentityManagementDelegate;
+struct IdentityManagement;
 
 #[delegate]
-impl DelegateInterface for IdentityManagementDelegate {
+impl DelegateInterface for IdentityManagement {
     fn process(
         _params: Parameters<'static>,
         _message: InboundDelegateMsg,

@@ -30,7 +30,7 @@ pub fn inspect(config: InspectCliConfig) -> Result<(), DynError> {
 
     match config.r#type {
         FileType::Code(_) => {
-            let (code, version) = ContractCode::load_versioned(&config.file)?;
+            let (code, version) = ContractCode::load_versioned_from_path(&config.file)?;
             let hash = code.hash_str();
             println!(
                 r#"code hash: {hash}

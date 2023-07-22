@@ -1,20 +1,15 @@
+use std::fmt::Display;
 use std::hash::Hasher;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
-use arc_swap::access::{Access, DynAccess};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use dioxus::prelude::*;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use once_cell::sync::Lazy;
-use rsa::pkcs1::EncodeRsaPublicKey;
-use rsa::{
-    pkcs1::DecodeRsaPrivateKey, pkcs1::DecodeRsaPublicKey, pkcs8::LineEnding, RsaPrivateKey,
-    RsaPublicKey,
-};
-use std::collections::HashMap;
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use wasm_bindgen::JsValue;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
@@ -25,75 +20,66 @@ use crate::{
 };
 
 mod login;
-
-// todo: simplify this whole alias map stuff mapping identities to contract keys
-pub(crate) static ALIAS_MAP: Lazy<HashMap<String, String>> = Lazy::new(|| {
-    const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
-    const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-    let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let mut map = HashMap::new();
-    map.insert("address1".to_string(), pub_key0);
-    map.insert("address2".to_string(), pub_key1);
-    map
-});
-
-pub(crate) static ALIAS_MAP2: Lazy<HashMap<String, String>> = Lazy::new(|| {
-    const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
-    const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-    let pub_key0: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let pub_key1: String = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM)
-        .unwrap()
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .unwrap();
-    let mut map = HashMap::new();
-    map.insert(pub_key0, "address1".to_string());
-    map.insert(pub_key1, "address2".to_string());
-    map
-});
+pub(crate) use login::{Alias, LoginController};
 
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
-    LoadMessages(Identity),
+    LoadMessages(Box<Identity>),
+    CreateIdentity {
+        alias: Rc<str>,
+        key: Vec<u8>,
+        description: String,
+    },
+    CreateContract {
+        alias: Rc<str>,
+        contract_type: ContractType,
+        key: Vec<u8>,
+    },
+    CreateDelegate {
+        alias: Rc<str>,
+        key: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ContractType {
+    InboxContract,
+    AFTContract,
+}
+
+impl Display for ContractType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContractType::InboxContract => write!(f, "InboxContract"),
+            ContractType::AFTContract => write!(f, "AFTContract"),
+        }
+    }
 }
 
 pub(crate) fn app(cx: Scope) -> Element {
-    crate::log::debug!("rendering app");
-
+    use_shared_state_provider(cx, login::LoginController::new);
+    let login_controller = use_shared_state::<login::LoginController>(cx).unwrap();
     // Initialize and fetch shared state for User, InboxController, and InboxView
     use_shared_state_provider(cx, User::new);
     let user = use_shared_state::<User>(cx).unwrap();
     use_shared_state_provider(cx, InboxController::new);
-    let controller = use_shared_state::<InboxController>(cx).unwrap();
+    let inbox_controller = use_shared_state::<InboxController>(cx).unwrap();
     use_shared_state_provider(cx, InboxView::new);
     let inbox = use_shared_state::<InboxView>(cx).unwrap();
-    use_context_provider(cx, || {
-        let inbox_data_context: InboxesData = Arc::new(ArcSwap::from_pointee(vec![]));
-        inbox_data_context
-    });
+    use_context_provider(cx, InboxesData::new);
     let inbox_data = use_context::<InboxesData>(cx).unwrap();
 
     #[cfg(feature = "use-node")]
     {
         let _sync: &Coroutine<NodeAction> = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
-            to_owned![controller];
+            to_owned![inbox_controller];
+            to_owned![login_controller];
+            to_owned![user];
             let fut = crate::api::node_comms(
                 rx,
-                controller,
-                user.read().identities.clone(),
+                inbox_controller,
+                login_controller,
+                user,
                 inbox_data.clone(),
             )
             .map(|_| Ok(JsValue::NULL));
@@ -101,6 +87,11 @@ pub(crate) fn app(cx: Scope) -> Element {
             async {}.boxed_local()
         });
     }
+    #[cfg(not(feature = "use-node"))]
+    {
+        let _sync = use_coroutine::<NodeAction, _, _>(cx, move |rx| async {});
+    }
+    let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
 
     // Render login page if user not identified, otherwise render the inbox or identifiers list based on user's logged in state
     if !user.read().identified {
@@ -110,11 +101,14 @@ pub(crate) fn app(cx: Scope) -> Element {
     } else if let Some(id) = user.read().logged_id() {
         #[cfg(feature = "use-node")]
         {
-            inbox.read().load_messages(cx, id).expect("load messages");
+            inbox
+                .read()
+                .load_messages(id, actions)
+                .expect("load messages");
         }
         #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
         {
-            controller.load_messages(id).unwrap();
+            inbox_controller.load_messages(id).unwrap();
         }
         cx.render(rsx! {
            user_inbox {}
@@ -126,7 +120,22 @@ pub(crate) fn app(cx: Scope) -> Element {
     }
 }
 
-pub(crate) type InboxesData = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
+#[derive(Clone)]
+pub(crate) struct InboxesData(Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>);
+
+impl InboxesData {
+    pub fn new() -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(vec![])))
+    }
+}
+
+impl std::ops::Deref for InboxesData {
+    type Target = Arc<ArcSwap<Vec<Rc<RefCell<InboxModel>>>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct InboxView {
@@ -145,8 +154,9 @@ pub struct InboxController {
 pub(crate) struct UserId(usize);
 
 impl UserId {
-    pub fn new(id: usize) -> Self {
-        Self(id)
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -181,7 +191,7 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         from: &str,
-        to: &str,
+        to: RsaPublicKey,
         title: &str,
         content: &str,
     ) -> Result<Vec<LocalBoxFuture<'static, ()>>, DynError> {
@@ -190,7 +200,7 @@ impl InboxView {
             title: title.to_owned(),
             content: content.to_owned(),
             from: from.to_owned(),
-            to: vec![to.to_owned()],
+            to: vec![to],
             cc: vec![],
             time: Utc::now(),
         };
@@ -201,14 +211,13 @@ impl InboxView {
             for recipient_encoded_key in content.to.iter() {
                 let content = content.clone();
                 let mut client = client.clone();
-                let recipient_key = RsaPublicKey::from_pkcs1_pem(recipient_encoded_key)
-                    .map_err(|e| format!("{e}"))?;
                 let Some(id) = crate::inbox::InboxModel::id_for_alias(from) else {
                     crate::log::error(format!("alias `{from}` not stored"), Some(TryNodeAction::SendMessage));
                     continue;
                 };
+                let to = recipient_encoded_key.clone();
                 let f = async move {
-                    let res = content.start_sending(&mut client, recipient_key, &id).await;
+                    let res = content.start_sending(&mut client, to, &id).await;
                     node_response_error_handling(client.into(), res, TryNodeAction::SendMessage)
                         .await;
                 };
@@ -223,9 +232,11 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
-        inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>>,
+        inbox_data: InboxesData,
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         tracing::debug!("removing messages: {ids:?}");
+        // FIXME: indexing by id fails cause all not aliases inboxes has been loaded initially
+        let inbox_data = inbox_data.load_full();
         let mut inbox = inbox_data[**self.active_id.borrow()].borrow_mut();
         inbox.remove_messages(client, ids)
     }
@@ -235,7 +246,7 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
-        inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>>,
+        inbox_data: InboxesData,
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
         {
             let messages = &mut *self.messages.borrow_mut();
@@ -304,29 +315,25 @@ impl InboxView {
     }
 
     #[cfg(feature = "use-node")]
-    fn load_messages(&self, cx: Scope, id: &Identity) -> Result<(), DynError> {
-        let actions = use_coroutine_handle::<NodeAction>(cx).unwrap();
-        actions.send(NodeAction::LoadMessages(id.clone()));
+    fn load_messages(
+        &self,
+        id: &Identity,
+        actions: &Coroutine<NodeAction>,
+    ) -> Result<(), DynError> {
+        actions.send(NodeAction::LoadMessages(Box::new(id.clone())));
         Ok(())
-    }
-
-    // #[cfg(feature = "use-node")]
-    fn get_public_key_from_alias(&self, alias: &str) -> Result<String, DynError> {
-        let pub_key = ALIAS_MAP.get(alias).ok_or("alias not found")?;
-        Ok(pub_key.to_string())
     }
 }
 
-struct User {
+pub(crate) struct User {
     logged: bool,
     identified: bool,
     active_id: Option<UserId>,
-    identities: Vec<Identity>,
+    pub identities: Vec<Identity>,
 }
 
 impl User {
-    // todo: enable feature gates after impl the other `use-node` version
-    // #[cfg(feature = "ui-testing")]
+    #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
     fn new() -> Self {
         const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
         const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
@@ -352,10 +359,15 @@ impl User {
         }
     }
 
-    // #[cfg(all(not(feature = "ui-testing"), feature = "use-node"))]
-    // fn new() -> Self {
-    //     // TODO: here we should load the user identities from the identity component
-    // }
+    #[cfg(feature = "use-node")]
+    fn new() -> Self {
+        User {
+            logged: false,
+            identified: true,
+            active_id: None,
+            identities: vec![],
+        }
+    }
 
     fn logged_id(&self) -> Option<&Identity> {
         self.active_id.and_then(|id| self.identities.get(id.0))
@@ -371,7 +383,7 @@ impl User {
 pub(crate) struct Identity {
     pub id: UserId,
     pub key: RsaPrivateKey,
-    alias: Rc<str>,
+    pub alias: Rc<str>,
 }
 
 impl Identity {
@@ -546,14 +558,6 @@ fn inbox_component(cx: Scope) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let user = use_shared_state::<User>(cx).unwrap();
 
-    // use_effect(cx, (&inbox.message_num,), |(msg,)| {
-    //     to_owned![changed];
-    //     async move {
-    //         crate::log::debug!("counter: {msg:?}");
-    //         changed.with_mut(|v| v.0 = true);
-    //     }
-    // });
-
     #[inline_props]
     fn email_link<'a>(
         cx: Scope<'a>,
@@ -583,8 +587,8 @@ fn inbox_component(cx: Scope) -> Element {
         let current_active_id: UserId = user.read().active_id.unwrap();
         // reload if there were new emails received
         let all_data = inbox_data.load_full();
-        crate::log::debug!("rendering");
         if let Some((current_model, id)) = all_data.iter().find_map(|ib| {
+            crate::log::debug!("trying to get identity for {key}", key = &ib.borrow().key);
             let id = crate::inbox::InboxModel::contract_identity(&ib.borrow().key).unwrap();
             (id.id == current_active_id).then(|| (ib, id))
         }) {
@@ -601,7 +605,7 @@ fn inbox_component(cx: Scope) -> Element {
 
     // Mark updated as false after after the inbox has been refreshed
     if controller.read().updated {
-        controller.write().updated = false;
+        controller.write_silent().updated = false;
     }
 
     let inbox = inbox.read();
@@ -627,7 +631,7 @@ fn inbox_component(cx: Scope) -> Element {
         let links = emails.iter().map(|email| {
             rsx!(email_link {
                 sender: email.from.clone(),
-                title: email.title.clone()
+                title: email.title.clone(),
                 read: email.read,
                 id: email.id,
             })
@@ -672,8 +676,7 @@ fn open_message(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
     let inbox = use_shared_state::<InboxView>(cx).unwrap();
-    let inbox_data: Arc<Vec<Rc<RefCell<InboxModel>>>> =
-        use_context::<InboxesData>(cx).unwrap().load_full();
+    let inbox_data = use_context::<InboxesData>(cx).unwrap();
     let email = cx.props;
     let email_id = [cx.props.id];
 
@@ -737,17 +740,22 @@ fn new_message_window(cx: Scope) -> Element {
 
     let alias = user_alias.to_string();
     let send_msg = move |_| {
-        let receiver_public_key = match inbox.read().get_public_key_from_alias(to.get()) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::log::error(format!("{e}"), Some(TryNodeAction::GetAlias));
+        let to = to.get();
+        // fixme: this will have to come from the address book in the future
+        let receiver_public_key = match Alias::get_alias(to) {
+            Some(v) => v.key.to_public_key(),
+            None => {
+                crate::log::error(
+                    format!("couldn't find key for `{to}`"),
+                    Some(TryNodeAction::GetAlias),
+                );
                 return;
             }
         };
         match inbox.write().send_message(
             client.clone(),
             &alias,
-            receiver_public_key.as_str(),
+            receiver_public_key,
             title.get(),
             content.get(),
         ) {

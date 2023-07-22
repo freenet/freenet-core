@@ -14,5 +14,5 @@ serde_json = { workspace = true }
 strum = { version = "0.24", features = ["derive"] }
 thiserror = "1"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 rand = "0.8"

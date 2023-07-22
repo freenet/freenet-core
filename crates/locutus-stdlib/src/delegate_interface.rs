@@ -139,6 +139,16 @@ impl From<Vec<u8>> for DelegateCode<'static> {
     }
 }
 
+impl<'a> From<&'a [u8]> for DelegateCode<'a> {
+    fn from(data: &'a [u8]) -> Self {
+        let key = CodeHash::new(data);
+        DelegateCode {
+            code: Cow::from(data),
+            code_hash: key,
+        }
+    }
+}
+
 #[serde_as]
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct DelegateKey {
@@ -180,7 +190,7 @@ impl DelegateKey {
 
     pub fn from_params(
         code_hash: impl Into<String>,
-        parameters: Parameters,
+        parameters: &Parameters,
     ) -> Result<Self, bs58::decode::Error> {
         let mut code_key = [0; DELEGATE_HASH_LENGTH];
         bs58::decode(code_hash.into())
@@ -293,6 +303,22 @@ impl Display for SecretsId {
     }
 }
 
+/// A Delegate is a webassembly code designed to act as an agent for the user on
+/// Freenet. Delegates can:
+///
+///  * Store private data on behalf of the user
+///  * Create, read, and modify contracts
+///  * Create other delegates
+///  * Send and receive messages from other delegates and user interfaces
+///  * Ask the user questions and receive answers
+///
+/// Example use cases:
+///
+///  * A delegate stores a private key for the user, other components can ask
+///    the delegate to sign messages, it will ask the user for permission
+///  * A delegate monitors an inbox contract and downloads new messages when
+///    they arrive
+
 pub trait DelegateInterface {
     /// Process inbound message, producing zero or more outbound messages in response
     /// Note that all state for the delegate must be stored using the secret mechanism.
@@ -304,7 +330,8 @@ pub trait DelegateInterface {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DelegateContext(pub Vec<u8>);
+// todo: add serde_as(Bytes)
+pub struct DelegateContext(Vec<u8>);
 
 impl DelegateContext {
     pub const MAX_SIZE: usize = 4096 * 10 * 10;
@@ -325,18 +352,20 @@ impl DelegateContext {
     }
 }
 
+impl AsRef<[u8]> for DelegateContext {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum InboundDelegateMsg<'a> {
     ApplicationMessage(ApplicationMessage),
     GetSecretResponse(GetSecretResponse),
+    // todo: remove this and replace by native locutus_stdlib contract api calls
     RandomBytes(Vec<u8>),
     UserResponse(#[serde(borrow)] UserInputResponse<'a>),
-    // GetContractResponse {
-    //     contract_id: ContractInstanceId,
-    //     #[serde(borrow)]
-    //     update_data: UpdateData<'static>,
-    //     context: Context
-    // },
+    GetSecretRequest(GetSecretRequest),
 }
 
 impl InboundDelegateMsg<'_> {
@@ -346,6 +375,7 @@ impl InboundDelegateMsg<'_> {
             InboundDelegateMsg::GetSecretResponse(r) => InboundDelegateMsg::GetSecretResponse(r),
             InboundDelegateMsg::RandomBytes(b) => InboundDelegateMsg::RandomBytes(b),
             InboundDelegateMsg::UserResponse(r) => InboundDelegateMsg::UserResponse(r.into_owned()),
+            InboundDelegateMsg::GetSecretRequest(r) => InboundDelegateMsg::GetSecretRequest(r),
         }
     }
 
@@ -374,6 +404,12 @@ impl InboundDelegateMsg<'_> {
     }
 }
 
+impl From<GetSecretRequest> for InboundDelegateMsg<'_> {
+    fn from(value: GetSecretRequest) -> Self {
+        Self::GetSecretRequest(value)
+    }
+}
+
 impl From<ApplicationMessage> for InboundDelegateMsg<'_> {
     fn from(value: ApplicationMessage) -> Self {
         Self::ApplicationMessage(value)
@@ -384,7 +420,6 @@ impl From<ApplicationMessage> for InboundDelegateMsg<'_> {
 pub struct GetSecretResponse {
     pub key: SecretsId,
     pub value: Option<Secret>,
-    #[serde(skip)]
     pub context: DelegateContext,
 }
 
@@ -451,6 +486,7 @@ pub enum OutboundDelegateMsg {
     //     mode: RelatedMode,
     //     contract_id: ContractInstanceId,
     // },
+    GetSecretResponse(GetSecretResponse),
 }
 
 impl From<GetSecretRequest> for OutboundDelegateMsg {
@@ -474,6 +510,7 @@ impl OutboundDelegateMsg {
             OutboundDelegateMsg::SetSecretRequest(_) => false,
             OutboundDelegateMsg::RequestUserInput(_) => true,
             OutboundDelegateMsg::ContextUpdated(_) => true,
+            OutboundDelegateMsg::GetSecretResponse(_) => true,
         }
     }
 
@@ -510,11 +547,21 @@ where
     Ok(value.into_owned())
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetSecretRequest {
     pub key: SecretsId,
     pub context: DelegateContext,
     pub processed: bool,
+}
+
+impl GetSecretRequest {
+    pub fn new(key: SecretsId) -> Self {
+        Self {
+            key,
+            context: Default::default(),
+            processed: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -317,123 +317,6 @@ fn get_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
     DateTime::<Utc>::from_utc(naive, Utc)
 }
 
-#[cfg(test)]
-mod tier_tests {
-    use super::*;
-
-    #[test]
-    fn is_correct_minute() {
-        let day7_tier = Tier::Day7;
-        assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
-        assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
-
-        let day30_tier = Tier::Day30;
-        assert!(day30_tier.is_valid_slot(get_date(2023, 1, 30)));
-        assert!(day30_tier.is_valid_slot(get_date(2023, 3, 1)));
-        assert!(!day30_tier.is_valid_slot(get_date(2023, 3, 30)));
-    }
-
-    #[test]
-    fn is_correct_hour() {
-        let hour3_tier = Tier::Hour3;
-        assert!(hour3_tier.is_valid_slot(get_date(2023, 1, 7).with_hour(6).unwrap()));
-        assert!(!hour3_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(7).unwrap()));
-
-        let hour12_tier = Tier::Hour12;
-        assert!(hour12_tier.is_valid_slot(get_date(2023, 1, 30).with_hour(12).unwrap()));
-        assert!(hour12_tier.is_valid_slot(get_date(2023, 3, 1)));
-        assert!(!hour12_tier.is_valid_slot(get_date(2023, 3, 30).with_hour(13).unwrap()));
-    }
-
-    #[test]
-    fn is_correct_day() {
-        let day1_tier = Tier::Day1;
-        assert!(day1_tier.is_valid_slot(get_date(2023, 1, 8)));
-        assert!(!day1_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(12).unwrap()));
-
-        let day7_tier = Tier::Day7;
-        assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
-        assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
-
-        let day30_tier = Tier::Day30;
-        assert!(day30_tier.is_valid_slot(get_date(2023, 1, 30)));
-        assert!(day30_tier.is_valid_slot(get_date(2023, 3, 1)));
-        assert!(!day30_tier.is_valid_slot(get_date(2023, 3, 30)));
-    }
-
-    #[test]
-    fn minute_tier_normalization() {
-        let min5_tier = Tier::Min5;
-        let min5_normalized =
-            min5_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(37).unwrap());
-        assert_eq!(
-            min5_normalized,
-            get_date(2023, 1, 1).with_minute(40).unwrap()
-        );
-        let min5_normalized =
-            min5_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(8).unwrap());
-        assert_eq!(
-            min5_normalized,
-            get_date(2023, 1, 1).with_minute(10).unwrap()
-        );
-
-        let min10_tier = Tier::Min10;
-        let min10_normalized =
-            min10_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(22).unwrap());
-        assert_eq!(
-            min10_normalized,
-            get_date(2023, 1, 1).with_minute(30).unwrap()
-        );
-        let min10_tier = Tier::Min10;
-        let min10_normalized =
-            min10_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(38).unwrap());
-        assert_eq!(
-            min10_normalized,
-            get_date(2023, 1, 1).with_minute(40).unwrap()
-        );
-    }
-
-    #[test]
-    fn hour_tier_normalization() {
-        let hour6_tier = Tier::Hour6;
-        let hour6_normalized =
-            hour6_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(4).unwrap());
-        assert_eq!(hour6_normalized, get_date(2023, 1, 1).with_hour(6).unwrap());
-        let hour6_normalized =
-            hour6_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(17).unwrap());
-        assert_eq!(
-            hour6_normalized,
-            get_date(2023, 1, 1).with_hour(18).unwrap()
-        );
-
-        let hour12_tier = Tier::Hour12;
-        let hour12_normalized =
-            hour12_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(4).unwrap());
-        assert_eq!(
-            hour12_normalized,
-            get_date(2023, 1, 1).with_hour(12).unwrap()
-        );
-        let hour12_normalized =
-            hour12_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(17).unwrap());
-        assert_eq!(hour12_normalized, get_date(2023, 1, 2));
-    }
-
-    #[test]
-    fn day_tier_normalization() {
-        let day7_tier = Tier::Day7;
-        let day7_normalized = day7_tier.normalize_to_next(get_date(2023, 1, 17));
-        assert_eq!(day7_normalized, get_date(2023, 1, 21));
-        let day15_normalized = day7_tier.normalize_to_next(get_date(2023, 1, 31));
-        assert_eq!(day15_normalized, get_date(2023, 2, 4));
-
-        let day15_tier = Tier::Day15;
-        let day15_normalized = day15_tier.normalize_to_next(get_date(2023, 1, 17));
-        assert_eq!(day15_normalized, get_date(2023, 1, 30));
-        let day15_normalized = day15_tier.normalize_to_next(get_date(2023, 1, 31));
-        assert_eq!(day15_normalized, get_date(2023, 2, 14));
-    }
-}
-
 #[non_exhaustive]
 #[derive(Serialize, Deserialize)]
 pub struct TokenDelegateParameters {
@@ -579,7 +462,7 @@ impl Display for AllocationCriteria {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TokenAllocationRecord {
     /// A list of issued tokens.
     ///
@@ -646,6 +529,10 @@ impl TokenAllocationRecord {
         let Ok(_idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else { return false };
         true
     }
+
+    pub fn serialized(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
 }
 
 impl<'a> IntoIterator for &'a TokenAllocationRecord {
@@ -692,8 +579,9 @@ impl TryFrom<TokenAllocationRecord> for State<'static> {
     type Error = ContractError;
 
     fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
-        let serialized =
-            serde_json::to_vec(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
+        let serialized = state
+            .serialized()
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(State::from(serialized))
     }
 }
@@ -702,8 +590,9 @@ impl TryFrom<TokenAllocationRecord> for StateDelta<'static> {
     type Error = ContractError;
 
     fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
-        let serialized =
-            serde_json::to_vec(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
+        let serialized = state
+            .serialized()
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(StateDelta::from(serialized))
     }
 }
@@ -732,6 +621,9 @@ impl TryFrom<StateSummary<'_>> for TokenAllocationSummary {
     type Error = ContractError;
 
     fn try_from(state: StateSummary<'_>) -> Result<Self, Self::Error> {
+        if state.as_ref().is_empty() {
+            return Ok(TokenAllocationSummary(HashMap::new()))
+        }
         let this = serde_json::from_slice(state.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(this)
@@ -844,13 +736,6 @@ impl TokenAssignment {
     }
 }
 
-#[test]
-fn to_be_signed_test() {
-    let _to_be_signed =
-        TokenAssignment::signature_content(&get_date(2021, 7, 28), Tier::Day90, &[0; 32]);
-    // dbg!(_to_be_signed);
-}
-
 impl PartialOrd for TokenAssignment {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.time_slot.cmp(&other.time_slot))
@@ -883,5 +768,122 @@ impl Display for TokenAssignment {
             slot = self.time_slot,
             record = self.token_record
         )
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    #[test]
+    fn is_correct_minute() {
+        let day7_tier = Tier::Day7;
+        assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
+        assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
+
+        let day30_tier = Tier::Day30;
+        assert!(day30_tier.is_valid_slot(get_date(2023, 1, 30)));
+        assert!(day30_tier.is_valid_slot(get_date(2023, 3, 1)));
+        assert!(!day30_tier.is_valid_slot(get_date(2023, 3, 30)));
+    }
+
+    #[test]
+    fn is_correct_hour() {
+        let hour3_tier = Tier::Hour3;
+        assert!(hour3_tier.is_valid_slot(get_date(2023, 1, 7).with_hour(6).unwrap()));
+        assert!(!hour3_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(7).unwrap()));
+
+        let hour12_tier = Tier::Hour12;
+        assert!(hour12_tier.is_valid_slot(get_date(2023, 1, 30).with_hour(12).unwrap()));
+        assert!(hour12_tier.is_valid_slot(get_date(2023, 3, 1)));
+        assert!(!hour12_tier.is_valid_slot(get_date(2023, 3, 30).with_hour(13).unwrap()));
+    }
+
+    #[test]
+    fn is_correct_day() {
+        let day1_tier = Tier::Day1;
+        assert!(day1_tier.is_valid_slot(get_date(2023, 1, 8)));
+        assert!(!day1_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(12).unwrap()));
+
+        let day7_tier = Tier::Day7;
+        assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
+        assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
+
+        let day30_tier = Tier::Day30;
+        assert!(day30_tier.is_valid_slot(get_date(2023, 1, 30)));
+        assert!(day30_tier.is_valid_slot(get_date(2023, 3, 1)));
+        assert!(!day30_tier.is_valid_slot(get_date(2023, 3, 30)));
+    }
+
+    #[test]
+    fn minute_tier_normalization() {
+        let min5_tier = Tier::Min5;
+        let min5_normalized =
+            min5_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(37).unwrap());
+        assert_eq!(
+            min5_normalized,
+            get_date(2023, 1, 1).with_minute(40).unwrap()
+        );
+        let min5_normalized =
+            min5_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(8).unwrap());
+        assert_eq!(
+            min5_normalized,
+            get_date(2023, 1, 1).with_minute(10).unwrap()
+        );
+
+        let min10_tier = Tier::Min10;
+        let min10_normalized =
+            min10_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(22).unwrap());
+        assert_eq!(
+            min10_normalized,
+            get_date(2023, 1, 1).with_minute(30).unwrap()
+        );
+        let min10_tier = Tier::Min10;
+        let min10_normalized =
+            min10_tier.normalize_to_next(get_date(2023, 1, 1).with_minute(38).unwrap());
+        assert_eq!(
+            min10_normalized,
+            get_date(2023, 1, 1).with_minute(40).unwrap()
+        );
+    }
+
+    #[test]
+    fn hour_tier_normalization() {
+        let hour6_tier = Tier::Hour6;
+        let hour6_normalized =
+            hour6_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(4).unwrap());
+        assert_eq!(hour6_normalized, get_date(2023, 1, 1).with_hour(6).unwrap());
+        let hour6_normalized =
+            hour6_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(17).unwrap());
+        assert_eq!(
+            hour6_normalized,
+            get_date(2023, 1, 1).with_hour(18).unwrap()
+        );
+
+        let hour12_tier = Tier::Hour12;
+        let hour12_normalized =
+            hour12_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(4).unwrap());
+        assert_eq!(
+            hour12_normalized,
+            get_date(2023, 1, 1).with_hour(12).unwrap()
+        );
+        let hour12_normalized =
+            hour12_tier.normalize_to_next(get_date(2023, 1, 1).with_hour(17).unwrap());
+        assert_eq!(hour12_normalized, get_date(2023, 1, 2));
+    }
+
+    #[test]
+    fn day_tier_normalization() {
+        let day7_tier = Tier::Day7;
+        let day7_normalized = day7_tier.normalize_to_next(get_date(2023, 1, 17));
+        assert_eq!(day7_normalized, get_date(2023, 1, 21));
+        let day15_normalized = day7_tier.normalize_to_next(get_date(2023, 1, 31));
+        assert_eq!(day15_normalized, get_date(2023, 2, 4));
+
+        let day15_tier = Tier::Day15;
+        let day15_normalized = day15_tier.normalize_to_next(get_date(2023, 1, 17));
+        assert_eq!(day15_normalized, get_date(2023, 1, 30));
+        let day15_normalized = day15_tier.normalize_to_next(get_date(2023, 1, 31));
+        assert_eq!(day15_normalized, get_date(2023, 2, 14));
     }
 }

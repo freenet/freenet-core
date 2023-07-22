@@ -4,7 +4,10 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializ
 
 use crate::{
     delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
-    prelude::{ContractKey, Parameters, RelatedContracts, StateSummary, UpdateData, WrappedState},
+    prelude::{
+        ContractKey, GetSecretRequest, Parameters, RelatedContracts, SecretsId, StateSummary,
+        UpdateData, WrappedState,
+    },
     versioning::ContractContainer,
 };
 
@@ -78,10 +81,14 @@ pub enum RequestError {
 /// Errors that may happen while interacting with delegates.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum DelegateError {
-    #[error("error while registering delegate: {0}")]
+    #[error("error while registering delegate {0}")]
     RegisterError(DelegateKey),
-    #[error("execution error, cause: {0}")]
+    #[error("execution error, cause {0}")]
     ExecutionError(String),
+    #[error("missing delegate {0}")]
+    Missing(DelegateKey),
+    #[error("missing secret `{secret}` for delegate {key}")]
+    MissingSecret { key: DelegateKey, secret: SecretsId },
 }
 
 /// Errors that may happen while interacting with contracts.
@@ -192,6 +199,37 @@ pub enum ContractRequest<'a> {
     },
 }
 
+impl ContractRequest<'_> {
+    pub fn into_owned(self) -> ContractRequest<'static> {
+        match self {
+            Self::Put {
+                contract,
+                state,
+                related_contracts,
+            } => ContractRequest::Put {
+                contract,
+                state,
+                related_contracts: related_contracts.into_owned(),
+            },
+            Self::Update { key, data } => ContractRequest::Update {
+                key,
+                data: data.into_owned(),
+            },
+            Self::Get {
+                key,
+                fetch_contract,
+            } => ContractRequest::Get {
+                key,
+                fetch_contract,
+            },
+            Self::Subscribe { key, summary } => ContractRequest::Subscribe {
+                key,
+                summary: summary.map(StateSummary::into_owned),
+            },
+        }
+    }
+}
+
 impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
     fn from(op: ContractRequest<'a>) -> Self {
         ClientRequest::ContractOp(op)
@@ -285,6 +323,11 @@ pub enum DelegateRequest<'a> {
         params: Parameters<'a>,
         inbound: Vec<InboundDelegateMsg<'a>>,
     },
+    GetSecretRequest {
+        key: DelegateKey,
+        params: Parameters<'a>,
+        get_request: GetSecretRequest,
+    },
     RegisterDelegate {
         #[serde(borrow)]
         delegate: Delegate<'a>,
@@ -295,6 +338,16 @@ pub enum DelegateRequest<'a> {
 }
 
 impl DelegateRequest<'_> {
+    pub const DEFAULT_CIPHER: [u8; 32] = [
+        0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164, 58, 161,
+        64, 108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    pub const DEFAULT_NONCE: [u8; 24] = [
+        57, 18, 79, 116, 63, 134, 93, 39, 208, 161, 156, 229, 222, 247, 111, 79, 210, 126, 127, 55,
+        224, 150, 139, 80,
+    ];
+
     pub fn into_owned(self) -> DelegateRequest<'static> {
         match self {
             DelegateRequest::ApplicationMessages {
@@ -305,6 +358,15 @@ impl DelegateRequest<'_> {
                 key,
                 params: params.into_owned(),
                 inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
+            },
+            DelegateRequest::GetSecretRequest {
+                key,
+                get_request,
+                params,
+            } => DelegateRequest::GetSecretRequest {
+                key,
+                get_request,
+                params: params.into_owned(),
             },
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -338,11 +400,14 @@ impl DelegateRequest<'_> {
 impl Display for ClientRequest<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientRequest::ContractOp(ops) => match ops {
+            ClientRequest::ContractOp(op) => match op {
                 ContractRequest::Put {
                     contract, state, ..
                 } => {
-                    write!(f, "put request for contract {contract} with state {state}")
+                    write!(
+                        f,
+                        "put request for contract `{contract}` with state {state}"
+                    )
                 }
                 ContractRequest::Update { key, .. } => write!(f, "update request for {key}"),
                 ContractRequest::Get {
@@ -350,11 +415,37 @@ impl Display for ClientRequest<'_> {
                     fetch_contract: contract,
                     ..
                 } => {
-                    write!(f, "get request for {key} (fetch full contract: {contract})")
+                    write!(
+                        f,
+                        "get request for `{key}` (fetch full contract: {contract})"
+                    )
                 }
-                ContractRequest::Subscribe { key, .. } => write!(f, "subscribe request for {key}"),
+                ContractRequest::Subscribe { key, .. } => {
+                    write!(f, "subscribe request for `{key}`")
+                }
             },
-            ClientRequest::DelegateOp(_op) => write!(f, "delegate request"),
+            ClientRequest::DelegateOp(op) => match op {
+                DelegateRequest::ApplicationMessages { key, inbound, .. } => {
+                    write!(
+                        f,
+                        "delegate app request for `{key}` with {} messages",
+                        inbound.len()
+                    )
+                }
+                DelegateRequest::GetSecretRequest {
+                    get_request: GetSecretRequest { key: secret_id, .. },
+                    key,
+                    ..
+                } => {
+                    write!(f, "get delegate secret `{secret_id}` for `{key}`")
+                }
+                DelegateRequest::RegisterDelegate { delegate, .. } => {
+                    write!(f, "delegate register request for `{}`", delegate.key())
+                }
+                DelegateRequest::UnregisterDelegate(key) => {
+                    write!(f, "delegate unregister request for `{key}`")
+                }
+            },
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
             ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }

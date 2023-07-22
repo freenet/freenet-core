@@ -91,46 +91,50 @@ impl Runtime {
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<DelegateContext> {
         const MAX_ITERATIONS: usize = 100;
-
-        let mut retries = 0;
+        let mut recurssion = 0;
         let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned()) else {
             return Ok(DelegateContext::default());
         };
         while let Some(outbound) = outbound_msgs.pop_front() {
             match outbound {
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                    key,
-                    context,
-                    processed,
+                    key, processed, ..
                 }) if !processed => {
                     let secret = self.secret_store.get_secret(delegate_key, &key)?;
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
                         value: Some(secret),
-                        context,
+                        context: last_context.clone(),
                     });
-                    if retries >= MAX_ITERATIONS {
+                    if recurssion >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
                     let new_msgs = self.exec_inbound(params, &inbound, process_func, instance)?;
-                    retries += 1;
+                    recurssion += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Error trying to update the context from the secret".to_string()).into())));
                     };
-                    let Some(new_last_context) = last_msg.get_context() else {
-                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Last messsage ".to_string()).into())));
+                    let mut updated = false;
+                    if let Some(new_last_context) = last_msg.get_context() {
+                        last_context = new_last_context.clone();
+                        updated = true;
                     };
-                    last_context = new_last_context.clone();
                     for mut pending in new_msgs {
-                        if let Some(ctx) = pending.get_mut_context() {
-                            *ctx = last_context.clone();
-                        };
+                        if updated {
+                            if let Some(ctx) = pending.get_mut_context() {
+                                *ctx = last_context.clone();
+                            };
+                        }
                         if !pending.processed() {
                             outbound_msgs.push_back(pending);
                         }
                     }
                 }
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
+                    tracing::debug!("get secret, processed");
+                    last_context = context;
+                }
+                OutboundDelegateMsg::GetSecretResponse(GetSecretResponse { context, .. }) => {
                     last_context = context;
                 }
                 OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
@@ -142,8 +146,11 @@ impl Runtime {
                     }
                 }
                 OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
-                    if retries >= MAX_ITERATIONS {
-                        panic!();
+                    if recurssion >= MAX_ITERATIONS {
+                        return Err(DelegateExecError::DelegateError(DelegateError::Other(
+                            "max recurssion (100) limit hit".into(),
+                        ))
+                        .into());
                     }
                     let outbound = self.exec_inbound(
                         params,
@@ -155,9 +162,9 @@ impl Runtime {
                         process_func,
                         instance,
                     )?;
-                    retries += 1;
-                    for m in outbound {
-                        outbound_msgs.push_back(m);
+                    recurssion += 1;
+                    for msg in outbound {
+                        outbound_msgs.push_back(msg);
                     }
                 }
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
@@ -174,8 +181,7 @@ impl Runtime {
                         .map_err(|err| DelegateError::Deser(format!("{err}")))
                         .unwrap();
                     let req_id = req.request_id;
-                    let mut context: Context =
-                        bincode::deserialize(last_context.0.as_slice()).unwrap();
+                    let mut context: Context = bincode::deserialize(last_context.as_ref()).unwrap();
                     context.waiting_for_user_input.remove(&req_id);
                     context.user_response.insert(req_id, response);
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
@@ -202,7 +208,7 @@ impl Runtime {
 impl DelegateRuntimeInterface for Runtime {
     fn inbound_app_message(
         &mut self,
-        key: &DelegateKey,
+        delegate_key: &DelegateKey,
         params: &Parameters,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
@@ -210,7 +216,7 @@ impl DelegateRuntimeInterface for Runtime {
         if inbound.is_empty() {
             return Ok(results);
         }
-        let running = self.prepare_delegate_call(params, key, 4096)?;
+        let running = self.prepare_delegate_call(params, delegate_key, 4096)?;
         let process_func: TypedFunction<(i64, i64), i64> = running
             .instance
             .exports
@@ -228,6 +234,7 @@ impl DelegateRuntimeInterface for Runtime {
             _ => DelegateContext::default(),
         };
 
+        let mut non_processed = vec![];
         for msg in inbound {
             match msg {
                 InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
@@ -236,7 +243,7 @@ impl DelegateRuntimeInterface for Runtime {
                     processed,
                     ..
                 }) => {
-                    let mut outbound = VecDeque::from(
+                    let outbound = VecDeque::from(
                         self.exec_inbound(
                             params,
                             &InboundDelegateMsg::ApplicationMessage(
@@ -249,34 +256,51 @@ impl DelegateRuntimeInterface for Runtime {
                         )?,
                     );
 
+                    let mut real_outbound = VecDeque::new();
+                    for outbound in outbound {
+                        match outbound {
+                            OutboundDelegateMsg::SetSecretRequest(set) => {
+                                non_processed.push(OutboundDelegateMsg::SetSecretRequest(set));
+                            }
+                            // msg if !msg.processed() {}
+                            msg => real_outbound.push_back(msg),
+                        }
+                    }
+
                     // Update the shared context for next messages
                     last_context = self.get_outbound(
-                        key,
+                        delegate_key,
                         &running.instance,
                         &process_func,
                         params,
-                        &mut outbound,
+                        &mut real_outbound,
                         &mut results,
                     )?;
                 }
                 InboundDelegateMsg::UserResponse(response) => {
-                    let mut outbound = VecDeque::from(self.exec_inbound(
+                    let outbound = self.exec_inbound(
                         params,
                         &InboundDelegateMsg::UserResponse(response),
                         &process_func,
                         &running.instance,
-                    )?);
+                    )?;
+
+                    let mut real_outbound = VecDeque::new();
+                    for outbound in outbound {
+                        match outbound {
+                            msg if !msg.processed() => non_processed.push(msg),
+                            msg => real_outbound.push_back(msg),
+                        }
+                    }
+
                     self.get_outbound(
-                        key,
+                        delegate_key,
                         &running.instance,
                         &process_func,
                         params,
-                        &mut outbound,
+                        &mut real_outbound,
                         &mut results,
                     )?;
-                }
-                InboundDelegateMsg::GetSecretResponse(_) => {
-                    return Err(DelegateExecError::UnexpectedMessage("get secret response").into())
                 }
                 InboundDelegateMsg::RandomBytes(bytes) => {
                     let mut outbound = VecDeque::from(self.exec_inbound(
@@ -286,7 +310,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &running.instance,
                     )?);
                     self.get_outbound(
-                        key,
+                        delegate_key,
                         &running.instance,
                         &process_func,
                         params,
@@ -294,6 +318,32 @@ impl DelegateRuntimeInterface for Runtime {
                         &mut results,
                     )?;
                 }
+                InboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+                    key: secret_key, ..
+                }) => {
+                    // FIXME: here only allow this if the application is trusted
+                    let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
+                    let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                        key: secret_key,
+                        value: Some(secret),
+                        context: Default::default(),
+                    });
+                    results.push(msg);
+                }
+                _ => {}
+            }
+        }
+        for outbound in non_processed {
+            match outbound {
+                OutboundDelegateMsg::SetSecretRequest(SetSecretRequest { key, value }) => {
+                    if let Some(plaintext) = value {
+                        self.secret_store
+                            .store_secret(delegate_key, &key, plaintext)?;
+                    } else {
+                        self.secret_store.remove_secret(delegate_key, &key)?;
+                    }
+                }
+                _ => unreachable!(),
             }
         }
         Ok(results)

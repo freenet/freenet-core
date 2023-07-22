@@ -546,7 +546,7 @@ impl std::fmt::Display for Contract<'_> {
     }
 }
 
-#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
+#[cfg(all(any(test, feature = "testing"), any(unix, windows)))]
 impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let contract: ContractCode = u.arbitrary()?;
@@ -767,7 +767,7 @@ impl<'a> DerefMut for StateSummary<'a> {
     }
 }
 
-#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
+#[cfg(all(any(test, feature = "testing"), any(unix, windows)))]
 impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
@@ -790,11 +790,10 @@ pub struct ContractCode<'a> {
 }
 
 impl ContractCode<'static> {
-    /// Loads contract code which has been versioned from the fs.
-    pub fn load_versioned(path: &Path) -> Result<(Self, Version), std::io::Error> {
+    fn load_versioned(
+        mut contract_data: Cursor<Vec<u8>>,
+    ) -> Result<(Self, Version), std::io::Error> {
         const VERSION_0_0_1: Version = Version::new(0, 0, 1);
-
-        let mut contract_data = Cursor::new(Self::load_bytes(path)?);
 
         // Get contract version
         let version_size = contract_data
@@ -818,6 +817,20 @@ impl ContractCode<'static> {
             .read_to_end(&mut code_data)
             .map_err(|_| std::io::ErrorKind::InvalidData)?;
         Ok((ContractCode::from(code_data), version))
+    }
+
+    /// Loads contract code which has been versioned from the fs.
+    pub fn load_versioned_from_path(path: &Path) -> Result<(Self, Version), std::io::Error> {
+        let contract_data = Cursor::new(Self::load_bytes(path)?);
+        Self::load_versioned(contract_data)
+    }
+
+    /// Loads contract code which has been versioned from the fs.
+    pub fn load_versioned_from_bytes(
+        versioned_code: Vec<u8>,
+    ) -> Result<(Self, Version), std::io::Error> {
+        let contract_data = Cursor::new(versioned_code);
+        Self::load_versioned(contract_data)
     }
 
     pub fn load_raw(path: &Path) -> Result<Self, std::io::Error> {
@@ -940,7 +953,7 @@ impl PartialEq for ContractCode<'_> {
 
 impl Eq for ContractCode<'_> {}
 
-#[cfg(all(any(test, feature = "testing"), target_family = "unix"))]
+#[cfg(all(any(test, feature = "testing"), any(unix, windows)))]
 impl<'a> arbitrary::Arbitrary<'a> for ContractCode<'static> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: Vec<u8> = u.arbitrary()?;
@@ -970,7 +983,7 @@ impl std::fmt::Display for ContractCode<'_> {
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 #[cfg_attr(
-    all(any(test, feature = "testing"), target_family = "unix"),
+    all(any(test, feature = "testing"), any(unix, windows)),
     derive(arbitrary::Arbitrary)
 )]
 #[repr(transparent)]
@@ -1035,7 +1048,7 @@ impl Display for ContractInstanceId {
 #[serde_as]
 #[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(
-    all(any(test, feature = "testing"), target_family = "unix"),
+    all(any(test, feature = "testing"), any(unix, windows)),
     derive(arbitrary::Arbitrary)
 )]
 pub struct ContractKey {
@@ -1696,7 +1709,7 @@ pub(crate) mod wasm_interface {
     conversion!(Result<StateDelta<'static>, ContractError>: ResultKind::StateDelta);
 }
 
-#[cfg(all(test, target_family = "unix"))]
+#[cfg(all(test, any(unix, windows)))]
 mod test {
     use super::*;
     use once_cell::sync::Lazy;
