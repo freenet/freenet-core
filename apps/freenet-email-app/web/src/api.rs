@@ -1020,7 +1020,7 @@ pub(crate) async fn node_comms(
                                 crate::inbox::InboxModel::load_all(
                                     &mut client,
                                     &identities,
-                                    token_rec_to_id,
+                                    inbox_to_id,
                                 )
                                 .await;
                                 crate::aft::AftRecords::load_all(

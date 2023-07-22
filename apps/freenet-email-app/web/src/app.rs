@@ -681,14 +681,14 @@ fn open_message(cx: Scope<Message>) -> Element {
     let email_id = [cx.props.id];
 
     let result = inbox
-        .write()
+        .write_silent()
         .mark_as_read(client.clone(), &email_id, inbox_data.clone())
         .unwrap();
     cx.spawn(result);
 
     let delete = move |_| {
         let result = inbox
-            .write()
+            .write_silent()
             .remove_messages(client.clone(), &email_id, inbox_data.clone())
             .unwrap();
         cx.spawn(result);
