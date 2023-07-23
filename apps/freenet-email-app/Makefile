@@ -43,6 +43,7 @@ build-inbox: \
 
 generate-inbox-contract-code-hash:
 	cd $(INBOX_DIR)
+	ldt build --features contract
 	hash=$$(bash -c "ldt inspect build/locutus/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
 	mkdir -p $(WEB_DIR_SRC)/../build
 	echo -n $$hash > $(WEB_DIR_SRC)/../build/inbox_code_hash
