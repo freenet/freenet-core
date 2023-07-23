@@ -469,7 +469,7 @@ mod menu {
             self.new_msg = false;
         }
 
-        pub fn is_received(&self) -> bool {
+        pub fn is_inbox_list(&self) -> bool {
             !self.new_msg && self.email.is_none()
         }
 
@@ -504,7 +504,7 @@ fn user_menu_component(cx: Scope) -> Element {
     let user = use_shared_state::<User>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
 
-    let received_class = (menu_selection.read().is_received()
+    let received_class = (menu_selection.read().is_inbox_list()
         || !menu_selection.read().is_new_msg())
     .then(|| "is-active")
     .unwrap_or("");
@@ -610,7 +610,7 @@ fn inbox_component(cx: Scope) -> Element {
 
     let inbox = inbox.read();
     let emails = inbox.messages.borrow();
-    let is_email = menu_selection.read().email();
+    let is_email: Option<u64> = menu_selection.read().email();
     if let Some(email_id) = is_email {
         let id_p = (*emails).binary_search_by_key(&email_id, |e| e.id).unwrap();
         let email = &emails[id_p];
@@ -628,6 +628,12 @@ fn inbox_component(cx: Scope) -> Element {
             new_message_window {}
         })
     } else {
+        DELAYED_ACTIONS.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            for fut in queue.drain(..) {
+                cx.spawn(fut);
+            }
+        });
         let links = emails.iter().map(|email| {
             rsx!(email_link {
                 sender: email.from.clone(),
@@ -672,6 +678,10 @@ fn inbox_component(cx: Scope) -> Element {
     }
 }
 
+thread_local! {
+    static DELAYED_ACTIONS: RefCell<Vec<LocalBoxFuture<'static, ()>>> = RefCell::new(Vec::new());
+}
+
 fn open_message(cx: Scope<Message>) -> Element {
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
     let client = crate::api::WEB_API_SENDER.get().unwrap();
@@ -684,16 +694,21 @@ fn open_message(cx: Scope<Message>) -> Element {
         .write_silent()
         .mark_as_read(client.clone(), &email_id, inbox_data.clone())
         .unwrap();
-    cx.spawn(result);
+    DELAYED_ACTIONS.with(|queue| {
+        queue.borrow_mut().push(result);
+    });
+    menu_selection.write_silent().at_inbox_list();
+    // cx.spawn(result);
 
-    let delete = move |_| {
-        let result = inbox
-            .write_silent()
-            .remove_messages(client.clone(), &email_id, inbox_data.clone())
-            .unwrap();
-        cx.spawn(result);
-        menu_selection.write().at_inbox_list();
-    };
+    // todo: delete this from the private delegate or send to trash category
+    // let delete = move |_| {
+    //     let result = inbox
+    //         .write_silent()
+    //         .remove_messages(client.clone(), &email_id, inbox_data.clone())
+    //         .unwrap();
+    //     cx.spawn(result);
+    //     menu_selection.write().at_inbox_list();
+    // };
 
     cx.render(rsx! {
         div {
@@ -713,7 +728,8 @@ fn open_message(cx: Scope<Message>) -> Element {
                 class: "column", 
                 a {
                     class: "icon is-small", 
-                    onclick: delete,
+                    // onclick: delete,
+                    onclick: move |_| {},
                     i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" } 
                 }
             }
