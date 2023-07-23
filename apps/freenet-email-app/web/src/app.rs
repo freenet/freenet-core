@@ -634,12 +634,12 @@ fn inbox_component(cx: Scope) -> Element {
                 cx.spawn(fut);
             }
         });
-        let links = emails.iter().map(|email| {
+        let links = emails.iter().enumerate().map(|(id, email)| {
             rsx!(email_link {
                 sender: email.from.clone(),
                 title: email.title.clone(),
                 read: email.read,
-                id: email.id,
+                id: id as u64,
             })
         });
         cx.render(rsx! {

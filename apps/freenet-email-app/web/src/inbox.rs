@@ -387,19 +387,6 @@ impl InboxModel {
         {
             let signing_key = SigningKey::<Sha256>::new(self.settings.private_key.clone());
             let signature: Box<[u8]> = signing_key.sign(&signed).into();
-            crate::log::debug!(
-                "removing messages: {ids:?}; signature: {sig:?}; signed msg: {signed:?}; signed with: {pub_key}",
-                sig = &*signature,
-                pub_key = {
-                    use rsa::pkcs1::EncodeRsaPublicKey;
-                    self
-                        .settings
-                        .private_key
-                        .to_public_key()
-                        .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
-                        .unwrap()
-                }
-            );
             let delta: UpdateInbox = UpdateInbox::RemoveMessages {
                 signature,
                 ids: to_rm_message_id,
