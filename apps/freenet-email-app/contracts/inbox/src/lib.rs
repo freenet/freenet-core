@@ -322,16 +322,30 @@ impl TryFrom<StateSummary<'static>> for InboxSummary {
 }
 
 /// Whether this messages can be added/removed from the inbox.
-fn can_modify_inbox<'a>(
+fn can_reemove_messages<'a>(
     params: &InboxParams,
     signature: &Signature,
-    ids: impl Iterator<Item = &'a TokenAssignmentHash>,
+    hashes: impl Iterator<Item = &'a TokenAssignmentHash>,
 ) -> Result<(), ContractError> {
-    let mut signed = Vec::with_capacity(ids.size_hint().0 * 32);
-    for hash in ids {
+    let mut signed = Vec::with_capacity(hashes.size_hint().0 * 32);
+    for hash in hashes {
         signed.extend(hash);
     }
-    let verifying_key = VerifyingKey::<Sha256>::from(params.pub_key.clone());
+    let verifying_key = VerifyingKey::<Sha256>::new(params.pub_key.clone());
+    #[cfg(all(target_family = "wasm", feature = "contract"))]
+    {
+        locutus_stdlib::log::info(&format!(
+            "trying to verify message removal signature: {sig:?}; signed: {signed:?}; verify with: {pub_key}",
+            sig = &**signature,
+            pub_key = {
+                use rsa::pkcs1::EncodeRsaPublicKey;
+                params
+                    .pub_key
+                    .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+                    .unwrap()
+            }
+        ));
+    }
     verifying_key
         .verify(
             signed.as_ref(),
@@ -428,7 +442,7 @@ impl ContractInterface for Inbox {
                         new_messages.append(&mut messages);
                     }
                     UpdateInbox::RemoveMessages { signature, ids } => {
-                        can_modify_inbox(&params, &signature, ids.iter())?;
+                        can_reemove_messages(&params, &signature, ids.iter())?;
                         rm_messages.extend(ids);
                     }
                     UpdateInbox::ModifySettings {

@@ -373,20 +373,37 @@ impl InboxModel {
         mut client: WebApiRequestClient,
         ids: &[u64],
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
-        self.remove_received_message(ids);
-        let ids = ids.to_vec();
         let mut signed: Vec<u8> = Vec::with_capacity(ids.len() * 32);
-        let mut ids = Vec::with_capacity(ids.len() * 32);
+        let mut to_rm_message_id = Vec::with_capacity(ids.len() * 32);
         for m in &self.messages {
-            let h = &m.token_assignment.assignment_hash;
-            signed.extend(h);
-            ids.push(*h);
+            if ids.contains(&m.id) {
+                let h = &m.token_assignment.assignment_hash;
+                signed.extend(h);
+                to_rm_message_id.push(*h);
+            }
         }
+        self.remove_received_message(ids);
         #[cfg(feature = "use-node")]
         {
             let signing_key = SigningKey::<Sha256>::new(self.settings.private_key.clone());
-            let signature = signing_key.sign(&signed).into();
-            let delta = UpdateInbox::RemoveMessages { signature, ids };
+            let signature: Box<[u8]> = signing_key.sign(&signed).into();
+            crate::log::debug!(
+                "removing messages: {ids:?}; signature: {sig:?}; signed msg: {signed:?}; signed with: {pub_key}",
+                sig = &*signature,
+                pub_key = {
+                    use rsa::pkcs1::EncodeRsaPublicKey;
+                    self
+                        .settings
+                        .private_key
+                        .to_public_key()
+                        .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+                        .unwrap()
+                }
+            );
+            let delta: UpdateInbox = UpdateInbox::RemoveMessages {
+                signature,
+                ids: to_rm_message_id,
+            };
             let request = ContractRequest::Update {
                 key: self.key.clone(),
                 data: UpdateData::Delta(serde_json::to_vec(&delta)?.into()),
