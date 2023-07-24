@@ -332,20 +332,6 @@ fn can_reemove_messages<'a>(
         signed.extend(hash);
     }
     let verifying_key = VerifyingKey::<Sha256>::new(params.pub_key.clone());
-    #[cfg(all(target_family = "wasm", feature = "contract"))]
-    {
-        locutus_stdlib::log::info(&format!(
-            "trying to verify message removal signature: {sig:?}; signed: {signed:?}; verify with: {pub_key}",
-            sig = &**signature,
-            pub_key = {
-                use rsa::pkcs1::EncodeRsaPublicKey;
-                params
-                    .pub_key
-                    .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
-                    .unwrap()
-            }
-        ));
-    }
     verifying_key
         .verify(
             signed.as_ref(),
