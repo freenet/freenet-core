@@ -1,3 +1,4 @@
+use std::hash::Hasher;
 use std::{cell::RefCell, rc::Rc};
 
 use dioxus::prelude::*;
@@ -5,14 +6,12 @@ use identity_management::IdentityManagement;
 use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
 use rand::rngs::OsRng;
-use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPrivateKey;
 
-use crate::api::AliasInfo;
 use crate::app::{ContractType, User, UserId};
 use crate::DynError;
 
-use super::{Identity, InboxView, NodeAction};
+use super::{InboxView, NodeAction};
 
 const DEFAULT_ID_ICON: &str = "data:image/x-icon;base64,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";
 const RSA_KEY_SIZE: usize = 4096;
@@ -36,41 +35,36 @@ fn login_header(cx: Scope) -> Element {
 }
 
 thread_local! {
-    static ALIASES: Lazy<Rc<RefCell<Vec<Alias>>>> = Lazy::new(|| {
+    static ALIASES: Lazy<Rc<RefCell<Vec<Identity >>>> = Lazy::new(|| {
         Rc::new(RefCell::new(Vec::default()))
     });
 }
 
-#[derive(PartialEq, Eq, Clone)]
-pub(crate) struct Alias {
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub(crate) struct Identity {
     pub alias: Rc<str>,
-    id: UserId,
-    info: Rc<AliasInfo>,
+    pub id: UserId,
+    pub description: String,
     pub key: RsaPrivateKey,
 }
 
-impl Alias {
+impl Identity {
     #[must_use]
     pub(crate) fn set_aliases(
         mut new_aliases: IdentityManagement,
         user: &UseSharedState<crate::app::User>,
-    ) -> Vec<Identity> {
+    ) -> Vec<Self> {
         ALIASES.with(|aliases| {
             let aliases = &mut *aliases.borrow_mut();
             let mut to_add = Vec::new();
             for alias in &*aliases {
                 // just modify and avoid creating a new id
-                let key: RsaPrivateKey = serde_json::from_slice(&alias.info.key).unwrap();
                 if let Some(info) = new_aliases.remove(&alias.alias) {
-                    to_add.push(Alias {
+                    to_add.push(Identity {
                         alias: alias.alias.clone(),
                         id: alias.id,
-                        info: Rc::new(AliasInfo {
-                            alias: alias.alias.clone(),
-                            description: info.extra.unwrap_or_default(),
-                            key: info.key,
-                        }),
-                        key,
+                        description: info.extra.unwrap_or_default(),
+                        key: alias.key.clone(),
                     });
                 }
             }
@@ -82,17 +76,14 @@ impl Alias {
                 let identity = Identity {
                     id,
                     key: key.clone(),
+                    description: String::default(),
                     alias: alias.clone(),
                 };
                 user.write().identities.push(identity.clone());
-                to_add.push(Alias {
+                to_add.push(Identity {
                     alias: alias.clone(),
                     id,
-                    info: Rc::new(AliasInfo {
-                        alias,
-                        description: info.extra.unwrap_or_default(),
-                        key: info.key,
-                    }),
+                    description: info.extra.unwrap_or_default(),
                     key,
                 });
                 identities.push(identity);
@@ -103,40 +94,58 @@ impl Alias {
     }
 
     pub(crate) fn set_alias(
-        alias_info: AliasInfo,
+        alias: Rc<str>,
+        description: String,
+        key: RsaPrivateKey,
         inbox_key: ContractKey,
         user: &UseSharedState<crate::app::User>,
     ) -> Identity {
-        let private_key: RsaPrivateKey = serde_json::from_slice(&alias_info.key).unwrap();
         let identity = Identity {
+            alias: alias.clone(),
             id: UserId::new(),
-            key: private_key.clone(),
-            alias: alias_info.alias.clone(),
+            description: description.clone(),
+            key: key.clone(),
         };
         crate::inbox::InboxModel::set_contract_identity(inbox_key, identity.clone());
         user.write().identities.push(identity.clone());
         ALIASES.with(|aliases| {
             let aliases = &mut *aliases.borrow_mut();
-            aliases.push(Alias {
-                alias: alias_info.alias.clone(),
+            aliases.push(Identity {
+                alias,
                 id: identity.id,
-                info: Rc::new(alias_info),
-                key: private_key,
+                description,
+                key,
             });
         });
         identity
     }
 
-    pub(crate) fn get_aliases() -> Rc<RefCell<Vec<Alias>>> {
+    pub(crate) fn get_aliases() -> Rc<RefCell<Vec<Identity>>> {
         ALIASES.with(|aliases| (**aliases).clone())
     }
 
-    pub(crate) fn get_alias(alias: impl AsRef<str>) -> Option<Alias> {
+    pub(crate) fn get_alias(alias: impl AsRef<str>) -> Option<Identity> {
         let alias = alias.as_ref();
-        ALIASES.with(|aliases: &Lazy<Rc<RefCell<Vec<Alias>>>>| {
+        ALIASES.with(|aliases: &Lazy<Rc<RefCell<Vec<Identity>>>>| {
             let aliases = &*aliases.borrow();
             aliases.iter().find(|a| &*a.alias == alias).cloned()
         })
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl std::hash::Hash for Identity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state)
+    }
+}
+
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &*self.alias)
     }
 }
 
@@ -176,7 +185,7 @@ pub(super) fn identifiers_list(cx: Scope) -> Element {
 }
 
 pub(super) fn identities(cx: Scope) -> Element {
-    let aliases = Alias::get_aliases();
+    let aliases = Identity::get_aliases();
     let aliases_list = aliases.borrow();
     let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
     let login_controller = use_shared_state::<LoginController>(cx).unwrap();
@@ -186,10 +195,9 @@ pub(super) fn identities(cx: Scope) -> Element {
     }
 
     #[inline_props]
-    fn identity_entry(cx: Scope, alias: Rc<str>, info: Rc<AliasInfo>, id: UserId) -> Element {
+    fn identity_entry(cx: Scope, alias: Rc<str>, description: String, id: UserId) -> Element {
         let user = use_shared_state::<User>(cx).unwrap();
         let inbox = use_shared_state::<InboxView>(cx).unwrap();
-        let description = &info.description;
         cx.render(rsx! {
             div {
                 class: "card-content",
@@ -222,7 +230,7 @@ pub(super) fn identities(cx: Scope) -> Element {
     let identities = aliases_list.iter().map(|alias| {
         rsx!(identity_entry {
             alias: alias.alias.clone(),
-            info: alias.info.clone(),
+            description: alias.description.clone(),
             id: alias.id
         })
     });
@@ -304,6 +312,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
         login_controller.write_silent().updated = false;
     }
 
+    let error = use_state(cx, || true);
     let generate = use_state(cx, || true);
     let address = use_state(cx, String::new);
     let description = use_state(cx, String::new);
@@ -389,32 +398,36 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                     create_alias_form.write().0 = false;
                     let alias: Rc<str> = address.get().to_owned().into();
                     // Generate or import keypair
-                    let key = match get_key(generate) {
-                        Ok(k) => k,
+                    let private_key = match get_key(generate) {
+                        Ok(k) => Some(k),
                         Err(e) => {
                             crate::log::debug!("Failed to generate or import key: {:?}", e);
-                            vec![]
+                            None
                         }
                     };
-                    // - create inbox contract
-                    actions.send(NodeAction::CreateContract {
-                        alias: alias.clone(),
-                        key: key.clone(),
-                        contract_type: ContractType::InboxContract,
-                    });
-                    // - create AFT delegate && contract
-                    actions.send(NodeAction::CreateDelegate {
-                        alias: alias.clone(),
-                        key: key.clone(),
-                    });
-                    actions.send(NodeAction::CreateContract {
-                        alias: alias.clone(),
-                        key: key.clone(),
-                        contract_type: ContractType::AFTContract,
-                    });
+                    if let Some(key) = private_key {
+                        // - create inbox contract
+                        actions.send(NodeAction::CreateContract {
+                            alias: alias.clone(),
+                            key: key.clone(),
+                            contract_type: ContractType::InboxContract,
+                        });
+                        // - create AFT delegate && contract
+                        actions.send(NodeAction::CreateDelegate {
+                            alias: alias.clone(),
+                            key: key.clone(),
+                        });
+                        actions.send(NodeAction::CreateContract {
+                            alias: alias.clone(),
+                            key: key.clone(),
+                            contract_type: ContractType::AFTContract,
+                        });
 
-                    let description = description.get().into();
-                    actions.send(NodeAction::CreateIdentity { alias, key, description });
+                        let description = description.get().into();
+                        actions.send(NodeAction::CreateIdentity { alias, key, description });
+                    } else {
+                        crate::log::debug!("Failed to create alias");
+                    }
                 },
                 "Create"
             }
@@ -422,19 +435,12 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
     })
 }
 
-fn get_key(generate: &UseState<bool>) -> Result<Vec<u8>, DynError> {
+fn get_key(generate: &UseState<bool>) -> Result<RsaPrivateKey, DynError> {
     if *generate.get() {
         crate::log::debug!("generating keypair");
         let private_key =
             RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate keypair");
-        crate::log::debug!(
-            "generated public key: {key}",
-            key = private_key
-                .to_public_key()
-                .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
-                .unwrap()
-        );
-        Ok(serde_json::to_vec(&private_key)?)
+        Ok(private_key)
     } else {
         crate::log::debug!("importing keypair");
         Err("importing not implemented yet".into())

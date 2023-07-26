@@ -1,5 +1,4 @@
 use std::fmt::Display;
-use std::hash::Hasher;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
@@ -12,6 +11,8 @@ use futures::FutureExt;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use wasm_bindgen::JsValue;
 
+pub(crate) use login::{Identity, LoginController};
+
 use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::{
     api::WebApiRequestClient,
@@ -20,24 +21,23 @@ use crate::{
 };
 
 mod login;
-pub(crate) use login::{Alias, LoginController};
 
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
     LoadMessages(Box<Identity>),
     CreateIdentity {
         alias: Rc<str>,
-        key: Vec<u8>,
+        key: RsaPrivateKey,
         description: String,
     },
     CreateContract {
         alias: Rc<str>,
         contract_type: ContractType,
-        key: Vec<u8>,
+        key: RsaPrivateKey,
     },
     CreateDelegate {
         alias: Rc<str>,
-        key: Vec<u8>,
+        key: RsaPrivateKey,
     },
 }
 
@@ -376,31 +376,6 @@ impl User {
     fn set_logged_id(&mut self, id: UserId) {
         assert!(id.0 < self.identities.len());
         self.active_id = Some(id);
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Identity {
-    pub id: UserId,
-    pub key: RsaPrivateKey,
-    pub alias: Rc<str>,
-}
-
-impl Identity {
-    pub fn alias(&self) -> &str {
-        &self.alias
-    }
-}
-
-impl std::hash::Hash for Identity {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.key.hash(state)
-    }
-}
-
-impl std::fmt::Display for Identity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &*self.alias)
     }
 }
 
@@ -756,7 +731,7 @@ fn new_message_window(cx: Scope) -> Element {
     let send_msg = move |_| {
         let to = to.get();
         // fixme: this will have to come from the address book in the future
-        let receiver_public_key = match Alias::get_alias(to) {
+        let receiver_public_key = match Identity::get_alias(to) {
             Some(v) => v.key.to_public_key(),
             None => {
                 crate::log::error(

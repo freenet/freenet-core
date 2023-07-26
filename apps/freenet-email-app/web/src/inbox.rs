@@ -27,15 +27,16 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 
+use freenet_email_inbox::{
+    Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
+    UpdateInbox,
+};
+
 use crate::{
     aft::AftRecords,
     api::{node_response_error_handling, TryNodeAction, WebApiRequestClient},
     app::Identity,
     DynError,
-};
-use freenet_email_inbox::{
-    Inbox as StoredInbox, InboxParams, InboxSettings as StoredSettings, Message as StoredMessage,
-    UpdateInbox,
 };
 
 type InboxContract = ContractKey;

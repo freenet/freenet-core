@@ -2,7 +2,6 @@ use std::sync::atomic::AtomicU32;
 use std::{cell::RefCell, collections::HashMap};
 
 use chrono::{DateTime, Utc};
-use freenet_email_inbox::InboxParams;
 use locutus_aft_interface::{
     AllocationCriteria, RequestNewToken, Tier, TokenAllocationRecord, TokenAllocationSummary,
     TokenAssignment, TokenDelegateMessage, TokenDelegateParameters,
@@ -14,6 +13,8 @@ use locutus_stdlib::prelude::{
     Parameters, State, UpdateData,
 };
 use rsa::RsaPublicKey;
+
+use freenet_email_inbox::InboxParams;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::inbox::MessageModel;
@@ -124,7 +125,7 @@ impl AftRecords {
                     })
                     .map(|idx| registers.remove(idx))
             })
-        }) else { return Ok(()) };
+        }) else { return Ok(()); };
         // we have a valid token now, so we can update the inbox contract
         MessageModel::finish_sending(client, confirmed.record, confirmed.inbox).await?;
         Ok(())
@@ -214,10 +215,10 @@ impl AftRecords {
         let Some(records) = RECORDS.with(|recs| recs.borrow().get(generator_id).cloned()) else {
             // todo: somehow propagate this to the UI so the user retries /or we retry automatically/ later
             return Err(
-                format!("failed to get token record for alias `{alias}` ({key})", 
-                alias = generator_id.alias(),
-                key = token_record).into()
-            )
+                format!("failed to get token record for alias `{alias}` ({key})",
+                        alias = generator_id.alias(),
+                        key = token_record).into()
+            );
         };
         let token_request = TokenDelegateMessage::RequestNewToken(RequestNewToken {
             request_id: REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -275,7 +276,7 @@ impl AftRecords {
             _ => {
                 return Err(DynError::from(
                     "Unexpected update data type while updating the record",
-                ))
+                ));
             }
         };
         RECORDS.with(|recs| {
