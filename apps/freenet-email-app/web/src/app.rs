@@ -697,8 +697,6 @@ fn open_message(cx: Scope<Message>) -> Element {
     DELAYED_ACTIONS.with(|queue| {
         queue.borrow_mut().push(result);
     });
-    menu_selection.write_silent().at_inbox_list();
-    // cx.spawn(result);
 
     // todo: delete this from the private delegate or send to trash category
     // let delete = move |_| {

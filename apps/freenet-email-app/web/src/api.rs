@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::OnceLock};
 
 use crate::app::{ContractType, InboxController};
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
-use futures::{future::LocalBoxFuture, SinkExt};
+use futures::SinkExt;
 use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
