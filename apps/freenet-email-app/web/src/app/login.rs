@@ -6,7 +6,7 @@ use identity_management::IdentityManagement;
 use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
 use rand::rngs::OsRng;
-use rsa::RsaPrivateKey;
+use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 
 use crate::app::{ContractType, User, UserId};
 use crate::DynError;
@@ -121,7 +121,11 @@ impl Identity {
     }
 
     pub(crate) fn get_aliases() -> Rc<RefCell<Vec<Identity>>> {
-        ALIASES.with(|aliases| (**aliases).clone())
+        ALIASES.with(|aliases| {
+            let mut sorted_aliases = (**aliases).borrow().clone();
+            sorted_aliases.sort_by(|a1, a2| a1.alias.cmp(&a2.alias));
+            Rc::new(RefCell::new(sorted_aliases))
+        })
     }
 
     pub(crate) fn get_alias(alias: impl AsRef<str>) -> Option<Identity> {
@@ -198,6 +202,8 @@ pub(super) fn identities(cx: Scope) -> Element {
     fn identity_entry(cx: Scope, alias: Rc<str>, description: String, id: UserId) -> Element {
         let user = use_shared_state::<User>(cx).unwrap();
         let inbox = use_shared_state::<InboxView>(cx).unwrap();
+        let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
+
         cx.render(rsx! {
             div {
                 class: "card-content",
@@ -236,68 +242,19 @@ pub(super) fn identities(cx: Scope) -> Element {
     });
 
     cx.render(rsx! {
-        identities
-        // div {
-        //     class: "card-content",
-        //     div {
-        //         class: "media",
-        //         div {
-        //             class: "media-left",
-        //             figure { class: "image is-48x48", img { src: DEFAULT_ID_ICON } }
-        //         }
-        //         div {
-        //             class: "media-content",
-        //             p {
-        //                 class: "title is-4",
-        //                 a {
-        //                     style: "color: inherit",
-        //                     onclick: move |_| {
-        //                         let id = UserId::new(0);
-        //                         user.write().set_logged_id(id);
-        //                         inbox.set_active_id(id);
-        //                     },
-        //                     "Ian Clarke"
-        //                 }
-        //             },
-        //             p { class: "subtitle is-6", "ian.clarke@freenet.org" }
-        //         }
-        //     }
-        // },
-        // div {
-        //     class: "card-content",
-        //     div {
-        //         class: "media",
-        //         div {
-        //             class: "media-left",
-        //             figure { class: "image is-48x48", img { src: DEFAULT_ID_ICON } }
-        //         }
-        //         div {
-        //             class: "media-content",
-        //             p {
-        //                 class: "title is-4",
-        //                 a {
-        //                     style: "color: inherit",
-        //                     onclick: move |_| {
-        //                         let id = UserId::new(1);
-        //                         user.write().set_logged_id(id);
-        //                         inbox.set_active_id(id);
-        //                     },
-        //                     "Ian's Other Account"
-        //                 }
-        //             },
-        //             p { class: "subtitle is-6", "other.stuff@freenet.org" }
-        //         }
-        //     }
-        // },
         div {
-            class: "card-content columns",
-            div { class: "column is-4" }
-            a {
-                class: "column is-4 is-link",
-                onclick: move |_| {
-                    create_alias_form.write().0 = true;
-                },
-                "Create new alias"
+            hidden: "{create_alias_form.read().0}",
+            identities
+            div {
+                class: "card-content columns",
+                div { class: "column is-4" }
+                a {
+                    class: "column is-4 is-link",
+                    onclick: move |_| {
+                        create_alias_form.write().0 = true;
+                    },
+                    "Create new alias"
+                }
             }
         }
     })
@@ -312,7 +269,8 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
         login_controller.write_silent().updated = false;
     }
 
-    let error = use_state(cx, || true);
+    let login_error = use_state(cx, String::new);
+    let show_error = use_state(cx, || false);
     let generate = use_state(cx, || true);
     let address = use_state(cx, String::new);
     let description = use_state(cx, String::new);
@@ -395,13 +353,17 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
             a {
                 class: "button",
                 onclick: move |_|  {
-                    create_alias_form.write().0 = false;
                     let alias: Rc<str> = address.get().to_owned().into();
                     // Generate or import keypair
-                    let private_key = match get_key(generate) {
-                        Ok(k) => Some(k),
+                    let private_key = match get_key(generate, key_path) {
+                        Ok(k) => {
+                            create_alias_form.write().0 = false;
+                            Some(k)
+                        },
                         Err(e) => {
                             crate::log::debug!("Failed to generate or import key: {:?}", e);
+                            show_error.modify(|_| true);
+                            login_error.modify(|_| format!("Failed to generate or import key: {:?}", e));
                             None
                         }
                     };
@@ -432,10 +394,25 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                 "Create"
             }
         }
+        div {
+            hidden: "{!show_error.get()}",
+            class: "notification is-danger",
+            button {
+                class: "delete",
+                onclick: move |_| {
+                    show_error.set(false);
+                    login_error.set(String::default());
+                },
+            },
+            login_error.get().clone()
+        }
     })
 }
 
-fn get_key(generate: &UseState<bool>) -> Result<RsaPrivateKey, DynError> {
+fn get_key(
+    generate: &UseState<bool>,
+    key_path: &UseState<String>,
+) -> Result<RsaPrivateKey, DynError> {
     if *generate.get() {
         crate::log::debug!("generating keypair");
         let private_key =
@@ -443,7 +420,18 @@ fn get_key(generate: &UseState<bool>) -> Result<RsaPrivateKey, DynError> {
         Ok(private_key)
     } else {
         crate::log::debug!("importing keypair");
-        Err("importing not implemented yet".into())
+        let key_path = key_path.get().clone();
+        match std::fs::read_to_string(key_path) {
+            Ok(key_str) => match RsaPrivateKey::from_pkcs1_pem(key_str.as_str()) {
+                Ok(private_key) => Ok(private_key),
+                Err(e) => {
+                    return Err("Failed to generate private key from file".into());
+                }
+            },
+            Err(e) => {
+                return Err("Failed to read key file".into());
+            }
+        }
     }
 }
 
