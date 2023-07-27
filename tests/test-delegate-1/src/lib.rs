@@ -64,30 +64,30 @@ impl DelegateInterface for Delegate {
                             OutboundAppMessage::CreateInboxResponse(PUB_KEY.to_vec());
                         let payload: Vec<u8> = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response_app_msg =
-                            ApplicationMessage::new(incoming_app.app, payload)
-                                .processed(true)
-                                .with_context(incoming_app.context);
+                        let response_app_msg = ApplicationMessage::new(incoming_app.app, payload)
+                            .processed(true)
+                            .with_context(incoming_app.context);
                         outbound.push(OutboundDelegateMsg::ApplicationMessage(response_app_msg));
                     }
                     InboundAppMessage::PleaseSignMessage(inbox_priv_key) => {
                         let key = SecretsId::new(inbox_priv_key);
-                        if incoming_app.context.0.is_empty() {
+                        if incoming_app.context.as_ref().is_empty() {
                             let request_secret = GetSecretRequest {
                                 key,
                                 context: SecretsContext::default().into(),
                                 processed: false,
                             }
-                                .into();
+                            .into();
                             let payload = incoming_app.payload;
                             let app = incoming_app.app;
-                            let please_sign_message_content =
-                                ApplicationMessage::new(app, payload).processed(false).into();
+                            let please_sign_message_content = ApplicationMessage::new(app, payload)
+                                .processed(false)
+                                .into();
                             return Ok(vec![request_secret, please_sign_message_content]);
                         }
 
                         let secrets_context: SecretsContext =
-                            bincode::deserialize(incoming_app.context.0.as_slice())
+                            bincode::deserialize(incoming_app.context.as_ref())
                                 .map_err(|err| DelegateError::Other(format!("{err}")))?;
 
                         if let Some(_private_key) = secrets_context.private_key {
@@ -134,7 +134,7 @@ impl DelegateInterface for Delegate {
                 let serialized_context: Vec<u8> = bincode::serialize(&SecretsContext {
                     private_key: Some(pk_bytes),
                 })
-                    .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                .map_err(|err| DelegateError::Other(format!("{err}")))?;
 
                 // Secret request
                 let get_secret_request_msg =
@@ -183,7 +183,10 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
         bincode::serialize(&InboundAppMessage::PleaseSignMessage(PRIVATE_KEY.to_vec())).unwrap();
     let id = ContractInstanceId::try_from(['a'; 32].into_iter().collect::<String>()).unwrap();
     let sign_msg = ApplicationMessage::new(id, payload).processed(false);
-    let output = Delegate::process(Parameters::from(vec![]),InboundDelegateMsg::ApplicationMessage(sign_msg))?;
+    let output = Delegate::process(
+        Parameters::from(vec![]),
+        InboundDelegateMsg::ApplicationMessage(sign_msg),
+    )?;
     assert_eq!(output.len(), 2);
     assert!(matches!(
         output.first().unwrap(),
@@ -200,13 +203,13 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
         value: Some(PRIVATE_KEY.to_vec()),
         context: DelegateContext::default(),
     });
-    let output = Delegate::process(Parameters::from(vec![]),msg)?;
+    let output = Delegate::process(Parameters::from(vec![]), msg)?;
     assert_eq!(output.len(), 1);
     match output.first().unwrap() {
         OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                                                  context, processed, ..
-                                              }) if *processed => {
-            let ctx: SecretsContext = bincode::deserialize(context.0.as_slice())?;
+            context, processed, ..
+        }) if *processed => {
+            let ctx: SecretsContext = bincode::deserialize(context.as_ref())?;
             assert!(matches!(ctx.private_key, Some(v) if v == PRIVATE_KEY));
         }
         _ => return Err("Not expected output".into()),

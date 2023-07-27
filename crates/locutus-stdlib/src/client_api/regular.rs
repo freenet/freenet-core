@@ -160,7 +160,7 @@ async fn process_request(
     req: Option<ClientRequest<'static>>,
 ) -> Result<(), Error> {
     let req = req.ok_or(Error::ChannelClosed)?;
-    let msg = serde_json::to_vec(&req)
+    let msg = bincode::serialize(&req)
         .map_err(Into::into)
         .map_err(Error::OtherError)?;
     conn.send(Message::Binary(msg)).await?;
