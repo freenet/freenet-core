@@ -63,12 +63,17 @@ pub mod local_node {
                 Ok(res) => {
                     http_handle.send(id, Ok(res)).await?;
                 }
-                Err(either::Left(RequestError::Disconnect)) => {}
                 Err(either::Left(err)) => {
-                    tracing::error!("{err}");
-                    http_handle
-                        .send(id, Err(ErrorKind::from(err).into()))
-                        .await?;
+                    let request_error = *err.clone();
+                    match *err {
+                        RequestError::Disconnect => {}
+                        _ => {
+                            tracing::error!("{err}");
+                            http_handle
+                                .send(id, Err(ErrorKind::from(request_error).into()))
+                                .await?;
+                        }
+                    }
                 }
                 Err(either::Right(err)) => {
                     tracing::error!("{err}");

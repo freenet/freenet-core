@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{either::Either, ClientId, DynError, HostResult, Storage};
 
-type Response = Result<HostResponse, Either<RequestError, DynError>>;
+type Response = Result<HostResponse, Either<Box<RequestError>, DynError>>;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationMode {
@@ -63,15 +63,15 @@ impl Executor {
         cli_id: ClientId,
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
-    ) -> Result<(), RequestError> {
+    ) -> Result<(), Box<RequestError>> {
         let channels = self.update_notifications.entry(key.clone()).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
-                return Err(RequestError::from(CoreContractError::Subscribe {
+                return Err(Box::new(RequestError::from(CoreContractError::Subscribe {
                     key,
                     cause: format!("Peer {cli_id} already subscribed"),
-                }));
+                })));
             }
         } else {
             channels.push((cli_id, notification_ch));
@@ -131,7 +131,7 @@ impl Executor {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
                 }
-                Err(Either::Left(RequestError::Disconnect))
+                Err(Either::Left(Box::new(RequestError::Disconnect)))
             }
             ClientRequest::GenerateRandData { bytes } => {
                 let mut output = vec![0; bytes];
@@ -204,13 +204,13 @@ impl Executor {
                 let res = is_valid
                     .then(|| ContractResponse::PutResponse { key: key.clone() }.into())
                     .ok_or_else(|| {
-                        Either::Left(
+                        Either::Left(Box::new(
                             CoreContractError::Put {
                                 key: key.clone(),
                                 cause: "not valid".to_owned(),
                             }
                             .into(),
-                        )
+                        ))
                     })?;
 
                 self.contract_state
@@ -221,13 +221,13 @@ impl Executor {
                 self.send_update_notification(&key, &params, &state)
                     .await
                     .map_err(|_| {
-                        Either::Left(
+                        Either::Left(Box::new(
                             CoreContractError::Put {
                                 key: key.clone(),
                                 cause: "failed while sending notifications".to_owned(),
                             }
                             .into(),
-                        )
+                        ))
                     })?;
                 Ok(res)
             }
@@ -252,15 +252,18 @@ impl Executor {
                         let update_modification = self
                             .runtime
                             .update_state(&key, &parameters, &state, &retrieved_contracts)
-                            .map_err(|err| match err {
-                                err if err.is_contract_exec_error() => Either::Left(
-                                    CoreContractError::Update {
-                                        key: key.clone(),
-                                        cause: format!("{err}"),
-                                    }
-                                    .into(),
-                                ),
-                                other => Either::Right(other.into()),
+                            .map_err(|err| {
+                                let is_contract_exec_error = err.is_contract_exec_error();
+                                match is_contract_exec_error {
+                                    true => Either::Left(Box::new(
+                                        CoreContractError::Update {
+                                            key: key.clone(),
+                                            cause: format!("{err}"),
+                                        }
+                                        .into(),
+                                    )),
+                                    _ => Either::Right(err.into()),
+                                }
                             })?;
                         let UpdateModification {
                             new_state, related, ..
@@ -357,11 +360,12 @@ impl Executor {
                     Ok(_) => Ok(DelegateResponse {
                         key,
                         values: Vec::new(),
-                    }
-                    .into()),
+                    }),
                     Err(err) => {
                         tracing::error!("failed registering delegate `{key}`: {err}");
-                        Err(Either::Left(CoreDelegateError::RegisterError(key).into()))
+                        Err(Either::Left(Box::new(
+                            CoreDelegateError::RegisterError(key).into(),
+                        )))
                     }
                 }
             }
@@ -386,7 +390,9 @@ impl Executor {
                 Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
                 Err(err) if err.delegate_is_missing() => {
                     tracing::error!("delegate not found `{key}`");
-                    Err(Either::Left(CoreDelegateError::Missing(key).into()))
+                    Err(Either::Left(Box::new(
+                        CoreDelegateError::Missing(key).into(),
+                    )))
                 }
                 Err(err) => Err(Either::Right(
                     format!("uncontrolled error while getting secret for `{key}`: {err}").into(),
@@ -408,23 +414,25 @@ impl Executor {
                     Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
                     Err(err) if err.is_delegate_exec_error() | err.is_execution_error() => {
                         tracing::error!("failed processing messages for delegate `{key}`: {err}");
-                        Err(Either::Left(
+                        Err(Either::Left(Box::new(
                             CoreDelegateError::ExecutionError(format!("{err}")).into(),
-                        ))
+                        )))
                     }
                     Err(err) if err.delegate_is_missing() => {
                         tracing::error!("delegate not found `{key}`");
-                        Err(Either::Left(CoreDelegateError::Missing(key).into()))
+                        Err(Either::Left(Box::new(
+                            CoreDelegateError::Missing(key).into(),
+                        )))
                     }
                     Err(err) if err.secret_is_missing() => {
                         tracing::error!("secret not found `{key}`");
-                        Err(Either::Left(
+                        Err(Either::Left(Box::new(
                             CoreDelegateError::MissingSecret {
                                 key,
                                 secret: err.get_secret_id(),
                             }
                             .into(),
-                        ))
+                        )))
                     }
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
@@ -442,7 +450,7 @@ impl Executor {
         key: &ContractKey,
         params: &Parameters<'a>,
         new_state: &WrappedState,
-    ) -> Result<(), Either<RequestError, DynError>> {
+    ) -> Result<(), Either<Box<RequestError>, DynError>> {
         tracing::debug!(contract = %key, "notify of contract update");
         if let Some(notifiers) = self.update_notifications.get_mut(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
@@ -456,15 +464,16 @@ impl Executor {
                         .get_state_delta(key, params, new_state, &*summary)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            match err {
-                                err if err.is_contract_exec_error() => Either::Left(
+                            let is_contract_exec_error = err.is_contract_exec_error();
+                            match is_contract_exec_error {
+                                true => Either::Left(Box::new(
                                     CoreContractError::Put {
                                         key: key.clone(),
                                         cause: format!("{err}"),
                                     }
                                     .into(),
-                                ),
-                                other => Either::Right(other.into()),
+                                )),
+                                _ => Either::Right(err.into()),
                             }
                         })?
                         .to_owned()
@@ -494,25 +503,25 @@ impl Executor {
         &mut self,
         contract: bool,
         key: ContractKey,
-    ) -> Result<HostResponse, RequestError> {
+    ) -> Result<HostResponse, Box<RequestError>> {
         let mut got_contract = None;
         if contract {
             let parameters = self.contract_state.get_params(&key).await.map_err(|e| {
                 tracing::error!("{e}");
-                RequestError::from(CoreContractError::Get {
+                Box::new(RequestError::from(CoreContractError::Get {
                     key: key.clone(),
                     cause: "missing contract".to_owned(),
-                })
+                }))
             })?;
             let contract = self
                 .runtime
                 .contract_store
                 .fetch_contract(&key, &parameters)
                 .ok_or_else(|| {
-                    RequestError::from(CoreContractError::Get {
+                    Box::new(RequestError::from(CoreContractError::Get {
                         key: key.clone(),
                         cause: "Missing contract".into(),
-                    })
+                    }))
                 })?;
             got_contract = Some(contract);
         }
@@ -523,16 +532,20 @@ impl Executor {
                 state,
             }
             .into()),
-            Err(StateStoreError::MissingContract(_)) => Err(CoreContractError::Get {
-                key,
-                cause: "missing contract state".into(),
-            }
-            .into()),
-            Err(err) => Err(CoreContractError::Get {
-                key,
-                cause: format!("{err}"),
-            }
-            .into()),
+            Err(StateStoreError::MissingContract(_)) => Err(Box::new(
+                CoreContractError::Get {
+                    key,
+                    cause: "missing contract state".into(),
+                }
+                .into(),
+            )),
+            Err(err) => Err(Box::new(
+                CoreContractError::Get {
+                    key,
+                    cause: format!("{err}"),
+                }
+                .into(),
+            )),
         }
     }
 }
