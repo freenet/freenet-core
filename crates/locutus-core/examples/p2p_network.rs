@@ -162,7 +162,7 @@ impl ClientEventsProxy for UserEvents {
         Box::pin(async move {
             Ok(OpenRequest::new(
                 ClientId::FIRST,
-                self.rx_ev.recv().await.expect("channel open"),
+                Box::new(self.rx_ev.recv().await.expect("channel open")),
             ))
         })
     }

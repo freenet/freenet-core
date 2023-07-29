@@ -273,7 +273,7 @@ mod test {
                 eprintln!("#{}, received msg {id}", self.id);
                 Ok(OpenRequest {
                     id: ClientId::new(id),
-                    request: ClientRequest::Disconnect { cause: None },
+                    request: Box::new(ClientRequest::Disconnect { cause: None }),
                     notification_channel: None,
                 })
             })
