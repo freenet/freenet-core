@@ -1,12 +1,12 @@
 use std::{collections::HashMap, fmt::Display, io::Cursor};
 
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 
 use crate::{
-    delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
+    delegate_interface::{DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
     prelude::{
-        ContractKey, GetSecretRequest, Parameters, RelatedContracts, SecretsId, StateSummary,
-        UpdateData, WrappedState,
+        ContractKey, DelegateContainer, GetSecretRequest, Parameters, RelatedContracts, SecretsId,
+        StateSummary, UpdateData, WrappedState,
     },
     versioning::ContractContainer,
 };
@@ -316,21 +316,19 @@ impl<'a> From<DelegateRequest<'a>> for ClientRequest<'a> {
 pub enum DelegateRequest<'a> {
     ApplicationMessages {
         key: DelegateKey,
-        #[serde(
-            serialize_with = "DelegateRequest::ser_params",
-            deserialize_with = "DelegateRequest::deser_params"
-        )]
+        #[serde(deserialize_with = "DelegateRequest::deser_params")]
         params: Parameters<'a>,
+        #[serde(borrow)]
         inbound: Vec<InboundDelegateMsg<'a>>,
     },
     GetSecretRequest {
         key: DelegateKey,
+        #[serde(borrow)]
         params: Parameters<'a>,
         get_request: GetSecretRequest,
     },
     RegisterDelegate {
-        #[serde(borrow)]
-        delegate: Delegate<'a>,
+        delegate: DelegateContainer,
         cipher: [u8; 32],
         nonce: [u8; 24],
     },
@@ -373,19 +371,12 @@ impl DelegateRequest<'_> {
                 cipher,
                 nonce,
             } => DelegateRequest::RegisterDelegate {
-                delegate: delegate.into_owned(),
+                delegate,
                 cipher,
                 nonce,
             },
             DelegateRequest::UnregisterDelegate(key) => DelegateRequest::UnregisterDelegate(key),
         }
-    }
-
-    fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        data.serialize(ser)
     }
 
     fn deser_params<'de, 'a, D>(deser: D) -> Result<Parameters<'a>, D::Error>

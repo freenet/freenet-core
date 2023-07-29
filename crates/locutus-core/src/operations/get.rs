@@ -657,7 +657,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use locutus_runtime::{ContractContainer, WasmAPIVersion};
+    use locutus_runtime::{ContractContainer, ContractWasmAPIVersion};
     use locutus_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
@@ -692,7 +692,7 @@ mod test {
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
             non_owned_contracts: vec![],
@@ -784,7 +784,7 @@ mod test {
 
         let node_1 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
             non_owned_contracts: vec![key.clone()],

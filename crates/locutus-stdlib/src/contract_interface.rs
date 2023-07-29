@@ -18,9 +18,8 @@ use std::{
 };
 
 use blake2::{Blake2s256, Digest};
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use semver::Version;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use byteorder::{LittleEndian, ReadBytesExt};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::serde_as;
 
 use crate::{
@@ -784,61 +783,19 @@ impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
 pub struct ContractCode<'a> {
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
-    data: Cow<'a, [u8]>,
+    pub(crate) data: Cow<'a, [u8]>,
     // todo: skip serializing and instead compute it
-    hash: CodeHash,
+    pub(crate) hash: CodeHash,
 }
 
 impl ContractCode<'static> {
-    fn load_versioned(
-        mut contract_data: Cursor<Vec<u8>>,
-    ) -> Result<(Self, Version), std::io::Error> {
-        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
-
-        // Get contract version
-        let version_size = contract_data
-            .read_u32::<BigEndian>()
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let mut version_data = vec![0; version_size as usize];
-        contract_data
-            .read_exact(&mut version_data)
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let version: Version = serde_json::from_slice(version_data.as_slice())
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-
-        if version == VERSION_0_0_1 {
-            let mut code_hash = [0u8; 32];
-            contract_data.read_exact(&mut code_hash)?;
-        }
-
-        // Get Contract code
-        let mut code_data: Vec<u8> = vec![];
-        contract_data
-            .read_to_end(&mut code_data)
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        Ok((ContractCode::from(code_data), version))
-    }
-
-    /// Loads contract code which has been versioned from the fs.
-    pub fn load_versioned_from_path(path: &Path) -> Result<(Self, Version), std::io::Error> {
-        let contract_data = Cursor::new(Self::load_bytes(path)?);
-        Self::load_versioned(contract_data)
-    }
-
-    /// Loads contract code which has been versioned from the fs.
-    pub fn load_versioned_from_bytes(
-        versioned_code: Vec<u8>,
-    ) -> Result<(Self, Version), std::io::Error> {
-        let contract_data = Cursor::new(versioned_code);
-        Self::load_versioned(contract_data)
-    }
-
+    /// Loads the contract raw wasm module, without any version.
     pub fn load_raw(path: &Path) -> Result<Self, std::io::Error> {
         let contract_data = Self::load_bytes(path)?;
         Ok(ContractCode::from(contract_data))
     }
 
-    fn load_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    pub(crate) fn load_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
         let mut contract_file = File::open(path)?;
         let mut contract_data = if let Ok(md) = contract_file.metadata() {
             Vec::with_capacity(md.len() as usize)
@@ -851,7 +808,7 @@ impl ContractCode<'static> {
 }
 
 impl ContractCode<'_> {
-    /// Contract key hash.
+    /// Contract code hash.
     pub fn hash(&self) -> &CodeHash {
         &self.hash
     }
@@ -894,27 +851,6 @@ impl ContractCode<'_> {
         let mut key = [0; CONTRACT_KEY_SIZE];
         key.copy_from_slice(&key_arr);
         CodeHash(key)
-    }
-
-    pub fn to_bytes_versioned(
-        &self,
-        version: &Version,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        match version {
-            ver if ver == &Version::new(0, 0, 1) => {
-                let mut serialized_version = serde_json::to_vec(&ver)
-                    .map_err(|e| format!("couldn't serialize contract version: {e}"))?;
-                let output_size =
-                    std::mem::size_of::<u32>() + serialized_version.len() + self.data().len();
-                let mut output: Vec<u8> = Vec::with_capacity(output_size);
-                output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
-                output.append(&mut serialized_version);
-                output.extend(self.hash.0.iter());
-                output.extend(self.data());
-                Ok(output)
-            }
-            _ => panic!("version not supported"),
-        }
     }
 }
 
@@ -1254,7 +1190,7 @@ impl WrappedState {
 
     fn ser_state<S>(data: &Arc<Vec<u8>>, ser: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+        S: serde::Serializer,
     {
         serde_bytes::serialize(&**data, ser)
     }
@@ -1342,10 +1278,7 @@ pub struct WrappedContract {
         deserialize_with = "WrappedContract::deser_contract_data"
     )]
     pub data: Arc<ContractCode<'static>>,
-    #[serde(
-        serialize_with = "WrappedContract::ser_params",
-        deserialize_with = "WrappedContract::deser_params"
-    )]
+    #[serde(deserialize_with = "WrappedContract::deser_params")]
     pub params: Parameters<'static>,
     pub key: ContractKey,
 }
@@ -1381,7 +1314,7 @@ impl WrappedContract {
 
     fn ser_contract_data<S>(data: &Arc<ContractCode<'_>>, ser: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+        S: serde::Serializer,
     {
         data.serialize(ser)
     }
@@ -1392,13 +1325,6 @@ impl WrappedContract {
     {
         let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
         Ok(Arc::new(data.into_owned()))
-    }
-
-    fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        data.serialize(ser)
     }
 
     fn deser_params<'de, D>(deser: D) -> Result<Parameters<'static>, D::Error>

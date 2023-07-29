@@ -787,7 +787,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use locutus_runtime::{WasmAPIVersion, WrappedContract};
+    use locutus_runtime::{ContractWasmAPIVersion, WrappedContract};
     use locutus_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
@@ -816,7 +816,7 @@ mod test {
         // both own the contract, and one triggers an update
         let node_0 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
             )],
             non_owned_contracts: vec![],
@@ -826,7 +826,7 @@ mod test {
 
         let node_1 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
             )],
             non_owned_contracts: vec![],
@@ -835,7 +835,7 @@ mod test {
         };
 
         let put_event = ContractRequest::Put {
-            contract: ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
+            contract: ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
             state: new_value.clone(),
             related_contracts: Default::default(),
         }
@@ -843,7 +843,7 @@ mod test {
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V1(contract.clone())),
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val,
             )],
             non_owned_contracts: vec![],

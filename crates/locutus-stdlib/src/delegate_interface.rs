@@ -1,6 +1,8 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt::Display,
+    fs::File,
+    io::Read,
     ops::Deref,
     path::Path,
 };
@@ -21,7 +23,7 @@ pub struct Delegate<'a> {
     #[serde(borrow)]
     parameters: Parameters<'a>,
     #[serde(borrow)]
-    data: DelegateCode<'a>,
+    pub data: DelegateCode<'a>,
     key: DelegateKey,
 }
 
@@ -55,6 +57,14 @@ impl Delegate<'_> {
     }
 }
 
+impl PartialEq for Delegate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Delegate<'_> {}
+
 impl<'a> From<(&DelegateCode<'a>, &Parameters<'a>)> for Delegate<'a> {
     fn from((data, parameters): (&DelegateCode<'a>, &Parameters<'a>)) -> Self {
         Self {
@@ -71,9 +81,63 @@ impl<'a> From<(&DelegateCode<'a>, &Parameters<'a>)> for Delegate<'a> {
 pub struct DelegateCode<'a> {
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
-    code: Cow<'a, [u8]>,
+    pub(crate) data: Cow<'a, [u8]>,
     // todo: skip serializing and instead compute it
-    code_hash: CodeHash,
+    pub(crate) code_hash: CodeHash,
+}
+
+impl DelegateCode<'static> {
+    /// Loads the contract raw wasm module, without any version.
+    pub fn load_raw(path: &Path) -> Result<Self, std::io::Error> {
+        let contract_data = Self::load_bytes(path)?;
+        Ok(DelegateCode::from(contract_data))
+    }
+
+    pub(crate) fn load_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+        let mut contract_file = File::open(path)?;
+        let mut contract_data = if let Ok(md) = contract_file.metadata() {
+            Vec::with_capacity(md.len() as usize)
+        } else {
+            Vec::new()
+        };
+        contract_file.read_to_end(&mut contract_data)?;
+        Ok(contract_data)
+    }
+}
+
+impl DelegateCode<'_> {
+    /// Delegate code hash.
+    pub fn hash(&self) -> &CodeHash {
+        &self.code_hash
+    }
+
+    /// Returns the `Base58` string representation of the delegate key.
+    pub fn hash_str(&self) -> String {
+        Self::encode_hash(&self.code_hash.0)
+    }
+
+    /// Reference to delegate code.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Returns the `Base58` string representation of a hash.
+    pub fn encode_hash(hash: &[u8; DELEGATE_HASH_LENGTH]) -> String {
+        bs58::encode(hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
+    }
+
+    pub fn into_owned(self) -> DelegateCode<'static> {
+        DelegateCode {
+            code_hash: self.code_hash,
+            data: Cow::from(self.data.into_owned()),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 impl PartialEq for DelegateCode<'_> {
@@ -84,48 +148,9 @@ impl PartialEq for DelegateCode<'_> {
 
 impl Eq for DelegateCode<'_> {}
 
-impl DelegateCode<'_> {
-    pub fn hash(&self) -> &CodeHash {
-        &self.code_hash
-    }
-
-    pub fn into_owned(self) -> DelegateCode<'static> {
-        DelegateCode {
-            code_hash: self.code_hash,
-            code: Cow::from(self.code.into_owned()),
-        }
-    }
-
-    pub fn hash_str(&self) -> String {
-        Self::encode_hash(&self.code_hash.0)
-    }
-
-    /// Returns the `Base58` string representation of a hash.
-    pub fn encode_hash(hash: &[u8; DELEGATE_HASH_LENGTH]) -> String {
-        bs58::encode(hash)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into_string()
-    }
-
-    pub fn size(&self) -> usize {
-        self.code.len()
-    }
-}
-
-impl DelegateCode<'static> {
-    pub fn load(path: &Path) -> Result<DelegateCode<'static>, std::io::Error> {
-        let code = Cow::from(std::fs::read(path)?);
-        let key = CodeHash::new(code.borrow());
-        Ok(DelegateCode {
-            code,
-            code_hash: key,
-        })
-    }
-}
-
 impl AsRef<[u8]> for DelegateCode<'_> {
     fn as_ref(&self) -> &[u8] {
-        self.code.borrow()
+        self.data.borrow()
     }
 }
 
@@ -133,7 +158,7 @@ impl From<Vec<u8>> for DelegateCode<'static> {
     fn from(data: Vec<u8>) -> Self {
         let key = CodeHash::new(data.as_slice());
         DelegateCode {
-            code: Cow::from(data),
+            data: Cow::from(data),
             code_hash: key,
         }
     }
@@ -143,7 +168,7 @@ impl<'a> From<&'a [u8]> for DelegateCode<'a> {
     fn from(data: &'a [u8]) -> Self {
         let key = CodeHash::new(data);
         DelegateCode {
-            code: Cow::from(data),
+            data: Cow::from(data),
             code_hash: key,
         }
     }

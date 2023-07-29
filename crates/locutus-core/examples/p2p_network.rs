@@ -7,7 +7,9 @@ use libp2p::{
     PeerId,
 };
 use locutus_core::*;
-use locutus_runtime::prelude::{ContractContainer, WasmAPIVersion, WrappedContract, WrappedState};
+use locutus_runtime::prelude::{
+    ContractContainer, ContractWasmAPIVersion, WrappedContract, WrappedState,
+};
 use locutus_stdlib::{
     client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
     prelude::{ContractCode, Parameters},
@@ -43,7 +45,7 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
         Arc::new(ContractCode::from(vec![7, 3, 9, 5])),
         Parameters::from(vec![]),
     )));

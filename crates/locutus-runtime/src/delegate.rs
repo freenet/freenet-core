@@ -1,6 +1,6 @@
 use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
-    ApplicationMessage, ClientResponse, Delegate, DelegateContext, DelegateError,
+    ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
     OutboundDelegateMsg, Parameters, SetSecretRequest,
 };
@@ -42,7 +42,7 @@ pub trait DelegateRuntimeInterface {
 
     fn register_delegate(
         &mut self,
-        delegate: Delegate<'_>,
+        delegate: DelegateContainer,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> RuntimeResult<()>;
@@ -352,7 +352,7 @@ impl DelegateRuntimeInterface for Runtime {
     #[inline]
     fn register_delegate(
         &mut self,
-        delegate: Delegate<'_>,
+        delegate: DelegateContainer,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> RuntimeResult<()> {
@@ -370,7 +370,9 @@ impl DelegateRuntimeInterface for Runtime {
 #[cfg(test)]
 mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
-    use locutus_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
+    use locutus_stdlib::prelude::{
+        ContractCode, ContractInstanceId, Delegate, DelegateWasmAPIVersion, Parameters,
+    };
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
@@ -396,7 +398,9 @@ mod test {
         MessageSigned(Vec<u8>),
     }
 
-    fn setup_runtime(name: &str) -> Result<(Delegate, Runtime), Box<dyn std::error::Error>> {
+    fn setup_runtime(
+        name: &str,
+    ) -> Result<(DelegateContainer, Runtime), Box<dyn std::error::Error>> {
         const TEST_PREFIX: &str = "delegate-api";
         let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let contracts_dir = crate::tests::test_dir(TEST_PREFIX);
@@ -412,7 +416,10 @@ mod test {
 
         let delegate = {
             let bytes = crate::tests::get_test_module(name)?;
-            Delegate::from((&bytes.into(), &vec![].into()))
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &bytes.into(),
+                &vec![].into(),
+            ))))
         };
         let _ = runtime.delegate_store.store_delegate(delegate.clone());
 

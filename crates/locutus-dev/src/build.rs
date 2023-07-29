@@ -446,7 +446,7 @@ mod contract {
                 } else {
                     get_default_ouput_dir(cwd)?.join(package_name)
                 };
-                let output = get_contract_with_version(&output_lib, cli_config)?;
+                let output = get_versioned_contract(&output_lib, cli_config)?;
                 let mut file = File::create(out_file)?;
                 file.write_all(output.as_slice())?;
             }
@@ -456,7 +456,7 @@ mod contract {
         Ok(())
     }
 
-    fn get_contract_with_version(
+    fn get_versioned_contract(
         contract_code_path: &Path,
         cli_config: &BuildToolCliConfig,
     ) -> Result<Vec<u8>, DynError> {
@@ -670,6 +670,8 @@ mod contract {
 }
 
 mod delegate {
+    use locutus_runtime::DelegateCode;
+
     use super::*;
 
     pub(super) fn package_delegate(
@@ -685,7 +687,19 @@ mod delegate {
             .into());
         }
         let out_file = get_default_ouput_dir(cwd)?.join(package_name);
-        std::fs::copy(&output_lib, out_file)?;
+        let output = get_versioned_contract(&output_lib, &cli_config)?;
+        let mut file = File::create(out_file)?;
+        file.write_all(output.as_slice())?;
         Ok(())
+    }
+
+    fn get_versioned_contract(
+        contract_code_path: &Path,
+        cli_config: &BuildToolCliConfig,
+    ) -> Result<Vec<u8>, DynError> {
+        let code: DelegateCode = DelegateCode::load_raw(contract_code_path)?;
+        tracing::info!("compiled contract code hash: {}", code.hash_str());
+        let output = code.to_bytes_versioned(&cli_config.version)?;
+        Ok(output)
     }
 }
