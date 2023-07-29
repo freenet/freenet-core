@@ -43,19 +43,19 @@ type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 #[non_exhaustive]
 pub struct OpenRequest<'a> {
     pub id: ClientId,
-    pub request: ClientRequest<'a>,
+    pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<UnboundedSender<HostResult>>,
 }
 
 impl<'a> OpenRequest<'a> {
     pub fn into_owned(self) -> OpenRequest<'static> {
         OpenRequest {
-            request: self.request.into_owned(),
+            request: Box::new(self.request.into_owned()),
             ..self
         }
     }
 
-    pub fn new(id: ClientId, request: ClientRequest<'a>) -> Self {
+    pub fn new(id: ClientId, request: Box<ClientRequest<'a>>) -> Self {
         Self {
             id,
             request,

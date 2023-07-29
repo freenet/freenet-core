@@ -105,7 +105,9 @@ async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
 ) -> Result<Html<String>, WebSocketApiError> {
     let full_path: String = format!("/contract/web/{}/{}", key, last_path);
-    web_handling::variable_content(key, full_path).await
+    web_handling::variable_content(key, full_path)
+        .await
+        .map_err(|e| *e)
 }
 
 async fn websocket_commands(
@@ -247,7 +249,10 @@ async fn process_client_request(
 
     tracing::debug!(req = %req, "received client request");
     request_sender
-        .send(ClientConnection::Request { client_id, req })
+        .send(ClientConnection::Request {
+            client_id,
+            req: Box::new(req),
+        })
         .await
         .map_err(|err| Some(err.into()))?;
     Ok(None)
@@ -322,34 +327,35 @@ impl HttpGateway {
                 self.response_channels.insert(cli_id, new_client_ch);
                 Ok(None)
             }
-            ClientConnection::Request {
-                client_id,
-                req: ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary }),
-            } => {
-                // intercept subscription messages because they require a callback subscription channel
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                if let Some(ch) = self.response_channels.get(&client_id) {
-                    ch.send(HostCallbackResult::SubscriptionChannel {
-                        key: key.clone(),
-                        id: client_id,
-                        callback: rx,
-                    })
-                    .map_err(|_| ErrorKind::ChannelClosed)?;
-                    Ok(Some(
-                        OpenRequest::new(
-                            client_id,
-                            ContractRequest::Subscribe { key, summary }.into(),
-                        )
-                        .with_notification(tx),
-                    ))
-                } else {
-                    tracing::warn!("client: {client_id} not found");
-                    Err(ErrorKind::UnknownClient(client_id.into()).into())
-                }
-            }
             ClientConnection::Request { client_id, req } => {
-                // just forward the request to the node
-                Ok(Some(OpenRequest::new(client_id, req)))
+                match *req.clone() {
+                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary }) => {
+                        // intercept subscription messages because they require a callback subscription channel
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        if let Some(ch) = self.response_channels.get(&client_id) {
+                            ch.send(HostCallbackResult::SubscriptionChannel {
+                                key: key.clone(),
+                                id: client_id,
+                                callback: rx,
+                            })
+                            .map_err(|_| ErrorKind::ChannelClosed)?;
+                            Ok(Some(
+                                OpenRequest::new(
+                                    client_id,
+                                    Box::new(ContractRequest::Subscribe { key, summary }.into()),
+                                )
+                                .with_notification(tx),
+                            ))
+                        } else {
+                            tracing::warn!("client: {client_id} not found");
+                            Err(ErrorKind::UnknownClient(client_id.into()).into())
+                        }
+                    }
+                    _ => {
+                        // just forward the request to the node
+                        Ok(Some(OpenRequest::new(client_id, req)))
+                    }
+                }
             }
         }
     }

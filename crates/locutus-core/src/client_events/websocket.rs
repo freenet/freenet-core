@@ -227,9 +227,9 @@ async fn new_request(
                         .send(
                             OpenRequest {
                                 id,
-                                request: ClientRequest::Disconnect {
+                                request: Box::new(ClientRequest::Disconnect {
                                     cause: Some(format!("{e}")),
-                                },
+                                }),
                                 notification_channel: None,
                             }
                             .into(),
@@ -245,9 +245,9 @@ async fn new_request(
                 .send(
                     OpenRequest {
                         id,
-                        request: ClientRequest::Disconnect {
+                        request: Box::new(ClientRequest::Disconnect {
                             cause: Some(format!("{e}")),
-                        },
+                        }),
                         notification_channel: None,
                     }
                     .into(),
@@ -261,7 +261,7 @@ async fn new_request(
         .send(
             OpenRequest {
                 id,
-                request: msg,
+                request: Box::new(msg),
                 notification_channel: None,
             }
             .into(),

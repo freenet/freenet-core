@@ -14,7 +14,7 @@ enum ClientConnection {
     NewConnection(tokio::sync::mpsc::UnboundedSender<HostCallbackResult>),
     Request {
         client_id: ClientId,
-        req: ClientRequest<'static>,
+        req: Box<ClientRequest<'static>>,
     },
 }
 
@@ -58,7 +58,7 @@ pub mod local_node {
             } = http_handle.recv().await?;
             tracing::trace!(cli_id = %id, "got request -> {request}");
             match executor
-                .handle_request(id, request, notification_channel)
+                .handle_request(id, *request, notification_channel)
                 .await
             {
                 Ok(res) => {

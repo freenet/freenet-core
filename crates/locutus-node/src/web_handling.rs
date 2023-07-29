@@ -47,11 +47,13 @@ pub(crate) async fn contract_home(
     request_sender
         .send(ClientConnection::Request {
             client_id,
-            req: ContractRequest::Get {
-                key: key.clone(),
-                fetch_contract: true,
-            }
-            .into(),
+            req: Box::new(
+                ContractRequest::Get {
+                    key: key.clone(),
+                    fetch_contract: true,
+                }
+                .into(),
+            ),
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -135,7 +137,7 @@ pub(crate) async fn contract_home(
     request_sender
         .send(ClientConnection::Request {
             client_id,
-            req: ClientRequest::Disconnect { cause: None },
+            req: Box::new(ClientRequest::Disconnect { cause: None }),
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -148,7 +150,7 @@ pub(crate) async fn contract_home(
 pub async fn variable_content(
     key: String,
     req_path: String,
-) -> Result<Html<String>, WebSocketApiError> {
+) -> Result<Html<String>, Box<WebSocketApiError>> {
     let key = ContractKey::from_id(key).map_err(|err| WebSocketApiError::InvalidParam {
         error_cause: format!("{err}"),
     })?;
@@ -205,13 +207,12 @@ fn contract_web_path(key: &ContractKey) -> PathBuf {
 }
 
 #[inline]
-fn get_file_path(uri: axum::http::Uri) -> Result<String, WebSocketApiError> {
-    let p =
-        uri.path()
-            .strip_prefix("/contract/")
-            .ok_or_else(|| WebSocketApiError::InvalidParam {
-                error_cause: format!("{uri} not valid"),
-            })?;
+fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>> {
+    let p = uri.path().strip_prefix("/contract/").ok_or_else(|| {
+        Box::new(WebSocketApiError::InvalidParam {
+            error_cause: format!("{uri} not valid"),
+        })
+    })?;
     let path = p
         .chars()
         .skip_while(|c| ALPHABET.contains(*c))
