@@ -188,7 +188,7 @@ pub(crate) enum ContractHandlerEvent<Err> {
 pub mod test {
     use std::sync::Arc;
 
-    use locutus_runtime::{ContractStore, WasmAPIVersion};
+    use locutus_runtime::{ContractStore, ContractWasmAPIVersion};
     use locutus_stdlib::{
         client_api::{ClientRequest, HostResponse},
         prelude::ContractCode,
@@ -292,10 +292,11 @@ pub mod test {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel::<SimStoreError>();
 
         let h = GlobalExecutor::spawn(async move {
-            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
-                Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
-                Parameters::from(vec![]),
-            )));
+            let contract =
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                    Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
+                    Parameters::from(vec![]),
+                )));
             send_halve
                 .send_to_handler(ContractHandlerEvent::Cache(contract))
                 .await
@@ -308,10 +309,9 @@ pub mod test {
         if let ContractHandlerEvent::Cache(contract) = ev {
             let data: Vec<u8> = contract.data();
             assert_eq!(data, vec![0, 1, 2, 3]);
-            let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
-                Arc::new(ContractCode::from(data)),
-                Parameters::from(vec![]),
-            )));
+            let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                WrappedContract::new(Arc::new(ContractCode::from(data)), Parameters::from(vec![])),
+            ));
             tokio::time::timeout(
                 Duration::from_millis(100),
                 rcv_halve.send_to_listener(id, ContractHandlerEvent::Cache(contract)),

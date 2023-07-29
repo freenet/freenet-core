@@ -91,8 +91,8 @@ pub(crate) mod test {
 
     use futures::FutureExt;
     use locutus_runtime::{
-        prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId, DelegateKey,
-        Parameters, RelatedContracts, WasmAPIVersion,
+        prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId,
+        ContractWasmAPIVersion, DelegateKey, Parameters, RelatedContracts,
     };
     use locutus_stdlib::client_api::{ContractRequest, TryFromTsStd};
     use rand::{prelude::Rng, thread_rng};
@@ -362,7 +362,7 @@ pub(crate) mod test {
     #[test]
     fn test_handle_put_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request: ContractRequest = ContractRequest::Put {
-            contract: ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+            contract: ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
                 Arc::new(ContractCode::from(vec![1])),
                 Parameters::from(vec![2]),
             ))),

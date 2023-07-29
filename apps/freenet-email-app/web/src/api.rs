@@ -182,11 +182,11 @@ mod delegate_api {
     pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
         delegate_code_hash: &str,
-        delegate_code: impl Into<Vec<u8>>,
+        delegate_code: &[u8],
         params: &Parameters<'static>,
     ) -> Result<DelegateKey, DynError> {
         let key = DelegateKey::from_params(delegate_code_hash, params)?;
-        let delegate = Delegate::from((&DelegateCode::from(delegate_code.into()), params));
+        let delegate = DelegateContainer::try_from((delegate_code.to_vec(), params))?;
         assert_eq!(&key, delegate.key());
         let request = ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
             delegate,

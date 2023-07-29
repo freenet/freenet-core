@@ -4,7 +4,7 @@ use locutus_core::{
     locutus_runtime::StateDelta, ClientId, Config, Executor, OperationMode, Storage,
 };
 use locutus_runtime::{
-    ContractContainer, ContractInstanceId, ContractStore, Delegate, DelegateCode, DelegateStore,
+    ContractContainer, ContractInstanceId, ContractStore, DelegateContainer, DelegateStore,
     Parameters, SecretsStore, StateStore,
 };
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest, DelegateRequest};
@@ -98,7 +98,7 @@ async fn put_delegate(
     other: BaseConfig,
     params: Parameters<'static>,
 ) -> Result<(), DynError> {
-    let code = DelegateCode::load(&config.code)?;
+    let delegate = DelegateContainer::try_from((config.code.as_path(), params))?;
 
     let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
         println!(
@@ -121,9 +121,7 @@ For additional hardening is recommended to use a different cipher and nonce to e
         (cipher, nonce)
     };
 
-    let delegate = Delegate::from((&code, &params));
     println!("Putting delegate {} ", delegate.key().encode());
-
     let request = DelegateRequest::RegisterDelegate {
         delegate,
         cipher,

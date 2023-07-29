@@ -5,7 +5,10 @@ use stretto::Cache;
 
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
-use locutus_stdlib::prelude::{CodeHash, Delegate, DelegateCode, DelegateKey, Parameters};
+use locutus_stdlib::prelude::{
+    CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey, DelegateWasmAPIVersion,
+    Parameters,
+};
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
 
@@ -45,7 +48,7 @@ impl From<&DashMap<DelegateKey, CodeHash>> for KeyToCodeMap {
 pub struct DelegateStore {
     delegates_dir: PathBuf,
     delegate_cache: Cache<CodeHash, DelegateCode<'static>>,
-    key_to_delegate_part: Arc<DashMap<DelegateKey, CodeHash>>,
+    key_to_code_part: Arc<DashMap<DelegateKey, CodeHash>>,
 }
 
 static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
@@ -89,7 +92,7 @@ impl DelegateStore {
         Ok(Self {
             delegate_cache: Cache::new(100, max_size).expect(ERR),
             delegates_dir,
-            key_to_delegate_part,
+            key_to_code_part: key_to_delegate_part,
         })
     }
 
@@ -102,13 +105,22 @@ impl DelegateStore {
         if let Some(delegate_code) = self.delegate_cache.get(key.code_hash()) {
             return Some(Delegate::from((delegate_code.value(), params)).into_owned());
         }
-        self.key_to_delegate_part.get(key).and_then(|code_part| {
+        self.key_to_code_part.get(key).and_then(|code_part| {
             let delegate_code_path = self
                 .delegates_dir
                 .join(code_part.value().encode())
                 .with_extension("wasm");
             tracing::debug!("loading delegate `{key}` from {delegate_code_path:?}");
-            let delegate_code = DelegateCode::load(delegate_code_path.as_path()).ok()?;
+            let DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate {
+                data: delegate_code,
+                ..
+            })) = DelegateContainer::try_from((
+                delegate_code_path.as_path(),
+                params.clone().into_owned(),
+            ))
+            .ok()? else {
+                unimplemented!()
+            };
             tracing::debug!("loaded `{key}` from path");
             let size = delegate_code.as_ref().len() as i64;
             let delegate = Delegate::from((&delegate_code, &params.clone().into_owned()));
@@ -118,7 +130,7 @@ impl DelegateStore {
         })
     }
 
-    pub fn store_delegate(&mut self, delegate: Delegate<'_>) -> RuntimeResult<()> {
+    pub fn store_delegate(&mut self, delegate: DelegateContainer) -> RuntimeResult<()> {
         let code_hash = delegate.code_hash();
         if self.delegate_cache.get(code_hash).is_some() {
             return Ok(());
@@ -126,7 +138,7 @@ impl DelegateStore {
 
         let key = delegate.key();
         Self::update(
-            &mut self.key_to_delegate_part,
+            &mut self.key_to_code_part,
             key.clone(),
             code_hash.clone(),
             KEY_FILE_PATH.get().unwrap(),
@@ -135,7 +147,7 @@ impl DelegateStore {
 
         let key_path = code_hash.encode();
         let delegate_path = self.delegates_dir.join(key_path).with_extension("wasm");
-        if let Ok(code) = DelegateCode::load(delegate_path.as_path()) {
+        if let Ok((code, _ver)) = DelegateCode::load_versioned_from_path(delegate_path.as_path()) {
             let size = delegate.code().size() as i64;
             self.delegate_cache.insert(code_hash.clone(), code, size);
             return Ok(());
@@ -174,9 +186,7 @@ impl DelegateStore {
     }
 
     pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
-        self.key_to_delegate_part
-            .get(key)
-            .map(|r| r.value().clone())
+        self.key_to_code_part.get(key).map(|r| r.value().clone())
     }
 }
 
@@ -185,7 +195,7 @@ impl Default for DelegateStore {
         Self {
             delegates_dir: Default::default(),
             delegate_cache: Cache::new(100, DEFAULT_MAX_SIZE).unwrap(),
-            key_to_delegate_part: Arc::new(DashMap::new()),
+            key_to_code_part: Arc::new(DashMap::new()),
         }
     }
 }
@@ -201,7 +211,10 @@ mod test {
             .join("delegates-store-test");
         std::fs::create_dir_all(&cdelegate_dir)?;
         let mut store = DelegateStore::new(cdelegate_dir, 10_000)?;
-        let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
+        let delegate = {
+            let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate))
+        };
         store.store_delegate(delegate.clone())?;
         let f = store.fetch_delegate(delegate.key(), &vec![].into());
         assert!(f.is_some());

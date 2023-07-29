@@ -39,9 +39,13 @@ contract API version: {version}
             );
         }
         FileType::Delegate => {
-            let code = DelegateCode::load(&config.file)?;
+            let (code, version) = DelegateCode::load_versioned_from_path(&config.file)?;
             let hash = code.hash_str();
-            println!(r#"code hash: {hash}"#);
+            println!(
+                r#"code hash: {hash}
+delegate API version: {version}
+"#
+            );
         }
         FileType::Contract => todo!(),
     }

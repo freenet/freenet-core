@@ -304,7 +304,7 @@ mod test {
 
     use crate::contract::contract_handler_channel;
     use crate::WrappedContract;
-    use locutus_runtime::{StateDelta, WasmAPIVersion};
+    use locutus_runtime::{ContractWasmAPIVersion, StateDelta};
     use locutus_stdlib::prelude::ContractCode;
 
     use super::SQLiteContractHandler;
@@ -327,7 +327,7 @@ mod test {
         // Generate a contract
         let contract_bytes = b"Test contract value".to_vec();
         let contract: ContractContainer =
-            ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
                 Arc::new(ContractCode::from(contract_bytes.clone())),
                 Parameters::from(vec![]),
             )));

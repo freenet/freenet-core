@@ -5,7 +5,7 @@ use std::{
 };
 
 use locutus_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractKey, WasmAPIVersion, WrappedContract,
+    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
 };
 
 use crate::ContractStore;
@@ -68,7 +68,7 @@ pub(crate) fn setup_test_contract(
         Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),
     );
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(contract_bytes));
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
     let key = contract.key();
     store.store_contract(contract)?;
     Ok((store, key))
