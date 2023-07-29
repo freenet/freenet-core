@@ -9,6 +9,7 @@ use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ClientConnection {
     NewConnection(tokio::sync::mpsc::UnboundedSender<HostCallbackResult>),
     Request {
