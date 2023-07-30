@@ -1,8 +1,7 @@
 use std::{fs::File, io::Write, iter::FromIterator, path::PathBuf, sync::Arc};
 
 use dashmap::DashMap;
-use locutus_stdlib::prelude::{CodeHash, ContractCode, Parameters, WrappedContract};
-use semver::Version;
+use locutus_stdlib::prelude::{APIVersion, CodeHash, ContractCode, Parameters, WrappedContract};
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
@@ -185,8 +184,8 @@ impl ContractStore {
         self.contract_cache
             .insert(code_hash.clone(), Arc::new(ContractCode::from(data)), size);
 
-        let version: Version = Version::from(contract);
-        let output: Vec<u8> = code.to_bytes_versioned(&version)?;
+        let version = APIVersion::from(contract);
+        let output: Vec<u8> = code.to_bytes_versioned(version)?;
         let mut file = File::create(key_path)?;
         file.write_all(output.as_slice())?;
 

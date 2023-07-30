@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
@@ -64,18 +63,15 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for DelegateContainer {
     type Error = std::io::Error;
 
     fn try_from((path, params): (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
-
         let (contract_code, version) = DelegateCode::load_versioned_from_path(path)?;
 
         match version {
-            version if version == VERSION_0_0_1 => {
+            APIVersion::Version0_0_1 => {
                 let delegate = Delegate::from((&contract_code, &params));
                 Ok(DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
                     delegate,
                 )))
             }
-            _ => Err(std::io::ErrorKind::InvalidData.into()),
         }
     }
 }
@@ -88,19 +84,17 @@ where
 
     fn try_from((versioned_contract_bytes, params): (Vec<u8>, P)) -> Result<Self, Self::Error> {
         let params = params.deref().clone().into_owned();
-        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
 
         let (contract_code, version) =
             DelegateCode::load_versioned_from_bytes(versioned_contract_bytes)?;
 
         match version {
-            version if version == VERSION_0_0_1 => {
+            APIVersion::Version0_0_1 => {
                 let delegate = Delegate::from((&contract_code, &params));
                 Ok(DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
                     delegate,
                 )))
             }
-            _ => Err(std::io::ErrorKind::InvalidData.into()),
         }
     }
 }
@@ -108,26 +102,19 @@ where
 impl DelegateCode<'static> {
     fn load_versioned(
         mut contract_data: Cursor<Vec<u8>>,
-    ) -> Result<(Self, Version), std::io::Error> {
-        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
-
+    ) -> Result<(Self, APIVersion), std::io::Error> {
         // Get contract version
-        let version_size = contract_data
-            .read_u32::<BigEndian>()
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let mut version_data = vec![0; version_size as usize];
-        contract_data
-            .read_exact(&mut version_data)
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let version: Version = serde_json::from_slice(version_data.as_slice())
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let version = contract_data
+            .read_u64::<BigEndian>()
+            .map_err(|_| std::io::ErrorKind::InvalidData)
+            .map(APIVersion::from_u64)?;
 
-        if version == VERSION_0_0_1 {
+        if version == APIVersion::Version0_0_1 {
             let mut code_hash = [0u8; 32];
             contract_data.read_exact(&mut code_hash)?;
         }
 
-        // Get Contract code
+        // Get contract code
         let mut code_data: Vec<u8> = vec![];
         contract_data
             .read_to_end(&mut code_data)
@@ -136,7 +123,7 @@ impl DelegateCode<'static> {
     }
 
     /// Loads contract code which has been versioned from the fs.
-    pub fn load_versioned_from_path(path: &Path) -> Result<(Self, Version), std::io::Error> {
+    pub fn load_versioned_from_path(path: &Path) -> Result<(Self, APIVersion), std::io::Error> {
         let contract_data = Cursor::new(Self::load_bytes(path)?);
         Self::load_versioned(contract_data)
     }
@@ -144,7 +131,7 @@ impl DelegateCode<'static> {
     /// Loads contract code which has been versioned from the fs.
     pub fn load_versioned_from_bytes(
         versioned_code: Vec<u8>,
-    ) -> Result<(Self, Version), std::io::Error> {
+    ) -> Result<(Self, APIVersion), std::io::Error> {
         let contract_data = Cursor::new(versioned_code);
         Self::load_versioned(contract_data)
     }
@@ -153,22 +140,18 @@ impl DelegateCode<'static> {
 impl DelegateCode<'_> {
     pub fn to_bytes_versioned(
         &self,
-        version: &Version,
+        version: APIVersion,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
         match version {
-            ver if ver == &Version::new(0, 0, 1) => {
-                let mut serialized_version = serde_json::to_vec(&ver)
-                    .map_err(|e| format!("couldn't serialize contract version: {e}"))?;
+            APIVersion::Version0_0_1 => {
                 let output_size =
-                    std::mem::size_of::<u32>() + serialized_version.len() + self.data().len();
+                    std::mem::size_of::<u64>() + self.data().len() + self.hash().0.len();
                 let mut output: Vec<u8> = Vec::with_capacity(output_size);
-                output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
-                output.append(&mut serialized_version);
+                output.write_u64::<BigEndian>(APIVersion::Version0_0_1.into_u64())?;
                 output.extend(self.hash().0.iter());
                 output.extend(self.data());
                 Ok(output)
             }
-            _ => panic!("version not supported"),
         }
     }
 }
@@ -205,10 +188,10 @@ pub enum ContractContainer {
     Wasm(ContractWasmAPIVersion),
 }
 
-impl From<ContractContainer> for Version {
-    fn from(contract: ContractContainer) -> Version {
+impl From<ContractContainer> for APIVersion {
+    fn from(contract: ContractContainer) -> APIVersion {
         match contract {
-            ContractContainer::Wasm(ContractWasmAPIVersion::V1(_)) => Version::new(0, 0, 1),
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(_)) => APIVersion::Version0_0_1,
         }
     }
 }
@@ -258,15 +241,12 @@ impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for ContractContainer {
     type Error = std::io::Error;
 
     fn try_from((path, params): (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
-
         let (contract_code, version) = ContractCode::load_versioned_from_path(path)?;
 
         match version {
-            version if version == VERSION_0_0_1 => Ok(ContractContainer::Wasm(
-                ContractWasmAPIVersion::V1(WrappedContract::new(Arc::new(contract_code), params)),
-            )),
-            _ => Err(std::io::ErrorKind::InvalidData.into()),
+            APIVersion::Version0_0_1 => Ok(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                WrappedContract::new(Arc::new(contract_code), params),
+            ))),
         }
     }
 }
@@ -279,16 +259,14 @@ where
 
     fn try_from((versioned_contract_bytes, params): (Vec<u8>, P)) -> Result<Self, Self::Error> {
         let params = params.deref().clone().into_owned();
-        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
 
         let (contract_code, version) =
             ContractCode::load_versioned_from_bytes(versioned_contract_bytes)?;
 
         match version {
-            version if version == VERSION_0_0_1 => Ok(ContractContainer::Wasm(
-                ContractWasmAPIVersion::V1(WrappedContract::new(Arc::new(contract_code), params)),
-            )),
-            _ => Err(std::io::ErrorKind::InvalidData.into()),
+            APIVersion::Version0_0_1 => Ok(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                WrappedContract::new(Arc::new(contract_code), params),
+            ))),
         }
     }
 }
@@ -296,26 +274,19 @@ where
 impl ContractCode<'static> {
     fn load_versioned(
         mut contract_data: Cursor<Vec<u8>>,
-    ) -> Result<(Self, Version), std::io::Error> {
-        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
-
+    ) -> Result<(Self, APIVersion), std::io::Error> {
         // Get contract version
-        let version_size = contract_data
-            .read_u32::<BigEndian>()
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let mut version_data = vec![0; version_size as usize];
-        contract_data
-            .read_exact(&mut version_data)
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
-        let version: Version = serde_json::from_slice(version_data.as_slice())
-            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let version = contract_data
+            .read_u64::<BigEndian>()
+            .map_err(|_| std::io::ErrorKind::InvalidData)
+            .map(APIVersion::from_u64)?;
 
-        if version == VERSION_0_0_1 {
+        if version == APIVersion::Version0_0_1 {
             let mut code_hash = [0u8; 32];
             contract_data.read_exact(&mut code_hash)?;
         }
 
-        // Get Contract code
+        // Get contract code
         let mut code_data: Vec<u8> = vec![];
         contract_data
             .read_to_end(&mut code_data)
@@ -324,7 +295,7 @@ impl ContractCode<'static> {
     }
 
     /// Loads contract code which has been versioned from the fs.
-    pub fn load_versioned_from_path(path: &Path) -> Result<(Self, Version), std::io::Error> {
+    pub fn load_versioned_from_path(path: &Path) -> Result<(Self, APIVersion), std::io::Error> {
         let contract_data = Cursor::new(Self::load_bytes(path)?);
         Self::load_versioned(contract_data)
     }
@@ -332,31 +303,65 @@ impl ContractCode<'static> {
     /// Loads contract code which has been versioned from the fs.
     pub fn load_versioned_from_bytes(
         versioned_code: Vec<u8>,
-    ) -> Result<(Self, Version), std::io::Error> {
+    ) -> Result<(Self, APIVersion), std::io::Error> {
         let contract_data = Cursor::new(versioned_code);
         Self::load_versioned(contract_data)
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum APIVersion {
+    Version0_0_1,
+}
+
+impl APIVersion {
+    fn from_u64(version: u64) -> Self {
+        match version {
+            0 => Self::Version0_0_1,
+            _ => panic!("unsupported incremental API version: {version}"),
+        }
+    }
+
+    fn into_u64(self) -> u64 {
+        match self {
+            Self::Version0_0_1 => 0,
+        }
+    }
+}
+
+impl Display for APIVersion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            APIVersion::Version0_0_1 => write!(f, "0.0.1"),
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a semver::Version> for APIVersion {
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    fn try_from(value: &'a semver::Version) -> Result<Self, Self::Error> {
+        match value {
+            ver if ver == &semver::Version::new(0, 0, 1) => Ok(APIVersion::Version0_0_1),
+            other => Err(format!("{other} version not supported").into()),
+        }
     }
 }
 
 impl ContractCode<'_> {
     pub fn to_bytes_versioned(
         &self,
-        version: &Version,
+        version: APIVersion,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
         match version {
-            ver if ver == &Version::new(0, 0, 1) => {
-                let mut serialized_version = serde_json::to_vec(&ver)
-                    .map_err(|e| format!("couldn't serialize contract version: {e}"))?;
+            APIVersion::Version0_0_1 => {
                 let output_size =
-                    std::mem::size_of::<u32>() + serialized_version.len() + self.data().len();
+                    std::mem::size_of::<u64>() + self.data().len() + self.hash().0.len();
                 let mut output: Vec<u8> = Vec::with_capacity(output_size);
-                output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
-                output.append(&mut serialized_version);
-                output.extend(self.hash.0.iter());
+                output.write_u64::<BigEndian>(APIVersion::Version0_0_1.into_u64())?;
+                output.extend(self.hash().0.iter());
                 output.extend(self.data());
                 Ok(output)
             }
-            _ => panic!("version not supported"),
         }
     }
 }
