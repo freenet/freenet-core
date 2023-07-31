@@ -1137,7 +1137,6 @@ dependencies = [
  "rmp-serde",
  "rmpv",
  "rsa 0.8.2",
- "semver",
  "serde",
  "serde_bytes",
  "serde_json",

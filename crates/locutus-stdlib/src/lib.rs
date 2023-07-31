@@ -31,7 +31,6 @@ pub mod prelude {
 
     pub use bincode;
     pub use blake2;
-    pub use semver::Version;
     pub use serde_json;
     pub use tracing;
     pub use tracing_subscriber;

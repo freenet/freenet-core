@@ -29,7 +29,7 @@ rand = { workspace = true }
 rsa = {  version = "0.8.2", default-features = false, features = ["serde", "sha2"] }
 rmpv = "1"
 rmp-serde = { version = "1" }
-semver = { workspace = true }
+# semver = { workspace = true }
 serde_json = { workspace = true }
 stretto = { version = "0.7", features = ["async", "sync"], default-features = false }
 tokio = { version = "1", features = ["rt"] }

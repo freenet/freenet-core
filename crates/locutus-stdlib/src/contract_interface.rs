@@ -785,7 +785,7 @@ pub struct ContractCode<'a> {
     #[serde(borrow)]
     pub(crate) data: Cow<'a, [u8]>,
     // todo: skip serializing and instead compute it
-    pub(crate) hash: CodeHash,
+    pub(crate) code_hash: CodeHash,
 }
 
 impl ContractCode<'static> {
@@ -810,12 +810,12 @@ impl ContractCode<'static> {
 impl ContractCode<'_> {
     /// Contract code hash.
     pub fn hash(&self) -> &CodeHash {
-        &self.hash
+        &self.code_hash
     }
 
     /// Returns the `Base58` string representation of the contract key.
     pub fn hash_str(&self) -> String {
-        Self::encode_hash(&self.hash.0)
+        Self::encode_hash(&self.code_hash.0)
     }
 
     /// Reference to contract code.
@@ -839,7 +839,7 @@ impl ContractCode<'_> {
     pub fn into_owned(self) -> ContractCode<'static> {
         ContractCode {
             data: self.data.into_owned().into(),
-            hash: self.hash,
+            code_hash: self.code_hash,
         }
     }
 
@@ -859,7 +859,7 @@ impl From<Vec<u8>> for ContractCode<'static> {
         let key = ContractCode::gen_hash(&data);
         ContractCode {
             data: Cow::from(data),
-            hash: key,
+            code_hash: key,
         }
     }
 }
@@ -869,7 +869,7 @@ impl<'a> From<&'a [u8]> for ContractCode<'a> {
         let hash = ContractCode::gen_hash(data);
         ContractCode {
             data: Cow::from(data),
-            hash,
+            code_hash: hash,
         }
     }
 }
@@ -883,7 +883,7 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for ContractCode<'a> {
 
 impl PartialEq for ContractCode<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
+        self.code_hash == other.code_hash
     }
 }
 
@@ -900,7 +900,7 @@ impl<'a> arbitrary::Arbitrary<'a> for ContractCode<'static> {
 impl std::fmt::Display for ContractCode<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Contract( key: ")?;
-        internal_fmt_key(&self.hash.0, f)?;
+        internal_fmt_key(&self.code_hash.0, f)?;
         let data: String = if self.data.len() > 8 {
             self.data[..4]
                 .iter()

@@ -462,7 +462,7 @@ mod contract {
     ) -> Result<Vec<u8>, DynError> {
         let code: ContractCode = ContractCode::load_raw(contract_code_path)?;
         tracing::info!("compiled contract code hash: {}", code.hash_str());
-        let output = code.to_bytes_versioned(&cli_config.version)?;
+        let output = code.to_bytes_versioned((&cli_config.version).try_into()?)?;
         Ok(output)
     }
 
@@ -699,7 +699,7 @@ mod delegate {
     ) -> Result<Vec<u8>, DynError> {
         let code: DelegateCode = DelegateCode::load_raw(contract_code_path)?;
         tracing::info!("compiled contract code hash: {}", code.hash_str());
-        let output = code.to_bytes_versioned(&cli_config.version)?;
+        let output = code.to_bytes_versioned((&cli_config.version).try_into()?)?;
         Ok(output)
     }
 }
