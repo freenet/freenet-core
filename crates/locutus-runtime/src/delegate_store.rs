@@ -6,8 +6,8 @@ use stretto::Cache;
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
 use locutus_stdlib::prelude::{
-    CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey, DelegateWasmAPIVersion,
-    Parameters,
+    APIVersion, CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
+    DelegateWasmAPIVersion, Parameters,
 };
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
@@ -162,8 +162,8 @@ impl DelegateStore {
             code_size,
         );
 
-        let mut output: Vec<u8> = Vec::with_capacity(code_size as usize);
-        output.append(&mut delegate.code().as_ref().to_vec());
+        let version = APIVersion::from(delegate.clone());
+        let output: Vec<u8> = delegate.code().to_bytes_versioned(version)?;
         let mut file = File::create(delegate_path)?;
         file.write_all(output.as_slice())?;
 

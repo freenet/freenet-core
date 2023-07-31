@@ -39,6 +39,14 @@ pub enum DelegateContainer {
     Wasm(DelegateWasmAPIVersion),
 }
 
+impl From<DelegateContainer> for APIVersion {
+    fn from(delegate: DelegateContainer) -> APIVersion {
+        match delegate {
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(_)) => APIVersion::Version0_0_1,
+        }
+    }
+}
+
 impl DelegateContainer {
     pub fn key(&self) -> &DelegateKey {
         match self {
