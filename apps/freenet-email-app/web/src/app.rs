@@ -776,7 +776,7 @@ fn new_message_window(cx: Scope) -> Element {
                             td { style: "width: 100%", contenteditable: true, oninput: move |ev| { to.set(ev.value.clone()); } }
                         }
                         tr {
-                            th { "Title"}
+                            th { "Subject"}
                             td { style: "width: 100%", contenteditable: true, oninput: move |ev| { title.set(ev.value.clone()); }  }
                         }
                     }
