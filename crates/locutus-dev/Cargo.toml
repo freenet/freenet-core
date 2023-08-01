@@ -9,20 +9,22 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/freenet/locutus"
 
 [dependencies]
+bs58 = { workspace = true }
 atty = "0.2"
-byteorder = "1"
+# byteorder = "1"
 clap = { workspace = true, features = ["derive", "env"] }
 either = { workspace = true }
 futures = { workspace = true }
 glob = "0.3"
 thiserror = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot"] }
 pico-args = "0.5"
+semver = { workspace = true }
 serde = "1"
 serde_json = "1"
-serde_with = "2"
+serde_with = { workspace = true }
 bincode = "1"
 tar = "0.4"
 toml = { version = "0.5", features = ["preserve_order"] }

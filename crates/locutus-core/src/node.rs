@@ -302,7 +302,7 @@ async fn client_event_handling<ClientEv, CErr>(
         let OpenRequest {
             id: _id, request, ..
         } = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
-        if let ClientRequest::Disconnect { .. } = request {
+        if let ClientRequest::Disconnect { .. } = *request {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
                 tracing::error!("{}", err);
             }
@@ -311,7 +311,7 @@ async fn client_event_handling<ClientEv, CErr>(
 
         let op_storage_cp = op_storage.clone();
         GlobalExecutor::spawn(async move {
-            match request {
+            match *request {
                 ClientRequest::ContractOp(ops) => match ops {
                     ContractRequest::Put {
                         state,
@@ -386,7 +386,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         todo!()
                     }
                 },
-                ClientRequest::DelegateOp(_op) => todo!("FIXME: component op"),
+                ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
                 ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
                 ClientRequest::Disconnect { .. } => unreachable!(),
             }

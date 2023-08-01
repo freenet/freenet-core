@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
 };
 
-use locutus_core::locutus_runtime::ContractContainer;
+use locutus_core::locutus_runtime::{ContractContainer, DelegateStore, SecretsStore};
 use locutus_core::{
     libp2p::identity::ed25519::PublicKey, locutus_runtime::StateStore, Config, Storage,
     WrappedState,
@@ -93,6 +93,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node = Executor::new(
         contract_store,
+        DelegateStore::default(),
+        SecretsStore::default(),
         state_store,
         || {
             locutus_core::util::set_cleanup_on_exit().unwrap();

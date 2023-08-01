@@ -1,13 +1,84 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SubsecRound, Timelike, Utc};
-use ed25519_dalek::{PublicKey, Signature};
-use hashbrown::HashMap;
 use locutus_stdlib::prelude::*;
+use rsa::{
+    pkcs1v15::{Signature, VerifyingKey},
+    sha2::Sha256,
+    RsaPrivateKey, RsaPublicKey,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::Display;
 
-type Assignment = ed25519_dalek::PublicKey;
+pub type Assignee = RsaPublicKey;
+
+pub type AssignmentHash = [u8; 32];
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TokenDelegateMessage {
+    RequestNewToken(RequestNewToken),
+    AllocatedToken {
+        delegate_id: SecretsId,
+        assignment: TokenAssignment,
+        /// An updated version of the record with the newly allocated token included
+        records: TokenAllocationRecord,
+    },
+    Failure(FailureReason),
+}
+
+impl TryFrom<&[u8]> for TokenDelegateMessage {
+    type Error = DelegateError;
+
+    fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
+        bincode::deserialize(payload).map_err(|err| DelegateError::Deser(format!("{err}")))
+    }
+}
+
+impl TokenDelegateMessage {
+    pub fn serialize(self) -> Result<Vec<u8>, DelegateError> {
+        bincode::serialize(&self).map_err(|err| DelegateError::Deser(format!("{err}")))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FailureReason {
+    /// The user didn't accept to allocate the tokens.
+    UserPermissionDenied,
+    /// No free slot to allocate with the requested criteria
+    NoFreeSlot {
+        delegate_id: SecretsId,
+        criteria: AllocationCriteria,
+    },
+}
+
+impl Display for FailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FailureReason::UserPermissionDenied => {
+                write!(f, "user disallowed token allocation for this application")
+            }
+            FailureReason::NoFreeSlot {
+                delegate_id,
+                criteria,
+            } => {
+                write!(
+                    f,
+                    "no free slot found for delegate `{delegate_id}` with criteria {criteria}"
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RequestNewToken {
+    pub request_id: u32,
+    pub delegate_id: SecretsId,
+    pub criteria: AllocationCriteria,
+    pub records: TokenAllocationRecord,
+    pub assignment_hash: AssignmentHash,
+}
 
 /// Contracts making use of the allocation must implement a type with this trait that allows
 /// extracting the criteria for the given contract.
@@ -152,7 +223,13 @@ impl Tier {
                     && time.nanosecond() == 0;
                 if !is_rounded {
                     let duration = chrono::Duration::from_std(self.tier_duration()).unwrap();
-                    time = time.with_second(0).unwrap().with_minute(0).unwrap();
+                    time = time
+                        .with_second(0)
+                        .unwrap()
+                        .with_minute(0)
+                        .unwrap()
+                        .with_hour(0)
+                        .unwrap();
                     time = time.trunc_subsecs(0);
                     time += duration;
                 }
@@ -212,7 +289,13 @@ impl Tier {
             && time.nanosecond() == 0
             && delta.num_days() % base_day == 0;
         if !is_rounded {
-            time = time.with_second(0).unwrap().with_minute(0).unwrap();
+            time = time
+                .with_second(0)
+                .unwrap()
+                .with_minute(0)
+                .unwrap()
+                .with_hour(0)
+                .unwrap();
             time = time.trunc_subsecs(0);
             let days_in_time = delta.num_days();
             let remainder_days = (days_in_time % base_day) as u32;
@@ -232,6 +315,460 @@ fn get_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         .and_hms_opt(0, 0, 0)
         .unwrap();
     DateTime::<Utc>::from_utc(naive, Utc)
+}
+
+#[non_exhaustive]
+#[derive(Serialize, Deserialize)]
+pub struct TokenDelegateParameters {
+    pub generator_public_key: RsaPublicKey,
+}
+
+impl TokenDelegateParameters {
+    pub fn new(generator_public_key: RsaPublicKey) -> Self {
+        Self {
+            generator_public_key,
+        }
+    }
+}
+
+impl TryFrom<Parameters<'_>> for TokenDelegateParameters {
+    type Error = ContractError;
+    fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(params.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))
+    }
+}
+
+impl TryFrom<TokenDelegateParameters> for Parameters<'static> {
+    type Error = serde_json::Error;
+    fn try_from(params: TokenDelegateParameters) -> Result<Self, Self::Error> {
+        serde_json::to_vec(&params).map(Into::into)
+    }
+}
+
+#[non_exhaustive]
+#[derive(Serialize, Deserialize)]
+pub struct DelegateParameters {
+    pub generator_private_key: RsaPrivateKey,
+}
+
+impl DelegateParameters {
+    pub fn new(generator_private_key: RsaPrivateKey) -> Self {
+        Self {
+            generator_private_key,
+        }
+    }
+}
+
+impl TryFrom<Parameters<'_>> for DelegateParameters {
+    type Error = DelegateError;
+    fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(params.as_ref())
+            .map_err(|err| DelegateError::Deser(format!("{err}")))
+    }
+}
+
+impl TryFrom<DelegateParameters> for Parameters<'static> {
+    type Error = serde_json::Error;
+    fn try_from(params: DelegateParameters) -> Result<Self, Self::Error> {
+        serde_json::to_vec(&params).map(Into::into)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InvalidReason {
+    #[error("invalid slot")]
+    InvalidSlot,
+    #[error("invalid signature")]
+    SignatureMismatch,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct AllocationError(Box<AllocationErrorInner>);
+
+impl AllocationError {
+    pub fn invalid_assignment(record: TokenAssignment, reason: InvalidReason) -> Self {
+        Self(Box::new(AllocationErrorInner::InvalidAssignment {
+            record,
+            reason,
+        }))
+    }
+
+    pub fn allocated_slot(assignment: &TokenAssignment) -> Self {
+        Self(Box::new(AllocationErrorInner::AllocatedSlot {
+            tier: assignment.tier,
+            slot: assignment.time_slot,
+        }))
+    }
+}
+
+impl From<AllocationErrorInner> for AllocationError {
+    fn from(value: AllocationErrorInner) -> Self {
+        Self(Box::new(value))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[allow(clippy::large_enum_variant)]
+enum AllocationErrorInner {
+    #[error("the following slot for {tier} has already been allocated: {slot}")]
+    AllocatedSlot { tier: Tier, slot: DateTime<Utc> },
+    #[error("the max age allowed is 730 days")]
+    IncorrectMaxAge,
+    #[error("the following assignment is incorrect: {record}, reason: {reason}")]
+    InvalidAssignment {
+        record: TokenAssignment,
+        reason: InvalidReason,
+    },
+}
+
+#[non_exhaustive]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AllocationCriteria {
+    pub frequency: Tier,
+    /// Maximum age of the allocated token.
+    pub max_age: std::time::Duration,
+    pub contract: ContractInstanceId,
+}
+
+impl AllocationCriteria {
+    pub fn new(
+        frequency: Tier,
+        max_age: std::time::Duration,
+        contract: ContractInstanceId,
+    ) -> Result<Self, AllocationError> {
+        if max_age <= std::time::Duration::from_secs(3600 * 24 * 365 * 2) {
+            Ok(Self {
+                frequency,
+                max_age,
+                contract,
+            })
+        } else {
+            Err(AllocationErrorInner::IncorrectMaxAge.into())
+        }
+    }
+}
+
+impl Display for AllocationCriteria {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frequency: {}; max age: {} secs",
+            self.frequency,
+            self.max_age.as_secs()
+        )
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TokenAllocationRecord {
+    /// A list of issued tokens.
+    ///
+    /// This is categorized by tiers and then sorted by time slot.
+    tokens_by_tier: HashMap<Tier, Vec<TokenAssignment>>,
+}
+
+impl TokenAllocationRecord {
+    pub fn get_tier(&self, tier: &Tier) -> Option<&[TokenAssignment]> {
+        self.tokens_by_tier.get(tier).map(|t| t.as_slice())
+    }
+
+    pub fn get_mut_tier(&mut self, tier: &Tier) -> Option<&mut Vec<TokenAssignment>> {
+        self.tokens_by_tier.get_mut(tier)
+    }
+
+    pub fn new(mut tokens: HashMap<Tier, Vec<TokenAssignment>>) -> Self {
+        tokens.iter_mut().for_each(|(_, assignments)| {
+            assignments.sort_unstable();
+        });
+        Self {
+            tokens_by_tier: tokens,
+        }
+    }
+
+    pub fn insert(&mut self, tier: Tier, assignments: Vec<TokenAssignment>) {
+        self.tokens_by_tier.insert(tier, assignments);
+    }
+
+    pub fn summarize(&self) -> TokenAllocationSummary {
+        let mut by_tier = HashMap::with_capacity(self.tokens_by_tier.len());
+        for (tier, assignments) in &self.tokens_by_tier {
+            let mut assignments_ts = Vec::with_capacity(assignments.len());
+            for a in assignments {
+                let ts = a.time_slot.timestamp();
+                assignments_ts.push(ts);
+            }
+            by_tier.insert(*tier, assignments_ts);
+        }
+        TokenAllocationSummary(by_tier)
+    }
+
+    pub fn delta(&self, summary: &TokenAllocationSummary) -> TokenAllocationRecord {
+        let mut delta = HashMap::new();
+        for (tier, summary_assignments) in &summary.0 {
+            let mut missing = vec![];
+            if let Some(assigned) = self.tokens_by_tier.get(tier) {
+                for a in assigned {
+                    let ts = a.time_slot.timestamp();
+                    if summary_assignments.binary_search(&ts).is_err() {
+                        missing.push(a.clone());
+                    }
+                }
+                delta.insert(*tier, missing);
+            }
+        }
+        TokenAllocationRecord {
+            tokens_by_tier: delta,
+        }
+    }
+
+    pub fn assignment_exists(&self, record: &TokenAssignment) -> bool {
+        let Some(assignments) = self.tokens_by_tier.get(&record.tier) else { return false };
+        let Ok(_idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else { return false };
+        true
+    }
+
+    pub fn serialized(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+}
+
+impl<'a> IntoIterator for &'a TokenAllocationRecord {
+    type Item = (&'a Tier, &'a Vec<TokenAssignment>);
+
+    type IntoIter = std::collections::hash_map::Iter<'a, Tier, Vec<TokenAssignment>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tokens_by_tier.iter()
+    }
+}
+
+impl IntoIterator for TokenAllocationRecord {
+    type Item = (Tier, Vec<TokenAssignment>);
+
+    type IntoIter = std::collections::hash_map::IntoIter<Tier, Vec<TokenAssignment>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tokens_by_tier.into_iter()
+    }
+}
+
+impl TryFrom<State<'_>> for TokenAllocationRecord {
+    type Error = ContractError;
+
+    fn try_from(state: State<'_>) -> Result<Self, Self::Error> {
+        let this = serde_json::from_slice(state.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(this)
+    }
+}
+
+impl TryFrom<StateDelta<'_>> for TokenAllocationRecord {
+    type Error = ContractError;
+
+    fn try_from(delta: StateDelta<'_>) -> Result<Self, Self::Error> {
+        let this = serde_json::from_slice(delta.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(this)
+    }
+}
+
+impl TryFrom<TokenAllocationRecord> for State<'static> {
+    type Error = ContractError;
+
+    fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
+        let serialized = state
+            .serialized()
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(State::from(serialized))
+    }
+}
+
+impl TryFrom<TokenAllocationRecord> for StateDelta<'static> {
+    type Error = ContractError;
+
+    fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
+        let serialized = state
+            .serialized()
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(StateDelta::from(serialized))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenAllocationSummary(HashMap<Tier, Vec<i64>>);
+
+impl TokenAllocationSummary {
+    pub fn contains_alloc(&self, tier: Tier, slot: DateTime<Utc>) -> bool {
+        self.0
+            .get(&tier)
+            .and_then(|assignments| {
+                let slot = slot.timestamp();
+                for ts in assignments {
+                    if *ts == slot {
+                        return Some(());
+                    }
+                }
+                None
+            })
+            .is_some()
+    }
+}
+
+impl TryFrom<StateSummary<'_>> for TokenAllocationSummary {
+    type Error = ContractError;
+
+    fn try_from(state: StateSummary<'_>) -> Result<Self, Self::Error> {
+        if state.as_ref().is_empty() {
+            return Ok(TokenAllocationSummary(HashMap::new()));
+        }
+        let this = serde_json::from_slice(state.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(this)
+    }
+}
+
+impl TryFrom<TokenAllocationSummary> for StateSummary<'static> {
+    type Error = ContractError;
+
+    fn try_from(summary: TokenAllocationSummary) -> Result<Self, Self::Error> {
+        let serialized =
+            serde_json::to_vec(&summary).map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(StateSummary::from(serialized))
+    }
+}
+
+pub type TokenAssignmentHash = [u8; 32];
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct TokenAssignment {
+    pub tier: Tier,
+    pub time_slot: DateTime<Utc>,
+    /// The public key of the generator of this token, and by extension, the one who created the signature.
+    /// This field can be used tipically to verify, that the token has been indeed generated by this generator.
+    pub generator: Assignee,
+    #[serde(with = "token_sig_ser")]
+    /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
+    pub signature: Signature,
+    /// A Blake2s256 hash of the message.
+    pub assignment_hash: TokenAssignmentHash,
+    /// Key to the contract holding the token records of the assignee.
+    pub token_record: ContractInstanceId,
+}
+
+mod token_sig_ser {
+    use super::*;
+    use rsa::signature::SignatureEncoding;
+    use serde::{Deserializer, Serializer};
+
+    pub fn deserialize<'de, D>(deser: D) -> Result<Signature, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let bytes = <Box<[u8]> as Deserialize>::deserialize(deser)?;
+        Signature::try_from(&*bytes).map_err(<D as Deserializer>::Error::custom)
+    }
+
+    pub fn serialize<S>(sig: &Signature, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s: Box<[u8]> = sig.to_bytes();
+        s.serialize(ser)
+    }
+}
+
+impl TokenAssignment {
+    const TIER_SIZE: usize = std::mem::size_of::<Tier>();
+    const TS_SIZE: usize = std::mem::size_of::<i64>();
+
+    pub const SIGNED_MSG_SIZE: usize = Self::TIER_SIZE + Self::TS_SIZE + 32;
+
+    /// The `(tier, issue_time, assignee)` tuple that has to be verified as bytes.
+    pub fn signature_content(
+        issue_time: &DateTime<Utc>,
+        tier: Tier,
+        assingment_hash: &AssignmentHash,
+    ) -> [u8; Self::SIGNED_MSG_SIZE] {
+        let mut cursor = 0;
+        let mut to_be_signed = [0; Self::SIGNED_MSG_SIZE];
+
+        to_be_signed[..Self::TIER_SIZE].copy_from_slice(&(tier as u8).to_le_bytes());
+        cursor += Self::TIER_SIZE;
+        let timestamp = issue_time.timestamp();
+        to_be_signed[cursor..cursor + Self::TS_SIZE].copy_from_slice(&timestamp.to_le_bytes());
+        cursor += Self::TS_SIZE;
+        to_be_signed[cursor..].copy_from_slice(assingment_hash);
+        to_be_signed
+    }
+
+    pub fn next_slot(&self) -> DateTime<Utc> {
+        self.time_slot + Duration::from_std(self.tier.tier_duration()).unwrap()
+    }
+
+    pub fn previous_slot(&self) -> DateTime<Utc> {
+        self.time_slot - Duration::from_std(self.tier.tier_duration()).unwrap()
+    }
+
+    pub fn is_valid(&self, verifying_key: &VerifyingKey<Sha256>) -> Result<(), InvalidReason> {
+        use rsa::signature::Verifier;
+        if !self.tier.is_valid_slot(self.time_slot) {
+            return Err(InvalidReason::InvalidSlot);
+        }
+        let msg =
+            TokenAssignment::signature_content(&self.time_slot, self.tier, &self.assignment_hash);
+        if verifying_key.verify(&msg, &self.signature).is_err() {
+            // not signed by the private key of this generator
+            #[cfg(target_family = "wasm")]
+            {
+                locutus_stdlib::log::info(&format!(
+                    "failed verification of message `{msg:?}` with signature: `{sig}`",
+                    sig = self.signature
+                ));
+            }
+            return Err(InvalidReason::SignatureMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl PartialOrd for TokenAssignment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.time_slot.cmp(&other.time_slot))
+    }
+}
+
+impl Ord for TokenAssignment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.time_slot.cmp(&other.time_slot)
+    }
+}
+
+impl TryFrom<StateDelta<'_>> for TokenAssignment {
+    type Error = ContractError;
+
+    fn try_from(state: StateDelta<'_>) -> Result<Self, Self::Error> {
+        let this = serde_json::from_slice(state.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))?;
+        Ok(this)
+    }
+}
+
+impl Display for TokenAssignment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let assignment = bs58::encode(self.assignment_hash).into_string();
+        write!(
+            f,
+            "{{ {tier} @ {slot} for assignment `{assignment}`, record: {record}}}",
+            tier = self.tier,
+            slot = self.time_slot,
+            record = self.token_record
+        )
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +801,10 @@ mod tier_tests {
 
     #[test]
     fn is_correct_day() {
+        let day1_tier = Tier::Day1;
+        assert!(day1_tier.is_valid_slot(get_date(2023, 1, 8)));
+        assert!(!day1_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(12).unwrap()));
+
         let day7_tier = Tier::Day7;
         assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
         assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
@@ -344,323 +885,5 @@ mod tier_tests {
         assert_eq!(day15_normalized, get_date(2023, 1, 30));
         let day15_normalized = day15_tier.normalize_to_next(get_date(2023, 1, 31));
         assert_eq!(day15_normalized, get_date(2023, 2, 14));
-    }
-}
-
-#[non_exhaustive]
-#[derive(Serialize, Deserialize)]
-pub struct TokenParameters {
-    pub generator_public_key: PublicKey,
-}
-
-impl TryFrom<Parameters<'_>> for TokenParameters {
-    type Error = ContractError;
-    fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(params.as_ref())
-            .map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(this)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-pub struct AllocationError(Box<AllocationErrorInner>);
-
-impl AllocationError {
-    pub fn invalid_assignment(assignment: TokenAssignment) -> Self {
-        Self(Box::new(AllocationErrorInner::InvalidAssignment(
-            assignment,
-        )))
-    }
-
-    pub fn allocated_slot(assignment: &TokenAssignment) -> Self {
-        Self(Box::new(AllocationErrorInner::AllocatedSlot {
-            tier: assignment.tier,
-            slot: assignment.time_slot,
-        }))
-    }
-}
-
-impl From<AllocationErrorInner> for AllocationError {
-    fn from(value: AllocationErrorInner) -> Self {
-        Self(Box::new(value))
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[allow(clippy::large_enum_variant)]
-enum AllocationErrorInner {
-    #[error("the following slot for {tier} has already been allocated: {slot}")]
-    AllocatedSlot { tier: Tier, slot: DateTime<Utc> },
-    #[error("the max age allowed is 730 days")]
-    IncorrectMaxAge,
-    #[error("the following assignment is incorrect: {0}")]
-    InvalidAssignment(TokenAssignment),
-}
-
-#[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AllocationCriteria {
-    pub frequency: Tier,
-    /// Maximum age of the allocated token.
-    pub max_age: std::time::Duration,
-    pub contract: ContractInstanceId,
-}
-
-impl AllocationCriteria {
-    pub fn new(
-        frequency: Tier,
-        max_age: std::time::Duration,
-        contract: ContractInstanceId,
-    ) -> Result<Self, AllocationError> {
-        if max_age <= std::time::Duration::from_secs(3600 * 24 * 365 * 2) {
-            Ok(Self {
-                frequency,
-                max_age,
-                contract,
-            })
-        } else {
-            Err(AllocationErrorInner::IncorrectMaxAge.into())
-        }
-    }
-}
-
-#[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TokenAllocationRecord {
-    /// A list of issued tokens.
-    ///
-    /// This is categorized by tiers and then sorted by time slot.
-    tokens_by_tier: HashMap<Tier, Vec<TokenAssignment>>,
-}
-
-impl TokenAllocationRecord {
-    pub fn get_tier(&self, tier: &Tier) -> Option<&[TokenAssignment]> {
-        self.tokens_by_tier.get(tier).map(|t| t.as_slice())
-    }
-
-    pub fn get_mut_tier(&mut self, tier: &Tier) -> Option<&mut Vec<TokenAssignment>> {
-        self.tokens_by_tier.get_mut(tier)
-    }
-
-    pub fn new(mut tokens: HashMap<Tier, Vec<TokenAssignment>>) -> Self {
-        for (_, assignments) in &mut tokens {
-            assignments.sort_unstable();
-        }
-        Self {
-            tokens_by_tier: tokens,
-        }
-    }
-
-    pub fn insert(&mut self, tier: Tier, assignments: Vec<TokenAssignment>) {
-        self.tokens_by_tier.insert(tier, assignments);
-    }
-
-    pub fn summarize(&self) -> TokenAllocationSummary {
-        let mut by_tier = HashMap::with_capacity(self.tokens_by_tier.len());
-        for (tier, assignments) in &self.tokens_by_tier {
-            let mut assignments_ts = Vec::with_capacity(assignments.len());
-            for a in assignments {
-                let ts = a.time_slot.timestamp();
-                assignments_ts.push(ts);
-            }
-            by_tier.insert(*tier, assignments_ts);
-        }
-        TokenAllocationSummary(by_tier)
-    }
-
-    pub fn delta(&self, summary: &TokenAllocationSummary) -> TokenAllocationRecord {
-        let mut delta = HashMap::new();
-        for (tier, summary_assignments) in &summary.0 {
-            let mut missing = vec![];
-            if let Some(assigned) = self.tokens_by_tier.get(tier) {
-                for a in assigned {
-                    let ts = a.time_slot.timestamp();
-                    if summary_assignments.binary_search(&ts).is_err() {
-                        missing.push(a.clone());
-                    }
-                }
-                delta.insert(*tier, missing);
-            }
-        }
-        TokenAllocationRecord {
-            tokens_by_tier: delta,
-        }
-    }
-
-    pub fn assignment_exists(&self, record: &TokenAssignment) -> bool {
-        let Some(assignments) = self.tokens_by_tier.get(&record.tier) else { return false };
-        let Ok(idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else { return false };
-        let assignment = &assignments[idx];
-        assignment == record
-    }
-}
-
-impl<'a> IntoIterator for &'a TokenAllocationRecord {
-    type Item = (&'a Tier, &'a Vec<TokenAssignment>);
-
-    type IntoIter = hashbrown::hash_map::Iter<'a, Tier, Vec<TokenAssignment>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.tokens_by_tier.iter()
-    }
-}
-
-impl IntoIterator for TokenAllocationRecord {
-    type Item = (Tier, Vec<TokenAssignment>);
-
-    type IntoIter = hashbrown::hash_map::IntoIter<Tier, Vec<TokenAssignment>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.tokens_by_tier.into_iter()
-    }
-}
-
-impl TryFrom<State<'_>> for TokenAllocationRecord {
-    type Error = ContractError;
-
-    fn try_from(state: State<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(state.as_ref())
-            .map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(this)
-    }
-}
-
-impl TryFrom<TokenAllocationRecord> for State<'static> {
-    type Error = ContractError;
-
-    fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
-        let serialized =
-            bincode::serialize(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(State::from(serialized))
-    }
-}
-
-impl TryFrom<TokenAllocationRecord> for StateDelta<'static> {
-    type Error = ContractError;
-
-    fn try_from(state: TokenAllocationRecord) -> Result<Self, Self::Error> {
-        let serialized =
-            bincode::serialize(&state).map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(StateDelta::from(serialized))
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TokenAllocationSummary(HashMap<Tier, Vec<i64>>);
-
-impl TryFrom<StateSummary<'_>> for TokenAllocationSummary {
-    type Error = ContractError;
-
-    fn try_from(state: StateSummary<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(state.as_ref())
-            .map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(this)
-    }
-}
-
-impl TryFrom<TokenAllocationSummary> for StateSummary<'static> {
-    type Error = ContractError;
-
-    fn try_from(summary: TokenAllocationSummary) -> Result<Self, Self::Error> {
-        let serialized =
-            bincode::serialize(&summary).map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(StateSummary::from(serialized))
-    }
-}
-
-pub type TokenAssignmentHash = [u8; 32];
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[must_use]
-pub struct TokenAssignment {
-    pub tier: Tier,
-    pub time_slot: DateTime<Utc>,
-    /// The assignment, the recipient decides whether this assignment is valid based on this field.
-    /// This will often be a public key.
-    pub assignee: Assignment,
-    /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
-    pub signature: Signature,
-    /// A Blake2s256 hash of the message.
-    pub assignment_hash: TokenAssignmentHash,
-    /// Key to the contract holding the token records of the assignee.
-    pub token_record: ContractInstanceId, // TODO: include this in the TokenAssignment itself
-}
-
-impl TokenAssignment {
-    const TIER_SIZE: usize = std::mem::size_of::<Tier>();
-    const TS_SIZE: usize = std::mem::size_of::<i64>();
-    const ASSIGNEE_SIZE: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
-
-    pub const SIGNED_MSG_SIZE: usize = Self::TIER_SIZE + Self::TS_SIZE + Self::ASSIGNEE_SIZE;
-
-    /// The `(tier, issue_time, assignee)` tuple that has to be verified as bytes.
-    pub fn to_be_signed(
-        issue_time: &DateTime<Utc>,
-        assigned_to: &Assignment,
-        tier: Tier,
-    ) -> [u8; Self::SIGNED_MSG_SIZE] {
-        let mut cursor = Self::TIER_SIZE;
-        let mut to_be_signed = [0; Self::SIGNED_MSG_SIZE];
-
-        to_be_signed[..Self::TIER_SIZE].copy_from_slice(&(tier as u8).to_be_bytes());
-        let timestamp = issue_time.timestamp();
-        to_be_signed[cursor..cursor + Self::TS_SIZE].copy_from_slice(&timestamp.to_le_bytes());
-        cursor += Self::TS_SIZE;
-        to_be_signed[cursor..].copy_from_slice(assigned_to.as_bytes());
-
-        to_be_signed
-    }
-
-    pub fn next_slot(&self) -> DateTime<Utc> {
-        self.time_slot + Duration::from_std(self.tier.tier_duration()).unwrap()
-    }
-
-    pub fn previous_slot(&self) -> DateTime<Utc> {
-        self.time_slot - Duration::from_std(self.tier.tier_duration()).unwrap()
-    }
-}
-
-#[test]
-fn to_be_signed_test() {
-    let _to_be_signed = TokenAssignment::to_be_signed(
-        &get_date(2021, 7, 28),
-        &ed25519_dalek::PublicKey::from_bytes(&[1; ed25519_dalek::PUBLIC_KEY_LENGTH]).unwrap(),
-        Tier::Day90,
-    );
-    // dbg!(_to_be_signed);
-}
-
-impl PartialOrd for TokenAssignment {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.time_slot.cmp(&other.time_slot))
-    }
-}
-
-impl Ord for TokenAssignment {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.time_slot.cmp(&other.time_slot)
-    }
-}
-
-impl TryFrom<StateDelta<'_>> for TokenAssignment {
-    type Error = ContractError;
-
-    fn try_from(state: StateDelta<'_>) -> Result<Self, Self::Error> {
-        let this = bincode::deserialize_from(state.as_ref())
-            .map_err(|err| ContractError::Deser(format!("{err}")))?;
-        Ok(this)
-    }
-}
-
-impl Display for TokenAssignment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let assignee = bs58::encode(&self.assignee).into_string();
-        write!(
-            f,
-            "{{ {tier} @ {slot} for {assignee}}}",
-            tier = self.tier,
-            slot = self.time_slot,
-        )
     }
 }

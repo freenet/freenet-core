@@ -101,6 +101,7 @@ impl WebApi {
     }
 
     pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
+        tracing::debug!(?request, "sending request");
         self.request_tx
             .send(request)
             .await
@@ -159,7 +160,9 @@ async fn process_request(
     req: Option<ClientRequest<'static>>,
 ) -> Result<(), Error> {
     let req = req.ok_or(Error::ChannelClosed)?;
-    let msg = rmp_serde::to_vec(&req)?;
+    let msg = bincode::serialize(&req)
+        .map_err(Into::into)
+        .map_err(Error::OtherError)?;
     conn.send(Message::Binary(msg)).await?;
     Ok(())
 }
@@ -173,14 +176,14 @@ async fn process_response(
     let res = res.ok_or(Error::ConnectionClosed)??;
     match res {
         Message::Text(msg) => {
-            let response: HostResult = rmp_serde::from_read(msg.as_bytes())?;
+            let response: HostResult = bincode::deserialize(msg.as_bytes())?;
             response_tx
                 .send(response)
                 .await
                 .map_err(|_| Error::ChannelClosed)?;
         }
         Message::Binary(binary) => {
-            let response: HostResult = rmp_serde::from_read(binary.as_slice())?;
+            let response: HostResult = bincode::deserialize(binary.as_slice())?;
             response_tx
                 .send(response)
                 .await
@@ -229,7 +232,7 @@ mod test {
 
             if !self.recv {
                 let res: HostResult = Ok(HostResponse::Ok);
-                let req = rmp_serde::to_vec(&res)?;
+                let req = bincode::serialize(&res)?;
                 stream.send(Message::Binary(req)).await?;
             }
 
@@ -237,7 +240,7 @@ mod test {
                         return Err("wrong msg".to_owned().into());
                 };
 
-            let _req: ClientRequest = rmp_serde::from_slice(&msg)?;
+            let _req: ClientRequest = bincode::deserialize(&msg)?;
             tx.send(()).map_err(|_| "couldn't error".to_owned())?;
             Ok(())
         }

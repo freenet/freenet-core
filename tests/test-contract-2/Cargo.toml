@@ -9,7 +9,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+locutus-stdlib = { path = "../../crates/locutus-stdlib", features = ["contract"] }
 
 [features]
 trace = ["locutus-stdlib/trace"]

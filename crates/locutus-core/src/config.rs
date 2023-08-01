@@ -78,8 +78,9 @@ impl WebSocketApiConfig {
 
 #[derive(Debug)]
 pub struct ConfigPaths {
-    // TODO: Add secrets and components dir
     pub(crate) contracts_dir: PathBuf,
+    pub(crate) delegates_dir: PathBuf,
+    pub(crate) secrets_dir: PathBuf,
     pub(crate) db_dir: PathBuf,
     app_data_dir: PathBuf,
 }
@@ -93,13 +94,24 @@ impl ConfigPaths {
         } else {
             project_dir.data_dir().into()
         };
-        // FIXME: Add dirs for components and secrets
         let contracts_dir = app_data_dir.join("contracts");
+        let delegates_dir = app_data_dir.join("delegates");
+        let secrets_dir = app_data_dir.join("secrets");
         let db_dir = app_data_dir.join("db");
 
         if !contracts_dir.exists() {
             fs::create_dir_all(&contracts_dir)?;
             fs::create_dir_all(contracts_dir.join("local"))?;
+        }
+
+        if !delegates_dir.exists() {
+            fs::create_dir_all(&delegates_dir)?;
+            fs::create_dir_all(delegates_dir.join("local"))?;
+        }
+
+        if !secrets_dir.exists() {
+            fs::create_dir_all(&secrets_dir)?;
+            fs::create_dir_all(secrets_dir.join("local"))?;
         }
 
         if !db_dir.exists() {
@@ -108,6 +120,8 @@ impl ConfigPaths {
 
         Ok(Self {
             contracts_dir,
+            delegates_dir,
+            secrets_dir,
             db_dir,
             app_data_dir,
         })
@@ -119,6 +133,22 @@ impl ConfigPaths {
 
     pub fn contracts_dir(&self) -> &Path {
         &self.contracts_dir
+    }
+
+    pub fn local_delegates_dir(&self) -> PathBuf {
+        self.delegates_dir.join("local")
+    }
+
+    pub fn delegates_dir(&self) -> &Path {
+        &self.delegates_dir
+    }
+
+    pub fn local_secrets_dir(&self) -> PathBuf {
+        self.secrets_dir.join("local")
+    }
+
+    pub fn secrets_dir(&self) -> &Path {
+        &self.secrets_dir
     }
 }
 

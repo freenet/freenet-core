@@ -3,6 +3,8 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.dependencies]
+arrayvec = { version = "0.7", features = ["serde"] }
+bs58 = "0.4"
 clap = "4"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = true }
@@ -16,7 +18,7 @@ semver = { version = "1.0.14",  features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
-serde_with = "2"
+serde_with = "3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 wasmer = "3"

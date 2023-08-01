@@ -13,6 +13,7 @@ anyhow = "1"
 arbitrary = { version = "1", features = ["derive"], optional = true}
 asynchronous-codec = "0.6"
 async-trait = "0.1"
+arrayvec = { workspace = true }
 bincode = "1"
 blake2 = { version =  "0.10", features = [ "std" ] }
 bs58 = "0.4"
@@ -54,7 +55,6 @@ axum = { version = "0.6", default-features = false, features = ["ws", "tower-log
 pav_regression = "0.4.0"
 itertools = "0.10.5"
 ordered-float = "3.6.0"
-
 
 # Tracing deps
 tower-http = { version = "0.4", features = ["trace"] }
