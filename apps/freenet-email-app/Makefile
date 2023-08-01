@@ -14,28 +14,21 @@ ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
 endif
 
-.PHONY: all build-inbox clean
-
-all:
-	$(MAKE) build-tool &
-	$(MAKE) build-inbox &
-	$(MAKE) run-node &
-	$(MAKE) run-web &
-	wait
+.PHONY: build clean
 
 build: \
 	build-tool \
-	build-id-manager \
+	generate-id-manager-key \
 	build-inbox 
 
 build-tool:
 	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
-build-id-manager:
-	FILE="$(INBOX_WEB_DIR)/build/identity-manager-key.private.pem"
+generate-id-manager-key:
+	FILE="$(IDENTITY_DELEGATE)/build/identity-manager-key.private.pem"
 	if [ ! -f $$FILE ]; then
-		cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(INBOX_WEB_DIR)/build/"
+		cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(IDENTITY_DELEGATE)/build/"
 	fi
 
 build-inbox: \

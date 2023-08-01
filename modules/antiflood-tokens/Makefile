@@ -10,11 +10,11 @@ ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
 endif
 
-.PHONY: all build-token-allocation clean
+.PHONY: all clean
 
 all:
-	$(MAKE) build-tool &
-	$(MAKE) build-token-allocation &
+	$(MAKE) build-tool &&
+	$(MAKE) build-token-allocation
 
 build-token-allocation: \
 	build-token-allocation-contract \

@@ -324,7 +324,8 @@ mod identity_management {
         include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
     const ID_MANAGER_CODE: &[u8] =
         include_bytes!("../../../../modules/identity-management/build/locutus/identity_management");
-    const ID_MANAGER_KEY: &[u8] = include_bytes!("../build/identity-manager-params");
+    const ID_MANAGER_KEY: &[u8] =
+        include_bytes!("../../../../modules/identity-management/build/identity-manager-params");
 
     pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
