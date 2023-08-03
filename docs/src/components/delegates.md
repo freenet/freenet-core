@@ -64,5 +64,5 @@ the user.
 
 However, Delegates are even more powerful. While Service Workers can
 store data and interact with components within the scope of the web browser and
-its pages, delegates can talk to other delegates in the same device, or with
-other delegates running elsewhere via Freenet's peer-to-peer network.
+its pages, Delegates can talk to other Delegates in the same device, or with
+other Delegates running elsewhere via Freenet's peer-to-peer network.
