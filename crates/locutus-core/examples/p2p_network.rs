@@ -102,7 +102,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse_args()?;
 
     let gw_port = 64510;
-    let gw_key: Keypair = Keypair::Ed25519(ed25519::Keypair::decode(&mut ENCODED_GW_KEY.to_vec())?);
+    let gw_key: Keypair = Keypair::try_from(ed25519::Keypair::try_from_bytes(
+        &mut ENCODED_GW_KEY.to_vec(),
+    )?)?;
     let gw_id: PeerId = gw_key.public().into();
     let gw_loc = Location::random();
     let gw_config = InitPeerNode::new(gw_id, gw_loc)

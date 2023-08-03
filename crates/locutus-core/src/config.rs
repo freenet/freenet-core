@@ -265,7 +265,7 @@ impl GlobalExecutor {
     }
 }
 
-impl libp2p::core::Executor for GlobalExecutor {
+impl libp2p::swarm::Executor for GlobalExecutor {
     fn exec(&self, future: Pin<Box<dyn Future<Output = ()> + 'static + Send>>) {
         GlobalExecutor::spawn(future);
     }
