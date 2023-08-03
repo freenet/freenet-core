@@ -1,9 +1,26 @@
 use quote::quote;
-use syn::{AttributeArgs, ItemImpl};
+use syn::punctuated::Punctuated;
+use syn::{ItemImpl, Meta, Token};
 
 pub(crate) mod common;
 mod contract_impl;
 mod delegate_impl;
+
+#[allow(dead_code)]
+struct AttributeArgs {
+    args: Punctuated<Meta, Token![,]>,
+}
+
+impl syn::parse::Parse for AttributeArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut args = Punctuated::new();
+        while !input.is_empty() {
+            let meta = input.parse::<Meta>()?;
+            args.push(meta);
+        }
+        Ok(AttributeArgs { args })
+    }
+}
 
 /// Generate the necessary code for the WASM runtime to interact with your contract ergonomically and safely.
 #[proc_macro_attribute]

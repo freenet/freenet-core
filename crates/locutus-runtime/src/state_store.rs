@@ -81,7 +81,7 @@ where
     }
 
     pub async fn get(&self, key: &ContractKey) -> Result<WrappedState, StateStoreError> {
-        if let Some(v) = self.state_mem_cache.get(key) {
+        if let Some(v) = self.state_mem_cache.get(key).await {
             return Ok(v.value().clone());
         }
         self.store

@@ -220,7 +220,7 @@ impl DelegateKey {
         let mut code_key = [0; DELEGATE_HASH_LENGTH];
         bs58::decode(code_hash.into())
             .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut code_key)?;
+            .onto(&mut code_key)?;
         let mut hasher = Blake2s256::new();
         hasher.update(code_key);
         hasher.update(parameters.as_ref());

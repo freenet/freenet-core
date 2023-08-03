@@ -112,12 +112,12 @@ For additional hardening is recommended to use a different cipher and nonce to e
         let mut cipher = [0; 32];
         bs58::decode(delegate_config.cipher.as_bytes())
             .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut cipher)?;
+            .onto(&mut cipher)?;
 
         let mut nonce = [0; 24];
         bs58::decode(delegate_config.nonce.as_bytes())
             .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut nonce)?;
+            .onto(&mut nonce)?;
         (cipher, nonce)
     };
 

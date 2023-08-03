@@ -94,7 +94,7 @@ fn get_out_lib(
 
     let mut f_content = vec![];
     File::open(work_dir.join("Cargo.toml"))?.read_to_end(&mut f_content)?;
-    let cargo_config: toml::Value = toml::from_slice(&f_content)?;
+    let cargo_config: toml::Value = toml::from_str(std::str::from_utf8(&f_content)?)?;
     let package_name = cargo_config
         .as_table()
         .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
@@ -416,7 +416,7 @@ mod contract {
         if config_file.exists() {
             let mut f_content = vec![];
             File::open(config_file)?.read_to_end(&mut f_content)?;
-            Ok(toml::from_slice(&f_content)?)
+            Ok(toml::from_str(std::str::from_utf8(&f_content)?)?)
         } else {
             Err("could not locate `locutus.toml` config file in current dir".into())
         }
@@ -576,8 +576,6 @@ mod contract {
                             toml::toml! {
                                 posts = { path = "../contracts/posts" }
                             }
-                            .as_table()
-                            .unwrap()
                             .clone(),
                         ),
                     }),
@@ -650,8 +648,8 @@ mod contract {
             let deps = toml::toml! {
                 posts = { path = "../contracts/posts" }
             };
-            println!("{:?}", deps.as_table().unwrap().clone());
-            include_deps(deps.as_table().unwrap())?;
+            println!("{:?}", deps.clone());
+            include_deps(&deps)?;
             Ok(())
         }
 
@@ -662,7 +660,7 @@ mod contract {
             let deps = toml::toml! {
                 posts = { path = "../contracts/posts" }
             };
-            let defs = include_deps(deps.as_table().unwrap()).unwrap();
+            let defs = include_deps(&deps).unwrap();
             embed_deps(&cwd, defs, &BuildToolCliConfig::default()).unwrap();
             Ok(())
         }

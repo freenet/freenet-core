@@ -43,7 +43,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
         }),
         state: None,
     };
-    let serialized = toml::to_vec(&locutus_file_config)?;
+    let serialized = toml::to_string(&locutus_file_config)?.into_bytes();
     let path = cwd.join("locutus").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
@@ -61,7 +61,7 @@ fn create_regular_contract(cwd: &Path) -> Result<(), DynError> {
         webapp: None,
         state: None,
     };
-    let serialized = toml::to_vec(&locutus_file_config)?;
+    let serialized = toml::to_string(&locutus_file_config)?.into_bytes();
     let path = cwd.join("locutus").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
@@ -115,7 +115,8 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
     let mut cargo_file = File::open(dest_path.join("Cargo.toml"))?;
     let mut buf = vec![];
     cargo_file.read_to_end(&mut buf)?;
-    let mut cargo_def: toml::Value = toml::from_slice(&buf)?;
+    let cargo_file_content = std::str::from_utf8(buf.as_slice()).expect("Found invalid cargo file");
+    let mut cargo_def: toml::Value = toml::from_str(cargo_file_content)?;
     let lib_entry = toml::map::Map::from_iter([(
         "crate-type".into(),
         toml::Value::Array(vec![toml::Value::String("cdylib".into())]),
@@ -124,7 +125,7 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
     root.insert("lib".into(), toml::Value::Table(lib_entry));
     std::mem::drop(cargo_file);
     let mut cargo_file = File::create(dest_path.join("Cargo.toml"))?;
-    cargo_file.write_all(&toml::to_vec(&cargo_def)?)?;
+    cargo_file.write_all(toml::to_string(&cargo_def)?.into_bytes().as_slice())?;
     Ok(())
 }
 

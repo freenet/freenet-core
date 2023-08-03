@@ -942,7 +942,7 @@ impl ContractInstanceId {
         let mut spec = [0; CONTRACT_KEY_SIZE];
         bs58::decode(bytes)
             .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut spec)?;
+            .onto(&mut spec)?;
         Ok(Self(spec))
     }
 }
@@ -1073,7 +1073,7 @@ impl ContractKey {
         let mut code_key = [0; CONTRACT_KEY_SIZE];
         bs58::decode(code_hash.into())
             .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut code_key)?;
+            .onto(&mut code_key)?;
 
         let mut hasher = Blake2s256::new();
         hasher.update(code_key);
