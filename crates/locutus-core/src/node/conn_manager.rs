@@ -1,6 +1,5 @@
 //! Types and definitions to handle all socket communication for the peer nodes.
 
-use libp2p::swarm::ProtocolsHandlerUpgrErr;
 use serde::{Deserialize, Serialize};
 
 use super::PeerKey;
@@ -39,9 +38,9 @@ pub(crate) enum ConnectionError {
     #[serde(skip)]
     #[error("IO connection error")]
     IOError(#[from] Option<std::io::Error>),
-    #[serde(skip)]
-    #[error("upgrade connection error")]
-    NegotiationError(#[from] Option<Box<ProtocolsHandlerUpgrErr<Self>>>),
+    // #[serde(skip)]
+    // #[error("upgrade connection error")]
+    // NegotiationError(#[from] Option<Box<ProtocolsHandlerUpgrErr<Self>>>),
 }
 
 impl Clone for ConnectionError {
@@ -51,7 +50,7 @@ impl Clone for ConnectionError {
             Self::Serialization(_) => Self::Serialization(None),
             Self::SendNotCompleted => Self::SendNotCompleted,
             Self::IOError(_) => Self::IOError(None),
-            Self::NegotiationError(_) => Self::NegotiationError(None),
+            // Self::NegotiationError(_) => Self::NegotiationError(None),
         }
     }
 }
