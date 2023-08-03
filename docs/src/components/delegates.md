@@ -1,24 +1,25 @@
 # Delegates
 
-Freenet's Delegates are advanced, self-contained software modules, which act as
-user agents within the Freenet ecosystem. They can perform complex tasks under a
-strict security model, managing private data and interacting with other Freenet
-[components](overview.md) like contracts, user interfaces, and other delegates.
+Just as human delegates are representatives who make decisions or take action on
+behalf of others, in Freenet, Delegates serve a similar role. They function like
+an advanced version of a web browser's local storage and share similarities with
+Unix "Daemons". They run in the background on your device within the Freenet
+kernel, providing a secure environment for managing private data and performing
+complex tasks.
 
-Implemented in WebAssembly, they adhere to the
+Delegates interact with various Freenet components, including contracts, user
+interfaces, and other Delegates. They securely store your private data,
+including cryptographic keys, tokens, and passwords. Acting on your behalf
+within the Freenet network, they execute tasks such as modifying contracts on
+the user's behalf.
+
+Delegates are implemented in WebAssembly and comply with the
 [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121)
-and run directly within the Freenet kernel on the user's device, trusted to
-carry out their tasks without external verification.
-
-Delegates can control and store private data, such as cryptographic keys,
-tokens, and passwords. They can also be created by UI components or other
-delegates. They perform actions on the user's behalf on Freenet, like consuming
-received messages in an inbox, or storing user data like contacts and messages.
-
-Delegates protect or "encapsulate" their stored private data. For instance, a
-delegate responsible for a private key would be asked to sign a document by
-another component, instead of having to reveal the key itself. This encapsulation
-ensures that the private key is never exposed to other components.
+trait. They operate directly within the Freenet kernel on your devices, with
+trust to carry out their duties without the need for external verification.
+Essentially, Delegates offer a more secure and powerful version of local
+storage, safeguarding and managing private data while conducting background
+tasks.
 
 ## Actor Model and Message Passing
 
