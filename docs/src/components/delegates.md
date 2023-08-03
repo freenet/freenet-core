@@ -33,7 +33,7 @@ they interact with, and decide if they can be trusted.
 Delegates have a wide variety of uses:
 
 - A **key manager delegate** manages a user's private keys. Other components can
-  request that this delegate sign messages or other data on their behalf.
+  request that this Delegate sign messages or other data on their behalf.
 
 - An **inbox delegate** maintains an inbox of messages sent to the user in an
   email-like system. It retrieves messages from an inbox Contract, decrypts
@@ -62,7 +62,7 @@ the web browser ecosystem. Both are self-contained software modules, running
 independently of the user interface and performing complex tasks on behalf of
 the user.
 
-However, delegates are even more powerful. While Service Workers can
+However, Delegates are even more powerful. While Service Workers can
 store data and interact with components within the scope of the web browser and
 its pages, delegates can talk to other delegates in the same device, or with
 other delegates running elsewhere via Freenet's peer-to-peer network.
