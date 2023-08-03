@@ -7,28 +7,24 @@ Unix "Daemons". They run in the background on your device within the Freenet
 kernel, providing a secure environment for managing private data and performing
 complex tasks.
 
-Delegates interact with various Freenet components, including contracts, user
+Delegates interact with various Freenet components, including Contracts, user
 interfaces, and other Delegates. They securely store your private data,
 including cryptographic keys, tokens, and passwords. Acting on your behalf
-within the Freenet network, they execute tasks such as modifying contracts on
+within the Freenet network, they execute tasks such as modifying Contracts on
 the user's behalf.
 
 Delegates are implemented in WebAssembly and comply with the
 [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121)
-trait. They operate directly within the Freenet kernel on your devices, with
-trust to carry out their duties without the need for external verification.
-Essentially, Delegates offer a more secure and powerful version of local
-storage, safeguarding and managing private data while conducting background
-tasks.
+trait. They operate directly within the Freenet kernel on your devices.
 
 ## Actor Model and Message Passing
 
 Delegates utilize a message passing system similar to the [actor
-model](https://en.wikipedia.org/wiki/Actor_model) to interact with contracts,
-other delegates, and applications. 
+model](https://en.wikipedia.org/wiki/Actor_model) to interact with Contracts,
+other Delegates, and Applications. 
 
 The Freenet kernel makes sure that for any incoming message, whether it's from
-another delegate, a user interface, or a contract update, the receiver knows who
+another Delegate, a User Interface, or a Contract update, the receiver knows who
 the sender is. This allows delegates to verify the behavior of any component
 they interact with, and decide if they can be trusted.
 
@@ -40,7 +36,7 @@ Delegates have a wide variety of uses:
   request that this delegate sign messages or other data on their behalf.
 
 - An **inbox delegate** maintains an inbox of messages sent to the user in an
-  email-like system. It retrieves messages from an inbox contract, decrypts
+  email-like system. It retrieves messages from an inbox Contract, decrypts
   them, and stores them locally where they can be accessed by other components
   like a user interface.
 
