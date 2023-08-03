@@ -76,6 +76,7 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Re
             eprintln!("Error while executing cargo command: {e}");
             Error::CommandFailed("cargo")
         })?;
+    println!("pipe");
     pipe_std_streams(child)?;
     Ok(())
 }
