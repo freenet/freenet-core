@@ -28,7 +28,6 @@ fn login_header(cx: Scope) -> Element {
             section {
                 class: "section is-small",
                 h1 { class: "title", "Freenet Email" }
-                h2 { class: "subtitle", "Nice " strong { "caption " } "text" }
             }
         }
     })
@@ -253,7 +252,7 @@ pub(super) fn identities(cx: Scope) -> Element {
                     onclick: move |_| {
                         create_alias_form.write().0 = true;
                     },
-                    "Create new alias"
+                    "Create new identity"
                 }
             }
         }
@@ -286,12 +285,12 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
             class: "box has-background-primary is-small mt-2",
             div {
                 class: "field",
-                label { "Alias" }
+                label { "Name" }
                 div {
                     class: "control has-icons-left",
                     input {
                         class: "input",
-                        placeholder: "Address",
+                        placeholder: "John Smith",
                         value: "{address}",
                         oninput: move |evt| address.modify(|_| evt.value.clone())
                     }
@@ -388,7 +387,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
                         let description = description.get().into();
                         actions.send(NodeAction::CreateIdentity { alias, key, description });
                     } else {
-                        crate::log::debug!("Failed to create alias");
+                        crate::log::debug!("Failed to create identity");
                     }
                 },
                 "Create"
@@ -414,22 +413,22 @@ fn get_key(
     key_path: &UseState<String>,
 ) -> Result<RsaPrivateKey, DynError> {
     if *generate.get() {
-        crate::log::debug!("generating keypair");
+        crate::log::debug!("generating secret key");
         let private_key =
-            RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate keypair");
+            RsaPrivateKey::new(&mut OsRng, RSA_KEY_SIZE).expect("failed to generate secret key");
         Ok(private_key)
     } else {
-        crate::log::debug!("importing keypair");
+        crate::log::debug!("importing secret key");
         let key_path = key_path.get().clone();
         match std::fs::read_to_string(key_path) {
             Ok(key_str) => match RsaPrivateKey::from_pkcs1_pem(key_str.as_str()) {
                 Ok(private_key) => Ok(private_key),
                 Err(e) => {
-                    return Err("Failed to generate private key from file".into());
+                    return Err("Failed to generate secret key from file".into());
                 }
             },
             Err(e) => {
-                return Err("Failed to read key file".into());
+                return Err("Failed to read secret key file".into());
             }
         }
     }
