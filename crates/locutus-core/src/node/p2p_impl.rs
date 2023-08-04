@@ -6,7 +6,7 @@ use libp2p::{
         muxing,
         transport::{self, upgrade},
     },
-    dns::{self, TokioDnsConfig},
+    dns::TokioDnsConfig,
     identity::Keypair,
     noise, tcp, yamux, PeerId, Transport,
 };

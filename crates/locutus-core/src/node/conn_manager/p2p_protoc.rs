@@ -541,7 +541,7 @@ impl NetworkBehaviour for LocutusBehaviour {
         &mut self,
         connection_id: ConnectionId,
         peer_id: PeerId,
-        local_addr: &Multiaddr,
+        _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
         self.openning_connection.remove(&peer_id);
@@ -556,14 +556,14 @@ impl NetworkBehaviour for LocutusBehaviour {
     fn handle_established_outbound_connection(
         &mut self,
         _connection_id: ConnectionId,
-        peer: PeerId,
-        addr: &Multiaddr,
-        role_override: libp2p::core::Endpoint,
+        _peer: PeerId,
+        _addr: &Multiaddr,
+        _role_override: libp2p::core::Endpoint,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
         todo!()
     }
 
-    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm<Self::ConnectionHandler>) {
+    fn on_swarm_event(&mut self, _event: libp2p::swarm::FromSwarm<Self::ConnectionHandler>) {
         // fn inject_disconnected(&mut self, peer: &PeerId) {
         //     self.connected.remove(peer);
         // }
@@ -588,6 +588,7 @@ pub(in crate::node) struct Handler {
     pending: Vec<Message>,
 }
 
+#[allow(dead_code)]
 enum ProtocolStatus {
     Unconfirmed,
     Confirmed,
@@ -595,6 +596,7 @@ enum ProtocolStatus {
     FailedUpgrade,
 }
 
+#[allow(dead_code)]
 enum SubstreamState {
     /// We haven't started opening the outgoing substream yet.
     /// Contains the initial request we want to send.
@@ -953,7 +955,7 @@ impl ConnectionHandler for Handler {
 
     fn on_connection_event(
         &mut self,
-        event: libp2p::swarm::handler::ConnectionEvent<
+        _event: libp2p::swarm::handler::ConnectionEvent<
             Self::InboundProtocol,
             Self::OutboundProtocol,
             Self::InboundOpenInfo,

@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.dependencies]
 arrayvec = { version = "0.7", features = ["serde"] }
-bs58 = "0.4"
+bs58 = "0.5"
 clap = "4"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = true }

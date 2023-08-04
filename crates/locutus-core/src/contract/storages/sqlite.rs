@@ -30,7 +30,7 @@ static POOL: Lazy<SqlitePool> = Lazy::new(|| {
             .create_if_missing(true)
             .filename(conn_str)
     };
-    opts.log_statements(tracing::log::LevelFilter::Debug);
+    let opts = opts.log_statements(tracing::log::LevelFilter::Debug);
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(async move { SqlitePool::connect_with(opts).await })
