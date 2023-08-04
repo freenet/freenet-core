@@ -1,5 +1,6 @@
 //! Types and definitions to handle all socket communication for the peer nodes.
 
+use libp2p::swarm::StreamUpgradeError;
 use serde::{Deserialize, Serialize};
 
 use super::PeerKey;
@@ -35,12 +36,31 @@ pub(crate) enum ConnectionError {
     Serialization(#[from] Option<Box<bincode::ErrorKind>>),
 
     // errors produced while handling the connection:
-    #[serde(skip)]
-    #[error("IO connection error")]
-    IOError(#[from] Option<std::io::Error>),
-    // #[serde(skip)]
-    // #[error("upgrade connection error")]
-    // NegotiationError(#[from] Option<Box<ProtocolsHandlerUpgrErr<Self>>>),
+    #[error("IO error: {0}")]
+    IOError(String),
+    #[error("timeout error while opening a connectio.")]
+    Timeout,
+    #[error("no protocols could be agreed upon")]
+    NegotiationFailed,
+    #[error("protocol upgrade error: {0}")]
+    Upgrade(String),
+}
+
+impl From<std::io::Error> for ConnectionError {
+    fn from(err: std::io::Error) -> Self {
+        Self::IOError(format!("{err}"))
+    }
+}
+
+impl<TUpgrErr: std::error::Error> From<StreamUpgradeError<TUpgrErr>> for ConnectionError {
+    fn from(err: StreamUpgradeError<TUpgrErr>) -> Self {
+        match err {
+            StreamUpgradeError::Timeout => Self::Timeout,
+            StreamUpgradeError::Apply(err) => Self::Upgrade(format!("{err}")),
+            StreamUpgradeError::NegotiationFailed => Self::NegotiationFailed,
+            StreamUpgradeError::Io(err) => Self::IOError(format!("{err}")),
+        }
+    }
 }
 
 impl Clone for ConnectionError {
@@ -49,8 +69,10 @@ impl Clone for ConnectionError {
             Self::LocationUnknown => Self::LocationUnknown,
             Self::Serialization(_) => Self::Serialization(None),
             Self::SendNotCompleted => Self::SendNotCompleted,
-            Self::IOError(_) => Self::IOError(None),
-            // Self::NegotiationError(_) => Self::NegotiationError(None),
+            Self::IOError(err) => Self::IOError(err.clone()),
+            Self::Timeout => Self::Timeout,
+            Self::Upgrade(err) => Self::Upgrade(err.clone()),
+            Self::NegotiationFailed => Self::NegotiationFailed,
         }
     }
 }
