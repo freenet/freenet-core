@@ -2,6 +2,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{Read, Seek},
+    sync::Arc,
     time::Duration,
 };
 
@@ -40,7 +41,7 @@ pub(super) async fn user_fn_handler(
         let command = input.recv().await;
         let command = command?;
         let dc = command.request.is_disconnect();
-        command_sender.send(command.request).await?;
+        command_sender.send(*command.request).await?;
         if dc {
             break;
         }
@@ -69,11 +70,11 @@ impl StdInput {
             })
             .transpose()?
             .unwrap_or_default();
-
-        let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::try_from((
-            &*config.contract,
+        let (contract_code, _ver) = ContractCode::load_versioned_from_path(&config.contract)?;
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(contract_code),
             params.into(),
-        ))?));
+        )));
         Ok(StdInput {
             input: File::open(&config.input_file)?,
             config,
@@ -92,23 +93,27 @@ impl StdInput {
         util::deserialize(self.config.ser_format, &buf)
     }
 
-    fn get_command_input<T>(&mut self, cmd: Command) -> Result<T, ClientError>
+    fn get_command_input<T>(&mut self, cmd: Command) -> Result<T, Box<ClientError>>
     where
         T: From<Vec<u8>>,
     {
-        self.input.rewind().map_err(|e| ErrorKind::Unhandled {
-            cause: format!("{e}"),
+        self.input.rewind().map_err(|e| {
+            Box::new(ClientError::from(ErrorKind::Unhandled {
+                cause: format!("{e}"),
+            }))
         })?;
         match self.config.ser_format {
             Some(DeserializationFmt::Json) => {
-                let state: serde_json::Value =
-                    self.read_input().map_err(|e| ErrorKind::Unhandled {
+                let state: serde_json::Value = self.read_input().map_err(|e| {
+                    Box::new(ClientError::from(ErrorKind::Unhandled {
                         cause: format!("deserialization error: {e}"),
-                    })?;
-                let json_str =
-                    serde_json::to_string_pretty(&state).map_err(|e| ErrorKind::Unhandled {
+                    }))
+                })?;
+                let json_str = serde_json::to_string_pretty(&state).map_err(|e| {
+                    Box::new(ClientError::from(ErrorKind::Unhandled {
                         cause: format!("{e}"),
-                    })?;
+                    }))
+                })?;
                 tracing::debug!("{cmd:?} value:\n{json_str}");
                 Ok(json_str.into_bytes().into())
             }
@@ -117,16 +122,18 @@ impl StdInput {
                 let mut buf = vec![];
                 self.input.read_to_end(&mut buf).unwrap();
                 let state = rmpv::decode::read_value_ref(&mut buf.as_ref()).map_err(|e| {
-                    ErrorKind::Unhandled {
+                    Box::new(ClientError::from(ErrorKind::Unhandled {
                         cause: format!("deserialization error: {e}"),
-                    }
+                    }))
                 })?;
                 tracing::debug!("{cmd:?} value:\n{state}");
                 Ok(buf.into())
             }
             _ => {
-                let state: Vec<u8> = self.read_input().map_err(|e| ErrorKind::Unhandled {
-                    cause: format!("deserialization error: {e}"),
+                let state: Vec<u8> = self.read_input().map_err(|e| {
+                    Box::new(ClientError::from(ErrorKind::Unhandled {
+                        cause: format!("deserialization error: {e}"),
+                    }))
                 })?;
                 Ok(state.into())
             }
@@ -236,7 +243,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
             },
             _ => unreachable!(),
         };
-        OpenRequest::new(ClientId::new(0), req)
+        OpenRequest::new(ClientId::new(0), Box::new(req))
     }
 }
 
@@ -268,7 +275,7 @@ impl ClientEventsProxy for StdInput {
                             let state: State = match self.get_command_input(Command::Put) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::debug!("Put event error: {e}");
+                                    tracing::debug!("Put event error: {}", e);
                                     return Ok(Either::Right(()));
                                 }
                             };

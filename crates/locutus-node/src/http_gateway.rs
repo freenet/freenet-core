@@ -5,12 +5,13 @@ use axum::extract::{Path, WebSocketUpgrade};
 use axum::response::{Html, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
 use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+    TryFromTsStd,
 };
+use std::collections::VecDeque;
 use std::{
     collections::HashMap,
     sync::{
@@ -104,7 +105,9 @@ async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
 ) -> Result<Html<String>, WebSocketApiError> {
     let full_path: String = format!("/contract/web/{}/{}", key, last_path);
-    web_handling::variable_content(key, full_path).await
+    web_handling::variable_content(key, full_path)
+        .await
+        .map_err(|e| *e)
 }
 
 async fn websocket_commands(
@@ -125,28 +128,31 @@ async fn websocket_interface(
 ) -> Result<(), DynError> {
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     let (mut tx, mut rx) = ws.split();
-    let listeners: Arc<Mutex<Vec<(_, UnboundedReceiver<HostResult>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let listeners: Arc<Mutex<VecDeque<(_, UnboundedReceiver<HostResult>)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
     loop {
         let active_listeners = listeners.clone();
         let listeners_task = async move {
             loop {
-                let active_listeners = &mut *active_listeners.lock().await;
+                let mut lock = active_listeners.lock().await;
+                let active_listeners = &mut *lock;
                 for _ in 0..active_listeners.len() {
-                    let (key, mut listener) = active_listeners.swap_remove(0);
-                    match listener.try_recv() {
-                        Ok(r) => {
-                            active_listeners.push((key, listener));
-                            return Ok(r);
-                        }
-                        Err(TryRecvError::Empty) => {
-                            active_listeners.push((key, listener));
-                        }
-                        Err(err @ TryRecvError::Disconnected) => {
-                            return Err(Box::new(err) as DynError)
+                    if let Some((key, mut listener)) = active_listeners.pop_front() {
+                        match listener.try_recv() {
+                            Ok(r) => {
+                                active_listeners.push_back((key, listener));
+                                return Ok(r);
+                            }
+                            Err(TryRecvError::Empty) => {
+                                active_listeners.push_back((key, listener));
+                            }
+                            Err(err @ TryRecvError::Disconnected) => {
+                                return Err(Box::new(err) as DynError)
+                            }
                         }
                     }
                 }
+                std::mem::drop(lock);
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
@@ -166,12 +172,13 @@ async fn websocket_interface(
             process_client_request(client_id, next_msg, &request_sender).await
         };
 
-        let active_listeners = listeners.clone();
         tokio::select! { biased;
             msg = async { process_host_response(response_rx.recv().await, client_id, &mut tx).await } => {
+                let active_listeners = listeners.clone();
                 if let Some(NewSubscription { key, callback }) = msg? {
+                    tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
                     let active_listeners = &mut *active_listeners.lock().await;
-                    active_listeners.push((key, callback));
+                    active_listeners.push_back((key, callback));
                 }
             }
             process_client_request = client_req_task => {
@@ -190,7 +197,7 @@ async fn websocket_interface(
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
-                let msg = rmp_serde::to_vec(&response)?;
+                let msg = bincode::serialize(&response)?;
                 tx.send(Message::Binary(msg)).await?;
             }
         }
@@ -219,24 +226,33 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
 
-    let req: ClientRequest = {
-        match ContractRequest::try_decode(&msg) {
-            Ok(r) => r.into(),
-            Err(e) => {
-                let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
-                    ErrorKind::DeserializationError {
-                        cause: format!("{e}"),
-                    }
-                    .into(),
-                ))
-                .map_err(|err| Some(err.into()))?;
-                return Ok(Some(Message::Binary(result_error)));
+    let req: Result<ClientRequest<'_>, _> = bincode::deserialize(&msg);
+    let req: ClientRequest = match req {
+        Ok(client_request) => client_request.into_owned(),
+        Err(error) => {
+            tracing::error!(%error, "error decoding request json");
+            match ContractRequest::try_decode(&msg) {
+                Ok(r) => r.to_owned().into(),
+                Err(e) => {
+                    let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+                        ErrorKind::DeserializationError {
+                            cause: format!("{e}"),
+                        }
+                        .into(),
+                    ))
+                    .map_err(|err| Some(err.into()))?;
+                    return Ok(Some(Message::Binary(result_error)));
+                }
             }
         }
     };
+
     tracing::debug!(req = %req, "received client request");
     request_sender
-        .send(ClientConnection::Request { client_id, req })
+        .send(ClientConnection::Request {
+            client_id,
+            req: Box::new(req),
+        })
         .await
         .map_err(|err| Some(err.into()))?;
     Ok(None)
@@ -255,9 +271,15 @@ async fn process_host_response(
                     tracing::debug!(response = %res, cli_id = %id, "sending response");
                     match res {
                         HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            key,
                             contract,
                             state,
-                        }) => Ok(ContractResponse::GetResponse { contract, state }.into()),
+                        }) => Ok(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }
+                        .into()),
                         other => Ok(other),
                     }
                 }
@@ -266,7 +288,7 @@ async fn process_host_response(
                     Err(err)
                 }
             };
-            let res = rmp_serde::to_vec(&result)?;
+            let res = bincode::serialize(&result)?;
             tx.send(Message::Binary(res)).await?;
             Ok(None)
         }
@@ -274,8 +296,12 @@ async fn process_host_response(
             debug_assert_eq!(id, client_id);
             Ok(Some(NewSubscription { key, callback }))
         }
-        _ => {
-            let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
+        Some(HostCallbackResult::NewId(cli_id)) => {
+            tracing::debug!(%cli_id, "new client registered");
+            Ok(None)
+        }
+        None => {
+            let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
                 ErrorKind::NodeUnavailable.into(),
             ))?;
             tx.send(Message::Binary(result_error)).await?;
@@ -301,31 +327,35 @@ impl HttpGateway {
                 self.response_channels.insert(cli_id, new_client_ch);
                 Ok(None)
             }
-            ClientConnection::Request {
-                client_id,
-                req: ClientRequest::ContractOp(ContractRequest::Subscribe { key }),
-            } => {
-                // intercept subscription messages because they require a callback subscription channel
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                if let Some(ch) = self.response_channels.get(&client_id) {
-                    ch.send(HostCallbackResult::SubscriptionChannel {
-                        key: key.clone(),
-                        id: client_id,
-                        callback: rx,
-                    })
-                    .map_err(|_| ErrorKind::ChannelClosed)?;
-                    Ok(Some(
-                        OpenRequest::new(client_id, ContractRequest::Subscribe { key }.into())
-                            .with_notification(tx),
-                    ))
-                } else {
-                    tracing::warn!("client: {client_id} not found");
-                    Err(ErrorKind::UnknownClient(client_id.into()).into())
-                }
-            }
             ClientConnection::Request { client_id, req } => {
-                // just forward the request to the node
-                Ok(Some(OpenRequest::new(client_id, req)))
+                match *req.clone() {
+                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary }) => {
+                        // intercept subscription messages because they require a callback subscription channel
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        if let Some(ch) = self.response_channels.get(&client_id) {
+                            ch.send(HostCallbackResult::SubscriptionChannel {
+                                key: key.clone(),
+                                id: client_id,
+                                callback: rx,
+                            })
+                            .map_err(|_| ErrorKind::ChannelClosed)?;
+                            Ok(Some(
+                                OpenRequest::new(
+                                    client_id,
+                                    Box::new(ContractRequest::Subscribe { key, summary }.into()),
+                                )
+                                .with_notification(tx),
+                            ))
+                        } else {
+                            tracing::warn!("client: {client_id} not found");
+                            Err(ErrorKind::UnknownClient(client_id.into()).into())
+                        }
+                    }
+                    _ => {
+                        // just forward the request to the node
+                        Ok(Some(OpenRequest::new(client_id, req)))
+                    }
+                }
             }
         }
     }
@@ -363,6 +393,8 @@ impl ClientEventsProxy for HttpGateway {
                 if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(id, ch);
+                } else {
+                    tracing::info!("dropped connection to client #{id}");
                 }
             } else {
                 tracing::warn!("client: {id} not found");

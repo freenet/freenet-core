@@ -12,8 +12,9 @@ use tower_http::trace::TraceLayer;
 
 use axum::routing::get;
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
-use locutus_runtime::prelude::TryFromTsStd;
-use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind, HostResponse};
+use locutus_stdlib::client_api::{
+    ClientRequest, ContractRequest, ErrorKind, HostResponse, TryFromTsStd,
+};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
@@ -226,9 +227,9 @@ async fn new_request(
                         .send(
                             OpenRequest {
                                 id,
-                                request: ClientRequest::Disconnect {
+                                request: Box::new(ClientRequest::Disconnect {
                                     cause: Some(format!("{e}")),
-                                },
+                                }),
                                 notification_channel: None,
                             }
                             .into(),
@@ -244,9 +245,9 @@ async fn new_request(
                 .send(
                     OpenRequest {
                         id,
-                        request: ClientRequest::Disconnect {
+                        request: Box::new(ClientRequest::Disconnect {
                             cause: Some(format!("{e}")),
-                        },
+                        }),
                         notification_channel: None,
                     }
                     .into(),
@@ -260,7 +261,7 @@ async fn new_request(
         .send(
             OpenRequest {
                 id,
-                request: msg,
+                request: Box::new(msg),
                 notification_channel: None,
             }
             .into(),

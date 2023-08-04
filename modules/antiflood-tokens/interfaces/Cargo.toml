@@ -7,9 +7,12 @@ edition = "2021"
 bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
-hashbrown = {workspace = true }
-locutus-stdlib = { workspace = true }
-ed25519-dalek = { workspace = true }
+locutus-stdlib = { workspace = true, features = ["contract"] }
+rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true }
+serde_json = { workspace = true }
 strum = { version = "0.24", features = ["derive"] }
 thiserror = "1"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+rand = "0.8"

@@ -14,8 +14,11 @@ jobs:
 
     runs-on: ubuntu-latest
     strategy:
+      max-parallel: 1
       matrix:
-        args: ["--no-default-features", "--all-features"]
+        # Disabled temporarily due to space issues on the device
+        #args: ["--no-default-features", "--all-features"]
+        args: ["--no-default-features"]
     env:
       LOCUTUS_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -62,6 +65,7 @@ jobs:
 
     runs-on: ubuntu-latest
     strategy:
+      max-parallel: 1
       matrix:
         targets: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
     env:
@@ -81,7 +85,7 @@ jobs:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@v2
-          
+
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -103,8 +107,12 @@ jobs:
 
     runs-on: ubuntu-latest
     strategy:
+      max-parallel: 1
       matrix:
         target: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
+    env:
+      LOCUTUS_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
       - name: Cancel Previous Runs
@@ -113,7 +121,7 @@ jobs:
           access_token: ${{ github.token }}
 
       - uses: actions/checkout@v3
-      
+
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -155,7 +163,7 @@ jobs:
           components: rustfmt
           override: "true"
           default: "true"
-          
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Check code formatting

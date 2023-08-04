@@ -7,7 +7,9 @@ use libp2p::{
     PeerId,
 };
 use locutus_core::*;
-use locutus_runtime::prelude::{ContractContainer, WasmAPIVersion, WrappedContract, WrappedState};
+use locutus_runtime::prelude::{
+    ContractContainer, ContractWasmAPIVersion, WrappedContract, WrappedState,
+};
 use locutus_stdlib::{
     client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
     prelude::{ContractCode, Parameters},
@@ -43,7 +45,7 @@ async fn start_new_peer(
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
         Arc::new(ContractCode::from(vec![7, 3, 9, 5])),
         Parameters::from(vec![]),
     )));
@@ -100,7 +102,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse_args()?;
 
     let gw_port = 64510;
-    let gw_key: Keypair = Keypair::Ed25519(ed25519::Keypair::decode(&mut ENCODED_GW_KEY.to_vec())?);
+    let gw_key: Keypair = Keypair::try_from(ed25519::Keypair::try_from_bytes(
+        &mut ENCODED_GW_KEY.to_vec(),
+    )?)?;
     let gw_id: PeerId = gw_key.public().into();
     let gw_loc = Location::random();
     let gw_config = InitPeerNode::new(gw_id, gw_loc)
@@ -160,7 +164,7 @@ impl ClientEventsProxy for UserEvents {
         Box::pin(async move {
             Ok(OpenRequest::new(
                 ClientId::FIRST,
-                self.rx_ev.recv().await.expect("channel open"),
+                Box::new(self.rx_ev.recv().await.expect("channel open")),
             ))
         })
     }

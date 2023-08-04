@@ -1,11 +1,9 @@
 use futures::future::BoxFuture;
-use locutus_runtime::{ContractInstanceId, DelegateKey};
 use locutus_stdlib::client_api::ClientRequest;
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
 use std::fmt::Display;
 
-use locutus_runtime::prelude::ContractKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -45,19 +43,19 @@ type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 #[non_exhaustive]
 pub struct OpenRequest<'a> {
     pub id: ClientId,
-    pub request: ClientRequest<'a>,
+    pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<UnboundedSender<HostResult>>,
 }
 
 impl<'a> OpenRequest<'a> {
     pub fn into_owned(self) -> OpenRequest<'static> {
         OpenRequest {
-            request: self.request.into_owned(),
+            request: Box::new(self.request.into_owned()),
             ..self
         }
     }
 
-    pub fn new(id: ClientId, request: ClientRequest<'a>) -> Self {
+    pub fn new(id: ClientId, request: Box<ClientRequest<'a>>) -> Self {
         Self {
             id,
             request,
@@ -83,37 +81,6 @@ pub trait ClientEventsProxy {
         response: Result<HostResponse, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>>;
 }
-
-#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
-pub enum RequestError {
-    #[error(transparent)]
-    ContractError(#[from] ContractError),
-    #[error(transparent)]
-    DelegateError(#[from] DelegateError),
-    #[error("client disconnect")]
-    Disconnect,
-}
-
-#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
-pub enum DelegateError {
-    #[error("error while registering component: {0}")]
-    RegisterError(DelegateKey),
-    #[error("execution error, cause: {0}")]
-    ExecutionError(String),
-}
-
-#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
-pub enum ContractError {
-    #[error("failed to get contract {key}, reason: {cause}")]
-    Get { key: ContractKey, cause: String },
-    #[error("put error for contract {key}, reason: {cause}")]
-    Put { key: ContractKey, cause: String },
-    #[error("update error for contract {key}, reason: {cause}")]
-    Update { key: ContractKey, cause: String },
-    #[error("missing related contract: {key}")]
-    MissingRelated { key: ContractInstanceId },
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     #![allow(unused)]
@@ -124,9 +91,10 @@ pub(crate) mod test {
 
     use futures::FutureExt;
     use locutus_runtime::{
-        ContractCode, ContractContainer, Parameters, RelatedContracts, TryFromTsStd, WasmAPIVersion,
+        prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId,
+        ContractWasmAPIVersion, DelegateKey, Parameters, RelatedContracts,
     };
-    use locutus_stdlib::client_api::ContractRequest;
+    use locutus_stdlib::client_api::{ContractRequest, TryFromTsStd};
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
@@ -224,7 +192,7 @@ pub(crate) mod test {
                             // self.non_owned_contracts[contract_no]
                             todo!("fixme")
                         };
-                        break ContractRequest::Subscribe { key }.into();
+                        break ContractRequest::Subscribe { key, summary: None }.into();
                     }
                     0 => {}
                     1 => {}
@@ -394,7 +362,7 @@ pub(crate) mod test {
     #[test]
     fn test_handle_put_request() -> Result<(), Box<dyn std::error::Error>> {
         let expected_client_request: ContractRequest = ContractRequest::Put {
-            contract: ContractContainer::Wasm(WasmAPIVersion::V1(WrappedContract::new(
+            contract: ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
                 Arc::new(ContractCode::from(vec![1])),
                 Parameters::from(vec![2]),
             ))),

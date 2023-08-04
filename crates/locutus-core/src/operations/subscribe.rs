@@ -464,6 +464,7 @@ mod test {
 
         let event = ContractRequest::Subscribe {
             key: contract_key.clone(),
+            summary: None,
         }
         .into();
         let first_node = NodeSpecification {
@@ -475,7 +476,7 @@ mod test {
 
         let second_node = NodeSpecification {
             owned_contracts: vec![(
-                ContractContainer::Wasm(WasmAPIVersion::V1(contract)),
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
             non_owned_contracts: Vec::new(),

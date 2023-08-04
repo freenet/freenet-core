@@ -20,7 +20,7 @@ pub use crate::config::Config;
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientEventsProxy, ClientId, HostResult,
-    OpenRequest, RequestError,
+    OpenRequest,
 };
 pub use contract::storages::{Storage, StorageContractHandler};
 pub use either;

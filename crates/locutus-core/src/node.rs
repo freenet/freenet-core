@@ -9,12 +9,7 @@
 
 use std::{fmt::Display, net::IpAddr, sync::Arc, time::Duration};
 
-use libp2p::{
-    core::PublicKey,
-    identity::{self},
-    multiaddr::Protocol,
-    Multiaddr, PeerId,
-};
+use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
 #[cfg(test)]
@@ -227,9 +222,10 @@ impl InitPeerNode {
     /// Will panic if is not a valid representation.
     pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> PeerId {
         PeerId::from_public_key(
-            &identity::Keypair::Ed25519(
-                identity::ed25519::Keypair::decode(bytes.as_mut()).unwrap(),
+            &identity::Keypair::try_from(
+                identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
             )
+            .unwrap()
             .public(),
         )
     }
@@ -302,7 +298,7 @@ async fn client_event_handling<ClientEv, CErr>(
         let OpenRequest {
             id: _id, request, ..
         } = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
-        if let ClientRequest::Disconnect { .. } = request {
+        if let ClientRequest::Disconnect { .. } = *request {
             if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
                 tracing::error!("{}", err);
             }
@@ -311,7 +307,7 @@ async fn client_event_handling<ClientEv, CErr>(
 
         let op_storage_cp = op_storage.clone();
         GlobalExecutor::spawn(async move {
-            match request {
+            match *request {
                 ClientRequest::ContractOp(ops) => match ops {
                     ContractRequest::Put {
                         state,
@@ -386,7 +382,7 @@ async fn client_event_handling<ClientEv, CErr>(
                         todo!()
                     }
                 },
-                ClientRequest::DelegateOp(_op) => todo!("FIXME: component op"),
+                ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
                 ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
                 ClientRequest::Disconnect { .. } => unreachable!(),
             }
@@ -554,8 +550,8 @@ impl Display for PeerKey {
     }
 }
 
-impl From<PublicKey> for PeerKey {
-    fn from(val: PublicKey) -> Self {
+impl From<identity::PublicKey> for PeerKey {
+    fn from(val: identity::PublicKey) -> Self {
         PeerKey(PeerId::from(val))
     }
 }

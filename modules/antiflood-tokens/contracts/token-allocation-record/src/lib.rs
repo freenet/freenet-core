@@ -1,12 +1,12 @@
-use ed25519_dalek::Verifier;
 use locutus_aft_interface::{
-    AllocationError, TokenAllocationRecord, TokenAllocationSummary, TokenAssignment,
-    TokenParameters,
+    AllocationError, TokenAllocationRecord, TokenAssignment, TokenDelegateParameters,
 };
 use locutus_stdlib::prelude::*;
+use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256, RsaPublicKey};
 
-struct TokenAllocContract;
+pub struct TokenAllocContract;
 
+#[contract]
 impl ContractInterface for TokenAllocContract {
     fn validate_state(
         parameters: Parameters<'static>,
@@ -14,10 +14,13 @@ impl ContractInterface for TokenAllocContract {
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let params = TokenParameters::try_from(parameters)?;
+        let params = TokenDelegateParameters::try_from(parameters)?;
+        #[allow(clippy::redundant_clone)]
+        let verifying_key = VerifyingKey::<Sha256>::new(params.generator_public_key.clone());
         for (_tier, assignments) in (&assigned_tokens).into_iter() {
             for assignment in assignments {
-                if !assignment.is_valid(&params) {
+                if assignment.is_valid(&verifying_key).is_err() {
+                    log_verification_err(&params.generator_public_key, "validate state");
                     return Ok(ValidateResult::Invalid);
                 }
             }
@@ -33,8 +36,15 @@ impl ContractInterface for TokenAllocContract {
         delta: StateDelta<'static>,
     ) -> Result<bool, ContractError> {
         let assigned_token = TokenAssignment::try_from(delta)?;
-        let params = TokenParameters::try_from(parameters)?;
-        Ok(assigned_token.is_valid(&params))
+        let params = TokenDelegateParameters::try_from(parameters)?;
+        #[allow(clippy::redundant_clone)]
+        let verifying_key = VerifyingKey::<Sha256>::new(params.generator_public_key.clone());
+        let verification = assigned_token.is_valid(&verifying_key);
+        if verification.is_err() {
+            log_verification_err(&params.generator_public_key, "validate delta");
+        }
+        log_succesful_ver(&params.generator_public_key, "validate delta");
+        Ok(verification.is_ok())
     }
 
     fn update_state(
@@ -43,42 +53,73 @@ impl ContractInterface for TokenAllocContract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         let mut assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let params = TokenParameters::try_from(parameters)?;
+        let params = TokenDelegateParameters::try_from(parameters)?;
+        let verifying_key = VerifyingKey::<Sha256>::new(params.generator_public_key.clone());
         for update in data {
             match update {
                 UpdateData::State(s) => {
                     let new_assigned_tokens = TokenAllocationRecord::try_from(s)?;
                     assigned_tokens
-                        .merge(new_assigned_tokens, &params)
+                        .merge(new_assigned_tokens, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (state)",
+                            );
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
+                    log_succesful_ver(&params.generator_public_key, "update state (state)")
                 }
                 UpdateData::Delta(d) => {
                     let new_assigned_token = TokenAssignment::try_from(d)?;
                     assigned_tokens
-                        .append(new_assigned_token, &params)
+                        .append(new_assigned_token, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (delta)",
+                            );
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
+                    log_succesful_ver(&params.generator_public_key, "update state (delta)")
                 }
                 UpdateData::StateAndDelta { state, delta } => {
                     let new_assigned_tokens = TokenAllocationRecord::try_from(state)?;
                     assigned_tokens
-                        .merge(new_assigned_tokens, &params)
+                        .merge(new_assigned_tokens, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (state and delta)",
+                            );
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                     let new_assigned_token = TokenAssignment::try_from(delta)?;
                     assigned_tokens
-                        .append(new_assigned_token, &params)
+                        .append(new_assigned_token, &verifying_key)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            log_verification_err(
+                                &params.generator_public_key,
+                                "update state (state and delta)",
+                            );
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
+                    log_succesful_ver(
+                        &params.generator_public_key,
+                        "update state (state and delta)",
+                    )
                 }
                 _ => unreachable!(),
             }
@@ -99,51 +140,60 @@ impl ContractInterface for TokenAllocContract {
     fn get_state_delta(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        summary: StateSummary<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
+        // FIXME: this will be broken because problem with node
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let summary = TokenAllocationSummary::try_from(summary)?;
-        let delta = assigned_tokens.delta(&summary);
-        delta.try_into()
+        //let summary = TokenAllocationSummary::try_from(summary)?;
+        //let delta = assigned_tokens.delta(&summary);
+        assigned_tokens.try_into()
     }
 }
 
-trait TokenAssignmentExt {
-    fn is_valid(&self, params: &TokenParameters) -> bool;
+#[allow(unused)]
+fn log_succesful_ver(pub_key: &RsaPublicKey, target: &str) {
+    #[cfg(target_family = "wasm")]
+    {
+        use rsa::pkcs8::EncodePublicKey;
+        let pk = pub_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .split_whitespace()
+            .collect::<String>();
+        // locutus_stdlib::log::info(&format!(
+        //     "successful verification with key: {pk} @ {target}"
+        // ));
+    }
 }
 
-impl TokenAssignmentExt for TokenAssignment {
-    fn is_valid(&self, params: &TokenParameters) -> bool {
-        if !self.tier.is_valid_slot(self.time_slot) {
-            return false;
-        }
-        let msg = TokenAssignment::to_be_signed(&self.time_slot, &self.assignee, self.tier);
-        if params
-            .generator_public_key
-            .verify(&msg, &self.signature)
-            .is_err()
-        {
-            // not signed by the private key of this generator
-            return false;
-        }
-        true
+#[allow(unused)]
+fn log_verification_err(pub_key: &RsaPublicKey, target: &str) {
+    #[cfg(target_family = "wasm")]
+    {
+        use rsa::pkcs8::EncodePublicKey;
+        let pk = pub_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .split_whitespace()
+            .collect::<String>();
+        locutus_stdlib::log::info(&format!("erroneous verification with key: {pk} @ {target}"));
     }
 }
 
 trait TokenAllocationRecordExt {
-    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), AllocationError>;
+    fn merge(&mut self, other: Self, key: &VerifyingKey<Sha256>) -> Result<(), AllocationError>;
     fn append(
         &mut self,
         assignment: TokenAssignment,
-        params: &TokenParameters,
+        params: &VerifyingKey<Sha256>,
     ) -> Result<(), AllocationError>;
 }
 
 impl TokenAllocationRecordExt for TokenAllocationRecord {
-    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), AllocationError> {
+    fn merge(&mut self, other: Self, key: &VerifyingKey<Sha256>) -> Result<(), AllocationError> {
         for (_, assignments) in other.into_iter() {
             for assignment in assignments {
-                self.append(assignment, params)?;
+                self.append(assignment, key)?;
             }
         }
         Ok(())
@@ -152,17 +202,18 @@ impl TokenAllocationRecordExt for TokenAllocationRecord {
     fn append(
         &mut self,
         assignment: TokenAssignment,
-        params: &TokenParameters,
+        key: &VerifyingKey<Sha256>,
     ) -> Result<(), AllocationError> {
         match self.get_mut_tier(&assignment.tier) {
             Some(list) => {
                 if list.binary_search(&assignment).is_err() {
-                    if assignment.is_valid(params) {
-                        list.push(assignment);
-                        list.sort_unstable();
-                        Ok(())
-                    } else {
-                        Err(AllocationError::invalid_assignment(assignment))
+                    match assignment.is_valid(key) {
+                        Ok(_) => {
+                            list.push(assignment);
+                            list.sort_unstable();
+                            Ok(())
+                        }
+                        Err(err) => Err(AllocationError::invalid_assignment(assignment, err)),
                     }
                 } else {
                     Err(AllocationError::allocated_slot(&assignment))

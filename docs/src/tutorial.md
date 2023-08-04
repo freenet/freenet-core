@@ -15,7 +15,7 @@ Mac (for Windows see [here](https://rustup.rs)):
 curl https://sh.rustup.rs -sSf | sh
 ```
 
-### Locutus Dev Tool (LTD)
+### Locutus Dev Tool (LDT)
 
 Once you have a working installation of Cargo you can install the Locutus dev
 tools:
