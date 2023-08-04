@@ -73,7 +73,8 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
         ContractKind::WebApp => (cwd.join("container"), &["new"]),
         ContractKind::Contract => (cwd.to_owned(), &["init"]),
     };
-    let cmd_args = if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+    use std::io::IsTerminal;
+    let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
         cmd.iter()
             .copied()
             .chain(["--color", "always"])

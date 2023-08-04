@@ -33,11 +33,16 @@ pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), D
 fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
     let package_type = cli_config.package_type;
     const RUST_TARGET_ARGS: &[&str] = &["build", "--release", "--lib", "--target"];
-    let target = cli_config.wasi.then(|| WASI_TARGET).unwrap_or(WASM_TARGET);
+    let target = if cli_config.wasi {
+        WASI_TARGET
+    } else {
+        WASM_TARGET
+    };
     if target == WASI_TARGET {
         println!("Enabling WASI extension");
     }
-    let cmd_args = if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+    use std::io::IsTerminal;
+    let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
         RUST_TARGET_ARGS
             .iter()
             .copied()
@@ -238,9 +243,10 @@ mod contract {
                         .as_ref()
                         .map(|c| c.webpack)
                         .unwrap_or_default();
+                    use std::io::IsTerminal;
                     if webpack {
                         let cmd_args: &[&str] =
-                            if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
                                 &["--color"]
                             } else {
                                 &[]
@@ -259,7 +265,7 @@ mod contract {
                         println!("Compiled input using webpack");
                     } else {
                         let cmd_args: &[&str] =
-                            if atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr) {
+                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
                                 &["--pretty"]
                             } else {
                                 &[]
