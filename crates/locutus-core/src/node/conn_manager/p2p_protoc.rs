@@ -23,7 +23,10 @@ use libp2p::{
     multiaddr::Protocol,
     ping,
     swarm::{
-        dial_opts::DialOpts, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, KeepAlive,
+        self,
+        dial_opts::DialOpts,
+        handler::{DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
+        ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm, KeepAlive,
         NetworkBehaviour, NotifyHandler, Stream as NegotiatedSubstream, SubstreamProtocol,
         SwarmBuilder, SwarmEvent, ToSwarm,
     },
@@ -471,6 +474,40 @@ impl NetworkBehaviour for LocutusBehaviour {
 
     type ToSwarm = Message;
 
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer_id: PeerId,
+        _local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.openning_connection.remove(&peer_id);
+        self.openning_connection.shrink_to_fit();
+        self.connected.insert(peer_id, connection_id);
+        self.routing_table
+            .entry(peer_id)
+            .or_default()
+            .insert(remote_addr.clone());
+        Ok(Handler::new())
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer_id: PeerId,
+        addr: &Multiaddr,
+        _role_override: libp2p::core::Endpoint,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.openning_connection.remove(&peer_id);
+        self.openning_connection.shrink_to_fit();
+        self.connected.insert(peer_id, connection_id);
+        self.routing_table
+            .entry(peer_id)
+            .or_default()
+            .insert(addr.clone());
+        Ok(Handler::new())
+    }
+
     fn on_connection_handler_event(
         &mut self,
         peer_id: PeerId,
@@ -484,6 +521,12 @@ impl NetworkBehaviour for LocutusBehaviour {
             HandlerEvent::Inbound(msg) => {
                 self.inbound.push_front(msg);
             }
+        }
+    }
+
+    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm<Self::ConnectionHandler>) {
+        if let FromSwarm::ConnectionClosed(swarm::ConnectionClosed { peer_id, .. }) = event {
+            self.connected.remove(&peer_id);
         }
     }
 
@@ -535,39 +578,6 @@ impl NetworkBehaviour for LocutusBehaviour {
         } else {
             Poll::Pending
         }
-    }
-
-    fn handle_established_inbound_connection(
-        &mut self,
-        connection_id: ConnectionId,
-        peer_id: PeerId,
-        _local_addr: &Multiaddr,
-        remote_addr: &Multiaddr,
-    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        self.openning_connection.remove(&peer_id);
-        self.connected.insert(peer_id, connection_id);
-        self.routing_table
-            .entry(peer_id)
-            .or_default()
-            .insert(remote_addr.clone());
-        Ok(Handler::new())
-    }
-
-    fn handle_established_outbound_connection(
-        &mut self,
-        _connection_id: ConnectionId,
-        _peer: PeerId,
-        _addr: &Multiaddr,
-        _role_override: libp2p::core::Endpoint,
-    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        todo!()
-    }
-
-    fn on_swarm_event(&mut self, _event: libp2p::swarm::FromSwarm<Self::ConnectionHandler>) {
-        // fn inject_disconnected(&mut self, peer: &PeerId) {
-        //     self.connected.remove(peer);
-        // }
-        todo!()
     }
 }
 
@@ -857,12 +867,11 @@ impl ConnectionHandler for Handler {
                             return Poll::Ready(event);
                         }
                         Poll::Ready(None) => {
-                            let event =
-                                ConnectionHandlerEvent::NotifyBehaviour(HandlerEvent::Inbound(
-                                    Right(NodeEvent::Error(ConnectionError::IOError(Some(
-                                        io::ErrorKind::UnexpectedEof.into(),
-                                    )))),
-                                ));
+                            let event = ConnectionHandlerEvent::NotifyBehaviour(
+                                HandlerEvent::Inbound(Right(NodeEvent::Error(
+                                    std::io::Error::from(io::ErrorKind::UnexpectedEof).into(),
+                                ))),
+                            );
                             return Poll::Ready(event);
                         }
                     },
@@ -886,83 +895,81 @@ impl ConnectionHandler for Handler {
         Poll::Pending
     }
 
-    // fn inject_fully_negotiated_outbound(
-    //     &mut self,
-    //     stream: <Self::OutboundProtocol as InboundUpgrade<NegotiatedSubstream>>::Output,
-    //     _info: Self::OutboundOpenInfo,
-    // ) {
-    //     if let Some(pos) = self
-    //         .substreams
-    //         .iter()
-    //         .position(|state| matches!(state, SubstreamState::AwaitingFirst { .. }))
-    //     {
-    //         let conn_id = match self.substreams.swap_remove(pos) {
-    //             SubstreamState::AwaitingFirst { conn_id } => conn_id,
-    //             _ => unreachable!(),
-    //         };
-    //         self.substreams.push(SubstreamState::FreeStream {
-    //             conn_id,
-    //             substream: stream,
-    //         });
-    //     } else {
-    //         unreachable!();
-    //     }
-    // }
-
-    // fn inject_fully_negotiated_inbound(
-    //     &mut self,
-    //     stream: <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Output,
-    //     _info: Self::InboundOpenInfo,
-    // ) {
-    //     if let Some(prev_stream) = self
-    //         .substreams
-    //         .iter()
-    //         .position(|state| matches!(state, SubstreamState::AwaitingFirst { .. }))
-    //     {
-    //         match self.substreams.swap_remove(prev_stream) {
-    //             SubstreamState::AwaitingFirst { conn_id } => {
-    //                 self.substreams.push(SubstreamState::FreeStream {
-    //                     conn_id,
-    //                     substream: stream,
-    //                 });
-    //             }
-    //             _ => unreachable!(),
-    //         }
-    //     } else {
-    //         self.substreams.push(SubstreamState::WaitingMsg {
-    //             conn_id: self.uniq_conn_id,
-    //             substream: stream,
-    //         });
-    //         self.uniq_conn_id += 1;
-    //     }
-
-    //     if let ProtocolStatus::Unconfirmed = self.protocol_status {
-    //         self.protocol_status = ProtocolStatus::Confirmed;
-    //     }
-    // }
-
-    // fn inject_dial_upgrade_error(
-    //     &mut self,
-    //     _: Self::OutboundOpenInfo,
-    //     error: ProtocolsHandlerUpgrErr<<Self::OutboundProtocol as OutboundUpgradeSend>::Error>,
-    // ) {
-    //     self.protocol_status = ProtocolStatus::FailedUpgrade;
-    //     self.substreams.push(SubstreamState::ReportError {
-    //         error: (Box::new(error)).into(),
-    //     });
-    //     self.uniq_conn_id += 1;
-    // }
-
     fn on_connection_event(
         &mut self,
-        _event: libp2p::swarm::handler::ConnectionEvent<
+        event: libp2p::swarm::handler::ConnectionEvent<
             Self::InboundProtocol,
             Self::OutboundProtocol,
             Self::InboundOpenInfo,
             Self::OutboundOpenInfo,
         >,
     ) {
-        todo!()
+        match event {
+            swarm::handler::ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
+                protocol: stream,
+                ..
+            }) => {
+                if let Some(prev_stream) = self
+                    .substreams
+                    .iter()
+                    .position(|state| matches!(state, SubstreamState::AwaitingFirst { .. }))
+                {
+                    match self.substreams.swap_remove(prev_stream) {
+                        SubstreamState::AwaitingFirst { conn_id } => {
+                            self.substreams.push(SubstreamState::FreeStream {
+                                conn_id,
+                                substream: stream,
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    self.substreams.push(SubstreamState::WaitingMsg {
+                        conn_id: self.uniq_conn_id,
+                        substream: stream,
+                    });
+                    self.uniq_conn_id += 1;
+                }
+
+                if let ProtocolStatus::Unconfirmed = self.protocol_status {
+                    self.protocol_status = ProtocolStatus::Confirmed;
+                }
+            }
+            swarm::handler::ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
+                protocol: stream,
+                ..
+            }) => {
+                if let Some(pos) = self
+                    .substreams
+                    .iter()
+                    .position(|state| matches!(state, SubstreamState::AwaitingFirst { .. }))
+                {
+                    let conn_id = match self.substreams.swap_remove(pos) {
+                        SubstreamState::AwaitingFirst { conn_id } => conn_id,
+                        _ => unreachable!(),
+                    };
+                    self.substreams.push(SubstreamState::FreeStream {
+                        conn_id,
+                        substream: stream,
+                    });
+                } else {
+                    unreachable!();
+                }
+            }
+            swarm::handler::ConnectionEvent::AddressChange(_) => todo!(),
+            swarm::handler::ConnectionEvent::DialUpgradeError(DialUpgradeError {
+                error, ..
+            }) => {
+                self.protocol_status = ProtocolStatus::FailedUpgrade;
+                self.substreams.push(SubstreamState::ReportError {
+                    error: error.into(),
+                });
+                self.uniq_conn_id += 1;
+            }
+            swarm::handler::ConnectionEvent::ListenUpgradeError(_) => todo!(),
+            swarm::handler::ConnectionEvent::LocalProtocolsChange(_) => todo!(),
+            swarm::handler::ConnectionEvent::RemoteProtocolsChange(_) => todo!(),
+        }
     }
 }
 
