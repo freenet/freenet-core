@@ -16,7 +16,9 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        args: ["--no-default-features", "--all-features"]
+        # Disabled temporarily due to space issues on the device
+        #args: ["--no-default-features", "--all-features"]
+        args: ["--no-default-features"]
     env:
       LOCUTUS_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
