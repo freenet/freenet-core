@@ -289,26 +289,26 @@ mod contract {
                 SupportedWebLangs::Rust => {
                     let cmd_args: &[&str] = &[
                         "build",
+                        "--target",
+                        "index.html",
+                        "--release",
+                        "--platform",
+                        "web",
                         "--features",
                         "use-node",
-                        "--no-default-features",
-                        "--public-url",
-                        "./",
-                        "--release",
-                        "index.html",
                     ];
-                    let child = Command::new("trunk")
+                    let child = Command::new("dx")
                         .args(cmd_args)
                         .current_dir(cwd)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()
                         .map_err(|e| {
-                            eprintln!("Error while executing trunk command: {}", e);
-                            Error::CommandFailed("trunk")
+                            eprintln!("Error while executing dx command: {}", e);
+                            Error::CommandFailed("dx")
                         })?;
                     pipe_std_streams(child)?;
-                    println!("Compiled input using trunk for Rust");
+                    println!("Compiled input using dx for Rust");
                 }
             }
         } else {

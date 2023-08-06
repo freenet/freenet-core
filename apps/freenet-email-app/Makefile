@@ -46,8 +46,8 @@ run-node:
 
 run-web:
 	cd $(INBOX_WEB_DIR)
-	trunk build --features use-node --no-default-features
-	trunk serve --features use-node --no-default-features --port 57616
+	dx build --target index.html --release --platform web --features use-node
+	dx serve --release --features use-node --port 57616
 
 build-webapp:
 	cd $(INBOX_WEB_DIR)
