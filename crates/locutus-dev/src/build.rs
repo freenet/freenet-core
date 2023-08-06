@@ -287,8 +287,16 @@ mod contract {
                 }
                 SupportedWebLangs::Javascript => todo!(),
                 SupportedWebLangs::Rust => {
-                    let cmd_args: &[&str] =
-                        &["build", "--features", "use-node", "--no-default-features"];
+                    let cmd_args: &[&str] = &[
+                        "build",
+                        "--features",
+                        "use-node",
+                        "--no-default-features",
+                        "--public-url",
+                        "./",
+                        "--release",
+                        "index.html",
+                    ];
                     let child = Command::new("trunk")
                         .args(cmd_args)
                         .current_dir(cwd)
