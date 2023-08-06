@@ -201,6 +201,7 @@ mod contract {
     pub(crate) enum SupportedWebLangs {
         Javascript,
         Typescript,
+        Rust,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -285,6 +286,22 @@ mod contract {
                     }
                 }
                 SupportedWebLangs::Javascript => todo!(),
+                SupportedWebLangs::Rust => {
+                    let cmd_args: &[&str] =
+                        &["build", "--features", "use-node", "--no-default-features"];
+                    let child = Command::new("trunk")
+                        .args(cmd_args)
+                        .current_dir(cwd)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| {
+                            eprintln!("Error while executing trunk command: {}", e);
+                            Error::CommandFailed("trunk")
+                        })?;
+                    pipe_std_streams(child)?;
+                    println!("Compiled input using trunk for Rust");
+                }
             }
         } else {
             println!("No webapp config found.");

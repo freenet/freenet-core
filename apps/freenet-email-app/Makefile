@@ -49,5 +49,13 @@ run-web:
 	trunk build --features use-node --no-default-features
 	trunk serve --features use-node --no-default-features --port 57616
 
+build-webapp:
+	cd $(INBOX_WEB_DIR)
+	ldt build
+
+publish-webapp:
+	cd $(INBOX_WEB_DIR)
+	ldt publish --code build/locutus/freenet_email_app_web contract --state build/locutus/contract-state
+
 clean:
 	rm -rf $(CARGO_TARGET_DIR)

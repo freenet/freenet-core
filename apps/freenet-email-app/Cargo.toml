@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["contracts/*", "delegates/*", "web"]
+members = ["contracts/*", "web", "web/container"]
 
 [profile.dev.package."*"]
 opt-level = 3

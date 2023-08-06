@@ -1,0 +1,13 @@
+[package]
+name = "freenet-email-app-web"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.71.1"
+resolver = "2"
+publish = false
+
+[dependencies]
+locutus-stdlib = { workspace = true }
+
+[lib]
+crate-type = ["cdylib"]
