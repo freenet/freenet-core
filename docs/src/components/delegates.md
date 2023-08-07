@@ -2,17 +2,17 @@
 
 Just as human delegates are representatives who make decisions or take action on
 behalf of others, in Freenet, Delegates serve a similar role. They function like
-an advanced version of a web browser's local storage and share similarities with
-Unix "Daemons". They run in the background on your device within the Freenet
-kernel, providing a secure environment for managing private data and performing
-complex tasks.
+an advanced version of a web browser's local storage while sharing similarities
+with Unix "Daemons". They run in the background on your device within the
+Freenet kernel, providing a secure environment for managing private data and
+performing complex tasks.
 
 Delegates interact with various Freenet components, including Contracts, User
 Interfaces, and other Delegates. They securely store your private data,
 including cryptographic keys, tokens, and passwords. They can read and modify
-data stored in Contracts, or send and receive messages from other Delegates
-and UIs. Delegates can also communicate directly with the user to, for example,
-ask permission to perform a task or notify the user of an event.
+data stored in Contracts, or send and receive messages from other Delegates and
+UIs. Delegates can also communicate directly with the user to, for example, ask
+permission to perform a task or notify the user of an event.
 
 Delegates are WebAssembly code and must comply with the
 [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121)
