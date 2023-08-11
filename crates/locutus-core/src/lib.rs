@@ -5,6 +5,7 @@ mod executor;
 mod message;
 mod node;
 mod operations;
+mod resource_manager;
 mod ring;
 mod router;
 pub mod util;
