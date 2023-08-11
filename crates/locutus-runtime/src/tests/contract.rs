@@ -15,7 +15,6 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
         false,
     )
     .unwrap();
-    runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
     let is_valid = runtime.validate_state(
         &key,
@@ -46,7 +45,6 @@ fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
         false,
     )
     .unwrap();
-    runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
     let is_valid = runtime.validate_delta(
         &key,
@@ -75,7 +73,6 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
         false,
     )
     .unwrap();
-    runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
     let new_state = runtime
         .update_state(
@@ -100,7 +97,6 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
         false,
     )
     .unwrap();
-    runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
     let summary = runtime.summarize_state(
         &key,
@@ -121,7 +117,6 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
         false,
     )
     .unwrap();
-    runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
 
     let delta = runtime.get_state_delta(
         &key,
