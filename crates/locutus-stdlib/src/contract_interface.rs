@@ -945,11 +945,6 @@ impl ContractInstanceId {
             .onto(&mut spec)?;
         Ok(Self(spec))
     }
-
-    /// Useful for debugging when you need a dummy contract id.
-    pub fn dummy() -> Self {
-        Self([0; CONTRACT_KEY_SIZE])
-    }
 }
 
 impl FromStr for ContractInstanceId {

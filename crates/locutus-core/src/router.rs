@@ -238,7 +238,6 @@ pub(crate) enum RoutingError {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-
 pub(crate) struct RoutingPrediction {
     pub failure_probability: f64,
     pub xfer_speed: TransferSpeed,

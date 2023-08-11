@@ -119,6 +119,8 @@ impl ResourceTotals {
 // Tests
 #[cfg(test)]
 mod tests {
+    use crate::DynError;
+
     use super::*;
 
     #[test]
@@ -176,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_meter_report() {
+    fn test_meter_report() -> Result<(), DynError> {
         let meter = Meter::new();
 
         // Report some usage and test that the total and attributed usage are updated
@@ -209,8 +211,11 @@ mod tests {
             50.0
         );
 
+        let bytes = crate::util::test::random_bytes_1024();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
         // Report usage for a different attribution and test that the total and attributed usage are updated
-        let other_attribution = AttributionSource::RelayedContract(ContractInstanceId::dummy());
+        let other_attribution =
+            AttributionSource::RelayedContract(gen.arbitrary::<ContractInstanceId>()?);
         meter.report(
             &other_attribution,
             ResourceType::InboundBandwidthBytes,
@@ -224,5 +229,6 @@ mod tests {
             meter.attributed_usage(&other_attribution, ResourceType::InboundBandwidthBytes),
             150.0
         );
+        Ok(())
     }
 }
