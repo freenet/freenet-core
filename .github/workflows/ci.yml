@@ -47,7 +47,6 @@ jobs:
       - name: Add dependencies
         run: |
           rustup target add wasm32-unknown-unknown
-          rustup target add wasm32-wasi
 
       - name: Build
         run: |
@@ -139,7 +138,6 @@ jobs:
       - name: Add dependencies
         run: |
           rustup target add wasm32-unknown-unknown
-          rustup target add wasm32-wasi
 
       - name: clippy
         run: cargo clippy -- -D warnings

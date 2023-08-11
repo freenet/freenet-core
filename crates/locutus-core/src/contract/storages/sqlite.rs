@@ -21,7 +21,7 @@ use super::super::{ContractHandler, ContractHandlerChannel};
 
 // Is fine to clone this as it wraps by an Arc.
 static POOL: Lazy<SqlitePool> = Lazy::new(|| {
-    let mut opts = if cfg!(test) {
+    let opts = if cfg!(test) {
         SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
     } else {
         let conn_str = CONFIG.config_paths.db_dir.join("locutus.db");

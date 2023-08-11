@@ -100,7 +100,6 @@ fn get_test_module(dir_name: &str, name: &str) -> Result<Vec<u8>, Box<dyn std::e
     println!("trying to compile the test contract, target: {target}");
     // attempt to compile it
     const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
-    const _WASI_TARGET: &str = "wasm32-wasi";
     const DEFAULT_TARGET: &str = "wasm32-unknown-unknown";
     let cmd_args = RUST_TARGET_ARGS
         .iter()
