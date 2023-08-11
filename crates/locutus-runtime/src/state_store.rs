@@ -10,8 +10,8 @@ use crate::{DynError, WrappedState};
 pub enum StateStoreError {
     #[error(transparent)]
     Any(#[from] DynError),
-    #[error("missing contract")]
-    MissingContract,
+    #[error("missing contract: {0}")]
+    MissingContract(ContractKey),
 }
 
 #[async_trait::async_trait]
@@ -81,14 +81,14 @@ where
     }
 
     pub async fn get(&self, key: &ContractKey) -> Result<WrappedState, StateStoreError> {
-        if let Some(v) = self.state_mem_cache.get(key) {
+        if let Some(v) = self.state_mem_cache.get(key).await {
             return Ok(v.value().clone());
         }
         self.store
             .get(key)
             .await
             .map_err(Into::into)?
-            .ok_or(StateStoreError::MissingContract)
+            .ok_or_else(|| StateStoreError::MissingContract(key.clone()))
     }
 
     pub fn get_params<'a>(
@@ -104,7 +104,7 @@ where
                 .get_params(key)
                 .await
                 .map_err(Into::into)?
-                .ok_or(StateStoreError::MissingContract)
+                .ok_or_else(|| StateStoreError::MissingContract(key.clone()))
         })
     }
 }

@@ -1,8 +1,17 @@
-use chacha20poly1305::{aead::Aead, Error as EncryptionError, XChaCha20Poly1305, XNonce};
+use blake2::digest::generic_array::GenericArray;
+use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20Poly1305, XNonce};
 use dashmap::DashMap;
+use locutus_stdlib::client_api::DelegateRequest;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::{collections::HashMap, fs, fs::File, iter::FromIterator, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::Write,
+    iter::FromIterator,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
@@ -47,6 +56,8 @@ pub enum SecretStoreError {
     IO(#[from] std::io::Error),
     #[error("missing cipher")]
     MissingCipher,
+    #[error("missing secret: {0}")]
+    MissingSecret(SecretsId),
 }
 
 impl From<&DashMap<DelegateKey, Vec<SecretKey>>> for KeyToEncryptionMap {
@@ -77,6 +88,19 @@ static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::Once
 
 impl StoreFsManagement<KeyToEncryptionMap> for SecretsStore {}
 
+static DEFAULT_CIPHER: Lazy<XChaCha20Poly1305> = Lazy::new(|| {
+    let arr = GenericArray::from_slice(&DelegateRequest::DEFAULT_CIPHER);
+    XChaCha20Poly1305::new(arr)
+});
+
+static DEFAULT_NONCE: Lazy<XNonce> =
+    Lazy::new(|| GenericArray::from_slice(&DelegateRequest::DEFAULT_NONCE).to_owned());
+
+static DEFAULT_ENCRYPTION: Lazy<Encryption> = Lazy::new(|| Encryption {
+    cipher: (*DEFAULT_CIPHER).clone(),
+    nonce: *DEFAULT_NONCE,
+});
+
 impl SecretsStore {
     pub fn new(secrets_dir: PathBuf) -> RuntimeResult<Self> {
         let key_to_secret_part;
@@ -90,7 +114,7 @@ impl SecretsStore {
         };
         if !key_file.exists() {
             std::fs::create_dir_all(&secrets_dir).map_err(|err| {
-                tracing::error!("error creating component dir: {err}");
+                tracing::error!("error creating delegate dir: {err}");
                 err
             })?;
             key_to_secret_part = Arc::new(DashMap::new());
@@ -114,41 +138,47 @@ impl SecretsStore {
         })
     }
 
-    pub fn register_component(
+    pub fn register_delegate(
         &mut self,
-        component: DelegateKey,
+        delegate: DelegateKey,
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> Result<(), SecretStoreError> {
         // FIXME: store/initialize the cyphers from disc
-        let encryption = Encryption { cipher, nonce };
-        self.ciphers.insert(component, encryption);
+        if nonce != *DEFAULT_NONCE {
+            let encryption = Encryption { cipher, nonce };
+            self.ciphers.insert(delegate, encryption);
+        }
         Ok(())
     }
 
     pub fn store_secret(
         &mut self,
-        component: &DelegateKey,
+        delegate: &DelegateKey,
         key: &SecretsId,
         plaintext: Vec<u8>,
     ) -> RuntimeResult<()> {
-        let component_path = self.base_path.join(component.encode());
-        let secret_file_path = component_path.join(key.encode());
-        let secret_key = *key.code_hash();
+        let delegate_path = self.base_path.join(delegate.encode());
+        let secret_file_path = delegate_path.join(key.encode());
+        let secret_key = *key.hash();
+        let encryption = self.ciphers.get(delegate).unwrap_or(&*DEFAULT_ENCRYPTION);
 
-        let encryption = self
-            .ciphers
-            .get(component)
-            .ok_or(SecretStoreError::MissingCipher)?;
         let ciphertext = encryption
             .cipher
             .encrypt(&encryption.nonce, plaintext.as_ref())
-            .map_err(SecretStoreError::Encryption)?;
+            .map_err(|err| {
+                if encryption.nonce == *DEFAULT_NONCE {
+                    SecretStoreError::MissingCipher
+                } else {
+                    SecretStoreError::Encryption(err)
+                }
+            })?;
 
         self.key_to_secret_part
-            .insert(component.clone(), vec![secret_key]);
+            .insert(delegate.clone(), vec![secret_key]);
 
-        fs::create_dir_all(&component_path)?;
+        fs::create_dir_all(&delegate_path)?;
+        tracing::debug!("storing secret `{key}` at {secret_file_path:?}");
         let mut file = File::create(secret_file_path)?;
         file.write_all(&ciphertext)?;
         Ok(())
@@ -156,10 +186,10 @@ impl SecretsStore {
 
     pub fn remove_secret(
         &mut self,
-        component: &DelegateKey,
+        delegate: &DelegateKey,
         key: &SecretsId,
     ) -> Result<(), SecretStoreError> {
-        let secret_path = self.base_path.join(component.encode()).join(key.encode());
+        let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
         match fs::remove_file(secret_path) {
             Ok(_) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -169,19 +199,24 @@ impl SecretsStore {
 
     pub fn get_secret(
         &self,
-        component: &DelegateKey,
+        delegate: &DelegateKey,
         key: &SecretsId,
     ) -> Result<Vec<u8>, SecretStoreError> {
-        let secret_path = self.base_path.join(component.encode()).join(key.encode());
-        let encryption = self
-            .ciphers
-            .get(component)
-            .ok_or(SecretStoreError::MissingCipher)?;
-        let ciphertext = fs::read(secret_path)?;
+        let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
+        let encryption = self.ciphers.get(delegate).unwrap_or(&*DEFAULT_ENCRYPTION);
+
+        let ciphertext =
+            fs::read(secret_path).map_err(|_| SecretStoreError::MissingSecret(key.clone()))?;
         let plaintext = encryption
             .cipher
             .decrypt(&encryption.nonce, ciphertext.as_ref())
-            .map_err(SecretStoreError::Encryption)?;
+            .map_err(|err| {
+                if encryption.nonce == *DEFAULT_NONCE {
+                    SecretStoreError::MissingCipher
+                } else {
+                    SecretStoreError::Encryption(err)
+                }
+            })?;
         Ok(plaintext)
     }
 }
@@ -200,16 +235,16 @@ mod test {
 
         let mut store = SecretsStore::new(secrets_dir)?;
 
-        let component = Delegate::from(vec![0, 1, 2]);
+        let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
 
         let cipher = XChaCha20Poly1305::new(&XChaCha20Poly1305::generate_key(&mut OsRng));
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let secret_id = SecretsId::new(vec![0, 1, 2]);
         let text = vec![0, 1, 2];
 
-        store.register_component(component.key().clone(), cipher, nonce)?;
-        store.store_secret(component.key(), &secret_id, text)?;
-        let f = store.get_secret(component.key(), &secret_id);
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        store.store_secret(delegate.key(), &secret_id, text)?;
+        let f = store.get_secret(delegate.key(), &secret_id);
 
         assert!(f.is_ok());
         Ok(())

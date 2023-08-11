@@ -2,7 +2,7 @@
 name = "locutus"
 version = "0.0.3"
 edition = "2021"
-rust-version = "1.58.0"
+rust-version = "1.71.1"
 publish = true
 description = "Locutus P2P network main node implementation"
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,10 @@ name = "ldt"
 path = "src/bin/dev-tool.rs"
 
 [dependencies]
+anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path"] }
+bincode = "1"
 bytes = "1"
 byteorder = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -29,11 +32,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 xz2 = "0.1"
-tower-http = { version = "0.3", features = ["trace"] }
-axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path"] }
-rmp = { workspace = true }
-rmpv = { workspace = true }
-rmp-serde = { workspace = true }
+tower-http = { version = "0.4", features = ["trace"] }
 
 # internal:
 locutus-core = { path = "../locutus-core", version = "0.0.3" }

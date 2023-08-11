@@ -5,7 +5,7 @@ use std::{
 };
 
 use locutus_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractKey, WasmAPIVersion, WrappedContract,
+    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
 };
 
 use crate::ContractStore;
@@ -39,11 +39,11 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
     println!("trying to compile the test contract, target: {target}");
     // attempt to compile it
     const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
-    const WASI_TARGET: &str = "wasm32-wasi";
+    const WASM_TARGET: &str = "wasm32-unknown-unknown";
     let cmd_args = RUST_TARGET_ARGS
         .iter()
         .copied()
-        .chain([WASI_TARGET])
+        .chain([WASM_TARGET])
         .collect::<Vec<_>>();
     let mut child = Command::new("cargo")
         .args(&cmd_args)
@@ -51,7 +51,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .spawn()?;
     child.wait()?;
     let output_file = Path::new(&target)
-        .join("wasm32-wasi")
+        .join(WASM_TARGET)
         .join("debug")
         .join(name)
         .with_extension("wasm");
@@ -62,13 +62,13 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
 pub(crate) fn setup_test_contract(
     name: &str,
 ) -> Result<(ContractStore, ContractKey), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let mut store = ContractStore::new(crate::tests::test_dir("contract"), 10_000)?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),
     );
-    let contract = ContractContainer::Wasm(WasmAPIVersion::V1(contract_bytes));
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
     let key = contract.key();
     store.store_contract(contract)?;
     Ok((store, key))

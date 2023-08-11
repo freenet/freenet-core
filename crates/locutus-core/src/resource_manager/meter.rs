@@ -1,7 +1,7 @@
-use std::{hash::Hash};
+use std::hash::Hash;
 
 use dashmap::DashMap;
-use locutus_runtime::{ComponentKey, ContractInstanceId};
+use locutus_runtime::{ContractInstanceId, DelegateKey};
 
 use crate::ring::PeerKeyLocation;
 
@@ -36,7 +36,11 @@ impl Meter {
         }
     }
 
-    pub fn attributed_usage(&self, attribution: &AttributionSource, resource: ResourceType) -> f64 {
+    pub(crate) fn attributed_usage(
+        &self,
+        attribution: &AttributionSource,
+        resource: ResourceType,
+    ) -> f64 {
         // Try to get a mutable reference to the AttributionMeters for the given attribution
         match self.attribution_meters.get_mut(attribution) {
             Some(attribution_meters) => {
@@ -56,7 +60,12 @@ impl Meter {
     /// Report the use of a resource. This should be done in the lowest-level
     /// functions that consume the resource, taking an AttributionMeter
     /// as a parameter.
-    pub fn report(&self, attribution: &AttributionSource, resource: ResourceType, value: f64) {
+    pub(crate) fn report(
+        &self,
+        attribution: &AttributionSource,
+        resource: ResourceType,
+        value: f64,
+    ) {
         // Report the total usage for the resource
         let mut total_value = self
             .totals_by_resource
@@ -79,10 +88,10 @@ impl Meter {
 }
 
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
-pub enum AttributionSource {
+pub(crate) enum AttributionSource {
     Peer(PeerKeyLocation),
     RelayedContract(ContractInstanceId),
-    Delegate(ComponentKey),
+    Delegate(DelegateKey),
 }
 
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]

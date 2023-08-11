@@ -12,20 +12,47 @@ This will install a Rust development environment including cargo on Linux or a
 Mac (for Windows see [here](https://rustup.rs)):
 
 ```bash
-$ curl https://sh.rustup.rs -sSf | sh
+curl https://sh.rustup.rs -sSf | sh
 ```
 
-### Locutus Dev Tool (LTD)
+### Locutus Dev Tool (LDT)
 
 Once you have a working installation of Cargo you can install the Locutus dev
 tools:
 
 ```bash
-$ cargo install locutus
+cargo install locutus
 ```
 
 This command will install `ldt` (Locutus Dev Tool) and a working Freenet kernel that can
 be used for local development.
+
+### Node.js and TypeScript
+
+To build user interfaces in JavaScript or TypeScript, you need to have Node.js
+and npm installed. On Linux or Mac:
+
+```bash
+sudo apt update
+sudo apt install nodejs npm
+```
+
+For Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
+
+Once Node.js and npm are installed, you can install TypeScript globally on your
+system, which includes the `tsc` command:
+
+```bash
+sudo npm install -g typescript
+```
+
+You can verify the installation by checking the version of `tsc`:
+
+```bash
+tsc --version
+```
+
+This command should output the version of TypeScript that you installed.
 
 ## Creating a new contract
 
@@ -49,10 +76,10 @@ technological stacks are supported (more to be added in the future):
 We will need to create a directory that will hold our web app and initialize it:
 
 ```bash
-$ mkdir -p my-app/web
-$ mkdir -p my-app/backend
-$ cd my-app/web
-$ ldt new web-app
+mkdir -p my-app/web
+mkdir -p my-app/backend
+cd my-app/web
+ldt new web-app
 ```
 
 will create the skeleton for a web application and its container contract for
@@ -68,7 +95,7 @@ The `new` command has created the source ready to be modified for us, in your
 favorite editor open the following file:
 
 ```bash
-$ ./container/src/lib.rs
+./container/src/lib.rs
 ```
 
 In this case, and for simplicity's sake, the contract won't be performing any
@@ -145,7 +172,7 @@ be used with Typescript/JavaScript to facilitate the development of web
 applications and interfacing with your local node, so we will make our
 `package.json` contains the dependency:
 
-```
+```json
 {
   "dependencies": {
     "@locutus/locutus-stdlib": "0.0.2"
@@ -165,7 +192,15 @@ Here is an example of how you could write your application to interact with the
 node:
 
 ```typescript
-import { LocutusWsApi } from "@locutus/locutus-stdlib/webSocketInterface";
+import {
+  GetResponse,
+  HostError,
+  Key,
+  LocutusWsApi,
+  PutResponse,
+  UpdateNotification,
+  UpdateResponse,
+} from "@locutus/locutus-stdlib/webSocketInterface";
 
 const handler = {
   onPut: (_response: PutResponse) => {},
@@ -242,8 +277,8 @@ a back end where we will be storing all the information, requires another
 contract. So we will create a new contract in a different directory for it:
 
 ```bash
-$ cd ../backend
-$ ldt new contract
+cd ../backend
+ldt new contract
 ```
 
 This will create a regular contract, and we will need to implement the interface
@@ -296,7 +331,7 @@ render them in our browser. We can do that, for example, using the API:
 ```typescript
 function getUpdateNotification(notification: UpdateNotification) {
   let decoder = new TextDecoder("utf8");
-  let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
+  let updatesBox = document.getElementById("updates") as HTMLPreElement;
   let newUpdate = decoder.decode(Uint8Array.from(notification.update));
   let newUpdateJson = JSON.parse(newUpdate);
   updatesBox.textContent = updatesBox.textContent + newUpdateJson;
@@ -355,24 +390,20 @@ installed.
 This means that you have installed either globally or at the directory level,
 e.g. globally:
 
-```
-$ npm install -g typescript
-$ npm install -g webpack
-$ npm install -g webpack-cli
+```bash
+npm install -g typescript webpack webpack-cli
 ```
 
 or locally (make sure your `package.json` file has the required dependencies):
 
-```
-$ npm install typescript --save-dev
-$ npm install webpack --save-dev
-$ npm install webpack-cli --save-dev
+```bash
+npm install --save-dev typescript webpack webpack-cli
 ```
 
 If, however, you prefer to follow a different workflow, you can write your own
 by enabling/disabling certain parameters or using a blank template. For example:
 
-```
+```toml
 [contract]
 lang = "rust"
 
@@ -383,7 +414,7 @@ files = ["my_packaged_web.tar.xz"]
 Would just delegate the work of building the packaged `tar` to the developer.
 Or:
 
-```
+```toml
 [contract]
 type = "webapp"
 lang = "rust"
@@ -395,13 +426,13 @@ lang = "typescript"
 webpack =  false
 ```
 
-would disable usign `webpack` at all.
+would disable using `webpack` at all.
 
 Now that we understand the details, and after making any necessary changes, in
 each contract directory we run the following commands:
 
 ```bash
-$ ldt build
+ldt build
 ```
 
 This command will read your contract manifest file (`locutus.toml`) and take
@@ -432,7 +463,7 @@ is running by running the following command as a background process or in
 another terminal; since we have installed it:
 
 ```bash
-$ locutus-node
+locutus-node
 ```
 
 You should see some logs printed via the stdout of the process indicating that
@@ -442,8 +473,8 @@ Once the HTTP gateway is running, we are ready to publish the contracts to our
 local Locutus node:
 
 ```bash
-$ cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
-$ cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
+cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
+cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
 ```
 
 In this case, we're not passing any parameters (so our parameters will be an

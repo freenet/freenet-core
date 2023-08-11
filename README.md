@@ -29,7 +29,7 @@ To learn more about Locutus as a developer read [The Locutus Book](https://docs.
 
 ## Status
 
-Locutus is currently under development. Using our [development guide](https://docs.freenet.org/dev-guide.html), developers can experiment with building decentralized applications using our SDK and testing them locally. 
+Locutus is currently under development. Using our [development guide](https://docs.freenet.org/tutorial.html), developers can experiment with building decentralized applications using our SDK and testing them locally.
 
 ## Applications
 

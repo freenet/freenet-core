@@ -24,8 +24,27 @@ impl Drop for RunningInstance {
     }
 }
 
+pub(crate) struct InstanceInfo {
+    pub start_ptr: i64,
+    key: Key,
+}
+
+impl InstanceInfo {
+    pub fn key(&self) -> String {
+        match &self.key {
+            Key::Contract(k) => k.encode(),
+            Key::Delegate(k) => k.encode(),
+        }
+    }
+}
+
+enum Key {
+    Contract(ContractInstanceId),
+    Delegate(DelegateKey),
+}
+
 impl RunningInstance {
-    fn new(rt: &mut Runtime, instance: Instance) -> RuntimeResult<Self> {
+    fn new(rt: &mut Runtime, instance: Instance, key: Key) -> RuntimeResult<Self> {
         let memory = rt
             .host_memory
             .as_ref()
@@ -38,7 +57,13 @@ impl RunningInstance {
         let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         set_id.call(&mut rt.wasm_store, id).unwrap();
         let ptr = memory.view(&rt.wasm_store).data_ptr() as i64;
-        native_api::MEM_ADDR.insert(id, ptr);
+        native_api::MEM_ADDR.insert(
+            id,
+            InstanceInfo {
+                start_ptr: ptr,
+                key,
+            },
+        );
         Ok(Self { instance, id })
     }
 }
@@ -68,13 +93,11 @@ pub struct Runtime {
     pub(crate) top_level_imports: Imports,
     /// assigned growable host memory
     pub(crate) host_memory: Option<Memory>,
-    #[cfg(test)]
-    pub(crate) enable_wasi: bool,
 
     pub(crate) secret_store: SecretsStore,
-    pub(crate) component_store: DelegateStore,
-    /// loaded component modules
-    pub(crate) component_modules: HashMap<DelegateKey, Module>,
+    pub(crate) delegate_store: DelegateStore,
+    /// loaded delegate modules
+    pub(crate) delegate_modules: HashMap<DelegateKey, Module>,
 
     /// Local contract storage.
     pub contract_store: ContractStore,
@@ -85,7 +108,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn build(
         contract_store: ContractStore,
-        component_store: DelegateStore,
+        delegate_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
     ) -> RuntimeResult<Self> {
@@ -102,20 +125,19 @@ impl Runtime {
             (None, imports! {})
         };
         native_api::time::prepare_export(&mut store, &mut top_level_imports);
+        native_api::log::prepare_export(&mut store, &mut top_level_imports);
 
         Ok(Self {
             wasm_store: store,
             top_level_imports,
             host_memory,
-            #[cfg(test)]
-            enable_wasi: false,
 
             secret_store,
-            component_store,
+            delegate_store,
             contract_modules: HashMap::new(),
 
             contract_store,
-            component_modules: HashMap::new(),
+            delegate_modules: HashMap::new(),
         })
     }
 
@@ -164,9 +186,10 @@ impl Runtime {
                 .fetch_contract(key, parameters)
                 .ok_or_else(|| RuntimeInnerError::ContractNotFound(key.clone()))?;
             let module = match contract {
-                ContractContainer::Wasm(WasmAPIVersion::V1(contract_v1)) => {
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                     Module::new(&self.wasm_store, contract_v1.code().data())?
                 }
+                _ => unimplemented!(),
             };
             self.contract_modules.insert(key.clone(), module);
             self.contract_modules.get(key).unwrap()
@@ -174,29 +197,31 @@ impl Runtime {
         .clone();
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
-        RunningInstance::new(self, instance)
+        RunningInstance::new(self, instance, Key::Contract(key.id()))
     }
 
-    pub(crate) fn prepare_component_call(
+    pub(crate) fn prepare_delegate_call(
         &mut self,
+        params: &Parameters,
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
-        let module = if let Some(module) = self.component_modules.get(key) {
+        let module = if let Some(module) = self.delegate_modules.get(key) {
             module
         } else {
-            let contract = self
-                .component_store
-                .fetch_component(key)
+            // FIXME
+            let delegate = self
+                .delegate_store
+                .fetch_delegate(key, params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
-            let module = Module::new(&self.wasm_store, contract.as_ref())?;
-            self.component_modules.insert(key.clone(), module);
-            self.component_modules.get(key).unwrap()
+            let module = Module::new(&self.wasm_store, delegate.code().as_ref())?;
+            self.delegate_modules.insert(key.clone(), module);
+            self.delegate_modules.get(key).unwrap()
         }
         .clone();
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
-        RunningInstance::new(self, instance)
+        RunningInstance::new(self, instance, Key::Delegate(key.clone()))
     }
 
     fn set_instance_mem(&mut self, req_bytes: usize, instance: &Instance) -> RuntimeResult<()> {
@@ -225,47 +250,12 @@ impl Runtime {
         Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
     }
 
-    #[cfg(not(test))]
     fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
         Ok(Instance::new(
             &mut self.wasm_store,
             module,
             &self.top_level_imports,
         )?)
-    }
-
-    #[cfg(test)]
-    // this fn enables WASI env for debuggability
-    fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
-        use wasmer::namespace;
-        use wasmer_wasi::WasiState;
-
-        if !self.enable_wasi {
-            return Ok(Instance::new(
-                &mut self.wasm_store,
-                module,
-                &self.top_level_imports,
-            )?);
-        }
-        let mut wasi_env = WasiState::new("locutus").finalize(&mut self.wasm_store)?;
-        let mut imports = wasi_env.import_object(&mut self.wasm_store, module)?;
-        if let Some(mem) = &self.host_memory {
-            imports.register_namespace("env", namespace!("memory" => mem.clone()));
-        }
-
-        let mut namespaces = HashMap::new();
-        for ((module, name), import) in self.top_level_imports.into_iter() {
-            let namespace: &mut wasmer::Exports = namespaces.entry(module).or_default();
-            namespace.insert(name, import);
-        }
-        for (module, ns) in namespaces {
-            imports.register_namespace(&module, ns);
-        }
-
-        let instance = Instance::new(&mut self.wasm_store, module, &imports)?;
-        wasi_env.initialize(&mut self.wasm_store, &instance)?;
-
-        Ok(instance)
     }
 
     fn instance_store() -> Store {

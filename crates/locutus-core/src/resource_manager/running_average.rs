@@ -1,4 +1,4 @@
-use std::{time::Instant, collections::VecDeque};
+use std::{collections::VecDeque, time::Instant};
 
 #[derive(Clone, Debug)]
 pub struct RunningAverage {
@@ -69,59 +69,59 @@ mod tests {
 
     use super::*;
 
-#[test]
-fn test_insert() {
-    let max_samples = 3;
-    let mut running_avg = RunningAverage::new(max_samples);
-    let now = Instant::now();
+    #[test]
+    fn test_insert() {
+        let max_samples = 3;
+        let mut running_avg = RunningAverage::new(max_samples);
+        let now = Instant::now();
 
-    running_avg.insert_with_time(now, 2.0);
-    assert_eq!(running_avg.samples.len(), 1);
-    assert_eq!(running_avg.sum_samples, 2.0);
+        running_avg.insert_with_time(now, 2.0);
+        assert_eq!(running_avg.samples.len(), 1);
+        assert_eq!(running_avg.sum_samples, 2.0);
 
-    running_avg.insert_with_time(now + Duration::from_secs(1), 4.0);
-    assert_eq!(running_avg.samples.len(), 2);
-    assert_eq!(running_avg.sum_samples, 6.0);
+        running_avg.insert_with_time(now + Duration::from_secs(1), 4.0);
+        assert_eq!(running_avg.samples.len(), 2);
+        assert_eq!(running_avg.sum_samples, 6.0);
 
-    running_avg.insert_with_time(now + Duration::from_secs(2), 6.0);
-    assert_eq!(running_avg.samples.len(), 3);
-    assert_eq!(running_avg.sum_samples, 12.0);
+        running_avg.insert_with_time(now + Duration::from_secs(2), 6.0);
+        assert_eq!(running_avg.samples.len(), 3);
+        assert_eq!(running_avg.sum_samples, 12.0);
 
-    // Test that the oldest value is removed when max_samples is exceeded
-    running_avg.insert_with_time(now + Duration::from_secs(3), 8.0);
-    assert_eq!(running_avg.samples.len(), 3);
-    assert_eq!(running_avg.sum_samples, 18.0);
-}
+        // Test that the oldest value is removed when max_samples is exceeded
+        running_avg.insert_with_time(now + Duration::from_secs(3), 8.0);
+        assert_eq!(running_avg.samples.len(), 3);
+        assert_eq!(running_avg.sum_samples, 18.0);
+    }
 
-#[test]
-fn test_per_second_measurement() {
-    let max_samples = 3;
-    let mut running_avg = RunningAverage::new(max_samples);
-    let now = Instant::now();
+    #[test]
+    fn test_per_second_measurement() {
+        let max_samples = 3;
+        let mut running_avg = RunningAverage::new(max_samples);
+        let now = Instant::now();
 
-    // Test with no samples
-    assert_eq!(running_avg.per_second_measurement_with_time(now), 0.0);
+        // Test with no samples
+        assert_eq!(running_avg.per_second_measurement_with_time(now), 0.0);
 
-    // Test with one sample
-    running_avg.insert_with_time(now, 2.0);
-    assert_eq!(
-        running_avg.per_second_measurement_with_time(now + Duration::from_secs(1)),
-        2.0
-    );
+        // Test with one sample
+        running_avg.insert_with_time(now, 2.0);
+        assert_eq!(
+            running_avg.per_second_measurement_with_time(now + Duration::from_secs(1)),
+            2.0
+        );
 
-    // Test with multiple samples
-    running_avg.insert_with_time(now + Duration::from_secs(1), 4.0);
-    running_avg.insert_with_time(now + Duration::from_secs(2), 6.0);
-    assert_eq!(
-        running_avg.per_second_measurement_with_time(now + Duration::from_secs(3)),
-        4.0
-    );
+        // Test with multiple samples
+        running_avg.insert_with_time(now + Duration::from_secs(1), 4.0);
+        running_avg.insert_with_time(now + Duration::from_secs(2), 6.0);
+        assert_eq!(
+            running_avg.per_second_measurement_with_time(now + Duration::from_secs(3)),
+            4.0
+        );
 
-    // Test with max_samples exceeded
-    running_avg.insert_with_time(now + Duration::from_secs(3), 8.0);
-    assert_eq!(
-        running_avg.per_second_measurement_with_time(now + Duration::from_secs(4)),
-        6.0
-    );
-}
+        // Test with max_samples exceeded
+        running_avg.insert_with_time(now + Duration::from_secs(3), 8.0);
+        assert_eq!(
+            running_avg.per_second_measurement_with_time(now + Duration::from_secs(4)),
+            6.0
+        );
+    }
 }

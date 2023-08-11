@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use locutus_stdlib::prelude::{ContractKey, DelegateKey};
+use locutus_stdlib::prelude::{ContractKey, DelegateKey, SecretsId};
 
 use crate::{delegate, runtime, secrets_store};
 
@@ -14,8 +14,36 @@ impl ContractError {
         matches!(&*self.0, RuntimeInnerError::ContractExecError(_))
     }
 
-    pub fn is_component_exec_error(&self) -> bool {
+    pub fn is_delegate_exec_error(&self) -> bool {
         matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
+    }
+
+    pub fn is_execution_error(&self) -> bool {
+        use RuntimeInnerError::*;
+        matches!(
+            &*self.0,
+            WasmInstantiationError(_) | WasmExportError(_) | WasmCompileError(_)
+        )
+    }
+
+    pub fn delegate_is_missing(&self) -> bool {
+        matches!(&*self.0, RuntimeInnerError::DelegateNotFound(_))
+    }
+
+    pub fn secret_is_missing(&self) -> bool {
+        matches!(
+            &*self.0,
+            RuntimeInnerError::SecretStoreError(secrets_store::SecretStoreError::MissingSecret(_))
+        )
+    }
+
+    pub fn get_secret_id(&self) -> SecretsId {
+        match &*self.0 {
+            RuntimeInnerError::SecretStoreError(
+                secrets_store::SecretStoreError::MissingSecret(id),
+            ) => id.clone(),
+            _ => panic!(),
+        }
     }
 }
 
@@ -50,10 +78,6 @@ impl_err!(secrets_store::SecretStoreError);
 impl_err!(bincode::Error);
 impl_err!(delegate::DelegateExecError);
 impl_err!(runtime::ContractExecError);
-#[cfg(test)]
-impl_err!(wasmer_wasi::WasiStateCreationError);
-#[cfg(test)]
-impl_err!(wasmer_wasi::WasiError);
 impl_err!(wasmer::CompileError);
 impl_err!(wasmer::ExportError);
 impl_err!(wasmer::InstantiationError);
@@ -77,8 +101,8 @@ pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
 
-    // component runtime errors
-    #[error("component {0} not found in store")]
+    // delegate runtime errors
+    #[error("delegate {0} not found in store")]
     DelegateNotFound(DelegateKey),
 
     #[error(transparent)]
@@ -95,14 +119,6 @@ pub(crate) enum RuntimeInnerError {
     UnwrapContract,
 
     // wasm runtime errors
-    #[cfg(test)]
-    #[error(transparent)]
-    WasiEnvError(#[from] wasmer_wasi::WasiStateCreationError),
-
-    #[cfg(test)]
-    #[error(transparent)]
-    WasiError(#[from] wasmer_wasi::WasiError),
-
     #[error(transparent)]
     WasmCompileError(#[from] wasmer::CompileError),
 

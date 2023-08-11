@@ -6,7 +6,8 @@ mod message;
 mod node;
 mod operations;
 mod resource_manager;
-pub mod ring;
+mod ring;
+mod router;
 pub mod util;
 
 pub type WrappedContract = locutus_runtime::prelude::WrappedContract;
@@ -20,7 +21,7 @@ pub use crate::config::Config;
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
     combinator::ClientEventsCombinator, BoxedClient, ClientEventsProxy, ClientId, HostResult,
-    OpenRequest, RequestError,
+    OpenRequest,
 };
 pub use contract::storages::{Storage, StorageContractHandler};
 pub use either;

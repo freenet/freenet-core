@@ -9,11 +9,12 @@ use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ClientConnection {
     NewConnection(tokio::sync::mpsc::UnboundedSender<HostCallbackResult>),
     Request {
         client_id: ClientId,
-        req: ClientRequest<'static>,
+        req: Box<ClientRequest<'static>>,
     },
 }
 
@@ -34,10 +35,8 @@ enum HostCallbackResult {
 pub mod local_node {
     use std::net::SocketAddr;
 
-    use locutus_core::{
-        either, ClientEventsProxy, Executor, OpenRequest, RequestError, WebSocketProxy,
-    };
-    use locutus_stdlib::client_api::{ClientError, ErrorKind};
+    use locutus_core::{either, ClientEventsProxy, Executor, OpenRequest, WebSocketProxy};
+    use locutus_stdlib::client_api::{ErrorKind, RequestError};
 
     use crate::{DynError, HttpGateway};
 
@@ -57,23 +56,25 @@ pub mod local_node {
                 notification_channel,
                 ..
             } = http_handle.recv().await?;
-            tracing::debug!("client {id}, req -> {request}");
+            tracing::trace!(cli_id = %id, "got request -> {request}");
             match executor
-                .handle_request(id, request, notification_channel)
+                .handle_request(id, *request, notification_channel)
                 .await
             {
                 Ok(res) => {
                     http_handle.send(id, Ok(res)).await?;
                 }
-                Err(either::Left(RequestError::Disconnect)) => {}
                 Err(either::Left(err)) => {
-                    tracing::error!("{err}");
-                    http_handle
-                        .send(
-                            id,
-                            Err(ClientError::from(ErrorKind::Other(format!("{err}")))),
-                        )
-                        .await?;
+                    let request_error = *err.clone();
+                    match *err {
+                        RequestError::Disconnect => {}
+                        _ => {
+                            tracing::error!("{err}");
+                            http_handle
+                                .send(id, Err(ErrorKind::from(request_error).into()))
+                                .await?;
+                        }
+                    }
                 }
                 Err(either::Right(err)) => {
                     tracing::error!("{err}");

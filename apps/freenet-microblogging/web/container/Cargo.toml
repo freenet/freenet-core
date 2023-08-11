@@ -2,7 +2,7 @@
 name = "freenet-microblogging-web"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.58.0"
+rust-version = "1.71.1"
 resolver = "2"
 publish = false
 

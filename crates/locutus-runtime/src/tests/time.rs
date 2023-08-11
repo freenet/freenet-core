@@ -14,7 +14,6 @@ fn now() -> Result<(), Box<dyn std::error::Error>> {
         false,
     )
     .unwrap();
-    runtime.enable_wasi = true;
 
     let module = runtime.prepare_contract_call(&key, &vec![].into(), 1_000)?;
     let f: TypedFunction<(), ()> = module

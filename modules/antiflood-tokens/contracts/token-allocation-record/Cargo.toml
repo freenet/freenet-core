@@ -1,17 +1,17 @@
 [package]
-name = "locutus-aft-allocation-record"
+name = "locutus-token-allocation-record"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 bincode = { workspace = true }
 chrono = { workspace = true }
-hashbrown = {workspace = true }
-locutus-stdlib = { workspace = true }
-ed25519-dalek = { workspace = true }
+locutus-stdlib = { workspace = true, features = ["contract"] }
+rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 locutus-aft-interface = { path = "../../interfaces" }
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]

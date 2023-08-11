@@ -1,0 +1,25 @@
+[package]
+name = "identity-management"
+version = "0.0.1"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+p384 =  { version = "0.13", default-features = false, features = ["serde", "pem", "pkcs8", "arithmetic"] }
+locutus-stdlib = { version = "0.0.3", path = "../../crates/locutus-stdlib" }
+serde = "1"
+serde_json = "1"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+p384 = { version = "0.13", default-features = true }
+ecdsa = "0.16"
+pico-args = "0.5"
+rand = "0.8"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+contract = ["locutus-stdlib/contract"]

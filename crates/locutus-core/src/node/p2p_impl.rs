@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use either::Either;
 use libp2p::{
-    core::{muxing, transport, upgrade},
+    core::{
+        muxing,
+        transport::{self, upgrade},
+    },
+    deflate,
     dns::TokioDnsConfig,
     identity::Keypair,
-    noise,
-    tcp::TokioTcpConfig,
-    yamux, PeerId, Transport,
+    noise, tcp, yamux, PeerId, Transport,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -105,30 +107,18 @@ where
     /// - TCP/IP handling over Tokio streams.
     /// - DNS when dialing peers.
     /// - Authentication and encryption via [Noise](https://github.com/libp2p/specs/tree/master/noise) protocol.
-    /// - Compression using Deflate (disabled right now due to a bug).
+    /// - Compression using Deflate.
     /// - Multiplexing using [Yamux](https://github.com/hashicorp/yamux/blob/master/spec.md).
     fn config_transport(
         local_key: &Keypair,
     ) -> std::io::Result<transport::Boxed<(PeerId, muxing::StreamMuxerBox)>> {
-        let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
-            .into_authentic(local_key)
-            .expect("signing libp2p-noise static DH keypair failed");
-
-        let tcp = TokioTcpConfig::new().nodelay(true).port_reuse(true);
-        // FIXME: there seems to be a problem with the deflate upgrade
-        // that repeteadly allocates more space on the heap until OOM
-        // .and_then(|conn, endpoint| {
-        //     upgrade::apply(
-        //         conn,
-        //         DeflateConfig::default(),
-        //         endpoint,
-        //         upgrade::Version::V1,
-        //     )
-        // });
-        Ok(TokioDnsConfig::system(tcp)?
+        let tcp = tcp::tokio::Transport::new(tcp::Config::new().nodelay(true).port_reuse(true));
+        let with_dns = TokioDnsConfig::system(tcp)?;
+        Ok(with_dns
             .upgrade(upgrade::Version::V1)
-            .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
-            .multiplex(yamux::YamuxConfig::default())
+            .authenticate(noise::Config::new(local_key).unwrap())
+            .apply(deflate::DeflateConfig::default())
+            .multiplex(yamux::Config::default())
             .timeout(config::PEER_TIMEOUT)
             .map(|(peer, muxer), _| (peer, muxing::StreamMuxerBox::new(muxer)))
             .boxed())
