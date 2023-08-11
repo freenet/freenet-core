@@ -19,7 +19,7 @@ ENV PATH="/usr/lib/llvm-13/bin/:${PATH}"
 # Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN rustup target add wasm32-unknown-unknown wasm32-wasi
+RUN rustup target add wasm32-unknown-unknown
 
 # Go to a non-root Work directory so npm install works.
 WORKDIR /src/locutus

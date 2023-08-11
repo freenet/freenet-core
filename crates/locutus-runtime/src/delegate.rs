@@ -430,7 +430,6 @@ mod test {
             .secret_store
             .register_delegate(delegate.key().clone(), cipher, nonce);
 
-        runtime.enable_wasi = true; // ENABLE FOR DEBUGGING; requires building for wasi
         Ok((delegate, runtime))
     }
 

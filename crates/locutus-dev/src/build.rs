@@ -20,7 +20,6 @@ use crate::{
 pub(crate) use contract::*;
 
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
-const WASI_TARGET: &str = "wasm32-wasi";
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), DynError> {
@@ -33,14 +32,7 @@ pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), D
 fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
     let package_type = cli_config.package_type;
     const RUST_TARGET_ARGS: &[&str] = &["build", "--release", "--lib", "--target"];
-    let target = if cli_config.wasi {
-        WASI_TARGET
-    } else {
-        WASM_TARGET
-    };
-    if target == WASI_TARGET {
-        println!("Enabling WASI extension");
-    }
+    let target = WASM_TARGET;
     use std::io::IsTerminal;
     let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
         RUST_TARGET_ARGS
@@ -87,15 +79,11 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Re
 
 fn get_out_lib(
     work_dir: &Path,
-    cli_config: &BuildToolCliConfig,
+    _cli_config: &BuildToolCliConfig,
 ) -> Result<(String, PathBuf), DynError> {
     const ERR: &str = "Cargo.toml definition incorrect";
 
-    let target = if cli_config.wasi {
-        WASI_TARGET
-    } else {
-        WASM_TARGET
-    };
+    let target = WASM_TARGET;
 
     let mut f_content = vec![];
     File::open(work_dir.join("Cargo.toml"))?.read_to_end(&mut f_content)?;
@@ -112,7 +100,11 @@ fn get_out_lib(
         .as_str()
         .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
         .replace('-', "_");
-    let output_lib = env::var("CARGO_TARGET_DIR")?
+    let output_lib = env::var("CARGO_TARGET_DIR")
+        .map_err(|e| {
+            println!("Missing environment variable `CARGO_TARGET_DIR");
+            e
+        })?
         .parse::<PathBuf>()?
         .join(target)
         .join("release")
@@ -615,6 +607,7 @@ mod contract {
 
         #[test]
         fn compile_webapp_contract() -> Result<(), DynError> {
+            //
             let (config, cwd) = setup_webapp_contract()?;
             compile_contract(&config, &BuildToolCliConfig::default(), &cwd)?;
             Ok(())

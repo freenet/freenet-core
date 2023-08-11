@@ -101,10 +101,6 @@ pub struct BuildToolCliConfig {
     #[arg(long)]
     pub(crate) features: Option<String>,
 
-    /// Compile the contract or delegate with WASI extension enabled (useful for debugging).
-    #[arg(long)]
-    pub(crate) wasi: bool,
-
     /// Compile the contract or delegate with a specific API version.
     #[arg(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
     pub(crate) version: Version,
@@ -145,7 +141,6 @@ impl Default for BuildToolCliConfig {
     fn default() -> Self {
         Self {
             features: None,
-            wasi: false,
             version: Version::new(0, 0, 1),
             package_type: PackageType::default(),
         }

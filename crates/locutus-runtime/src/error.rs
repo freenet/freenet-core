@@ -78,10 +78,6 @@ impl_err!(secrets_store::SecretStoreError);
 impl_err!(bincode::Error);
 impl_err!(delegate::DelegateExecError);
 impl_err!(runtime::ContractExecError);
-#[cfg(test)]
-impl_err!(wasmer_wasi::WasiStateCreationError);
-#[cfg(test)]
-impl_err!(wasmer_wasi::WasiError);
 impl_err!(wasmer::CompileError);
 impl_err!(wasmer::ExportError);
 impl_err!(wasmer::InstantiationError);
@@ -123,14 +119,6 @@ pub(crate) enum RuntimeInnerError {
     UnwrapContract,
 
     // wasm runtime errors
-    #[cfg(test)]
-    #[error(transparent)]
-    WasiEnvError(#[from] wasmer_wasi::WasiStateCreationError),
-
-    #[cfg(test)]
-    #[error(transparent)]
-    WasiError(#[from] wasmer_wasi::WasiError),
-
     #[error(transparent)]
     WasmCompileError(#[from] wasmer::CompileError),
 

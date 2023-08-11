@@ -603,7 +603,7 @@ enum ProtocolStatus {
     Unconfirmed,
     Confirmed,
     Reported,
-    FailedUpgrade,
+    Failed,
 }
 
 #[allow(dead_code)]
@@ -956,19 +956,25 @@ impl ConnectionHandler for Handler {
                     unreachable!();
                 }
             }
-            swarm::handler::ConnectionEvent::AddressChange(_) => todo!(),
+            swarm::handler::ConnectionEvent::AddressChange(_) => {}
             swarm::handler::ConnectionEvent::DialUpgradeError(DialUpgradeError {
                 error, ..
             }) => {
-                self.protocol_status = ProtocolStatus::FailedUpgrade;
+                self.protocol_status = ProtocolStatus::Failed;
                 self.substreams.push(SubstreamState::ReportError {
                     error: error.into(),
                 });
                 self.uniq_conn_id += 1;
             }
-            swarm::handler::ConnectionEvent::ListenUpgradeError(_) => todo!(),
-            swarm::handler::ConnectionEvent::LocalProtocolsChange(_) => todo!(),
-            swarm::handler::ConnectionEvent::RemoteProtocolsChange(_) => todo!(),
+            swarm::handler::ConnectionEvent::ListenUpgradeError(
+                swarm::handler::ListenUpgradeError { error, .. },
+            ) => {
+                self.protocol_status = ProtocolStatus::Failed;
+                self.substreams.push(SubstreamState::ReportError { error });
+                self.uniq_conn_id += 1;
+            }
+            swarm::handler::ConnectionEvent::LocalProtocolsChange(_) => {}
+            swarm::handler::ConnectionEvent::RemoteProtocolsChange(_) => {}
         }
     }
 }
