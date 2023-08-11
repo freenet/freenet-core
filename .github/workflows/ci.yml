@@ -31,22 +31,16 @@ jobs:
 
       - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          profile: minimal
-          override: "true"
-          default: "true"
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Install stdlib packages
         working-directory: apps/stdlib
         run: npm run dev.package
-
-      - name: Add dependencies
-        run: |
-          rustup target add wasm32-unknown-unknown
 
       - name: Build
         run: |
@@ -79,23 +73,12 @@ jobs:
 
       - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: "true"
-          default: "true"
-
-      - name: Add dependencies
-        run: |
-          rustup target add wasm32-unknown-unknown
-          rustup target add wasm32-wasi
 
       - name: Build  - locutus-stdlib
         working-directory: crates/locutus-stdlib
@@ -121,23 +104,12 @@ jobs:
 
       - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          components: clippy
-          override: "true"
-          default: "true"
-
-      - name: Add dependencies
-        run: |
-          rustup target add wasm32-unknown-unknown
 
       - name: clippy
         run: cargo clippy -- -D warnings
@@ -154,15 +126,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          profile: minimal
-          components: rustfmt
-          override: "true"
-          default: "true"
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Check code formatting
         run: cargo fmt -- --check
