@@ -22,13 +22,18 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::serde_as;
 
+use crate::client_api::TryFromFbs;
+use crate::client_request_generated::client_request::{RelatedContracts as FbsRelatedContracts, *};
+use crate::common_generated::common::{
+    ContractKey as FbsContractKey, UpdateData as FbsUpdateData, UpdateDataType,
+};
 use crate::{
     client_api::{TryFromTsStd, WsApiError},
     code_hash::CodeHash,
     parameters::Parameters,
 };
 
-const CONTRACT_KEY_SIZE: usize = 32;
+pub(crate) const CONTRACT_KEY_SIZE: usize = 32;
 
 /// Type of errors during interaction with a contract.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
@@ -169,6 +174,18 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for RelatedContracts<'a> {
                 (id, Some(state))
             }));
         Ok(RelatedContracts::from(related_contracts))
+    }
+}
+
+impl<'a> TryFromFbs<&FbsRelatedContracts<'a>> for RelatedContracts<'a> {
+    fn try_decode_fbs(related_contracts: &FbsRelatedContracts<'a>) -> Result<Self, WsApiError> {
+        let mut map = HashMap::with_capacity(related_contracts.contracts().len());
+        for related in related_contracts.contracts().iter() {
+            let id = ContractInstanceId::from_bytes(related.instance_id().data().bytes()).unwrap();
+            let state = State::from(related.state().bytes());
+            map.insert(id, Some(state));
+        }
+        Ok(RelatedContracts::from(map))
     }
 }
 
@@ -354,6 +371,58 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for UpdateData<'a> {
                     delta: StateDelta::from(delta.as_slice().unwrap()),
                     related_to: ContractInstanceId::from_bytes(related_to.as_slice().unwrap())
                         .unwrap(),
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl<'a> TryFromFbs<&FbsUpdateData<'a>> for UpdateData<'a> {
+    fn try_decode_fbs(update_data: &FbsUpdateData<'a>) -> Result<Self, WsApiError> {
+        match update_data.update_data_type() {
+            UpdateDataType::StateUpdate => {
+                let update = update_data.update_data_as_state_update().unwrap();
+                let state = State::from(update.state().bytes());
+                Ok(UpdateData::State(state))
+            }
+            UpdateDataType::DeltaUpdate => {
+                let update = update_data.update_data_as_delta_update().unwrap();
+                let delta = StateDelta::from(update.delta().bytes());
+                Ok(UpdateData::Delta(delta))
+            }
+            UpdateDataType::StateAndDeltaUpdate => {
+                let update = update_data.update_data_as_state_and_delta_update().unwrap();
+                let state = State::from(update.state().bytes());
+                let delta = StateDelta::from(update.delta().bytes());
+                Ok(UpdateData::StateAndDelta { state, delta })
+            }
+            UpdateDataType::RelatedStateUpdate => {
+                let update = update_data.update_data_as_related_state_update().unwrap();
+                let state = State::from(update.state().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedState { related_to, state })
+            }
+            UpdateDataType::RelatedDeltaUpdate => {
+                let update = update_data.update_data_as_related_delta_update().unwrap();
+                let delta = StateDelta::from(update.delta().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedDelta { related_to, delta })
+            }
+            UpdateDataType::RelatedStateAndDeltaUpdate => {
+                let update = update_data
+                    .update_data_as_related_state_and_delta_update()
+                    .unwrap();
+                let state = State::from(update.state().bytes());
+                let delta = StateDelta::from(update.delta().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedStateAndDelta {
+                    related_to,
+                    state,
+                    delta,
                 })
             }
             _ => unreachable!(),
@@ -952,7 +1021,7 @@ impl ContractInstanceId {
     }
 
     /// Build `ContractId` from the binary representation.
-    fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, bs58::decode::Error> {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, bs58::decode::Error> {
         let mut spec = [0; CONTRACT_KEY_SIZE];
         bs58::decode(bytes)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -1151,6 +1220,17 @@ impl TryFromTsStd<&rmpv::Value> for ContractKey {
         };
 
         Ok(ContractKey::from_id(instance_id).unwrap())
+    }
+}
+
+impl<'a> TryFromFbs<&FbsContractKey<'a>> for ContractKey {
+    fn try_decode_fbs(key: &FbsContractKey<'a>) -> Result<Self, WsApiError> {
+        let instance = ContractInstanceId::from_bytes(key.instance().data().bytes()).unwrap();
+        let code = match key.code() {
+            Some(code_hash) => Some(CodeHash::new(code_hash.bytes())),
+            _ => None,
+        };
+        Ok(ContractKey { instance, code })
     }
 }
 
