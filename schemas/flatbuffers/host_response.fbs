@@ -1,0 +1,130 @@
+include "common.fbs";
+namespace host_response;
+
+table GetResponse {
+  key: common.ContractKey(required);
+  contract: common.ContractContainer(required);
+  state: [ubyte](required);
+}
+
+table PutResponse {
+  key: common.ContractKey(required);
+}
+
+table UpdateNotification {
+  key: common.ContractKey(required);
+  update: common.UpdateData(required);
+}
+
+table UpdateResponse {
+  key: common.ContractKey(required);
+  summary: [ubyte](required);
+}
+
+union ContractResponseType {
+  GetResponse,
+  PutResponse,
+  UpdateNotification,
+  UpdateResponse
+}
+
+table ContractResponse {
+  contract_response: ContractResponseType(required);
+}
+
+// New definitions start here
+
+table DelegateKey {
+    key: [ubyte](required);
+    code_hash: [ubyte](required);
+}
+
+table UserInputRequest {
+    request_id: uint32;
+    message:[ubyte](required);
+    responses:[ClientResponse](required);
+}
+
+// New definitions end here
+
+table ApplicationMessage {
+    app: common.ContractInstanceId(required);
+    payload: [ubyte](required);
+    delegate_context: [ubyte](required);
+    processed: bool;
+}
+
+table ClientResponse {
+    data: [ubyte];
+}
+
+table RequestUserInput {
+    request_id: uint32;
+    message:[ubyte];
+    responses:[ClientResponse](required);
+}
+
+table ContextUpdated {
+    context: [ubyte](required);
+}
+
+table GetSecretRequest {
+    key: common.SecretsId(required);
+    delegate_context: [ubyte](required);
+    processed: bool;
+}
+
+table SetSecretRequest {
+    key: common.SecretsId(required);
+    value: [ubyte](required);
+}
+
+table RandomBytesRequest {
+    data: uint;
+}
+
+table GetSecretResponse {
+    key: common.SecretsId(required);
+    value: [ubyte](required);
+    delegate_context: [ubyte](required);
+}
+
+union OutboundDelegateMsgType {
+    ApplicationMessage,
+    RequestUserInput,
+    ContextUpdated,
+    GetSecretRequest,
+    SetSecretRequest,
+    RandomBytesRequest,
+    GetSecretResponse,
+}
+
+table OutboundDelegateMsg {
+    inbound: OutboundDelegateMsgType(required);
+}
+
+table DelegateResponse {
+  key: DelegateKey(required);
+  values: [OutboundDelegateMsg](required);
+}
+
+table GenerateRandData {
+  wrapped_state: [ubyte](required);
+}
+
+table Ok {
+  msg:string(required);
+}
+
+union HostResponseType {
+  ContractResponse,
+  DelegateResponse,
+  GenerateRandData,
+  Ok
+}
+
+table HostResponse {
+  response:HostResponseType(required);
+}
+
+root_type HostResponse;

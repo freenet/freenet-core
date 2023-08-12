@@ -11,7 +11,15 @@ use blake3::{traits::digest::Digest, Hasher as Blake3};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::prelude::ContractInstanceId;
+use crate::client_request_generated::client_request::{
+    DelegateKey as FbsDelegateKey, InboundDelegateMsg as FbsInboundDelegateMsg,
+    InboundDelegateMsgType,
+};
+
+use crate::common_generated::common::SecretsId as FbsSecretsId;
+
+use crate::client_api::{TryFromFbs, WsApiError};
+use crate::prelude::{ContractInstanceId, CONTRACT_KEY_SIZE};
 use crate::{code_hash::CodeHash, prelude::Parameters};
 
 const DELEGATE_HASH_LENGTH: usize = 32;
@@ -213,6 +221,10 @@ impl DelegateKey {
         &self.code_hash
     }
 
+    pub fn bytes(&self) -> &[u8] {
+        self.key.as_ref()
+    }
+
     pub fn from_params(
         code_hash: impl Into<String>,
         parameters: &Parameters,
@@ -263,6 +275,17 @@ where
 impl Display for DelegateKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.encode())
+    }
+}
+
+impl<'a> TryFromFbs<&FbsDelegateKey<'a>> for DelegateKey {
+    fn try_decode_fbs(key: &FbsDelegateKey<'a>) -> Result<Self, WsApiError> {
+        let mut key_bytes = [0; DELEGATE_HASH_LENGTH];
+        key_bytes.copy_from_slice(key.key().bytes().iter().as_ref());
+        Ok(DelegateKey {
+            key: key_bytes,
+            code_hash: CodeHash::new(key.code_hash().bytes()),
+        })
     }
 }
 
@@ -320,11 +343,25 @@ impl SecretsId {
     pub fn hash(&self) -> &[u8; 32] {
         &self.hash
     }
+    pub fn key(&self) -> &[u8] {
+        self.key.as_slice()
+    }
 }
 
 impl Display for SecretsId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.encode())
+    }
+}
+
+impl<'a> TryFromFbs<&FbsSecretsId<'a>> for SecretsId {
+    fn try_decode_fbs(key: &FbsSecretsId<'a>) -> Result<Self, WsApiError> {
+        let mut key_hash = [0; 32];
+        key_hash.copy_from_slice(key.hash().bytes().iter().as_ref());
+        Ok(SecretsId {
+            key: key.key().bytes().to_vec(),
+            hash: key_hash,
+        })
     }
 }
 
@@ -438,6 +475,66 @@ impl From<GetSecretRequest> for InboundDelegateMsg<'_> {
 impl From<ApplicationMessage> for InboundDelegateMsg<'_> {
     fn from(value: ApplicationMessage) -> Self {
         Self::ApplicationMessage(value)
+    }
+}
+
+impl<'a> TryFromFbs<&FbsInboundDelegateMsg<'a>> for InboundDelegateMsg<'a> {
+    fn try_decode_fbs(msg: &FbsInboundDelegateMsg<'a>) -> Result<Self, WsApiError> {
+        match msg.inbound_type() {
+            InboundDelegateMsgType::ApplicationMessage => {
+                let app_msg = msg.inbound_as_application_message().unwrap();
+                let mut instance_key_bytes = [0; CONTRACT_KEY_SIZE];
+                instance_key_bytes
+                    .copy_from_slice(app_msg.app().data().bytes().to_vec().as_slice());
+                let app_msg = ApplicationMessage {
+                    app: ContractInstanceId::new(instance_key_bytes),
+                    payload: app_msg.payload().bytes().to_vec(),
+                    context: DelegateContext::new(app_msg.context().bytes().to_vec()),
+                    processed: app_msg.processed(),
+                };
+                Ok(InboundDelegateMsg::ApplicationMessage(app_msg))
+            }
+            InboundDelegateMsgType::GetSecretResponse => {
+                let get_secret = msg.inbound_as_get_secret_response().unwrap();
+                let get_secret = GetSecretResponse {
+                    key: SecretsId::try_decode_fbs(&get_secret.key())?,
+                    value: if let Some(value) = get_secret.value() {
+                        Some(value.bytes().to_vec())
+                    } else {
+                        None
+                    },
+                    context: DelegateContext::new(get_secret.context().bytes().to_vec()),
+                };
+                Ok(InboundDelegateMsg::GetSecretResponse(get_secret))
+            }
+            InboundDelegateMsgType::RandomBytes => {
+                let random_bytes = msg.inbound_as_random_bytes().unwrap();
+                Ok(InboundDelegateMsg::RandomBytes(
+                    random_bytes.data().bytes().to_vec(),
+                ))
+            }
+            InboundDelegateMsgType::UserInputResponse => {
+                let user_response = msg.inbound_as_user_input_response().unwrap();
+                let user_response = UserInputResponse {
+                    request_id: user_response.request_id(),
+                    response: ClientResponse::new(user_response.response().data().bytes().to_vec()),
+                    context: DelegateContext::new(
+                        user_response.delegate_context().bytes().to_vec(),
+                    ),
+                };
+                Ok(InboundDelegateMsg::UserResponse(user_response))
+            }
+            InboundDelegateMsgType::GetSecretRequest => {
+                let get_secret = msg.inbound_as_get_secret_request().unwrap();
+                let get_secret = GetSecretRequest {
+                    key: SecretsId::try_decode_fbs(&get_secret.key())?,
+                    context: DelegateContext::new(get_secret.delegate_context().bytes().to_vec()),
+                    processed: get_secret.processed(),
+                };
+                Ok(InboundDelegateMsg::GetSecretRequest(get_secret))
+            }
+            _ => unreachable!("invalid inbound delegate message type"),
+        }
     }
 }
 
@@ -618,6 +715,9 @@ impl NotificationMessage<'_> {
     pub fn into_owned(self) -> NotificationMessage<'static> {
         NotificationMessage(self.0.into_owned().into())
     }
+    pub fn bytes(&self) -> &[u8] {
+        &self.0.as_ref()
+    }
 }
 
 #[serde_as]
@@ -642,6 +742,9 @@ impl ClientResponse<'_> {
     }
     pub fn into_owned(self) -> ClientResponse<'static> {
         ClientResponse(self.0.into_owned().into())
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.0.as_ref()
     }
 }
 

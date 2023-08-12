@@ -8,9 +8,14 @@ use axum::{Extension, Router};
 use locutus_core::*;
 use locutus_runtime::ContractKey;
 use locutus_stdlib::client_api::{
-    ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
-    TryFromTsStd,
+    ClientError, ClientRequest, ContractRequest, ContractResponse, DelegateRequest, ErrorKind,
+    HostResponse, TryFromFbs, TryFromTsStd,
 };
+use locutus_stdlib::client_request_generated::client_request::{
+    root_as_client_request, ClientRequest as FbsClientRequest,
+    DelegateRequest as FbsDelegateRequest, *,
+};
+
 use std::collections::VecDeque;
 use std::{
     collections::HashMap,
@@ -228,11 +233,43 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
 
-    let req: Result<ClientRequest<'_>, _> = bincode::deserialize(&msg);
-    let req: ClientRequest = match req {
-        Ok(client_request) => client_request.into_owned(),
-        Err(error) => {
-            tracing::error!(%error, "error decoding request json");
+    // Try to deserialize the ClientRequest message
+    let req = {
+        if let Ok(client_request) = bincode::deserialize::<ClientRequest<'_>>(&msg) {
+            client_request
+        } else if let Ok(client_request) = root_as_client_request(&msg) {
+            match client_request.client_request_type() {
+                ClientRequestType::ContractRequest => {
+                    let contract_request =
+                        client_request.client_request_as_contract_request().unwrap();
+                    ContractRequest::try_decode_fbs(&contract_request)?.into()
+                }
+                ClientRequestType::DelegateRequest => {
+                    let delegate_request =
+                        client_request.client_request_as_delegate_request().unwrap();
+                    DelegateRequest::try_decode_fbs(&delegate_request)?.into()
+                }
+                ClientRequestType::GenerateRandData => {
+                    let delegate_request = client_request
+                        .client_request_as_generate_rand_data()
+                        .unwrap();
+                    ClientRequest::GenerateRandData {
+                        bytes: delegate_request.data() as usize,
+                    }
+                    .into()
+                }
+                ClientRequestType::Disconnect => {
+                    let delegate_request = client_request.client_request_as_disconnect().unwrap();
+                    let cause = if let Some(cuase_msg) = delegate_request.cause() {
+                        Some(cuase_msg.to_string())
+                    } else {
+                        None
+                    };
+                    ClientRequest::Disconnect { cause }.into()
+                }
+                _ => unreachable!(),
+            }
+        } else {
             match ContractRequest::try_decode(&msg) {
                 Ok(r) => r.to_owned().into(),
                 Err(e) => {

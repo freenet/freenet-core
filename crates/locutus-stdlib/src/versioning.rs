@@ -8,8 +8,13 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
-use crate::client_api::{TryFromTsStd, WsApiError};
+use crate::client_api::{TryFromFbs, TryFromTsStd, WsApiError};
+use crate::client_request_generated::client_request::{
+    DelegateContainer as FbsDelegateContainer, DelegateType,
+};
+use crate::common_generated::common::{ContractContainer as FbsContractContainer, ContractType};
 use crate::parameters::Parameters;
+use crate::prelude::ContractWasmAPIVersion::V1;
 use crate::prelude::{CodeHash, Delegate, DelegateCode, DelegateKey, WrappedContract};
 use crate::{contract_interface::ContractKey, prelude::ContractCode};
 
@@ -103,6 +108,23 @@ where
                     delegate,
                 )))
             }
+        }
+    }
+}
+
+impl<'a> TryFromFbs<&FbsDelegateContainer<'a>> for DelegateContainer {
+    fn try_decode_fbs(container: &FbsDelegateContainer<'a>) -> Result<Self, WsApiError> {
+        match container.delegate_type() {
+            DelegateType::WasmDelegateV1 => {
+                let delegate = container.delegate_as_wasm_delegate_v1().unwrap();
+                let data = DelegateCode::from(delegate.data().data().bytes().to_vec());
+                let params = Parameters::from(delegate.parameters().bytes().to_vec());
+                let r = Ok(DelegateContainer::from(DelegateContainer::Wasm(
+                    DelegateWasmAPIVersion::V1(Delegate::from((&data, &params))),
+                )));
+                r
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -409,6 +431,26 @@ impl TryFromTsStd<&rmpv::Value> for ContractContainer {
                 Ok(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                     contract,
                 )))
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl<'a> TryFromFbs<&FbsContractContainer<'a>> for ContractContainer {
+    fn try_decode_fbs(value: &FbsContractContainer<'a>) -> Result<Self, WsApiError> {
+        match value.contract_type() {
+            ContractType::WasmContractV1 => {
+                let contract = value.contract_as_wasm_contract_v1().unwrap();
+                let data = Arc::new(ContractCode::from(contract.data().data().bytes().to_vec()));
+                let params = Parameters::from(contract.parameters().bytes().to_vec());
+                let key = ContractKey::from((&params, &*data));
+                let r = Ok(ContractContainer::from(V1(WrappedContract {
+                    data,
+                    params,
+                    key,
+                })));
+                r
             }
             _ => unreachable!(),
         }
