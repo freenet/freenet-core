@@ -1,12 +1,16 @@
-import { decode, Encoder } from "@msgpack/msgpack";
+import flatbuffers from 'flatbuffers';
 import base58 from "bs58";
 
-const GLOBAL = {
-  MAX_U8: 255,
-  MIN_U8: 0,
-};
-
-// base interface types:
+import {client_request, common} from "./client_request";
+import {host_response} from "./host_response";
+import {ContractContainerT} from "./common/contract-container";
+import {ContractInstanceIdT} from "./common/contract-instance-id";
+import {DeltaUpdateT} from "./common/delta-update";
+import {RelatedDeltaUpdateT} from "./common/related-delta-update";
+import {RelatedStateAndDeltaUpdateT} from "./common/related-state-and-delta-update";
+import {RelatedStateUpdateT} from "./common/related-state-update";
+import {StateAndDeltaUpdateT} from "./common/state-and-delta-update";
+import {StateUpdateT} from "./common/state-update";
 
 /**
  * The id of a live instance of a contract. This is effectively the tuple
@@ -16,170 +20,176 @@ const GLOBAL = {
  */
 export type ContractInstanceId = Uint8Array;
 
-/**
- * The key representing the tuple of a contract code and a set of parameters.
- * See {@link ContractInstanceId} for more information.
- * @public
- */
-export class Key {
-  private instance: ContractInstanceId;
-  private code: Uint8Array | null;
-
-  /**
-   * @constructor
-   * @param {ContractInstanceId} instance
-   * @param {Uint8Array} [code]
-   */
-  constructor(instance: ContractInstanceId, code?: Uint8Array) {
-    if (
-      instance.length != 32 ||
-      (typeof code != "undefined" && code.length != 32)
-    ) {
-      throw TypeError(
-        "invalid array lenth (expected 32 bytes): " + instance.length
-      );
-    }
-    this.instance = instance;
-    if (typeof code == "undefined") {
-      this.code = null;
-    } else {
-      this.code = code;
-    }
-  }
-
-  /**
-   * Generates key from base58 key spec representation
-   * @example
-   * Here's a simple example:
-   * ```
-   * const MODEL_CONTRACT = "DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1";
-   * const KEY = Key.fromSpec(MODEL_CONTRACT);
-   * ```
-   * @param spec - Base58 string representation of the key
-   * @returns The key representation from given spec
-   * @constructor
-   */
-  static fromInstanceId(spec: string): Key {
-    let encoded = base58.decode(spec);
-    return new Key(encoded);
-  }
-
-  /**
-   * @returns {ContractInstanceId} Hash of the full key specification (contract code + parameter).
-   */
-  bytes(): ContractInstanceId {
-    return this.instance;
-  }
-
-  /**
-   * @returns {Uint8Array | null} Hash of the contract code part of the full specification, if is available.
-   */
-  codePart(): Uint8Array | null {
-    return this.code;
-  }
-
-  /**
-   * Generates the full key specification (contract code + parameter) encoded as base58 string.
-   *
-   * @returns {string} The encoded string representation.
-   */
-  encode(): string {
-    return base58.encode(this.instance);
-  }
-}
-
-/**
- * A contract and its key. It includes the contract data/code and the parameters run along with it.
- * @public
- */
-export type ContractV1 = {
-  key: Key;
-  data: Uint8Array;
-  parameters: Uint8Array;
-  version: String;
-};
-
-/**
- * Representation of a contract state
- * @public
- */
-export type State = Uint8Array;
-
-/**
- * Representation of a contract state changes summary
- * @public
- */
-export type StateSummary = Uint8Array;
-
-/**
- * State delta representation
- * @public
- */
-export type StateDelta = Uint8Array;
-
-/** Update data from a notification for a contract which the client subscribed to.
- * It can be either the main contract or any related contracts to that main contract.
- * @public
- */
-export type UpdateData =
-  | { state: State }
-  | { delta: StateDelta }
-  | { state: State; delta: StateDelta }
-  | { relatedTo: ContractInstanceId; state: State }
-  | { relatedTo: ContractInstanceId; delta: StateDelta }
-  | { relatedTo: ContractInstanceId; state: State; delta: StateDelta };
-
-/**
- * A map of contract id's to their respective states in case this have
- * been successfully retrieved from the network.
- */
-export type RelatedContracts = Map<ContractInstanceId, State | null>;
-
-// ops:
 
 /**
  * Representation of the client put request operation
  * @public
  */
-export type PutRequest = {
-  container: ContractContainer;
-  state: State;
-  relatedContracts: RelatedContracts;
-};
+export class PutRequest extends client_request.PutT {
+    constructor(container: ContractContainerT | null = null,
+                wrappedState: (number)[] = [],
+                relatedContracts: client_request.RelatedContractsT | null = null) {
+        super(container, wrappedState, relatedContracts);
+    }
+}
 
 /**
  * Representation of the client update request operation
  * @public
  */
-export type UpdateRequest = {
-  key: Key;
-  data: UpdateData;
-};
+export class UpdateRequest extends client_request.UpdateT {
+    constructor(key: Key | null = null, update: common.UpdateDataT | null = null) {
+        const contract_key = key?.get_contract_key().unpack();
+        super(contract_key, update);
+    }
+}
 
 /**
  * Representation of the client get request operation
  * @public
  */
-export type GetRequest = {
-  key: Key;
-  fetchContract: boolean;
-};
+export class GetRequest extends client_request.GetT {
+    constructor(key: Key | null = null, fetchContract: boolean = false) {
+        const contract_key = key?.get_contract_key().unpack();
+        super(contract_key, fetchContract);
+    }
+}
 
 /**
  * Representation of the client subscribe request operation
  * @public
  */
-export type SubscribeRequest = {
-  key: Key;
-};
+export class SubscribeRequest extends client_request.SubscribeT {
+    constructor(key: Key | null = null, summary: (number)[] = []) {
+        const contract_key = key?.get_contract_key().unpack();
+        super(contract_key, summary);
+    }
+}
 
 /**
  * Representation of the client disconnect request operation
  * @public
  */
-export type DisconnectRequest = {
-  cause?: string;
-};
+export class DisconnectRequest extends client_request.DisconnectT {
+    constructor(cause: string | Uint8Array | null = null) {
+        super(cause);
+    }
+}
+
+export class UpdateData extends common.UpdateDataT {
+    constructor(updateDataType: common.UpdateDataType = common.UpdateDataType.NONE,
+                updateData: DeltaUpdateT | RelatedDeltaUpdateT | RelatedStateAndDeltaUpdateT | RelatedStateUpdateT
+                    | StateAndDeltaUpdateT | StateUpdateT | null = null) {
+        super(updateDataType, updateData);
+    }
+}
+
+/**
+ * Representation of the state update data
+ * @public
+ */
+export class StateUpdate extends common.StateUpdateT {
+    constructor(state: (number)[] = []) {
+        super(state);
+    }
+}
+
+/**
+ * Representation of the delta update data
+ * @public
+ */
+export class DeltaUpdate extends common.DeltaUpdateT {
+    constructor(delta: (number)[] = []) {
+        super(delta);
+    }
+}
+
+/**
+ * Representation of the state and delta update data
+ * @public
+ */
+export class StateAndDeltaUpdate extends common.StateAndDeltaUpdateT {
+    constructor(state: (number)[] = [], delta: (number)[] = []) {
+        super(state, delta);
+    }
+}
+
+/**
+ * Representation of the related state update data
+ * @public
+ */
+export class RelatedStateUpdate extends common.RelatedStateUpdateT {
+    constructor(relatedTo: ContractInstanceIdT | null = null, state: (number)[] = []) {
+        super(relatedTo, state);
+    }
+}
+
+/**
+ * Representation of the related delta update data
+ * @public
+ */
+export class RelatedDeltaUpdate extends common.RelatedDeltaUpdateT {
+    constructor(relatedTo: ContractInstanceIdT | null = null, delta: (number)[] = []) {
+        super(relatedTo, delta);
+    }
+}
+
+/**
+ * Representation of the related state and delta update data
+ * @public
+ */
+export class RelatedStateAndDeltaUpdate extends common.RelatedStateAndDeltaUpdateT {
+    constructor(relatedTo: ContractInstanceIdT | null = null, state: (number)[] = [], delta: (number)[] = []) {
+        super(relatedTo, state, delta);
+    }
+}
+
+
+export class Key {
+    private builder = new flatbuffers.Builder(1024);
+    private key: common.ContractKey;
+
+    constructor(instance: ContractInstanceId, code?: Uint8Array) {
+        if (instance.length !== 32 || (code && code.length !== 32)) {
+            throw new TypeError('Invalid array length, expected 32 bytes');
+        }
+
+        const instanceOffset = common.ContractInstanceId.createDataVector(this.builder, instance);
+        const instanceEndOffset = common.ContractInstanceId.createContractInstanceId(this.builder, instanceOffset);
+        common.ContractKey.startContractKey(this.builder);
+        common.ContractKey.addInstance(this.builder, instanceEndOffset);
+        if (code) {
+            const codeOffset = common.ContractKey.createCodeVector(this.builder, code);
+            common.ContractKey.addCode(this.builder, codeOffset);
+        }
+        const keyOffset = common.ContractKey.endContractKey(this.builder);
+        this.builder.finish(keyOffset);
+        this.key = common.ContractKey.getRootAsContractKey(this.builder.dataBuffer());
+    }
+
+    static fromInstanceId(spec: string): Key {
+        const decoded = base58.decode(spec);
+        return new Key(decoded);
+    }
+
+    bytes(): ContractInstanceId {
+        return this.key.instance()?.dataArray()!;
+    }
+
+    codePart(): Uint8Array | null {
+        return this.key.codeArray();
+    }
+
+    encode(): string {
+        const instance = this.key.instance()?.dataArray()!;
+        return base58.encode(instance);
+    }
+
+    get_contract_key(): common.ContractKey {
+        return this.key;
+    }
+}
+
 
 // API
 
@@ -202,30 +212,30 @@ export type DisconnectRequest = {
  * @public
  */
 export interface ResponseHandler {
-  /**
-   * `Put` response handler
-   */
-  onPut: (response: PutResponse) => void;
-  /**
-   * `Get` response handler
-   */
-  onGet: (response: GetResponse) => void;
-  /**
-   * `Update` response handler
-   */
-  onUpdate: (response: UpdateResponse) => void;
-  /**
-   * `Update` notification handler
-   */
-  onUpdateNotification: (response: UpdateNotification) => void;
-  /**
-   * `Error` handler
-   */
-  onErr: (response: HostError) => void;
-  /**
-   * Callback executed after successfully establishing connection with websocket
-   */
-  onOpen: () => void;
+    /**
+     * `Put` response handler
+     */
+    onPut: (response: host_response.PutResponseT) => void;
+    /**
+     * `Get` response handler
+     */
+    onGet: (response: host_response.GetResponseT) => void;
+    /**
+     * `Update` response handler
+     */
+    onUpdate: (response: host_response.UpdateResponseT) => void;
+    /**
+     * `Update` notification handler
+     */
+    onUpdateNotification: (response: host_response.UpdateNotificationT) => void;
+    /**
+     * `Error` handler
+     */
+    onErr: (response: HostError) => void;
+    /**
+     * Callback executed after successfully establishing connection with websocket
+     */
+    onOpen: () => void;
 }
 
 /**
@@ -238,473 +248,183 @@ export interface ResponseHandler {
  * ```
  */
 export class LocutusWsApi {
-  /**
-   * Websocket object for creating and managing a WebSocket connection to a server,
-   * as well as for sending and receiving data on the connection.
-   * @private
-   */
-  private ws: WebSocket;
-  /**
-   * @private
-   */
-  private encoder: Encoder;
-  /**
-   * @private
-   */
-  private reponseHandler: ResponseHandler;
+    /**
+     * Websocket object for creating and managing a WebSocket connection to a server,
+     * as well as for sending and receiving data on the connection.
+     * @private
+     */
+    private ws: WebSocket;
+    /**
+     * @private
+     */
+    private reponseHandler: ResponseHandler;
 
-  /**
-   * @constructor
-   * @param url - The websocket URL to which to connect
-   * @param handler - The ResponseHandler implementation
-   */
-  constructor(url: URL, handler: ResponseHandler) {
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = "arraybuffer";
-    this.encoder = new Encoder();
-    this.reponseHandler = handler;
-    this.ws.onmessage = (ev) => {
-      this.handleResponse(ev);
-    };
-    this.ws.addEventListener("open", (_) => {
-      handler.onOpen();
-    });
-  }
-
-  /**
-   * @private
-   */
-  private handleResponse(ev: MessageEvent<any>): void | Error {
-    let response;
-    try {
-      let data = new Uint8Array(ev.data);
-      response = new HostResponse(data);
-    } catch (err) {
-      console.log(`found error: ${err}`);
-      return new Error(`${err}`);
+    /**
+     * @constructor
+     * @param url - The websocket URL to which to connect
+     * @param handler - The ResponseHandler implementation
+     */
+    constructor(url: URL, handler: ResponseHandler) {
+        this.ws = new WebSocket(url);
+        this.ws.binaryType = "arraybuffer";
+        this.reponseHandler = handler;
+        this.ws.onmessage = (ev) => {
+            this.handleResponse(ev);
+        };
+        this.ws.addEventListener("open", (_) => {
+            handler.onOpen();
+        });
     }
-    if (response.isOk()) {
-      switch (response.unwrapOk().kind) {
-        case "put":
-          this.reponseHandler.onPut(response.unwrapPut());
-        case "get":
-          this.reponseHandler.onGet(response.unwrapGet());
-        case "update":
-          this.reponseHandler.onUpdate(response.unwrapUpdate());
-        case "updateNotification":
-          this.reponseHandler.onUpdateNotification(
-            response.unwrapUpdateNotification()
-          );
-      }
-    } else {
-      this.reponseHandler.onErr(response.unwrapErr());
+
+    /**
+     * @private
+     */
+    private handleResponse(ev: MessageEvent<any>): void | Error {
+        let response: host_response.HostResponseT;
+        try {
+            let data = new flatbuffers.ByteBuffer(ev.data);
+            response = new host_response.HostResponseT();
+            host_response.HostResponse.getRootAsHostResponse(data).unpackTo(response);
+        } catch (err) {
+            console.log(`found error: ${err}`);
+            return new Error(`${err}`);
+        }
+        switch (response.responseType) {
+            case host_response.HostResponseType.ContractResponse:
+                let host_resp = response.response as host_response.ContractResponseT;
+                switch (host_resp.contractResponseType) {
+                    case host_response.ContractResponseType.PutResponse:
+                        const put_response = host_resp.contractResponse as host_response.PutResponseT;
+                        this.reponseHandler.onPut(put_response);
+                        break;
+                    case host_response.ContractResponseType.GetResponse:
+                        const get_response = host_resp.contractResponse as host_response.GetResponseT;
+                        this.reponseHandler.onGet(get_response);
+                        break;
+                    case host_response.ContractResponseType.UpdateResponse:
+                        const update_response = host_resp.contractResponse as host_response.UpdateResponseT;
+                        this.reponseHandler.onUpdate(update_response);
+                        break;
+                    case host_response.ContractResponseType.UpdateNotification:
+                        const update_notification = host_resp.contractResponse as host_response.UpdateNotificationT;
+                        this.reponseHandler.onUpdateNotification(update_notification);
+                        break;
+                    default:
+                        const cause = `Contract response type not implemented`;
+                        console.log(cause);
+                        const err: HostError = {
+                            cause,
+                        }
+                        this.reponseHandler.onErr(err);
+                        break;
+
+                }
+                break;
+            case host_response.HostResponseType.DelegateResponse:
+                console.log(`Delegate response handler not implemented`);
+                break;
+            case host_response.HostResponseType.GenerateRandData:
+                console.log(`GenerateRandData response handler not implemented`);
+                break;
+            case host_response.HostResponseType.Ok:
+                console.log(`not implemented`);
+                break;
+            case host_response.HostResponseType.NONE:
+                console.log(`response error`);
+                break;
+            default:
+                const cause = `HostResponse type not implemented`;
+                console.log(cause);
+                const err: HostError = {
+                    cause,
+                }
+                this.reponseHandler.onErr(err);
+                break;
+        }
     }
-  }
 
-  /**
-   * Sends a put request to the host through websocket
-   * @param put - The `PutRequest` object
-   */
-  async put(put: PutRequest): Promise<void> {
-    let encoded = this.encoder.encode(put);
-    this.ws.send(encoded);
-  }
+    /**
+     * Sends a put request to the host through websocket
+     * @param put - The `PutRequest` object
+     */
+    async put(put: PutRequest): Promise<void> {
+        let fbb = new flatbuffers.Builder(1024);
+        client_request.ClientRequest.finishClientRequestBuffer(fbb, put.pack(fbb));
+        this.ws.send(fbb.asUint8Array());
+    }
 
-  /**
-   * Sends an update request to the host through websocket
-   * @param update - The `UpdateRequest` object
-   */
-  async update(update: UpdateRequest): Promise<void> {
-    let encoded = this.encoder.encode(update);
-    this.ws.send(encoded);
-  }
+    /**
+     * Sends an update request to the host through websocket
+     * @param update - The `UpdateRequest` object
+     */
+    async update(update: UpdateRequest): Promise<void> {
+        let fbb = new flatbuffers.Builder(1024);
+        client_request.ClientRequest.finishClientRequestBuffer(fbb, update.pack(fbb));
+        this.ws.send(fbb.asUint8Array());
+    }
 
-  /**
-   * Sends a get request to the host through websocket
-   * @param get - The `GetRequest` object
-   */
-  async get(get: GetRequest): Promise<void> {
-    let encoded = this.encoder.encode(get);
-    this.ws.send(encoded);
-  }
+    /**
+     * Sends a get request to the host through websocket
+     * @param get - The `GetRequest` object
+     */
+    async get(get: GetRequest): Promise<void> {
+        let fbb = new flatbuffers.Builder(1024);
+        client_request.ClientRequest.finishClientRequestBuffer(fbb, get.pack(fbb));
+        this.ws.send(fbb.asUint8Array());
+    }
 
-  /**
-   * Sends a subscribe request to the host through websocket
-   * @param subscribe - The `SubscribeRequest` object
-   */
-  async subscribe(subscribe: SubscribeRequest): Promise<void> {
-    let encoded = this.encoder.encode(subscribe);
-    this.ws.send(encoded);
-  }
+    /**
+     * Sends a subscribe request to the host through websocket
+     * @param subscribe - The `SubscribeRequest` object
+     */
+    async subscribe(subscribe: SubscribeRequest): Promise<void> {
+        let fbb = new flatbuffers.Builder(1024);
+        client_request.ClientRequest.finishClientRequestBuffer(fbb, subscribe.pack(fbb));
+        this.ws.send(fbb.asUint8Array());
+    }
 
-  /**
-   * Sends an disconnect notification to the host through websocket
-   * @param disconnect - The `DisconnectRequest` object
-   */
-  async disconnect(disconnect: DisconnectRequest): Promise<void> {
-    let encoded = this.encoder.encode(disconnect);
-    this.ws.send(encoded);
-    this.ws.close();
-  }
+    /**
+     * Sends an disconnect notification to the host through websocket
+     * @param disconnect - The `DisconnectRequest` object
+     */
+    async disconnect(disconnect: DisconnectRequest): Promise<void> {
+        let fbb = new flatbuffers.Builder(1024);
+        client_request.ClientRequest.finishClientRequestBuffer(fbb, disconnect.pack(fbb));
+        this.ws.send(fbb.asUint8Array());
+        this.ws.close();
+    }
 }
 
 // host replies:
 
 /**
- * Host response types
+ * The response for a contract put operation
  * @public
  */
-export type Ok =
-  | PutResponse
-  | UpdateResponse
-  | GetResponse
-  | UpdateNotification;
+export type PutResponse = host_response.PutResponseT;
+
+/**
+ * The response for a contract get operation
+ * @public
+ */
+export type GetResponse = host_response.GetResponseT;
+
+/**
+ * The response for a contract update operation
+ * @public
+ */
+export type UpdateResponse = host_response.UpdateResponseT;
+
+/**
+ * The response for a contract update notification
+ * @public
+ */
+export type UpdateNotification = host_response.UpdateNotificationT;
 
 /**
  * Host reponse error type
  * @public
  */
 export type HostError = {
-  cause: string;
+    cause: string;
 };
-
-/**
- * The response for a contract put operation
- * @public
- */
-export interface PutResponse {
-  readonly kind: "put";
-  key: Key;
-}
-
-/**
- * The response for a contract update operation
- * @public
- */
-export interface UpdateResponse {
-  readonly kind: "update";
-  key: Key;
-  summary: StateSummary;
-}
-
-/**
- * The response for a contract get operation
- * @public
- */
-export interface GetResponse {
-  readonly kind: "get";
-  contract?: ContractV1;
-  state: State;
-}
-
-/**
- * The response for a state update notification
- * @public
- */
-export interface UpdateNotification {
-  readonly kind: "updateNotification";
-  key: Key;
-  update: UpdateData;
-}
-
-/**
- * Check that the condition is met
- * @param condition - Condition to check
- * @param [msg] - Error message
- * @public
- */
-function assert(condition: boolean, msg?: string) {
-  if (!condition) throw new TypeError(msg);
-}
-
-/**
- * A typed response from the host HTTP gateway to requests made via the API.
- *
- * @public
- */
-export class HostResponse {
-  /**
-   * @private
-   */
-  private result: Ok | HostError;
-
-  /**
-   * Builds the response from the bytes received via the websocket interface.
-   * @param bytes - Response data
-   * @returns The corresponding response type result
-   * @constructor
-   */
-  constructor(bytes: Uint8Array) {
-    let decoded = decode(bytes) as object;
-    if ("Ok" in decoded) {
-      let ok = decoded as { Ok: any };
-      if ("ContractResponse" in ok.Ok) {
-        let response = ok.Ok as { ContractResponse: any };
-        if ("PutResponse" in response.ContractResponse) {
-          response.ContractResponse as { PutResponse: any };
-          assert(Array.isArray(response.ContractResponse.PutResponse));
-          let key = HostResponse.assertKey(
-            response.ContractResponse.PutResponse[0][0]
-          );
-          this.result = { kind: "put", key };
-          return;
-        } else if ("UpdateResponse" in response.ContractResponse) {
-          response.ContractResponse as { UpdateResponse: any };
-          assert(Array.isArray(response.ContractResponse.UpdateResponse));
-          assert(response.ContractResponse.UpdateResponse.length == 2);
-          let key = HostResponse.assertKey(
-            response.ContractResponse.UpdateResponse[0][0]
-          );
-          let summary = HostResponse.assertBytes(
-            response.ContractResponse.UpdateResponse[1]
-          );
-          this.result = { kind: "update", key, summary };
-          return;
-        } else if ("GetResponse" in response.ContractResponse) {
-          response.ContractResponse as { GetResponse: any };
-          assert(Array.isArray(response.ContractResponse.GetResponse));
-          assert(response.ContractResponse.GetResponse.length == 2);
-          let contract;
-          if (response.ContractResponse.GetResponse[0] !== null) {
-            contract = {
-              data: new Uint8Array(
-                response.ContractResponse.GetResponse[0][0][1]
-              ),
-              parameters: new Uint8Array(
-                response.ContractResponse.GetResponse[0][1]
-              ),
-              key: new Key(response.ContractResponse.GetResponse[0][2][0]),
-            };
-          } else {
-            contract = null;
-          }
-          let get = {
-            kind: "get",
-            contract,
-            state: response.ContractResponse.GetResponse[1],
-          };
-          this.result = get as GetResponse;
-          return;
-        } else if ("UpdateNotification" in response.ContractResponse) {
-          response.ContractResponse as { UpdateNotification: any };
-          assert(Array.isArray(response.ContractResponse.UpdateNotification));
-          assert(response.ContractResponse.UpdateNotification.length == 2);
-          let key = HostResponse.assertKey(
-            response.ContractResponse.UpdateNotification[0][0]
-          );
-          let update = HostResponse.getUpdateData(
-            response.ContractResponse.UpdateNotification[1]
-          );
-          this.result = {
-            kind: "updateNotification",
-            key,
-            update,
-          } as UpdateNotification;
-          return;
-        }
-      }
-    } else if ("Err" in decoded) {
-      let err = decoded as { Err: Array<any> };
-      if ("RequestError" in err.Err[0]) {
-        function formatErr(kind: string, err: Array<any>): HostError {
-          let contractKey = new Key(err[0][0]).encode();
-          let cause =
-            `${kind} error for contract ${contractKey}, cause: ` + err[1];
-          return { cause };
-        }
-
-        if (typeof err.Err[0].RequestError === "string") {
-          this.result = { cause: err.Err[0].RequestError };
-          return;
-        }
-        if ("Put" in err.Err[0].RequestError) {
-          let putErr = err.Err[0].RequestError.Put as Array<any>;
-          this.result = formatErr("Put", putErr);
-          return;
-        } else if ("Update" in err.Err[0].RequestError) {
-          let updateErr = err.Err[0].RequestError.Update as Array<any>;
-          this.result = formatErr("Update", updateErr);
-          return;
-        } else if ("Get" in err.Err[0].RequestError) {
-          let getErr = err.Err[0].RequestError.Get as Array<any>;
-          this.result = formatErr("Get", getErr);
-          return;
-        } else if ("Disconnect" in err.Err[0].RequestError) {
-          this.result = { cause: "client disconnected" };
-          return;
-        }
-      }
-    }
-    throw new TypeError("bytes are not a valid HostResponse");
-  }
-
-  /**
-   * Check if the response is ok or an error.
-   * @returns True if contains the expected key otherwise false
-   * @public
-   */
-  isOk(): boolean {
-    if ("kind" in this.result) return true;
-    else return false;
-  }
-
-  /**
-   * Try to get the response content.
-   * @returns The specific response content
-   * @public
-   */
-  unwrapOk(): Ok {
-    if ("kind" in this.result) {
-      return this.result;
-    } else throw new TypeError();
-  }
-
-  /**
-   * Check if the response is an error.
-   * @returns True if is an error otherwise false
-   * @public
-   */
-  isErr(): boolean {
-    if (this.result instanceof Error) return true;
-    else return false;
-  }
-
-  /**
-   * Get the specific error object from the response content
-   * @returns The specific error
-   * @public
-   */
-  unwrapErr(): HostError {
-    if (this.result instanceof Error) return this.result as HostError;
-    else throw new TypeError();
-  }
-
-  /**
-   * Check if is a put response.
-   * @returns True if is a put response otherwise false
-   * @public
-   */
-  isPut(): boolean {
-    return this.isOfType("put");
-  }
-
-  /**
-   * Try to get the response content as a `PutResponse` object
-   * @returns The PutResponse object
-   * @public
-   */
-  unwrapPut(): PutResponse {
-    if (this.isOfType("put")) return this.result as PutResponse;
-    else throw new TypeError();
-  }
-
-  /**
-   * Check if is an update response.
-   * @returns True if is an update response otherwise false
-   * @public
-   */
-  isUpdate(): boolean {
-    return this.isOfType("update");
-  }
-
-  /**
-   * Try to get the response content as an `UpdateResponse` object
-   * @returns The UpdateResponse object
-   * @public
-   */
-  unwrapUpdate(): UpdateResponse {
-    if (this.isOfType("update")) return this.result as UpdateResponse;
-    else throw new TypeError();
-  }
-
-  /**
-   * Check if is a get response.
-   * @returns True if is a get response otherwise false
-   * @public
-   */
-  isGet(): boolean {
-    return this.isOfType("get");
-  }
-
-  /**
-   * Try to get the response content as a GetResponse object
-   * @returns The GetResponse object
-   * @public
-   */
-  unwrapGet(): GetResponse {
-    if (this.isOfType("get")) return this.result as GetResponse;
-    else throw new TypeError();
-  }
-
-  /**
-   * Check if is a update notification response.
-   * @returns True if is a update notification response otherwise false
-   * @public
-   */
-  isUpdateNotification(): boolean {
-    return this.isOfType("updateNotification");
-  }
-
-  /**
-   * Try to get the response content as a UpdateNotification object
-   * @returns The UpdateNotification object
-   * @public
-   */
-  unwrapUpdateNotification(): UpdateNotification {
-    if (this.isOfType("updateNotification"))
-      return this.result as UpdateNotification;
-    else throw new TypeError();
-  }
-
-  /**
-   * @private
-   */
-  private isOfType(ty: string): boolean {
-    return "kind" in this.result && this.result.kind === ty;
-  }
-
-  /**
-   * @private
-   */
-  private static assertKey(key: any): Key {
-    let bytes = HostResponse.assertBytes(key);
-    assert(bytes.length === 32, "expected exactly 32 bytes");
-    return new Key(bytes as Uint8Array);
-  }
-
-  /**
-   * @private
-   */
-  private static assertBytes(state: any): Uint8Array {
-    assert(Array.isArray(state) || ArrayBuffer.isView(state));
-    assert(
-      state.every((value: any) => {
-        if (
-          typeof value === "number" &&
-          value >= GLOBAL.MIN_U8 &&
-          value <= GLOBAL.MAX_U8
-        )
-          return true;
-        else return false;
-      }),
-      "expected an array of bytes"
-    );
-    return state as Uint8Array;
-  }
-
-  private static getUpdateData(update: UpdateData): UpdateData {
-    if ("Delta" in update) {
-      let delta = update["Delta"];
-      return {
-        delta: HostResponse.assertBytes(delta),
-      };
-    } else {
-      throw new TypeError("Invalid update data while building HostResponse");
-    }
-  }
-}
-
-// Versioning:
-type WasmContract = ContractV1;
-
-type ContractContainer = WasmContract;
