@@ -7,9 +7,6 @@
     <img src="https://img.shields.io/crates/v/locutus.svg?style=flat-square"
     alt="Crates.io version" />
   </a>
-  <a href="https://discord.gg/2kZuKNxYXv">
-    <img src="https://img.shields.io/discord/917499817758978089?style=flat-square&label=discord&logo=discord" alt="discord" />
-  </a>
   <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
     <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
