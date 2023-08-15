@@ -93,8 +93,6 @@ pub struct Runtime {
     pub(crate) top_level_imports: Imports,
     /// assigned growable host memory
     pub(crate) host_memory: Option<Memory>,
-    #[cfg(test)]
-    pub(crate) enable_wasi: bool,
 
     pub(crate) secret_store: SecretsStore,
     pub(crate) delegate_store: DelegateStore,
@@ -133,8 +131,6 @@ impl Runtime {
             wasm_store: store,
             top_level_imports,
             host_memory,
-            #[cfg(test)]
-            enable_wasi: false,
 
             secret_store,
             delegate_store,
@@ -254,47 +250,12 @@ impl Runtime {
         Ok(Memory::new(store, MemoryType::new(20u32, None, false))?)
     }
 
-    #[cfg(not(test))]
     fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
         Ok(Instance::new(
             &mut self.wasm_store,
             module,
             &self.top_level_imports,
         )?)
-    }
-
-    #[cfg(test)]
-    // this fn enables WASI env for debuggability
-    fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
-        use wasmer::namespace;
-        use wasmer_wasi::WasiState;
-
-        if !self.enable_wasi {
-            return Ok(Instance::new(
-                &mut self.wasm_store,
-                module,
-                &self.top_level_imports,
-            )?);
-        }
-        let mut wasi_env = WasiState::new("locutus").finalize(&mut self.wasm_store)?;
-        let mut imports = wasi_env.import_object(&mut self.wasm_store, module)?;
-        if let Some(mem) = &self.host_memory {
-            imports.register_namespace("env", namespace!("memory" => mem.clone()));
-        }
-
-        let mut namespaces = HashMap::new();
-        for ((module, name), import) in self.top_level_imports.into_iter() {
-            let namespace: &mut wasmer::Exports = namespaces.entry(module).or_default();
-            namespace.insert(name, import);
-        }
-        for (module, ns) in namespaces {
-            imports.register_namespace(&module, ns);
-        }
-
-        let instance = Instance::new(&mut self.wasm_store, module, &imports)?;
-        wasi_env.initialize(&mut self.wasm_store, &instance)?;
-
-        Ok(instance)
     }
 
     fn instance_store() -> Store {

@@ -68,7 +68,6 @@ tracing-subscriber = { version = "0.3.16", optional = true }
 # internal deps
 locutus-stdlib = { path = "../locutus-stdlib", version = "0.0.3", features = ["net"] }
 locutus-runtime = { path = "../locutus-runtime", version = "0.0.3" }
-
 [dev-dependencies]
 tracing = "0.1"
 arbitrary = { version = "1", features = ["derive"] }

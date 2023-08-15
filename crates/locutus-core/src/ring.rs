@@ -421,10 +421,6 @@ impl Location {
             Distance::new(1.0f64 - d)
         }
     }
-
-    pub fn as_f64(&self) -> f64 {
-        self.0
-    }
 }
 
 /// Ensure at compile time locations can only be constructed from well formed contract keys
