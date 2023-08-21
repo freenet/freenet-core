@@ -201,7 +201,6 @@ pub(super) fn identities(cx: Scope) -> Element {
     fn identity_entry(cx: Scope, alias: Rc<str>, description: String, id: UserId) -> Element {
         let user = use_shared_state::<User>(cx).unwrap();
         let inbox = use_shared_state::<InboxView>(cx).unwrap();
-        let create_alias_form = use_shared_state::<CreateAlias>(cx).unwrap();
 
         cx.render(rsx! {
             div {
@@ -423,13 +422,9 @@ fn get_key(
         match std::fs::read_to_string(key_path) {
             Ok(key_str) => match RsaPrivateKey::from_pkcs1_pem(key_str.as_str()) {
                 Ok(private_key) => Ok(private_key),
-                Err(e) => {
-                    return Err("Failed to generate secret key from file".into());
-                }
+                Err(_e) => Err("Failed to generate secret key from file".into()),
             },
-            Err(e) => {
-                return Err("Failed to read secret key file".into());
-            }
+            Err(_e) => Err("Failed to read secret key file".into()),
         }
     }
 }

@@ -479,15 +479,17 @@ fn user_menu_component(cx: Scope) -> Element {
     let user = use_shared_state::<User>(cx).unwrap();
     let menu_selection = use_shared_state::<menu::MenuSelection>(cx).unwrap();
 
-    let received_class = (menu_selection.read().is_inbox_list()
-        || !menu_selection.read().is_new_msg())
-    .then(|| "is-active")
-    .unwrap_or("");
-    let write_msg_class = menu_selection
-        .read()
-        .is_new_msg()
-        .then(|| "is-active")
-        .unwrap_or("");
+    let received_class =
+        if menu_selection.read().is_inbox_list() || !menu_selection.read().is_new_msg() {
+            "is-active"
+        } else {
+            ""
+        };
+    let write_msg_class = if menu_selection.read().is_new_msg() {
+        "is-active"
+    } else {
+        ""
+    };
 
     cx.render(rsx!(
         div {
@@ -565,7 +567,7 @@ fn inbox_component(cx: Scope) -> Element {
         if let Some((current_model, id)) = all_data.iter().find_map(|ib| {
             crate::log::debug!("trying to get identity for {key}", key = &ib.borrow().key);
             let id = crate::inbox::InboxModel::contract_identity(&ib.borrow().key).unwrap();
-            (id.id == current_active_id).then(|| (ib, id))
+            (id.id == current_active_id).then_some((ib, id))
         }) {
             let inbox = inbox.read();
             let mut emails = inbox.messages.borrow_mut();
