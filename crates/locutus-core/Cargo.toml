@@ -26,7 +26,7 @@ dashmap = "^5.1"
 directories = "5"
 either = { workspace = true , features = ["serde"] }
 futures = "0.3.21"
-libp2p = { version = "0.52.1", features = [
+libp2p = { version = "0.52.2", features = [
     "autonat",
     "deflate",
     "dns",
@@ -55,7 +55,7 @@ rocksdb = { version = "0.21.0", default-features = false, optional = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
 pav_regression = "0.4.0"
 itertools = "0.11"
-ordered-float = "3.6.0"
+ordered-float = "3.9.0"
 
 # Tracing deps
 tower-http = { version = "0.4", features = ["trace"] }
