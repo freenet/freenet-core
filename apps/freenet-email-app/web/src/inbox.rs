@@ -542,7 +542,6 @@ impl InboxModel {
 #[cfg(test)]
 mod tests {
     use locutus_stdlib::prelude::ContractCode;
-    use rsa::pkcs1::DecodeRsaPrivateKey;
 
     use super::*;
 
@@ -565,8 +564,7 @@ mod tests {
 
     #[test]
     fn remove_msg() {
-        const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-        let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
+        let key = RsaPrivateKey::new(&mut OsRng, 32).unwrap();
         let mut inbox = InboxModel::new(key).unwrap();
         for id in 0..10000 {
             inbox.messages.push(MessageModel {

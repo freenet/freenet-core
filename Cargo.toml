@@ -21,8 +21,7 @@ serde_json = "1"
 serde_with = "3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-wasmer = "3"
-wasmer-wasi = "3"
+wasmer = "4.1.1"
 
 [profile.dev.package."*"]
 opt-level = 3

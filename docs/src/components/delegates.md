@@ -7,11 +7,13 @@ Unix "Daemons". They run in the background on your device within the Freenet
 kernel, providing a secure environment for managing private data and performing
 complex tasks.
 
-Delegates interact with various Freenet components, including Contracts, user
-interfaces, and other Delegates. They securely store your private data,
-including cryptographic keys, tokens, and passwords. Acting on your behalf
-within the Freenet network, they execute tasks such as modifying Contracts on
-the user's behalf.
+Delegates interact with various Freenet components, including Contracts, User
+Interfaces, other Delegates, and directly with the user. They securely store
+your private data, including cryptographic keys, tokens, and passwords. 
+
+Acting on your behalf within the Freenet network, Delegates can modify
+Contracts, and ask the user questions directly such as to request permission or
+inform the user of an event.
 
 Delegates are implemented in WebAssembly and comply with the
 [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121)
@@ -21,7 +23,7 @@ trait. They operate directly within the Freenet kernel on your devices.
 
 Delegates utilize a message passing system similar to the [actor
 model](https://en.wikipedia.org/wiki/Actor_model) to interact with Contracts,
-other Delegates, and Applications. 
+other Delegates, and Applications.
 
 The Freenet kernel makes sure that for any incoming message, whether it's from
 another Delegate, a User Interface, or a Contract update, the receiver knows who
