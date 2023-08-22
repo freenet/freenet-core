@@ -138,11 +138,6 @@ mod contract {
                         EmbeddedDeps::default()
                     };
                 build_web_state(&config, embedded, cwd)?
-                // if config.webapp.is_some() {
-                //     build_web_state(&config, embedded, cwd)?
-                // } else {
-                //     build_generic_state(&mut config, cwd)?
-                // }
             }
             ContractType::Standard => build_generic_state(&mut config, cwd)?,
         }
@@ -198,7 +193,6 @@ mod contract {
     pub(crate) enum SupportedWebLangs {
         Javascript,
         Typescript,
-        Rust,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -283,30 +277,6 @@ mod contract {
                     }
                 }
                 Some(SupportedWebLangs::Javascript) => todo!(),
-                Some(SupportedWebLangs::Rust) => {
-                    let cmd_args: &[&str] = &[
-                        "build",
-                        "--target",
-                        "index.html",
-                        "--release",
-                        "--platform",
-                        "web",
-                        "--features",
-                        "use-node",
-                    ];
-                    let child = Command::new("dx")
-                        .args(cmd_args)
-                        .current_dir(cwd)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .map_err(|e| {
-                            eprintln!("Error while executing dx command: {}", e);
-                            Error::CommandFailed("dx")
-                        })?;
-                    pipe_std_streams(child)?;
-                    println!("Compiled input using dx for Rust");
-                }
                 None => {}
             }
         } else {
