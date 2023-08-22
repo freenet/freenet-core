@@ -7,12 +7,12 @@ resolver = "2"
 publish = false
 
 [dependencies]
+byteorder = "1"
 locutus-stdlib = { workspace = true }
+rsa = { version = "0.9.2", default-features = false, features = ["serde", "pem", "sha2"] }
 serde = "1"
 serde_json = "1"
 serde_with = { version = "3", default-features = false, features = ["macros"] }
-ed25519-dalek = { version = "1", features = ["serde", "u32_backend"], default-features = false }
-byteorder = "1"
 
 [lib]
 crate-type = ["cdylib"]
