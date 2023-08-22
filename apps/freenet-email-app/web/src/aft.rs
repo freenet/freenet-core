@@ -3,8 +3,8 @@ use std::{cell::RefCell, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 use locutus_aft_interface::{
-    AllocationCriteria, RequestNewToken, Tier, TokenAllocationRecord, TokenAllocationSummary,
-    TokenAssignment, TokenDelegateMessage, TokenDelegateParameters,
+    AllocationCriteria, DelegateParameters, RequestNewToken, Tier, TokenAllocationRecord,
+    TokenAllocationSummary, TokenAssignment, TokenDelegateMessage, TokenDelegateParameters,
 };
 use locutus_stdlib::client_api::{ContractRequest, DelegateRequest};
 use locutus_stdlib::prelude::UpdateData::{Delta, State as StateUpdate};
@@ -180,7 +180,7 @@ impl AftRecords {
     ) -> Result<DelegateKey, DynError> {
         static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
         let sender_key = generator_id.key.to_public_key();
-        let token_params: Parameters = TokenDelegateParameters::new(sender_key.clone())
+        let token_params: Parameters = DelegateParameters::new(generator_id.clone().key)
             .try_into()
             .map_err(|e| format!("{e}"))
             .unwrap();
