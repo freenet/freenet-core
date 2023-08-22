@@ -19,7 +19,9 @@ endif
 build: \
 	build-tool \
 	generate-id-manager-key \
-	build-inbox 
+	build-inbox \
+	build-webapp \
+	publish-webapp
 
 build-tool:
 	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
@@ -46,8 +48,18 @@ run-node:
 
 run-web:
 	cd $(INBOX_WEB_DIR)
-	trunk build --features use-node --no-default-features
-	trunk serve --features use-node --no-default-features --port 57616
+	dx build --target index.html --platform web --features use-node
+	dx serve --features use-node --port 57616
+
+build-webapp:
+	cd $(INBOX_WEB_DIR)
+	dx build --target index.html --release --platform web --features use-node
+	sed -i 's@/./assets@./assets@g' dist/index.html
+	ldt build
+
+publish-webapp:
+	cd $(INBOX_WEB_DIR)
+	ldt publish --code build/locutus/freenet_email_app_web contract --state build/locutus/contract-state
 
 clean:
 	rm -rf $(CARGO_TARGET_DIR)

@@ -1,0 +1,8 @@
+[contract]
+type = "webapp"
+lang = "rust"
+
+[webapp]
+
+[webapp.state-sources]
+source_dirs = ["dist"]

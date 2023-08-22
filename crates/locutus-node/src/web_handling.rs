@@ -1,7 +1,10 @@
 //! Handle the `web` part of the bundles.
 
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::{
+    http::StatusCode,
+    response::{Html, IntoResponse},
+};
+use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
 use locutus_runtime::{
@@ -25,7 +28,7 @@ const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 pub(crate) async fn contract_home(
     key: String,
     request_sender: mpsc::Sender<ClientConnection>,
-) -> Result<Html<String>, WebSocketApiError> {
+) -> Result<impl IntoResponse, WebSocketApiError> {
     let key = ContractKey::from_id(key)
         .map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
@@ -74,7 +77,7 @@ pub(crate) async fn contract_home(
                 let key = contract.key();
                 let path = contract_web_path(&key);
                 let web_body = match get_web_body(&path).await {
-                    Ok(b) => b,
+                    Ok(b) => b.into_response(),
                     Err(err) => match err {
                         WebSocketApiError::NodeError {
                             error_cause: _cause,
@@ -105,7 +108,7 @@ pub(crate) async fn contract_home(
                                     error_cause: format!("{err}"),
                                 }
                             })?;
-                            Html(index_body)
+                            Html(index_body).into_response()
                         }
                         other => {
                             tracing::error!("{other}");
@@ -150,7 +153,8 @@ pub(crate) async fn contract_home(
 pub async fn variable_content(
     key: String,
     req_path: String,
-) -> Result<Html<String>, Box<WebSocketApiError>> {
+) -> Result<impl IntoResponse, Box<WebSocketApiError>> {
+    // compose the correct absolute path
     let key = ContractKey::from_id(key).map_err(|err| WebSocketApiError::InvalidParam {
         error_cause: format!("{err}"),
     })?;
@@ -161,24 +165,23 @@ pub async fn variable_content(
             error_cause: format!("{err}"),
         })?;
     let file_path = base_path.join(get_file_path(req_uri)?);
-    let mut buf = vec![];
-    File::open(file_path)
+
+    // serve the file
+    let mut serve_file = tower_http::services::fs::ServeFile::new(&file_path);
+    let fake_req = axum::http::Request::new(axum::body::Empty::<Bytes>::new());
+    serve_file
+        .try_call(fake_req)
         .await
-        .map_err(|err| WebSocketApiError::NodeError {
-            error_cause: format!("{err}"),
-        })?
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|err| WebSocketApiError::NodeError {
-            error_cause: format!("{err}"),
-        })?;
-    let body = String::from_utf8(buf).map_err(|err| WebSocketApiError::NodeError {
-        error_cause: format!("{err}"),
-    })?;
-    Ok(Html(body))
+        .map_err(|err| {
+            WebSocketApiError::NodeError {
+                error_cause: format!("{err}"),
+            }
+            .into()
+        })
+        .map(|r| r.into_response())
 }
 
-async fn get_web_body(path: &Path) -> Result<Html<String>, WebSocketApiError> {
+async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiError> {
     let web_path = path.join("web").join("index.html");
     let mut key_file = File::open(&web_path)
         .await
