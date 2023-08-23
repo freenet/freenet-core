@@ -2,11 +2,11 @@ use std::str::FromStr;
 
 use locutus_aft_interface::{Tier, TokenAssignment};
 use locutus_stdlib::prelude::ContractInstanceId;
-use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
+use rand_chacha::rand_core::OsRng;
+use rsa::RsaPrivateKey;
 
 pub(crate) fn test_assignment() -> TokenAssignment {
-    const RSA_PRIV_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-    let key = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_PEM).unwrap();
+    let key = RsaPrivateKey::new(&mut OsRng, 32).unwrap();
     TokenAssignment {
         tier: Tier::Day1,
         time_slot: Default::default(),

@@ -2,7 +2,7 @@ use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamEx
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, WebSocketUpgrade};
-use axum::response::{Html, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use locutus_core::*;
@@ -97,17 +97,19 @@ async fn home() -> axum::response::Response {
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
-) -> Result<Html<String>, WebSocketApiError> {
-    web_handling::contract_home(key, rs).await
+) -> Result<axum::response::Response, WebSocketApiError> {
+    let contract_idx = web_handling::contract_home(key, rs).await?;
+    Ok(contract_idx.into_response())
 }
 
 async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
-) -> Result<Html<String>, WebSocketApiError> {
+) -> Result<axum::response::Response, WebSocketApiError> {
     let full_path: String = format!("/contract/web/{}/{}", key, last_path);
     web_handling::variable_content(key, full_path)
         .await
         .map_err(|e| *e)
+        .map(|r| r.into_response())
 }
 
 async fn websocket_commands(

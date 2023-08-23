@@ -450,7 +450,7 @@ impl ContractInterface for Inbox {
         let missing_related: Vec<_> = missing_related
             .into_iter()
             .filter_map(|missing| {
-                (!allocation_records.contains_key(&missing)).then(|| RelatedContract {
+                (!allocation_records.contains_key(&missing)).then_some(RelatedContract {
                     contract_instance_id: missing,
                     mode: RelatedMode::StateOnce,
                 })
@@ -495,14 +495,11 @@ impl ContractInterface for Inbox {
 #[cfg(all(feature = "contract", test))]
 mod tests {
     use super::*;
-    use rsa::{pkcs1::DecodeRsaPrivateKey, Pkcs1v15Sign, RsaPrivateKey};
+    use rsa::{rand_core::OsRng, Pkcs1v15Sign, RsaPrivateKey};
 
     #[test]
     fn validate_test() -> Result<(), Box<dyn std::error::Error>> {
-        let private_key = RsaPrivateKey::from_pkcs1_pem(include_str!(
-            "../../../web/examples/rsa4096-id-1-priv.pem"
-        ))
-        .unwrap();
+        let private_key = RsaPrivateKey::new(&mut OsRng, 32).unwrap();
         let public_key = private_key.to_public_key();
 
         let params: Parameters = InboxParams {

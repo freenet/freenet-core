@@ -180,7 +180,7 @@ mod contract {
 
     #[derive(Serialize, Deserialize)]
     pub(crate) struct WebAppContract {
-        pub lang: SupportedWebLangs,
+        pub lang: Option<SupportedWebLangs>,
         pub typescript: Option<TypescriptConfig>,
         #[serde(rename = "state-sources")]
         pub state_sources: Option<Sources>,
@@ -188,7 +188,7 @@ mod contract {
         pub dependencies: Option<toml::value::Table>,
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, PartialEq)]
     #[serde(rename_all = "lowercase")]
     pub(crate) enum SupportedWebLangs {
         Javascript,
@@ -218,7 +218,7 @@ mod contract {
         if let Some(web_config) = &config.webapp {
             println!("Bundling webapp contract state");
             match &web_config.lang {
-                SupportedWebLangs::Typescript => {
+                Some(SupportedWebLangs::Typescript) => {
                     let child = Command::new("npm")
                         .args(["install"])
                         .current_dir(cwd)
@@ -276,7 +276,8 @@ mod contract {
                         println!("Compiled input using tsc");
                     }
                 }
-                SupportedWebLangs::Javascript => todo!(),
+                Some(SupportedWebLangs::Javascript) => todo!(),
+                None => {}
             }
         } else {
             println!("No webapp config found.");
@@ -563,7 +564,7 @@ mod contract {
                     },
                     state: None,
                     webapp: Some(WebAppContract {
-                        lang: SupportedWebLangs::Typescript,
+                        lang: Some(SupportedWebLangs::Typescript),
                         typescript: Some(TypescriptConfig { webpack: true }),
                         state_sources: Some(Sources {
                             source_dirs: Some(vec!["dist".into()]),

@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 xz2 = "0.1"
-tower-http = { version = "0.4", features = ["trace"] }
+tower-http = { version = "0.4", features = ["trace", "fs"] }
 
 # internal:
 locutus-core = { path = "../locutus-core", version = "0.0.3" }

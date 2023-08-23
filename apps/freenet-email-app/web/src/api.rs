@@ -374,7 +374,7 @@ mod identity_management {
         user: &UseSharedState<crate::app::User>,
     ) {
         let id = identity_management::PENDING_CONFIRMATION
-            .with(|pend| pend.borrow_mut().remove(&private_key));
+            .with(|pend| pend.borrow_mut().remove(private_key));
         let NewIdentity {
             alias,
             description,

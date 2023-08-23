@@ -18,7 +18,7 @@ bs58 = "0.5"
 arc-swap = "1.6"
 rand_chacha = "0.3"
 chrono = { workspace = true, features = ["wasmbind"] }
-dioxus = { git = "https://github.com/DioxusLabs/dioxus.git", rev = "0fec47d" }
+dioxus = "0.4.0"
 futures = "0.3"
 rsa = { workspace = true }
 chacha20poly1305 = "0.10"
@@ -38,7 +38,7 @@ locutus-aft-interface = { workspace = true }
 identity-management = { path = "../../../modules/identity-management" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-dioxus-web = { git = "https://github.com/DioxusLabs/dioxus.git", rev = "0fec47d" }
+dioxus-web = "0.4.0"
 getrandom = { version = "*", features = ["js"] }
 locutus-stdlib = { workspace = true, features = ["net"] }
 serde-wasm-bindgen = { version = "0.5" }
@@ -58,7 +58,7 @@ features = [
 ]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-dioxus-desktop = { git = "https://github.com/DioxusLabs/dioxus.git", rev = "0fec47d" }
+dioxus-desktop = "0.4.0"
 
 [features]
 default = ["ui-testing"]
