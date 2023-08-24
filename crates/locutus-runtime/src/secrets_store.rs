@@ -1,4 +1,4 @@
-use blake2::digest::generic_array::GenericArray;
+use blake3::traits::digest::generic_array::GenericArray;
 use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20Poly1305, XNonce};
 use dashmap::DashMap;
 use locutus_stdlib::client_api::DelegateRequest;

@@ -509,7 +509,7 @@ mod tests {
         .map_err(|e| format!("{e}"))
         .unwrap();
 
-        use locutus_stdlib::prelude::blake2::Digest;
+        use locutus_stdlib::prelude::blake3::traits::digest::Digest;
         let digest = Sha256::digest(STATE_UPDATE).to_vec();
         let signature = private_key
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)

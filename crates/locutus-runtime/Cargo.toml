@@ -13,7 +13,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 arrayvec = { workspace = true }
 async-trait = "0.1"
 bincode = "1"
-blake2 = { version =  "0.10", features = [ "std" ] }
+blake3 = { workspace = true }
 bs58 = "0.5"
 byteorder = "1"
 chacha20poly1305 = { workspace = true }

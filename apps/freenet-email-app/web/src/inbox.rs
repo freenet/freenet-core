@@ -17,7 +17,7 @@ use locutus_stdlib::prelude::StateSummary;
 use locutus_stdlib::{
     client_api::ContractRequest,
     prelude::{
-        blake2::{self, Digest},
+        blake3::{self, traits::digest::Digest},
         ContractKey, State, UpdateData,
     },
 };
@@ -257,7 +257,7 @@ impl DecryptedMessage {
         content.extend(encrypted_key);
         content.extend(encrypted_data);
 
-        let mut hasher = blake2::Blake2s256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(&content);
         let assignment_hash: [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
         Ok((assignment_hash, content))

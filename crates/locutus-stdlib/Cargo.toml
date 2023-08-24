@@ -13,7 +13,7 @@ arbitrary = { version = "1", optional = true, features = ["derive"] }
 arrayvec = { workspace = true }
 bincode = "1"
 byteorder = "1"
-blake2 = { version =  "0.10", features = [ "std" ] }
+blake3 = { workspace = true }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
 futures = "0.3"
@@ -62,8 +62,7 @@ optional = true
 [target.'cfg(any(unix, windows))'.dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 bincode = "1"
-wasmer = { version = "3", features = [ "sys-default"] }
-wasmer-wasi = { version = "3" }
+wasmer = { version = "4.1.2", features = [ "sys-default"] }
 rand = { version = "0.8", features = ["small_rng"] }
 
 [features]

@@ -660,7 +660,7 @@ impl JRState {
         CErr: std::error::Error,
     {
         if let Self::AwaitingProxyResponse { accepted_by, .. } = self {
-            accepted_by.extend(proxies.into_iter());
+            accepted_by.extend(proxies);
             Ok(())
         } else {
             Err(OpError::UnexpectedOpState)

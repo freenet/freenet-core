@@ -15,7 +15,7 @@ asynchronous-codec = "0.6"
 async-trait = "0.1"
 arrayvec = { workspace = true }
 bincode = "1"
-blake2 = { version =  "0.10", features = [ "std" ] }
+blake3 = { workspace = true }
 bs58 = "0.5"
 chacha20poly1305 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }

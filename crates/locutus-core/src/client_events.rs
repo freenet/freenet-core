@@ -126,7 +126,7 @@ pub(crate) mod test {
 
         /// Contracts that are available in the network to be requested.
         pub fn request_contracts(&mut self, contracts: impl IntoIterator<Item = ContractKey>) {
-            self.non_owned_contracts.extend(contracts.into_iter())
+            self.non_owned_contracts.extend(contracts)
         }
 
         /// Contracts that the user updates.
@@ -142,7 +142,7 @@ pub(crate) mod test {
             &mut self,
             events: impl IntoIterator<Item = (EventId, ClientRequest<'static>)>,
         ) {
-            self.events_to_gen.extend(events.into_iter())
+            self.events_to_gen.extend(events)
         }
 
         fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest> {

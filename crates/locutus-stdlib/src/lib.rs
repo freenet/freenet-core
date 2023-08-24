@@ -30,7 +30,7 @@ pub mod prelude {
     pub use locutus_macros::{contract, delegate};
 
     pub use bincode;
-    pub use blake2;
+    pub use blake3;
     pub use serde_json;
     pub use tracing;
     pub use tracing_subscriber;
