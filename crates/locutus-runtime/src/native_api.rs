@@ -40,7 +40,6 @@ pub(crate) mod time {
         let ptr = compute_ptr::<DateTime<UtcOriginal>>(ptr, info.start_ptr);
         // eprintln!("{ptr:p} ({}) outside", ptr as i64);
         unsafe {
-            let ptr = ptr as *mut DateTime<UtcOriginal>;
             ptr.write(now);
         };
     }
