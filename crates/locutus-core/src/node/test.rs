@@ -455,8 +455,7 @@ fn pretty_print_connections(conns: &HashMap<String, HashMap<String, Distance>>) 
 fn group_locations_test() -> Result<(), anyhow::Error> {
     let locations = vec![0.5356, 0.5435, 0.5468, 0.5597, 0.6745, 0.7309, 0.7412];
 
-    let mut grouped: Vec<_> =
-        group_locations_in_buckets(locations.clone(), 1).collect();
+    let mut grouped: Vec<_> = group_locations_in_buckets(locations.clone(), 1).collect();
     grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     assert_eq!(grouped, vec![(0.5, 4), (0.6, 1), (0.7, 2)]);
 
