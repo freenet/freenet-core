@@ -1,23 +1,20 @@
 # Delegates
 
-Just as human delegates are representatives who make decisions or take action on
-behalf of others, in Freenet, Delegates serve a similar role. They function like
-an advanced version of a web browser's local storage and share similarities with
-Unix "Daemons". They run in the background on your device within the Freenet
-kernel, providing a secure environment for managing private data and performing
-complex tasks.
+In Freenet, Delegates act like advanced representatives, similar to a human
+delegate, performing actions on Freenet on your behalf. Think of them as a more
+sophisticated version of a web browser's local storage, with similarities to
+Unix "Daemons". Operating within the Freenet kernel on your device, Delegates
+are a secure and flexible mechanism for managing private data, such as
+cryptographic keys, tokens, and passwords, and executing complex tasks.
 
-Delegates interact with various Freenet components, including Contracts, User
-Interfaces, other Delegates, and directly with the user. They securely store
-your private data, including cryptographic keys, tokens, and passwords. 
+Delegates interact with various components within Freenet, including Contracts,
+User Interfaces, and other Delegates. They can also communicate directly with
+the user, such as to request user permissions or notify the user of events.
 
-Acting on your behalf within the Freenet network, Delegates can modify
-Contracts, and ask the user questions directly such as to request permission or
-inform the user of an event.
-
-Delegates are implemented in WebAssembly and comply with the
+Implemented in WebAssembly and adhering to the
 [DelegateInterface](https://github.com/freenet/locutus/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/locutus-stdlib/src/delegate_interface.rs#L121)
-trait. They operate directly within the Freenet kernel on your devices.
+trait, Delegates seamlessly integrate within the Freenet network, operating
+securely on your devices.
 
 ## Actor Model and Message Passing
 

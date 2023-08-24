@@ -1,8 +1,8 @@
-use ed25519_dalek::Verifier;
 use locutus_stdlib::prelude::{
     blake2::{Blake2b512, Digest},
     *,
 };
+use rsa::{self, pkcs1v15::VerifyingKey, sha2::Sha256};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -19,6 +19,8 @@ impl<'a> TryFrom<State<'a>> for PostsFeed {
     }
 }
 
+type Signature = Box<[u8]>;
+
 #[derive(Serialize, Deserialize)]
 pub struct Post {
     pub author: String,
@@ -27,7 +29,7 @@ pub struct Post {
     pub content: String,
     #[serde(default = "Post::modded")]
     pub mod_msg: bool,
-    pub signature: Option<ed25519_dalek::Signature>,
+    pub signature: Option<Signature>,
 }
 
 impl Post {
@@ -76,14 +78,19 @@ impl<'a> TryFrom<StateSummary<'a>> for MessageSummary {
 
 #[derive(Serialize, Deserialize)]
 pub struct Verification {
-    public_key: ed25519_dalek::PublicKey,
+    public_key: rsa::RsaPublicKey,
 }
 
 impl Verification {
     fn verify(&self, msg: &Post) -> bool {
-        if let Some(sig) = msg.signature {
-            self.public_key
-                .verify(&serde_json::to_vec(msg).unwrap(), &sig)
+        if let Some(sig) = &msg.signature {
+            use rsa::signature::Verifier;
+            let verifying_key = VerifyingKey::<Sha256>::new(self.public_key.clone());
+            verifying_key
+                .verify(
+                    &serde_json::to_vec(msg).unwrap(),
+                    &rsa::pkcs1v15::Signature::try_from(&**sig).unwrap(),
+                )
                 .is_ok()
         } else {
             false

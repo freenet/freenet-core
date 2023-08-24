@@ -55,7 +55,7 @@ rocksdb = { version = "0.21.0", default-features = false, optional = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
 pav_regression = "0.4.0"
 itertools = "0.11"
-ordered-float = "3.9.0"
+ordered-float = "3.9.1"
 
 # Tracing deps
 tower-http = { version = "0.4", features = ["trace"] }

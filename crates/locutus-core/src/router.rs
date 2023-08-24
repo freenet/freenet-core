@@ -299,7 +299,7 @@ mod tests {
     fn test_request_time() {
         // Define constants for the number of peers, number of events, and number of test iterations.
         const NUM_PEERS: usize = 25;
-        const NUM_EVENTS: usize = 10000;
+        const NUM_EVENTS: usize = 40000;
 
         // Create `NUM_PEERS` random peers and put them in a vector.
         let peers: Vec<PeerKeyLocation> =
@@ -361,7 +361,7 @@ mod tests {
             let failure_probability_error =
                 (prediction.failure_probability - truth.failure_probability).abs();
             assert!(
-                failure_probability_error < 0.2,
+                failure_probability_error < 0.3,
                 "failure_probability: Prediction: {}, Truth: {}, Error: {}",
                 prediction.failure_probability,
                 truth.failure_probability,

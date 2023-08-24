@@ -450,7 +450,7 @@ impl ContractInterface for Inbox {
         let missing_related: Vec<_> = missing_related
             .into_iter()
             .filter_map(|missing| {
-                (!allocation_records.contains_key(&missing)).then(|| RelatedContract {
+                (!allocation_records.contains_key(&missing)).then_some(RelatedContract {
                     contract_instance_id: missing,
                     mode: RelatedMode::StateOnce,
                 })

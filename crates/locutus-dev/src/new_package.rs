@@ -32,7 +32,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
             output_dir: None,
         },
         webapp: Some(WebAppContract {
-            lang: SupportedWebLangs::Typescript,
+            lang: Some(SupportedWebLangs::Typescript),
             typescript: Some(TypescriptConfig { webpack: true }),
             state_sources: Some(Sources {
                 source_dirs: Some(vec![PathBuf::from("dist")]),
