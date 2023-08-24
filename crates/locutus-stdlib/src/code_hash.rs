@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use blake2::{Blake2s256, Digest};
+use blake3::{traits::digest::Digest, Hasher as Blake3};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -16,7 +16,7 @@ pub struct CodeHash(#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] pub(crate) [u8; C
 
 impl CodeHash {
     pub fn new(wasm_code: &[u8]) -> Self {
-        let mut hasher = Blake2s256::new();
+        let mut hasher = Blake3::new();
         hasher.update(wasm_code);
         let hashed = hasher.finalize();
         let mut delegate_key = [0; CONTRACT_KEY_SIZE];

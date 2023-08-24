@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use blake2::{Blake2s256, Digest};
+use blake3::{traits::digest::Digest, Hasher as Blake3};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -221,8 +221,8 @@ impl DelegateKey {
         bs58::decode(code_hash.into())
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .onto(&mut code_key)?;
-        let mut hasher = Blake2s256::new();
-        hasher.update(code_key);
+        let mut hasher = Blake3::new();
+        hasher.update(code_key.as_slice());
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
 
@@ -281,8 +281,8 @@ fn generate_id<'a>(
 ) -> [u8; DELEGATE_HASH_LENGTH] {
     let contract_hash = code_data.hash();
 
-    let mut hasher = Blake2s256::new();
-    hasher.update(contract_hash.0);
+    let mut hasher = Blake3::new();
+    hasher.update(contract_hash.0.as_slice());
     hasher.update(parameters.as_ref());
     let full_key_arr = hasher.finalize();
 
@@ -303,7 +303,7 @@ pub struct SecretsId {
 
 impl SecretsId {
     pub fn new(key: Vec<u8>) -> Self {
-        let mut hasher = Blake2s256::new();
+        let mut hasher = Blake3::new();
         hasher.update(&key);
         let hashed = hasher.finalize();
         let mut hash = [0; 32];

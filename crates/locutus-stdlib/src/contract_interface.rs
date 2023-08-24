@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
 };
 
-use blake2::{Blake2s256, Digest};
+use blake3::{traits::digest::Digest, Hasher as Blake3};
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::serde_as;
@@ -844,7 +844,7 @@ impl ContractCode<'_> {
     }
 
     fn gen_hash(data: &[u8]) -> CodeHash {
-        let mut hasher = Blake2s256::new();
+        let mut hasher = Blake3::new();
         hasher.update(data);
         let key_arr = hasher.finalize();
         debug_assert_eq!(key_arr[..].len(), CONTRACT_KEY_SIZE);
@@ -1075,8 +1075,8 @@ impl ContractKey {
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .onto(&mut code_key)?;
 
-        let mut hasher = Blake2s256::new();
-        hasher.update(code_key);
+        let mut hasher = Blake3::new();
+        hasher.update(code_key.as_slice());
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
 
@@ -1146,8 +1146,8 @@ fn generate_id<'a>(
 ) -> ContractInstanceId {
     let contract_hash = code_data.hash();
 
-    let mut hasher = Blake2s256::new();
-    hasher.update(contract_hash.0);
+    let mut hasher = Blake3::new();
+    hasher.update(contract_hash.0.as_slice());
     hasher.update(parameters.as_ref());
     let full_key_arr = hasher.finalize();
 

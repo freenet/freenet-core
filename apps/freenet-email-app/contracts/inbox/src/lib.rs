@@ -495,14 +495,11 @@ impl ContractInterface for Inbox {
 #[cfg(all(feature = "contract", test))]
 mod tests {
     use super::*;
-    use rsa::{pkcs1::DecodeRsaPrivateKey, Pkcs1v15Sign, RsaPrivateKey};
+    use rsa::{rand_core::OsRng, Pkcs1v15Sign, RsaPrivateKey};
 
     #[test]
     fn validate_test() -> Result<(), Box<dyn std::error::Error>> {
-        let private_key = RsaPrivateKey::from_pkcs1_pem(include_str!(
-            "../../../web/examples/rsa4096-id-1-priv.pem"
-        ))
-        .unwrap();
+        let private_key = RsaPrivateKey::new(&mut OsRng, 32).unwrap();
         let public_key = private_key.to_public_key();
 
         let params: Parameters = InboxParams {
@@ -512,7 +509,7 @@ mod tests {
         .map_err(|e| format!("{e}"))
         .unwrap();
 
-        use locutus_stdlib::prelude::blake2::Digest;
+        use locutus_stdlib::prelude::blake3::traits::digest::Digest;
         let digest = Sha256::digest(STATE_UPDATE).to_vec();
         let signature = private_key
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)

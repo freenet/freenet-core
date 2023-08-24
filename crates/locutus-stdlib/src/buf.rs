@@ -340,10 +340,8 @@ pub fn initiate_buffer(capacity: u32) -> i64 {
 mod test {
     use super::*;
     use wasmer::{
-        imports, namespace, wat2wasm, AsStoreMut, Cranelift, Function, Instance, Module, Store,
-        TypedFunction,
+        imports, wat2wasm, AsStoreMut, Cranelift, Function, Instance, Module, Store, TypedFunction,
     };
-    use wasmer_wasi::WasiState;
 
     const TEST_MODULE: &str = r#"
         (module
@@ -361,23 +359,6 @@ mod test {
         let imports = imports! {
             "locutus" => { "initiate_buffer" => init_buf_fn }
         };
-        let instance = Instance::new(&mut store, &module, &imports).unwrap();
-        Ok((store, instance))
-    }
-
-    // FIXME
-    #[allow(dead_code)]
-    fn build_test_mod_with_wasi() -> Result<(Store, Instance), Box<dyn std::error::Error>> {
-        let wasm_bytes = wat2wasm(TEST_MODULE.as_bytes())?;
-        let mut store = Store::new(Cranelift::new());
-        let module = Module::new(&store, wasm_bytes)?;
-
-        let init_buf_fn = Function::new_typed(&mut store, initiate_buffer);
-        let funcs = namespace!("initiate_buffer" => init_buf_fn );
-        let wasi_env = WasiState::new("locutus").finalize(&mut store)?;
-        let mut imports = wasi_env.import_object(&mut store, &module)?;
-        imports.register_namespace("locutus", funcs);
-
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         Ok((store, instance))
     }

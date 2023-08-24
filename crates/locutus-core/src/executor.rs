@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use blake2::digest::generic_array::GenericArray;
+use blake3::traits::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
 use locutus_stdlib::client_api::HostResponse::DelegateResponse;
 use locutus_stdlib::client_api::{
