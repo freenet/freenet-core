@@ -1,5 +1,5 @@
 use locutus_stdlib::prelude::{
-    blake2::{Blake2b512, Digest},
+    blake3::{traits::digest::Digest, Hasher as Blake3},
     *,
 };
 use rsa::{self, pkcs1v15::VerifyingKey, sha2::Sha256};
@@ -34,7 +34,7 @@ pub struct Post {
 
 impl Post {
     pub fn hash(&self) -> [u8; 64] {
-        let mut hasher = Blake2b512::new();
+        let mut hasher = Blake3::new();
         hasher.update(self.author.as_bytes());
         hasher.update(self.title.as_bytes());
         hasher.update(self.content.as_bytes());
@@ -186,7 +186,7 @@ impl ContractInterface for PostsFeed {
         summary.summaries.sort();
         let mut final_messages = vec![];
         for msg in feed.messages {
-            let mut hasher = Blake2b512::new();
+            let mut hasher = Blake3::new();
             hasher.update(msg.author.as_bytes());
             hasher.update(msg.title.as_bytes());
             hasher.update(msg.content.as_bytes());
