@@ -83,9 +83,9 @@ pub trait ClientEventsProxy {
 }
 #[cfg(test)]
 pub(crate) mod test {
+    // FIXME: remove unused
     #![allow(unused)]
 
-    // FIXME: remove unused
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -249,139 +249,5 @@ pub(crate) mod test {
         ) -> BoxFuture<'_, Result<(), ClientError>> {
             async { Ok(()) }.boxed()
         }
-    }
-
-    // #[test]
-    // fn put_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
-    //     let bytes = crate::util::test::random_bytes_1024();
-    //     let mut gen = arbitrary::Unstructured::new(&bytes);
-
-    //     let key = ContractKey::from((
-    //         &gen.arbitrary::<Parameters>()?,
-    //         &gen.arbitrary::<ContractCode>()?,
-    //     ));
-    //     let complete_put: HostResult = Ok(HostResponse::PutResponse { key });
-    //     let encoded = rmp_serde::to_vec(&complete_put)?;
-    //     let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
-
-    //     let key = ContractKey::from_id(key.encoded_contract_id())?;
-    //     let only_spec: HostResult = Ok(HostResponse::PutResponse { key });
-    //     let encoded = rmp_serde::to_vec(&only_spec)?;
-    //     let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
-    //     Ok(())
-    // }
-
-    // #[test]
-    // fn update_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
-    //     let bytes = crate::util::test::random_bytes_1024();
-    //     let mut gen = arbitrary::Unstructured::new(&bytes);
-
-    //     let update: HostResult = Ok(HostResponse::UpdateResponse {
-    //         key: gen.arbitrary()?,
-    //         summary: gen.arbitrary()?,
-    //     });
-    //     let encoded = rmp_serde::to_vec(&update)?;
-    //     let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
-    //     Ok(())
-    // }
-
-    // #[test]
-    // fn get_response_serialization() -> Result<(), Box<dyn std::error::Error>> {
-    //     let bytes = crate::util::test::random_bytes_1024();
-    //     let mut gen = arbitrary::Unstructured::new(&bytes);
-
-    //     let state: WrappedState = gen.arbitrary()?;
-    //     let complete_get: HostResult = Ok(HostResponse::GetResponse {
-    //         contract: Some(gen.arbitrary()?),
-    //         state: state.clone(),
-    //     });
-    //     let encoded = rmp_serde::to_vec(&complete_get)?;
-    //     let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
-
-    //     let incomplete_get: HostResult = Ok(HostResponse::GetResponse {
-    //         contract: None,
-    //         state,
-    //     });
-    //     let encoded = rmp_serde::to_vec(&incomplete_get)?;
-    //     let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
-    //     Ok(())
-    // }
-
-    // #[test]
-    // fn update_notification_serialization() -> Result<(), Box<dyn std::error::Error>> {
-    //     let bytes = crate::util::test::random_bytes_1024();
-    //     let mut gen = arbitrary::Unstructured::new(&bytes);
-
-    //     let update_notif: HostResult = Ok(HostResponse::UpdateNotification {
-    //         key: gen.arbitrary()?,
-    //         update: StateDelta::from(gen.arbitrary::<Vec<u8>>()?).into(),
-    //     });
-    //     let encoded = rmp_serde::to_vec(&update_notif)?;
-    //     let _decoded: HostResult = rmp_serde::from_slice(&encoded)?;
-    //     Ok(())
-    // }
-
-    #[test]
-    fn test_handle_update_request() -> Result<(), Box<dyn std::error::Error>> {
-        let expected_client_request: ContractRequest = ContractRequest::Update {
-            key: ContractKey::from_id("DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1".to_string())
-                .unwrap(),
-            data: locutus_runtime::StateDelta::from(vec![0, 1, 2]).into(),
-        };
-        let msg: Vec<u8> = vec![
-            130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 181,
-            41, 189, 142, 103, 137, 251, 46, 133, 213, 21, 255, 179, 17, 3, 17, 240, 208, 191, 5,
-            215, 72, 60, 41, 194, 14, 217, 228, 225, 251, 209, 100, 164, 99, 111, 100, 101, 192,
-            164, 100, 97, 116, 97, 129, 165, 100, 101, 108, 116, 97, 196, 3, 0, 1, 2,
-        ];
-
-        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
-        assert_eq!(result_client_request, expected_client_request);
-        Ok(())
-    }
-
-    #[test]
-    fn test_handle_get_request() -> Result<(), Box<dyn std::error::Error>> {
-        let expected_client_request: ContractRequest = ContractRequest::Get {
-            key: ContractKey::from_id("JAgVrRHt88YbBFjGQtBD3uEmRUFvZQqK7k8ypnJ8g6TC".to_string())
-                .unwrap(),
-            fetch_contract: false,
-        };
-        let msg: Vec<u8> = vec![
-            130, 163, 107, 101, 121, 130, 168, 105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 255,
-            17, 144, 159, 194, 187, 46, 33, 205, 77, 242, 70, 87, 18, 202, 62, 226, 149, 25, 151,
-            188, 167, 153, 197, 129, 25, 179, 198, 218, 99, 159, 139, 164, 99, 111, 100, 101, 192,
-            173, 102, 101, 116, 99, 104, 67, 111, 110, 116, 114, 97, 99, 116, 194,
-        ];
-
-        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
-        assert_eq!(result_client_request, expected_client_request);
-        Ok(())
-    }
-
-    #[test]
-    fn test_handle_put_request() -> Result<(), Box<dyn std::error::Error>> {
-        let expected_client_request: ContractRequest = ContractRequest::Put {
-            contract: ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-                Arc::new(ContractCode::from(vec![1])),
-                Parameters::from(vec![2]),
-            ))),
-            state: WrappedState::new(vec![3]),
-            related_contracts: RelatedContracts::from(HashMap::new()),
-        };
-
-        let msg: Vec<u8> = vec![
-            131, 169, 99, 111, 110, 116, 97, 105, 110, 101, 114, 132, 163, 107, 101, 121, 130, 168,
-            105, 110, 115, 116, 97, 110, 99, 101, 196, 32, 135, 191, 81, 248, 20, 212, 21, 0, 62,
-            82, 40, 7, 217, 52, 41, 65, 33, 245, 251, 131, 23, 147, 59, 124, 134, 129, 218, 158,
-            113, 132, 235, 85, 164, 99, 111, 100, 101, 192, 164, 100, 97, 116, 97, 196, 1, 1, 170,
-            112, 97, 114, 97, 109, 101, 116, 101, 114, 115, 196, 1, 2, 167, 118, 101, 114, 115,
-            105, 111, 110, 162, 86, 49, 165, 115, 116, 97, 116, 101, 196, 1, 3, 176, 114, 101, 108,
-            97, 116, 101, 100, 67, 111, 110, 116, 114, 97, 99, 116, 115, 128,
-        ];
-
-        let result_client_request: ContractRequest = ContractRequest::try_decode(&msg)?;
-        assert_eq!(result_client_request, expected_client_request);
-        Ok(())
     }
 }

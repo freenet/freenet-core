@@ -118,7 +118,8 @@ impl DelegateStore {
                 delegate_code_path.as_path(),
                 params.clone().into_owned(),
             ))
-            .ok()? else {
+            .ok()?
+            else {
                 unimplemented!()
             };
             tracing::debug!("loaded `{key}` from path");

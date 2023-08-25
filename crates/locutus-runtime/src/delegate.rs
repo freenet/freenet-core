@@ -92,7 +92,8 @@ impl Runtime {
     ) -> RuntimeResult<DelegateContext> {
         const MAX_ITERATIONS: usize = 100;
         let mut recurssion = 0;
-        let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned()) else {
+        let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned())
+        else {
             return Ok(DelegateContext::default());
         };
         while let Some(outbound) = outbound_msgs.pop_front() {
@@ -112,7 +113,12 @@ impl Runtime {
                     let new_msgs = self.exec_inbound(params, &inbound, process_func, instance)?;
                     recurssion += 1;
                     let Some(last_msg) = new_msgs.last() else {
-                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("Error trying to update the context from the secret".to_string()).into())));
+                        return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
+                            DelegateError::Other(
+                                "Error trying to update the context from the secret".to_string(),
+                            )
+                            .into(),
+                        )));
                     };
                     let mut updated = false;
                     if let Some(new_last_context) = last_msg.get_context() {

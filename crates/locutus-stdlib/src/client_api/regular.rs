@@ -236,9 +236,10 @@ mod test {
                 stream.send(Message::Binary(req)).await?;
             }
 
-            let Message::Binary(msg) = stream.next().await.ok_or_else(|| "no msg".to_owned())?? else {
-                        return Err("wrong msg".to_owned().into());
-                };
+            let Message::Binary(msg) = stream.next().await.ok_or_else(|| "no msg".to_owned())??
+            else {
+                return Err("wrong msg".to_owned().into());
+            };
 
             let _req: ClientRequest = bincode::deserialize(&msg)?;
             tx.send(()).map_err(|_| "couldn't error".to_owned())?;
