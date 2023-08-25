@@ -10,16 +10,15 @@ pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, StoreResponse,
 };
-pub(crate) use test::MockRuntime;
 #[cfg(test)]
-pub(crate) use test::{MemoryContractHandler, SimStoreError};
+pub(crate) use test::MemoryContractHandler;
+pub(crate) use test::MockRuntime;
 
-pub(crate) async fn contract_handling<'a, CH, Err>(
-    mut contract_handler: CH,
-) -> Result<(), ContractError<Err>>
+use crate::DynError;
+
+pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
-    CH: ContractHandler<Error = Err> + Send + 'static,
-    Err: std::error::Error + Send + 'static,
+    CH: ContractHandler + Send + 'static,
 {
     loop {
         let res = contract_handler.channel().recv_from_listener().await?;
@@ -114,9 +113,9 @@ where
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ContractError<CErr> {
+pub(crate) enum ContractError {
     #[error("handler channel dropped")]
-    ChannelDropped(Box<ContractHandlerEvent<CErr>>),
+    ChannelDropped(Box<ContractHandlerEvent>),
     #[error("contract {0} not found in storage")]
     ContractNotFound(ContractKey),
     #[error("")]
@@ -126,5 +125,5 @@ pub(crate) enum ContractError<CErr> {
     #[error("no response received from handler")]
     NoEvHandlerResponse,
     #[error("failed while storing a contract")]
-    StorageError(CErr),
+    StorageError(DynError),
 }

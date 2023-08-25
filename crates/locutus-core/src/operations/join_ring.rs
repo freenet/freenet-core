@@ -34,18 +34,24 @@ impl JoinRingOp {
     }
 }
 
-impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for JoinRingOp
-where
-    CErr: std::error::Error + Send,
-{
-    type Message = JoinRingMsg;
+pub(crate) struct JoinRingResult {}
 
-    type Error = OpError<CErr>;
+impl TryFrom<JoinRingOp> for JoinRingResult {
+    type Error = OpError;
+
+    fn try_from(value: JoinRingOp) -> Result<Self, Self::Error> {
+        todo!()
+    }
+}
+
+impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
+    type Message = JoinRingMsg;
+    type Result = JoinRingResult;
 
     fn load_or_init(
-        op_storage: &OpManager<CErr>,
+        op_storage: &OpManager,
         msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError<CErr>> {
+    ) -> Result<OpInitialization<Self>, OpError> {
         let sender;
         let tx = *msg.id();
         match op_storage.pop(msg.id()) {
@@ -81,9 +87,9 @@ where
     fn process_message<'a>(
         self,
         conn_manager: &'a mut CB,
-        op_storage: &'a OpManager<CErr>,
+        op_storage: &'a OpManager,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let mut return_msg = None;
             let mut new_state = None;
@@ -515,14 +521,14 @@ where
     }
 }
 
-fn build_op_result<CErr: std::error::Error>(
+fn build_op_result(
     id: Transaction,
     state: Option<JRState>,
     msg: Option<JoinRingMsg>,
     gateway: Box<PeerKeyLocation>,
     backoff: Option<ExponentialBackoff>,
     ttl: Duration,
-) -> Result<OperationResult, OpError<CErr>> {
+) -> Result<OperationResult, OpError> {
     let output_op = Some(JoinRingOp {
         id,
         state,
@@ -563,13 +569,13 @@ fn try_proxy_connection(
     (new_state, return_msg)
 }
 
-async fn propagate_oc_to_accepted_peers<CErr: std::error::Error, CB: ConnectionBridge>(
+async fn propagate_oc_to_accepted_peers<CB: ConnectionBridge>(
     conn_manager: &mut CB,
-    op_storage: &OpManager<CErr>,
+    op_storage: &OpManager,
     sender: PeerKeyLocation,
     other_peer: &PeerKeyLocation,
     msg: JoinRingMsg,
-) -> Result<(), OpError<CErr>> {
+) -> Result<(), OpError> {
     if op_storage.ring.should_accept(
         &other_peer
             .location
@@ -637,10 +643,7 @@ struct ConnectionInfo {
 }
 
 impl JRState {
-    fn try_unwrap_connecting<CErr>(self) -> Result<ConnectionInfo, OpError<CErr>>
-    where
-        CErr: std::error::Error,
-    {
+    fn try_unwrap_connecting(self) -> Result<ConnectionInfo, OpError> {
         if let Self::Connecting(conn_info) = self {
             Ok(conn_info)
         } else {
@@ -652,13 +655,10 @@ impl JRState {
         matches!(self, JRState::Connected { .. })
     }
 
-    fn add_new_proxy<CErr>(
+    fn add_new_proxy(
         &mut self,
         proxies: impl IntoIterator<Item = PeerKeyLocation>,
-    ) -> Result<(), OpError<CErr>>
-    where
-        CErr: std::error::Error,
-    {
+    ) -> Result<(), OpError> {
         if let Self::AwaitingProxyResponse { accepted_by, .. } = self {
             accepted_by.extend(proxies);
             Ok(())
@@ -694,15 +694,14 @@ pub(crate) fn initial_request(
 }
 
 /// Join ring routine, called upon performing a join operation for this node.
-pub(crate) async fn join_ring_request<CB, CErr>(
+pub(crate) async fn join_ring_request<CB>(
     tx: Transaction,
-    op_storage: &OpManager<CErr>,
+    op_storage: &OpManager,
     conn_manager: &mut CB,
     mut join_op: JoinRingOp,
-) -> Result<(), OpError<CErr>>
+) -> Result<(), OpError>
 where
     CB: ConnectionBridge,
-    CErr: std::error::Error,
 {
     let ConnectionInfo {
         gateway,
@@ -738,7 +737,7 @@ where
 }
 
 // FIXME: don't forward to previously rejecting nodes (keep track of skip list)
-async fn forward_conn<CM, Err>(
+async fn forward_conn<CM>(
     id: Transaction,
     ring: &Ring,
     conn_manager: &mut CM,
@@ -746,10 +745,9 @@ async fn forward_conn<CM, Err>(
     new_peer_loc: PeerKeyLocation,
     left_htl: usize,
     num_accepted: usize,
-) -> Result<Option<JRState>, OpError<Err>>
+) -> Result<Option<JRState>, OpError>
 where
     CM: ConnectionBridge,
-    Err: std::error::Error,
 {
     if left_htl == 0 || (ring.num_connections() == 0 && num_accepted == 0) {
         return Ok(None);

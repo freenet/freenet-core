@@ -27,17 +27,24 @@ pub(crate) struct SubscribeOp {
     _ttl: Duration,
 }
 
-impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for SubscribeOp
-where
-    CErr: std::error::Error + Send,
-{
+pub(crate) struct SubscribeResult {}
+
+impl TryFrom<SubscribeOp> for SubscribeResult {
+    type Error = OpError;
+
+    fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
+        todo!()
+    }
+}
+
+impl<CB: ConnectionBridge> Operation<CB> for SubscribeOp {
     type Message = SubscribeMsg;
-    type Error = OpError<CErr>;
+    type Result = SubscribeResult;
 
     fn load_or_init(
-        op_storage: &OpManager<CErr>,
+        op_storage: &OpManager,
         msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError<CErr>> {
+    ) -> Result<OpInitialization<Self>, OpError> {
         let mut sender: Option<PeerKey> = None;
         if let Some(peer_key_loc) = msg.sender().cloned() {
             sender = Some(peer_key_loc.peer);
@@ -75,9 +82,9 @@ where
     fn process_message<'a>(
         self,
         conn_manager: &'a mut CB,
-        op_storage: &'a OpManager<CErr>,
+        op_storage: &'a OpManager,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
             let new_state;
@@ -257,12 +264,12 @@ where
     }
 }
 
-fn build_op_result<CErr: std::error::Error>(
+fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
     ttl: Duration,
-) -> Result<OperationResult, OpError<CErr>> {
+) -> Result<OperationResult, OpError> {
     let output_op = Some(SubscribeOp {
         id,
         state,
@@ -302,13 +309,10 @@ enum SubscribeState {
 }
 
 /// Request to subscribe to value changes from a contract.
-pub(crate) async fn request_subscribe<CErr>(
-    op_storage: &OpManager<CErr>,
+pub(crate) async fn request_subscribe(
+    op_storage: &OpManager,
     sub_op: SubscribeOp,
-) -> Result<(), OpError<CErr>>
-where
-    CErr: std::error::Error,
-{
+) -> Result<(), OpError> {
     let (target, _id) =
         if let Some(SubscribeState::PrepareRequest { id, key }) = sub_op.state.clone() {
             if !op_storage.ring.is_contract_cached(&key) {

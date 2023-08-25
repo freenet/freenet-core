@@ -17,7 +17,7 @@ use tracing::{info, instrument};
 use crate::{
     client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
-    contract::{MemoryContractHandler, SimStoreError},
+    contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
     NodeConfig, WrappedState,
@@ -50,8 +50,8 @@ pub(crate) struct SimNetwork {
     pub event_listener: TestEventListener,
     usr_ev_controller: Sender<(EventId, PeerKey)>,
     receiver_ch: Receiver<(EventId, PeerKey)>,
-    gateways: Vec<(NodeInMemory<SimStoreError>, GatewayConfig)>,
-    nodes: Vec<(NodeInMemory<SimStoreError>, String)>,
+    gateways: Vec<(NodeInMemory, GatewayConfig)>,
+    nodes: Vec<(NodeInMemory, String)>,
     ring_max_htl: usize,
     rnd_if_htl_above: usize,
     max_connections: usize,
@@ -207,7 +207,7 @@ impl SimNetwork {
             self.event_listener
                 .add_node(label.clone(), PeerKey::from(id));
 
-            let node = NodeInMemory::<SimStoreError>::build::<MemoryContractHandler>(
+            let node = NodeInMemory::build::<MemoryContractHandler>(
                 config,
                 Some(Box::new(self.event_listener.clone())),
             )
@@ -236,7 +236,7 @@ impl SimNetwork {
 
     fn initialize_peer(
         &mut self,
-        mut peer: NodeInMemory<SimStoreError>,
+        mut peer: NodeInMemory,
         label: String,
         node_specs: Option<NodeSpecification>,
     ) {

@@ -13,9 +13,9 @@ pub type StorageContractHandler<R> = SQLiteContractHandler<R>;
 pub type StorageDbError = SqlDbError;
 
 #[cfg(feature = "sqlite")]
-impl From<SqlDbError> for ContractError<SqlDbError> {
+impl From<SqlDbError> for ContractError {
     fn from(err: SqlDbError) -> Self {
-        Self::StorageError(err)
+        Self::StorageError(err.into())
     }
 }
 
@@ -32,8 +32,8 @@ pub type StorageContractHandler<R> = RocksDbContractHandler<R>;
 pub type StorageDbError = RocksDbError;
 
 #[cfg(feature = "rocks_db")]
-impl From<rocks_db::RocksDbError> for ContractError<rocks_db::RocksDbError> {
+impl From<rocks_db::RocksDbError> for ContractError {
     fn from(err: rocks_db::RocksDbError) -> Self {
-        Self::StorageError(err)
+        Self::StorageError(err.into())
     }
 }

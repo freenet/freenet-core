@@ -27,18 +27,24 @@ pub(crate) struct PutOp {
     /// time left until time out, when this reaches zero it will be removed from the state
     _ttl: Duration,
 }
+pub(crate) struct PutResult {}
 
-impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for PutOp
-where
-    CErr: std::error::Error + Send + Sync,
-{
+impl TryFrom<PutOp> for PutResult {
+    type Error = OpError;
+
+    fn try_from(value: PutOp) -> Result<Self, Self::Error> {
+        todo!()
+    }
+}
+
+impl<CB: ConnectionBridge> Operation<CB> for PutOp {
     type Message = PutMsg;
-    type Error = OpError<CErr>;
+    type Result = PutResult;
 
     fn load_or_init(
-        op_storage: &OpManager<CErr>,
+        op_storage: &OpManager,
         msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError<CErr>> {
+    ) -> Result<OpInitialization<Self>, OpError> {
         let mut sender: Option<PeerKey> = None;
         if let Some(peer_key_loc) = msg.sender().cloned() {
             sender = Some(peer_key_loc.peer);
@@ -73,9 +79,9 @@ where
     fn process_message<'a>(
         self,
         conn_manager: &'a mut CB,
-        op_storage: &'a OpManager<CErr>,
+        op_storage: &'a OpManager,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
             let new_state;
@@ -391,12 +397,12 @@ where
     }
 }
 
-fn build_op_result<CErr: std::error::Error>(
+fn build_op_result(
     id: Transaction,
     state: Option<PutState>,
     msg: Option<PutMsg>,
     ttl: Duration,
-) -> Result<OperationResult, OpError<CErr>> {
+) -> Result<OperationResult, OpError> {
     let output_op = Some(PutOp {
         id,
         state,
@@ -408,11 +414,11 @@ fn build_op_result<CErr: std::error::Error>(
     })
 }
 
-async fn try_to_cache_contract<'a, CErr: std::error::Error>(
-    op_storage: &'a OpManager<CErr>,
+async fn try_to_cache_contract<'a>(
+    op_storage: &'a OpManager,
     contract: &ContractContainer,
     key: &ContractKey,
-) -> Result<(), OpError<CErr>> {
+) -> Result<(), OpError> {
     // this node does not have the contract, so instead store the contract and execute the put op.
     let res = op_storage
         .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
@@ -429,15 +435,15 @@ async fn try_to_cache_contract<'a, CErr: std::error::Error>(
     }
 }
 
-async fn try_to_broadcast<CErr: std::error::Error>(
+async fn try_to_broadcast(
     id: Transaction,
-    op_storage: &OpManager<CErr>,
+    op_storage: &OpManager,
     state: Option<PutState>,
     broadcast_to: Vec<PeerKeyLocation>,
     key: ContractKey,
     new_value: WrappedState,
     ttl: Duration,
-) -> Result<(Option<PutState>, Option<PutMsg>), OpError<CErr>> {
+) -> Result<(Option<PutState>, Option<PutMsg>), OpError> {
     let new_state;
     let return_msg;
 
@@ -524,13 +530,7 @@ enum PutState {
 }
 
 /// Request to insert/update a value into a contract.
-pub(crate) async fn request_put<CErr>(
-    op_storage: &OpManager<CErr>,
-    put_op: PutOp,
-) -> Result<(), OpError<CErr>>
-where
-    CErr: std::error::Error,
-{
+pub(crate) async fn request_put(op_storage: &OpManager, put_op: PutOp) -> Result<(), OpError> {
     let key = if let Some(PutState::PrepareRequest { contract, .. }) = put_op.state.clone() {
         contract.key()
     } else {
@@ -584,14 +584,11 @@ where
     Ok(())
 }
 
-async fn put_contract<CErr>(
-    op_storage: &OpManager<CErr>,
+async fn put_contract(
+    op_storage: &OpManager,
     key: ContractKey,
     state: WrappedState,
-) -> Result<WrappedState, OpError<CErr>>
-where
-    CErr: std::error::Error,
-{
+) -> Result<WrappedState, OpError> {
     // after the contract has been cached, push the update query
     match op_storage
         .notify_contract_handler(ContractHandlerEvent::PushQuery { key, state })
@@ -615,8 +612,8 @@ where
 // since sending the contract over and over, will be expensive; this can be done via subscriptions
 /// Communicate changes in the contract to other peers nearby the contract location.
 /// This operation is "fire and forget" and the node does not keep track if is successful or not.
-async fn forward_changes<CErr, CB>(
-    op_storage: &OpManager<CErr>,
+async fn forward_changes<CB>(
+    op_storage: &OpManager,
     conn_manager: &CB,
     contract: &ContractContainer,
     new_value: WrappedState,
@@ -624,7 +621,6 @@ async fn forward_changes<CErr, CB>(
     htl: usize,
     skip_list: &[PeerKey],
 ) where
-    CErr: std::error::Error,
     CB: ConnectionBridge,
 {
     let key = contract.key();

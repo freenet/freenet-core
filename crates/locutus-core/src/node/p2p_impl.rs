@@ -28,19 +28,16 @@ use crate::{
 
 use super::OpManager;
 
-pub(super) struct NodeP2P<CErr> {
+pub(super) struct NodeP2P {
     pub(crate) peer_key: PeerKey,
-    pub(crate) op_storage: Arc<OpManager<CErr>>,
+    pub(crate) op_storage: Arc<OpManager>,
     notification_channel: Receiver<Either<Message, NodeEvent>>,
     pub(super) conn_manager: P2pConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
 }
 
-impl<CErr> NodeP2P<CErr>
-where
-    CErr: std::error::Error + Send + Sync + 'static,
-{
+impl NodeP2P {
     pub(super) async fn run_node(mut self) -> Result<(), anyhow::Error> {
         // start listening in case this is a listening node (gateway) and join the ring
         if self.is_gateway {
@@ -68,12 +65,11 @@ where
             .await
     }
 
-    pub(crate) fn build<CH, Err, const CLIENTS: usize>(
+    pub(crate) fn build<CH, const CLIENTS: usize>(
         config: NodeConfig<CLIENTS>,
-    ) -> Result<NodeP2P<Err>, anyhow::Error>
+    ) -> Result<NodeP2P, anyhow::Error>
     where
-        CH: ContractHandler<Error = Err> + Send + Sync + 'static,
-        Err: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
+        CH: ContractHandler + Send + Sync + 'static,
     {
         let peer_key = PeerKey::from(config.local_key.public());
         let gateways = config.get_gateways()?;
@@ -134,7 +130,7 @@ mod test {
     use crate::{
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
-        contract::{TestContractHandler, TestContractStoreError},
+        contract::TestContractHandler,
         node::{test::get_free_port, InitPeerNode},
         ring::Location,
     };
@@ -144,10 +140,7 @@ mod test {
     use tokio::sync::watch::channel;
 
     /// Ping test event loop
-    async fn ping_ev_loop<CErr>(peer: &mut NodeP2P<CErr>) -> Result<(), ()>
-    where
-        CErr: std::error::Error,
-    {
+    async fn ping_ev_loop(peer: &mut NodeP2P) -> Result<(), ()> {
         loop {
             let ev = tokio::time::timeout(
                 Duration::from_secs(30),
@@ -194,11 +187,7 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 = Box::new(NodeP2P::<TestContractStoreError>::build::<
-                TestContractHandler,
-                TestContractStoreError,
-                1,
-            >(config)?);
+            let mut peer1 = Box::new(NodeP2P::build::<TestContractHandler, 1>(config)?);
             peer1.conn_manager.listen_on()?;
             ping_ev_loop(&mut peer1).await.unwrap();
             Ok::<_, anyhow::Error>(())
@@ -209,12 +198,7 @@ mod test {
             let user_events = MemoryEventsGen::new(receiver2, PeerKey::from(peer2_id));
             let mut config = NodeConfig::new([Box::new(user_events)]);
             config.add_gateway(peer1_config.clone());
-            let mut peer2 = NodeP2P::<TestContractStoreError>::build::<
-                TestContractHandler,
-                TestContractStoreError,
-                1,
-            >(config)
-            .unwrap();
+            let mut peer2 = NodeP2P::build::<TestContractHandler, 1>(config).unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2

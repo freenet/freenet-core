@@ -7,6 +7,7 @@ use locutus_runtime::ContractKey;
 use crate::message::InnerMessage;
 use crate::operations::op_trait::Operation;
 use crate::operations::OpInitialization;
+use crate::DynError;
 use crate::{
     config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
@@ -32,18 +33,27 @@ pub(crate) struct GetOp {
     _ttl: Duration,
 }
 
-impl<CErr, CB: ConnectionBridge> Operation<CErr, CB> for GetOp
+pub(crate) struct GetResult {}
+
+impl TryFrom<GetOp> for GetResult {
+    type Error = OpError;
+
+    fn try_from(value: GetOp) -> Result<Self, Self::Error> {
+        todo!()
+    }
+}
+
+impl<CB: ConnectionBridge> Operation<CB> for GetOp
 where
-    CErr: std::error::Error + Send + Sync,
     CB: std::marker::Send,
 {
     type Message = GetMsg;
-    type Error = OpError<CErr>;
+    type Result = GetResult;
 
     fn load_or_init(
-        op_storage: &OpManager<CErr>,
+        op_storage: &OpManager,
         msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError<CErr>> {
+    ) -> Result<OpInitialization<Self>, OpError> {
         let mut sender: Option<PeerKey> = None;
         if let Some(peer_key_loc) = msg.sender().cloned() {
             sender = Some(peer_key_loc.peer);
@@ -78,9 +88,9 @@ where
     fn process_message<'a>(
         self,
         conn_manager: &'a mut CB,
-        op_storage: &'a OpManager<CErr>,
+        op_storage: &'a OpManager,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
             let new_state;
@@ -403,12 +413,12 @@ where
     }
 }
 
-fn build_op_result<CErr: std::error::Error>(
+fn build_op_result(
     id: Transaction,
     state: Option<GetState>,
     msg: Option<GetMsg>,
     ttl: Duration,
-) -> Result<OperationResult, OpError<CErr>> {
+) -> Result<OperationResult, OpError> {
     let output_op = Some(GetOp {
         id,
         state,
@@ -420,11 +430,11 @@ fn build_op_result<CErr: std::error::Error>(
     })
 }
 
-async fn continue_seeking<CErr: std::error::Error, CB: ConnectionBridge>(
+async fn continue_seeking<CB: ConnectionBridge>(
     conn_manager: &mut CB,
     new_target: &PeerKeyLocation,
     retry_msg: Message,
-) -> Result<(), OpError<CErr>> {
+) -> Result<(), OpError> {
     tracing::info!(
         "Retrying to get the contract from node @ {}",
         new_target.peer
@@ -435,13 +445,13 @@ async fn continue_seeking<CErr: std::error::Error, CB: ConnectionBridge>(
     Ok(())
 }
 
-fn check_contract_found<CErr: std::error::Error>(
+fn check_contract_found(
     key: ContractKey,
     id: Transaction,
     fetch_contract: bool,
-    value: &Result<StoreResponse, CErr>,
+    value: &Result<StoreResponse, DynError>,
     returned_key: ContractKey,
-) -> Result<(), OpError<CErr>> {
+) -> Result<(), OpError> {
     if returned_key != key {
         // shouldn't be a reachable path
         tracing::error!(
@@ -504,13 +514,7 @@ enum GetState {
 }
 
 /// Request to get the current value from a contract.
-pub(crate) async fn request_get<CErr>(
-    op_storage: &OpManager<CErr>,
-    get_op: GetOp,
-) -> Result<(), OpError<CErr>>
-where
-    CErr: std::error::Error,
-{
+pub(crate) async fn request_get(op_storage: &OpManager, get_op: GetOp) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = get_op.state.clone()
     {
         // the initial request must provide:

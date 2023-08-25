@@ -113,7 +113,7 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 type P2pBridgeEvent = Either<(PeerKey, Box<Message>), NodeEvent>;
 
 #[derive(Clone)]
-pub(in crate::node) struct P2pBridge {
+pub(crate) struct P2pBridge {
     active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
     accepted_peers: Arc<DashSet<PeerKey>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
@@ -217,14 +217,11 @@ impl P2pConnManager {
         Ok(())
     }
 
-    pub async fn run_event_listener<CErr>(
+    pub async fn run_event_listener(
         mut self,
-        op_manager: Arc<OpManager<CErr>>,
+        op_manager: Arc<OpManager>,
         mut notification_channel: Receiver<Either<Message, NodeEvent>>,
-    ) -> Result<(), anyhow::Error>
-    where
-        CErr: std::error::Error + Send + Sync + 'static,
-    {
+    ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
         loop {
