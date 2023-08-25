@@ -132,7 +132,8 @@ impl ContractStore {
                     tracing::debug!("contract not found: {err}");
                     err
                 })
-                .ok()? else {
+                .ok()?
+            else {
                 unimplemented!()
             };
             // add back the contract part to the mem store
