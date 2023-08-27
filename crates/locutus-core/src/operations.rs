@@ -49,7 +49,7 @@ where
     handle_op_result(
         op_storage,
         conn_manager,
-        result.map_err(|err| (err.into(), tx)),
+        result.map_err(|err| (err, tx)),
         sender,
     )
     .await

@@ -2,12 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use locutus_runtime::ContractKey;
+use locutus_runtime::{ContractContainer, ContractKey, Parameters};
 
 use crate::message::InnerMessage;
 use crate::operations::op_trait::Operation;
 use crate::operations::OpInitialization;
-use crate::DynError;
 use crate::{
     config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
@@ -15,6 +14,7 @@ use crate::{
     node::{ConnectionBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
 };
+use crate::{DynError, WrappedState};
 
 use super::{OpEnum, OpError, OperationResult};
 
@@ -33,12 +33,16 @@ pub(crate) struct GetOp {
     _ttl: Duration,
 }
 
-pub(crate) struct GetResult {}
+pub(crate) struct GetResult {
+    pub state: WrappedState,
+    pub contract: ContractContainer,
+    pub params: Parameters<'static>,
+}
 
 impl TryFrom<GetOp> for GetResult {
     type Error = OpError;
 
-    fn try_from(value: GetOp) -> Result<Self, Self::Error> {
+    fn try_from(_value: GetOp) -> Result<Self, Self::Error> {
         todo!()
     }
 }

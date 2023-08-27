@@ -69,7 +69,7 @@ impl StateStorage for Pool {
     async fn store(
         &mut self,
         key: ContractKey,
-        state: locutus_runtime::WrappedState,
+        state: locutus_runtime::WrappedV1State,
     ) -> Result<(), Self::Error> {
         sqlx::query(
             "INSERT INTO states (contract, state) 
@@ -87,7 +87,7 @@ impl StateStorage for Pool {
     async fn get(
         &self,
         key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
+    ) -> Result<Option<locutus_runtime::WrappedV1State>, Self::Error> {
         match sqlx::query("SELECT state FROM states WHERE contract = ?")
             .bind(key.bytes())
             .map(|row: SqliteRow| Some(WrappedState::new(row.get("state"))))
@@ -269,7 +269,7 @@ where
                             &key,
                             &params,
                             &state,
-                            related_contracts,
+                            &related_contracts,
                         )?;
                         // FIXME: should deal with additional related contracts requested
                         if result != ValidateResult::Valid {

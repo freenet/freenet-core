@@ -17,8 +17,8 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
-        related: locutus_runtime::RelatedContracts,
+        state: &locutus_runtime::WrappedV1State,
+        related: &locutus_runtime::RelatedContracts,
     ) -> locutus_runtime::RuntimeResult<ValidateResult> {
         todo!()
     }
@@ -36,7 +36,7 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
+        state: &locutus_runtime::WrappedV1State,
         data: &[locutus_runtime::UpdateData<'_>],
     ) -> locutus_runtime::RuntimeResult<UpdateModification<'static>> {
         todo!()
@@ -46,7 +46,7 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
+        state: &locutus_runtime::WrappedV1State,
     ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateSummary<'static>> {
         todo!()
     }
@@ -55,7 +55,7 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
+        state: &locutus_runtime::WrappedV1State,
         delta_to: &locutus_runtime::StateSummary<'_>,
     ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateDelta<'static>> {
         todo!()
@@ -72,7 +72,7 @@ impl StateStorage for MemKVStore {
     async fn store(
         &mut self,
         _key: ContractKey,
-        _state: locutus_runtime::WrappedState,
+        _state: locutus_runtime::WrappedV1State,
     ) -> Result<(), Self::Error> {
         todo!()
     }
@@ -80,7 +80,7 @@ impl StateStorage for MemKVStore {
     async fn get(
         &self,
         _key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
+    ) -> Result<Option<locutus_runtime::WrappedV1State>, Self::Error> {
         todo!()
     }
 

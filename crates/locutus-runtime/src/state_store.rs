@@ -4,7 +4,7 @@ use std::pin::Pin;
 use locutus_stdlib::prelude::{ContractKey, Parameters};
 use stretto::AsyncCache;
 
-use crate::{DynError, WrappedState};
+use crate::{DynError, WrappedV1State};
 
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {
@@ -18,13 +18,13 @@ pub enum StateStoreError {
 #[allow(clippy::type_complexity)]
 pub trait StateStorage {
     type Error;
-    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error>;
+    async fn store(&mut self, key: ContractKey, state: WrappedV1State) -> Result<(), Self::Error>;
     async fn store_params(
         &mut self,
         key: ContractKey,
         state: Parameters<'static>,
     ) -> Result<(), Self::Error>;
-    async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
+    async fn get(&self, key: &ContractKey) -> Result<Option<WrappedV1State>, Self::Error>;
     fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
@@ -32,7 +32,7 @@ pub trait StateStorage {
 }
 
 pub struct StateStore<S: StateStorage> {
-    state_mem_cache: AsyncCache<ContractKey, WrappedState>,
+    state_mem_cache: AsyncCache<ContractKey, WrappedV1State>,
     // params_mem_cache: AsyncCache<ContractKey, Parameters<'static>>,
     store: S,
 }
@@ -60,7 +60,7 @@ where
     pub async fn store(
         &mut self,
         key: ContractKey,
-        state: WrappedState,
+        state: WrappedV1State,
         params: Option<Parameters<'static>>,
     ) -> Result<(), StateStoreError> {
         self.store
@@ -80,7 +80,7 @@ where
         Ok(())
     }
 
-    pub async fn get(&self, key: &ContractKey) -> Result<WrappedState, StateStoreError> {
+    pub async fn get(&self, key: &ContractKey) -> Result<WrappedV1State, StateStoreError> {
         if let Some(v) = self.state_mem_cache.get(key).await {
             return Ok(v.value().clone());
         }

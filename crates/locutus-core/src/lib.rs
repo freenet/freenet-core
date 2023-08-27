@@ -11,7 +11,7 @@ mod router;
 pub mod util;
 
 pub type WrappedContract = locutus_runtime::prelude::WrappedContract;
-pub type WrappedState = locutus_runtime::prelude::WrappedState;
+pub type WrappedState = locutus_runtime::prelude::WrappedV1State;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

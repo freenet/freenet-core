@@ -5,7 +5,7 @@ pub mod storages;
 mod test;
 
 #[cfg(test)]
-pub(crate) use handler::test::{TestContractHandler, TestContractStoreError};
+pub(crate) use handler::test::TestContractHandler;
 pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, StoreResponse,

@@ -39,7 +39,7 @@ pub(crate) struct JoinRingResult {}
 impl TryFrom<JoinRingOp> for JoinRingResult {
     type Error = OpError;
 
-    fn try_from(value: JoinRingOp) -> Result<Self, Self::Error> {
+    fn try_from(_value: JoinRingOp) -> Result<Self, Self::Error> {
         todo!()
     }
 }

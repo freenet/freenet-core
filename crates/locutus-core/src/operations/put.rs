@@ -32,7 +32,7 @@ pub(crate) struct PutResult {}
 impl TryFrom<PutOp> for PutResult {
     type Error = OpError;
 
-    fn try_from(value: PutOp) -> Result<Self, Self::Error> {
+    fn try_from(_value: PutOp) -> Result<Self, Self::Error> {
         todo!()
     }
 }

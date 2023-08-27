@@ -32,7 +32,7 @@ pub(crate) struct SubscribeResult {}
 impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
 
-    fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
+    fn try_from(_value: SubscribeOp) -> Result<Self, Self::Error> {
         todo!()
     }
 }

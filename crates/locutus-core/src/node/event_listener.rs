@@ -176,7 +176,7 @@ mod test_utils {
     };
 
     use dashmap::DashMap;
-    use locutus_runtime::WrappedState;
+    use locutus_runtime::WrappedV1State;
     use parking_lot::RwLock;
 
     use super::*;
@@ -225,7 +225,7 @@ mod test_utils {
             &self,
             peer: &PeerKey,
             for_key: &ContractKey,
-            expected_value: &WrappedState,
+            expected_value: &WrappedV1State,
         ) -> bool {
             let logs = self.logs.read();
             let put_ops = logs.iter().filter_map(|l| match &l.kind {

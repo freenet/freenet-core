@@ -1,6 +1,6 @@
 use locutus_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
-    UpdateData, UpdateModification, ValidateResult, WrappedState,
+    UpdateData, UpdateModification, ValidateResult, WrappedV1State,
 };
 use wasmer::TypedFunction;
 
@@ -15,8 +15,8 @@ pub trait ContractRuntimeInterface {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
-        state: &WrappedState,
-        related: RelatedContracts,
+        state: &WrappedV1State,
+        related: &RelatedContracts<'_>,
     ) -> RuntimeResult<ValidateResult>;
 
     /// Verify that a delta is valid - at least as much as possible. The goal is to prevent DDoS of
@@ -40,7 +40,7 @@ pub trait ContractRuntimeInterface {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
-        state: &WrappedState,
+        state: &WrappedV1State,
         update_data: &[UpdateData<'_>],
     ) -> RuntimeResult<UpdateModification<'static>>;
 
@@ -51,7 +51,7 @@ pub trait ContractRuntimeInterface {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
-        state: &WrappedState,
+        state: &WrappedV1State,
     ) -> RuntimeResult<StateSummary<'static>>;
 
     /// Generate a state delta using a summary from the current state.
@@ -61,7 +61,7 @@ pub trait ContractRuntimeInterface {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
-        state: &WrappedState,
+        state: &WrappedV1State,
         delta_to: &StateSummary<'_>,
     ) -> RuntimeResult<StateDelta<'static>>;
 }
@@ -71,8 +71,8 @@ impl ContractRuntimeInterface for crate::Runtime {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
-        state: &WrappedState,
-        related: RelatedContracts,
+        state: &WrappedV1State,
+        related: &RelatedContracts<'_>,
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
@@ -89,7 +89,7 @@ impl ContractRuntimeInterface for crate::Runtime {
             state_buf.ptr()
         };
         let related_buf_ptr = {
-            let serialized = bincode::serialize(&related)?;
+            let serialized = bincode::serialize(related)?;
             let mut related_buf = self.init_buf(&running.instance, &serialized)?;
             related_buf.write(serialized)?;
             related_buf.ptr()
@@ -161,7 +161,7 @@ impl ContractRuntimeInterface for crate::Runtime {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
-        state: &WrappedState,
+        state: &WrappedV1State,
         update_data: &[UpdateData<'_>],
     ) -> RuntimeResult<UpdateModification<'static>> {
         // todo: if we keep this hot in memory some things to take into account:
@@ -214,7 +214,7 @@ impl ContractRuntimeInterface for crate::Runtime {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
-        state: &WrappedState,
+        state: &WrappedV1State,
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
@@ -256,7 +256,7 @@ impl ContractRuntimeInterface for crate::Runtime {
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'a>,
-        state: &WrappedState,
+        state: &WrappedV1State,
         summary: &StateSummary<'a>,
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();

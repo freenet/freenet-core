@@ -229,7 +229,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
                 let state = cmd.input.unwrap().unwrap_put();
                 ContractRequest::Put {
                     contract: cmd.contract,
-                    state: WrappedState::new(state.into_bytes()),
+                    state: WrappedV1State::new(state.into_bytes()),
                     related_contracts: Default::default(),
                 }
                 .into()

@@ -138,6 +138,12 @@ impl<'a> RelatedContracts<'a> {
     ) -> impl Iterator<Item = (&ContractInstanceId, &mut Option<State<'a>>)> + 'b {
         self.map.iter_mut()
     }
+
+    pub fn missing(&mut self, contracts: Vec<ContractInstanceId>) {
+        for key in contracts {
+            self.map.entry(key).or_default();
+        }
+    }
 }
 
 impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
@@ -1171,17 +1177,17 @@ fn internal_fmt_key(
 /// The state for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct WrappedState(
+pub struct WrappedV1State(
     #[serde(
-        serialize_with = "WrappedState::ser_state",
-        deserialize_with = "WrappedState::deser_state"
+        serialize_with = "WrappedV1State::ser_state",
+        deserialize_with = "WrappedV1State::deser_state"
     )]
     Arc<Vec<u8>>,
 );
 
-impl WrappedState {
+impl WrappedV1State {
     pub fn new(bytes: Vec<u8>) -> Self {
-        WrappedState(Arc::new(bytes))
+        WrappedV1State(Arc::new(bytes))
     }
 
     pub fn size(&self) -> usize {
@@ -1204,32 +1210,32 @@ impl WrappedState {
     }
 }
 
-impl From<Vec<u8>> for WrappedState {
+impl From<Vec<u8>> for WrappedV1State {
     fn from(bytes: Vec<u8>) -> Self {
         Self::new(bytes)
     }
 }
 
-impl From<&'_ [u8]> for WrappedState {
+impl From<&'_ [u8]> for WrappedV1State {
     fn from(bytes: &[u8]) -> Self {
         Self::new(bytes.to_owned())
     }
 }
 
-impl TryFromTsStd<&rmpv::Value> for WrappedState {
+impl TryFromTsStd<&rmpv::Value> for WrappedV1State {
     fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
         let state = value.as_slice().unwrap().to_vec();
-        Ok(WrappedState::from(state))
+        Ok(WrappedV1State::from(state))
     }
 }
 
-impl AsRef<[u8]> for WrappedState {
+impl AsRef<[u8]> for WrappedV1State {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
 }
 
-impl Deref for WrappedState {
+impl Deref for WrappedV1State {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -1237,14 +1243,14 @@ impl Deref for WrappedState {
     }
 }
 
-impl Borrow<[u8]> for WrappedState {
+impl Borrow<[u8]> for WrappedV1State {
     fn borrow(&self) -> &[u8] {
         &self.0
     }
 }
 
-impl From<WrappedState> for State<'static> {
-    fn from(value: WrappedState) -> Self {
+impl From<WrappedV1State> for State<'static> {
+    fn from(value: WrappedV1State) -> Self {
         match Arc::try_unwrap(value.0) {
             Ok(v) => State::from(v),
             Err(v) => State::from(v.as_ref().to_vec()),
@@ -1252,7 +1258,7 @@ impl From<WrappedState> for State<'static> {
     }
 }
 
-impl std::fmt::Display for WrappedState {
+impl std::fmt::Display for WrappedV1State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let data: String = if self.0.len() > 8 {
             let last_4 = self.0.len() - 4;

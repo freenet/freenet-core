@@ -19,16 +19,16 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
     let is_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
-        &WrappedState::new(vec![1, 2, 3, 4]),
-        Default::default(),
+        &WrappedV1State::new(vec![1, 2, 3, 4]),
+        &Default::default(),
     )?;
     assert!(is_valid == ValidateResult::Valid);
 
     let not_valid = runtime.validate_state(
         &key,
         &Parameters::from([].as_ref()),
-        &WrappedState::new(vec![1, 0, 0, 1]),
-        Default::default(),
+        &WrappedV1State::new(vec![1, 0, 0, 1]),
+        &Default::default(),
     )?;
     assert!(matches!(not_valid, ValidateResult::RequestRelated(_)));
 
@@ -78,7 +78,7 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
         .update_state(
             &key,
             &Parameters::from([].as_ref()),
-            &WrappedState::new(vec![5, 2, 3]),
+            &WrappedV1State::new(vec![5, 2, 3]),
             &[StateDelta::from([4].as_ref()).into()],
         )?
         .unwrap_valid();
@@ -101,7 +101,7 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
     let summary = runtime.summarize_state(
         &key,
         &Parameters::from([].as_ref()),
-        &WrappedState::new(vec![5, 2, 3, 4]),
+        &WrappedV1State::new(vec![5, 2, 3, 4]),
     )?;
     assert_eq!(summary.as_ref(), &[5, 2, 3]);
     Ok(())
@@ -121,7 +121,7 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     let delta = runtime.get_state_delta(
         &key,
         &Parameters::from([].as_ref()),
-        &WrappedState::new(vec![5, 2, 3, 4]),
+        &WrappedV1State::new(vec![5, 2, 3, 4]),
         &StateSummary::from([2, 3].as_ref()),
     )?;
     assert!(delta.as_ref().len() == 1);

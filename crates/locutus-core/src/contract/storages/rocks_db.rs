@@ -45,7 +45,7 @@ impl StateStorage for RocksDb {
     async fn store(
         &mut self,
         key: ContractKey,
-        state: locutus_runtime::WrappedState,
+        state: locutus_runtime::WrappedV1State,
     ) -> Result<(), Self::Error> {
         self.0
             .put([key.bytes(), RocksDb::STATE_SUFFIX].concat(), state)?;
@@ -56,7 +56,7 @@ impl StateStorage for RocksDb {
     async fn get(
         &self,
         key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
+    ) -> Result<Option<locutus_runtime::WrappedV1State>, Self::Error> {
         match self.0.get([key.bytes(), RocksDb::STATE_SUFFIX].concat()) {
             Ok(result) => {
                 if let Some(r) = result.map(|r| Some(WrappedState::new(r))) {
@@ -245,7 +245,7 @@ where
                             &key,
                             &params,
                             &state,
-                            related_contracts,
+                            &related_contracts,
                         )?;
                         // FIXME: should deal with additional related contracts requested
                         if result != ValidateResult::Valid {

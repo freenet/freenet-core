@@ -9,8 +9,6 @@ pub use sqlite::{Pool as SqlitePool, SQLiteContractHandler, SqlDbError};
 pub type Storage = SqlitePool;
 #[cfg(feature = "sqlite")]
 pub type StorageContractHandler<R> = SQLiteContractHandler<R>;
-#[cfg(feature = "sqlite")]
-pub type StorageDbError = SqlDbError;
 
 #[cfg(feature = "sqlite")]
 impl From<SqlDbError> for ContractError {
@@ -28,8 +26,6 @@ use self::rocks_db::{RocksDb, RocksDbContractHandler, RocksDbError};
 pub type Storage = RocksDb;
 #[cfg(all(feature = "rocks_db", not(feature = "sqlite")))]
 pub type StorageContractHandler<R> = RocksDbContractHandler<R>;
-#[cfg(all(feature = "rocks_db", not(feature = "sqlite")))]
-pub type StorageDbError = RocksDbError;
 
 #[cfg(feature = "rocks_db")]
 impl From<rocks_db::RocksDbError> for ContractError {
