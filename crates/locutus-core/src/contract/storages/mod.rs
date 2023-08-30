@@ -20,7 +20,7 @@ impl From<SqlDbError> for ContractError {
 #[cfg(feature = "rocks_db")]
 pub mod rocks_db;
 #[cfg(all(feature = "rocks_db", not(feature = "sqlite")))]
-use self::rocks_db::{RocksDb, RocksDbContractHandler, RocksDbError};
+use self::rocks_db::{RocksDb, RocksDbContractHandler};
 
 #[cfg(all(feature = "rocks_db", not(feature = "sqlite")))]
 pub type Storage = RocksDb;

@@ -1,8 +1,8 @@
 use rocksdb::{Options, DB};
-use std::{collections::HashMap, pin::Pin};
+use std::collections::HashMap;
 
 use futures::future::BoxFuture;
-use futures::{Future, FutureExt};
+use futures::FutureExt;
 use locutus_runtime::{
     ContractContainer, ContractError, ContractExecError, ContractRuntimeInterface, ContractStore,
     Parameters, StateStorage, StateStore, StateStoreError, ValidateResult,
@@ -45,7 +45,7 @@ impl StateStorage for RocksDb {
     async fn store(
         &mut self,
         key: ContractKey,
-        state: locutus_runtime::WrappedV1State,
+        state: locutus_runtime::WrappedState,
     ) -> Result<(), Self::Error> {
         self.0
             .put([key.bytes(), RocksDb::STATE_SUFFIX].concat(), state)?;
@@ -56,7 +56,7 @@ impl StateStorage for RocksDb {
     async fn get(
         &self,
         key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedV1State>, Self::Error> {
+    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
         match self.0.get([key.bytes(), RocksDb::STATE_SUFFIX].concat()) {
             Ok(result) => {
                 if let Some(r) = result.map(|r| Some(WrappedState::new(r))) {
@@ -92,25 +92,22 @@ impl StateStorage for RocksDb {
         Ok(())
     }
 
-    fn get_params<'a>(
+    async fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            match self.0.get([key.bytes(), RocksDb::PARAMS_SUFFIX].concat()) {
-                Ok(result) => Ok(result
-                    .map(|r| Some(Parameters::from(r)))
-                    .expect("vec bytes")),
-                Err(e) => {
-                    if rocksdb::ErrorKind::NotFound == e.kind() {
-                        Ok(None)
-                    } else {
-                        Err(e)
-                    }
+    ) -> Result<Option<Parameters<'static>>, Self::Error> {
+        match self.0.get([key.bytes(), RocksDb::PARAMS_SUFFIX].concat()) {
+            Ok(result) => Ok(result
+                .map(|r| Some(Parameters::from(r)))
+                .expect("vec bytes")),
+            Err(e) => {
+                if rocksdb::ErrorKind::NotFound == e.kind() {
+                    Ok(None)
+                } else {
+                    Err(e)
                 }
             }
-        })
+        }
     }
 }
 
@@ -251,8 +248,9 @@ where
                         if result != ValidateResult::Valid {
                             todo!("return error");
                         }
-                        let _params: Parameters<'static> = params.clone().into_bytes().into();
-                        self.state_store.store(key, state, None).await?;
+                        self.state_store
+                            .store(key, state, params.into_owned())
+                            .await?;
                         todo!()
                     }
                     _ => unreachable!(),

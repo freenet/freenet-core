@@ -17,7 +17,7 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedV1State,
+        state: &locutus_runtime::WrappedState,
         related: &locutus_runtime::RelatedContracts,
     ) -> locutus_runtime::RuntimeResult<ValidateResult> {
         todo!()
@@ -36,7 +36,7 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedV1State,
+        state: &locutus_runtime::WrappedState,
         data: &[locutus_runtime::UpdateData<'_>],
     ) -> locutus_runtime::RuntimeResult<UpdateModification<'static>> {
         todo!()
@@ -46,7 +46,7 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedV1State,
+        state: &locutus_runtime::WrappedState,
     ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateSummary<'static>> {
         todo!()
     }
@@ -55,7 +55,7 @@ impl ContractRuntimeInterface for MockRuntime {
         &mut self,
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedV1State,
+        state: &locutus_runtime::WrappedState,
         delta_to: &locutus_runtime::StateSummary<'_>,
     ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateDelta<'static>> {
         todo!()
@@ -72,7 +72,7 @@ impl StateStorage for MemKVStore {
     async fn store(
         &mut self,
         _key: ContractKey,
-        _state: locutus_runtime::WrappedV1State,
+        _state: locutus_runtime::WrappedState,
     ) -> Result<(), Self::Error> {
         todo!()
     }
@@ -80,7 +80,7 @@ impl StateStorage for MemKVStore {
     async fn get(
         &self,
         _key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedV1State>, Self::Error> {
+    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
         todo!()
     }
 
@@ -92,17 +92,10 @@ impl StateStorage for MemKVStore {
         todo!()
     }
 
-    fn get_params<'a>(
+    async fn get_params<'a>(
         &'a self,
         _key: &'a ContractKey,
-    ) -> std::pin::Pin<
-        Box<
-            dyn futures::Future<
-                    Output = Result<Option<locutus_runtime::Parameters<'static>>, Self::Error>,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> Result<Option<locutus_runtime::Parameters<'static>>, Self::Error> {
         todo!()
     }
 }

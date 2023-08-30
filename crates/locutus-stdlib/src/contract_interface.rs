@@ -575,6 +575,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct State<'a>(
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     Cow<'a, [u8]>,
@@ -652,6 +653,7 @@ impl<'a> std::io::Read for State<'a> {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct StateDelta<'a>(
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     Cow<'a, [u8]>,
@@ -716,6 +718,7 @@ impl<'a> DerefMut for StateDelta<'a> {
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct StateSummary<'a>(
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     Cow<'a, [u8]>,
@@ -787,6 +790,7 @@ impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContractCode<'a> {
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     pub(crate) data: Cow<'a, [u8]>,
@@ -1174,20 +1178,21 @@ fn internal_fmt_key(
     write!(f, "{}", &r[..8])
 }
 
+// TODO:  get rid of this when State is internally an Arc<[u8]>
 /// The state for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct WrappedV1State(
+pub struct WrappedState(
     #[serde(
-        serialize_with = "WrappedV1State::ser_state",
-        deserialize_with = "WrappedV1State::deser_state"
+        serialize_with = "WrappedState::ser_state",
+        deserialize_with = "WrappedState::deser_state"
     )]
     Arc<Vec<u8>>,
 );
 
-impl WrappedV1State {
+impl WrappedState {
     pub fn new(bytes: Vec<u8>) -> Self {
-        WrappedV1State(Arc::new(bytes))
+        WrappedState(Arc::new(bytes))
     }
 
     pub fn size(&self) -> usize {
@@ -1210,32 +1215,32 @@ impl WrappedV1State {
     }
 }
 
-impl From<Vec<u8>> for WrappedV1State {
+impl From<Vec<u8>> for WrappedState {
     fn from(bytes: Vec<u8>) -> Self {
         Self::new(bytes)
     }
 }
 
-impl From<&'_ [u8]> for WrappedV1State {
+impl From<&'_ [u8]> for WrappedState {
     fn from(bytes: &[u8]) -> Self {
         Self::new(bytes.to_owned())
     }
 }
 
-impl TryFromTsStd<&rmpv::Value> for WrappedV1State {
+impl TryFromTsStd<&rmpv::Value> for WrappedState {
     fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
         let state = value.as_slice().unwrap().to_vec();
-        Ok(WrappedV1State::from(state))
+        Ok(WrappedState::from(state))
     }
 }
 
-impl AsRef<[u8]> for WrappedV1State {
+impl AsRef<[u8]> for WrappedState {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
 }
 
-impl Deref for WrappedV1State {
+impl Deref for WrappedState {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -1243,14 +1248,14 @@ impl Deref for WrappedV1State {
     }
 }
 
-impl Borrow<[u8]> for WrappedV1State {
+impl Borrow<[u8]> for WrappedState {
     fn borrow(&self) -> &[u8] {
         &self.0
     }
 }
 
-impl From<WrappedV1State> for State<'static> {
-    fn from(value: WrappedV1State) -> Self {
+impl From<WrappedState> for State<'static> {
+    fn from(value: WrappedState) -> Self {
         match Arc::try_unwrap(value.0) {
             Ok(v) => State::from(v),
             Err(v) => State::from(v.as_ref().to_vec()),
@@ -1258,7 +1263,7 @@ impl From<WrappedV1State> for State<'static> {
     }
 }
 
-impl std::fmt::Display for WrappedV1State {
+impl std::fmt::Display for WrappedState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let data: String = if self.0.len() > 8 {
             let last_4 = self.0.len() - 4;

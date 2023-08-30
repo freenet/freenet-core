@@ -6,7 +6,7 @@ use crate::{
     delegate_interface::{DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
     prelude::{
         ContractKey, DelegateContainer, GetSecretRequest, Parameters, RelatedContracts, SecretsId,
-        StateSummary, UpdateData, WrappedV1State,
+        StateSummary, UpdateData, WrappedState,
     },
     versioning::ContractContainer,
 };
@@ -178,7 +178,7 @@ pub enum ContractRequest<'a> {
     Put {
         contract: ContractContainer,
         /// Value to upsert in the contract.
-        state: WrappedV1State,
+        state: WrappedState,
         /// Related contracts.
         #[serde(borrow)]
         related_contracts: RelatedContracts<'a>,
@@ -268,7 +268,7 @@ impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
                         ContractRequest::Put {
                             contract: ContractContainer::try_decode(*contract)
                                 .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            state: WrappedV1State::try_decode(*value_map.get("state").unwrap())
+                            state: WrappedState::try_decode(*value_map.get("state").unwrap())
                                 .map_err(|err| WsApiError::deserialization(err.to_string()))?,
                             related_contracts: RelatedContracts::try_decode(
                                 *value_map.get("relatedContracts").unwrap(),
@@ -450,7 +450,7 @@ impl Display for ClientRequest<'_> {
 
 /// A response to a previous [`ClientRequest`]
 #[derive(Serialize, Deserialize, Debug)]
-pub enum HostResponse<T = WrappedV1State, U = Vec<u8>> {
+pub enum HostResponse<T = WrappedState, U = Vec<u8>> {
     ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),
     DelegateResponse {
         key: DelegateKey,
@@ -470,7 +470,7 @@ impl HostResponse {
         }
     }
 
-    pub fn unwrap_get(self) -> (WrappedV1State, Option<ContractContainer>) {
+    pub fn unwrap_get(self) -> (WrappedState, Option<ContractContainer>) {
         if let Self::ContractResponse(ContractResponse::GetResponse {
             contract, state, ..
         }) = self
@@ -508,7 +508,7 @@ impl std::fmt::Display for HostResponse {
 
 // todo: add a `AsBytes` trait for state representations
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum ContractResponse<T = WrappedV1State> {
+pub enum ContractResponse<T = WrappedState> {
     GetResponse {
         key: ContractKey,
         contract: Option<ContractContainer>,

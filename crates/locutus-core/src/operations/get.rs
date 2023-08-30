@@ -33,6 +33,7 @@ pub(crate) struct GetOp {
     _ttl: Duration,
 }
 
+#[allow(dead_code)]
 pub(crate) struct GetResult {
     pub state: WrappedState,
     pub contract: ContractContainer,

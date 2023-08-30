@@ -8,7 +8,7 @@ use libp2p::{
 };
 use locutus_core::*;
 use locutus_runtime::prelude::{
-    ContractContainer, ContractWasmAPIVersion, WrappedContract, WrappedV1State,
+    ContractContainer, ContractWasmAPIVersion, WrappedContract, WrappedState,
 };
 use locutus_stdlib::{
     client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
@@ -50,7 +50,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         Parameters::from(vec![]),
     )));
     let key = contract.key().clone();
-    let init_val = WrappedV1State::new(vec![1, 2, 3, 4]);
+    let init_val = WrappedState::new(vec![1, 2, 3, 4]);
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     manager
@@ -80,7 +80,7 @@ async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {
         .map_err(|_| anyhow!("channel closed"))?;
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    let second_val = WrappedV1State::new(vec![2, 3, 1, 4]);
+    let second_val = WrappedState::new(vec![2, 3, 1, 4]);
     manager
         .tx_node_ev
         .send(

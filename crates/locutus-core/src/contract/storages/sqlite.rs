@@ -1,7 +1,6 @@
-use std::{collections::HashMap, pin::Pin, str::FromStr};
+use std::{collections::HashMap, str::FromStr};
 
-use futures::future::BoxFuture;
-use futures::{Future, FutureExt};
+use futures::{future::BoxFuture, FutureExt};
 use locutus_runtime::{
     ContractContainer, ContractError, ContractExecError, ContractRuntimeInterface, ContractStore,
     Parameters, StateStorage, StateStore, StateStoreError, ValidateResult,
@@ -69,7 +68,7 @@ impl StateStorage for Pool {
     async fn store(
         &mut self,
         key: ContractKey,
-        state: locutus_runtime::WrappedV1State,
+        state: locutus_runtime::WrappedState,
     ) -> Result<(), Self::Error> {
         sqlx::query(
             "INSERT INTO states (contract, state) 
@@ -87,7 +86,7 @@ impl StateStorage for Pool {
     async fn get(
         &self,
         key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedV1State>, Self::Error> {
+    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
         match sqlx::query("SELECT state FROM states WHERE contract = ?")
             .bind(key.bytes())
             .map(|row: SqliteRow| Some(WrappedState::new(row.get("state"))))
@@ -118,23 +117,20 @@ impl StateStorage for Pool {
         Ok(())
     }
 
-    fn get_params<'a>(
+    async fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            match sqlx::query("SELECT params FROM states WHERE contract = ?")
-                .bind(key.bytes())
-                .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("params"))))
-                .fetch_one(&self.0)
-                .await
-            {
-                Ok(result) => Ok(result),
-                Err(sqlx::Error::RowNotFound) => Ok(None),
-                Err(_) => Err(SqlDbError::ContractNotFound),
-            }
-        })
+    ) -> Result<Option<Parameters<'static>>, Self::Error> {
+        match sqlx::query("SELECT params FROM states WHERE contract = ?")
+            .bind(key.bytes())
+            .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("params"))))
+            .fetch_one(&self.0)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(sqlx::Error::RowNotFound) => Ok(None),
+            Err(_) => Err(SqlDbError::ContractNotFound),
+        }
     }
 }
 
@@ -275,8 +271,9 @@ where
                         if result != ValidateResult::Valid {
                             todo!("return error");
                         }
-                        let _params: Parameters<'static> = params.clone().into_bytes().into();
-                        self.state_store.store(key, state, None).await?;
+                        self.state_store
+                            .store(key, state, params.into_owned())
+                            .await?;
                         todo!()
                     }
                     _ => unreachable!(),
