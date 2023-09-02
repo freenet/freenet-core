@@ -16,13 +16,15 @@
   </a>
 </div>
 
-# Locutus
+# Freenet
+
+## (Formerly Locutus)
 
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
-Locutus is a software platform that makes it easy to create decentralized alternatives to today's centralized tech companies. These decentralized apps will be easy to use, scalable, and secured through cryptography.
+Freenet is a software platform that makes it easy to create decentralized alternatives to today's centralized tech companies. These decentralized apps will be easy to use, scalable, and secured through cryptography.
 
-To learn more about Locutus as a developer read [The Locutus Book](https://docs.freenet.org/). For an introduction to Locutus watch **Ian's talk and Q&A** - [YouTube](https://youtu.be/d31jmv5Tx5k) / [Vimeo](https://vimeo.com/manage/videos/740461100).
+To learn more about Locutus as a developer read [The User Manual](https://docs.freenet.org/). For an introduction to Freenet watch **Ian's talk and Q&A** - [YouTube](https://youtu.be/d31jmv5Tx5k) / [Vimeo](https://vimeo.com/manage/videos/740461100).
 
 ## Status
 
