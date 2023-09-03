@@ -8,12 +8,8 @@ use axum::{Extension, Router};
 use locutus_core::*;
 use locutus_runtime::ContractKey;
 use locutus_stdlib::client_api::{
-    ClientError, ClientRequest, ContractRequest, ContractResponse, DelegateRequest, ErrorKind,
-    HostResponse, TryFromFbs, TryFromTsStd,
-};
-use locutus_stdlib::client_request_generated::client_request::{
-    root_as_client_request, ClientRequest as FbsClientRequest,
-    DelegateRequest as FbsDelegateRequest, *,
+    ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+    TryFromTsStd,
 };
 
 use std::collections::VecDeque;
@@ -265,9 +261,9 @@ async fn process_client_request(
     // Try to deserialize the ClientRequest message
     let req = {
         if let Ok(client_request) = bincode::deserialize::<ClientRequest<'_>>(&msg) {
-            client_request
+            client_request.into_owned()
         } else if let Ok(client_request) = ClientRequest::try_decode_fbs(&msg) {
-            client_request.into()
+            client_request.into_owned()
         } else {
             match ContractRequest::try_decode(&msg) {
                 Ok(r) => r.to_owned().into(),

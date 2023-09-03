@@ -119,10 +119,9 @@ impl<'a> TryFromFbs<&FbsDelegateContainer<'a>> for DelegateContainer {
                 let delegate = container.delegate_as_wasm_delegate_v1().unwrap();
                 let data = DelegateCode::from(delegate.data().data().bytes().to_vec());
                 let params = Parameters::from(delegate.parameters().bytes().to_vec());
-                let r = Ok(DelegateContainer::from(DelegateContainer::Wasm(
-                    DelegateWasmAPIVersion::V1(Delegate::from((&data, &params))),
-                )));
-                r
+                Ok(DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
+                    Delegate::from((&data, &params)),
+                )))
             }
             _ => unreachable!(),
         }
@@ -445,12 +444,11 @@ impl<'a> TryFromFbs<&FbsContractContainer<'a>> for ContractContainer {
                 let data = Arc::new(ContractCode::from(contract.data().data().bytes().to_vec()));
                 let params = Parameters::from(contract.parameters().bytes().to_vec());
                 let key = ContractKey::from((&params, &*data));
-                let r = Ok(ContractContainer::from(V1(WrappedContract {
+                Ok(ContractContainer::from(V1(WrappedContract {
                     data,
                     params,
                     key,
-                })));
-                r
+                })))
             }
             _ => unreachable!(),
         }
