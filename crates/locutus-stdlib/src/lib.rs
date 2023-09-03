@@ -8,15 +8,15 @@ pub(crate) mod global;
 mod parameters;
 mod versioning;
 
-//#[allow(dead_code, unused_imports, clippy::all)]
-//#[path = "../../../target/flatbuffers/common_generated.rs"]
-pub mod common_generated;
-//#[allow(dead_code, unused_imports, clippy::all)]
-//#[path = "../../../target/flatbuffers/client_request_generated.rs"]
-pub mod client_request_generated;
-//#[allow(dead_code, unused_imports, clippy::all)]
-//#[path = "../../../target/flatbuffers/host_response_generated.rs"]
-pub mod host_response_generated;
+#[allow(dead_code, unused_imports, clippy::all)]
+#[path = "../../../target/flatbuffers/client_request_generated.rs"]
+pub(crate) mod client_request_generated;
+#[allow(dead_code, unused_imports, clippy::all)]
+#[path = "../../../target/flatbuffers/common_generated.rs"]
+pub(crate) mod common_generated;
+#[allow(dead_code, unused_imports, clippy::all)]
+#[path = "../../../target/flatbuffers/host_response_generated.rs"]
+pub(crate) mod host_response_generated;
 
 pub mod client_api;
 #[cfg(all(feature = "log", target_family = "wasm"))]
