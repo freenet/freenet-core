@@ -1,8 +1,6 @@
 import flatbuffers from 'flatbuffers';
 import base58 from "bs58";
 
-import {client_request, common} from "./client_request";
-import {host_response} from "./host_response";
 import {ContractContainerT} from "./common/contract-container";
 import {ContractInstanceIdT} from "./common/contract-instance-id";
 import {DeltaUpdateT} from "./common/delta-update";
@@ -11,6 +9,25 @@ import {RelatedStateAndDeltaUpdateT} from "./common/related-state-and-delta-upda
 import {RelatedStateUpdateT} from "./common/related-state-update";
 import {StateAndDeltaUpdateT} from "./common/state-and-delta-update";
 import {StateUpdateT} from "./common/state-update";
+import {
+    ClientRequest,
+    DelegateContainerT,
+    DisconnectT,
+    GetT,
+    PutT,
+    RelatedContractsT,
+    SubscribeT,
+    UpdateT
+} from "./client-request";
+import {UpdateDataT} from "./common/update-data";
+import {UpdateDataType} from "./common/update-data-type";
+import {ContractKeyT} from "./common/contract-key";
+import {PutResponseT} from "./host-response/put-response";
+import {GetResponseT} from "./host-response/get-response";
+import {UpdateResponseT} from "./host-response/update-response";
+import {UpdateNotificationT} from "./host-response/update-notification";
+import {HostResponse, HostResponseT} from "./host-response/host-response";
+import {ContractResponseT, ContractResponseType, HostResponseType} from "./host-response";
 
 /**
  * The id of a live instance of a contract. This is effectively the tuple
@@ -20,15 +37,29 @@ import {StateUpdateT} from "./common/state-update";
  */
 export type ContractInstanceId = Uint8Array;
 
+/**
+ * Wrapper that allows contract versioning. This enum maintains the types of contracts that are allowed
+ * and their corresponding version.
+ * @public
+ */
+export type ContractContainer = ContractContainerT;
+
+/**
+ * Wrapper that allows delegate versioning. This enum maintains the types of delegates that are allowed
+ * and their corresponding version.
+ * @public
+ */
+export type DelegateContainer = DelegateContainerT;
+
 
 /**
  * Representation of the client put request operation
  * @public
  */
-export class PutRequest extends client_request.PutT {
+export class PutRequest extends PutT {
     constructor(container: ContractContainerT | null = null,
                 wrappedState: (number)[] = [],
-                relatedContracts: client_request.RelatedContractsT | null = null) {
+                relatedContracts: RelatedContractsT | null = null) {
         super(container, wrappedState, relatedContracts);
     }
 }
@@ -37,9 +68,9 @@ export class PutRequest extends client_request.PutT {
  * Representation of the client update request operation
  * @public
  */
-export class UpdateRequest extends client_request.UpdateT {
-    constructor(key: Key | null = null, update: common.UpdateDataT | null = null) {
-        const contract_key = key?.get_contract_key().unpack();
+export class UpdateRequest extends UpdateT {
+    constructor(key: Key | null = null, update: UpdateDataT | null = null) {
+        const contract_key = key?.get_contract_key();
         super(contract_key, update);
     }
 }
@@ -48,9 +79,9 @@ export class UpdateRequest extends client_request.UpdateT {
  * Representation of the client get request operation
  * @public
  */
-export class GetRequest extends client_request.GetT {
+export class GetRequest extends GetT {
     constructor(key: Key | null = null, fetchContract: boolean = false) {
-        const contract_key = key?.get_contract_key().unpack();
+        const contract_key = key?.get_contract_key();
         super(contract_key, fetchContract);
     }
 }
@@ -59,9 +90,9 @@ export class GetRequest extends client_request.GetT {
  * Representation of the client subscribe request operation
  * @public
  */
-export class SubscribeRequest extends client_request.SubscribeT {
+export class SubscribeRequest extends SubscribeT {
     constructor(key: Key | null = null, summary: (number)[] = []) {
-        const contract_key = key?.get_contract_key().unpack();
+        const contract_key = key?.get_contract_key();
         super(contract_key, summary);
     }
 }
@@ -70,14 +101,14 @@ export class SubscribeRequest extends client_request.SubscribeT {
  * Representation of the client disconnect request operation
  * @public
  */
-export class DisconnectRequest extends client_request.DisconnectT {
+export class DisconnectRequest extends DisconnectT {
     constructor(cause: string | Uint8Array | null = null) {
         super(cause);
     }
 }
 
-export class UpdateData extends common.UpdateDataT {
-    constructor(updateDataType: common.UpdateDataType = common.UpdateDataType.NONE,
+export class UpdateData extends UpdateDataT {
+    constructor(updateDataType: UpdateDataType = UpdateDataType.NONE,
                 updateData: DeltaUpdateT | RelatedDeltaUpdateT | RelatedStateAndDeltaUpdateT | RelatedStateUpdateT
                     | StateAndDeltaUpdateT | StateUpdateT | null = null) {
         super(updateDataType, updateData);
@@ -88,7 +119,7 @@ export class UpdateData extends common.UpdateDataT {
  * Representation of the state update data
  * @public
  */
-export class StateUpdate extends common.StateUpdateT {
+export class StateUpdate extends StateUpdateT {
     constructor(state: (number)[] = []) {
         super(state);
     }
@@ -98,7 +129,7 @@ export class StateUpdate extends common.StateUpdateT {
  * Representation of the delta update data
  * @public
  */
-export class DeltaUpdate extends common.DeltaUpdateT {
+export class DeltaUpdate extends DeltaUpdateT {
     constructor(delta: (number)[] = []) {
         super(delta);
     }
@@ -108,7 +139,7 @@ export class DeltaUpdate extends common.DeltaUpdateT {
  * Representation of the state and delta update data
  * @public
  */
-export class StateAndDeltaUpdate extends common.StateAndDeltaUpdateT {
+export class StateAndDeltaUpdate extends StateAndDeltaUpdateT {
     constructor(state: (number)[] = [], delta: (number)[] = []) {
         super(state, delta);
     }
@@ -118,7 +149,7 @@ export class StateAndDeltaUpdate extends common.StateAndDeltaUpdateT {
  * Representation of the related state update data
  * @public
  */
-export class RelatedStateUpdate extends common.RelatedStateUpdateT {
+export class RelatedStateUpdate extends RelatedStateUpdateT {
     constructor(relatedTo: ContractInstanceIdT | null = null, state: (number)[] = []) {
         super(relatedTo, state);
     }
@@ -128,7 +159,7 @@ export class RelatedStateUpdate extends common.RelatedStateUpdateT {
  * Representation of the related delta update data
  * @public
  */
-export class RelatedDeltaUpdate extends common.RelatedDeltaUpdateT {
+export class RelatedDeltaUpdate extends RelatedDeltaUpdateT {
     constructor(relatedTo: ContractInstanceIdT | null = null, delta: (number)[] = []) {
         super(relatedTo, delta);
     }
@@ -138,33 +169,25 @@ export class RelatedDeltaUpdate extends common.RelatedDeltaUpdateT {
  * Representation of the related state and delta update data
  * @public
  */
-export class RelatedStateAndDeltaUpdate extends common.RelatedStateAndDeltaUpdateT {
+export class RelatedStateAndDeltaUpdate extends RelatedStateAndDeltaUpdateT {
     constructor(relatedTo: ContractInstanceIdT | null = null, state: (number)[] = [], delta: (number)[] = []) {
         super(relatedTo, state, delta);
     }
 }
 
 
-export class Key {
-    private builder = new flatbuffers.Builder(1024);
-    private key: common.ContractKey;
-
+export class Key extends ContractKeyT {
     constructor(instance: ContractInstanceId, code?: Uint8Array) {
         if (instance.length !== 32 || (code && code.length !== 32)) {
             throw new TypeError('Invalid array length, expected 32 bytes');
         }
 
-        const instanceOffset = common.ContractInstanceId.createDataVector(this.builder, instance);
-        const instanceEndOffset = common.ContractInstanceId.createContractInstanceId(this.builder, instanceOffset);
-        common.ContractKey.startContractKey(this.builder);
-        common.ContractKey.addInstance(this.builder, instanceEndOffset);
+        let contract_instance_id = new ContractInstanceIdT(Array.from(instance))
+        let contract_code: (number)[] = [];
         if (code) {
-            const codeOffset = common.ContractKey.createCodeVector(this.builder, code);
-            common.ContractKey.addCode(this.builder, codeOffset);
+            contract_code = Array.from(code);
         }
-        const keyOffset = common.ContractKey.endContractKey(this.builder);
-        this.builder.finish(keyOffset);
-        this.key = common.ContractKey.getRootAsContractKey(this.builder.dataBuffer());
+        super(contract_instance_id, contract_code);
     }
 
     static fromInstanceId(spec: string): Key {
@@ -173,22 +196,56 @@ export class Key {
     }
 
     bytes(): ContractInstanceId {
-        return this.key.instance()?.dataArray()!;
+        return new Uint8Array(this.instance?.data!) as ContractInstanceId;
     }
 
     codePart(): Uint8Array | null {
-        return this.key.codeArray();
+        return new Uint8Array(this.code);
     }
 
     encode(): string {
-        const instance = this.key.instance()?.dataArray()!;
+        const instance = new Uint8Array(this.instance?.data!);
         return base58.encode(instance);
     }
 
-    get_contract_key(): common.ContractKey {
-        return this.key;
+    get_contract_key(): Key {
+        return this;
     }
 }
+
+// host replies:
+
+/**
+ * The response for a contract put operation
+ * @public
+ */
+export type PutResponse = PutResponseT;
+
+/**
+ * The response for a contract get operation
+ * @public
+ */
+export type GetResponse = GetResponseT;
+
+/**
+ * The response for a contract update operation
+ * @public
+ */
+export type UpdateResponse = UpdateResponseT;
+
+/**
+ * The response for a contract update notification
+ * @public
+ */
+export type UpdateNotification = UpdateNotificationT;
+
+/**
+ * Host reponse error type
+ * @public
+ */
+export type HostError = {
+    cause: string;
+};
 
 
 // API
@@ -215,19 +272,19 @@ export interface ResponseHandler {
     /**
      * `Put` response handler
      */
-    onPut: (response: host_response.PutResponseT) => void;
+    onPut: (response: PutResponse) => void;
     /**
      * `Get` response handler
      */
-    onGet: (response: host_response.GetResponseT) => void;
+    onGet: (response: GetResponse) => void;
     /**
      * `Update` response handler
      */
-    onUpdate: (response: host_response.UpdateResponseT) => void;
+    onUpdate: (response: UpdateResponse) => void;
     /**
      * `Update` notification handler
      */
-    onUpdateNotification: (response: host_response.UpdateNotificationT) => void;
+    onUpdateNotification: (response: UpdateNotification) => void;
     /**
      * `Error` handler
      */
@@ -280,33 +337,33 @@ export class LocutusWsApi {
      * @private
      */
     private handleResponse(ev: MessageEvent<any>): void | Error {
-        let response: host_response.HostResponseT;
+        let response: HostResponseT;
         try {
             let data = new flatbuffers.ByteBuffer(ev.data);
-            response = new host_response.HostResponseT();
-            host_response.HostResponse.getRootAsHostResponse(data).unpackTo(response);
+            response = new HostResponseT();
+            HostResponse.getRootAsHostResponse(data).unpackTo(response);
         } catch (err) {
             console.log(`found error: ${err}`);
             return new Error(`${err}`);
         }
         switch (response.responseType) {
-            case host_response.HostResponseType.ContractResponse:
-                let host_resp = response.response as host_response.ContractResponseT;
+            case HostResponseType.ContractResponse:
+                let host_resp = response.response as ContractResponseT;
                 switch (host_resp.contractResponseType) {
-                    case host_response.ContractResponseType.PutResponse:
-                        const put_response = host_resp.contractResponse as host_response.PutResponseT;
+                    case ContractResponseType.PutResponse:
+                        const put_response = host_resp.contractResponse as PutResponseT;
                         this.reponseHandler.onPut(put_response);
                         break;
-                    case host_response.ContractResponseType.GetResponse:
-                        const get_response = host_resp.contractResponse as host_response.GetResponseT;
+                    case ContractResponseType.GetResponse:
+                        const get_response = host_resp.contractResponse as GetResponseT;
                         this.reponseHandler.onGet(get_response);
                         break;
-                    case host_response.ContractResponseType.UpdateResponse:
-                        const update_response = host_resp.contractResponse as host_response.UpdateResponseT;
+                    case ContractResponseType.UpdateResponse:
+                        const update_response = host_resp.contractResponse as UpdateResponseT;
                         this.reponseHandler.onUpdate(update_response);
                         break;
-                    case host_response.ContractResponseType.UpdateNotification:
-                        const update_notification = host_resp.contractResponse as host_response.UpdateNotificationT;
+                    case ContractResponseType.UpdateNotification:
+                        const update_notification = host_resp.contractResponse as UpdateNotificationT;
                         this.reponseHandler.onUpdateNotification(update_notification);
                         break;
                     default:
@@ -320,16 +377,16 @@ export class LocutusWsApi {
 
                 }
                 break;
-            case host_response.HostResponseType.DelegateResponse:
+            case HostResponseType.DelegateResponse:
                 console.log(`Delegate response handler not implemented`);
                 break;
-            case host_response.HostResponseType.GenerateRandData:
+            case HostResponseType.GenerateRandData:
                 console.log(`GenerateRandData response handler not implemented`);
                 break;
-            case host_response.HostResponseType.Ok:
+            case HostResponseType.Ok:
                 console.log(`not implemented`);
                 break;
-            case host_response.HostResponseType.NONE:
+            case HostResponseType.NONE:
                 console.log(`response error`);
                 break;
             default:
@@ -349,7 +406,7 @@ export class LocutusWsApi {
      */
     async put(put: PutRequest): Promise<void> {
         let fbb = new flatbuffers.Builder(1024);
-        client_request.ClientRequest.finishClientRequestBuffer(fbb, put.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, put.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -359,7 +416,7 @@ export class LocutusWsApi {
      */
     async update(update: UpdateRequest): Promise<void> {
         let fbb = new flatbuffers.Builder(1024);
-        client_request.ClientRequest.finishClientRequestBuffer(fbb, update.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, update.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -369,7 +426,7 @@ export class LocutusWsApi {
      */
     async get(get: GetRequest): Promise<void> {
         let fbb = new flatbuffers.Builder(1024);
-        client_request.ClientRequest.finishClientRequestBuffer(fbb, get.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, get.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -379,7 +436,7 @@ export class LocutusWsApi {
      */
     async subscribe(subscribe: SubscribeRequest): Promise<void> {
         let fbb = new flatbuffers.Builder(1024);
-        client_request.ClientRequest.finishClientRequestBuffer(fbb, subscribe.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, subscribe.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -389,42 +446,8 @@ export class LocutusWsApi {
      */
     async disconnect(disconnect: DisconnectRequest): Promise<void> {
         let fbb = new flatbuffers.Builder(1024);
-        client_request.ClientRequest.finishClientRequestBuffer(fbb, disconnect.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, disconnect.pack(fbb));
         this.ws.send(fbb.asUint8Array());
         this.ws.close();
     }
 }
-
-// host replies:
-
-/**
- * The response for a contract put operation
- * @public
- */
-export type PutResponse = host_response.PutResponseT;
-
-/**
- * The response for a contract get operation
- * @public
- */
-export type GetResponse = host_response.GetResponseT;
-
-/**
- * The response for a contract update operation
- * @public
- */
-export type UpdateResponse = host_response.UpdateResponseT;
-
-/**
- * The response for a contract update notification
- * @public
- */
-export type UpdateNotification = host_response.UpdateNotificationT;
-
-/**
- * Host reponse error type
- * @public
- */
-export type HostError = {
-    cause: string;
-};
