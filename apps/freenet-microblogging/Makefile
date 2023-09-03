@@ -5,13 +5,14 @@
 WEB_DIR =./web
 POSTS_DIR =./contracts/posts
 LOCUTUS_DIR := $(abspath ../../)
-CARGO_TARGET_DIR ?= ${LOCUTUS_DIR}/target
-export CARGO_TARGET_DIR
+
+ifeq ($(CARGO_TARGET_DIR),)
+$(error CARGO_TARGET_DIR is not set)
+endif
 
 build-tool:
-	cd $(LOCUTUS_DIR)
-	cd crates/locutus-node
-	cargo build --bin ldt
+	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
+	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
 webapp:
 	cd $(LOCUTUS_DIR)
