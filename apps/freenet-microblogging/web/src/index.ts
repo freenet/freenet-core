@@ -11,7 +11,7 @@ import {
     SubscribeRequest,
     UpdateData,
     DeltaUpdate,
-} from "locutus-stdlib/flatbuffersWebSocketInterface";
+} from "locutus-stdlib/webSocketInterface";
 
 import "./scss/styles.scss";
 import {UpdateDataType} from "locutus-stdlib/common";
