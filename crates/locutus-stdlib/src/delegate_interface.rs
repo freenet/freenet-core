@@ -503,11 +503,7 @@ impl<'a> TryFromFbs<&FbsInboundDelegateMsg<'a>> for InboundDelegateMsg<'a> {
                 let get_secret = msg.inbound_as_get_secret_response().unwrap();
                 let get_secret = GetSecretResponse {
                     key: SecretsId::try_decode_fbs(&get_secret.key())?,
-                    value: if let Some(value) = get_secret.value() {
-                        Some(value.bytes().to_vec())
-                    } else {
-                        None
-                    },
+                    value: get_secret.value().map(|value| value.bytes().to_vec()),
                     context: DelegateContext::new(get_secret.context().bytes().to_vec()),
                 };
                 Ok(InboundDelegateMsg::GetSecretResponse(get_secret))
@@ -721,7 +717,7 @@ impl NotificationMessage<'_> {
         NotificationMessage(self.0.into_owned().into())
     }
     pub fn bytes(&self) -> &[u8] {
-        &self.0.as_ref()
+        self.0.as_ref()
     }
 }
 
@@ -749,7 +745,7 @@ impl ClientResponse<'_> {
         ClientResponse(self.0.into_owned().into())
     }
     pub fn bytes(&self) -> &[u8] {
-        &self.0.as_ref()
+        self.0.as_ref()
     }
 }
 
