@@ -7,6 +7,7 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 
 use crate::client_api::TryFromFbs;
 use crate::client_request_generated::client_request::{
+    root_as_client_request, ClientRequest as FbsClientRequest, ClientRequestType,
     ContractRequest as FbsContractRequest, ContractRequestType,
     DelegateRequest as FbsDelegateRequest, DelegateRequestType,
 };
@@ -23,11 +24,22 @@ use crate::common_generated::common::{
 };
 use crate::delegate_interface::DelegateContext;
 use crate::host_response_generated::host_response::{
-    ClientResponse as FbsClientResponse, ContractResponse as FbsContractResponse,
-    DelegateKey as FbsDelegateKey, GenerateRandData as FbsGenerateRandData,
-    GetSecretRequest as FbsGetSecretRequest, GetSecretResponse as FbsGetSecretResponse,
-    HostResponse as FbsHostResponse, Ok as FbsOk, OutboundDelegateMsg as FbsOutboundDelegateMsg,
-    RandomBytesRequest as FbsRandomBytesRequest, SetSecretRequest as FbsSetSecretRequest, *,
+    finish_host_response_buffer, ApplicationMessage as FbsApplicationMessage,
+    ApplicationMessageArgs, ClientResponse as FbsClientResponse, ClientResponseArgs,
+    ContextUpdated as FbsContextUpdated, ContextUpdatedArgs,
+    ContractResponse as FbsContractResponse, ContractResponseArgs, ContractResponseType,
+    DelegateKey as FbsDelegateKey, DelegateKeyArgs, DelegateResponse as FbsDelegateResponse,
+    DelegateResponseArgs, GenerateRandData as FbsGenerateRandData, GenerateRandDataArgs,
+    GetResponse as FbsGetResponse, GetResponseArgs, GetSecretRequest as FbsGetSecretRequest,
+    GetSecretRequestArgs, GetSecretResponse as FbsGetSecretResponse, GetSecretResponseArgs,
+    HostResponse as FbsHostResponse, HostResponseArgs, HostResponseType, Ok as FbsOk, OkArgs,
+    OutboundDelegateMsg as FbsOutboundDelegateMsg, OutboundDelegateMsgArgs,
+    OutboundDelegateMsgType, PutResponse as FbsPutResponse, PutResponseArgs,
+    RandomBytesRequest as FbsRandomBytesRequest, RandomBytesRequestArgs,
+    RequestUserInput as FbsRequestUserInput, RequestUserInputArgs,
+    SetSecretRequest as FbsSetSecretRequest, SetSecretRequestArgs,
+    UpdateNotification as FbsUpdateNotification, UpdateNotificationArgs,
+    UpdateResponse as FbsUpdateResponse, UpdateResponseArgs,
 };
 use crate::prelude::APIVersion;
 use crate::prelude::ContractContainer::Wasm;
@@ -207,6 +219,51 @@ impl ClientRequest<'_> {
 
     pub fn is_disconnect(&self) -> bool {
         matches!(self, Self::Disconnect { .. })
+    }
+
+    pub fn try_decode_fbs(msg: &[u8]) -> Result<ClientRequest, WsApiError> {
+        let req = {
+            match root_as_client_request(&msg) {
+                Ok(client_request) => match client_request.client_request_type() {
+                    ClientRequestType::ContractRequest => {
+                        let contract_request =
+                            client_request.client_request_as_contract_request().unwrap();
+                        ContractRequest::try_decode_fbs(&contract_request)?.into()
+                    }
+                    ClientRequestType::DelegateRequest => {
+                        let delegate_request =
+                            client_request.client_request_as_delegate_request().unwrap();
+                        DelegateRequest::try_decode_fbs(&delegate_request)?.into()
+                    }
+                    ClientRequestType::GenerateRandData => {
+                        let delegate_request = client_request
+                            .client_request_as_generate_rand_data()
+                            .unwrap();
+                        ClientRequest::GenerateRandData {
+                            bytes: delegate_request.data() as usize,
+                        }
+                        .into()
+                    }
+                    ClientRequestType::Disconnect => {
+                        let delegate_request =
+                            client_request.client_request_as_disconnect().unwrap();
+                        let cause = if let Some(cuase_msg) = delegate_request.cause() {
+                            Some(cuase_msg.to_string())
+                        } else {
+                            None
+                        };
+                        ClientRequest::Disconnect { cause }.into()
+                    }
+                    _ => unreachable!(),
+                },
+                Err(e) => {
+                    let cause = format!("{e}");
+                    return Err(WsApiError::deserialization(cause));
+                }
+            }
+        };
+
+        Ok(req)
     }
 }
 
@@ -661,7 +718,7 @@ impl HostResponse {
                         },
                     );
 
-                    let put_offset = PutResponse::create(
+                    let put_offset = FbsPutResponse::create(
                         &mut builder,
                         &PutResponseArgs {
                             key: Some(key_offset),
@@ -712,7 +769,7 @@ impl HostResponse {
 
                     let summary_data = builder.create_vector(&summary.into_bytes());
 
-                    let update_response_offset = UpdateResponse::create(
+                    let update_response_offset = FbsUpdateResponse::create(
                         &mut builder,
                         &UpdateResponseArgs {
                             key: Some(key_offset),
@@ -825,7 +882,7 @@ impl HostResponse {
 
                     let state_data = builder.create_vector(&state.to_vec());
 
-                    let get_offset = GetResponse::create(
+                    let get_offset = FbsGetResponse::create(
                         &mut builder,
                         &GetResponseArgs {
                             key: Some(contract_key_offset),
@@ -1020,7 +1077,7 @@ impl HostResponse {
                         }
                     };
 
-                    let update_notification_offset = UpdateNotification::create(
+                    let update_notification_offset = FbsUpdateNotification::create(
                         &mut builder,
                         &UpdateNotificationArgs {
                             key: Some(key_offset),
@@ -1070,7 +1127,7 @@ impl HostResponse {
                         );
                         let payload_data = builder.create_vector(&app.payload);
                         let delegate_context_data = builder.create_vector(app.context.as_ref());
-                        let app_offset = ApplicationMessage::create(
+                        let app_offset = FbsApplicationMessage::create(
                             &mut builder,
                             &ApplicationMessageArgs {
                                 app: Some(instance_offset),
@@ -1102,7 +1159,7 @@ impl HostResponse {
                             responses.push(response)
                         });
                         let responses_offset = builder.create_vector(&responses);
-                        let input_offset = RequestUserInput::create(
+                        let input_offset = FbsRequestUserInput::create(
                             &mut builder,
                             &RequestUserInputArgs {
                                 request_id: input.request_id,
@@ -1121,7 +1178,7 @@ impl HostResponse {
                     }
                     OutboundDelegateMsg::ContextUpdated(context) => {
                         let context_data = builder.create_vector(context.as_ref());
-                        let context_offset = ContextUpdated::create(
+                        let context_offset = FbsContextUpdated::create(
                             &mut builder,
                             &ContextUpdatedArgs {
                                 context: Some(context_data),
@@ -1250,7 +1307,7 @@ impl HostResponse {
                     }
                 });
                 let messages_offset = builder.create_vector(&messages);
-                let delegate_response_offset = DelegateResponse::create(
+                let delegate_response_offset = FbsDelegateResponse::create(
                     &mut builder,
                     &DelegateResponseArgs {
                         key: Some(key_offset),

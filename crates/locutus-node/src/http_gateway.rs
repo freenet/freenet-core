@@ -237,38 +237,8 @@ async fn process_client_request(
     let req = {
         if let Ok(client_request) = bincode::deserialize::<ClientRequest<'_>>(&msg) {
             client_request
-        } else if let Ok(client_request) = root_as_client_request(&msg) {
-            match client_request.client_request_type() {
-                ClientRequestType::ContractRequest => {
-                    let contract_request =
-                        client_request.client_request_as_contract_request().unwrap();
-                    ContractRequest::try_decode_fbs(&contract_request)?.into()
-                }
-                ClientRequestType::DelegateRequest => {
-                    let delegate_request =
-                        client_request.client_request_as_delegate_request().unwrap();
-                    DelegateRequest::try_decode_fbs(&delegate_request)?.into()
-                }
-                ClientRequestType::GenerateRandData => {
-                    let delegate_request = client_request
-                        .client_request_as_generate_rand_data()
-                        .unwrap();
-                    ClientRequest::GenerateRandData {
-                        bytes: delegate_request.data() as usize,
-                    }
-                    .into()
-                }
-                ClientRequestType::Disconnect => {
-                    let delegate_request = client_request.client_request_as_disconnect().unwrap();
-                    let cause = if let Some(cuase_msg) = delegate_request.cause() {
-                        Some(cuase_msg.to_string())
-                    } else {
-                        None
-                    };
-                    ClientRequest::Disconnect { cause }.into()
-                }
-                _ => unreachable!(),
-            }
+        } else if let Ok(client_request) = ClientRequest::try_decode_fbs(&msg) {
+            client_request.into()
         } else {
             match ContractRequest::try_decode(&msg) {
                 Ok(r) => r.to_owned().into(),
