@@ -1,15 +1,12 @@
 use flatbuffers::WIPOffset;
-use std::hash::Hash;
-use std::io::Read;
 use std::{collections::HashMap, fmt::Display, io::Cursor};
 
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 
 use crate::client_api::TryFromFbs;
 use crate::client_request_generated::client_request::{
-    root_as_client_request, ClientRequest as FbsClientRequest, ClientRequestType,
-    ContractRequest as FbsContractRequest, ContractRequestType,
-    DelegateRequest as FbsDelegateRequest, DelegateRequestType,
+    root_as_client_request, ClientRequestType, ContractRequest as FbsContractRequest,
+    ContractRequestType, DelegateRequest as FbsDelegateRequest, DelegateRequestType,
 };
 
 use crate::common_generated::common::{
@@ -223,7 +220,7 @@ impl ClientRequest<'_> {
 
     pub fn try_decode_fbs(msg: &[u8]) -> Result<ClientRequest, WsApiError> {
         let req = {
-            match root_as_client_request(&msg) {
+            match root_as_client_request(msg) {
                 Ok(client_request) => match client_request.client_request_type() {
                     ClientRequestType::ContractRequest => {
                         let contract_request =
@@ -242,17 +239,14 @@ impl ClientRequest<'_> {
                         ClientRequest::GenerateRandData {
                             bytes: delegate_request.data() as usize,
                         }
-                        .into()
                     }
                     ClientRequestType::Disconnect => {
                         let delegate_request =
                             client_request.client_request_as_disconnect().unwrap();
-                        let cause = if let Some(cuase_msg) = delegate_request.cause() {
-                            Some(cuase_msg.to_string())
-                        } else {
-                            None
-                        };
-                        ClientRequest::Disconnect { cause }.into()
+                        let cause = delegate_request
+                            .cause()
+                            .map(|cuase_msg| cuase_msg.to_string());
+                        ClientRequest::Disconnect { cause }
                     }
                     _ => unreachable!(),
                 },
@@ -442,10 +436,9 @@ impl<'a> TryFromFbs<&FbsContractRequest<'a>> for ContractRequest<'a> {
                 ContractRequestType::Subscribe => {
                     let subscribe = request.contract_request_as_subscribe().unwrap();
                     let key = ContractKey::try_decode_fbs(&subscribe.key())?;
-                    let summary = match subscribe.summary() {
-                        Some(summary_data) => Some(StateSummary::from(summary_data.bytes())),
-                        None => None,
-                    };
+                    let summary = subscribe
+                        .summary()
+                        .map(|summary_data| StateSummary::from(summary_data.bytes()));
                     ContractRequest::Subscribe { key, summary }
                 }
                 _ => unreachable!(),
@@ -692,12 +685,12 @@ impl HostResponse {
         }
     }
 
-    pub fn to_fbs_bytes(self) -> Vec<u8> {
+    pub fn into_fbs_bytes(self) -> Vec<u8> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         match self {
             HostResponse::ContractResponse(res) => match res {
                 ContractResponse::PutResponse { key } => {
-                    let instance_data = builder.create_vector(&key.bytes());
+                    let instance_data = builder.create_vector(key.bytes());
                     let instance_offset = ContractInstanceId::create(
                         &mut builder,
                         &ContractInstanceIdArgs {
@@ -705,11 +698,9 @@ impl HostResponse {
                         },
                     );
 
-                    let code = if let Some(code) = key.code_hash() {
-                        Some(builder.create_vector(&code.0.to_vec()))
-                    } else {
-                        None
-                    };
+                    let code = key
+                        .code_hash()
+                        .map(|code| builder.create_vector(code.0.as_ref()));
                     let key_offset = FbsContractKey::create(
                         &mut builder,
                         &ContractKeyArgs {
@@ -745,7 +736,7 @@ impl HostResponse {
                     builder.finished_data().to_vec()
                 }
                 ContractResponse::UpdateResponse { key, summary } => {
-                    let instance_data = builder.create_vector(&key.bytes());
+                    let instance_data = builder.create_vector(key.bytes());
                     let instance_offset = ContractInstanceId::create(
                         &mut builder,
                         &ContractInstanceIdArgs {
@@ -753,11 +744,9 @@ impl HostResponse {
                         },
                     );
 
-                    let code = if let Some(code) = key.code_hash() {
-                        Some(builder.create_vector(&code.0.to_vec()))
-                    } else {
-                        None
-                    };
+                    let code = key
+                        .code_hash()
+                        .map(|code| builder.create_vector(code.0.as_ref()));
 
                     let key_offset = FbsContractKey::create(
                         &mut builder,
@@ -801,7 +790,7 @@ impl HostResponse {
                     contract,
                     state,
                 } => {
-                    let instance_data = builder.create_vector(&key.bytes());
+                    let instance_data = builder.create_vector(key.bytes());
                     let instance_offset = ContractInstanceId::create(
                         &mut builder,
                         &ContractInstanceIdArgs {
@@ -809,11 +798,7 @@ impl HostResponse {
                         },
                     );
 
-                    let code = if let Some(code) = key.code_hash() {
-                        Some(builder.create_vector(&code.0.to_vec()))
-                    } else {
-                        None
-                    };
+                    let code = key.code_hash().map(|code| builder.create_vector(&code.0));
                     let key_offset = FbsContractKey::create(
                         &mut builder,
                         &ContractKeyArgs {
@@ -823,18 +808,17 @@ impl HostResponse {
                     );
 
                     let contract = contract.unwrap();
-                    let data = builder.create_vector(&contract.key().bytes());
+                    let data = builder.create_vector(contract.key().bytes());
 
                     let instance_offset = ContractInstanceId::create(
                         &mut builder,
                         &ContractInstanceIdArgs { data: Some(data) },
                     );
 
-                    let code = if let Some(code) = contract.key().code_hash() {
-                        Some(builder.create_vector(&code.0.to_vec()))
-                    } else {
-                        None
-                    };
+                    let code = contract
+                        .key()
+                        .code_hash()
+                        .map(|code| builder.create_vector(&code.0));
                     let contract_key_offset = FbsContractKey::create(
                         &mut builder,
                         &ContractKeyArgs {
@@ -844,7 +828,7 @@ impl HostResponse {
                     );
 
                     let contract_data =
-                        builder.create_vector(&contract.clone().unwrap_v1().data.data());
+                        builder.create_vector(contract.clone().unwrap_v1().data.data());
                     let contract_code_hash =
                         builder.create_vector(&contract.clone().unwrap_v1().data.hash().0);
 
@@ -880,7 +864,7 @@ impl HostResponse {
                         },
                     );
 
-                    let state_data = builder.create_vector(&state.to_vec());
+                    let state_data = builder.create_vector(&state);
 
                     let get_offset = FbsGetResponse::create(
                         &mut builder,
@@ -911,7 +895,7 @@ impl HostResponse {
                     builder.finished_data().to_vec()
                 }
                 ContractResponse::UpdateNotification { key, update } => {
-                    let instance_data = builder.create_vector(&key.bytes());
+                    let instance_data = builder.create_vector(key.bytes());
                     let instance_offset = ContractInstanceId::create(
                         &mut builder,
                         &ContractInstanceIdArgs {
@@ -919,11 +903,9 @@ impl HostResponse {
                         },
                     );
 
-                    let code = if let Some(code) = key.code_hash() {
-                        Some(builder.create_vector(&code.0.to_vec()))
-                    } else {
-                        None
-                    };
+                    let code = key
+                        .code_hash()
+                        .map(|code| builder.create_vector(code.0.as_ref()));
                     let key_offset = FbsContractKey::create(
                         &mut builder,
                         &ContractKeyArgs {
@@ -988,7 +970,7 @@ impl HostResponse {
                         RelatedState { related_to, state } => {
                             let state_data = builder.create_vector(&state.into_bytes());
                             let instance_data =
-                                builder.create_vector(&related_to.encode().as_bytes());
+                                builder.create_vector(related_to.encode().as_bytes());
 
                             let instance_offset = ContractInstanceId::create(
                                 &mut builder,
@@ -1015,7 +997,7 @@ impl HostResponse {
                         }
                         RelatedDelta { related_to, delta } => {
                             let instance_data =
-                                builder.create_vector(&related_to.encode().as_bytes());
+                                builder.create_vector(related_to.encode().as_bytes());
                             let delta_data = builder.create_vector(&delta.into_bytes());
 
                             let instance_offset = ContractInstanceId::create(
@@ -1047,7 +1029,7 @@ impl HostResponse {
                             delta,
                         } => {
                             let instance_data =
-                                builder.create_vector(&related_to.encode().as_bytes());
+                                builder.create_vector(related_to.encode().as_bytes());
                             let state_data = builder.create_vector(&state.into_bytes());
                             let delta_data = builder.create_vector(&delta.into_bytes());
 
@@ -1233,11 +1215,10 @@ impl HostResponse {
                             },
                         );
 
-                        let value_data = if let Some(value) = request.value.clone() {
-                            Some(builder.create_vector(value.as_slice()))
-                        } else {
-                            None
-                        };
+                        let value_data = request
+                            .value
+                            .clone()
+                            .map(|value| builder.create_vector(value.as_slice()));
                         let request_offset = FbsSetSecretRequest::create(
                             &mut builder,
                             &SetSecretRequestArgs {
@@ -1280,11 +1261,10 @@ impl HostResponse {
                             },
                         );
 
-                        let value_data = if let Some(value) = response.value.clone() {
-                            Some(builder.create_vector(value.as_slice()))
-                        } else {
-                            None
-                        };
+                        let value_data = response
+                            .value
+                            .clone()
+                            .map(|value| builder.create_vector(value.as_slice()));
 
                         let delegate_context_data =
                             builder.create_vector(response.context.as_ref());
@@ -1434,7 +1414,7 @@ impl<T> From<ContractResponse<T>> for HostResponse<T> {
 
 #[cfg(test)]
 mod client_request_test {
-    use crate::client_api::{ClientRequest, ContractRequest, TryFromFbs};
+    use crate::client_api::{ContractRequest, TryFromFbs};
     use crate::client_request_generated::client_request::{
         root_as_client_request, ClientRequest as FbsClientRequest, ClientRequestArgs,
         ClientRequestType, ContractRequest as FbsContractRequest, ContractRequestArgs,
@@ -1447,14 +1427,13 @@ mod client_request_test {
         ContractKey as FbsContractKey, ContractKeyArgs, ContractType, WasmContractV1,
         WasmContractV1Args,
     };
-    use crate::prelude::CodeHash;
 
     fn build_test_fbs_contract_put_op() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
 
         // generate WasmContractV1 key:ContractKey offset
         let instance_bytes: Vec<u8> = vec![1, 2, 3, 4];
-        let instance_data = builder.create_vector(&instance_bytes.as_slice());
+        let instance_data = builder.create_vector(instance_bytes.as_slice());
         let instance_offset = FbsContractInstanceId::create(
             &mut builder,
             &ContractInstanceIdArgs {
