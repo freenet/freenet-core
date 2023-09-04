@@ -1,4 +1,4 @@
-import flatbuffers from 'flatbuffers';
+import * as flatbuffers from 'flatbuffers';
 import base58 from "bs58";
 
 import {ContractContainerT} from "./common/contract-container";
@@ -10,7 +10,7 @@ import {RelatedStateUpdateT} from "./common/related-state-update";
 import {StateAndDeltaUpdateT} from "./common/state-and-delta-update";
 import {StateUpdateT} from "./common/state-update";
 import {
-    ClientRequest,
+    ClientRequest, ClientRequestT, ClientRequestType, ContractRequestT, ContractRequestType,
     DelegateContainerT,
     DisconnectT,
     GetT,
@@ -405,8 +405,10 @@ export class LocutusWsApi {
      * @param put - The `PutRequest` object
      */
     async put(put: PutRequest): Promise<void> {
+        let put_request = new ContractRequestT(ContractRequestType.Put, put);
+        let request = new ClientRequestT(ClientRequestType.ContractRequest, put_request);
         let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, put.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -415,8 +417,10 @@ export class LocutusWsApi {
      * @param update - The `UpdateRequest` object
      */
     async update(update: UpdateRequest): Promise<void> {
+        let update_request = new ContractRequestT(ContractRequestType.Update, update);
+        let request = new ClientRequestT(ClientRequestType.ContractRequest, update_request);
         let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, update.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -425,8 +429,10 @@ export class LocutusWsApi {
      * @param get - The `GetRequest` object
      */
     async get(get: GetRequest): Promise<void> {
+        let get_request = new ContractRequestT(ContractRequestType.Get, get);
+        let request = new ClientRequestT(ClientRequestType.ContractRequest, get_request);
         let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, get.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -435,8 +441,10 @@ export class LocutusWsApi {
      * @param subscribe - The `SubscribeRequest` object
      */
     async subscribe(subscribe: SubscribeRequest): Promise<void> {
+        let subscribe_request = new ContractRequestT(ContractRequestType.Subscribe, subscribe);
+        let request = new ClientRequestT(ClientRequestType.ContractRequest, subscribe_request);
         let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, subscribe.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
         this.ws.send(fbb.asUint8Array());
     }
 
@@ -445,9 +453,9 @@ export class LocutusWsApi {
      * @param disconnect - The `DisconnectRequest` object
      */
     async disconnect(disconnect: DisconnectRequest): Promise<void> {
+        let request = new ClientRequestT(ClientRequestType.Disconnect, disconnect);
         let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, disconnect.pack(fbb));
+        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
         this.ws.send(fbb.asUint8Array());
-        this.ws.close();
     }
 }
