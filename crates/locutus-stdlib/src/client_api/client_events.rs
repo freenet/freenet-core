@@ -76,6 +76,8 @@ pub enum RequestError {
     DelegateError(#[from] DelegateError),
     #[error("client disconnect")]
     Disconnect,
+    #[error("operation timed out")]
+    Timeout
 }
 
 /// Errors that may happen while interacting with delegates.

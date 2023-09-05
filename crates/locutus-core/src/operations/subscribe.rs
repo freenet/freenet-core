@@ -27,7 +27,7 @@ pub(crate) struct SubscribeOp {
     _ttl: Duration,
 }
 
-pub(crate) struct SubscribeResult {}
+pub(crate) enum SubscribeResult {}
 
 impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
