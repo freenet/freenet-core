@@ -323,7 +323,15 @@ async fn process_host_response(
                     Err(err)
                 }
             };
-            let res = bincode::serialize(&result)?;
+
+            let res = match result {
+                Ok(res) => match res.clone().into_fbs_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(_) => bincode::serialize(&Ok::<HostResponse, ClientError>(res))?,
+                },
+                Err(err) => bincode::serialize(&Err::<HostResponse, ClientError>(err))?,
+            };
+
             tx.send(Message::Binary(res)).await?;
             Ok(None)
         }
