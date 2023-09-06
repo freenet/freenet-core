@@ -20,5 +20,5 @@ if [ "$IS_DEV"=1 ]; then
 set +e
 rm $PKG_DIR/locutus-stdlib.tgz
 set -e
-mv $PKG_DIR/*.tgz $PKG_DIR/locutus-stdlib.tgz
+mv $PKG_DIR/*.tgz $PKG_DIR/locutus-locutus-stdlib-0.0.3.tgz
 fi

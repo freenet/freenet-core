@@ -1,7 +1,7 @@
 {
   "dependencies": {
     "bootstrap": "5.3.1",
-    "locutus-stdlib": "file:../../stdlib/dist/pack/locutus-stdlib.tgz",
+    "locutus-stdlib": "file:../../stdlib/dist/pack/locutus-locutus-stdlib-0.0.3.tgz",
     "module-alias": "^2.2.2"
   },
   "main": "src/index.ts",

@@ -182,6 +182,9 @@ export class Key extends ContractKeyT {
             throw new TypeError('Invalid array length, expected 32 bytes');
         }
 
+        // print instance byte array
+        console.log(`instance: ${instance}`);
+
         let contract_instance_id = new ContractInstanceIdT(Array.from(instance))
         let contract_code: (number)[] = [];
         if (code) {
