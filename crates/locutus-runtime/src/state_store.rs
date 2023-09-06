@@ -59,6 +59,14 @@ where
         key: &ContractKey,
         state: WrappedState,
     ) -> Result<(), StateStoreError> {
+        // only allow updates for existing contracts
+        if self.state_mem_cache.get(key).await.is_none() {
+            self.store
+                .get(key)
+                .await
+                .map_err(Into::into)?
+                .ok_or_else(|| StateStoreError::MissingContract(key.clone()))?;
+        }
         self.store
             .store(key.clone(), state.clone())
             .await

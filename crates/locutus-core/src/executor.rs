@@ -232,9 +232,9 @@ impl Executor {
                     all(feature = "network-mode", not(feature = "network-mode"))
                 ))]
                 {
-                    // by default a subscribe op has an implicit get
                     Self::subscribe(key).await?;
                 }
+                // by default a subscribe op has an implicit get
                 Ok(res)
             }
         }
@@ -249,25 +249,18 @@ impl Executor {
         // FIXME: in net node, we don't allow puts for existing contract states
         //        if it hits a node which already has it it will get rejected
         //
-        //        while we wait for confirmation for the state,
-        //        we don't respond with the interim state
-        //
         //        if there is a conflict, resolve the conflict to see which
         //        is the outdated state:
         //          1. through the arbitraur mechanism
         //          2. a new func which compared two summaries and gives the most fresh
         //          3. could convert into an update with the full state
         //        you can request to several nodes and determine which node has a fresher ver
+
         let key = contract.key();
         let params = contract.params();
 
-        self.verify_and_store_contract(
-            key.clone(),
-            state.clone(),
-            params.clone(),
-            related_contracts.clone(),
-        )
-        .await?;
+        self.verify_and_store_contract(state.clone(), contract, related_contracts)
+            .await?;
 
         self.send_update_notification(&key, &params, &state)
             .await
@@ -366,11 +359,10 @@ impl Executor {
                             {
                                 let state = match self.local_state_or_from_network(&id).await? {
                                     Either::Left(state) => state,
-                                    Either::Right(GetResult { state, params, .. }) => {
+                                    Either::Right(GetResult { state, contract }) => {
                                         self.verify_and_store_contract(
-                                            id.into(),
                                             state.clone(),
-                                            params,
+                                            contract,
                                             RelatedContracts::default(),
                                         )
                                         .await?;
@@ -389,11 +381,10 @@ impl Executor {
                             Err(StateStoreError::MissingContract(_)) => {
                                 let state = match self.local_state_or_from_network(&id).await? {
                                     Either::Left(state) => state,
-                                    Either::Right(GetResult { state, params, .. }) => {
+                                    Either::Right(GetResult { state, contract }) => {
                                         self.verify_and_store_contract(
-                                            id.into(),
                                             state.clone(),
-                                            params,
+                                            contract,
                                             RelatedContracts::default(),
                                         )
                                         .await?;
@@ -533,14 +524,13 @@ impl Executor {
                     .local_state_or_from_network(&key.clone().into())
                     .await?
                 {
-                    Either::Right(GetResult {
-                        state,
-                        contract,
-                        params,
-                    }) => {
-                        let related = RelatedContracts::default();
-                        self.verify_and_store_contract(key, state, params, related)
-                            .await?;
+                    Either::Right(GetResult { state, contract }) => {
+                        self.verify_and_store_contract(
+                            state,
+                            contract.clone(),
+                            RelatedContracts::default(),
+                        )
+                        .await?;
                         break Ok(Some(contract));
                     }
                     Either::Left(_state) => continue,
@@ -565,11 +555,13 @@ impl Executor {
 
     async fn verify_and_store_contract<'a>(
         &mut self,
-        key: ContractKey,
         state: WrappedState,
-        params: Parameters<'static>,
+        trying_container: ContractContainer,
         mut related_contracts: RelatedContracts<'a>,
     ) -> Result<(), Error> {
+        let key = trying_container.key();
+        let params = trying_container.params();
+
         #[cfg(all(feature = "local-mode", not(feature = "network-mode")))]
         #[inline]
         async fn get_local_contract(
@@ -599,14 +591,16 @@ impl Executor {
         let mut trying_key = key;
         let mut trying_state = state;
         let mut trying_params = params;
-        let mut trying_contract = None;
+        let mut trying_contract = Some(trying_container);
 
         while iterations < DEPENDENCY_CYCLE_LIMIT_GUARD {
-            self.runtime
-                .contract_store
-                .store_contract(trying_contract.take().unwrap())
-                .map_err(Into::into)
-                .map_err(Either::Right)?;
+            if let Some(contract) = trying_contract.take() {
+                self.runtime
+                    .contract_store
+                    .store_contract(contract)
+                    .map_err(Into::into)
+                    .map_err(Either::Right)?;
+            }
 
             let result = self
                 .runtime
@@ -617,7 +611,10 @@ impl Executor {
                     &related_contracts,
                 )
                 .map_err(Into::into)
-                .map_err(Either::Right)?;
+                .map_err(|err| {
+                    let _ = self.runtime.contract_store.remove_contract(&trying_key);
+                    Either::Right(err)
+                })?;
 
             let is_valid = match result {
                 ValidateResult::Valid => true,
@@ -644,7 +641,7 @@ impl Executor {
                                     }
                                     Either::Right(result) => {
                                         trying_key = (*id).into();
-                                        trying_params = result.params;
+                                        trying_params = result.contract.params();
                                         trying_state = result.state;
                                         trying_contract = Some(result.contract);
                                         continue;

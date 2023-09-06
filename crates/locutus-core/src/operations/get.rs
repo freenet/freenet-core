@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use locutus_runtime::{ContractContainer, ContractKey, Parameters};
+use locutus_runtime::{ContractContainer, ContractKey};
 
 use crate::message::InnerMessage;
 use crate::operations::op_trait::Operation;
@@ -37,7 +37,6 @@ pub(crate) struct GetOp {
 pub(crate) struct GetResult {
     pub state: WrappedState,
     pub contract: ContractContainer,
-    pub params: Parameters<'static>,
 }
 
 impl TryFrom<GetOp> for GetResult {
