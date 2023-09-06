@@ -589,7 +589,7 @@ impl UserInputResponse<'_> {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum OutboundDelegateMsg {
     // for the apps
     ApplicationMessage(ApplicationMessage),
@@ -682,7 +682,7 @@ impl GetSecretRequest {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SetSecretRequest {
     pub key: SecretsId,
     /// Sets or unsets (if none) a value associated with the key.

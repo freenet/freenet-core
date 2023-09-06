@@ -3,7 +3,7 @@ namespace host_response;
 
 table GetResponse {
   key: common.ContractKey(required);
-  contract: common.ContractContainer(required);
+  contract: common.ContractContainer;
   state: [ubyte](required);
 }
 

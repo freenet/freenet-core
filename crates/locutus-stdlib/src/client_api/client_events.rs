@@ -653,7 +653,7 @@ impl<'a> TryFromFbs<&FbsDelegateRequest<'a>> for DelegateRequest<'a> {
 }
 
 /// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[non_exhaustive]
 pub enum HostResponse<T = WrappedState> {
     ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),
@@ -685,7 +685,7 @@ impl HostResponse {
         }
     }
 
-    pub fn into_fbs_bytes(self) -> Vec<u8> {
+    pub fn into_fbs_bytes(self) -> Result<Vec<u8>, ClientError> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         match self {
             HostResponse::ContractResponse(res) => match res {
@@ -733,7 +733,7 @@ impl HostResponse {
                     );
 
                     finish_host_response_buffer(&mut builder, response_offset);
-                    builder.finished_data().to_vec()
+                    Ok(builder.finished_data().to_vec())
                 }
                 ContractResponse::UpdateResponse { key, summary } => {
                     let instance_data = builder.create_vector(key.bytes());
@@ -783,11 +783,11 @@ impl HostResponse {
                     );
 
                     finish_host_response_buffer(&mut builder, response_offset);
-                    builder.finished_data().to_vec()
+                    Ok(builder.finished_data().to_vec())
                 }
                 ContractResponse::GetResponse {
                     key,
-                    contract,
+                    contract: contract_container,
                     state,
                 } => {
                     let instance_data = builder.create_vector(key.bytes());
@@ -807,70 +807,73 @@ impl HostResponse {
                         },
                     );
 
-                    let contract = contract.unwrap();
-                    let data = builder.create_vector(contract.key().bytes());
+                    let container_offset = if let Some(contract) = contract_container {
+                        let data = builder.create_vector(contract.key().bytes());
 
-                    let instance_offset = ContractInstanceId::create(
-                        &mut builder,
-                        &ContractInstanceIdArgs { data: Some(data) },
-                    );
-
-                    let code = contract
-                        .key()
-                        .code_hash()
-                        .map(|code| builder.create_vector(&code.0));
-                    let contract_key_offset = FbsContractKey::create(
-                        &mut builder,
-                        &ContractKeyArgs {
-                            instance: Some(instance_offset),
-                            code,
-                        },
-                    );
-
-                    let contract_data =
-                        builder.create_vector(contract.clone().unwrap_v1().data.data());
-                    let contract_code_hash =
-                        builder.create_vector(&contract.clone().unwrap_v1().data.hash().0);
-
-                    let contract_code_offset = ContractCode::create(
-                        &mut builder,
-                        &ContractCodeArgs {
-                            data: Some(contract_data),
-                            code_hash: Some(contract_code_hash),
-                        },
-                    );
-
-                    let contract_params =
-                        builder.create_vector(&contract.clone().params().into_bytes());
-                    let contract_version =
-                        builder.create_string(&APIVersion::from(contract.clone()).to_string());
-
-                    let contract_offset = match contract {
-                        Wasm(V1(..)) => WasmContractV1::create(
+                        let instance_offset = ContractInstanceId::create(
                             &mut builder,
-                            &WasmContractV1Args {
-                                key: Some(key_offset),
-                                data: Some(contract_code_offset),
-                                parameters: Some(contract_params),
-                            },
-                        ),
-                    };
+                            &ContractInstanceIdArgs { data: Some(data) },
+                        );
 
-                    let container_offset = FbsContractContainer::create(
-                        &mut builder,
-                        &ContractContainerArgs {
-                            contract_type: ContractType::WasmContractV1,
-                            contract: Some(contract_offset.as_union_value()),
-                        },
-                    );
+                        let code = contract
+                            .key()
+                            .code_hash()
+                            .map(|code| builder.create_vector(&code.0));
+                        let contract_key_offset = FbsContractKey::create(
+                            &mut builder,
+                            &ContractKeyArgs {
+                                instance: Some(instance_offset),
+                                code,
+                            },
+                        );
+
+                        let contract_data =
+                            builder.create_vector(contract.clone().unwrap_v1().data.data());
+                        let contract_code_hash =
+                            builder.create_vector(&contract.clone().unwrap_v1().data.hash().0);
+
+                        let contract_code_offset = ContractCode::create(
+                            &mut builder,
+                            &ContractCodeArgs {
+                                data: Some(contract_data),
+                                code_hash: Some(contract_code_hash),
+                            },
+                        );
+
+                        let contract_params =
+                            builder.create_vector(&contract.clone().params().into_bytes());
+                        let contract_version =
+                            builder.create_string(&APIVersion::from(contract.clone()).to_string());
+
+                        let contract_offset = match contract {
+                            Wasm(V1(..)) => WasmContractV1::create(
+                                &mut builder,
+                                &WasmContractV1Args {
+                                    key: Some(contract_key_offset),
+                                    data: Some(contract_code_offset),
+                                    parameters: Some(contract_params),
+                                },
+                            ),
+                        };
+
+                        Some(FbsContractContainer::create(
+                            &mut builder,
+                            &ContractContainerArgs {
+                                contract_type: ContractType::WasmContractV1,
+                                contract: Some(contract_offset.as_union_value()),
+                            },
+                        ))
+                    } else {
+                        None
+                    };
 
                     let state_data = builder.create_vector(&state);
 
                     let get_offset = FbsGetResponse::create(
                         &mut builder,
                         &GetResponseArgs {
-                            key: Some(contract_key_offset),
-                            contract: Some(container_offset),
+                            key: Some(key_offset),
+                            contract: container_offset,
                             state: Some(state_data),
                         },
                     );
@@ -892,7 +895,7 @@ impl HostResponse {
                     );
 
                     finish_host_response_buffer(&mut builder, response_offset);
-                    builder.finished_data().to_vec()
+                    Ok(builder.finished_data().to_vec())
                 }
                 ContractResponse::UpdateNotification { key, update } => {
                     let instance_data = builder.create_vector(key.bytes());
@@ -1084,7 +1087,7 @@ impl HostResponse {
                     );
 
                     finish_host_response_buffer(&mut builder, host_response_offset);
-                    builder.finished_data().to_vec()
+                    Ok(builder.finished_data().to_vec())
                 }
             },
             HostResponse::DelegateResponse { key, values } => {
@@ -1302,7 +1305,7 @@ impl HostResponse {
                     },
                 );
                 finish_host_response_buffer(&mut builder, host_response_offset);
-                todo!()
+                Ok(builder.finished_data().to_vec())
             }
             HostResponse::GenerateRandData(data) => {
                 let data = builder.create_vector(data.as_slice());
@@ -1320,7 +1323,7 @@ impl HostResponse {
                     },
                 );
                 finish_host_response_buffer(&mut builder, host_response_offset);
-                builder.finished_data().to_vec()
+                Ok(builder.finished_data().to_vec())
             }
             HostResponse::Ok => {
                 let ok_offset = FbsOk::create(&mut builder, &OkArgs { msg: None });
@@ -1332,8 +1335,11 @@ impl HostResponse {
                     },
                 );
                 finish_host_response_buffer(&mut builder, host_response_offset);
-                builder.finished_data().to_vec()
+                Ok(builder.finished_data().to_vec())
             }
+            _ => Err(ClientError::from(format!(
+                "Failed encoding HoestResponse to flatbuffers bytes represntation"
+            )))?,
         }
     }
 }

@@ -11,7 +11,7 @@ import {
     SubscribeRequest,
     UpdateData,
     DeltaUpdate,
-} from "locutus-stdlib/webSocketInterface";
+} from "locutus-stdlib/websocket-interface";
 
 import "./scss/styles.scss";
 import {UpdateDataType} from "locutus-stdlib/common";
@@ -28,7 +28,7 @@ function getDocument(): Document {
 
 const DOCUMENT: Document = getDocument();
 
-const MODEL_CONTRACT = "7i4DAmvgk3E3L7XF1SZrpGEHAq7rPZmNaJNeUqz4yKTu";
+const MODEL_CONTRACT = "6GLuygZv99q8xACJCEc4ANyjgr7NqJU9DniRD5HuYFow";
 const KEY = Key.fromInstanceId(MODEL_CONTRACT);
 
 function getState(hostResponse: GetResponse) {
@@ -126,6 +126,7 @@ async function subscribeToUpdates() {
     console.log(`subscribing to contract: ${MODEL_CONTRACT}`);
     const subscribe_request: SubscribeRequest = new SubscribeRequest(KEY, new Array<number>());
     await locutusApi.subscribe(subscribe_request);
+    console.log(`sent key subscription instance bytes '${KEY.bytes()}'`)
     console.log(`sent subscription request to key: '${KEY.encode()}'`);
 }
 
