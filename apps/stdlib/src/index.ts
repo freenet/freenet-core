@@ -1,3 +1,1 @@
-import * as wsInterface from "./webSocketInterface";
-
-export const webSocketApi = wsInterface;
+export * from "./websocket-interface";
