@@ -39,6 +39,7 @@ impl From<String> for ClientError {
 }
 
 #[derive(thiserror::Error, Debug, Serialize, Deserialize, Clone)]
+#[non_exhaustive]
 pub enum ErrorKind {
     #[error("comm channel between client/host closed")]
     ChannelClosed,
@@ -69,6 +70,7 @@ impl Display for ClientError {
 impl std::error::Error for ClientError {}
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+#[non_exhaustive]
 pub enum RequestError {
     #[error(transparent)]
     ContractError(#[from] ContractError),
@@ -82,6 +84,7 @@ pub enum RequestError {
 
 /// Errors that may happen while interacting with delegates.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+#[non_exhaustive]
 pub enum DelegateError {
     #[error("error while registering delegate {0}")]
     RegisterError(DelegateKey),
@@ -95,6 +98,7 @@ pub enum DelegateError {
 
 /// Errors that may happen while interacting with contracts.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+#[non_exhaustive]
 pub enum ContractError {
     #[error("failed to get contract {key}, reason: {cause}")]
     Get { key: ContractKey, cause: String },
@@ -117,11 +121,11 @@ pub enum ContractError {
 
 /// A request from a client application to the host.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[non_exhaustive]
 // #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum ClientRequest<'a> {
     DelegateOp(#[serde(borrow)] DelegateRequest<'a>),
     ContractOp(#[serde(borrow)] ContractRequest<'a>),
-    GenerateRandData { bytes: usize },
     Disconnect { cause: Option<String> },
 }
 
@@ -164,7 +168,6 @@ impl ClientRequest<'_> {
                 let op = op.into_owned();
                 ClientRequest::DelegateOp(op)
             }
-            ClientRequest::GenerateRandData { bytes } => ClientRequest::GenerateRandData { bytes },
             ClientRequest::Disconnect { cause } => ClientRequest::Disconnect { cause },
         }
     }
@@ -175,6 +178,7 @@ impl ClientRequest<'_> {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContractRequest<'a> {
     /// Insert a new value in a contract corresponding with the provided key.
     Put {
@@ -320,6 +324,7 @@ impl<'a> From<DelegateRequest<'a>> for ClientRequest<'a> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[non_exhaustive]
 pub enum DelegateRequest<'a> {
     ApplicationMessages {
         key: DelegateKey,
@@ -445,20 +450,19 @@ impl Display for ClientRequest<'_> {
                 }
             },
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
-            ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }
     }
 }
 
 /// A response to a previous [`ClientRequest`]
 #[derive(Serialize, Deserialize, Debug)]
-pub enum HostResponse<T = WrappedState, U = Vec<u8>> {
+#[non_exhaustive]
+pub enum HostResponse<T = WrappedState> {
     ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),
     DelegateResponse {
         key: DelegateKey,
         values: Vec<OutboundDelegateMsg>,
     },
-    GenerateRandData(U),
     /// A requested action which doesn't require an answer was performed successfully.
     Ok,
 }
@@ -503,13 +507,13 @@ impl std::fmt::Display for HostResponse {
             },
             HostResponse::DelegateResponse { .. } => write!(f, "delegate responses"),
             HostResponse::Ok => write!(f, "ok response"),
-            HostResponse::GenerateRandData(_) => write!(f, "random bytes"),
         }
     }
 }
 
 // todo: add a `AsBytes` trait for state representations
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[non_exhaustive]
 pub enum ContractResponse<T = WrappedState> {
     GetResponse {
         key: ContractKey,

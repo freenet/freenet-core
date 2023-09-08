@@ -367,10 +367,15 @@ where
                         }
                         todo!()
                     }
+                    _ => {
+                        tracing::error!("op not supported");
+                    }
                 },
                 ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
-                ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
                 ClientRequest::Disconnect { .. } => unreachable!(),
+                _ => {
+                    tracing::error!("op not supported");
+                }
             }
         });
     }
