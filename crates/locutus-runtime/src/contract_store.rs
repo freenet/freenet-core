@@ -100,6 +100,7 @@ impl ContractStore {
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
+    // FIXME: instead return Result<Option<_>, _> to handle IO errors upstream
     pub fn fetch_contract(
         &self,
         key: &ContractKey,
@@ -197,12 +198,28 @@ impl ContractStore {
         let contract_hash = match key.code_hash() {
             Some(k) => k.clone(),
             None => self.code_hash_from_key(key).ok_or_else(|| {
-                tracing::warn!("trying to store partially unspecified contract `{key}`");
+                tracing::warn!("trying to get partially unspecified contract `{key}`");
                 RuntimeInnerError::UnwrapContract
             })?,
         };
         let key_path = contract_hash.encode();
         Ok(self.contracts_dir.join(key_path).with_extension("wasm"))
+    }
+
+    pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+        let contract_hash = match key.code_hash() {
+            Some(k) => k.clone(),
+            None => self.code_hash_from_key(key).ok_or_else(|| {
+                tracing::warn!("trying to get partially unspecified contract `{key}`");
+                RuntimeInnerError::UnwrapContract
+            })?,
+        };
+        let key_path = self
+            .contracts_dir
+            .join(contract_hash.encode())
+            .with_extension("wasm");
+        std::fs::remove_file(key_path)?;
+        Ok(())
     }
 
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {

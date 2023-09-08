@@ -1,6 +1,7 @@
 //! Contract executor.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use blake3::traits::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
@@ -12,9 +13,18 @@ use locutus_stdlib::client_api::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::node::{OpManager, P2pBridge};
+#[cfg(any(
+    not(feature = "local-mode"),
+    feature = "network-mode",
+    all(not(feature = "local-mode"), not(feature = "network-mode"))
+))]
+use crate::operations::get::GetResult;
+use crate::operations::{self, op_trait::Operation};
 use crate::{either::Either, ClientId, DynError, HostResult, Storage};
 
-type Response = Result<HostResponse, Either<Box<RequestError>, DynError>>;
+type Error = Either<Box<RequestError>, DynError>;
+type Response = Result<HostResponse, Error>;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationMode {
@@ -24,20 +34,73 @@ pub enum OperationMode {
     Network,
 }
 
+#[cfg(any(
+    not(feature = "local-mode"),
+    feature = "network-mode",
+    all(not(feature = "local-mode"), not(feature = "network-mode"))
+))]
+// for now just mocking up requests to the network
+async fn op_request<Op, M>(_request: M) -> Result<Op, DynError>
+where
+    Op: Operation<P2pBridge>,
+    M: ComposeNetworkMessage<Op>,
+{
+    todo!()
+}
+
+#[allow(unused)]
+trait ComposeNetworkMessage<Op>
+where
+    Self: Sized,
+    Op: Operation<P2pBridge>,
+{
+    fn get_message(self, manager: &OpManager) -> Op::Message {
+        todo!()
+    }
+}
+
+#[allow(unused)]
+struct GetContract {
+    key: ContractKey,
+    fetch_contract: bool,
+}
+
+impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {}
+
+#[allow(unused)]
+struct SubscribeContract {
+    key: ContractKey,
+}
+
+impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeContract {}
+
+#[allow(unused)]
+struct UpdateContract {
+    key: ContractKey,
+    new_state: WrappedState,
+}
+
+impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {}
+
 /// A WASM executor which will run any contracts, delegates, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 pub struct Executor {
+    #[cfg(any(
+        all(feature = "local-mode", feature = "network-mode"),
+        all(not(feature = "local-mode"), not(feature = "network-mode")),
+    ))]
     mode: OperationMode,
     runtime: Runtime,
-    contract_state: StateStore<Storage>,
+    state_store: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
 }
 
 impl Executor {
+    #[allow(unused_variables)]
     pub async fn new(
         contract_store: ContractStore,
         delegate_store: DelegateStore,
@@ -49,9 +112,13 @@ impl Executor {
         ctrl_handler();
 
         Ok(Self {
+            #[cfg(any(
+                all(feature = "local-mode", feature = "network-mode"),
+                all(not(feature = "local-mode"), not(feature = "network-mode")),
+            ))]
             mode,
             runtime: Runtime::build(contract_store, delegate_store, secret_store, false).unwrap(),
-            contract_state,
+            state_store: contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
         })
@@ -144,204 +211,531 @@ impl Executor {
     async fn contract_op(
         &mut self,
         req: ContractRequest<'_>,
-        id: ClientId,
+        cli_id: ClientId,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
             ContractRequest::Put {
                 contract,
                 state,
-                mut related_contracts,
+                related_contracts,
             } => {
-                // FIXME: in net node, we don't allow puts for existing contract states
-                //        if it hits a node which already has it it will get rejected
-                //        while we wait for confirmation for the state,
-                //        we don't respond with the interim state
-                //
-                //        if there is a conflict, resolve the conflict to see which
-                //        is the outdated state:
-                //          1. through the arbitraur mechanism
-                //          2. a new func which compared two summaries and gives the most fresh
-                //        you can request to several nodes and determine which node has a fresher ver
-                let key = contract.key();
-                let params = contract.params();
-                self.runtime
-                    .contract_store
-                    .store_contract(contract.clone())
-                    .map_err(Into::into)
-                    .map_err(Either::Right)?;
-
-                if self.mode == OperationMode::Local {
-                    for (id, related) in related_contracts.update() {
-                        let Ok(contract) = self.contract_state.get(&(*id).into()).await else {
-                            return Err(Either::Right(
-                                CoreContractError::MissingRelated { key: *id }.into(),
-                            ));
-                        };
-                        let state: &[u8] = unsafe {
-                            // Safety: this is fine since this will never scape this scope
-                            std::mem::transmute::<&[u8], &'_ [u8]>(contract.as_ref())
-                        };
-                        *related = Some(State::from(state));
-                    }
-                }
-
-                let result = self
-                    .runtime
-                    .validate_state(&key, &params, &state, related_contracts)
-                    .map_err(Into::into)
-                    .map_err(Either::Right)?;
-                let is_valid = match result {
-                    ValidateResult::Valid => true,
-                    ValidateResult::Invalid => false,
-                    ValidateResult::RequestRelated(_related) => {
-                        if self.mode == OperationMode::Network {
-                            // FIXME: should deal with additional related contracts requested
-                            todo!()
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                };
-                let res = is_valid
-                    .then(|| ContractResponse::PutResponse { key: key.clone() }.into())
-                    .ok_or_else(|| {
-                        Either::Left(Box::new(
-                            CoreContractError::Put {
-                                key: key.clone(),
-                                cause: "not valid".to_owned(),
-                            }
-                            .into(),
-                        ))
-                    })?;
-
-                self.contract_state
-                    .store(key.clone(), state.clone(), Some(params.clone()))
+                self.perform_contract_put(contract, state, related_contracts)
                     .await
-                    .map_err(Into::into)
-                    .map_err(Either::Right)?;
-                self.send_update_notification(&key, &params, &state)
-                    .await
-                    .map_err(|_| {
-                        Either::Left(Box::new(
-                            CoreContractError::Put {
-                                key: key.clone(),
-                                cause: "failed while sending notifications".to_owned(),
-                            }
-                            .into(),
-                        ))
-                    })?;
-                Ok(res)
             }
-            ContractRequest::Update { key, data } => {
-                let parameters = {
-                    self.contract_state
-                        .get_params(&key)
-                        .await
-                        .map_err(|err| Either::Right(err.into()))?
-                };
-                let new_state = {
-                    let state = self
-                        .contract_state
-                        .get(&key)
-                        .await
-                        .map_err(Into::into)
-                        .map_err(Either::Right)?
-                        .clone();
-                    let mut retrieved_contracts = Vec::new();
-                    retrieved_contracts.push(data);
-                    loop {
-                        let update_modification = self
-                            .runtime
-                            .update_state(&key, &parameters, &state, &retrieved_contracts)
-                            .map_err(|err| {
-                                let is_contract_exec_error = err.is_contract_exec_error();
-                                match is_contract_exec_error {
-                                    true => Either::Left(Box::new(
-                                        CoreContractError::Update {
-                                            key: key.clone(),
-                                            cause: format!("{err}"),
-                                        }
-                                        .into(),
-                                    )),
-                                    _ => Either::Right(err.into()),
-                                }
-                            })?;
-                        let UpdateModification {
-                            new_state, related, ..
-                        } = update_modification;
-                        if let Some(new_state) = new_state {
-                            let new_state = WrappedState::new(new_state.into_bytes());
-                            self.contract_state
-                                .store(key.clone(), new_state.clone(), None)
-                                .await
-                                .map_err(|err| Either::Right(err.into()))?;
-                            break new_state;
-                        } else if !related.is_empty() {
-                            // some required contracts are missing
-                            let required_contracts = related.len() + 1;
-                            for RelatedContract {
-                                contract_instance_id: id,
-                                mode,
-                            } in related
-                            {
-                                match self.contract_state.get(&id.into()).await {
-                                    Ok(state) => {
-                                        // in this case we are already subscribed to and are updating this contract,
-                                        // we can try first with the existing value
-                                        retrieved_contracts.push(UpdateData::RelatedState {
-                                            related_to: id,
-                                            state: state.into(),
-                                        });
-                                    }
-                                    Err(StateStoreError::MissingContract(_))
-                                        if self.mode == OperationMode::Network =>
-                                    {
-                                        // retrieve the contract from the network first in the mode the consumer contract informed the node
-                                        todo!("related mode updates subscription not implemented for type {mode:?}")
-                                    }
-                                    Err(other_err) => return Err(Either::Right(other_err.into())),
-                                }
-                            }
-                            if retrieved_contracts.len() == required_contracts {
-                                // try running again with all the related contracts retrieved
-                                continue;
-                            } else {
-                                todo!("keep waiting/trying until timeout?")
-                            }
-                        } else {
-                            // state wasn't updated
-                            break state;
-                        }
-                    }
-                };
-                // in the network impl this would be sent over the network
-                let summary = self
-                    .runtime
-                    .summarize_state(&key, &parameters, &new_state)
-                    .map_err(Into::into)
-                    .map_err(Either::Right)?;
-                self.send_update_notification(&key, &parameters, &new_state)
-                    .await?;
-                // TODO: in network mode, wait at least for one confirmation
-                //       when a node receives a delta from updates, run the update themselves
-                //       and send back confirmation
-                Ok(ContractResponse::UpdateResponse { key, summary }.into())
-            }
+            ContractRequest::Update { key, data } => self.perform_contract_update(key, data).await,
             ContractRequest::Get {
                 key,
                 fetch_contract: contract,
-            } => self.perform_get(contract, key).await.map_err(Either::Left),
+            } => self.perform_contract_get(contract, key).await,
             ContractRequest::Subscribe { key, summary } => {
                 let updates =
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
-                self.register_contract_notifier(key.clone(), id, updates, summary)
+                self.register_contract_notifier(key.clone(), cli_id, updates, summary)
                     .map_err(Either::Left)?;
+                let res = self.perform_contract_get(false, key.clone()).await?;
+                #[cfg(any(
+                    all(not(feature = "local-mode"), not(feature = "network-mode")),
+                    all(feature = "local-mode", feature = "network-mode"),
+                    all(feature = "network-mode", not(feature = "network-mode"))
+                ))]
+                {
+                    self.subscribe(key).await?;
+                }
                 // by default a subscribe op has an implicit get
-                self.perform_get(false, key).await.map_err(Either::Left)
-                // todo: in network mode, also send a subscribe to keep up to date
+                Ok(res)
             }
         }
+    }
+
+    async fn perform_contract_put(
+        &mut self,
+        contract: ContractContainer,
+        state: WrappedState,
+        related_contracts: RelatedContracts<'_>,
+    ) -> Response {
+        let key = contract.key();
+        let params = contract.params();
+
+        if self.get_local_contract(&key.id()).await.is_ok() {
+            // already existing contract, just try to merge states
+            return self
+                .perform_contract_update(key, UpdateData::State(state.into()))
+                .await;
+        }
+
+        self.verify_and_store_contract(state.clone(), contract, related_contracts)
+            .await?;
+
+        self.send_update_notification(&key, &params, &state)
+            .await
+            .map_err(|_| {
+                Either::Left(Box::new(
+                    CoreContractError::Put {
+                        key: key.clone(),
+                        cause: "failed while sending notifications".to_owned(),
+                    }
+                    .into(),
+                ))
+            })?;
+        Ok(ContractResponse::PutResponse { key }.into())
+    }
+
+    async fn perform_contract_update(
+        &mut self,
+        key: ContractKey,
+        data: UpdateData<'_>,
+    ) -> Response {
+        let parameters = {
+            self.state_store
+                .get_params(&key)
+                .await
+                .map_err(|err| Either::Right(err.into()))?
+                .ok_or_else(|| {
+                    let e = RequestError::ContractError(CoreContractError::Update {
+                        cause: format!("missing contract parameters: {key}"),
+                        key: key.clone(),
+                    });
+                    Either::Right(e.into())
+                })?
+        };
+        let new_state = {
+            let state = self
+                .state_store
+                .get(&key)
+                .await
+                .map_err(Into::into)
+                .map_err(Either::Right)?
+                .clone();
+            let mut retrieved_contracts = Vec::new();
+            retrieved_contracts.push(data);
+
+            let start = Instant::now();
+            loop {
+                let update_modification =
+                    match self
+                        .runtime
+                        .update_state(&key, &parameters, &state, &retrieved_contracts)
+                    {
+                        Err(err) if err.is_contract_exec_error() => {
+                            return Err(Either::Left(Box::new(
+                                CoreContractError::Update {
+                                    key: key.clone(),
+                                    cause: format!("{err}"),
+                                }
+                                .into(),
+                            )));
+                        }
+                        Err(err) => return Err(Either::Right(err.into())),
+                        Ok(result) => result,
+                    };
+                let UpdateModification {
+                    new_state, related, ..
+                } = update_modification;
+                if let Some(new_state) = new_state {
+                    let new_state = WrappedState::new(new_state.into_bytes());
+                    self.state_store
+                        .update(&key, new_state.clone())
+                        .await
+                        .map_err(|err| Either::Right(err.into()))?;
+                    break new_state;
+                } else if !related.is_empty() {
+                    // some required contracts are missing
+                    let required_contracts = related.len() + 1;
+                    for RelatedContract {
+                        contract_instance_id: id,
+                        mode,
+                    } in related
+                    {
+                        match self.state_store.get(&id.into()).await {
+                            Ok(state) => {
+                                // in this case we are already subscribed to and are updating this contract,
+                                // we can try first with the existing value
+                                retrieved_contracts.push(UpdateData::RelatedState {
+                                    related_to: id,
+                                    state: state.into(),
+                                });
+                            }
+                            #[cfg(any(
+                                all(not(feature = "local-mode"), not(feature = "network-mode")),
+                                all(feature = "local-mode", feature = "network-mode")
+                            ))]
+                            Err(StateStoreError::MissingContract(_))
+                                if self.mode == OperationMode::Network =>
+                            {
+                                let state = match self.local_state_or_from_network(&id).await? {
+                                    Either::Left(state) => state,
+                                    Either::Right(GetResult { state, contract }) => {
+                                        self.verify_and_store_contract(
+                                            state.clone(),
+                                            contract,
+                                            RelatedContracts::default(),
+                                        )
+                                        .await?;
+                                        state
+                                    }
+                                };
+                                retrieved_contracts.push(UpdateData::State(state.into()));
+                                match mode {
+                                    RelatedMode::StateOnce => {}
+                                    RelatedMode::StateThenSubscribe => {
+                                        self.subscribe(id.into()).await?;
+                                    }
+                                }
+                            }
+                            #[cfg(all(not(feature = "local-mode"), feature = "network-mode"))]
+                            Err(StateStoreError::MissingContract(_)) => {
+                                let state = match self.local_state_or_from_network(&id).await? {
+                                    Either::Left(state) => state,
+                                    Either::Right(GetResult { state, contract }) => {
+                                        self.verify_and_store_contract(
+                                            state.clone(),
+                                            contract,
+                                            RelatedContracts::default(),
+                                        )
+                                        .await?;
+                                        state
+                                    }
+                                };
+                                retrieved_contracts.push(UpdateData::State(state.into()));
+                                match mode {
+                                    RelatedMode::StateOnce => {}
+                                    RelatedMode::StateThenSubscribe => {
+                                        self.subscribe(id.into()).await?;
+                                    }
+                                }
+                            }
+                            Err(other_err) => {
+                                let _ = mode;
+                                return Err(Either::Right(other_err.into()));
+                            }
+                        }
+                    }
+                    if retrieved_contracts.len() == required_contracts {
+                        // try running again with all the related contracts retrieved
+                        continue;
+                    } else if start.elapsed() > Duration::from_secs(10) {
+                        /* make this timeout configurable, and anyway should be controlled globally*/
+                        return Err(Either::Left(RequestError::Timeout.into()));
+                    }
+                } else {
+                    // state wasn't updated
+                    break state;
+                }
+            }
+        };
+        // in the network impl this would be sent over the network
+        let summary = self
+            .runtime
+            .summarize_state(&key, &parameters, &new_state)
+            .map_err(Into::into)
+            .map_err(Either::Right)?;
+        self.send_update_notification(&key, &parameters, &new_state)
+            .await?;
+
+        #[cfg(any(
+            not(feature = "local-mode"),
+            feature = "network-mode",
+            all(not(feature = "local-mode"), not(feature = "network-mode"))
+        ))]
+        {
+            #[cfg(any(
+                all(feature = "local-mode", feature = "network-mode"),
+                all(not(feature = "local-mode"), not(feature = "network-mode"))
+            ))]
+            {
+                if self.mode == OperationMode::Local {
+                    return Ok(ContractResponse::UpdateResponse { key, summary }.into());
+                }
+            }
+            // notify peers with deltas from summary in network
+            let request = UpdateContract {
+                key: key.clone(),
+                new_state,
+            };
+            let op: operations::update::UpdateOp =
+                op_request(request).await.map_err(Either::Right)?;
+            let _update: operations::update::UpdateResult =
+                op.try_into().map_err(Into::into).map_err(Either::Right)?;
+        }
+
+        Ok(ContractResponse::UpdateResponse { key, summary }.into())
+    }
+
+    async fn perform_contract_get(&mut self, contract: bool, key: ContractKey) -> Response {
+        let mut got_contract = None;
+
+        #[cfg(any(
+            all(not(feature = "local-mode"), not(feature = "network-mode")),
+            all(feature = "local-mode", feature = "network-mode"),
+        ))]
+        {
+            if contract && self.mode == OperationMode::Local {
+                let Some(contract) = self
+                    .get_contract_locally(&key)
+                    .await
+                    .map_err(Either::Left)?
+                else {
+                    return Err(Either::Right(Box::new(RequestError::from(
+                        CoreContractError::Get {
+                            key: key.clone(),
+                            cause: "Missing contract or parameters".into(),
+                        },
+                    ))));
+                };
+                got_contract = Some(contract);
+            } else if contract {
+                got_contract = self.get_contract_from_network(key.clone()).await?;
+            }
+        }
+
+        #[cfg(all(feature = "local-mode", not(feature = "network-mode")))]
+        if contract {
+            let Some(contract) = self
+                .get_contract_locally(&key)
+                .await
+                .map_err(Either::Left)?
+            else {
+                return Err(Either::Right(Box::new(RequestError::from(
+                    CoreContractError::Get {
+                        key: key.clone(),
+                        cause: "Missing contract or parameters".into(),
+                    },
+                ))));
+            };
+            got_contract = Some(contract);
+        }
+
+        #[cfg(all(feature = "network-mode", not(feature = "local-mode")))]
+        if contract {
+            if let Ok(Some(contract)) = self.get_contract_locally(&key).await {
+                got_contract = Some(contract);
+            } else {
+                got_contract = self.get_contract_from_network(key.clone()).await?;
+            }
+        }
+
+        match self.state_store.get(&key).await {
+            Ok(state) => Ok(ContractResponse::GetResponse {
+                key,
+                contract: got_contract,
+                state,
+            }
+            .into()),
+            Err(StateStoreError::MissingContract(_)) => Err(Either::Right(Box::new(
+                RequestError::from(CoreContractError::Get {
+                    key,
+                    cause: "missing contract state".into(),
+                }),
+            ))),
+            Err(err) => Err(Either::Right(Box::new(RequestError::from(
+                CoreContractError::Get {
+                    key,
+                    cause: format!("{err}"),
+                },
+            )))),
+        }
+    }
+
+    #[cfg(any(
+        not(feature = "local-mode"),
+        feature = "network-mode",
+        all(not(feature = "local-mode"), not(feature = "network-mode"))
+    ))]
+    async fn get_contract_from_network(
+        &mut self,
+        key: ContractKey,
+    ) -> Result<Option<ContractContainer>, Error> {
+        loop {
+            if let Ok(Some(contract)) = self.get_contract_locally(&key).await {
+                break Ok(Some(contract));
+            } else {
+                #[cfg(any(
+                    all(not(feature = "local-mode"), not(feature = "network-mode")),
+                    all(feature = "local-mode", feature = "network-mode")
+                ))]
+                {
+                    if self.mode == OperationMode::Local {
+                        return Err(Either::Left(Box::new(RequestError::ContractError(
+                            CoreContractError::MissingRelated { key: key.id() },
+                        ))));
+                    }
+                }
+                match self
+                    .local_state_or_from_network(&key.clone().into())
+                    .await?
+                {
+                    Either::Right(GetResult { state, contract }) => {
+                        self.verify_and_store_contract(
+                            state,
+                            contract.clone(),
+                            RelatedContracts::default(),
+                        )
+                        .await?;
+                        break Ok(Some(contract));
+                    }
+                    Either::Left(_state) => continue,
+                }
+            }
+        }
+    }
+
+    #[cfg(any(
+        not(feature = "local-mode"),
+        feature = "network-mode",
+        all(not(feature = "local-mode"), not(feature = "network-mode"))
+    ))]
+    async fn subscribe(&self, key: ContractKey) -> Result<(), Error> {
+        #[cfg(any(
+            all(not(feature = "local-mode"), not(feature = "network-mode")),
+            all(feature = "local-mode", feature = "network-mode")
+        ))]
+        {
+            if self.mode == OperationMode::Local {
+                return Ok(());
+            }
+        }
+        let request = SubscribeContract { key };
+        let op: operations::subscribe::SubscribeOp =
+            op_request(request).await.map_err(Either::Right)?;
+        let _sub: operations::subscribe::SubscribeResult =
+            op.try_into().map_err(Into::into).map_err(Either::Right)?;
+        Ok(())
+    }
+
+    async fn get_local_contract(
+        &self,
+        id: &ContractInstanceId,
+    ) -> Result<State<'static>, Either<Box<RequestError>, DynError>> {
+        let Ok(contract) = self.state_store.get(&(*id).into()).await else {
+            return Err(Either::Right(
+                CoreContractError::MissingRelated { key: *id }.into(),
+            ));
+        };
+        let state: &[u8] = unsafe {
+            // Safety: this is fine since this will never scape this scope
+            std::mem::transmute::<&[u8], &'_ [u8]>(contract.as_ref())
+        };
+        Ok(State::from(state))
+    }
+
+    async fn verify_and_store_contract<'a>(
+        &mut self,
+        state: WrappedState,
+        trying_container: ContractContainer,
+        mut related_contracts: RelatedContracts<'a>,
+    ) -> Result<(), Error> {
+        let key = trying_container.key();
+        let params = trying_container.params();
+
+        const DEPENDENCY_CYCLE_LIMIT_GUARD: usize = 100;
+        let mut iterations = 0;
+
+        let original_key = key.clone();
+        let original_state = state.clone();
+        let original_params = params.clone();
+        let mut trying_key = key;
+        let mut trying_state = state;
+        let mut trying_params = params;
+        let mut trying_contract = Some(trying_container);
+
+        while iterations < DEPENDENCY_CYCLE_LIMIT_GUARD {
+            if let Some(contract) = trying_contract.take() {
+                self.runtime
+                    .contract_store
+                    .store_contract(contract)
+                    .map_err(Into::into)
+                    .map_err(Either::Right)?;
+            }
+
+            let result = self
+                .runtime
+                .validate_state(
+                    &trying_key,
+                    &trying_params,
+                    &trying_state,
+                    &related_contracts,
+                )
+                .map_err(Into::into)
+                .map_err(|err| {
+                    let _ = self.runtime.contract_store.remove_contract(&trying_key);
+                    Either::Right(err)
+                })?;
+
+            let is_valid = match result {
+                ValidateResult::Valid => true,
+                ValidateResult::Invalid => false,
+                ValidateResult::RequestRelated(related) => {
+                    iterations += 1;
+                    related_contracts.missing(related);
+                    for (id, related) in related_contracts.update() {
+                        if related.is_none() {
+                            #[cfg(all(feature = "local-mode", not(feature = "network-mode")))]
+                            {
+                                let current_state = self.get_local_contract(id).await?;
+                                *related = Some(current_state);
+                            }
+
+                            #[cfg(any(
+                                all(not(feature = "local-mode"), not(feature = "network-mode")),
+                                all(feature = "local-mode", feature = "network-mode"),
+                                all(not(feature = "local-mode"), feature = "network-mode")
+                            ))]
+                            {
+                                match self.local_state_or_from_network(id).await? {
+                                    Either::Left(state) => {
+                                        *related = Some(state.into());
+                                    }
+                                    Either::Right(result) => {
+                                        trying_key = (*id).into();
+                                        trying_params = result.contract.params();
+                                        trying_state = result.state;
+                                        trying_contract = Some(result.contract);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if !is_valid {
+                return Err(Either::Left(Box::new(
+                    CoreContractError::Put {
+                        key: trying_key.clone(),
+                        cause: "not valid".to_owned(),
+                    }
+                    .into(),
+                )));
+            }
+
+            self.state_store
+                .store(
+                    trying_key.clone(),
+                    trying_state.clone(),
+                    trying_params.clone(),
+                )
+                .await
+                .map_err(|err| Either::Right(err.into()))?;
+            if trying_key != original_key {
+                trying_key = original_key.clone();
+                trying_params = original_params.clone();
+                trying_state = original_state.clone();
+                continue;
+            }
+            break;
+        }
+        if iterations == DEPENDENCY_CYCLE_LIMIT_GUARD {
+            return Err(Either::Left(Box::new(
+                CoreContractError::MissingRelated {
+                    key: original_key.id(),
+                }
+                .into(),
+            )));
+        }
+        Ok(())
     }
 
     fn delegate_op(&mut self, req: DelegateRequest<'_>) -> Response {
@@ -452,7 +846,7 @@ impl Executor {
         key: &ContractKey,
         params: &Parameters<'a>,
         new_state: &WrappedState,
-    ) -> Result<(), Either<Box<RequestError>, DynError>> {
+    ) -> Result<(), Error> {
         tracing::debug!(contract = %key, "notify of contract update");
         if let Some(notifiers) = self.update_notifications.get_mut(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
@@ -501,54 +895,46 @@ impl Executor {
         Ok(())
     }
 
-    async fn perform_get(
-        &mut self,
-        contract: bool,
-        key: ContractKey,
-    ) -> Result<HostResponse, Box<RequestError>> {
-        let mut got_contract = None;
-        if contract {
-            let parameters = self.contract_state.get_params(&key).await.map_err(|e| {
-                tracing::error!("{e}");
-                Box::new(RequestError::from(CoreContractError::Get {
-                    key: key.clone(),
-                    cause: "missing contract".to_owned(),
-                }))
-            })?;
-            let contract = self
-                .runtime
-                .contract_store
-                .fetch_contract(&key, &parameters)
-                .ok_or_else(|| {
-                    Box::new(RequestError::from(CoreContractError::Get {
-                        key: key.clone(),
-                        cause: "Missing contract".into(),
-                    }))
-                })?;
-            got_contract = Some(contract);
-        }
-        match self.contract_state.get(&key).await {
-            Ok(state) => Ok(ContractResponse::GetResponse {
-                key,
-                contract: got_contract,
-                state,
-            }
-            .into()),
-            Err(StateStoreError::MissingContract(_)) => Err(Box::new(
-                CoreContractError::Get {
-                    key,
-                    cause: "missing contract state".into(),
-                }
-                .into(),
-            )),
-            Err(err) => Err(Box::new(
-                CoreContractError::Get {
-                    key,
-                    cause: format!("{err}"),
-                }
-                .into(),
-            )),
-        }
+    #[cfg(any(
+        not(feature = "local-mode"),
+        feature = "network-mode",
+        all(not(feature = "local-mode"), not(feature = "network-mode")),
+    ))]
+    #[inline]
+    async fn local_state_or_from_network(
+        &self,
+        id: &ContractInstanceId,
+    ) -> Result<Either<WrappedState, operations::get::GetResult>, Error> {
+        if let Ok(contract) = self.state_store.get(&(*id).into()).await {
+            return Ok(Either::Left(contract));
+        };
+        let request: GetContract = GetContract {
+            key: (*id).into(),
+            fetch_contract: true,
+        };
+        let op: operations::get::GetOp = op_request(request).await.map_err(Either::Right)?;
+        let get_result: operations::get::GetResult =
+            op.try_into().map_err(Into::into).map_err(Either::Right)?;
+        Ok(Either::Right(get_result))
+    }
+
+    async fn get_contract_locally(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<ContractContainer>, Box<RequestError>> {
+        let Some(parameters) = self.state_store.get_params(key).await.map_err(|e| {
+            RequestError::ContractError(CoreContractError::Update {
+                cause: format!("{e}"),
+                key: key.clone(),
+            })
+        })?
+        else {
+            return Ok(None);
+        };
+        let Some(contract) = self.runtime.contract_store.fetch_contract(key, &parameters) else {
+            return Ok(None);
+        };
+        Ok(Some(contract))
     }
 }
 

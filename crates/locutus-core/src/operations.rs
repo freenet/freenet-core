@@ -17,6 +17,7 @@ pub(crate) mod join_ring;
 pub(crate) mod op_trait;
 pub(crate) mod put;
 pub(crate) mod subscribe;
+pub(crate) mod update;
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
@@ -30,19 +31,18 @@ pub(crate) struct OpInitialization<Op> {
     op: Op,
 }
 
-pub(crate) async fn handle_op_request<Op, CErr, CB>(
-    op_storage: &OpManager<CErr>,
+pub(crate) async fn handle_op_request<Op, CB>(
+    op_storage: &OpManager,
     conn_manager: &mut CB,
     msg: Op::Message,
-) -> Result<(), OpError<CErr>>
+) -> Result<(), OpError>
 where
-    Op: Operation<CErr, CB>,
-    CErr: std::error::Error + Send + Sync,
+    Op: Operation<CB>,
     CB: ConnectionBridge,
 {
     let sender;
     let tx = *msg.id();
-    let result: Result<_, Op::Error> = {
+    let result = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, &msg)?;
         sender = s;
         op.process_message(conn_manager, op_storage, msg).await
@@ -50,21 +50,20 @@ where
     handle_op_result(
         op_storage,
         conn_manager,
-        result.map_err(|err| (err.into(), tx)),
+        result.map_err(|err| (err, tx)),
         sender,
     )
     .await
 }
 
-async fn handle_op_result<CB, CErr>(
-    op_storage: &OpManager<CErr>,
+async fn handle_op_result<CB>(
+    op_storage: &OpManager,
     conn_manager: &mut CB,
-    result: Result<OperationResult, (OpError<CErr>, Transaction)>,
+    result: Result<OperationResult, (OpError, Transaction)>,
     sender: Option<PeerKey>,
-) -> Result<(), OpError<CErr>>
+) -> Result<(), OpError>
 where
     CB: ConnectionBridge,
-    CErr: std::error::Error + Send + Sync,
 {
     // FIXME: register changes in the future op commit log
     match result {
@@ -94,7 +93,7 @@ where
             state: Some(updated_state),
         }) => {
             // interim state
-            let id = OpEnum::id::<CErr, CB>(&updated_state);
+            let id = OpEnum::id::<CB>(&updated_state);
             op_storage.push(id, updated_state)?;
         }
         Ok(OperationResult {
@@ -124,28 +123,25 @@ pub(crate) enum OpEnum {
 }
 
 impl OpEnum {
-    fn id<CErr, CB: ConnectionBridge>(&self) -> Transaction
-    where
-        CErr: std::error::Error + Send + Sync,
-    {
+    fn id<CB: ConnectionBridge>(&self) -> Transaction {
         use OpEnum::*;
         match self {
-            JoinRing(op) => *<JoinRingOp as Operation<CErr, CB>>::id(op),
-            Put(op) => *<PutOp as Operation<CErr, CB>>::id(op),
-            Get(op) => *<GetOp as Operation<CErr, CB>>::id(op),
-            Subscribe(op) => *<SubscribeOp as Operation<CErr, CB>>::id(op),
+            JoinRing(op) => *<JoinRingOp as Operation<CB>>::id(op),
+            Put(op) => *<PutOp as Operation<CB>>::id(op),
+            Get(op) => *<GetOp as Operation<CB>>::id(op),
+            Subscribe(op) => *<SubscribeOp as Operation<CB>>::id(op),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OpError<S: std::error::Error> {
+pub(crate) enum OpError {
     #[error(transparent)]
     ConnError(#[from] ConnectionError),
     #[error(transparent)]
     RingError(#[from] RingError),
     #[error(transparent)]
-    ContractError(#[from] ContractError<S>),
+    ContractError(#[from] ContractError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
@@ -167,11 +163,8 @@ pub(crate) enum OpError<S: std::error::Error> {
     StatePushed,
 }
 
-impl<S> From<SendError<Message>> for OpError<S>
-where
-    S: std::error::Error,
-{
-    fn from(err: SendError<Message>) -> OpError<S> {
+impl From<SendError<Message>> for OpError {
+    fn from(err: SendError<Message>) -> OpError {
         OpError::NotificationError(Box::new(err))
     }
 }

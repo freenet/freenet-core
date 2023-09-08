@@ -77,9 +77,11 @@ locutus-runtime = { path = "../locutus-runtime", features = ["testing"] }
 locutus-stdlib = { path = "../locutus-stdlib", features = ["testing", "net"] }
 
 [features]
-testing = ["arbitrary"]
 default = ["websocket", "rocks_db", "trace"]
+testing = ["arbitrary"]
 rocks_db = ["rocksdb"]
 sqlite = ["sqlx"]
 websocket = ["axum/ws", "rmp-serde"]
 trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]
+local-mode = []
+network-mode = []

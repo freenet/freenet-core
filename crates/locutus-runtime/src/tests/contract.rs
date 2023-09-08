@@ -20,7 +20,7 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 2, 3, 4]),
-        Default::default(),
+        &Default::default(),
     )?;
     assert!(is_valid == ValidateResult::Valid);
 
@@ -28,7 +28,7 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
         &key,
         &Parameters::from([].as_ref()),
         &WrappedState::new(vec![1, 0, 0, 1]),
-        Default::default(),
+        &Default::default(),
     )?;
     assert!(matches!(not_valid, ValidateResult::RequestRelated(_)));
 

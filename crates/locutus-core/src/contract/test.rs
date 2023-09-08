@@ -7,7 +7,7 @@ use locutus_runtime::{
 use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
-use crate::{config::CONFIG, WrappedState};
+use crate::{config::CONFIG, DynError, WrappedState};
 
 pub(crate) struct MockRuntime {}
 
@@ -18,7 +18,7 @@ impl ContractRuntimeInterface for MockRuntime {
         key: &ContractKey,
         parameters: &locutus_runtime::Parameters<'_>,
         state: &locutus_runtime::WrappedState,
-        related: locutus_runtime::RelatedContracts,
+        related: &locutus_runtime::RelatedContracts,
     ) -> locutus_runtime::RuntimeResult<ValidateResult> {
         todo!()
     }
@@ -92,17 +92,10 @@ impl StateStorage for MemKVStore {
         todo!()
     }
 
-    fn get_params<'a>(
+    async fn get_params<'a>(
         &'a self,
         _key: &'a ContractKey,
-    ) -> std::pin::Pin<
-        Box<
-            dyn futures::Future<
-                    Output = Result<Option<locutus_runtime::Parameters<'static>>, Self::Error>,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> Result<Option<locutus_runtime::Parameters<'static>>, Self::Error> {
         todo!()
     }
 }
@@ -117,7 +110,7 @@ pub(crate) struct MemoryContractHandler<KVStore = MemKVStore>
 where
     KVStore: StateStorage,
 {
-    channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
+    channel: ContractHandlerChannel<CHListenerHalve>,
     kv_store: StateStore<KVStore>,
     contract_store: ContractStore,
     _runtime: MockRuntime,
@@ -130,10 +123,7 @@ where
 {
     const MAX_MEM_CACHE: i64 = 10_000_000;
 
-    pub fn new(
-        channel: ContractHandlerChannel<SimStoreError, CHListenerHalve>,
-        kv_store: KVStore,
-    ) -> Self {
+    pub fn new(channel: ContractHandlerChannel<CHListenerHalve>, kv_store: KVStore) -> Self {
         MemoryContractHandler {
             channel,
             kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
@@ -147,23 +137,18 @@ where
     }
 }
 
-impl From<ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>>
-    for MemoryContractHandler
-{
-    fn from(
-        channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
-    ) -> Self {
+impl From<ContractHandlerChannel<CHListenerHalve>> for MemoryContractHandler {
+    fn from(channel: ContractHandlerChannel<CHListenerHalve>) -> Self {
         let store = MemKVStore::new();
         MemoryContractHandler::new(channel, store)
     }
 }
 
 impl ContractHandler for MemoryContractHandler {
-    type Error = SimStoreError;
     type Store = MemKVStore;
 
     #[inline(always)]
-    fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
+    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
         &mut self.channel
     }
 
@@ -175,7 +160,7 @@ impl ContractHandler for MemoryContractHandler {
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         _req: ClientRequest<'a>,
-    ) -> BoxFuture<'static, Result<HostResponse, Self::Error>> {
+    ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
         // async fn get_state(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         //     Ok(self.kv_store.get(contract).cloned())
         // }

@@ -76,6 +76,8 @@ pub enum RequestError {
     DelegateError(#[from] DelegateError),
     #[error("client disconnect")]
     Disconnect,
+    #[error("operation timed out")]
+    Timeout,
 }
 
 /// Errors that may happen while interacting with delegates.
@@ -104,6 +106,11 @@ pub enum ContractError {
     Subscribe { key: ContractKey, cause: String },
     #[error("missing related contract: {key}")]
     MissingRelated {
+        key: crate::contract_interface::ContractInstanceId,
+    },
+    // todo: actually build a stack of the involved keys
+    #[error("dependency contract stack overflow : {key}")]
+    ContractStackOverflow {
         key: crate::contract_interface::ContractInstanceId,
     },
 }

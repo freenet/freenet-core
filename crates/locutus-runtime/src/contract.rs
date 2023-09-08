@@ -16,7 +16,7 @@ pub trait ContractRuntimeInterface {
         key: &ContractKey,
         parameters: &Parameters<'_>,
         state: &WrappedState,
-        related: RelatedContracts,
+        related: &RelatedContracts<'_>,
     ) -> RuntimeResult<ValidateResult>;
 
     /// Verify that a delta is valid - at least as much as possible. The goal is to prevent DDoS of
@@ -72,7 +72,7 @@ impl ContractRuntimeInterface for crate::Runtime {
         key: &ContractKey,
         parameters: &Parameters<'_>,
         state: &WrappedState,
-        related: RelatedContracts,
+        related: &RelatedContracts<'_>,
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
@@ -89,7 +89,7 @@ impl ContractRuntimeInterface for crate::Runtime {
             state_buf.ptr()
         };
         let related_buf_ptr = {
-            let serialized = bincode::serialize(&related)?;
+            let serialized = bincode::serialize(related)?;
             let mut related_buf = self.init_buf(&running.instance, &serialized)?;
             related_buf.write(serialized)?;
             related_buf.ptr()

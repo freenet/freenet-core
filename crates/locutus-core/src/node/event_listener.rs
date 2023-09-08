@@ -34,10 +34,7 @@ pub(crate) struct EventLog<'a> {
 }
 
 impl<'a> EventLog<'a> {
-    pub fn new<CErr>(msg: &'a Message, op_storage: &'a OpManager<CErr>) -> Self
-    where
-        CErr: std::error::Error,
-    {
+    pub fn new(msg: &'a Message, op_storage: &'a OpManager) -> Self {
         let kind = match msg {
             Message::JoinRing(JoinRingMsg::Connected { sender, target, .. }) => {
                 EventKind::Connected {
