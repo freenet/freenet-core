@@ -253,11 +253,15 @@ where
                             .await?;
                         todo!()
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        tracing::error!("op not supported");
+                        Err("op not supported".into())
+                    }
                 },
-                ClientRequest::DelegateOp(_op) => unreachable!(),
-                ClientRequest::Disconnect { .. } => unreachable!(),
-                ClientRequest::GenerateRandData { bytes: _ } => unreachable!(),
+                _ => {
+                    tracing::error!("op not supported");
+                    Err("op not supported".into())
+                }
             }
         }
         .boxed()

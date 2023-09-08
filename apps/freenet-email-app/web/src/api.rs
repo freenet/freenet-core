@@ -689,6 +689,7 @@ pub(crate) async fn node_comms(
                             RequestError::Disconnect => {
                                 todo!("lost connection to node, should retry connecting")
                             }
+                            _ => {}
                         }
                     }
                     ErrorKind::Unhandled { cause } => {

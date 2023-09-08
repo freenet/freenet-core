@@ -200,11 +200,7 @@ impl Executor {
                 }
                 Err(Either::Left(Box::new(RequestError::Disconnect)))
             }
-            ClientRequest::GenerateRandData { bytes } => {
-                let mut output = vec![0; bytes];
-                locutus_runtime::util::generate_random_bytes(&mut output);
-                Ok(HostResponse::GenerateRandData(output))
-            }
+            _ => Err(Either::Right("not supported".into())),
         }
     }
 
@@ -245,6 +241,7 @@ impl Executor {
                 // by default a subscribe op has an implicit get
                 Ok(res)
             }
+            _ => Err(Either::Right("not supported".into())),
         }
     }
 
@@ -838,6 +835,7 @@ impl Executor {
                     }
                 }
             }
+            _ => Err(Either::Right("not supported".into())),
         }
     }
 

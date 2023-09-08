@@ -97,7 +97,10 @@ async fn execute_command(
             }
         }
         ClientRequest::Disconnect { .. } => return Ok(true),
-        ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
+        _ => {
+            tracing::error!("op not supported");
+            return Err("op not support".into());
+        }
     }
     Ok(false)
 }

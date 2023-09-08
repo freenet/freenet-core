@@ -28,6 +28,7 @@ pub use client_events::*;
 type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     Deserialization(#[from] bincode::Error),
@@ -50,6 +51,7 @@ pub trait TryFromTsStd<T>: Sized {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum WsApiError {
     #[error("Failed decoding msgpack message from client request: {cause}")]
     MsgpackDecodeError { cause: String },
