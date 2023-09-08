@@ -149,10 +149,6 @@ table DelegateRequest {
   delegate_request:DelegateRequestType(required);
 }
 
-table GenerateRandData {
-  data:int;
-}
-
 table Disconnect {
   cause:string;
 }
@@ -160,7 +156,6 @@ table Disconnect {
 union ClientRequestType {
     ContractRequest,
     DelegateRequest,
-    GenerateRandData,
     Disconnect
 }
 
