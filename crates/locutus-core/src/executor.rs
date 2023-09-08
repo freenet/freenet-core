@@ -246,18 +246,15 @@ impl Executor {
         state: WrappedState,
         related_contracts: RelatedContracts<'_>,
     ) -> Response {
-        // FIXME: in net node, we don't allow puts for existing contract states
-        //        if it hits a node which already has it it will get rejected
-        //
-        //        if there is a conflict, resolve the conflict to see which
-        //        is the outdated state:
-        //          1. through the arbitraur mechanism
-        //          2. a new func which compared two summaries and gives the most fresh
-        //          3. could convert into an update with the full state
-        //        you can request to several nodes and determine which node has a fresher ver
-
         let key = contract.key();
         let params = contract.params();
+
+        if self.get_local_contract(&key.id()).await.is_ok() {
+            // already existing contract, just try to merge states
+            return self
+                .perform_contract_update(key, UpdateData::State(state.into()))
+                .await;
+        }
 
         self.verify_and_store_contract(state.clone(), contract, related_contracts)
             .await?;
@@ -307,22 +304,23 @@ impl Executor {
 
             let start = Instant::now();
             loop {
-                let update_modification = self
-                    .runtime
-                    .update_state(&key, &parameters, &state, &retrieved_contracts)
-                    .map_err(|err| {
-                        let is_contract_exec_error = err.is_contract_exec_error();
-                        match is_contract_exec_error {
-                            true => Either::Left(Box::new(
+                let update_modification =
+                    match self
+                        .runtime
+                        .update_state(&key, &parameters, &state, &retrieved_contracts)
+                    {
+                        Err(err) if err.is_contract_exec_error() => {
+                            return Err(Either::Left(Box::new(
                                 CoreContractError::Update {
                                     key: key.clone(),
                                     cause: format!("{err}"),
                                 }
                                 .into(),
-                            )),
-                            _ => Either::Right(err.into()),
+                            )));
                         }
-                    })?;
+                        Err(err) => return Err(Either::Right(err.into())),
+                        Ok(result) => result,
+                    };
                 let UpdateModification {
                     new_state, related, ..
                 } = update_modification;
@@ -426,9 +424,7 @@ impl Executor {
             .map_err(Either::Right)?;
         self.send_update_notification(&key, &parameters, &new_state)
             .await?;
-        // TODO: in network mode, wait at least for one confirmation
-        //       when a node receives a delta from updates, run the update themselves
-        //       and send back confirmation
+        // TODO: notify peers with deltas from summary in network
         Ok(ContractResponse::UpdateResponse { key, summary }.into())
     }
 
@@ -553,6 +549,22 @@ impl Executor {
         Ok(())
     }
 
+    async fn get_local_contract(
+        &self,
+        id: &ContractInstanceId,
+    ) -> Result<State<'static>, Either<Box<RequestError>, DynError>> {
+        let Ok(contract) = self.state_store.get(&(*id).into()).await else {
+            return Err(Either::Right(
+                CoreContractError::MissingRelated { key: *id }.into(),
+            ));
+        };
+        let state: &[u8] = unsafe {
+            // Safety: this is fine since this will never scape this scope
+            std::mem::transmute::<&[u8], &'_ [u8]>(contract.as_ref())
+        };
+        Ok(State::from(state))
+    }
+
     async fn verify_and_store_contract<'a>(
         &mut self,
         state: WrappedState,
@@ -561,26 +573,6 @@ impl Executor {
     ) -> Result<(), Error> {
         let key = trying_container.key();
         let params = trying_container.params();
-
-        #[cfg(all(feature = "local-mode", not(feature = "network-mode")))]
-        #[inline]
-        async fn get_local_contract(
-            store: &StateStore<Storage>,
-            id: &ContractInstanceId,
-            related: &mut Option<State<'_>>,
-        ) -> Result<(), Either<Box<RequestError>, DynError>> {
-            let Ok(contract) = store.get(&(*id).into()).await else {
-                return Err(Either::Right(
-                    CoreContractError::MissingRelated { key: *id }.into(),
-                ));
-            };
-            let state: &[u8] = unsafe {
-                // Safety: this is fine since this will never scape this scope
-                std::mem::transmute::<&[u8], &'_ [u8]>(contract.as_ref())
-            };
-            *related = Some(State::from(state));
-            Ok(())
-        }
 
         const DEPENDENCY_CYCLE_LIMIT_GUARD: usize = 100;
         let mut iterations = 0;
@@ -626,7 +618,8 @@ impl Executor {
                         if related.is_none() {
                             #[cfg(all(feature = "local-mode", not(feature = "network-mode")))]
                             {
-                                get_local_contract(&self.state_store, id, related).await?;
+                                let current_state = self.get_local_contract(id).await?;
+                                *related = Some(current_state);
                             }
 
                             #[cfg(any(
