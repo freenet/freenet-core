@@ -411,14 +411,13 @@ pub struct DelegateRequestTypeUnionTableOffset {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_CLIENT_REQUEST_TYPE: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_CLIENT_REQUEST_TYPE: u8 = 4;
+pub const ENUM_MAX_CLIENT_REQUEST_TYPE: u8 = 3;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_CLIENT_REQUEST_TYPE: [ClientRequestType; 5] = [
+pub const ENUM_VALUES_CLIENT_REQUEST_TYPE: [ClientRequestType; 4] = [
   ClientRequestType::NONE,
   ClientRequestType::ContractRequest,
   ClientRequestType::DelegateRequest,
-  ClientRequestType::GenerateRandData,
   ClientRequestType::Disconnect,
 ];
 
@@ -430,16 +429,14 @@ impl ClientRequestType {
   pub const NONE: Self = Self(0);
   pub const ContractRequest: Self = Self(1);
   pub const DelegateRequest: Self = Self(2);
-  pub const GenerateRandData: Self = Self(3);
-  pub const Disconnect: Self = Self(4);
+  pub const Disconnect: Self = Self(3);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 4;
+  pub const ENUM_MAX: u8 = 3;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::ContractRequest,
     Self::DelegateRequest,
-    Self::GenerateRandData,
     Self::Disconnect,
   ];
   /// Returns the variant's name or "" if unknown.
@@ -448,7 +445,6 @@ impl ClientRequestType {
       Self::NONE => Some("NONE"),
       Self::ContractRequest => Some("ContractRequest"),
       Self::DelegateRequest => Some("DelegateRequest"),
-      Self::GenerateRandData => Some("GenerateRandData"),
       Self::Disconnect => Some("Disconnect"),
       _ => None,
     }
@@ -3711,103 +3707,6 @@ impl core::fmt::Debug for DelegateRequest<'_> {
       ds.finish()
   }
 }
-pub enum GenerateRandDataOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct GenerateRandData<'a> {
-  pub _tab: flatbuffers::Table<'a>,
-}
-
-impl<'a> flatbuffers::Follow<'a> for GenerateRandData<'a> {
-  type Inner = GenerateRandData<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: flatbuffers::Table::new(buf, loc) }
-  }
-}
-
-impl<'a> GenerateRandData<'a> {
-  pub const VT_DATA: flatbuffers::VOffsetT = 4;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
-    GenerateRandData { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
-    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-    args: &'args GenerateRandDataArgs
-  ) -> flatbuffers::WIPOffset<GenerateRandData<'bldr>> {
-    let mut builder = GenerateRandDataBuilder::new(_fbb);
-    builder.add_data(args.data);
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn data(&self) -> i32 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<i32>(GenerateRandData::VT_DATA, Some(0)).unwrap()}
-  }
-}
-
-impl flatbuffers::Verifiable for GenerateRandData<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut flatbuffers::Verifier, pos: usize
-  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-    use self::flatbuffers::Verifiable;
-    v.visit_table(pos)?
-     .visit_field::<i32>("data", Self::VT_DATA, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct GenerateRandDataArgs {
-    pub data: i32,
-}
-impl<'a> Default for GenerateRandDataArgs {
-  #[inline]
-  fn default() -> Self {
-    GenerateRandDataArgs {
-      data: 0,
-    }
-  }
-}
-
-pub struct GenerateRandDataBuilder<'a: 'b, 'b> {
-  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
-  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b> GenerateRandDataBuilder<'a, 'b> {
-  #[inline]
-  pub fn add_data(&mut self, data: i32) {
-    self.fbb_.push_slot::<i32>(GenerateRandData::VT_DATA, data, 0);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> GenerateRandDataBuilder<'a, 'b> {
-    let start = _fbb.start_table();
-    GenerateRandDataBuilder {
-      fbb_: _fbb,
-      start_: start,
-    }
-  }
-  #[inline]
-  pub fn finish(self) -> flatbuffers::WIPOffset<GenerateRandData<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    flatbuffers::WIPOffset::new(o.value())
-  }
-}
-
-impl core::fmt::Debug for GenerateRandData<'_> {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    let mut ds = f.debug_struct("GenerateRandData");
-      ds.field("data", &self.data());
-      ds.finish()
-  }
-}
 pub enum DisconnectOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -3984,20 +3883,6 @@ impl<'a> ClientRequest<'a> {
 
   #[inline]
   #[allow(non_snake_case)]
-  pub fn client_request_as_generate_rand_data(&self) -> Option<GenerateRandData<'a>> {
-    if self.client_request_type() == ClientRequestType::GenerateRandData {
-      let u = self.client_request();
-      // Safety:
-      // Created from a valid Table for this object
-      // Which contains a valid union in this slot
-      Some(unsafe { GenerateRandData::init_from_table(u) })
-    } else {
-      None
-    }
-  }
-
-  #[inline]
-  #[allow(non_snake_case)]
   pub fn client_request_as_disconnect(&self) -> Option<Disconnect<'a>> {
     if self.client_request_type() == ClientRequestType::Disconnect {
       let u = self.client_request();
@@ -4023,7 +3908,6 @@ impl flatbuffers::Verifiable for ClientRequest<'_> {
         match key {
           ClientRequestType::ContractRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ContractRequest>>("ClientRequestType::ContractRequest", pos),
           ClientRequestType::DelegateRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<DelegateRequest>>("ClientRequestType::DelegateRequest", pos),
-          ClientRequestType::GenerateRandData => v.verify_union_variant::<flatbuffers::ForwardsUOffset<GenerateRandData>>("ClientRequestType::GenerateRandData", pos),
           ClientRequestType::Disconnect => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Disconnect>>("ClientRequestType::Disconnect", pos),
           _ => Ok(()),
         }
@@ -4089,13 +3973,6 @@ impl core::fmt::Debug for ClientRequest<'_> {
         },
         ClientRequestType::DelegateRequest => {
           if let Some(x) = self.client_request_as_delegate_request() {
-            ds.field("client_request", &x)
-          } else {
-            ds.field("client_request", &"InvalidFlatbuffer: Union discriminant does not match value.")
-          }
-        },
-        ClientRequestType::GenerateRandData => {
-          if let Some(x) = self.client_request_as_generate_rand_data() {
             ds.field("client_request", &x)
           } else {
             ds.field("client_request", &"InvalidFlatbuffer: Union discriminant does not match value.")

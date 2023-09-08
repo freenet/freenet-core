@@ -232,14 +232,6 @@ impl ClientRequest<'_> {
                             client_request.client_request_as_delegate_request().unwrap();
                         DelegateRequest::try_decode_fbs(&delegate_request)?.into()
                     }
-                    ClientRequestType::GenerateRandData => {
-                        let delegate_request = client_request
-                            .client_request_as_generate_rand_data()
-                            .unwrap();
-                        ClientRequest::GenerateRandData {
-                            bytes: delegate_request.data() as usize,
-                        }
-                    }
                     ClientRequestType::Disconnect => {
                         let delegate_request =
                             client_request.client_request_as_disconnect().unwrap();
@@ -1309,24 +1301,6 @@ impl HostResponse {
                     &HostResponseArgs {
                         response_type: HostResponseType::DelegateResponse,
                         response: Some(delegate_response_offset.as_union_value()),
-                    },
-                );
-                finish_host_response_buffer(&mut builder, host_response_offset);
-                Ok(builder.finished_data().to_vec())
-            }
-            HostResponse::GenerateRandData(data) => {
-                let data = builder.create_vector(data.as_slice());
-                let rand_data_offset = FbsGenerateRandData::create(
-                    &mut builder,
-                    &GenerateRandDataArgs {
-                        wrapped_state: Some(data),
-                    },
-                );
-                let host_response_offset = FbsHostResponse::create(
-                    &mut builder,
-                    &HostResponseArgs {
-                        response_type: HostResponseType::GenerateRandData,
-                        response: Some(rand_data_offset.as_union_value()),
                     },
                 );
                 finish_host_response_buffer(&mut builder, host_response_offset);
