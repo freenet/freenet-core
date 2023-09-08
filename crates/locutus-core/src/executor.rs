@@ -74,6 +74,14 @@ struct SubscribeContract {
 
 impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeContract {}
 
+#[allow(unused)]
+struct UpdateContract {
+    key: ContractKey,
+    new_state: WrappedState,
+}
+
+impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {}
+
 /// A WASM executor which will run any contracts, delegates, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
@@ -232,7 +240,7 @@ impl Executor {
                     all(feature = "network-mode", not(feature = "network-mode"))
                 ))]
                 {
-                    Self::subscribe(key).await?;
+                    self.subscribe(key).await?;
                 }
                 // by default a subscribe op has an implicit get
                 Ok(res)
@@ -371,7 +379,7 @@ impl Executor {
                                 match mode {
                                     RelatedMode::StateOnce => {}
                                     RelatedMode::StateThenSubscribe => {
-                                        Self::subscribe(id.into()).await?;
+                                        self.subscribe(id.into()).await?;
                                     }
                                 }
                             }
@@ -393,7 +401,7 @@ impl Executor {
                                 match mode {
                                     RelatedMode::StateOnce => {}
                                     RelatedMode::StateThenSubscribe => {
-                                        Self::subscribe(id.into()).await?;
+                                        self.subscribe(id.into()).await?;
                                     }
                                 }
                             }
@@ -424,7 +432,33 @@ impl Executor {
             .map_err(Either::Right)?;
         self.send_update_notification(&key, &parameters, &new_state)
             .await?;
-        // TODO: notify peers with deltas from summary in network
+
+        #[cfg(any(
+            not(feature = "local-mode"),
+            feature = "network-mode",
+            all(not(feature = "local-mode"), not(feature = "network-mode"))
+        ))]
+        {
+            #[cfg(any(
+                all(feature = "local-mode", feature = "network-mode"),
+                all(not(feature = "local-mode"), not(feature = "network-mode"))
+            ))]
+            {
+                if self.mode == OperationMode::Local {
+                    return Ok(ContractResponse::UpdateResponse { key, summary }.into());
+                }
+            }
+            // notify peers with deltas from summary in network
+            let request = UpdateContract {
+                key: key.clone(),
+                new_state,
+            };
+            let op: operations::update::UpdateOp =
+                op_request(request).await.map_err(Either::Right)?;
+            let _update: operations::update::UpdateResult =
+                op.try_into().map_err(Into::into).map_err(Either::Right)?;
+        }
+
         Ok(ContractResponse::UpdateResponse { key, summary }.into())
     }
 
@@ -516,6 +550,17 @@ impl Executor {
             if let Ok(Some(contract)) = self.get_contract_locally(&key).await {
                 break Ok(Some(contract));
             } else {
+                #[cfg(any(
+                    all(not(feature = "local-mode"), not(feature = "network-mode")),
+                    all(feature = "local-mode", feature = "network-mode")
+                ))]
+                {
+                    if self.mode == OperationMode::Local {
+                        return Err(Either::Left(Box::new(RequestError::ContractError(
+                            CoreContractError::MissingRelated { key: key.id() },
+                        ))));
+                    }
+                }
                 match self
                     .local_state_or_from_network(&key.clone().into())
                     .await?
@@ -540,7 +585,16 @@ impl Executor {
         feature = "network-mode",
         all(not(feature = "local-mode"), not(feature = "network-mode"))
     ))]
-    async fn subscribe(key: ContractKey) -> Result<(), Error> {
+    async fn subscribe(&self, key: ContractKey) -> Result<(), Error> {
+        #[cfg(any(
+            all(not(feature = "local-mode"), not(feature = "network-mode")),
+            all(feature = "local-mode", feature = "network-mode")
+        ))]
+        {
+            if self.mode == OperationMode::Local {
+                return Ok(());
+            }
+        }
         let request = SubscribeContract { key };
         let op: operations::subscribe::SubscribeOp =
             op_request(request).await.map_err(Either::Right)?;
@@ -842,9 +896,9 @@ impl Executor {
     }
 
     #[cfg(any(
-        all(not(feature = "local-mode"), not(feature = "network-mode")),
-        all(feature = "local-mode", feature = "network-mode"),
+        not(feature = "local-mode"),
         feature = "network-mode",
+        all(not(feature = "local-mode"), not(feature = "network-mode")),
     ))]
     #[inline]
     async fn local_state_or_from_network(

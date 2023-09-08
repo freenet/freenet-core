@@ -17,6 +17,7 @@ pub(crate) mod join_ring;
 pub(crate) mod op_trait;
 pub(crate) mod put;
 pub(crate) mod subscribe;
+pub(crate) mod update;
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
