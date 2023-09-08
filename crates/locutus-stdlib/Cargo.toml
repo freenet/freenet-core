@@ -62,7 +62,7 @@ optional = true
 [target.'cfg(any(unix, windows))'.dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 bincode = "1"
-wasmer = { version = "4.1.2", features = [ "sys-default"] }
+wasmer = { version = "4.2.0", features = [ "sys-default"] }
 rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
