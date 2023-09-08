@@ -842,8 +842,6 @@ impl HostResponse {
 
                         let contract_params =
                             builder.create_vector(&contract.clone().params().into_bytes());
-                        let contract_version =
-                            builder.create_string(&APIVersion::from(contract.clone()).to_string());
 
                         let contract_offset = match contract {
                             Wasm(V1(..)) => WasmContractV1::create(

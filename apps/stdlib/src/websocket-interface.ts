@@ -342,9 +342,8 @@ export class LocutusWsApi {
     private handleResponse(ev: MessageEvent<any>): void | Error {
         let response: HostResponseT;
         try {
-            let data = new flatbuffers.ByteBuffer(ev.data);
-            response = new HostResponseT();
-            HostResponse.getRootAsHostResponse(data).unpackTo(response);
+            let data = new flatbuffers.ByteBuffer(new Uint8Array(ev.data));
+            response = HostResponse.getRootAsHostResponse(data).unpack();
         } catch (err) {
             console.log(`found error: ${err}`);
             return new Error(`${err}`);
