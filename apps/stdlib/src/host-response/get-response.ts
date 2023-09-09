@@ -82,7 +82,6 @@ static startStateVector(builder:flatbuffers.Builder, numElems:number) {
 static endGetResponse(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   builder.requiredField(offset, 4) // key
-  builder.requiredField(offset, 6) // contract
   builder.requiredField(offset, 8) // state
   return offset;
 }

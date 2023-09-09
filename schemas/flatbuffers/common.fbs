@@ -19,6 +19,25 @@ table ContractCode {
     code_hash:[ubyte](required);
 }
 
+table ApplicationMessage {
+    app: ContractInstanceId(required);
+    payload: [ubyte](required);
+    context: [ubyte](required);
+    processed: bool;
+}
+
+table GetSecretRequest {
+    key: SecretsId(required);
+    delegate_context: [ubyte](required);
+    processed: bool;
+}
+
+table GetSecretResponse {
+    key: SecretsId(required);
+    value: [ubyte];
+    delegate_context: [ubyte](required);
+}
+
 table WasmContractV1 {
     data:ContractCode(required);
     parameters:[ubyte](required);

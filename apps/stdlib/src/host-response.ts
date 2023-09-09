@@ -2,7 +2,6 @@
 
 /* eslint-disable @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
-export { ApplicationMessage, ApplicationMessageT } from './host-response/application-message.js';
 export { ClientResponse, ClientResponseT } from './host-response/client-response.js';
 export { ContextUpdated, ContextUpdatedT } from './host-response/context-updated.js';
 export { ContractResponse, ContractResponseT } from './host-response/contract-response.js';
@@ -11,8 +10,6 @@ export { DelegateKey, DelegateKeyT } from './host-response/delegate-key.js';
 export { DelegateResponse, DelegateResponseT } from './host-response/delegate-response.js';
 export { GenerateRandData, GenerateRandDataT } from './host-response/generate-rand-data.js';
 export { GetResponse, GetResponseT } from './host-response/get-response.js';
-export { GetSecretRequest, GetSecretRequestT } from './host-response/get-secret-request.js';
-export { GetSecretResponse, GetSecretResponseT } from './host-response/get-secret-response.js';
 export { HostResponse, HostResponseT } from './host-response/host-response.js';
 export { HostResponseType } from './host-response/host-response-type.js';
 export { Ok, OkT } from './host-response/ok.js';
