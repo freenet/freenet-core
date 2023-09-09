@@ -47,13 +47,6 @@ table UserInputRequest {
 
 // New definitions end here
 
-table ApplicationMessage {
-    app: common.ContractInstanceId(required);
-    payload: [ubyte](required);
-    delegate_context: [ubyte](required);
-    processed: bool;
-}
-
 table ClientResponse {
     data: [ubyte];
 }
@@ -68,12 +61,6 @@ table ContextUpdated {
     context: [ubyte](required);
 }
 
-table GetSecretRequest {
-    key: common.SecretsId(required);
-    delegate_context: [ubyte](required);
-    processed: bool;
-}
-
 table SetSecretRequest {
     key: common.SecretsId(required);
     value: [ubyte](required);
@@ -83,20 +70,14 @@ table RandomBytesRequest {
     data: uint;
 }
 
-table GetSecretResponse {
-    key: common.SecretsId(required);
-    value: [ubyte](required);
-    delegate_context: [ubyte](required);
-}
-
 union OutboundDelegateMsgType {
-    ApplicationMessage,
+    common.ApplicationMessage,
     RequestUserInput,
     ContextUpdated,
-    GetSecretRequest,
+    common.GetSecretRequest,
     SetSecretRequest,
     RandomBytesRequest,
-    GetSecretResponse,
+    common.GetSecretResponse,
 }
 
 table OutboundDelegateMsg {

@@ -5,26 +5,23 @@
 import { ContractRequest, ContractRequestT } from '../client-request/contract-request.js';
 import { DelegateRequest, DelegateRequestT } from '../client-request/delegate-request.js';
 import { Disconnect, DisconnectT } from '../client-request/disconnect.js';
-import { GenerateRandData, GenerateRandDataT } from '../client-request/generate-rand-data.js';
 
 
 export enum ClientRequestType {
   NONE = 0,
   ContractRequest = 1,
   DelegateRequest = 2,
-  GenerateRandData = 3,
-  Disconnect = 4
+  Disconnect = 3
 }
 
 export function unionToClientRequestType(
   type: ClientRequestType,
-  accessor: (obj:ContractRequest|DelegateRequest|Disconnect|GenerateRandData) => ContractRequest|DelegateRequest|Disconnect|GenerateRandData|null
-): ContractRequest|DelegateRequest|Disconnect|GenerateRandData|null {
+  accessor: (obj:ContractRequest|DelegateRequest|Disconnect) => ContractRequest|DelegateRequest|Disconnect|null
+): ContractRequest|DelegateRequest|Disconnect|null {
   switch(ClientRequestType[type]) {
     case 'NONE': return null; 
     case 'ContractRequest': return accessor(new ContractRequest())! as ContractRequest;
     case 'DelegateRequest': return accessor(new DelegateRequest())! as DelegateRequest;
-    case 'GenerateRandData': return accessor(new GenerateRandData())! as GenerateRandData;
     case 'Disconnect': return accessor(new Disconnect())! as Disconnect;
     default: return null;
   }
@@ -32,14 +29,13 @@ export function unionToClientRequestType(
 
 export function unionListToClientRequestType(
   type: ClientRequestType, 
-  accessor: (index: number, obj:ContractRequest|DelegateRequest|Disconnect|GenerateRandData) => ContractRequest|DelegateRequest|Disconnect|GenerateRandData|null, 
+  accessor: (index: number, obj:ContractRequest|DelegateRequest|Disconnect) => ContractRequest|DelegateRequest|Disconnect|null, 
   index: number
-): ContractRequest|DelegateRequest|Disconnect|GenerateRandData|null {
+): ContractRequest|DelegateRequest|Disconnect|null {
   switch(ClientRequestType[type]) {
     case 'NONE': return null; 
     case 'ContractRequest': return accessor(index, new ContractRequest())! as ContractRequest;
     case 'DelegateRequest': return accessor(index, new DelegateRequest())! as DelegateRequest;
-    case 'GenerateRandData': return accessor(index, new GenerateRandData())! as GenerateRandData;
     case 'Disconnect': return accessor(index, new Disconnect())! as Disconnect;
     default: return null;
   }

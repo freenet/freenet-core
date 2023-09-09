@@ -2,7 +2,7 @@ import {
     GetRequest,
     GetResponse,
     HostError,
-    Key,
+    ContractKey,
     LocutusWsApi,
     PutResponse,
     UpdateNotification,
@@ -10,7 +10,7 @@ import {
     UpdateRequest,
     SubscribeRequest,
     UpdateData,
-    DeltaUpdate,
+    DeltaUpdate, DelegateResponse,
 } from "locutus-stdlib/websocket-interface";
 
 import "./scss/styles.scss";
@@ -29,7 +29,7 @@ function getDocument(): Document {
 const DOCUMENT: Document = getDocument();
 
 const MODEL_CONTRACT = "4EhpHnF27Hqby5XtqqBSj2xbyBVLdTcfDAbTpnpEkG8o";
-const KEY = Key.fromInstanceId(MODEL_CONTRACT);
+const KEY = ContractKey.fromInstanceId(MODEL_CONTRACT);
 
 function getState(hostResponse: GetResponse) {
     console.log("Received get");
@@ -131,12 +131,14 @@ async function subscribeToUpdates() {
 }
 
 const handler = {
-    onPut: (_response: PutResponse) => {
+    onContractPut: (_response: PutResponse) => {
     },
-    onGet: getState,
-    onUpdate: (_up: UpdateResponse) => {
+    onContractGet: getState,
+    onContractUpdate: (_up: UpdateResponse) => {
     },
-    onUpdateNotification: getUpdateNotification,
+    onContractUpdateNotification: getUpdateNotification,
+    onDelegateResponse: (_response: DelegateResponse) => {
+    },
     onErr: (err: HostError) => {
         console.log("Received error, cause: " + err.cause);
     },
@@ -152,7 +154,7 @@ const locutusApi = new LocutusWsApi(API_URL, handler);
 
 async function loadState() {
 
-    const key = Key.fromInstanceId(MODEL_CONTRACT);
+    const key = ContractKey.fromInstanceId(MODEL_CONTRACT);
     const fetchContract = false;
     const getRequest: GetRequest = new GetRequest(key, fetchContract);
 

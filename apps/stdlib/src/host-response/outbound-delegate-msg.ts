@@ -4,10 +4,10 @@
 
 import * as flatbuffers from 'flatbuffers';
 
-import { ApplicationMessage, ApplicationMessageT } from '../host-response/application-message.js';
+import { ApplicationMessage, ApplicationMessageT } from '../common/application-message.js';
+import { GetSecretRequest, GetSecretRequestT } from '../common/get-secret-request.js';
+import { GetSecretResponse, GetSecretResponseT } from '../common/get-secret-response.js';
 import { ContextUpdated, ContextUpdatedT } from '../host-response/context-updated.js';
-import { GetSecretRequest, GetSecretRequestT } from '../host-response/get-secret-request.js';
-import { GetSecretResponse, GetSecretResponseT } from '../host-response/get-secret-response.js';
 import { OutboundDelegateMsgType, unionToOutboundDelegateMsgType, unionListToOutboundDelegateMsgType } from '../host-response/outbound-delegate-msg-type.js';
 import { RandomBytesRequest, RandomBytesRequestT } from '../host-response/random-bytes-request.js';
 import { RequestUserInput, RequestUserInputT } from '../host-response/request-user-input.js';

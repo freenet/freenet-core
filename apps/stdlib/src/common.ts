@@ -2,12 +2,15 @@
 
 /* eslint-disable @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
+export { ApplicationMessage, ApplicationMessageT } from './common/application-message.js';
 export { ContractCode, ContractCodeT } from './common/contract-code.js';
 export { ContractContainer, ContractContainerT } from './common/contract-container.js';
 export { ContractInstanceId, ContractInstanceIdT } from './common/contract-instance-id.js';
 export { ContractKey, ContractKeyT } from './common/contract-key.js';
 export { ContractType } from './common/contract-type.js';
 export { DeltaUpdate, DeltaUpdateT } from './common/delta-update.js';
+export { GetSecretRequest, GetSecretRequestT } from './common/get-secret-request.js';
+export { GetSecretResponse, GetSecretResponseT } from './common/get-secret-response.js';
 export { RelatedDeltaUpdate, RelatedDeltaUpdateT } from './common/related-delta-update.js';
 export { RelatedStateAndDeltaUpdate, RelatedStateAndDeltaUpdateT } from './common/related-state-and-delta-update.js';
 export { RelatedStateUpdate, RelatedStateUpdateT } from './common/related-state-update.js';

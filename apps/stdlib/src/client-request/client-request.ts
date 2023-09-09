@@ -8,7 +8,6 @@ import { ClientRequestType, unionToClientRequestType, unionListToClientRequestTy
 import { ContractRequest, ContractRequestT } from '../client-request/contract-request.js';
 import { DelegateRequest, DelegateRequestT } from '../client-request/delegate-request.js';
 import { Disconnect, DisconnectT } from '../client-request/disconnect.js';
-import { GenerateRandData, GenerateRandDataT } from '../client-request/generate-rand-data.js';
 
 
 export class ClientRequest implements flatbuffers.IUnpackableObject<ClientRequestT> {
@@ -97,7 +96,7 @@ unpackTo(_o: ClientRequestT): void {
 export class ClientRequestT implements flatbuffers.IGeneratedObject {
 constructor(
   public clientRequestType: ClientRequestType = ClientRequestType.NONE,
-  public clientRequest: ContractRequestT|DelegateRequestT|DisconnectT|GenerateRandDataT|null = null
+  public clientRequest: ContractRequestT|DelegateRequestT|DisconnectT|null = null
 ){}
 
 

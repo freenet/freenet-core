@@ -214,11 +214,11 @@ pub const ENUM_MAX_INBOUND_DELEGATE_MSG_TYPE: u8 = 5;
 #[allow(non_camel_case_types)]
 pub const ENUM_VALUES_INBOUND_DELEGATE_MSG_TYPE: [InboundDelegateMsgType; 6] = [
   InboundDelegateMsgType::NONE,
-  InboundDelegateMsgType::ApplicationMessage,
-  InboundDelegateMsgType::GetSecretResponse,
+  InboundDelegateMsgType::common_ApplicationMessage,
+  InboundDelegateMsgType::common_GetSecretResponse,
   InboundDelegateMsgType::RandomBytes,
   InboundDelegateMsgType::UserInputResponse,
-  InboundDelegateMsgType::GetSecretRequest,
+  InboundDelegateMsgType::common_GetSecretRequest,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -227,31 +227,31 @@ pub struct InboundDelegateMsgType(pub u8);
 #[allow(non_upper_case_globals)]
 impl InboundDelegateMsgType {
   pub const NONE: Self = Self(0);
-  pub const ApplicationMessage: Self = Self(1);
-  pub const GetSecretResponse: Self = Self(2);
+  pub const common_ApplicationMessage: Self = Self(1);
+  pub const common_GetSecretResponse: Self = Self(2);
   pub const RandomBytes: Self = Self(3);
   pub const UserInputResponse: Self = Self(4);
-  pub const GetSecretRequest: Self = Self(5);
+  pub const common_GetSecretRequest: Self = Self(5);
 
   pub const ENUM_MIN: u8 = 0;
   pub const ENUM_MAX: u8 = 5;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
-    Self::ApplicationMessage,
-    Self::GetSecretResponse,
+    Self::common_ApplicationMessage,
+    Self::common_GetSecretResponse,
     Self::RandomBytes,
     Self::UserInputResponse,
-    Self::GetSecretRequest,
+    Self::common_GetSecretRequest,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
     match self {
       Self::NONE => Some("NONE"),
-      Self::ApplicationMessage => Some("ApplicationMessage"),
-      Self::GetSecretResponse => Some("GetSecretResponse"),
+      Self::common_ApplicationMessage => Some("common_ApplicationMessage"),
+      Self::common_GetSecretResponse => Some("common_GetSecretResponse"),
       Self::RandomBytes => Some("RandomBytes"),
       Self::UserInputResponse => Some("UserInputResponse"),
-      Self::GetSecretRequest => Some("GetSecretRequest"),
+      Self::common_GetSecretRequest => Some("common_GetSecretRequest"),
       _ => None,
     }
   }
@@ -1806,290 +1806,6 @@ impl core::fmt::Debug for Subscribe<'_> {
       ds.finish()
   }
 }
-pub enum ApplicationMessageOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct ApplicationMessage<'a> {
-  pub _tab: flatbuffers::Table<'a>,
-}
-
-impl<'a> flatbuffers::Follow<'a> for ApplicationMessage<'a> {
-  type Inner = ApplicationMessage<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: flatbuffers::Table::new(buf, loc) }
-  }
-}
-
-impl<'a> ApplicationMessage<'a> {
-  pub const VT_APP: flatbuffers::VOffsetT = 4;
-  pub const VT_PAYLOAD: flatbuffers::VOffsetT = 6;
-  pub const VT_CONTEXT: flatbuffers::VOffsetT = 8;
-  pub const VT_PROCESSED: flatbuffers::VOffsetT = 10;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
-    ApplicationMessage { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
-    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-    args: &'args ApplicationMessageArgs<'args>
-  ) -> flatbuffers::WIPOffset<ApplicationMessage<'bldr>> {
-    let mut builder = ApplicationMessageBuilder::new(_fbb);
-    if let Some(x) = args.context { builder.add_context(x); }
-    if let Some(x) = args.payload { builder.add_payload(x); }
-    if let Some(x) = args.app { builder.add_app(x); }
-    builder.add_processed(args.processed);
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn app(&self) -> super::common::ContractInstanceId<'a> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<super::common::ContractInstanceId>>(ApplicationMessage::VT_APP, None).unwrap()}
-  }
-  #[inline]
-  pub fn payload(&self) -> flatbuffers::Vector<'a, u8> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(ApplicationMessage::VT_PAYLOAD, None).unwrap()}
-  }
-  #[inline]
-  pub fn context(&self) -> flatbuffers::Vector<'a, u8> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(ApplicationMessage::VT_CONTEXT, None).unwrap()}
-  }
-  #[inline]
-  pub fn processed(&self) -> bool {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<bool>(ApplicationMessage::VT_PROCESSED, Some(false)).unwrap()}
-  }
-}
-
-impl flatbuffers::Verifiable for ApplicationMessage<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut flatbuffers::Verifier, pos: usize
-  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-    use self::flatbuffers::Verifiable;
-    v.visit_table(pos)?
-     .visit_field::<flatbuffers::ForwardsUOffset<super::common::ContractInstanceId>>("app", Self::VT_APP, true)?
-     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("payload", Self::VT_PAYLOAD, true)?
-     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("context", Self::VT_CONTEXT, true)?
-     .visit_field::<bool>("processed", Self::VT_PROCESSED, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct ApplicationMessageArgs<'a> {
-    pub app: Option<flatbuffers::WIPOffset<super::common::ContractInstanceId<'a>>>,
-    pub payload: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-    pub context: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-    pub processed: bool,
-}
-impl<'a> Default for ApplicationMessageArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    ApplicationMessageArgs {
-      app: None, // required field
-      payload: None, // required field
-      context: None, // required field
-      processed: false,
-    }
-  }
-}
-
-pub struct ApplicationMessageBuilder<'a: 'b, 'b> {
-  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
-  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b> ApplicationMessageBuilder<'a, 'b> {
-  #[inline]
-  pub fn add_app(&mut self, app: flatbuffers::WIPOffset<super::common::ContractInstanceId<'b >>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<super::common::ContractInstanceId>>(ApplicationMessage::VT_APP, app);
-  }
-  #[inline]
-  pub fn add_payload(&mut self, payload: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ApplicationMessage::VT_PAYLOAD, payload);
-  }
-  #[inline]
-  pub fn add_context(&mut self, context: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ApplicationMessage::VT_CONTEXT, context);
-  }
-  #[inline]
-  pub fn add_processed(&mut self, processed: bool) {
-    self.fbb_.push_slot::<bool>(ApplicationMessage::VT_PROCESSED, processed, false);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ApplicationMessageBuilder<'a, 'b> {
-    let start = _fbb.start_table();
-    ApplicationMessageBuilder {
-      fbb_: _fbb,
-      start_: start,
-    }
-  }
-  #[inline]
-  pub fn finish(self) -> flatbuffers::WIPOffset<ApplicationMessage<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    self.fbb_.required(o, ApplicationMessage::VT_APP,"app");
-    self.fbb_.required(o, ApplicationMessage::VT_PAYLOAD,"payload");
-    self.fbb_.required(o, ApplicationMessage::VT_CONTEXT,"context");
-    flatbuffers::WIPOffset::new(o.value())
-  }
-}
-
-impl core::fmt::Debug for ApplicationMessage<'_> {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    let mut ds = f.debug_struct("ApplicationMessage");
-      ds.field("app", &self.app());
-      ds.field("payload", &self.payload());
-      ds.field("context", &self.context());
-      ds.field("processed", &self.processed());
-      ds.finish()
-  }
-}
-pub enum GetSecretResponseOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct GetSecretResponse<'a> {
-  pub _tab: flatbuffers::Table<'a>,
-}
-
-impl<'a> flatbuffers::Follow<'a> for GetSecretResponse<'a> {
-  type Inner = GetSecretResponse<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: flatbuffers::Table::new(buf, loc) }
-  }
-}
-
-impl<'a> GetSecretResponse<'a> {
-  pub const VT_KEY: flatbuffers::VOffsetT = 4;
-  pub const VT_VALUE: flatbuffers::VOffsetT = 6;
-  pub const VT_CONTEXT: flatbuffers::VOffsetT = 8;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
-    GetSecretResponse { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
-    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-    args: &'args GetSecretResponseArgs<'args>
-  ) -> flatbuffers::WIPOffset<GetSecretResponse<'bldr>> {
-    let mut builder = GetSecretResponseBuilder::new(_fbb);
-    if let Some(x) = args.context { builder.add_context(x); }
-    if let Some(x) = args.value { builder.add_value(x); }
-    if let Some(x) = args.key { builder.add_key(x); }
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn key(&self) -> super::common::SecretsId<'a> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<super::common::SecretsId>>(GetSecretResponse::VT_KEY, None).unwrap()}
-  }
-  #[inline]
-  pub fn value(&self) -> Option<flatbuffers::Vector<'a, u8>> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(GetSecretResponse::VT_VALUE, None)}
-  }
-  #[inline]
-  pub fn context(&self) -> flatbuffers::Vector<'a, u8> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(GetSecretResponse::VT_CONTEXT, None).unwrap()}
-  }
-}
-
-impl flatbuffers::Verifiable for GetSecretResponse<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut flatbuffers::Verifier, pos: usize
-  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-    use self::flatbuffers::Verifiable;
-    v.visit_table(pos)?
-     .visit_field::<flatbuffers::ForwardsUOffset<super::common::SecretsId>>("key", Self::VT_KEY, true)?
-     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("value", Self::VT_VALUE, false)?
-     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("context", Self::VT_CONTEXT, true)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct GetSecretResponseArgs<'a> {
-    pub key: Option<flatbuffers::WIPOffset<super::common::SecretsId<'a>>>,
-    pub value: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-    pub context: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-}
-impl<'a> Default for GetSecretResponseArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    GetSecretResponseArgs {
-      key: None, // required field
-      value: None,
-      context: None, // required field
-    }
-  }
-}
-
-pub struct GetSecretResponseBuilder<'a: 'b, 'b> {
-  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
-  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b> GetSecretResponseBuilder<'a, 'b> {
-  #[inline]
-  pub fn add_key(&mut self, key: flatbuffers::WIPOffset<super::common::SecretsId<'b >>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<super::common::SecretsId>>(GetSecretResponse::VT_KEY, key);
-  }
-  #[inline]
-  pub fn add_value(&mut self, value: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GetSecretResponse::VT_VALUE, value);
-  }
-  #[inline]
-  pub fn add_context(&mut self, context: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GetSecretResponse::VT_CONTEXT, context);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> GetSecretResponseBuilder<'a, 'b> {
-    let start = _fbb.start_table();
-    GetSecretResponseBuilder {
-      fbb_: _fbb,
-      start_: start,
-    }
-  }
-  #[inline]
-  pub fn finish(self) -> flatbuffers::WIPOffset<GetSecretResponse<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    self.fbb_.required(o, GetSecretResponse::VT_KEY,"key");
-    self.fbb_.required(o, GetSecretResponse::VT_CONTEXT,"context");
-    flatbuffers::WIPOffset::new(o.value())
-  }
-}
-
-impl core::fmt::Debug for GetSecretResponse<'_> {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    let mut ds = f.debug_struct("GetSecretResponse");
-      ds.field("key", &self.key());
-      ds.field("value", &self.value());
-      ds.field("context", &self.context());
-      ds.finish()
-  }
-}
 pub enum RandomBytesOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -2470,13 +2186,13 @@ impl<'a> InboundDelegateMsg<'a> {
   }
   #[inline]
   #[allow(non_snake_case)]
-  pub fn inbound_as_application_message(&self) -> Option<ApplicationMessage<'a>> {
-    if self.inbound_type() == InboundDelegateMsgType::ApplicationMessage {
+  pub fn inbound_as_common_application_message(&self) -> Option<super::common::ApplicationMessage<'a>> {
+    if self.inbound_type() == InboundDelegateMsgType::common_ApplicationMessage {
       let u = self.inbound();
       // Safety:
       // Created from a valid Table for this object
       // Which contains a valid union in this slot
-      Some(unsafe { ApplicationMessage::init_from_table(u) })
+      Some(unsafe { super::common::ApplicationMessage::init_from_table(u) })
     } else {
       None
     }
@@ -2484,13 +2200,13 @@ impl<'a> InboundDelegateMsg<'a> {
 
   #[inline]
   #[allow(non_snake_case)]
-  pub fn inbound_as_get_secret_response(&self) -> Option<GetSecretResponse<'a>> {
-    if self.inbound_type() == InboundDelegateMsgType::GetSecretResponse {
+  pub fn inbound_as_common_get_secret_response(&self) -> Option<super::common::GetSecretResponse<'a>> {
+    if self.inbound_type() == InboundDelegateMsgType::common_GetSecretResponse {
       let u = self.inbound();
       // Safety:
       // Created from a valid Table for this object
       // Which contains a valid union in this slot
-      Some(unsafe { GetSecretResponse::init_from_table(u) })
+      Some(unsafe { super::common::GetSecretResponse::init_from_table(u) })
     } else {
       None
     }
@@ -2526,13 +2242,13 @@ impl<'a> InboundDelegateMsg<'a> {
 
   #[inline]
   #[allow(non_snake_case)]
-  pub fn inbound_as_get_secret_request(&self) -> Option<GetSecretRequest<'a>> {
-    if self.inbound_type() == InboundDelegateMsgType::GetSecretRequest {
+  pub fn inbound_as_common_get_secret_request(&self) -> Option<super::common::GetSecretRequest<'a>> {
+    if self.inbound_type() == InboundDelegateMsgType::common_GetSecretRequest {
       let u = self.inbound();
       // Safety:
       // Created from a valid Table for this object
       // Which contains a valid union in this slot
-      Some(unsafe { GetSecretRequest::init_from_table(u) })
+      Some(unsafe { super::common::GetSecretRequest::init_from_table(u) })
     } else {
       None
     }
@@ -2549,11 +2265,11 @@ impl flatbuffers::Verifiable for InboundDelegateMsg<'_> {
     v.visit_table(pos)?
      .visit_union::<InboundDelegateMsgType, _>("inbound_type", Self::VT_INBOUND_TYPE, "inbound", Self::VT_INBOUND, true, |key, v, pos| {
         match key {
-          InboundDelegateMsgType::ApplicationMessage => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ApplicationMessage>>("InboundDelegateMsgType::ApplicationMessage", pos),
-          InboundDelegateMsgType::GetSecretResponse => v.verify_union_variant::<flatbuffers::ForwardsUOffset<GetSecretResponse>>("InboundDelegateMsgType::GetSecretResponse", pos),
+          InboundDelegateMsgType::common_ApplicationMessage => v.verify_union_variant::<flatbuffers::ForwardsUOffset<super::common::ApplicationMessage>>("InboundDelegateMsgType::common_ApplicationMessage", pos),
+          InboundDelegateMsgType::common_GetSecretResponse => v.verify_union_variant::<flatbuffers::ForwardsUOffset<super::common::GetSecretResponse>>("InboundDelegateMsgType::common_GetSecretResponse", pos),
           InboundDelegateMsgType::RandomBytes => v.verify_union_variant::<flatbuffers::ForwardsUOffset<RandomBytes>>("InboundDelegateMsgType::RandomBytes", pos),
           InboundDelegateMsgType::UserInputResponse => v.verify_union_variant::<flatbuffers::ForwardsUOffset<UserInputResponse>>("InboundDelegateMsgType::UserInputResponse", pos),
-          InboundDelegateMsgType::GetSecretRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<GetSecretRequest>>("InboundDelegateMsgType::GetSecretRequest", pos),
+          InboundDelegateMsgType::common_GetSecretRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<super::common::GetSecretRequest>>("InboundDelegateMsgType::common_GetSecretRequest", pos),
           _ => Ok(()),
         }
      })?
@@ -2609,15 +2325,15 @@ impl core::fmt::Debug for InboundDelegateMsg<'_> {
     let mut ds = f.debug_struct("InboundDelegateMsg");
       ds.field("inbound_type", &self.inbound_type());
       match self.inbound_type() {
-        InboundDelegateMsgType::ApplicationMessage => {
-          if let Some(x) = self.inbound_as_application_message() {
+        InboundDelegateMsgType::common_ApplicationMessage => {
+          if let Some(x) = self.inbound_as_common_application_message() {
             ds.field("inbound", &x)
           } else {
             ds.field("inbound", &"InvalidFlatbuffer: Union discriminant does not match value.")
           }
         },
-        InboundDelegateMsgType::GetSecretResponse => {
-          if let Some(x) = self.inbound_as_get_secret_response() {
+        InboundDelegateMsgType::common_GetSecretResponse => {
+          if let Some(x) = self.inbound_as_common_get_secret_response() {
             ds.field("inbound", &x)
           } else {
             ds.field("inbound", &"InvalidFlatbuffer: Union discriminant does not match value.")
@@ -2637,8 +2353,8 @@ impl core::fmt::Debug for InboundDelegateMsg<'_> {
             ds.field("inbound", &"InvalidFlatbuffer: Union discriminant does not match value.")
           }
         },
-        InboundDelegateMsgType::GetSecretRequest => {
-          if let Some(x) = self.inbound_as_get_secret_request() {
+        InboundDelegateMsgType::common_GetSecretRequest => {
+          if let Some(x) = self.inbound_as_common_get_secret_request() {
             ds.field("inbound", &x)
           } else {
             ds.field("inbound", &"InvalidFlatbuffer: Union discriminant does not match value.")
@@ -2786,139 +2502,6 @@ impl core::fmt::Debug for ApplicationMessages<'_> {
       ds.finish()
   }
 }
-pub enum GetSecretRequestOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct GetSecretRequest<'a> {
-  pub _tab: flatbuffers::Table<'a>,
-}
-
-impl<'a> flatbuffers::Follow<'a> for GetSecretRequest<'a> {
-  type Inner = GetSecretRequest<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: flatbuffers::Table::new(buf, loc) }
-  }
-}
-
-impl<'a> GetSecretRequest<'a> {
-  pub const VT_KEY: flatbuffers::VOffsetT = 4;
-  pub const VT_DELEGATE_CONTEXT: flatbuffers::VOffsetT = 6;
-  pub const VT_PROCESSED: flatbuffers::VOffsetT = 8;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
-    GetSecretRequest { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
-    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-    args: &'args GetSecretRequestArgs<'args>
-  ) -> flatbuffers::WIPOffset<GetSecretRequest<'bldr>> {
-    let mut builder = GetSecretRequestBuilder::new(_fbb);
-    if let Some(x) = args.delegate_context { builder.add_delegate_context(x); }
-    if let Some(x) = args.key { builder.add_key(x); }
-    builder.add_processed(args.processed);
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn key(&self) -> super::common::SecretsId<'a> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<super::common::SecretsId>>(GetSecretRequest::VT_KEY, None).unwrap()}
-  }
-  #[inline]
-  pub fn delegate_context(&self) -> flatbuffers::Vector<'a, u8> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(GetSecretRequest::VT_DELEGATE_CONTEXT, None).unwrap()}
-  }
-  #[inline]
-  pub fn processed(&self) -> bool {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<bool>(GetSecretRequest::VT_PROCESSED, Some(false)).unwrap()}
-  }
-}
-
-impl flatbuffers::Verifiable for GetSecretRequest<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut flatbuffers::Verifier, pos: usize
-  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-    use self::flatbuffers::Verifiable;
-    v.visit_table(pos)?
-     .visit_field::<flatbuffers::ForwardsUOffset<super::common::SecretsId>>("key", Self::VT_KEY, true)?
-     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("delegate_context", Self::VT_DELEGATE_CONTEXT, true)?
-     .visit_field::<bool>("processed", Self::VT_PROCESSED, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct GetSecretRequestArgs<'a> {
-    pub key: Option<flatbuffers::WIPOffset<super::common::SecretsId<'a>>>,
-    pub delegate_context: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-    pub processed: bool,
-}
-impl<'a> Default for GetSecretRequestArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    GetSecretRequestArgs {
-      key: None, // required field
-      delegate_context: None, // required field
-      processed: false,
-    }
-  }
-}
-
-pub struct GetSecretRequestBuilder<'a: 'b, 'b> {
-  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
-  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b> GetSecretRequestBuilder<'a, 'b> {
-  #[inline]
-  pub fn add_key(&mut self, key: flatbuffers::WIPOffset<super::common::SecretsId<'b >>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<super::common::SecretsId>>(GetSecretRequest::VT_KEY, key);
-  }
-  #[inline]
-  pub fn add_delegate_context(&mut self, delegate_context: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GetSecretRequest::VT_DELEGATE_CONTEXT, delegate_context);
-  }
-  #[inline]
-  pub fn add_processed(&mut self, processed: bool) {
-    self.fbb_.push_slot::<bool>(GetSecretRequest::VT_PROCESSED, processed, false);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> GetSecretRequestBuilder<'a, 'b> {
-    let start = _fbb.start_table();
-    GetSecretRequestBuilder {
-      fbb_: _fbb,
-      start_: start,
-    }
-  }
-  #[inline]
-  pub fn finish(self) -> flatbuffers::WIPOffset<GetSecretRequest<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    self.fbb_.required(o, GetSecretRequest::VT_KEY,"key");
-    self.fbb_.required(o, GetSecretRequest::VT_DELEGATE_CONTEXT,"delegate_context");
-    flatbuffers::WIPOffset::new(o.value())
-  }
-}
-
-impl core::fmt::Debug for GetSecretRequest<'_> {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    let mut ds = f.debug_struct("GetSecretRequest");
-      ds.field("key", &self.key());
-      ds.field("delegate_context", &self.delegate_context());
-      ds.field("processed", &self.processed());
-      ds.finish()
-  }
-}
 pub enum GetSecretRequestTypeOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -2971,11 +2554,11 @@ impl<'a> GetSecretRequestType<'a> {
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(GetSecretRequestType::VT_PARAMS, None).unwrap()}
   }
   #[inline]
-  pub fn get_request(&self) -> GetSecretRequest<'a> {
+  pub fn get_request(&self) -> super::common::GetSecretRequest<'a> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<GetSecretRequest>>(GetSecretRequestType::VT_GET_REQUEST, None).unwrap()}
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<super::common::GetSecretRequest>>(GetSecretRequestType::VT_GET_REQUEST, None).unwrap()}
   }
 }
 
@@ -2988,7 +2571,7 @@ impl flatbuffers::Verifiable for GetSecretRequestType<'_> {
     v.visit_table(pos)?
      .visit_field::<flatbuffers::ForwardsUOffset<DelegateKey>>("key", Self::VT_KEY, true)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("params", Self::VT_PARAMS, true)?
-     .visit_field::<flatbuffers::ForwardsUOffset<GetSecretRequest>>("get_request", Self::VT_GET_REQUEST, true)?
+     .visit_field::<flatbuffers::ForwardsUOffset<super::common::GetSecretRequest>>("get_request", Self::VT_GET_REQUEST, true)?
      .finish();
     Ok(())
   }
@@ -2996,7 +2579,7 @@ impl flatbuffers::Verifiable for GetSecretRequestType<'_> {
 pub struct GetSecretRequestTypeArgs<'a> {
     pub key: Option<flatbuffers::WIPOffset<DelegateKey<'a>>>,
     pub params: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-    pub get_request: Option<flatbuffers::WIPOffset<GetSecretRequest<'a>>>,
+    pub get_request: Option<flatbuffers::WIPOffset<super::common::GetSecretRequest<'a>>>,
 }
 impl<'a> Default for GetSecretRequestTypeArgs<'a> {
   #[inline]
@@ -3023,8 +2606,8 @@ impl<'a: 'b, 'b> GetSecretRequestTypeBuilder<'a, 'b> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GetSecretRequestType::VT_PARAMS, params);
   }
   #[inline]
-  pub fn add_get_request(&mut self, get_request: flatbuffers::WIPOffset<GetSecretRequest<'b >>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<GetSecretRequest>>(GetSecretRequestType::VT_GET_REQUEST, get_request);
+  pub fn add_get_request(&mut self, get_request: flatbuffers::WIPOffset<super::common::GetSecretRequest<'b >>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<super::common::GetSecretRequest>>(GetSecretRequestType::VT_GET_REQUEST, get_request);
   }
   #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> GetSecretRequestTypeBuilder<'a, 'b> {

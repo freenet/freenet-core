@@ -10,14 +10,27 @@ import {RelatedStateUpdateT} from "./common/related-state-update";
 import {StateAndDeltaUpdateT} from "./common/state-and-delta-update";
 import {StateUpdateT} from "./common/state-update";
 import {
-    ClientRequest, ClientRequestT, ClientRequestType, ContractRequestT, ContractRequestType,
+    ApplicationMessagesT,
+    ClientRequest,
+    ClientRequestT,
+    ClientRequestType,
+    ContractRequestT,
+    ContractRequestType,
+    DelegateCodeT,
     DelegateContainerT,
+    DelegateKeyT, DelegateRequestT, DelegateRequestType,
+    DelegateType,
     DisconnectT,
+    GetSecretRequestTypeT,
     GetT,
-    PutT,
+    InboundDelegateMsgT, InboundDelegateMsgType,
+    PutT, RandomBytesT,
+    RegisterDelegateT,
     RelatedContractsT,
     SubscribeT,
-    UpdateT
+    UnregisterDelegateT,
+    UpdateT, UserInputResponseT,
+    WasmDelegateV1T
 } from "./client-request";
 import {UpdateDataT} from "./common/update-data";
 import {UpdateDataType} from "./common/update-data-type";
@@ -27,8 +40,24 @@ import {GetResponseT} from "./host-response/get-response";
 import {UpdateResponseT} from "./host-response/update-response";
 import {UpdateNotificationT} from "./host-response/update-notification";
 import {HostResponse, HostResponseT} from "./host-response/host-response";
-import {ContractResponseT, ContractResponseType, HostResponseType} from "./host-response";
+import {
+    ContextUpdatedT,
+    ContractResponseT,
+    ContractResponseType,
+    DelegateResponseT,
+    HostResponseType,
+    OutboundDelegateMsgT, OutboundDelegateMsgType, RandomBytesRequestT, RequestUserInputT, SetSecretRequestT
+} from "./host-response";
+import {
+    ApplicationMessageT,
+    ContractCodeT,
+    ContractType,
+    GetSecretRequestT,
+    GetSecretResponseT,
+    WasmContractV1T
+} from "./common";
 
+// Common types
 /**
  * The id of a live instance of a contract. This is effectively the tuple
  * of the hash of the hash of the contract code and a set of parameters used to run
@@ -38,75 +67,9 @@ import {ContractResponseT, ContractResponseType, HostResponseType} from "./host-
 export type ContractInstanceId = Uint8Array;
 
 /**
- * Wrapper that allows contract versioning. This enum maintains the types of contracts that are allowed
- * and their corresponding version.
+ * Update notifications for a contract or a related contract.
  * @public
  */
-export type ContractContainer = ContractContainerT;
-
-/**
- * Wrapper that allows delegate versioning. This enum maintains the types of delegates that are allowed
- * and their corresponding version.
- * @public
- */
-export type DelegateContainer = DelegateContainerT;
-
-
-/**
- * Representation of the client put request operation
- * @public
- */
-export class PutRequest extends PutT {
-    constructor(container: ContractContainerT | null = null,
-                wrappedState: (number)[] = [],
-                relatedContracts: RelatedContractsT | null = null) {
-        super(container, wrappedState, relatedContracts);
-    }
-}
-
-/**
- * Representation of the client update request operation
- * @public
- */
-export class UpdateRequest extends UpdateT {
-    constructor(key: Key | null = null, update: UpdateDataT | null = null) {
-        const contract_key = key?.get_contract_key();
-        super(contract_key, update);
-    }
-}
-
-/**
- * Representation of the client get request operation
- * @public
- */
-export class GetRequest extends GetT {
-    constructor(key: Key | null = null, fetchContract: boolean = false) {
-        const contract_key = key?.get_contract_key();
-        super(contract_key, fetchContract);
-    }
-}
-
-/**
- * Representation of the client subscribe request operation
- * @public
- */
-export class SubscribeRequest extends SubscribeT {
-    constructor(key: Key | null = null, summary: (number)[] = []) {
-        const contract_key = key?.get_contract_key();
-        super(contract_key, summary);
-    }
-}
-
-/**
- * Representation of the client disconnect request operation
- * @public
- */
-export class DisconnectRequest extends DisconnectT {
-    constructor(cause: string | Uint8Array | null = null) {
-        super(cause);
-    }
-}
-
 export class UpdateData extends UpdateDataT {
     constructor(updateDataType: UpdateDataType = UpdateDataType.NONE,
                 updateData: DeltaUpdateT | RelatedDeltaUpdateT | RelatedStateAndDeltaUpdateT | RelatedStateUpdateT
@@ -175,8 +138,11 @@ export class RelatedStateAndDeltaUpdate extends RelatedStateAndDeltaUpdateT {
     }
 }
 
-
-export class Key extends ContractKeyT {
+/**
+ * Representation of the ContractKey
+ * @public
+ */
+export class ContractKey extends ContractKeyT {
     constructor(instance: ContractInstanceId, code?: Uint8Array) {
         if (instance.length !== 32 || (code && code.length !== 32)) {
             throw new TypeError('Invalid array length, expected 32 bytes');
@@ -193,9 +159,9 @@ export class Key extends ContractKeyT {
         super(contract_instance_id, contract_code);
     }
 
-    static fromInstanceId(spec: string): Key {
+    static fromInstanceId(spec: string): ContractKey {
         const decoded = base58.decode(spec);
-        return new Key(decoded);
+        return new ContractKey(decoded);
     }
 
     bytes(): ContractInstanceId {
@@ -211,13 +177,221 @@ export class Key extends ContractKeyT {
         return base58.encode(instance);
     }
 
-    get_contract_key(): Key {
+    get_contract_key(): ContractKey {
         return this;
     }
 }
 
-// host replies:
+/**
+ * Representation of the DelegateKey
+ * @public
+ */
+export type DelegateKey = DelegateKeyT;
 
+/**
+ * Representation of the ContractCode
+ * @public
+ */
+export type ContractCode = ContractCodeT;
+
+/**
+ * Representation of the DelegateCode
+ * @public
+ */
+export type DelegateCode = DelegateCodeT;
+
+/**
+ * Representation of the WasmContractV1
+ * @public
+ */
+export class WasmContractV1 extends WasmContractV1T {
+    constructor(data: ContractCode | null = null, parameters: (number)[] = [], key: ContractKeyT | null = null) {
+        super(data, parameters, key);
+    }
+}
+
+/**
+ * Contract version type
+ */
+export type Contract =
+    | WasmContractV1;
+
+/**
+ * Wrapper that allows contract versioning. This enum maintains the types of contracts that are allowed
+ * and their corresponding version.
+ * @public
+ */
+export class ContractContainer extends ContractContainerT {
+    constructor(contractType: ContractType = ContractType.NONE,
+                contract: Contract) {
+        super(contractType, contract);
+    }
+}
+
+/**
+ * Representation of the WasmDelegateV1
+ * @public
+ */
+export class WasmDelegateV1 extends WasmDelegateV1T {
+    constructor(parameters: (number)[] = [], data: DelegateCode, key: DelegateKey) {
+        super(parameters, data, key);
+    }
+}
+
+/**
+ * Delegate version type
+ */
+export type Delegate =
+    | WasmDelegateV1;
+
+/**
+ * Wrapper that allows delegate versioning. This enum maintains the types of delegates that are allowed
+ * and their corresponding version.
+ * @public
+ */
+export class DelegateContainer extends DelegateContainerT {
+    constructor(delegateType: DelegateType = DelegateType.NONE,
+                delegate: Delegate) {
+        super(delegateType, delegate);
+    }
+}
+
+/**
+ * Representation of the delegate GetSecretRequest message content
+ * @public
+ */
+export type GetSecretRequest = GetSecretRequestT;
+/**
+ * Representation of the delegate GetSecretRequest message type
+ * @public
+ */
+export type GetSecretRequestType = GetSecretRequestTypeT;
+/**
+ * Representation of the delegate GetSecretResponse message content
+ * @public
+ */
+export type GetSecretResponse = GetSecretResponseT;
+
+/**
+ * Representation of the delegate Application message
+ *
+ */
+export type ApplicationMessage = ApplicationMessageT;
+
+// Client requests
+
+// Contract
+
+/**
+ * Representation of the client put request operation
+ * @public
+ */
+export class PutRequest extends PutT {
+    constructor(container: ContractContainerT | null = null,
+                wrappedState: (number)[] = [],
+                relatedContracts: RelatedContractsT | null = null) {
+        super(container, wrappedState, relatedContracts);
+    }
+}
+
+/**
+ * Representation of the client update request operation
+ * @public
+ */
+export class UpdateRequest extends UpdateT {
+    constructor(key: ContractKey | null = null, update: UpdateDataT | null = null) {
+        const contract_key = key?.get_contract_key();
+        super(contract_key, update);
+    }
+}
+
+/**
+ * Representation of the client get request operation
+ * @public
+ */
+export class GetRequest extends GetT {
+    constructor(key: ContractKey | null = null, fetchContract: boolean = false) {
+        const contract_key = key?.get_contract_key();
+        super(contract_key, fetchContract);
+    }
+}
+
+/**
+ * Representation of the client subscribe request operation
+ * @public
+ */
+export class SubscribeRequest extends SubscribeT {
+    constructor(key: ContractKey | null = null, summary: (number)[] = []) {
+        const contract_key = key?.get_contract_key();
+        super(contract_key, summary);
+    }
+}
+
+/**
+ * Representation of the client disconnect request operation
+ * @public
+ */
+export class DisconnectRequest extends DisconnectT {
+    constructor(cause: string | Uint8Array | null = null) {
+        super(cause);
+    }
+}
+
+// Delegate
+/**
+ * Representation of the RandomBytes message
+ * @public
+ */
+export type RandomBytes = RandomBytesT;
+/**
+ * Representation of the UserInputResponse message
+ * @public
+ */
+export type UserInputResponse = UserInputResponseT;
+
+export type InboundMessage =
+    | ApplicationMessage
+    | GetSecretResponse
+    | RandomBytes
+    | UserInputResponse
+    | GetSecretRequest;
+
+/**
+ * Representation of DelegateRequest Inbound message
+ * @public
+ */
+export class InboundDelegateMsg extends InboundDelegateMsgT {
+    constructor(inboundType: InboundDelegateMsgType = InboundDelegateMsgType.NONE,
+                inbound: InboundMessage) {
+        super(inboundType, inbound);
+    }
+};
+/**
+ * Representation of an inbound application messages
+ * @public
+ */
+export type ApplicationMessages = ApplicationMessagesT;
+/**
+ * Representation of the RegisterDelegate message
+ * @public
+ */
+export type RegisterDelegate = RegisterDelegateT;
+/**
+ * Representation of the UnregisterDelegate message
+ * @public
+ */
+export type UnregisterDelegate = UnregisterDelegateT;
+
+export class DelegateRequest extends DelegateRequestT {
+    constructor(delegateRequestType: DelegateRequestType = DelegateRequestType.NONE,
+                delegateRequest: ApplicationMessages | GetSecretRequestType | RegisterDelegate | UnregisterDelegate) {
+        super(delegateRequestType, delegateRequest);
+    }
+}
+
+// Host replies
+
+// Contract
 /**
  * The response for a contract put operation
  * @public
@@ -242,8 +416,60 @@ export type UpdateResponse = UpdateResponseT;
  */
 export type UpdateNotification = UpdateNotificationT;
 
+// Delegate
 /**
- * Host reponse error type
+ * Representation of ContextUpdated message
+ * @public
+ */
+export type ContextUpdated = ContextUpdatedT;
+/**
+ * Representation of RandomBytesRequest message
+ * @public
+ */
+export type RandomBytesRequest = RandomBytesRequestT;
+/**
+ * Representation of RequestUserInput message
+ * @public
+ */
+export type RequestUserInput = RequestUserInputT;
+/**
+ * Representation of GetSecretRequest message
+ * @public
+ */
+export type SetSecretRequest = SetSecretRequestT;
+
+/**
+ * Representation of the outbound delegate message types
+ * @public
+ */
+export type OutboundMessage =
+    | ApplicationMessage
+    | RequestUserInput
+    | ContextUpdated
+    | GetSecretRequest
+    | SetSecretRequest
+    | RandomBytesRequest
+    | GetSecretResponse;
+
+export class OutboundDelegateMsg extends OutboundDelegateMsgT {
+    constructor(inboundType: OutboundDelegateMsgType = OutboundDelegateMsgType.NONE,
+                inbound: OutboundMessage) {
+        super(inboundType, inbound);
+    }
+}
+
+/**
+ * The response for a delegate operation
+ * @public
+ */
+export class DelegateResponse extends DelegateResponseT {
+    constructor(key: DelegateKey | null = null, values: (OutboundDelegateMsg)[] = []) {
+        super(key, values);
+    }
+}
+
+/**
+ * Host response error type
  * @public
  */
 export type HostError = {
@@ -260,10 +486,11 @@ export type HostError = {
  * Here's a simple implementation example:
  * ```
  * const handler = {
- *  onPut: (_response: PutResponse) => {},
- *  onGet: (_response: GetResponse) => {},
- *  onUpdate: (_up: UpdateResponse) => {},
- *  onUpdateNotification: (_notif: UpdateNotification) => {},
+ *  onContractPut: (_response: PutResponse) => {},
+ *  onContractGet: (_response: GetResponse) => {},
+ *  onContractUpdate: (_up: UpdateResponse) => {},
+ *  onContractUpdateNotification: (_notif: UpdateNotification) => {},
+ *  onDelegateResponse: (_response: DelegateResponse) => {},
  *  onErr: (err: HostError) => {},
  *  onOpen: () => {},
  * };
@@ -273,23 +500,28 @@ export type HostError = {
  */
 export interface ResponseHandler {
     /**
-     * `Put` response handler
+     * Contract `Put` response handler
      */
-    onPut: (response: PutResponse) => void;
+    onContractPut: (response: PutResponse) => void;
     /**
-     * `Get` response handler
+     * Contract `Get` response handler
      */
-    onGet: (response: GetResponse) => void;
+    onContractGet: (response: GetResponse) => void;
     /**
-     * `Update` response handler
+     * Contract `Update` response handler
      */
-    onUpdate: (response: UpdateResponse) => void;
+    onContractUpdate: (response: UpdateResponse) => void;
     /**
-     * `Update` notification handler
+     * Contract `Update` notification handler
      */
-    onUpdateNotification: (response: UpdateNotification) => void;
+    onContractUpdateNotification: (response: UpdateNotification) => void;
     /**
-     * `Error` handler
+     * `Delegate` response handler
+     * @param response
+     */
+    onDelegateResponse: (response: DelegateResponse) => void;
+    /**
+     * Contract `Error` handler
      */
     onErr: (response: HostError) => void;
     /**
@@ -317,7 +549,7 @@ export class LocutusWsApi {
     /**
      * @private
      */
-    private reponseHandler: ResponseHandler;
+    private responseHandler: ResponseHandler;
 
     /**
      * @constructor
@@ -327,7 +559,7 @@ export class LocutusWsApi {
     constructor(url: URL, handler: ResponseHandler) {
         this.ws = new WebSocket(url);
         this.ws.binaryType = "arraybuffer";
-        this.reponseHandler = handler;
+        this.responseHandler = handler;
         this.ws.onmessage = (ev) => {
             this.handleResponse(ev);
         };
@@ -354,50 +586,44 @@ export class LocutusWsApi {
                 switch (host_resp.contractResponseType) {
                     case ContractResponseType.PutResponse:
                         const put_response = host_resp.contractResponse as PutResponseT;
-                        this.reponseHandler.onPut(put_response);
+                        this.responseHandler.onContractPut(put_response);
                         break;
                     case ContractResponseType.GetResponse:
                         const get_response = host_resp.contractResponse as GetResponseT;
-                        this.reponseHandler.onGet(get_response);
+                        this.responseHandler.onContractGet(get_response);
                         break;
                     case ContractResponseType.UpdateResponse:
                         const update_response = host_resp.contractResponse as UpdateResponseT;
-                        this.reponseHandler.onUpdate(update_response);
+                        this.responseHandler.onContractUpdate(update_response);
                         break;
                     case ContractResponseType.UpdateNotification:
                         const update_notification = host_resp.contractResponse as UpdateNotificationT;
-                        this.reponseHandler.onUpdateNotification(update_notification);
+                        this.responseHandler.onContractUpdateNotification(update_notification);
                         break;
                     default:
-                        const cause = `Contract response type not implemented`;
+                        const cause = "Contract response type not implemented";
                         console.log(cause);
                         const err: HostError = {
                             cause,
                         }
-                        this.reponseHandler.onErr(err);
+                        this.responseHandler.onErr(err);
                         break;
 
                 }
                 break;
             case HostResponseType.DelegateResponse:
-                console.log(`Delegate response handler not implemented`);
-                break;
-            case HostResponseType.GenerateRandData:
-                console.log(`GenerateRandData response handler not implemented`);
+                let delegate_response = response.response as DelegateResponseT;
+                this.responseHandler.onDelegateResponse(delegate_response);
                 break;
             case HostResponseType.Ok:
-                console.log(`not implemented`);
-                break;
-            case HostResponseType.NONE:
-                console.log(`response error`);
                 break;
             default:
-                const cause = `HostResponse type not implemented`;
+                const cause = `Received wrong HostResponse type`;
                 console.log(cause);
                 const err: HostError = {
                     cause,
                 }
-                this.reponseHandler.onErr(err);
+                this.responseHandler.onErr(err);
                 break;
         }
     }
