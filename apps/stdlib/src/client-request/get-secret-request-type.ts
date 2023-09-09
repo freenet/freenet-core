@@ -5,7 +5,7 @@
 import * as flatbuffers from 'flatbuffers';
 
 import { DelegateKey, DelegateKeyT } from '../client-request/delegate-key.js';
-import { GetSecretRequest, GetSecretRequestT } from '../client-request/get-secret-request.js';
+import { GetSecretRequest, GetSecretRequestT } from '../common/get-secret-request.js';
 
 
 export class GetSecretRequestType implements flatbuffers.IUnpackableObject<GetSecretRequestTypeT> {

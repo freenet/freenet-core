@@ -486,8 +486,8 @@ impl From<ApplicationMessage> for InboundDelegateMsg<'_> {
 impl<'a> TryFromFbs<&FbsInboundDelegateMsg<'a>> for InboundDelegateMsg<'a> {
     fn try_decode_fbs(msg: &FbsInboundDelegateMsg<'a>) -> Result<Self, WsApiError> {
         match msg.inbound_type() {
-            InboundDelegateMsgType::ApplicationMessage => {
-                let app_msg = msg.inbound_as_application_message().unwrap();
+            InboundDelegateMsgType::common_ApplicationMessage => {
+                let app_msg = msg.inbound_as_common_application_message().unwrap();
                 let mut instance_key_bytes = [0; CONTRACT_KEY_SIZE];
                 instance_key_bytes
                     .copy_from_slice(app_msg.app().data().bytes().to_vec().as_slice());
@@ -499,12 +499,12 @@ impl<'a> TryFromFbs<&FbsInboundDelegateMsg<'a>> for InboundDelegateMsg<'a> {
                 };
                 Ok(InboundDelegateMsg::ApplicationMessage(app_msg))
             }
-            InboundDelegateMsgType::GetSecretResponse => {
-                let get_secret = msg.inbound_as_get_secret_response().unwrap();
+            InboundDelegateMsgType::common_GetSecretResponse => {
+                let get_secret = msg.inbound_as_common_get_secret_response().unwrap();
                 let get_secret = GetSecretResponse {
                     key: SecretsId::try_decode_fbs(&get_secret.key())?,
                     value: get_secret.value().map(|value| value.bytes().to_vec()),
-                    context: DelegateContext::new(get_secret.context().bytes().to_vec()),
+                    context: DelegateContext::new(get_secret.delegate_context().bytes().to_vec()),
                 };
                 Ok(InboundDelegateMsg::GetSecretResponse(get_secret))
             }
@@ -525,8 +525,8 @@ impl<'a> TryFromFbs<&FbsInboundDelegateMsg<'a>> for InboundDelegateMsg<'a> {
                 };
                 Ok(InboundDelegateMsg::UserResponse(user_response))
             }
-            InboundDelegateMsgType::GetSecretRequest => {
-                let get_secret = msg.inbound_as_get_secret_request().unwrap();
+            InboundDelegateMsgType::common_GetSecretRequest => {
+                let get_secret = msg.inbound_as_common_get_secret_request().unwrap();
                 let get_secret = GetSecretRequest {
                     key: SecretsId::try_decode_fbs(&get_secret.key())?,
                     context: DelegateContext::new(get_secret.delegate_context().bytes().to_vec()),

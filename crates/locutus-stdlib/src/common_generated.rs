@@ -657,6 +657,423 @@ impl core::fmt::Debug for ContractCode<'_> {
       ds.finish()
   }
 }
+pub enum ApplicationMessageOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct ApplicationMessage<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for ApplicationMessage<'a> {
+  type Inner = ApplicationMessage<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> ApplicationMessage<'a> {
+  pub const VT_APP: flatbuffers::VOffsetT = 4;
+  pub const VT_PAYLOAD: flatbuffers::VOffsetT = 6;
+  pub const VT_CONTEXT: flatbuffers::VOffsetT = 8;
+  pub const VT_PROCESSED: flatbuffers::VOffsetT = 10;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    ApplicationMessage { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args ApplicationMessageArgs<'args>
+  ) -> flatbuffers::WIPOffset<ApplicationMessage<'bldr>> {
+    let mut builder = ApplicationMessageBuilder::new(_fbb);
+    if let Some(x) = args.context { builder.add_context(x); }
+    if let Some(x) = args.payload { builder.add_payload(x); }
+    if let Some(x) = args.app { builder.add_app(x); }
+    builder.add_processed(args.processed);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn app(&self) -> ContractInstanceId<'a> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<ContractInstanceId>>(ApplicationMessage::VT_APP, None).unwrap()}
+  }
+  #[inline]
+  pub fn payload(&self) -> flatbuffers::Vector<'a, u8> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(ApplicationMessage::VT_PAYLOAD, None).unwrap()}
+  }
+  #[inline]
+  pub fn context(&self) -> flatbuffers::Vector<'a, u8> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(ApplicationMessage::VT_CONTEXT, None).unwrap()}
+  }
+  #[inline]
+  pub fn processed(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(ApplicationMessage::VT_PROCESSED, Some(false)).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for ApplicationMessage<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<ContractInstanceId>>("app", Self::VT_APP, true)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("payload", Self::VT_PAYLOAD, true)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("context", Self::VT_CONTEXT, true)?
+     .visit_field::<bool>("processed", Self::VT_PROCESSED, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct ApplicationMessageArgs<'a> {
+    pub app: Option<flatbuffers::WIPOffset<ContractInstanceId<'a>>>,
+    pub payload: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+    pub context: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+    pub processed: bool,
+}
+impl<'a> Default for ApplicationMessageArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    ApplicationMessageArgs {
+      app: None, // required field
+      payload: None, // required field
+      context: None, // required field
+      processed: false,
+    }
+  }
+}
+
+pub struct ApplicationMessageBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> ApplicationMessageBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_app(&mut self, app: flatbuffers::WIPOffset<ContractInstanceId<'b >>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<ContractInstanceId>>(ApplicationMessage::VT_APP, app);
+  }
+  #[inline]
+  pub fn add_payload(&mut self, payload: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ApplicationMessage::VT_PAYLOAD, payload);
+  }
+  #[inline]
+  pub fn add_context(&mut self, context: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ApplicationMessage::VT_CONTEXT, context);
+  }
+  #[inline]
+  pub fn add_processed(&mut self, processed: bool) {
+    self.fbb_.push_slot::<bool>(ApplicationMessage::VT_PROCESSED, processed, false);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ApplicationMessageBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    ApplicationMessageBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<ApplicationMessage<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, ApplicationMessage::VT_APP,"app");
+    self.fbb_.required(o, ApplicationMessage::VT_PAYLOAD,"payload");
+    self.fbb_.required(o, ApplicationMessage::VT_CONTEXT,"context");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for ApplicationMessage<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("ApplicationMessage");
+      ds.field("app", &self.app());
+      ds.field("payload", &self.payload());
+      ds.field("context", &self.context());
+      ds.field("processed", &self.processed());
+      ds.finish()
+  }
+}
+pub enum GetSecretRequestOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct GetSecretRequest<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for GetSecretRequest<'a> {
+  type Inner = GetSecretRequest<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> GetSecretRequest<'a> {
+  pub const VT_KEY: flatbuffers::VOffsetT = 4;
+  pub const VT_DELEGATE_CONTEXT: flatbuffers::VOffsetT = 6;
+  pub const VT_PROCESSED: flatbuffers::VOffsetT = 8;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    GetSecretRequest { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args GetSecretRequestArgs<'args>
+  ) -> flatbuffers::WIPOffset<GetSecretRequest<'bldr>> {
+    let mut builder = GetSecretRequestBuilder::new(_fbb);
+    if let Some(x) = args.delegate_context { builder.add_delegate_context(x); }
+    if let Some(x) = args.key { builder.add_key(x); }
+    builder.add_processed(args.processed);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn key(&self) -> SecretsId<'a> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<SecretsId>>(GetSecretRequest::VT_KEY, None).unwrap()}
+  }
+  #[inline]
+  pub fn delegate_context(&self) -> flatbuffers::Vector<'a, u8> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(GetSecretRequest::VT_DELEGATE_CONTEXT, None).unwrap()}
+  }
+  #[inline]
+  pub fn processed(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(GetSecretRequest::VT_PROCESSED, Some(false)).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for GetSecretRequest<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<SecretsId>>("key", Self::VT_KEY, true)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("delegate_context", Self::VT_DELEGATE_CONTEXT, true)?
+     .visit_field::<bool>("processed", Self::VT_PROCESSED, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct GetSecretRequestArgs<'a> {
+    pub key: Option<flatbuffers::WIPOffset<SecretsId<'a>>>,
+    pub delegate_context: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+    pub processed: bool,
+}
+impl<'a> Default for GetSecretRequestArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    GetSecretRequestArgs {
+      key: None, // required field
+      delegate_context: None, // required field
+      processed: false,
+    }
+  }
+}
+
+pub struct GetSecretRequestBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> GetSecretRequestBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_key(&mut self, key: flatbuffers::WIPOffset<SecretsId<'b >>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<SecretsId>>(GetSecretRequest::VT_KEY, key);
+  }
+  #[inline]
+  pub fn add_delegate_context(&mut self, delegate_context: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GetSecretRequest::VT_DELEGATE_CONTEXT, delegate_context);
+  }
+  #[inline]
+  pub fn add_processed(&mut self, processed: bool) {
+    self.fbb_.push_slot::<bool>(GetSecretRequest::VT_PROCESSED, processed, false);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> GetSecretRequestBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    GetSecretRequestBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<GetSecretRequest<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, GetSecretRequest::VT_KEY,"key");
+    self.fbb_.required(o, GetSecretRequest::VT_DELEGATE_CONTEXT,"delegate_context");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for GetSecretRequest<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("GetSecretRequest");
+      ds.field("key", &self.key());
+      ds.field("delegate_context", &self.delegate_context());
+      ds.field("processed", &self.processed());
+      ds.finish()
+  }
+}
+pub enum GetSecretResponseOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct GetSecretResponse<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for GetSecretResponse<'a> {
+  type Inner = GetSecretResponse<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> GetSecretResponse<'a> {
+  pub const VT_KEY: flatbuffers::VOffsetT = 4;
+  pub const VT_VALUE: flatbuffers::VOffsetT = 6;
+  pub const VT_DELEGATE_CONTEXT: flatbuffers::VOffsetT = 8;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    GetSecretResponse { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args GetSecretResponseArgs<'args>
+  ) -> flatbuffers::WIPOffset<GetSecretResponse<'bldr>> {
+    let mut builder = GetSecretResponseBuilder::new(_fbb);
+    if let Some(x) = args.delegate_context { builder.add_delegate_context(x); }
+    if let Some(x) = args.value { builder.add_value(x); }
+    if let Some(x) = args.key { builder.add_key(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn key(&self) -> SecretsId<'a> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<SecretsId>>(GetSecretResponse::VT_KEY, None).unwrap()}
+  }
+  #[inline]
+  pub fn value(&self) -> Option<flatbuffers::Vector<'a, u8>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(GetSecretResponse::VT_VALUE, None)}
+  }
+  #[inline]
+  pub fn delegate_context(&self) -> flatbuffers::Vector<'a, u8> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(GetSecretResponse::VT_DELEGATE_CONTEXT, None).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for GetSecretResponse<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<SecretsId>>("key", Self::VT_KEY, true)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("value", Self::VT_VALUE, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("delegate_context", Self::VT_DELEGATE_CONTEXT, true)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct GetSecretResponseArgs<'a> {
+    pub key: Option<flatbuffers::WIPOffset<SecretsId<'a>>>,
+    pub value: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+    pub delegate_context: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+}
+impl<'a> Default for GetSecretResponseArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    GetSecretResponseArgs {
+      key: None, // required field
+      value: None,
+      delegate_context: None, // required field
+    }
+  }
+}
+
+pub struct GetSecretResponseBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> GetSecretResponseBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_key(&mut self, key: flatbuffers::WIPOffset<SecretsId<'b >>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<SecretsId>>(GetSecretResponse::VT_KEY, key);
+  }
+  #[inline]
+  pub fn add_value(&mut self, value: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GetSecretResponse::VT_VALUE, value);
+  }
+  #[inline]
+  pub fn add_delegate_context(&mut self, delegate_context: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GetSecretResponse::VT_DELEGATE_CONTEXT, delegate_context);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> GetSecretResponseBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    GetSecretResponseBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<GetSecretResponse<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, GetSecretResponse::VT_KEY,"key");
+    self.fbb_.required(o, GetSecretResponse::VT_DELEGATE_CONTEXT,"delegate_context");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for GetSecretResponse<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("GetSecretResponse");
+      ds.field("key", &self.key());
+      ds.field("value", &self.value());
+      ds.field("delegate_context", &self.delegate_context());
+      ds.finish()
+  }
+}
 pub enum WasmContractV1Offset {}
 #[derive(Copy, Clone, PartialEq)]
 

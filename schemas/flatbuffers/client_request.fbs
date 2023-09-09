@@ -66,19 +66,6 @@ union ContractRequestType {
   Subscribe
 }
 
-table ApplicationMessage {
-    app:common.ContractInstanceId(required);
-    payload:[ubyte](required);
-    context:[ubyte](required);
-    processed:bool;
-}
-
-table GetSecretResponse {
-    key:common.SecretsId(required);
-    value:[ubyte];
-    context:[ubyte](required);
-}
-
 table RandomBytes {
     data:[ubyte](required);
 }
@@ -94,11 +81,11 @@ table UserInputResponse {
 }
 
 union InboundDelegateMsgType {
-    ApplicationMessage,
-    GetSecretResponse,
+    common.ApplicationMessage,
+    common.GetSecretResponse,
     RandomBytes,
     UserInputResponse,
-    GetSecretRequest,
+    common.GetSecretRequest,
 }
 
 table InboundDelegateMsg {
@@ -111,16 +98,10 @@ table ApplicationMessages {
     inbound:[InboundDelegateMsg](required);
 }
 
-table GetSecretRequest {
-    key:common.SecretsId(required);
-    delegate_context:[ubyte](required);
-    processed:bool;
-}
-
 table GetSecretRequestType {
     key:DelegateKey(required);
     params:[ubyte](required);
-    get_request:GetSecretRequest(required);
+    get_request:common.GetSecretRequest(required);
 }
 
 table RegisterDelegate {

@@ -10,9 +10,11 @@ use crate::client_request_generated::client_request::{
 };
 
 use crate::common_generated::common::{
-    ContractCode, ContractCodeArgs, ContractContainer as FbsContractContainer,
-    ContractContainerArgs, ContractInstanceId, ContractInstanceIdArgs,
-    ContractKey as FbsContractKey, ContractKeyArgs, ContractType, DeltaUpdate, DeltaUpdateArgs,
+    ApplicationMessage as FbsApplicationMessage, ApplicationMessageArgs, ContractCode,
+    ContractCodeArgs, ContractContainer as FbsContractContainer, ContractContainerArgs,
+    ContractInstanceId, ContractInstanceIdArgs, ContractKey as FbsContractKey, ContractKeyArgs,
+    ContractType, DeltaUpdate, DeltaUpdateArgs, GetSecretRequest as FbsGetSecretRequest,
+    GetSecretRequestArgs, GetSecretResponse as FbsGetSecretResponse, GetSecretResponseArgs,
     RelatedDeltaUpdate, RelatedDeltaUpdateArgs, RelatedStateAndDeltaUpdate,
     RelatedStateAndDeltaUpdateArgs, RelatedStateUpdate, RelatedStateUpdateArgs,
     SecretsId as FbsSecretsId, SecretsIdArgs, StateAndDeltaUpdate, StateAndDeltaUpdateArgs,
@@ -21,14 +23,11 @@ use crate::common_generated::common::{
 };
 use crate::delegate_interface::DelegateContext;
 use crate::host_response_generated::host_response::{
-    finish_host_response_buffer, ApplicationMessage as FbsApplicationMessage,
-    ApplicationMessageArgs, ClientResponse as FbsClientResponse, ClientResponseArgs,
+    finish_host_response_buffer, ClientResponse as FbsClientResponse, ClientResponseArgs,
     ContextUpdated as FbsContextUpdated, ContextUpdatedArgs,
     ContractResponse as FbsContractResponse, ContractResponseArgs, ContractResponseType,
     DelegateKey as FbsDelegateKey, DelegateKeyArgs, DelegateResponse as FbsDelegateResponse,
-    DelegateResponseArgs, GenerateRandData as FbsGenerateRandData, GenerateRandDataArgs,
-    GetResponse as FbsGetResponse, GetResponseArgs, GetSecretRequest as FbsGetSecretRequest,
-    GetSecretRequestArgs, GetSecretResponse as FbsGetSecretResponse, GetSecretResponseArgs,
+    DelegateResponseArgs, GetResponse as FbsGetResponse, GetResponseArgs,
     HostResponse as FbsHostResponse, HostResponseArgs, HostResponseType, Ok as FbsOk, OkArgs,
     OutboundDelegateMsg as FbsOutboundDelegateMsg, OutboundDelegateMsgArgs,
     OutboundDelegateMsgType, PutResponse as FbsPutResponse, PutResponseArgs,
@@ -1116,14 +1115,14 @@ impl HostResponse {
                             &ApplicationMessageArgs {
                                 app: Some(instance_offset),
                                 payload: Some(payload_data),
-                                delegate_context: Some(delegate_context_data),
+                                context: Some(delegate_context_data),
                                 processed: app.processed,
                             },
                         );
                         let msg = FbsOutboundDelegateMsg::create(
                             &mut builder,
                             &OutboundDelegateMsgArgs {
-                                inbound_type: OutboundDelegateMsgType::ApplicationMessage,
+                                inbound_type: OutboundDelegateMsgType::common_ApplicationMessage,
                                 inbound: Some(app_offset.as_union_value()),
                             },
                         );
@@ -1200,7 +1199,7 @@ impl HostResponse {
                         let msg = FbsOutboundDelegateMsg::create(
                             &mut builder,
                             &OutboundDelegateMsgArgs {
-                                inbound_type: OutboundDelegateMsgType::GetSecretRequest,
+                                inbound_type: OutboundDelegateMsgType::common_GetSecretRequest,
                                 inbound: Some(request_offset.as_union_value()),
                             },
                         );
@@ -1281,7 +1280,7 @@ impl HostResponse {
                         let msg = FbsOutboundDelegateMsg::create(
                             &mut builder,
                             &OutboundDelegateMsgArgs {
-                                inbound_type: OutboundDelegateMsgType::GetSecretResponse,
+                                inbound_type: OutboundDelegateMsgType::common_GetSecretResponse,
                                 inbound: Some(response_offset.as_union_value()),
                             },
                         );

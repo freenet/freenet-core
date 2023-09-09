@@ -4,12 +4,12 @@
 
 import * as flatbuffers from 'flatbuffers';
 
-import { ApplicationMessage, ApplicationMessageT } from '../client-request/application-message.js';
-import { GetSecretRequest, GetSecretRequestT } from '../client-request/get-secret-request.js';
-import { GetSecretResponse, GetSecretResponseT } from '../client-request/get-secret-response.js';
 import { InboundDelegateMsgType, unionToInboundDelegateMsgType, unionListToInboundDelegateMsgType } from '../client-request/inbound-delegate-msg-type.js';
 import { RandomBytes, RandomBytesT } from '../client-request/random-bytes.js';
 import { UserInputResponse, UserInputResponseT } from '../client-request/user-input-response.js';
+import { ApplicationMessage, ApplicationMessageT } from '../common/application-message.js';
+import { GetSecretRequest, GetSecretRequestT } from '../common/get-secret-request.js';
+import { GetSecretResponse, GetSecretResponseT } from '../common/get-secret-response.js';
 
 
 export class InboundDelegateMsg implements flatbuffers.IUnpackableObject<InboundDelegateMsgT> {

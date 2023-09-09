@@ -2,10 +2,10 @@
 
 /* eslint-disable @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
-import { ApplicationMessage, ApplicationMessageT } from '../host-response/application-message.js';
+import { ApplicationMessage, ApplicationMessageT } from '../common/application-message.js';
+import { GetSecretRequest, GetSecretRequestT } from '../common/get-secret-request.js';
+import { GetSecretResponse, GetSecretResponseT } from '../common/get-secret-response.js';
 import { ContextUpdated, ContextUpdatedT } from '../host-response/context-updated.js';
-import { GetSecretRequest, GetSecretRequestT } from '../host-response/get-secret-request.js';
-import { GetSecretResponse, GetSecretResponseT } from '../host-response/get-secret-response.js';
 import { RandomBytesRequest, RandomBytesRequestT } from '../host-response/random-bytes-request.js';
 import { RequestUserInput, RequestUserInputT } from '../host-response/request-user-input.js';
 import { SetSecretRequest, SetSecretRequestT } from '../host-response/set-secret-request.js';
@@ -13,13 +13,13 @@ import { SetSecretRequest, SetSecretRequestT } from '../host-response/set-secret
 
 export enum OutboundDelegateMsgType {
   NONE = 0,
-  ApplicationMessage = 1,
+  common_ApplicationMessage = 1,
   RequestUserInput = 2,
   ContextUpdated = 3,
-  GetSecretRequest = 4,
+  common_GetSecretRequest = 4,
   SetSecretRequest = 5,
   RandomBytesRequest = 6,
-  GetSecretResponse = 7
+  common_GetSecretResponse = 7
 }
 
 export function unionToOutboundDelegateMsgType(
@@ -28,13 +28,13 @@ export function unionToOutboundDelegateMsgType(
 ): ApplicationMessage|ContextUpdated|GetSecretRequest|GetSecretResponse|RandomBytesRequest|RequestUserInput|SetSecretRequest|null {
   switch(OutboundDelegateMsgType[type]) {
     case 'NONE': return null; 
-    case 'ApplicationMessage': return accessor(new ApplicationMessage())! as ApplicationMessage;
+    case 'common_ApplicationMessage': return accessor(new ApplicationMessage())! as ApplicationMessage;
     case 'RequestUserInput': return accessor(new RequestUserInput())! as RequestUserInput;
     case 'ContextUpdated': return accessor(new ContextUpdated())! as ContextUpdated;
-    case 'GetSecretRequest': return accessor(new GetSecretRequest())! as GetSecretRequest;
+    case 'common_GetSecretRequest': return accessor(new GetSecretRequest())! as GetSecretRequest;
     case 'SetSecretRequest': return accessor(new SetSecretRequest())! as SetSecretRequest;
     case 'RandomBytesRequest': return accessor(new RandomBytesRequest())! as RandomBytesRequest;
-    case 'GetSecretResponse': return accessor(new GetSecretResponse())! as GetSecretResponse;
+    case 'common_GetSecretResponse': return accessor(new GetSecretResponse())! as GetSecretResponse;
     default: return null;
   }
 }
@@ -46,13 +46,13 @@ export function unionListToOutboundDelegateMsgType(
 ): ApplicationMessage|ContextUpdated|GetSecretRequest|GetSecretResponse|RandomBytesRequest|RequestUserInput|SetSecretRequest|null {
   switch(OutboundDelegateMsgType[type]) {
     case 'NONE': return null; 
-    case 'ApplicationMessage': return accessor(index, new ApplicationMessage())! as ApplicationMessage;
+    case 'common_ApplicationMessage': return accessor(index, new ApplicationMessage())! as ApplicationMessage;
     case 'RequestUserInput': return accessor(index, new RequestUserInput())! as RequestUserInput;
     case 'ContextUpdated': return accessor(index, new ContextUpdated())! as ContextUpdated;
-    case 'GetSecretRequest': return accessor(index, new GetSecretRequest())! as GetSecretRequest;
+    case 'common_GetSecretRequest': return accessor(index, new GetSecretRequest())! as GetSecretRequest;
     case 'SetSecretRequest': return accessor(index, new SetSecretRequest())! as SetSecretRequest;
     case 'RandomBytesRequest': return accessor(index, new RandomBytesRequest())! as RandomBytesRequest;
-    case 'GetSecretResponse': return accessor(index, new GetSecretResponse())! as GetSecretResponse;
+    case 'common_GetSecretResponse': return accessor(index, new GetSecretResponse())! as GetSecretResponse;
     default: return null;
   }
 }

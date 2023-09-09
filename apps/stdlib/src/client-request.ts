@@ -2,7 +2,6 @@
 
 /* eslint-disable @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
-export { ApplicationMessage, ApplicationMessageT } from './client-request/application-message.js';
 export { ApplicationMessages, ApplicationMessagesT } from './client-request/application-messages.js';
 export { ClientRequest, ClientRequestT } from './client-request/client-request.js';
 export { ClientRequestType } from './client-request/client-request-type.js';
@@ -17,11 +16,8 @@ export { DelegateRequest, DelegateRequestT } from './client-request/delegate-req
 export { DelegateRequestType } from './client-request/delegate-request-type.js';
 export { DelegateType } from './client-request/delegate-type.js';
 export { Disconnect, DisconnectT } from './client-request/disconnect.js';
-export { GenerateRandData, GenerateRandDataT } from './client-request/generate-rand-data.js';
 export { Get, GetT } from './client-request/get.js';
-export { GetSecretRequest, GetSecretRequestT } from './client-request/get-secret-request.js';
 export { GetSecretRequestType, GetSecretRequestTypeT } from './client-request/get-secret-request-type.js';
-export { GetSecretResponse, GetSecretResponseT } from './client-request/get-secret-response.js';
 export { InboundDelegateMsg, InboundDelegateMsgT } from './client-request/inbound-delegate-msg.js';
 export { InboundDelegateMsgType } from './client-request/inbound-delegate-msg-type.js';
 export { Put, PutT } from './client-request/put.js';
