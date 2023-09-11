@@ -70,7 +70,7 @@ where
     pub fn consume_to_state<CErr: std::error::Error>(
         &mut self,
         input: T::Input,
-    ) -> Result<Option<T::Output>, OpError<CErr>> {
+    ) -> Result<Option<T::Output>, OpError> {
         let popped_state = self
             .state
             .take()
@@ -89,7 +89,7 @@ where
     pub fn consume_to_output<CErr: std::error::Error>(
         &mut self,
         mut input: T::Input,
-    ) -> Result<Option<T::Output>, OpError<CErr>> {
+    ) -> Result<Option<T::Output>, OpError> {
         let mut popped_state = self
             .state
             .take()

@@ -1,6 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
-
 use locutus_stdlib::prelude::{ContractKey, Parameters};
 use stretto::AsyncCache;
 
@@ -25,10 +22,10 @@ pub trait StateStorage {
         state: Parameters<'static>,
     ) -> Result<(), Self::Error>;
     async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
-    fn get_params<'a>(
+    async fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>;
+    ) -> Result<Option<Parameters<'static>>, Self::Error>;
 }
 
 pub struct StateStore<S: StateStorage> {
@@ -57,11 +54,33 @@ where
         })
     }
 
+    pub async fn update(
+        &mut self,
+        key: &ContractKey,
+        state: WrappedState,
+    ) -> Result<(), StateStoreError> {
+        // only allow updates for existing contracts
+        if self.state_mem_cache.get(key).await.is_none() {
+            self.store
+                .get(key)
+                .await
+                .map_err(Into::into)?
+                .ok_or_else(|| StateStoreError::MissingContract(key.clone()))?;
+        }
+        self.store
+            .store(key.clone(), state.clone())
+            .await
+            .map_err(Into::into)?;
+        let cost = state.size() as i64;
+        self.state_mem_cache.insert(key.clone(), state, cost).await;
+        Ok(())
+    }
+
     pub async fn store(
         &mut self,
         key: ContractKey,
         state: WrappedState,
-        params: Option<Parameters<'static>>,
+        params: Parameters<'static>,
     ) -> Result<(), StateStoreError> {
         self.store
             .store(key.clone(), state.clone())
@@ -69,14 +88,12 @@ where
             .map_err(Into::into)?;
         let cost = state.size() as i64;
         self.state_mem_cache.insert(key.clone(), state, cost).await;
-        if let Some(params) = params {
-            self.store
-                .store_params(key, params.clone())
-                .await
-                .map_err(Into::into)?;
-            // let cost = params.size();
-            // self.params_mem_cache.insert(key, params, cost as i64).await;
-        }
+        self.store
+            .store_params(key, params.clone())
+            .await
+            .map_err(Into::into)?;
+        // let cost = params.size();
+        // self.params_mem_cache.insert(key, params, cost as i64).await;
         Ok(())
     }
 
@@ -84,27 +101,18 @@ where
         if let Some(v) = self.state_mem_cache.get(key).await {
             return Ok(v.value().clone());
         }
-        self.store
-            .get(key)
-            .await
-            .map_err(Into::into)?
-            .ok_or_else(|| StateStoreError::MissingContract(key.clone()))
+        let r = self.store.get(key).await.map_err(Into::into)?;
+        r.ok_or_else(|| StateStoreError::MissingContract(key.clone()))
     }
 
-    pub fn get_params<'a>(
+    pub async fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Parameters<'static>, StateStoreError>> + Send + 'a>>
-    {
+    ) -> Result<Option<Parameters<'static>>, StateStoreError> {
         // if let Some(v) = self.params_mem_cache.get(key) {
         //     return Ok(v.value().clone());
         // }
-        Box::pin(async move {
-            self.store
-                .get_params(key)
-                .await
-                .map_err(Into::into)?
-                .ok_or_else(|| StateStoreError::MissingContract(key.clone()))
-        })
+        let r = self.store.get_params(key).await.map_err(Into::into)?;
+        Ok(r)
     }
 }

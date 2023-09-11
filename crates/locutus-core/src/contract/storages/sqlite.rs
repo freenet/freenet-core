@@ -1,7 +1,6 @@
-use std::{collections::HashMap, pin::Pin, str::FromStr};
+use std::{collections::HashMap, str::FromStr};
 
-use futures::future::BoxFuture;
-use futures::{Future, FutureExt};
+use futures::{future::BoxFuture, FutureExt};
 use locutus_runtime::{
     ContractContainer, ContractError, ContractExecError, ContractRuntimeInterface, ContractStore,
     Parameters, StateStorage, StateStore, StateStoreError, ValidateResult,
@@ -14,6 +13,7 @@ use sqlx::{
 };
 
 use crate::contract::ContractKey;
+use crate::DynError;
 use crate::{config::CONFIG, contract::test::MockRuntime, WrappedState};
 
 use super::super::handler::{CHListenerHalve, MAX_MEM_CACHE};
@@ -117,23 +117,20 @@ impl StateStorage for Pool {
         Ok(())
     }
 
-    fn get_params<'a>(
+    async fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            match sqlx::query("SELECT params FROM states WHERE contract = ?")
-                .bind(key.bytes())
-                .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("params"))))
-                .fetch_one(&self.0)
-                .await
-            {
-                Ok(result) => Ok(result),
-                Err(sqlx::Error::RowNotFound) => Ok(None),
-                Err(_) => Err(SqlDbError::ContractNotFound),
-            }
-        })
+    ) -> Result<Option<Parameters<'static>>, Self::Error> {
+        match sqlx::query("SELECT params FROM states WHERE contract = ?")
+            .bind(key.bytes())
+            .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("params"))))
+            .fetch_one(&self.0)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(sqlx::Error::RowNotFound) => Ok(None),
+            Err(_) => Err(SqlDbError::ContractNotFound),
+        }
     }
 }
 
@@ -152,7 +149,7 @@ pub enum SqlDbError {
 }
 
 pub struct SQLiteContractHandler<R> {
-    channel: ContractHandlerChannel<SqlDbError, CHListenerHalve>,
+    channel: ContractHandlerChannel<CHListenerHalve>,
     store: ContractStore,
     runtime: R,
     state_store: StateStore<Pool>,
@@ -167,7 +164,7 @@ where
     const MEM_SIZE: u32 = 10_000_000;
 
     async fn new(
-        channel: ContractHandlerChannel<SqlDbError, CHListenerHalve>,
+        channel: ContractHandlerChannel<CHListenerHalve>,
         store: ContractStore,
         runtime: R,
     ) -> Result<Self, SqlDbError> {
@@ -198,12 +195,8 @@ where
     }
 }
 
-impl From<ContractHandlerChannel<SqlDbError, CHListenerHalve>>
-    for SQLiteContractHandler<MockRuntime>
-{
-    fn from(
-        channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
-    ) -> Self {
+impl From<ContractHandlerChannel<CHListenerHalve>> for SQLiteContractHandler<MockRuntime> {
+    fn from(channel: ContractHandlerChannel<CHListenerHalve>) -> Self {
         let store =
             ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
         let runtime = MockRuntime {};
@@ -218,13 +211,12 @@ impl From<ContractHandlerChannel<SqlDbError, CHListenerHalve>>
 impl<R> ContractHandler for SQLiteContractHandler<R>
 where
     R: ContractRuntimeInterface + Send + Sync + 'static,
-    Self: From<ContractHandlerChannel<SqlDbError, CHListenerHalve>>,
+    Self: From<ContractHandlerChannel<CHListenerHalve>>,
 {
-    type Error = SqlDbError;
     type Store = Pool;
 
     #[inline(always)]
-    fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
+    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
         &mut self.channel
     }
 
@@ -236,7 +228,7 @@ where
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
-    ) -> BoxFuture<'a, Result<HostResponse, Self::Error>> {
+    ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
         async move {
             match req {
                 ClientRequest::ContractOp(ops) => match ops {
@@ -266,28 +258,33 @@ where
                                 )
                             }
                             Err(SqlDbError::ContractNotFound) => {}
-                            Err(other) => return Err(other),
+                            Err(other) => return Err(other.into()),
                         }
 
                         let result = self.runtime.validate_state(
                             &key,
                             &params,
                             &state,
-                            related_contracts,
+                            &related_contracts,
                         )?;
                         // FIXME: should deal with additional related contracts requested
                         if result != ValidateResult::Valid {
                             todo!("return error");
                         }
-                        let _params: Parameters<'static> = params.clone().into_bytes().into();
-                        self.state_store.store(key, state, None).await?;
+                        self.state_store
+                            .store(key, state, params.into_owned())
+                            .await?;
                         todo!()
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        tracing::error!("op not supported");
+                        Err("op not supported".into())
+                    }
                 },
-                ClientRequest::DelegateOp(_op) => unreachable!(),
-                ClientRequest::Disconnect { .. } => unreachable!(),
-                ClientRequest::GenerateRandData { bytes: _ } => unreachable!(),
+                _ => {
+                    tracing::error!("op not supported");
+                    Err("op not supported".into())
+                }
             }
         }
         .boxed()
@@ -320,7 +317,7 @@ mod test {
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn contract_handler() -> Result<(), anyhow::Error> {
+    async fn contract_handler() -> Result<(), DynError> {
         // Create a sqlite handler and initialize the database
         let mut handler = get_handler().await?;
 

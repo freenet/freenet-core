@@ -138,6 +138,12 @@ impl<'a> RelatedContracts<'a> {
     ) -> impl Iterator<Item = (&ContractInstanceId, &mut Option<State<'a>>)> + 'b {
         self.map.iter_mut()
     }
+
+    pub fn missing(&mut self, contracts: Vec<ContractInstanceId>) {
+        for key in contracts {
+            self.map.entry(key).or_default();
+        }
+    }
 }
 
 impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
@@ -569,6 +575,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct State<'a>(
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     Cow<'a, [u8]>,
@@ -646,6 +653,7 @@ impl<'a> std::io::Read for State<'a> {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct StateDelta<'a>(
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     Cow<'a, [u8]>,
@@ -710,6 +718,7 @@ impl<'a> DerefMut for StateDelta<'a> {
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct StateSummary<'a>(
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     Cow<'a, [u8]>,
@@ -781,6 +790,7 @@ impl<'a> arbitrary::Arbitrary<'a> for StateSummary<'static> {
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContractCode<'a> {
+    // TODO: conver this to Arc<[u8]> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     pub(crate) data: Cow<'a, [u8]>,
@@ -1168,6 +1178,7 @@ fn internal_fmt_key(
     write!(f, "{}", &r[..8])
 }
 
+// TODO:  get rid of this when State is internally an Arc<[u8]>
 /// The state for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]

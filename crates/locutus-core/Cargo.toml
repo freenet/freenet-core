@@ -21,7 +21,7 @@ chacha20poly1305 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 config = { version = "0.13.0", features = [ "toml" ] } 
 crossbeam = "0.8.2"
-ctrlc = { version = "3.0", features = ["termination"] }
+ctrlc = { version = "3.4", features = ["termination"] }
 dashmap = "^5.5"
 directories = "5"
 either = { workspace = true , features = ["serde"] }
@@ -77,9 +77,11 @@ locutus-runtime = { path = "../locutus-runtime", features = ["testing"] }
 locutus-stdlib = { path = "../locutus-stdlib", features = ["testing", "net"] }
 
 [features]
-testing = ["arbitrary"]
 default = ["websocket", "rocks_db", "trace"]
+testing = ["arbitrary"]
 rocks_db = ["rocksdb"]
 sqlite = ["sqlx"]
 websocket = ["axum/ws", "rmp-serde"]
 trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]
+local-mode = []
+network-mode = []

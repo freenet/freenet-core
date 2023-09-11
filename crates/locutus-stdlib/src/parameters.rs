@@ -13,6 +13,7 @@ use crate::client_api::{TryFromTsStd, WsApiError};
 #[serde_as]
 #[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
 pub struct Parameters<'a>(
+    // TODO: conver this to Arc<u8> instead
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     Cow<'a, [u8]>,

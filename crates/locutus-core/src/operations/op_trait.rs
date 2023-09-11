@@ -10,19 +10,18 @@ use crate::{
     operations::{OpError, OpInitialization, OperationResult},
 };
 
-pub(crate) trait Operation<CErr, CB>
+pub(crate) trait Operation<CB>
 where
-    Self: Sized,
-    CErr: std::error::Error,
+    Self: Sized + TryInto<Self::Result>,
 {
     type Message: InnerMessage;
 
-    type Error: Into<OpError<CErr>>;
+    type Result;
 
     fn load_or_init(
-        op_storage: &OpManager<CErr>,
+        op_storage: &OpManager,
         msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError<CErr>>;
+    ) -> Result<OpInitialization<Self>, OpError>;
 
     //     fn new(transaction: Transaction, builder: Self::Builder) -> Self;
 
@@ -32,7 +31,7 @@ where
     fn process_message<'a>(
         self,
         conn_manager: &'a mut CB,
-        op_storage: &'a OpManager<CErr>,
+        op_storage: &'a OpManager,
         input: Self::Message,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, Self::Error>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }

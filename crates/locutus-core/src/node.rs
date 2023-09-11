@@ -21,10 +21,7 @@ use self::{
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
     config::{GlobalExecutor, CONFIG},
-    contract::{
-        storages::{StorageContractHandler, StorageDbError},
-        ContractError, MockRuntime,
-    },
+    contract::{storages::StorageContractHandler, ContractError, MockRuntime},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
         get,
@@ -36,7 +33,7 @@ use crate::{
 };
 
 use crate::operations::handle_op_request;
-pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
+pub(crate) use conn_manager::{p2p_protoc::P2pBridge, ConnectionBridge, ConnectionError};
 pub(crate) use op_state::OpManager;
 
 mod conn_manager;
@@ -48,12 +45,9 @@ mod p2p_impl;
 #[cfg(test)]
 pub(crate) mod test;
 
-pub struct Node<CErr>(NodeP2P<CErr>);
+pub struct Node(NodeP2P);
 
-impl<CErr> Node<CErr>
-where
-    CErr: std::error::Error + Send + Sync + 'static,
-{
+impl Node {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         //TODO: Initialize tracer
         self.0.run_node().await?;
@@ -161,12 +155,8 @@ impl<const CLIENTS: usize> NodeConfig<CLIENTS> {
     }
 
     /// Builds a node using the default backend connection manager.
-    pub fn build(self) -> Result<Node<StorageDbError>, anyhow::Error> {
-        let node = NodeP2P::<StorageDbError>::build::<
-            StorageContractHandler<MockRuntime>,
-            StorageDbError,
-            CLIENTS,
-        >(self)?;
+    pub fn build(self) -> Result<Node, anyhow::Error> {
+        let node = NodeP2P::build::<StorageContractHandler<MockRuntime>, CLIENTS>(self)?;
         Ok(Node(node))
     }
 
@@ -252,15 +242,14 @@ impl InitPeerNode {
     }
 }
 
-async fn join_ring_request<CErr, CM>(
+async fn join_ring_request<CM>(
     backoff: Option<ExponentialBackoff>,
     peer_key: PeerKey,
     gateway: &PeerKeyLocation,
-    op_storage: &OpManager<CErr>,
+    op_storage: &OpManager,
     conn_manager: &mut CM,
-) -> Result<(), OpError<CErr>>
+) -> Result<(), OpError>
 where
-    CErr: std::error::Error,
     CM: ConnectionBridge + Send + Sync,
 {
     let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
@@ -286,12 +275,9 @@ where
 }
 
 /// Process client events.
-async fn client_event_handling<ClientEv, CErr>(
-    op_storage: Arc<OpManager<CErr>>,
-    mut client_events: ClientEv,
-) where
+async fn client_event_handling<ClientEv>(op_storage: Arc<OpManager>, mut client_events: ClientEv)
+where
     ClientEv: ClientEventsProxy + Send + Sync + 'static,
-    CErr: std::error::Error + Send + Sync + 'static,
 {
     loop {
         // fixme: send back responses to client
@@ -381,10 +367,15 @@ async fn client_event_handling<ClientEv, CErr>(
                         }
                         todo!()
                     }
+                    _ => {
+                        tracing::error!("op not supported");
+                    }
                 },
                 ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
-                ClientRequest::GenerateRandData { .. } => todo!("FIXME"),
                 ClientRequest::Disconnect { .. } => unreachable!(),
+                _ => {
+                    tracing::error!("op not supported");
+                }
             }
         });
     }
@@ -401,23 +392,19 @@ macro_rules! log_handling_msg {
 }
 
 #[inline(always)]
-fn report_result<CErr>(op_result: Result<(), OpError<CErr>>)
-where
-    CErr: std::error::Error,
-{
+fn report_result(op_result: Result<(), OpError>) {
     if let Err(err) = op_result {
         tracing::debug!("Finished tx w/ error: {}", err)
     }
 }
 
-async fn process_message<CErr, CB>(
+async fn process_message<CB>(
     msg: Result<Message, ConnectionError>,
-    op_storage: Arc<OpManager<CErr>>,
+    op_storage: Arc<OpManager>,
     mut conn_manager: CB,
     event_listener: Option<Box<dyn EventListener + Send + Sync>>,
 ) where
     CB: ConnectionBridge,
-    CErr: std::error::Error + Sync + Send + 'static,
 {
     match msg {
         Ok(msg) => {
@@ -427,7 +414,7 @@ async fn process_message<CErr, CB>(
             match msg {
                 Message::JoinRing(op) => {
                     log_handling_msg!("join", op.id(), op_storage);
-                    let op_result = handle_op_request::<join_ring::JoinRingOp, _, _>(
+                    let op_result = handle_op_request::<join_ring::JoinRingOp, _>(
                         &op_storage,
                         &mut conn_manager,
                         op,
@@ -438,20 +425,20 @@ async fn process_message<CErr, CB>(
                 Message::Put(op) => {
                     log_handling_msg!("put", *op.id(), op_storage);
                     let op_result =
-                        handle_op_request::<put::PutOp, _, _>(&op_storage, &mut conn_manager, op)
+                        handle_op_request::<put::PutOp, _>(&op_storage, &mut conn_manager, op)
                             .await;
                     report_result(op_result);
                 }
                 Message::Get(op) => {
                     log_handling_msg!("get", op.id(), op_storage);
                     let op_result =
-                        handle_op_request::<get::GetOp, _, _>(&op_storage, &mut conn_manager, op)
+                        handle_op_request::<get::GetOp, _>(&op_storage, &mut conn_manager, op)
                             .await;
                     report_result(op_result);
                 }
                 Message::Subscribe(op) => {
                     log_handling_msg!("subscribe", op.id(), op_storage);
-                    let op_result = handle_op_request::<subscribe::SubscribeOp, _, _>(
+                    let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                         &op_storage,
                         &mut conn_manager,
                         op,
@@ -463,20 +450,19 @@ async fn process_message<CErr, CB>(
             }
         }
         Err(err) => {
-            report_result::<CErr>(Err(err.into()));
+            report_result(Err(err.into()));
         }
     }
 }
 
-async fn handle_cancelled_op<CErr, CM>(
+async fn handle_cancelled_op<CM>(
     tx: Transaction,
     peer_key: PeerKey,
     gateways: impl Iterator<Item = &PeerKeyLocation>,
-    op_storage: &OpManager<CErr>,
+    op_storage: &OpManager,
     conn_manager: &mut CM,
-) -> Result<(), OpError<CErr>>
+) -> Result<(), OpError>
 where
-    CErr: std::error::Error,
     CM: ConnectionBridge + Send + Sync,
 {
     tracing::warn!("Failed tx `{}`, potentially attempting a retry", tx);

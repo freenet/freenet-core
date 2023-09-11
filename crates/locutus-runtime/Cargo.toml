@@ -35,7 +35,7 @@ stretto = { version = "0.8", features = ["async", "sync"], default-features = fa
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 thiserror = "1"
-walkdir = "2.3.2"
+walkdir = "2.4.0"
 wasmer = { workspace = true, features = [ "sys"] }
 varuint = "0.6"
 

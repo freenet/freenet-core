@@ -21,13 +21,13 @@ use super::PeerKey;
 
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
-pub(crate) struct OpManager<CErr> {
+pub(crate) struct OpManager {
     join_ring: DashMap<Transaction, JoinRingOp>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
     notification_channel: Sender<Either<Message, NodeEvent>>,
-    contract_handler: Mutex<ContractHandlerChannel<CErr, CHSenderHalve>>,
+    contract_handler: Mutex<ContractHandlerChannel<CHSenderHalve>>,
     // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
     _ops_ttl: RwLock<BTreeMap<Instant, Vec<Transaction>>>,
     pub ring: Ring,
@@ -41,14 +41,11 @@ macro_rules! check_id_op {
     };
 }
 
-impl<CErr> OpManager<CErr>
-where
-    CErr: std::error::Error,
-{
+impl OpManager {
     pub fn new(
         ring: Ring,
         notification_channel: Sender<Either<Message, NodeEvent>>,
-        contract_handler: ContractHandlerChannel<CErr, CHSenderHalve>,
+        contract_handler: ContractHandlerChannel<CHSenderHalve>,
     ) -> Self {
         Self {
             join_ring: DashMap::default(),
@@ -92,8 +89,8 @@ where
     /// Send an event to the contract handler and await a response event from it if successful.
     pub async fn notify_contract_handler(
         &self,
-        msg: ContractHandlerEvent<CErr>,
-    ) -> Result<ContractHandlerEvent<CErr>, ContractError<CErr>> {
+        msg: ContractHandlerEvent,
+    ) -> Result<ContractHandlerEvent, ContractError> {
         self.contract_handler
             .lock()
             .await
@@ -101,7 +98,7 @@ where
             .await
     }
 
-    pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError<CErr>> {
+    pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
         match op {
             OpEnum::JoinRing(tx) => {
                 check_id_op!(id.tx_type(), TransactionType::JoinRing);

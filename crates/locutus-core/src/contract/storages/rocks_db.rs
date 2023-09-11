@@ -1,8 +1,8 @@
 use rocksdb::{Options, DB};
-use std::{collections::HashMap, pin::Pin};
+use std::collections::HashMap;
 
 use futures::future::BoxFuture;
-use futures::{Future, FutureExt};
+use futures::FutureExt;
 use locutus_runtime::{
     ContractContainer, ContractError, ContractExecError, ContractRuntimeInterface, ContractStore,
     Parameters, StateStorage, StateStore, StateStoreError, ValidateResult,
@@ -10,6 +10,7 @@ use locutus_runtime::{
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 
 use crate::contract::ContractKey;
+use crate::DynError;
 use crate::{config::CONFIG, contract::test::MockRuntime, WrappedState};
 
 use super::super::handler::{CHListenerHalve, MAX_MEM_CACHE};
@@ -91,25 +92,22 @@ impl StateStorage for RocksDb {
         Ok(())
     }
 
-    fn get_params<'a>(
+    async fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            match self.0.get([key.bytes(), RocksDb::PARAMS_SUFFIX].concat()) {
-                Ok(result) => Ok(result
-                    .map(|r| Some(Parameters::from(r)))
-                    .expect("vec bytes")),
-                Err(e) => {
-                    if rocksdb::ErrorKind::NotFound == e.kind() {
-                        Ok(None)
-                    } else {
-                        Err(e)
-                    }
+    ) -> Result<Option<Parameters<'static>>, Self::Error> {
+        match self.0.get([key.bytes(), RocksDb::PARAMS_SUFFIX].concat()) {
+            Ok(result) => Ok(result
+                .map(|r| Some(Parameters::from(r)))
+                .expect("vec bytes")),
+            Err(e) => {
+                if rocksdb::ErrorKind::NotFound == e.kind() {
+                    Ok(None)
+                } else {
+                    Err(e)
                 }
             }
-        })
+        }
     }
 }
 
@@ -128,7 +126,7 @@ pub enum RocksDbError {
 }
 
 pub struct RocksDbContractHandler<R> {
-    channel: ContractHandlerChannel<RocksDbError, CHListenerHalve>,
+    channel: ContractHandlerChannel<CHListenerHalve>,
     store: ContractStore,
     runtime: R,
     state_store: StateStore<RocksDb>,
@@ -143,7 +141,7 @@ where
     const MEM_SIZE: u32 = 10_000_000;
 
     async fn new(
-        channel: ContractHandlerChannel<RocksDbError, CHListenerHalve>,
+        channel: ContractHandlerChannel<CHListenerHalve>,
         store: ContractStore,
         runtime: R,
     ) -> Result<Self, RocksDbError> {
@@ -174,12 +172,8 @@ where
     }
 }
 
-impl From<ContractHandlerChannel<RocksDbError, CHListenerHalve>>
-    for RocksDbContractHandler<MockRuntime>
-{
-    fn from(
-        channel: ContractHandlerChannel<<Self as ContractHandler>::Error, CHListenerHalve>,
-    ) -> Self {
+impl From<ContractHandlerChannel<CHListenerHalve>> for RocksDbContractHandler<MockRuntime> {
+    fn from(channel: ContractHandlerChannel<CHListenerHalve>) -> Self {
         let store =
             ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
         let runtime = MockRuntime {};
@@ -194,13 +188,12 @@ impl From<ContractHandlerChannel<RocksDbError, CHListenerHalve>>
 impl<R> ContractHandler for RocksDbContractHandler<R>
 where
     R: ContractRuntimeInterface + Send + Sync + 'static,
-    Self: From<ContractHandlerChannel<RocksDbError, CHListenerHalve>>,
+    Self: From<ContractHandlerChannel<CHListenerHalve>>,
 {
-    type Error = RocksDbError;
     type Store = RocksDb;
 
     #[inline(always)]
-    fn channel(&mut self) -> &mut ContractHandlerChannel<Self::Error, CHListenerHalve> {
+    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
         &mut self.channel
     }
 
@@ -212,7 +205,7 @@ where
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
-    ) -> BoxFuture<'a, Result<HostResponse, Self::Error>> {
+    ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
         async move {
             match req {
                 ClientRequest::ContractOp(ops) => match ops {
@@ -242,28 +235,33 @@ where
                                 )
                             }
                             Err(RocksDbError::ContractNotFound) => {}
-                            Err(other) => return Err(other),
+                            Err(other) => return Err(other.into()),
                         }
 
                         let result = self.runtime.validate_state(
                             &key,
                             &params,
                             &state,
-                            related_contracts,
+                            &related_contracts,
                         )?;
                         // FIXME: should deal with additional related contracts requested
                         if result != ValidateResult::Valid {
                             todo!("return error");
                         }
-                        let _params: Parameters<'static> = params.clone().into_bytes().into();
-                        self.state_store.store(key, state, None).await?;
+                        self.state_store
+                            .store(key, state, params.into_owned())
+                            .await?;
                         todo!()
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        tracing::error!("op not supported");
+                        Err("op not supported".into())
+                    }
                 },
-                ClientRequest::DelegateOp(_op) => unreachable!(),
-                ClientRequest::Disconnect { .. } => unreachable!(),
-                ClientRequest::GenerateRandData { bytes: _ } => unreachable!(),
+                _ => {
+                    tracing::error!("op not supported");
+                    Err("op not supported".into())
+                }
             }
         }
         .boxed()
@@ -294,7 +292,7 @@ mod test {
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn contract_handler() -> Result<(), anyhow::Error> {
+    async fn contract_handler() -> Result<(), DynError> {
         // Create a rocksdb handler and initialize the database
         let mut handler = get_handler().await?;
 

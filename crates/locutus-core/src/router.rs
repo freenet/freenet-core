@@ -206,10 +206,8 @@ impl Router {
             .estimate_retrieval_time(peer, contract_location)
             .unwrap();
 
-        /*
-         * This is a fairly naive approach, assuming that the cost of a failure is a multiple
-         * of the cost of success.
-         */
+        // This is a fairly naive approach, assuming that the cost of a failure is a multiple
+        // of the cost of success.
         let failure_cost_multiplier = 3.0;
 
         let expected_total_time = time_to_response_start_estimate
