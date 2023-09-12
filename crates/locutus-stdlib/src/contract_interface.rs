@@ -947,6 +947,10 @@ impl ContractInstanceId {
             .into_string()
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
     /// Build `ContractId` from the binary representation.
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, bs58::decode::Error> {
         let mut spec = [0; CONTRACT_KEY_SIZE];

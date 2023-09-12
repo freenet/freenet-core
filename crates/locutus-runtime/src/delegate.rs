@@ -2,7 +2,7 @@ use crate::{util, ContractError, Runtime, RuntimeResult};
 use locutus_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters, SetSecretRequest,
+    OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
 };
 
 use crate::error::RuntimeInnerError;
@@ -24,9 +24,16 @@ struct Context {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum DelegateExecError {
     #[error(transparent)]
     DelegateError(#[from] DelegateError),
+
+    #[error("Permission denied: secret {secret} cannot be accesed by {delegate} at this time")]
+    UnauthorizedSecretAccess {
+        secret: SecretsId,
+        delegate: DelegateKey,
+    },
 
     #[error("Received an unexpected message from the client apps: {0}")]
     UnexpectedMessage(&'static str),
@@ -37,6 +44,7 @@ pub trait DelegateRuntimeInterface {
         &mut self,
         key: &DelegateKey,
         params: &Parameters,
+        attested: Option<&[u8]>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
@@ -54,8 +62,9 @@ impl Runtime {
     fn exec_inbound(
         &mut self,
         params: &Parameters<'_>,
+        attested: Option<&[u8]>,
         msg: &InboundDelegateMsg,
-        process_func: &TypedFunction<(i64, i64), i64>,
+        process_func: &TypedFunction<(i64, i64, i64), i64>,
         instance: &Instance,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let param_buf_ptr = {
@@ -63,14 +72,23 @@ impl Runtime {
             param_buf.write(params)?;
             param_buf.ptr()
         };
-
+        let attested_buf_ptr = {
+            let mut attested_buf = self.init_buf(instance, attested.unwrap_or(&[]))?;
+            attested_buf.write(params)?;
+            attested_buf.ptr()
+        };
         let msg_ptr = {
             let msg = bincode::serialize(msg)?;
             let mut msg_buf = self.init_buf(instance, &msg)?;
             msg_buf.write(msg)?;
             msg_buf.ptr()
         };
-        let res = process_func.call(&mut self.wasm_store, param_buf_ptr as i64, msg_ptr as i64)?;
+        let res = process_func.call(
+            &mut self.wasm_store,
+            param_buf_ptr as i64,
+            attested_buf_ptr as i64,
+            msg_ptr as i64,
+        )?;
         let linear_mem = self.linear_mem(instance)?;
         let outbound = unsafe {
             DelegateInterfaceResult::from_raw(res, &linear_mem)
@@ -81,12 +99,14 @@ impl Runtime {
     }
 
     // FIXME: modify the context atomically from the delegates, requires some changes to handle function calls with envs
+    #[allow(clippy::too_many_arguments)]
     fn get_outbound(
         &mut self,
         delegate_key: &DelegateKey,
         instance: &Instance,
-        process_func: &TypedFunction<(i64, i64), i64>,
+        process_func: &TypedFunction<(i64, i64, i64), i64>,
         params: &Parameters<'_>,
+        attested: Option<&[u8]>,
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<DelegateContext> {
@@ -110,7 +130,8 @@ impl Runtime {
                     if recurssion >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
-                    let new_msgs = self.exec_inbound(params, &inbound, process_func, instance)?;
+                    let new_msgs =
+                        self.exec_inbound(params, attested, &inbound, process_func, instance)?;
                     recurssion += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
@@ -160,6 +181,7 @@ impl Runtime {
                     }
                     let outbound = self.exec_inbound(
                         params,
+                        attested,
                         &InboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(msg.app, msg.payload)
                                 .processed(msg.processed)
@@ -197,7 +219,7 @@ impl Runtime {
                     util::generate_random_bytes(&mut bytes);
                     let inbound = InboundDelegateMsg::RandomBytes(bytes);
                     let new_outbound_msgs =
-                        self.exec_inbound(params, &inbound, process_func, instance)?;
+                        self.exec_inbound(params, attested, &inbound, process_func, instance)?;
                     for msg in new_outbound_msgs.into_iter() {
                         outbound_msgs.push_back(msg);
                     }
@@ -216,6 +238,7 @@ impl DelegateRuntimeInterface for Runtime {
         &mut self,
         delegate_key: &DelegateKey,
         params: &Parameters,
+        attested: Option<&[u8]>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
@@ -223,7 +246,7 @@ impl DelegateRuntimeInterface for Runtime {
             return Ok(results);
         }
         let running = self.prepare_delegate_call(params, delegate_key, 4096)?;
-        let process_func: TypedFunction<(i64, i64), i64> = running
+        let process_func: TypedFunction<(i64, i64, i64), i64> = running
             .instance
             .exports
             .get_typed_function(&self.wasm_store, "process")?;
@@ -252,6 +275,7 @@ impl DelegateRuntimeInterface for Runtime {
                     let outbound = VecDeque::from(
                         self.exec_inbound(
                             params,
+                            attested,
                             &InboundDelegateMsg::ApplicationMessage(
                                 ApplicationMessage::new(app, payload)
                                     .processed(processed)
@@ -279,6 +303,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &running.instance,
                         &process_func,
                         params,
+                        attested,
                         &mut real_outbound,
                         &mut results,
                     )?;
@@ -286,6 +311,7 @@ impl DelegateRuntimeInterface for Runtime {
                 InboundDelegateMsg::UserResponse(response) => {
                     let outbound = self.exec_inbound(
                         params,
+                        attested,
                         &InboundDelegateMsg::UserResponse(response),
                         &process_func,
                         &running.instance,
@@ -304,6 +330,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &running.instance,
                         &process_func,
                         params,
+                        attested,
                         &mut real_outbound,
                         &mut results,
                     )?;
@@ -311,6 +338,7 @@ impl DelegateRuntimeInterface for Runtime {
                 InboundDelegateMsg::RandomBytes(bytes) => {
                     let mut outbound = VecDeque::from(self.exec_inbound(
                         params,
+                        attested,
                         &InboundDelegateMsg::RandomBytes(bytes),
                         &process_func,
                         &running.instance,
@@ -320,6 +348,7 @@ impl DelegateRuntimeInterface for Runtime {
                         &running.instance,
                         &process_func,
                         params,
+                        attested,
                         &mut outbound,
                         &mut results,
                     )?;
@@ -328,13 +357,21 @@ impl DelegateRuntimeInterface for Runtime {
                     key: secret_key, ..
                 }) => {
                     // FIXME: here only allow this if the application is trusted
-                    let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
-                    let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                        key: secret_key,
-                        value: Some(secret),
-                        context: Default::default(),
-                    });
-                    results.push(msg);
+                    if attested.is_some() {
+                        let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
+                        let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                            key: secret_key,
+                            value: Some(secret),
+                            context: Default::default(),
+                        });
+                        results.push(msg);
+                    } else {
+                        return Err(DelegateExecError::UnauthorizedSecretAccess {
+                            secret: secret_key.clone(),
+                            delegate: delegate_key.clone(),
+                        }
+                        .into());
+                    }
                 }
                 _ => {}
             }
@@ -454,7 +491,7 @@ mod test {
 
         let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), vec![inbound])?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
 
@@ -471,7 +508,7 @@ mod test {
 
         let inbound = InboundDelegateMsg::ApplicationMessage(please_sign_message_msg);
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), vec![inbound])?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
         assert_eq!(outbound.len(), 1);
