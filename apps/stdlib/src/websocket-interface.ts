@@ -1,60 +1,69 @@
-import * as flatbuffers from 'flatbuffers';
+import * as flatbuffers from "flatbuffers";
 import base58 from "bs58";
 
-import {ContractContainerT} from "./common/contract-container";
-import {ContractInstanceIdT} from "./common/contract-instance-id";
-import {DeltaUpdateT} from "./common/delta-update";
-import {RelatedDeltaUpdateT} from "./common/related-delta-update";
-import {RelatedStateAndDeltaUpdateT} from "./common/related-state-and-delta-update";
-import {RelatedStateUpdateT} from "./common/related-state-update";
-import {StateAndDeltaUpdateT} from "./common/state-and-delta-update";
-import {StateUpdateT} from "./common/state-update";
+import { ContractContainerT } from "./common/contract-container";
+import { ContractInstanceIdT } from "./common/contract-instance-id";
+import { DeltaUpdateT } from "./common/delta-update";
+import { RelatedDeltaUpdateT } from "./common/related-delta-update";
+import { RelatedStateAndDeltaUpdateT } from "./common/related-state-and-delta-update";
+import { RelatedStateUpdateT } from "./common/related-state-update";
+import { StateAndDeltaUpdateT } from "./common/state-and-delta-update";
+import { StateUpdateT } from "./common/state-update";
 import {
-    ApplicationMessagesT,
-    ClientRequest,
-    ClientRequestT,
-    ClientRequestType,
-    ContractRequestT,
-    ContractRequestType,
-    DelegateCodeT,
-    DelegateContainerT,
-    DelegateKeyT, DelegateRequestT, DelegateRequestType,
-    DelegateType,
-    DisconnectT,
-    GetSecretRequestTypeT,
-    GetT,
-    InboundDelegateMsgT, InboundDelegateMsgType,
-    PutT, RandomBytesT,
-    RegisterDelegateT,
-    RelatedContractsT,
-    SubscribeT,
-    UnregisterDelegateT,
-    UpdateT, UserInputResponseT,
-    WasmDelegateV1T
+  ApplicationMessagesT,
+  ClientRequest,
+  ClientRequestT,
+  ClientRequestType,
+  ContractRequestT,
+  ContractRequestType,
+  DelegateCodeT,
+  DelegateContainerT,
+  DelegateKeyT,
+  DelegateRequestT,
+  DelegateRequestType,
+  DelegateType,
+  DisconnectT,
+  GetSecretRequestTypeT,
+  GetT,
+  InboundDelegateMsgT,
+  InboundDelegateMsgType,
+  PutT,
+  RandomBytesT,
+  RegisterDelegateT,
+  RelatedContractsT,
+  SubscribeT,
+  UnregisterDelegateT,
+  UpdateT,
+  UserInputResponseT,
+  WasmDelegateV1T,
 } from "./client-request";
-import {UpdateDataT} from "./common/update-data";
-import {UpdateDataType} from "./common/update-data-type";
-import {ContractKeyT} from "./common/contract-key";
-import {PutResponseT} from "./host-response/put-response";
-import {GetResponseT} from "./host-response/get-response";
-import {UpdateResponseT} from "./host-response/update-response";
-import {UpdateNotificationT} from "./host-response/update-notification";
-import {HostResponse, HostResponseT} from "./host-response/host-response";
+import { UpdateDataT } from "./common/update-data";
+import { UpdateDataType } from "./common/update-data-type";
+import { ContractKeyT } from "./common/contract-key";
+import { PutResponseT } from "./host-response/put-response";
+import { GetResponseT } from "./host-response/get-response";
+import { UpdateResponseT } from "./host-response/update-response";
+import { UpdateNotificationT } from "./host-response/update-notification";
+import { HostResponse, HostResponseT } from "./host-response/host-response";
 import {
-    ContextUpdatedT,
-    ContractResponseT,
-    ContractResponseType,
-    DelegateResponseT,
-    HostResponseType,
-    OutboundDelegateMsgT, OutboundDelegateMsgType, RandomBytesRequestT, RequestUserInputT, SetSecretRequestT
+  ContextUpdatedT,
+  ContractResponseT,
+  ContractResponseType,
+  DelegateResponseT,
+  HostResponseType,
+  OutboundDelegateMsgT,
+  OutboundDelegateMsgType,
+  RandomBytesRequestT,
+  RequestUserInputT,
+  SetSecretRequestT,
 } from "./host-response";
 import {
-    ApplicationMessageT,
-    ContractCodeT,
-    ContractType,
-    GetSecretRequestT,
-    GetSecretResponseT,
-    WasmContractV1T
+  ApplicationMessageT,
+  ContractCodeT,
+  ContractType,
+  GetSecretRequestT,
+  GetSecretResponseT,
+  WasmContractV1T,
 } from "./common";
 
 // Common types
@@ -71,11 +80,19 @@ export type ContractInstanceId = Uint8Array;
  * @public
  */
 export class UpdateData extends UpdateDataT {
-    constructor(updateDataType: UpdateDataType = UpdateDataType.NONE,
-                updateData: DeltaUpdateT | RelatedDeltaUpdateT | RelatedStateAndDeltaUpdateT | RelatedStateUpdateT
-                    | StateAndDeltaUpdateT | StateUpdateT | null = null) {
-        super(updateDataType, updateData);
-    }
+  constructor(
+    updateDataType: UpdateDataType = UpdateDataType.NONE,
+    updateData:
+      | DeltaUpdateT
+      | RelatedDeltaUpdateT
+      | RelatedStateAndDeltaUpdateT
+      | RelatedStateUpdateT
+      | StateAndDeltaUpdateT
+      | StateUpdateT
+      | null = null
+  ) {
+    super(updateDataType, updateData);
+  }
 }
 
 /**
@@ -83,9 +100,9 @@ export class UpdateData extends UpdateDataT {
  * @public
  */
 export class StateUpdate extends StateUpdateT {
-    constructor(state: (number)[] = []) {
-        super(state);
-    }
+  constructor(state: number[] = []) {
+    super(state);
+  }
 }
 
 /**
@@ -93,9 +110,9 @@ export class StateUpdate extends StateUpdateT {
  * @public
  */
 export class DeltaUpdate extends DeltaUpdateT {
-    constructor(delta: (number)[] = []) {
-        super(delta);
-    }
+  constructor(delta: number[] = []) {
+    super(delta);
+  }
 }
 
 /**
@@ -103,9 +120,9 @@ export class DeltaUpdate extends DeltaUpdateT {
  * @public
  */
 export class StateAndDeltaUpdate extends StateAndDeltaUpdateT {
-    constructor(state: (number)[] = [], delta: (number)[] = []) {
-        super(state, delta);
-    }
+  constructor(state: number[] = [], delta: number[] = []) {
+    super(state, delta);
+  }
 }
 
 /**
@@ -113,9 +130,12 @@ export class StateAndDeltaUpdate extends StateAndDeltaUpdateT {
  * @public
  */
 export class RelatedStateUpdate extends RelatedStateUpdateT {
-    constructor(relatedTo: ContractInstanceIdT | null = null, state: (number)[] = []) {
-        super(relatedTo, state);
-    }
+  constructor(
+    relatedTo: ContractInstanceIdT | null = null,
+    state: number[] = []
+  ) {
+    super(relatedTo, state);
+  }
 }
 
 /**
@@ -123,9 +143,12 @@ export class RelatedStateUpdate extends RelatedStateUpdateT {
  * @public
  */
 export class RelatedDeltaUpdate extends RelatedDeltaUpdateT {
-    constructor(relatedTo: ContractInstanceIdT | null = null, delta: (number)[] = []) {
-        super(relatedTo, delta);
-    }
+  constructor(
+    relatedTo: ContractInstanceIdT | null = null,
+    delta: number[] = []
+  ) {
+    super(relatedTo, delta);
+  }
 }
 
 /**
@@ -133,9 +156,13 @@ export class RelatedDeltaUpdate extends RelatedDeltaUpdateT {
  * @public
  */
 export class RelatedStateAndDeltaUpdate extends RelatedStateAndDeltaUpdateT {
-    constructor(relatedTo: ContractInstanceIdT | null = null, state: (number)[] = [], delta: (number)[] = []) {
-        super(relatedTo, state, delta);
-    }
+  constructor(
+    relatedTo: ContractInstanceIdT | null = null,
+    state: number[] = [],
+    delta: number[] = []
+  ) {
+    super(relatedTo, state, delta);
+  }
 }
 
 /**
@@ -143,43 +170,43 @@ export class RelatedStateAndDeltaUpdate extends RelatedStateAndDeltaUpdateT {
  * @public
  */
 export class ContractKey extends ContractKeyT {
-    constructor(instance: ContractInstanceId, code?: Uint8Array) {
-        if (instance.length !== 32 || (code && code.length !== 32)) {
-            throw new TypeError('Invalid array length, expected 32 bytes');
-        }
-
-        // print instance byte array
-        console.log(`instance: ${instance}`);
-
-        let contract_instance_id = new ContractInstanceIdT(Array.from(instance))
-        let contract_code: (number)[] = [];
-        if (code) {
-            contract_code = Array.from(code);
-        }
-        super(contract_instance_id, contract_code);
+  constructor(instance: ContractInstanceId, code?: Uint8Array) {
+    if (instance.length !== 32 || (code && code.length !== 32)) {
+      throw new TypeError("Invalid array length, expected 32 bytes");
     }
 
-    static fromInstanceId(spec: string): ContractKey {
-        const decoded = base58.decode(spec);
-        return new ContractKey(decoded);
-    }
+    // print instance byte array
+    console.log(`instance: ${instance}`);
 
-    bytes(): ContractInstanceId {
-        return new Uint8Array(this.instance?.data!) as ContractInstanceId;
+    let contract_instance_id = new ContractInstanceIdT(Array.from(instance));
+    let contract_code: number[] = [];
+    if (code) {
+      contract_code = Array.from(code);
     }
+    super(contract_instance_id, contract_code);
+  }
 
-    codePart(): Uint8Array | null {
-        return new Uint8Array(this.code);
-    }
+  static fromInstanceId(spec: string): ContractKey {
+    const decoded = base58.decode(spec);
+    return new ContractKey(decoded);
+  }
 
-    encode(): string {
-        const instance = new Uint8Array(this.instance?.data!);
-        return base58.encode(instance);
-    }
+  bytes(): ContractInstanceId {
+    return new Uint8Array(this.instance?.data!) as ContractInstanceId;
+  }
 
-    get_contract_key(): ContractKey {
-        return this;
-    }
+  codePart(): Uint8Array | null {
+    return new Uint8Array(this.code);
+  }
+
+  encode(): string {
+    const instance = new Uint8Array(this.instance?.data!);
+    return base58.encode(instance);
+  }
+
+  get_contract_key(): ContractKey {
+    return this;
+  }
 }
 
 /**
@@ -205,16 +232,19 @@ export type DelegateCode = DelegateCodeT;
  * @public
  */
 export class WasmContractV1 extends WasmContractV1T {
-    constructor(data: ContractCode | null = null, parameters: (number)[] = [], key: ContractKeyT | null = null) {
-        super(data, parameters, key);
-    }
+  constructor(
+    data: ContractCode | null = null,
+    parameters: number[] = [],
+    key: ContractKeyT | null = null
+  ) {
+    super(data, parameters, key);
+  }
 }
 
 /**
  * Contract version type
  */
-export type Contract =
-    | WasmContractV1;
+export type Contract = WasmContractV1;
 
 /**
  * Wrapper that allows contract versioning. This enum maintains the types of contracts that are allowed
@@ -222,10 +252,12 @@ export type Contract =
  * @public
  */
 export class ContractContainer extends ContractContainerT {
-    constructor(contractType: ContractType = ContractType.NONE,
-                contract: Contract) {
-        super(contractType, contract);
-    }
+  constructor(
+    contractType: ContractType = ContractType.NONE,
+    contract: Contract
+  ) {
+    super(contractType, contract);
+  }
 }
 
 /**
@@ -233,16 +265,15 @@ export class ContractContainer extends ContractContainerT {
  * @public
  */
 export class WasmDelegateV1 extends WasmDelegateV1T {
-    constructor(parameters: (number)[] = [], data: DelegateCode, key: DelegateKey) {
-        super(parameters, data, key);
-    }
+  constructor(parameters: number[] = [], data: DelegateCode, key: DelegateKey) {
+    super(parameters, data, key);
+  }
 }
 
 /**
  * Delegate version type
  */
-export type Delegate =
-    | WasmDelegateV1;
+export type Delegate = WasmDelegateV1;
 
 /**
  * Wrapper that allows delegate versioning. This enum maintains the types of delegates that are allowed
@@ -250,10 +281,12 @@ export type Delegate =
  * @public
  */
 export class DelegateContainer extends DelegateContainerT {
-    constructor(delegateType: DelegateType = DelegateType.NONE,
-                delegate: Delegate) {
-        super(delegateType, delegate);
-    }
+  constructor(
+    delegateType: DelegateType = DelegateType.NONE,
+    delegate: Delegate
+  ) {
+    super(delegateType, delegate);
+  }
 }
 
 /**
@@ -287,11 +320,13 @@ export type ApplicationMessage = ApplicationMessageT;
  * @public
  */
 export class PutRequest extends PutT {
-    constructor(container: ContractContainerT | null = null,
-                wrappedState: (number)[] = [],
-                relatedContracts: RelatedContractsT | null = null) {
-        super(container, wrappedState, relatedContracts);
-    }
+  constructor(
+    container: ContractContainerT | null = null,
+    wrappedState: number[] = [],
+    relatedContracts: RelatedContractsT | null = null
+  ) {
+    super(container, wrappedState, relatedContracts);
+  }
 }
 
 /**
@@ -299,10 +334,13 @@ export class PutRequest extends PutT {
  * @public
  */
 export class UpdateRequest extends UpdateT {
-    constructor(key: ContractKey | null = null, update: UpdateDataT | null = null) {
-        const contract_key = key?.get_contract_key();
-        super(contract_key, update);
-    }
+  constructor(
+    key: ContractKey | null = null,
+    update: UpdateDataT | null = null
+  ) {
+    const contract_key = key?.get_contract_key();
+    super(contract_key, update);
+  }
 }
 
 /**
@@ -310,10 +348,10 @@ export class UpdateRequest extends UpdateT {
  * @public
  */
 export class GetRequest extends GetT {
-    constructor(key: ContractKey | null = null, fetchContract: boolean = false) {
-        const contract_key = key?.get_contract_key();
-        super(contract_key, fetchContract);
-    }
+  constructor(key: ContractKey | null = null, fetchContract: boolean = false) {
+    const contract_key = key?.get_contract_key();
+    super(contract_key, fetchContract);
+  }
 }
 
 /**
@@ -321,10 +359,10 @@ export class GetRequest extends GetT {
  * @public
  */
 export class SubscribeRequest extends SubscribeT {
-    constructor(key: ContractKey | null = null, summary: (number)[] = []) {
-        const contract_key = key?.get_contract_key();
-        super(contract_key, summary);
-    }
+  constructor(key: ContractKey | null = null, summary: number[] = []) {
+    const contract_key = key?.get_contract_key();
+    super(contract_key, summary);
+  }
 }
 
 /**
@@ -332,9 +370,9 @@ export class SubscribeRequest extends SubscribeT {
  * @public
  */
 export class DisconnectRequest extends DisconnectT {
-    constructor(cause: string | Uint8Array | null = null) {
-        super(cause);
-    }
+  constructor(cause: string | Uint8Array | null = null) {
+    super(cause);
+  }
 }
 
 // Delegate
@@ -350,22 +388,24 @@ export type RandomBytes = RandomBytesT;
 export type UserInputResponse = UserInputResponseT;
 
 export type InboundMessage =
-    | ApplicationMessage
-    | GetSecretResponse
-    | RandomBytes
-    | UserInputResponse
-    | GetSecretRequest;
+  | ApplicationMessage
+  | GetSecretResponse
+  | RandomBytes
+  | UserInputResponse
+  | GetSecretRequest;
 
 /**
  * Representation of DelegateRequest Inbound message
  * @public
  */
 export class InboundDelegateMsg extends InboundDelegateMsgT {
-    constructor(inboundType: InboundDelegateMsgType = InboundDelegateMsgType.NONE,
-                inbound: InboundMessage) {
-        super(inboundType, inbound);
-    }
-};
+  constructor(
+    inboundType: InboundDelegateMsgType = InboundDelegateMsgType.NONE,
+    inbound: InboundMessage
+  ) {
+    super(inboundType, inbound);
+  }
+}
 /**
  * Representation of an inbound application messages
  * @public
@@ -383,10 +423,16 @@ export type RegisterDelegate = RegisterDelegateT;
 export type UnregisterDelegate = UnregisterDelegateT;
 
 export class DelegateRequest extends DelegateRequestT {
-    constructor(delegateRequestType: DelegateRequestType = DelegateRequestType.NONE,
-                delegateRequest: ApplicationMessages | GetSecretRequestType | RegisterDelegate | UnregisterDelegate) {
-        super(delegateRequestType, delegateRequest);
-    }
+  constructor(
+    delegateRequestType: DelegateRequestType = DelegateRequestType.NONE,
+    delegateRequest:
+      | ApplicationMessages
+      | GetSecretRequestType
+      | RegisterDelegate
+      | UnregisterDelegate
+  ) {
+    super(delegateRequestType, delegateRequest);
+  }
 }
 
 // Host replies
@@ -443,19 +489,21 @@ export type SetSecretRequest = SetSecretRequestT;
  * @public
  */
 export type OutboundMessage =
-    | ApplicationMessage
-    | RequestUserInput
-    | ContextUpdated
-    | GetSecretRequest
-    | SetSecretRequest
-    | RandomBytesRequest
-    | GetSecretResponse;
+  | ApplicationMessage
+  | RequestUserInput
+  | ContextUpdated
+  | GetSecretRequest
+  | SetSecretRequest
+  | RandomBytesRequest
+  | GetSecretResponse;
 
 export class OutboundDelegateMsg extends OutboundDelegateMsgT {
-    constructor(inboundType: OutboundDelegateMsgType = OutboundDelegateMsgType.NONE,
-                inbound: OutboundMessage) {
-        super(inboundType, inbound);
-    }
+  constructor(
+    inboundType: OutboundDelegateMsgType = OutboundDelegateMsgType.NONE,
+    inbound: OutboundMessage
+  ) {
+    super(inboundType, inbound);
+  }
 }
 
 /**
@@ -463,9 +511,12 @@ export class OutboundDelegateMsg extends OutboundDelegateMsgT {
  * @public
  */
 export class DelegateResponse extends DelegateResponseT {
-    constructor(key: DelegateKey | null = null, values: (OutboundDelegateMsg)[] = []) {
-        super(key, values);
-    }
+  constructor(
+    key: DelegateKey | null = null,
+    values: OutboundDelegateMsg[] = []
+  ) {
+    super(key, values);
+  }
 }
 
 /**
@@ -473,9 +524,8 @@ export class DelegateResponse extends DelegateResponseT {
  * @public
  */
 export type HostError = {
-    cause: string;
+  cause: string;
 };
-
 
 // API
 
@@ -499,35 +549,35 @@ export type HostError = {
  * @public
  */
 export interface ResponseHandler {
-    /**
-     * Contract `Put` response handler
-     */
-    onContractPut: (response: PutResponse) => void;
-    /**
-     * Contract `Get` response handler
-     */
-    onContractGet: (response: GetResponse) => void;
-    /**
-     * Contract `Update` response handler
-     */
-    onContractUpdate: (response: UpdateResponse) => void;
-    /**
-     * Contract `Update` notification handler
-     */
-    onContractUpdateNotification: (response: UpdateNotification) => void;
-    /**
-     * `Delegate` response handler
-     * @param response
-     */
-    onDelegateResponse: (response: DelegateResponse) => void;
-    /**
-     * Contract `Error` handler
-     */
-    onErr: (response: HostError) => void;
-    /**
-     * Callback executed after successfully establishing connection with websocket
-     */
-    onOpen: () => void;
+  /**
+   * Contract `Put` response handler
+   */
+  onContractPut: (response: PutResponse) => void;
+  /**
+   * Contract `Get` response handler
+   */
+  onContractGet: (response: GetResponse) => void;
+  /**
+   * Contract `Update` response handler
+   */
+  onContractUpdate: (response: UpdateResponse) => void;
+  /**
+   * Contract `Update` notification handler
+   */
+  onContractUpdateNotification: (response: UpdateNotification) => void;
+  /**
+   * `Delegate` response handler
+   * @param response
+   */
+  onDelegateResponse: (response: DelegateResponse) => void;
+  /**
+   * Contract `Error` handler
+   */
+  onErr: (response: HostError) => void;
+  /**
+   * Callback executed after successfully establishing connection with websocket
+   */
+  onOpen: () => void;
 }
 
 /**
@@ -539,151 +589,203 @@ export interface ResponseHandler {
  * const locutusApi = new LocutusWsApi(API_URL, handler);
  * ```
  */
+
+const AUTHORIZATION_HEADER: string = "Authorization";
+const ENCODING_PROTOC_HEADER: string = "Encoding-Protocol";
+
 export class LocutusWsApi {
-    /**
-     * Websocket object for creating and managing a WebSocket connection to a server,
-     * as well as for sending and receiving data on the connection.
-     * @private
-     */
-    private ws: WebSocket;
-    /**
-     * @private
-     */
-    private responseHandler: ResponseHandler;
+  /**
+   * Websocket object for creating and managing a WebSocket connection to a server,
+   * as well as for sending and receiving data on the connection.
+   * @private
+   */
+  private ws: WebSocket;
+  /**
+   * @private
+   */
+  private responseHandler: ResponseHandler;
 
-    /**
-     * @constructor
-     * @param url - The websocket URL to which to connect
-     * @param handler - The ResponseHandler implementation
-     */
-    constructor(url: URL, handler: ResponseHandler) {
-        this.ws = new WebSocket(url);
-        this.ws.binaryType = "arraybuffer";
-        this.responseHandler = handler;
-        this.ws.onmessage = (ev) => {
-            this.handleResponse(ev);
+  static async open(
+    url: URL,
+    handler: ResponseHandler,
+    authToken?: string
+  ): Promise<LocutusWsApi> {
+    const initialHeaders = new Headers();
+    if (authToken) {
+      initialHeaders.append(AUTHORIZATION_HEADER, authToken);
+    }
+    initialHeaders.append(ENCODING_PROTOC_HEADER, "flatbuffers");
+
+    let socket;
+    if (url.protocol === "http:") {
+      socket = await fetch(url.toString(), {
+        method: "GET",
+        headers: initialHeaders,
+      }).then(() => {
+        return new WebSocket(url);
+      });
+    } else if (url.protocol === "ws:") {
+      socket = new WebSocket(url);
+    } else {
+      throw new Error(`unsupported protocol: ${url.protocol}`);
+    }
+    return new LocutusWsApi(socket!, handler);
+  }
+
+  /**
+   * @constructor
+   * @param ws - The websocket connection
+   * @param handler - The ResponseHandler implementation
+   */
+  constructor(ws: WebSocket, handler: ResponseHandler) {
+    this.ws = ws;
+    this.ws.binaryType = "arraybuffer";
+    this.responseHandler = handler;
+    this.ws.onmessage = (ev) => {
+      this.handleResponse(ev);
+    };
+    this.ws.addEventListener("open", (_) => {
+      handler.onOpen();
+    });
+  }
+
+  /**
+   * @private
+   */
+  private handleResponse(ev: MessageEvent<any>): void | Error {
+    let response: HostResponseT;
+    try {
+      let data = new flatbuffers.ByteBuffer(new Uint8Array(ev.data));
+      response = HostResponse.getRootAsHostResponse(data).unpack();
+    } catch (err) {
+      console.log(`found error: ${err}`);
+      return new Error(`${err}`);
+    }
+    switch (response.responseType) {
+      case HostResponseType.ContractResponse:
+        let host_resp = response.response as ContractResponseT;
+        switch (host_resp.contractResponseType) {
+          case ContractResponseType.PutResponse:
+            const put_response = host_resp.contractResponse as PutResponseT;
+            this.responseHandler.onContractPut(put_response);
+            break;
+          case ContractResponseType.GetResponse:
+            const get_response = host_resp.contractResponse as GetResponseT;
+            this.responseHandler.onContractGet(get_response);
+            break;
+          case ContractResponseType.UpdateResponse:
+            const update_response =
+              host_resp.contractResponse as UpdateResponseT;
+            this.responseHandler.onContractUpdate(update_response);
+            break;
+          case ContractResponseType.UpdateNotification:
+            const update_notification =
+              host_resp.contractResponse as UpdateNotificationT;
+            this.responseHandler.onContractUpdateNotification(
+              update_notification
+            );
+            break;
+          default:
+            const cause = "Contract response type not implemented";
+            console.log(cause);
+            const err: HostError = {
+              cause,
+            };
+            this.responseHandler.onErr(err);
+            break;
+        }
+        break;
+      case HostResponseType.DelegateResponse:
+        let delegate_response = response.response as DelegateResponseT;
+        this.responseHandler.onDelegateResponse(delegate_response);
+        break;
+      case HostResponseType.Ok:
+        break;
+      default:
+        const cause = `Received wrong HostResponse type`;
+        console.log(cause);
+        const err: HostError = {
+          cause,
         };
-        this.ws.addEventListener("open", (_) => {
-            handler.onOpen();
-        });
+        this.responseHandler.onErr(err);
+        break;
     }
+  }
 
-    /**
-     * @private
-     */
-    private handleResponse(ev: MessageEvent<any>): void | Error {
-        let response: HostResponseT;
-        try {
-            let data = new flatbuffers.ByteBuffer(new Uint8Array(ev.data));
-            response = HostResponse.getRootAsHostResponse(data).unpack();
-        } catch (err) {
-            console.log(`found error: ${err}`);
-            return new Error(`${err}`);
-        }
-        switch (response.responseType) {
-            case HostResponseType.ContractResponse:
-                let host_resp = response.response as ContractResponseT;
-                switch (host_resp.contractResponseType) {
-                    case ContractResponseType.PutResponse:
-                        const put_response = host_resp.contractResponse as PutResponseT;
-                        this.responseHandler.onContractPut(put_response);
-                        break;
-                    case ContractResponseType.GetResponse:
-                        const get_response = host_resp.contractResponse as GetResponseT;
-                        this.responseHandler.onContractGet(get_response);
-                        break;
-                    case ContractResponseType.UpdateResponse:
-                        const update_response = host_resp.contractResponse as UpdateResponseT;
-                        this.responseHandler.onContractUpdate(update_response);
-                        break;
-                    case ContractResponseType.UpdateNotification:
-                        const update_notification = host_resp.contractResponse as UpdateNotificationT;
-                        this.responseHandler.onContractUpdateNotification(update_notification);
-                        break;
-                    default:
-                        const cause = "Contract response type not implemented";
-                        console.log(cause);
-                        const err: HostError = {
-                            cause,
-                        }
-                        this.responseHandler.onErr(err);
-                        break;
+  /**
+   * Sends a put request to the host through websocket
+   * @param put - The `PutRequest` object
+   */
+  async put(put: PutRequest): Promise<void> {
+    let put_request = new ContractRequestT(ContractRequestType.Put, put);
+    let request = new ClientRequestT(
+      ClientRequestType.ContractRequest,
+      put_request
+    );
+    let fbb = new flatbuffers.Builder(1024);
+    ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
+    this.ws.send(fbb.asUint8Array());
+  }
 
-                }
-                break;
-            case HostResponseType.DelegateResponse:
-                let delegate_response = response.response as DelegateResponseT;
-                this.responseHandler.onDelegateResponse(delegate_response);
-                break;
-            case HostResponseType.Ok:
-                break;
-            default:
-                const cause = `Received wrong HostResponse type`;
-                console.log(cause);
-                const err: HostError = {
-                    cause,
-                }
-                this.responseHandler.onErr(err);
-                break;
-        }
-    }
+  /**
+   * Sends an update request to the host through websocket
+   * @param update - The `UpdateRequest` object
+   */
+  async update(update: UpdateRequest): Promise<void> {
+    let update_request = new ContractRequestT(
+      ContractRequestType.Update,
+      update
+    );
+    let request = new ClientRequestT(
+      ClientRequestType.ContractRequest,
+      update_request
+    );
+    let fbb = new flatbuffers.Builder(1024);
+    ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
+    this.ws.send(fbb.asUint8Array());
+  }
 
-    /**
-     * Sends a put request to the host through websocket
-     * @param put - The `PutRequest` object
-     */
-    async put(put: PutRequest): Promise<void> {
-        let put_request = new ContractRequestT(ContractRequestType.Put, put);
-        let request = new ClientRequestT(ClientRequestType.ContractRequest, put_request);
-        let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
-        this.ws.send(fbb.asUint8Array());
-    }
+  /**
+   * Sends a get request to the host through websocket
+   * @param get - The `GetRequest` object
+   */
+  async get(get: GetRequest): Promise<void> {
+    let get_request = new ContractRequestT(ContractRequestType.Get, get);
+    let request = new ClientRequestT(
+      ClientRequestType.ContractRequest,
+      get_request
+    );
+    let fbb = new flatbuffers.Builder(1024);
+    ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
+    this.ws.send(fbb.asUint8Array());
+  }
 
-    /**
-     * Sends an update request to the host through websocket
-     * @param update - The `UpdateRequest` object
-     */
-    async update(update: UpdateRequest): Promise<void> {
-        let update_request = new ContractRequestT(ContractRequestType.Update, update);
-        let request = new ClientRequestT(ClientRequestType.ContractRequest, update_request);
-        let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
-        this.ws.send(fbb.asUint8Array());
-    }
+  /**
+   * Sends a subscribe request to the host through websocket
+   * @param subscribe - The `SubscribeRequest` object
+   */
+  async subscribe(subscribe: SubscribeRequest): Promise<void> {
+    let subscribe_request = new ContractRequestT(
+      ContractRequestType.Subscribe,
+      subscribe
+    );
+    let request = new ClientRequestT(
+      ClientRequestType.ContractRequest,
+      subscribe_request
+    );
+    let fbb = new flatbuffers.Builder(1024);
+    ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
+    this.ws.send(fbb.asUint8Array());
+  }
 
-    /**
-     * Sends a get request to the host through websocket
-     * @param get - The `GetRequest` object
-     */
-    async get(get: GetRequest): Promise<void> {
-        let get_request = new ContractRequestT(ContractRequestType.Get, get);
-        let request = new ClientRequestT(ClientRequestType.ContractRequest, get_request);
-        let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
-        this.ws.send(fbb.asUint8Array());
-    }
-
-    /**
-     * Sends a subscribe request to the host through websocket
-     * @param subscribe - The `SubscribeRequest` object
-     */
-    async subscribe(subscribe: SubscribeRequest): Promise<void> {
-        let subscribe_request = new ContractRequestT(ContractRequestType.Subscribe, subscribe);
-        let request = new ClientRequestT(ClientRequestType.ContractRequest, subscribe_request);
-        let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
-        this.ws.send(fbb.asUint8Array());
-    }
-
-    /**
-     * Sends an disconnect notification to the host through websocket
-     * @param disconnect - The `DisconnectRequest` object
-     */
-    async disconnect(disconnect: DisconnectRequest): Promise<void> {
-        let request = new ClientRequestT(ClientRequestType.Disconnect, disconnect);
-        let fbb = new flatbuffers.Builder(1024);
-        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
-        this.ws.send(fbb.asUint8Array());
-    }
+  /**
+   * Sends an disconnect notification to the host through websocket
+   * @param disconnect - The `DisconnectRequest` object
+   */
+  async disconnect(disconnect: DisconnectRequest): Promise<void> {
+    let request = new ClientRequestT(ClientRequestType.Disconnect, disconnect);
+    let fbb = new flatbuffers.Builder(1024);
+    ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
+    this.ws.send(fbb.asUint8Array());
+  }
 }

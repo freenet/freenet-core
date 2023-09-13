@@ -652,7 +652,7 @@ impl<'a> TryFromFbs<&FbsDelegateRequest<'a>> for DelegateRequest<'a> {
 }
 
 /// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 #[non_exhaustive]
 pub enum HostResponse<T = WrappedState> {
     ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),

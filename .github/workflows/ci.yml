@@ -12,7 +12,15 @@ jobs:
   test_all:
     name: Test features
 
+    on:
+      pull_request:
+        types: [review_requested, ready_for_review]
+      push:
+        branches:
+          - main
+
     runs-on: ubuntu-latest
+
     strategy:
       max-parallel: 1
       matrix:
@@ -87,7 +95,15 @@ jobs:
   clippy_check:
     name: Clippy
 
+    on:
+      pull_request:
+        types: [review_requested, ready_for_review]
+      push:
+        branches:
+          - main
+
     runs-on: ubuntu-latest
+
     strategy:
       max-parallel: 1
       matrix:
