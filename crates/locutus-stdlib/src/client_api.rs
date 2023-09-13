@@ -25,7 +25,7 @@ pub use browser::*;
 pub use client_events::*;
 
 #[cfg(feature = "net")]
-type HostResult = Result<client_events::HostResponse, ClientError>;
+type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
