@@ -17,6 +17,8 @@ cp -r $SCRIPT_DIR/dist/src/* $PKG_DIR
 cp $SCRIPT_DIR/README.md $SCRIPT_DIR/package.json $PKG_DIR
 npm pack $PKG_DIR 
 if [ "$IS_DEV"=1 ]; then
+set +e
 rm $PKG_DIR/locutus-stdlib.tgz
+set -e
 mv $PKG_DIR/*.tgz $PKG_DIR/locutus-stdlib.tgz
 fi
