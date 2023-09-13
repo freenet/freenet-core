@@ -16,7 +16,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        # Disabled temporarily due to space issues on the device
+        # Disabled temporarily due to space issues on the test container
         #args: ["--no-default-features", "--all-features"]
         args: ["--no-default-features"]
     env:
