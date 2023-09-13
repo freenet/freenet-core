@@ -15,7 +15,7 @@ import {
   PutResponse,
   UpdateNotification,
   UpdateResponse,
-} from "@locutus/locutus-stdlib/webSocketInterface";
+} from "@locutus/locutus-stdlib/websocket-interface";
 
 const handler = {
   onPut: (_response: PutResponse) => {},
