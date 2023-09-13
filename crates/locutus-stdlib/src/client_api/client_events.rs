@@ -37,7 +37,6 @@ use crate::host_response_generated::host_response::{
     UpdateNotification as FbsUpdateNotification, UpdateNotificationArgs,
     UpdateResponse as FbsUpdateResponse, UpdateResponseArgs,
 };
-use crate::prelude::APIVersion;
 use crate::prelude::ContractContainer::Wasm;
 use crate::prelude::ContractWasmAPIVersion::V1;
 use crate::prelude::UpdateData::{
@@ -514,6 +513,15 @@ impl DelegateRequest<'_> {
         }
     }
 
+    pub fn key(&self) -> &DelegateKey {
+        match self {
+            DelegateRequest::ApplicationMessages { key, .. } => key,
+            DelegateRequest::GetSecretRequest { key, .. } => key,
+            DelegateRequest::RegisterDelegate { delegate, .. } => delegate.key(),
+            DelegateRequest::UnregisterDelegate(key) => key,
+        }
+    }
+
     fn deser_params<'de, 'a, D>(deser: D) -> Result<Parameters<'a>, D::Error>
     where
         D: Deserializer<'de>,
@@ -676,7 +684,7 @@ impl HostResponse {
         }
     }
 
-    pub fn into_fbs_bytes(self) -> Result<Vec<u8>, ClientError> {
+    pub fn into_fbs_bytes(self) -> Result<Vec<u8>, Box<ClientError>> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         match self {
             HostResponse::ContractResponse(res) => match res {
@@ -1308,9 +1316,6 @@ impl HostResponse {
                 finish_host_response_buffer(&mut builder, host_response_offset);
                 Ok(builder.finished_data().to_vec())
             }
-            _ => Err(ClientError::from(format!(
-                "Failed encoding HoestResponse to flatbuffers bytes represntation"
-            )))?,
         }
     }
 }

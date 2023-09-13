@@ -92,6 +92,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                             id: external,
                             request,
                             notification_channel,
+                            token,
                         }) => {
                             tracing::debug!(
                                 "received request; internal_id={external}; req={request}"
@@ -112,6 +113,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                                 id,
                                 request,
                                 notification_channel,
+                                token,
                             })
                         }
                         err @ Err(_) => err,
@@ -167,9 +169,9 @@ async fn client_fn(
             }
             client_msg = client.recv() => {
                 match client_msg {
-                    Ok(OpenRequest {id,  request, notification_channel}) => {
+                    Ok(OpenRequest {id,  request, notification_channel, token}) => {
                         tracing::debug!("received msg @ combinator from external id {id}, msg: {request}");
-                        if tx_host.send(Ok(OpenRequest { id,  request, notification_channel })).await.is_err() {
+                        if tx_host.send(Ok(OpenRequest { id,  request, notification_channel, token })).await.is_err() {
                             break;
                         }
                     }
@@ -271,11 +273,10 @@ mod test {
                     .ok_or_else::<ClientError, _>(|| ErrorKind::ChannelClosed.into())?;
                 assert_eq!(id, self.id);
                 eprintln!("#{}, received msg {id}", self.id);
-                Ok(OpenRequest {
-                    id: ClientId::new(id),
-                    request: Box::new(ClientRequest::Disconnect { cause: None }),
-                    notification_channel: None,
-                })
+                Ok(OpenRequest::new(
+                    ClientId::new(id),
+                    Box::new(ClientRequest::Disconnect { cause: None }),
+                ))
             })
         }
 

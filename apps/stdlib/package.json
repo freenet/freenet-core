@@ -25,7 +25,7 @@
     "build": "tsc",
     "prod.package": "./package.prod.sh",
     "dev.package": "./package.dev.sh dev",
-    "flatc_schemas": "bash -c \"flatc --ts --gen-object-api -o ./src ../../schemas/flatbuffers/*\""
+    "flatc-schemas": "bash -c \"flatc --ts --gen-object-api -o ./src ../../schemas/flatbuffers/*\""
   },
   "license": "MIT+APACHE-2.0",
   "homepage": "https://github.com/freenet/locutus",
