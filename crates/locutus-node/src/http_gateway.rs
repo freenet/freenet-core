@@ -1,7 +1,7 @@
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, WebSocketUpgrade};
+use axum::extract::{Path, Query, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -9,10 +9,10 @@ use locutus_core::*;
 use locutus_stdlib::{
     client_api::{
         ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
-        TryFromTsStd,
     },
     prelude::*,
 };
+use serde::Deserialize;
 
 use std::collections::VecDeque;
 use std::fmt::Display;
@@ -65,9 +65,10 @@ impl HttpGateway {
 
         let router = Router::new()
             .route("/", get(home))
-            .route("/contract/command/", get(websocket_commands))
+            .route("/contract/command", get(websocket_commands))
             .route("/contract/web/:key/", get(web_home))
             .route("/contract/web/:key/*path", get(web_subpages))
+            .layer(axum::middleware::from_fn(connection_info))
             .layer(Extension(request_sender));
 
         (gateway, router)
@@ -76,6 +77,66 @@ impl HttpGateway {
     pub fn next_client_id() -> ClientId {
         internal_next_client_id()
     }
+}
+
+async fn connection_info<B>(
+    encoding_protoc: Result<
+        axum::TypedHeader<EncodingProtocol>,
+        axum::extract::rejection::TypedHeaderRejection,
+    >,
+    auth_token: Result<
+        axum::TypedHeader<axum::headers::Authorization<axum::headers::authorization::Bearer>>,
+        axum::extract::rejection::TypedHeaderRejection,
+    >,
+    Query(ConnectionInfo {
+        auth_token: auth_token_q,
+        encoding_protocol,
+    }): Query<ConnectionInfo>,
+    mut req: axum::http::Request<B>,
+    next: axum::middleware::Next<B>,
+) -> Response {
+    tracing::info!(
+        "headers: {:?}",
+        req.headers()
+            .iter()
+            .flat_map(|(k, v)| v.to_str().ok().map(|v| format!("{k}: {v}")))
+            .collect::<Vec<_>>()
+    );
+    let encoding_protoc = match encoding_protoc {
+        Ok(protoc) => protoc.0,
+        Err(err)
+            if matches!(
+                err.reason(),
+                axum::extract::rejection::TypedHeaderRejectionReason::Missing
+            ) =>
+        {
+            tracing::info!(" from query: {encoding_protocol:?}");
+            encoding_protocol.unwrap_or(EncodingProtocol::Flatbuffers)
+        }
+        Err(other) => return other.into_response(),
+    };
+
+    let auth_token = match auth_token {
+        Ok(auth_token) => Some(AuthToken::from(auth_token.token().to_owned())),
+        Err(err)
+            if matches!(
+                err.reason(),
+                axum::extract::rejection::TypedHeaderRejectionReason::Missing
+            ) =>
+        {
+            auth_token_q
+        }
+        Err(other) => return other.into_response(),
+    };
+
+    tracing::debug!(
+        "establishing connection with encoding protocol {encoding_protoc}, authenticated: {auth}",
+        auth = auth_token.is_some()
+    );
+    req.extensions_mut().insert(encoding_protoc);
+    req.extensions_mut().insert(auth_token);
+
+    next.run(req).await
 }
 
 fn internal_next_client_id() -> ClientId {
@@ -127,7 +188,7 @@ async fn web_subpages(
         .map(|r| r.into_response())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Debug)]
 enum EncodingProtocol {
     /// Flatbuffers
     Flatbuffers,
@@ -174,43 +235,19 @@ impl axum::headers::Header for EncodingProtocol {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionInfo {
+    auth_token: Option<AuthToken>,
+    encoding_protocol: Option<EncodingProtocol>,
+}
+
 async fn websocket_commands(
     ws: WebSocketUpgrade,
-    auth_token: Result<
-        axum::TypedHeader<axum::headers::Authorization<axum::headers::authorization::Bearer>>,
-        axum::extract::rejection::TypedHeaderRejection,
-    >,
-    encoding_protoc: Result<
-        axum::TypedHeader<EncodingProtocol>,
-        axum::extract::rejection::TypedHeaderRejection,
-    >,
+    Extension(auth_token): Extension<Option<AuthToken>>,
+    Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
 ) -> Response {
-    let auth_token = match auth_token {
-        Ok(auth_token) => Some(AuthToken::from(auth_token.token().to_owned())),
-        Err(err)
-            if matches!(
-                err.reason(),
-                axum::extract::rejection::TypedHeaderRejectionReason::Missing
-            ) =>
-        {
-            None
-        }
-        Err(other) => return other.into_response(),
-    };
-    let encoding_protoc = match encoding_protoc {
-        Ok(protoc) => protoc.0,
-        Err(err)
-            if matches!(
-                err.reason(),
-                axum::extract::rejection::TypedHeaderRejectionReason::Missing
-            ) =>
-        {
-            EncodingProtocol::Flatbuffers
-        }
-        Err(other) => return other.into_response(),
-    };
-    tracing::debug!("establishing connection with encoding protocol {encoding_protoc}");
     let on_upgrade = move |ws: WebSocket| async move {
         if let Err(e) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
             tracing::error!("{e}");
@@ -221,7 +258,7 @@ async fn websocket_commands(
 
 async fn websocket_interface(
     request_sender: mpsc::Sender<ClientConnection>,
-    auth_token: Option<AuthToken>,
+    mut auth_token: Option<AuthToken>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> Result<(), DynError> {
@@ -256,7 +293,6 @@ async fn websocket_interface(
             }
         };
 
-        let auth_token_cp = auth_token.clone();
         let client_req_task = async {
             let next_msg = match rx
                 .next()
@@ -269,7 +305,14 @@ async fn websocket_interface(
                 }
                 Ok(v) => v,
             };
-            process_client_request(client_id, next_msg, &request_sender, auth_token_cp).await
+            process_client_request(
+                client_id,
+                next_msg,
+                &request_sender,
+                &mut auth_token,
+                encoding_protoc,
+            )
+            .await
         };
 
         tokio::select! { biased;
@@ -283,8 +326,8 @@ async fn websocket_interface(
             }
             process_client_request = client_req_task => {
                 match process_client_request {
-                    Ok(Some(response)) => {
-                        tx.send(response).await?;
+                    Ok(Some(error)) => {
+                        tx.send(error).await?;
                     }
                     Ok(None) => continue,
                     Err(None) => return Ok(()),
@@ -313,7 +356,8 @@ async fn process_client_request(
     client_id: ClientId,
     msg: Result<Message, axum::Error>,
     request_sender: &mpsc::Sender<ClientConnection>,
-    auth_token: Option<AuthToken>,
+    auth_token: &mut Option<AuthToken>,
+    encoding_protoc: EncodingProtocol,
 ) -> Result<Option<Message>, Option<DynError>> {
     let msg = match msg {
         Ok(Message::Binary(data)) => data,
@@ -329,33 +373,36 @@ async fn process_client_request(
 
     // Try to deserialize the ClientRequest message
     let req = {
-        if let Ok(client_request) = bincode::deserialize::<ClientRequest<'_>>(&msg) {
-            client_request.into_owned()
-        } else if let Ok(client_request) = ClientRequest::try_decode_fbs(&msg) {
-            client_request.into_owned()
-        } else {
-            match ContractRequest::try_decode(&msg) {
-                Ok(r) => r.to_owned().into(),
-                Err(e) => {
+        match encoding_protoc {
+            EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
+                Ok(decoded) => decoded.into_owned(),
+                Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes()))),
+            },
+            EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
+                Ok(decoded) => decoded.into_owned(),
+                Err(err) => {
                     let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
                         ErrorKind::DeserializationError {
-                            cause: format!("{e}"),
+                            cause: format!("{err}"),
                         }
                         .into(),
                     ))
                     .map_err(|err| Some(err.into()))?;
                     return Ok(Some(Message::Binary(result_error)));
                 }
-            }
+            },
         }
     };
+    if let ClientRequest::Authenticate { token } = &req {
+        *auth_token = Some(AuthToken::from(token.clone()));
+    }
 
     tracing::debug!(req = %req, "received client request");
     request_sender
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(req),
-            auth_token,
+            auth_token: auth_token.clone(),
         })
         .await
         .map_err(|err| Some(err.into()))?;

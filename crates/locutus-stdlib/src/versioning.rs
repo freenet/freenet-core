@@ -404,7 +404,7 @@ impl TryFromTsStd<&rmpv::Value> for ContractContainer {
                     .map(|(key, val)| (key.as_str().unwrap(), val)),
             ),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding ContractContainer, input value is not a map"
                         .to_string(),
                 })
@@ -414,7 +414,7 @@ impl TryFromTsStd<&rmpv::Value> for ContractContainer {
         let container_version = match container_map.get("version") {
             Some(version_value) => (*version_value).as_str().unwrap(),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding ContractContainer, version not found".to_string(),
                 })
             }
@@ -422,11 +422,10 @@ impl TryFromTsStd<&rmpv::Value> for ContractContainer {
 
         match container_version {
             "V1" => {
-                let contract = WrappedContract::try_decode(value).map_err(|e| {
-                    WsApiError::MsgpackDecodeError {
+                let contract =
+                    WrappedContract::try_decode(value).map_err(|e| WsApiError::DeserError {
                         cause: format!("{e}"),
-                    }
-                })?;
+                    })?;
                 Ok(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                     contract,
                 )))

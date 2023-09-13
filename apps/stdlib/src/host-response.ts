@@ -6,6 +6,7 @@ export { ContractResponse, ContractResponseT } from './host-response/contract-re
 export { ContractResponseType } from './host-response/contract-response-type.js';
 export { DelegateKey, DelegateKeyT } from './host-response/delegate-key.js';
 export { DelegateResponse, DelegateResponseT } from './host-response/delegate-response.js';
+export { Error, ErrorT } from './host-response/error.js';
 export { GenerateRandData, GenerateRandDataT } from './host-response/generate-rand-data.js';
 export { GetResponse, GetResponseT } from './host-response/get-response.js';
 export { HostResponse, HostResponseT } from './host-response/host-response.js';

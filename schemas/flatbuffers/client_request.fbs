@@ -134,10 +134,15 @@ table Disconnect {
   cause:string;
 }
 
+table Authenticate {
+  token:string(required);
+}
+
 union ClientRequestType {
     ContractRequest,
     DelegateRequest,
-    Disconnect
+    Disconnect,
+    Authenticate
 }
 
 table ClientRequest {
