@@ -36,7 +36,7 @@ publish-webapp:
 posts:
 	cd $(POSTS_DIR)
 
-	${CARGO_TARGET_DIR}/debug/ldt build
+	ldt build
 	cp ./build/locutus/freenet_microblogging_posts ../../../../crates/locutus-node/examples/
 	cp ./build/locutus/contract-state ../../../../crates/locutus-node/examples/freenet_microblogging_posts_state
 
@@ -46,7 +46,7 @@ publish-posts:
 	ldt publish --code build/locutus/freenet_microblogging_posts contract --state build/locutus/contract-state
 
 run-node:
-	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,info locutus-node local
+	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,locutus_node=debug,info locutus-node local
 
 run:
 	cd $(LOCUTUS_DIR)

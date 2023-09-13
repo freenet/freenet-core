@@ -1225,12 +1225,6 @@ impl TryFromTsStd<&rmpv::Value> for ContractKey {
 
 impl<'a> TryFromFbs<&FbsContractKey<'a>> for ContractKey {
     fn try_decode_fbs(key: &FbsContractKey<'a>) -> Result<Self, WsApiError> {
-        tracing::debug!("Key instance: {:?}", key.instance());
-        tracing::debug!("Key instance data: {:?}", key.instance().data());
-        tracing::debug!(
-            "Key instance data bytes: {:?}",
-            key.instance().data().bytes()
-        );
         let key_bytes: [u8; CONTRACT_KEY_SIZE] = key.instance().data().bytes().try_into().unwrap();
         let instance = ContractInstanceId::new(key_bytes);
         let code = key.code().map(|code_hash| CodeHash::new(code_hash.bytes()));
