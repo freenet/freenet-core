@@ -54,14 +54,7 @@ impl AuthToken {
         let mut rng = rand::thread_rng();
         let mut token = [0u8; 32];
         rng.fill(&mut token);
-
-        // encode
-        let hex_chars: &[u8] = b"0123456789abcdef";
-        let mut token_str = String::with_capacity(32 * 2);
-        for &byte in token.iter() {
-            token_str.push(hex_chars[(byte >> 4) as usize] as char);
-            token_str.push(hex_chars[(byte & 0xF) as usize] as char);
-        }
+        let token_str = bs58::encode(token).into_string();
         AuthToken::from(token_str)
     }
 }
