@@ -225,13 +225,12 @@ async fn new_request(
                 Err(e) => {
                     let _ = request_sender
                         .send(
-                            OpenRequest {
+                            OpenRequest::new(
                                 id,
-                                request: Box::new(ClientRequest::Disconnect {
+                                Box::new(ClientRequest::Disconnect {
                                     cause: Some(format!("{e}")),
                                 }),
-                                notification_channel: None,
-                            }
+                            )
                             .into(),
                         )
                         .await;
@@ -243,13 +242,12 @@ async fn new_request(
         Some(Err(e)) => {
             let _ = request_sender
                 .send(
-                    OpenRequest {
+                    OpenRequest::new(
                         id,
-                        request: Box::new(ClientRequest::Disconnect {
+                        Box::new(ClientRequest::Disconnect {
                             cause: Some(format!("{e}")),
                         }),
-                        notification_channel: None,
-                    }
+                    )
                     .into(),
                 )
                 .await;
@@ -258,14 +256,7 @@ async fn new_request(
         None => return Err(()),
     };
     if request_sender
-        .send(
-            OpenRequest {
-                id,
-                request: Box::new(msg),
-                notification_channel: None,
-            }
-            .into(),
-        )
+        .send(OpenRequest::new(id, Box::new(msg)).into())
         .await
         .is_err()
     {

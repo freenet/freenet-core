@@ -391,6 +391,15 @@ impl DelegateRequest<'_> {
         }
     }
 
+    pub fn key(&self) -> &DelegateKey {
+        match self {
+            DelegateRequest::ApplicationMessages { key, .. } => key,
+            DelegateRequest::GetSecretRequest { key, .. } => key,
+            DelegateRequest::RegisterDelegate { delegate, .. } => delegate.key(),
+            DelegateRequest::UnregisterDelegate(key) => key,
+        }
+    }
+
     fn deser_params<'de, 'a, D>(deser: D) -> Result<Parameters<'a>, D::Error>
     where
         D: Deserializer<'de>,

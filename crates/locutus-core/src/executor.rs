@@ -97,6 +97,7 @@ pub struct Executor {
     state_store: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
+    delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
 }
 
 impl Executor {
@@ -121,6 +122,7 @@ impl Executor {
             state_store: contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
+            delegate_attested_ids: HashMap::default(),
         })
     }
 
@@ -166,14 +168,13 @@ impl Executor {
         related_contracts: RelatedContracts<'static>,
     ) {
         if let Err(err) = self
-            .handle_request(
-                cli_id,
+            .contract_op(
                 ContractRequest::Put {
                     contract,
                     state,
                     related_contracts,
-                }
-                .into(),
+                },
+                cli_id,
                 None,
             )
             .await
@@ -193,7 +194,7 @@ impl Executor {
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_op(op, id, updates).await,
-            ClientRequest::DelegateOp(op) => self.delegate_op(op),
+            ClientRequest::DelegateOp(op) => self.delegate_op(op, None),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -204,7 +205,7 @@ impl Executor {
         }
     }
 
-    async fn contract_op(
+    pub async fn contract_op(
         &mut self,
         req: ContractRequest<'_>,
         cli_id: ClientId,
@@ -735,7 +736,11 @@ impl Executor {
         Ok(())
     }
 
-    fn delegate_op(&mut self, req: DelegateRequest<'_>) -> Response {
+    pub fn delegate_op(
+        &mut self,
+        req: DelegateRequest<'_>,
+        attestaded_contract: Option<&ContractInstanceId>,
+    ) -> Response {
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -744,11 +749,16 @@ impl Executor {
             } => {
                 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
                 let key = delegate.key().clone();
-
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
                 tracing::debug!("registering delegate `{key}");
+                if let Some(contract) = attestaded_contract {
+                    self.delegate_attested_ids
+                        .entry(key.clone())
+                        .or_default()
+                        .push(*contract);
+                }
                 match self.runtime.register_delegate(delegate, cipher, nonce) {
                     Ok(_) => Ok(DelegateResponse {
                         key,
@@ -763,6 +773,7 @@ impl Executor {
                 }
             }
             DelegateRequest::UnregisterDelegate(key) => {
+                self.delegate_attested_ids.remove(&key);
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
@@ -775,30 +786,45 @@ impl Executor {
                 key,
                 params,
                 get_request,
-            } => match self.runtime.inbound_app_message(
-                &key,
-                &params,
-                vec![InboundDelegateMsg::GetSecretRequest(get_request)],
-            ) {
-                Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                Err(err) if err.delegate_is_missing() => {
-                    tracing::error!("delegate not found `{key}`");
-                    Err(Either::Left(Box::new(
-                        CoreDelegateError::Missing(key).into(),
-                    )))
+            } => {
+                let attested = attestaded_contract.and_then(|contract| {
+                    self.delegate_attested_ids
+                        .get(&key)
+                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
+                });
+                match self.runtime.inbound_app_message(
+                    &key,
+                    &params,
+                    attested.map(|c| c.as_bytes()),
+                    vec![InboundDelegateMsg::GetSecretRequest(get_request)],
+                ) {
+                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Err(err) if err.delegate_is_missing() => {
+                        tracing::error!("delegate not found `{key}`");
+                        Err(Either::Left(Box::new(
+                            CoreDelegateError::Missing(key).into(),
+                        )))
+                    }
+                    Err(err) => Err(Either::Right(
+                        format!("uncontrolled error while getting secret for `{key}`: {err}")
+                            .into(),
+                    )),
                 }
-                Err(err) => Err(Either::Right(
-                    format!("uncontrolled error while getting secret for `{key}`: {err}").into(),
-                )),
-            },
+            }
             DelegateRequest::ApplicationMessages {
                 key,
                 inbound,
                 params,
             } => {
+                let attested = attestaded_contract.and_then(|contract| {
+                    self.delegate_attested_ids
+                        .get(&key)
+                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
+                });
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
+                    attested.map(|c| c.as_bytes()),
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)
