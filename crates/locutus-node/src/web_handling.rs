@@ -1,9 +1,6 @@
 //! Handle the `web` part of the bundles.
 
-use axum::{
-    http::StatusCode,
-    response::{Html, IntoResponse},
-};
+use axum::response::{Html, IntoResponse};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +17,7 @@ use locutus_core::{
 };
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
-use crate::errors::WebSocketApiError;
+use crate::{errors::WebSocketApiError, AuthToken};
 use crate::{ClientConnection, HostCallbackResult};
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -28,6 +25,7 @@ const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 pub(crate) async fn contract_home(
     key: String,
     request_sender: mpsc::Sender<ClientConnection>,
+    assigned_token: AuthToken,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let key = ContractKey::from_id(key)
         .map_err(|err| WebSocketApiError::InvalidParam {
@@ -36,13 +34,16 @@ pub(crate) async fn contract_home(
         .unwrap();
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
-        .send(ClientConnection::NewConnection(response_sender))
+        .send(ClientConnection::NewConnection {
+            notifications: response_sender,
+            assigned_token: Some((assigned_token, key.clone().into())),
+        })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })
         .unwrap();
-    let client_id = if let Some(HostCallbackResult::NewId(id)) = response_recv.recv().await {
+    let client_id = if let Some(HostCallbackResult::NewId { id }) = response_recv.recv().await {
         id
     } else {
         todo!("this is an error");
@@ -57,6 +58,7 @@ pub(crate) async fn contract_home(
                 }
                 .into(),
             ),
+            auth_token: None,
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -112,9 +114,7 @@ pub(crate) async fn contract_home(
                         }
                         other => {
                             tracing::error!("{other}");
-                            return Err(WebSocketApiError::HttpError {
-                                code: StatusCode::INTERNAL_SERVER_ERROR,
-                            });
+                            return Err(other);
                         }
                     },
                 };
@@ -141,6 +141,7 @@ pub(crate) async fn contract_home(
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(ClientRequest::Disconnect { cause: None }),
+            auth_token: None,
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
