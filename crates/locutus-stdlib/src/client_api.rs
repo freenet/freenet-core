@@ -57,16 +57,41 @@ pub trait TryFromFbs<T>: Sized {
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum WsApiError {
-    #[error("Failed decoding msgpack message from client request: {cause}")]
-    MsgpackDecodeError { cause: String },
     #[error("Unsupported contract version")]
     UnsupportedContractVersion,
     #[error("Failed unpacking contract container")]
     UnpackingContractContainerError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("Failed decoding message from client request: {cause}")]
+    DeserError { cause: String },
 }
 
 impl WsApiError {
     pub fn deserialization(cause: String) -> Self {
-        Self::MsgpackDecodeError { cause }
+        Self::DeserError { cause }
+    }
+
+    pub fn into_fbs_bytes(self) -> Vec<u8> {
+        use crate::host_response_generated::host_response::{
+            finish_host_response_buffer, Error, ErrorArgs, HostResponse, HostResponseArgs,
+            HostResponseType,
+        };
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let as_msg = format!("{self}");
+        let msg_offset = builder.create_string(&as_msg);
+        let err_offset = Error::create(
+            &mut builder,
+            &ErrorArgs {
+                msg: Some(msg_offset),
+            },
+        );
+        let res = HostResponse::create(
+            &mut builder,
+            &HostResponseArgs {
+                response_type: HostResponseType::Error,
+                response: Some(err_offset.as_union_value()),
+            },
+        );
+        finish_host_response_buffer(&mut builder, res);
+        builder.finished_data().to_vec()
     }
 }
