@@ -116,6 +116,7 @@ impl ContractRuntimeInterface for crate::Runtime {
         Ok(is_valid)
     }
 
+    // FIXME: actually use this in the executor!
     fn validate_delta<'a>(
         &mut self,
         key: &ContractKey,

@@ -20,8 +20,8 @@ pub use crate::config::Config;
 #[cfg(feature = "websocket")]
 pub use client_events::websocket::WebSocketProxy;
 pub use client_events::{
-    combinator::ClientEventsCombinator, BoxedClient, ClientEventsProxy, ClientId, HostResult,
-    OpenRequest,
+    combinator::ClientEventsCombinator, AuthToken, BoxedClient, ClientEventsProxy, ClientId,
+    HostResult, OpenRequest,
 };
 pub use contract::storages::{Storage, StorageContractHandler};
 pub use either;

@@ -39,6 +39,7 @@ struct Delegate;
 impl DelegateInterface for Delegate {
     fn process(
         params: Parameters<'static>,
+        _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let mut outbound = Vec::new();

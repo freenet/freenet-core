@@ -10,6 +10,7 @@ struct Delegate;
 impl DelegateInterface for Delegate {
     fn process(
         _parameters: Parameters<'static>,
+        _attested: Option<&'static [u8]>,
         _messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         unimplemented!()

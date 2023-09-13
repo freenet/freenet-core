@@ -3,6 +3,7 @@ use locutus_stdlib::client_api::ClientRequest;
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
 use std::fmt::Display;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -40,11 +41,36 @@ impl Display for ClientId {
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuthToken(Arc<str>);
+
+impl AuthToken {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn generate() -> AuthToken {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut token = [0u8; 32];
+        rng.fill(&mut token);
+        let token_str = bs58::encode(token).into_string();
+        AuthToken::from(token_str)
+    }
+}
+
+impl From<String> for AuthToken {
+    fn from(value: String) -> Self {
+        Self(value.into())
+    }
+}
+
 #[non_exhaustive]
 pub struct OpenRequest<'a> {
     pub id: ClientId,
     pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<UnboundedSender<HostResult>>,
+    pub token: Option<AuthToken>,
 }
 
 impl<'a> OpenRequest<'a> {
@@ -60,11 +86,17 @@ impl<'a> OpenRequest<'a> {
             id,
             request,
             notification_channel: None,
+            token: None,
         }
     }
 
     pub fn with_notification(mut self, ch: UnboundedSender<HostResult>) -> Self {
         self.notification_channel = Some(ch);
+        self
+    }
+
+    pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
+        self.token = token;
         self
     }
 }

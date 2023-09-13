@@ -3,31 +3,40 @@ mod http_gateway;
 pub(crate) mod web_handling;
 
 pub use http_gateway::HttpGateway;
-use locutus_core::{locutus_runtime::ContractKey, ClientId, HostResult};
-use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+use locutus_core::{locutus_runtime::ContractKey, AuthToken, ClientId, HostResult};
+use locutus_stdlib::{
+    client_api::{ClientError, ClientRequest, HostResponse},
+    prelude::ContractInstanceId,
+};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum ClientConnection {
-    NewConnection(tokio::sync::mpsc::UnboundedSender<HostCallbackResult>),
+    NewConnection {
+        notifications: tokio::sync::mpsc::UnboundedSender<HostCallbackResult>,
+        assigned_token: Option<(AuthToken, ContractInstanceId)>,
+    },
     Request {
         client_id: ClientId,
         req: Box<ClientRequest<'static>>,
+        auth_token: Option<AuthToken>,
     },
 }
 
 #[derive(Debug)]
 enum HostCallbackResult {
-    NewId(ClientId),
+    NewId {
+        id: ClientId,
+    },
     Result {
         id: ClientId,
         result: Result<HostResponse, ClientError>,
     },
     SubscriptionChannel {
-        key: ContractKey,
         id: ClientId,
+        key: ContractKey,
         callback: tokio::sync::mpsc::UnboundedReceiver<HostResult>,
     },
 }
@@ -35,8 +44,11 @@ enum HostCallbackResult {
 pub mod local_node {
     use std::net::SocketAddr;
 
-    use locutus_core::{either, ClientEventsProxy, Executor, OpenRequest, WebSocketProxy};
-    use locutus_stdlib::client_api::{ErrorKind, RequestError};
+    use locutus_core::{
+        either::{self, Either},
+        ClientEventsProxy, Executor, OpenRequest, WebSocketProxy,
+    };
+    use locutus_stdlib::client_api::{ClientRequest, ErrorKind, RequestError};
 
     use crate::{DynError, HttpGateway};
 
@@ -54,13 +66,38 @@ pub mod local_node {
                 id,
                 request,
                 notification_channel,
+                token,
                 ..
             } = http_handle.recv().await?;
             tracing::trace!(cli_id = %id, "got request -> {request}");
-            match executor
-                .handle_request(id, *request, notification_channel)
-                .await
-            {
+
+            let res = match *request {
+                ClientRequest::ContractOp(op) => {
+                    executor.contract_op(op, id, notification_channel).await
+                }
+                ClientRequest::DelegateOp(op) => {
+                    let attested_contract = token.and_then(|token| {
+                        http_handle.attested_contracts.get(&token).map(|(t, _)| t)
+                    });
+                    executor.delegate_op(op, attested_contract)
+                }
+                ClientRequest::Disconnect { cause } => {
+                    if let Some(cause) = cause {
+                        tracing::info!("disconnecting cause: {cause}");
+                    }
+                    if let Some(rm_token) = http_handle
+                        .attested_contracts
+                        .iter()
+                        .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
+                    {
+                        http_handle.attested_contracts.remove(&rm_token);
+                    }
+                    Err(Either::Left(Box::new(RequestError::Disconnect)))
+                }
+                _ => Err(Either::Right("not supported".into())),
+            };
+
+            match res {
                 Ok(res) => {
                     http_handle.send(id, Ok(res)).await?;
                 }

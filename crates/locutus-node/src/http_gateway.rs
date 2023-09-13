@@ -11,6 +11,7 @@ use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
     TryFromTsStd,
 };
+use locutus_stdlib::prelude::ContractInstanceId;
 use std::collections::VecDeque;
 use std::{
     collections::HashMap,
@@ -26,7 +27,7 @@ use tokio::sync::{
 };
 
 use crate::errors::WebSocketApiError;
-use crate::{web_handling, ClientConnection, DynError, HostCallbackResult};
+use crate::{web_handling, AuthToken, ClientConnection, DynError, HostCallbackResult};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
@@ -42,6 +43,7 @@ static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 pub struct HttpGateway {
     server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
+    pub(crate) attested_contracts: HashMap<AuthToken, (ContractInstanceId, ClientId)>,
 }
 
 impl HttpGateway {
@@ -54,6 +56,7 @@ impl HttpGateway {
         let gateway = Self {
             server_request,
             response_channels: HashMap::new(),
+            attested_contracts: HashMap::new(),
         };
 
         let router = Router::new()
@@ -80,11 +83,14 @@ async fn new_client_connection(
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
-        .send(ClientConnection::NewConnection(response_sender))
+        .send(ClientConnection::NewConnection {
+            notifications: response_sender,
+            assigned_token: None,
+        })
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;
     match response_recv.recv().await {
-        Some(HostCallbackResult::NewId(client_id)) => Ok((response_recv, client_id)),
+        Some(HostCallbackResult::NewId { id: client_id, .. }) => Ok((response_recv, client_id)),
         None => Err(ErrorKind::NodeUnavailable.into()),
         other => unreachable!("received unexpected message: {other:?}"),
     }
@@ -98,8 +104,13 @@ async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    let contract_idx = web_handling::contract_home(key, rs).await?;
-    Ok(contract_idx.into_response())
+    use axum::headers::HeaderMapExt;
+    let token = AuthToken::generate();
+    let token_header = axum::headers::Authorization::bearer(token.as_str()).unwrap();
+    let contract_idx = web_handling::contract_home(key, rs, token).await?;
+    let mut response = contract_idx.into_response();
+    response.headers_mut().typed_insert(token_header);
+    Ok(response)
 }
 
 async fn web_subpages(
@@ -114,10 +125,26 @@ async fn web_subpages(
 
 async fn websocket_commands(
     ws: WebSocketUpgrade,
+    auth_token: Result<
+        axum::TypedHeader<axum::headers::Authorization<axum::headers::authorization::Bearer>>,
+        axum::extract::rejection::TypedHeaderRejection,
+    >,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
 ) -> Response {
+    let auth_token = match auth_token {
+        Ok(auth_token) => Some(AuthToken::from(auth_token.token().to_owned())),
+        Err(err)
+            if matches!(
+                err.reason(),
+                axum::extract::rejection::TypedHeaderRejectionReason::Missing
+            ) =>
+        {
+            None
+        }
+        Err(other) => return other.into_response(),
+    };
     let on_upgrade = move |ws: WebSocket| async move {
-        if let Err(e) = websocket_interface(rs.clone(), ws).await {
+        if let Err(e) = websocket_interface(rs.clone(), auth_token, ws).await {
             tracing::error!("{e}");
         }
     };
@@ -126,6 +153,7 @@ async fn websocket_commands(
 
 async fn websocket_interface(
     request_sender: mpsc::Sender<ClientConnection>,
+    auth_token: Option<AuthToken>,
     ws: WebSocket,
 ) -> Result<(), DynError> {
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
@@ -159,6 +187,7 @@ async fn websocket_interface(
             }
         };
 
+        let auth_token_cp = auth_token.clone();
         let client_req_task = async {
             let next_msg = match rx
                 .next()
@@ -171,7 +200,7 @@ async fn websocket_interface(
                 }
                 Ok(v) => v,
             };
-            process_client_request(client_id, next_msg, &request_sender).await
+            process_client_request(client_id, next_msg, &request_sender, auth_token_cp).await
         };
 
         tokio::select! { biased;
@@ -215,6 +244,7 @@ async fn process_client_request(
     client_id: ClientId,
     msg: Result<Message, axum::Error>,
     request_sender: &mpsc::Sender<ClientConnection>,
+    auth_token: Option<AuthToken>,
 ) -> Result<Option<Message>, Option<DynError>> {
     let msg = match msg {
         Ok(Message::Binary(data)) => data,
@@ -254,6 +284,7 @@ async fn process_client_request(
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(req),
+            auth_token,
         })
         .await
         .map_err(|err| Some(err.into()))?;
@@ -298,7 +329,7 @@ async fn process_host_response(
             debug_assert_eq!(id, client_id);
             Ok(Some(NewSubscription { key, callback }))
         }
-        Some(HostCallbackResult::NewId(cli_id)) => {
+        Some(HostCallbackResult::NewId { id: cli_id }) => {
             tracing::debug!(%cli_id, "new client registered");
             Ok(None)
         }
@@ -320,18 +351,29 @@ impl HttpGateway {
         msg: ClientConnection,
     ) -> Result<Option<OpenRequest>, ClientError> {
         match msg {
-            ClientConnection::NewConnection(new_client_ch) => {
+            ClientConnection::NewConnection {
+                notifications,
+                assigned_token,
+            } => {
                 // is a new client, assign an id and open a channel to communicate responses from the node
                 let cli_id = internal_next_client_id();
-                new_client_ch
-                    .send(HostCallbackResult::NewId(cli_id))
+                notifications
+                    .send(HostCallbackResult::NewId { id: cli_id })
                     .map_err(|_e| ErrorKind::NodeUnavailable)?;
-                self.response_channels.insert(cli_id, new_client_ch);
+                self.response_channels.insert(cli_id, notifications);
+                if let Some((assigned_token, contract)) = assigned_token {
+                    self.attested_contracts
+                        .insert(assigned_token, (contract, cli_id));
+                }
                 Ok(None)
             }
-            ClientConnection::Request { client_id, req } => {
-                match *req.clone() {
-                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary }) => {
+            ClientConnection::Request {
+                client_id,
+                req,
+                auth_token,
+            } => {
+                let open_req = match &*req {
+                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
                         // intercept subscription messages because they require a callback subscription channel
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                         if let Some(ch) = self.response_channels.get(&client_id) {
@@ -341,23 +383,20 @@ impl HttpGateway {
                                 callback: rx,
                             })
                             .map_err(|_| ErrorKind::ChannelClosed)?;
-                            Ok(Some(
-                                OpenRequest::new(
-                                    client_id,
-                                    Box::new(ContractRequest::Subscribe { key, summary }.into()),
-                                )
-                                .with_notification(tx),
-                            ))
+                            OpenRequest::new(client_id, req)
+                                .with_notification(tx)
+                                .with_token(auth_token)
                         } else {
                             tracing::warn!("client: {client_id} not found");
-                            Err(ErrorKind::UnknownClient(client_id.into()).into())
+                            return Err(ErrorKind::UnknownClient(client_id.into()).into());
                         }
                     }
                     _ => {
                         // just forward the request to the node
-                        Ok(Some(OpenRequest::new(client_id, req)))
+                        OpenRequest::new(client_id, req).with_token(auth_token)
                     }
-                }
+                };
+                Ok(Some(open_req))
             }
         }
     }
