@@ -4,6 +4,7 @@ import * as flatbuffers from 'flatbuffers';
 
 import { ContractResponse, ContractResponseT } from '../host-response/contract-response.js';
 import { DelegateResponse, DelegateResponseT } from '../host-response/delegate-response.js';
+import { Error, ErrorT } from '../host-response/error.js';
 import { GenerateRandData, GenerateRandDataT } from '../host-response/generate-rand-data.js';
 import { HostResponseType, unionToHostResponseType, unionListToHostResponseType } from '../host-response/host-response-type.js';
 import { Ok, OkT } from '../host-response/ok.js';
@@ -95,7 +96,7 @@ unpackTo(_o: HostResponseT): void {
 export class HostResponseT implements flatbuffers.IGeneratedObject {
 constructor(
   public responseType: HostResponseType = HostResponseType.NONE,
-  public response: ContractResponseT|DelegateResponseT|GenerateRandDataT|OkT|null = null
+  public response: ContractResponseT|DelegateResponseT|ErrorT|GenerateRandDataT|OkT|null = null
 ){}
 
 

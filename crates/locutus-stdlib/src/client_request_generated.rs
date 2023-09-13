@@ -411,14 +411,15 @@ pub struct DelegateRequestTypeUnionTableOffset {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_CLIENT_REQUEST_TYPE: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_CLIENT_REQUEST_TYPE: u8 = 3;
+pub const ENUM_MAX_CLIENT_REQUEST_TYPE: u8 = 4;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_CLIENT_REQUEST_TYPE: [ClientRequestType; 4] = [
+pub const ENUM_VALUES_CLIENT_REQUEST_TYPE: [ClientRequestType; 5] = [
   ClientRequestType::NONE,
   ClientRequestType::ContractRequest,
   ClientRequestType::DelegateRequest,
   ClientRequestType::Disconnect,
+  ClientRequestType::Authenticate,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -430,14 +431,16 @@ impl ClientRequestType {
   pub const ContractRequest: Self = Self(1);
   pub const DelegateRequest: Self = Self(2);
   pub const Disconnect: Self = Self(3);
+  pub const Authenticate: Self = Self(4);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 3;
+  pub const ENUM_MAX: u8 = 4;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::ContractRequest,
     Self::DelegateRequest,
     Self::Disconnect,
+    Self::Authenticate,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
@@ -446,6 +449,7 @@ impl ClientRequestType {
       Self::ContractRequest => Some("ContractRequest"),
       Self::DelegateRequest => Some("DelegateRequest"),
       Self::Disconnect => Some("Disconnect"),
+      Self::Authenticate => Some("Authenticate"),
       _ => None,
     }
   }
@@ -3387,6 +3391,104 @@ impl core::fmt::Debug for Disconnect<'_> {
       ds.finish()
   }
 }
+pub enum AuthenticateOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct Authenticate<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for Authenticate<'a> {
+  type Inner = Authenticate<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> Authenticate<'a> {
+  pub const VT_TOKEN: flatbuffers::VOffsetT = 4;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    Authenticate { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args AuthenticateArgs<'args>
+  ) -> flatbuffers::WIPOffset<Authenticate<'bldr>> {
+    let mut builder = AuthenticateBuilder::new(_fbb);
+    if let Some(x) = args.token { builder.add_token(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn token(&self) -> &'a str {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Authenticate::VT_TOKEN, None).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for Authenticate<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("token", Self::VT_TOKEN, true)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct AuthenticateArgs<'a> {
+    pub token: Option<flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for AuthenticateArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    AuthenticateArgs {
+      token: None, // required field
+    }
+  }
+}
+
+pub struct AuthenticateBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> AuthenticateBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_token(&mut self, token: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Authenticate::VT_TOKEN, token);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> AuthenticateBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    AuthenticateBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<Authenticate<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, Authenticate::VT_TOKEN,"token");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for Authenticate<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("Authenticate");
+      ds.field("token", &self.token());
+      ds.finish()
+  }
+}
 pub enum ClientRequestOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -3478,6 +3580,20 @@ impl<'a> ClientRequest<'a> {
     }
   }
 
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn client_request_as_authenticate(&self) -> Option<Authenticate<'a>> {
+    if self.client_request_type() == ClientRequestType::Authenticate {
+      let u = self.client_request();
+      // Safety:
+      // Created from a valid Table for this object
+      // Which contains a valid union in this slot
+      Some(unsafe { Authenticate::init_from_table(u) })
+    } else {
+      None
+    }
+  }
+
 }
 
 impl flatbuffers::Verifiable for ClientRequest<'_> {
@@ -3492,6 +3608,7 @@ impl flatbuffers::Verifiable for ClientRequest<'_> {
           ClientRequestType::ContractRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ContractRequest>>("ClientRequestType::ContractRequest", pos),
           ClientRequestType::DelegateRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<DelegateRequest>>("ClientRequestType::DelegateRequest", pos),
           ClientRequestType::Disconnect => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Disconnect>>("ClientRequestType::Disconnect", pos),
+          ClientRequestType::Authenticate => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Authenticate>>("ClientRequestType::Authenticate", pos),
           _ => Ok(()),
         }
      })?
@@ -3563,6 +3680,13 @@ impl core::fmt::Debug for ClientRequest<'_> {
         },
         ClientRequestType::Disconnect => {
           if let Some(x) = self.client_request_as_disconnect() {
+            ds.field("client_request", &x)
+          } else {
+            ds.field("client_request", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        ClientRequestType::Authenticate => {
+          if let Some(x) = self.client_request_as_authenticate() {
             ds.field("client_request", &x)
           } else {
             ds.field("client_request", &"InvalidFlatbuffer: Union discriminant does not match value.")

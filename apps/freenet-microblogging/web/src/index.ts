@@ -77,7 +77,7 @@ async function sendUpdate() {
     );
     const update = new UpdateData(UpdateDataType.DeltaUpdate, delta);
     let updateRequest = new UpdateRequest(KEY, update);
-    await locutusApi.then((api) => api.update(updateRequest));
+    await locutusApi.update(updateRequest);
   }
 }
 
@@ -128,7 +128,7 @@ async function subscribeToUpdates() {
     KEY,
     new Array<number>()
   );
-  await locutusApi.then((api) => api.subscribe(subscribe_request));
+  await locutusApi.subscribe(subscribe_request);
   console.log(`sent key subscription instance bytes '${KEY.bytes()}'`);
   console.log(`sent subscription request to key: '${KEY.encode()}'`);
 }
@@ -149,15 +149,15 @@ const handler = {
   },
 };
 
-const API_URL = new URL(`ws://${location.host}/contract/command/`);
-const locutusApi = LocutusWsApi.open(API_URL, handler);
+const API_URL = new URL(`ws://${location.host}/contract/command`);
+const locutusApi = new LocutusWsApi(API_URL, handler);
 
 async function loadState() {
   const key = ContractKey.fromInstanceId(MODEL_CONTRACT);
   const fetchContract = false;
   const getRequest: GetRequest = new GetRequest(key, fetchContract);
 
-  await locutusApi.then((api) => api.get(getRequest));
+  await locutusApi.get(getRequest);
 }
 
 window.addEventListener("load", function (_ev: Event) {

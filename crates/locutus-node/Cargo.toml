@@ -19,7 +19,7 @@ path = "src/bin/dev-tool.rs"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path", "headers"] }
+axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path", "headers", "query"] }
 bincode = "1"
 bytes = "1"
 byteorder = "1"

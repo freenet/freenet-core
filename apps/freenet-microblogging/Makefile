@@ -11,7 +11,6 @@ $(error CARGO_TARGET_DIR is not set)
 endif
 
 build: \
-	build-tool \
 	webapp \
 	posts \
 	publish-webapp \
@@ -23,6 +22,7 @@ build-tool:
 
 webapp:
 	cd $(WEB_DIR)
+	npm run build
 
 	ldt build
 	cp ./build/locutus/freenet_microblogging_web ../../../crates/locutus-node/examples/

@@ -11,6 +11,7 @@ import { StateAndDeltaUpdateT } from "./common/state-and-delta-update";
 import { StateUpdateT } from "./common/state-update";
 import {
   ApplicationMessagesT,
+  AuthenticateT,
   ClientRequest,
   ClientRequestT,
   ClientRequestType,
@@ -65,6 +66,7 @@ import {
   GetSecretResponseT,
   WasmContractV1T,
 } from "./common";
+import { ErrorT } from "./host-response/error";
 
 // Common types
 /**
@@ -174,9 +176,6 @@ export class ContractKey extends ContractKeyT {
     if (instance.length !== 32 || (code && code.length !== 32)) {
       throw new TypeError("Invalid array length, expected 32 bytes");
     }
-
-    // print instance byte array
-    console.log(`instance: ${instance}`);
 
     let contract_instance_id = new ContractInstanceIdT(Array.from(instance));
     let contract_code: number[] = [];
@@ -591,7 +590,8 @@ export interface ResponseHandler {
  */
 
 const AUTHORIZATION_HEADER: string = "Authorization";
-const ENCODING_PROTOC_HEADER: string = "Encoding-Protocol";
+const ENCODING_PROTOC_HEADER: string = `Encoding-Protocol`;
+const ENCODING_PROTOC: string = "flatbuffers";
 
 export class LocutusWsApi {
   /**
@@ -605,46 +605,34 @@ export class LocutusWsApi {
    */
   private responseHandler: ResponseHandler;
 
-  static async open(
-    url: URL,
-    handler: ResponseHandler,
-    authToken?: string
-  ): Promise<LocutusWsApi> {
-    const initialHeaders = new Headers();
-    if (authToken) {
-      initialHeaders.append(AUTHORIZATION_HEADER, authToken);
-    }
-    initialHeaders.append(ENCODING_PROTOC_HEADER, "flatbuffers");
-
-    let socket;
-    if (url.protocol === "http:") {
-      socket = await fetch(url.toString(), {
-        method: "GET",
-        headers: initialHeaders,
-      }).then(() => {
-        return new WebSocket(url);
-      });
-    } else if (url.protocol === "ws:") {
-      socket = new WebSocket(url);
-    } else {
-      throw new Error(`unsupported protocol: ${url.protocol}`);
-    }
-    return new LocutusWsApi(socket!, handler);
-  }
-
   /**
    * @constructor
-   * @param ws - The websocket connection
+   * @param url - The websocket URL to establish the connection.
    * @param handler - The ResponseHandler implementation
    */
-  constructor(ws: WebSocket, handler: ResponseHandler) {
-    this.ws = ws;
+  constructor(url: URL, handler: ResponseHandler, authToken?: string) {
+    // let protocols = [`${ENCODING_PROTOC_HEADER}: ${ENCODING_PROTOC}`];
+    if (authToken) {
+      url.searchParams.append("authToken", authToken);
+      //   protocols.push(`${AUTHORIZATION_HEADER}: Bearer ${authToken}`);
+    }
+    url.searchParams.append("encodingProtocol", ENCODING_PROTOC);
+    this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
     this.responseHandler = handler;
     this.ws.onmessage = (ev) => {
       this.handleResponse(ev);
     };
     this.ws.addEventListener("open", (_) => {
+      if (!authToken) {
+        const request = new ClientRequestT(
+          ClientRequestType.Authenticate,
+          new AuthenticateT(authToken)
+        );
+        const fbb = new flatbuffers.Builder();
+        ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
+        this.ws.send(fbb.asUint8Array());
+      }
       handler.onOpen();
     });
   }
@@ -658,7 +646,7 @@ export class LocutusWsApi {
       let data = new flatbuffers.ByteBuffer(new Uint8Array(ev.data));
       response = HostResponse.getRootAsHostResponse(data).unpack();
     } catch (err) {
-      console.log(`found error: ${err}`);
+      console.error(err);
       return new Error(`${err}`);
     }
     switch (response.responseType) {
@@ -687,7 +675,7 @@ export class LocutusWsApi {
             break;
           default:
             const cause = "Contract response type not implemented";
-            console.log(cause);
+            console.error(cause);
             const err: HostError = {
               cause,
             };
@@ -701,9 +689,13 @@ export class LocutusWsApi {
         break;
       case HostResponseType.Ok:
         break;
+      case HostResponseType.Error:
+        const hostError = response.response as ErrorT;
+        this.responseHandler.onErr({ cause: hostError.msg!.toString() });
+        break;
       default:
         const cause = `Received wrong HostResponse type`;
-        console.log(cause);
+        console.error(cause);
         const err: HostError = {
           cause,
         };

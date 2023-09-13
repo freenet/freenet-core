@@ -41,8 +41,8 @@ impl Display for ClientId {
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AuthToken(Arc<str>);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct AuthToken(#[serde(deserialize_with = "AuthToken::deser_auth_token")] Arc<str>);
 
 impl AuthToken {
     pub fn as_str(&self) -> &str {
@@ -56,6 +56,16 @@ impl AuthToken {
         rng.fill(&mut token);
         let token_str = bs58::encode(token).into_string();
         AuthToken::from(token_str)
+    }
+}
+
+impl AuthToken {
+    fn deser_auth_token<'de, D>(deser: D) -> Result<Arc<str>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as Deserialize>::deserialize(deser)?;
+        Ok(value.into())
     }
 }
 
