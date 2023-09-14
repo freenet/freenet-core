@@ -23,15 +23,6 @@ async fn run(config: NodeConfig) -> Result<(), DynError> {
 }
 
 async fn run_local(config: NodeConfig) -> Result<(), DynError> {
-    match &config.bind {
-        IpAddr::V4(ip) if !ip.is_loopback() => {
-            return Err(format!("invalid ip: {ip}, expecting localhost").into())
-        }
-        IpAddr::V6(ip) if !ip.is_loopback() => {
-            return Err(format!("invalid ip: {ip}, expecting localhost").into())
-        }
-        _ => {}
-    }
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
 
     let contract_dir = config

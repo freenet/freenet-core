@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use std::collections::VecDeque;
 use std::fmt::Display;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::{
     collections::HashMap,
@@ -50,9 +51,19 @@ pub struct HttpGateway {
     pub(crate) attested_contracts: HashMap<AuthToken, (ContractInstanceId, ClientId)>,
 }
 
+#[derive(Clone)]
+struct Config {
+    localhost: bool,
+}
+
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
-    pub fn as_router() -> (Self, Router) {
+    pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
+        let localhost = match socket.ip() {
+            IpAddr::V4(ip) if ip.is_loopback() => true,
+            IpAddr::V6(ip) if ip.is_loopback() => true,
+            _ => false,
+        };
         let contract_web_path = std::env::temp_dir().join("locutus").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
 
@@ -63,11 +74,14 @@ impl HttpGateway {
             attested_contracts: HashMap::new(),
         };
 
+        let config = Config { localhost };
+
         let router = Router::new()
             .route("/", get(home))
-            .route("/contract/command", get(websocket_commands))
             .route("/contract/web/:key/", get(web_home))
+            .with_state(config)
             .route("/contract/web/:key/*path", get(web_subpages))
+            .route("/contract/command", get(websocket_commands))
             .layer(axum::middleware::from_fn(connection_info))
             .layer(Extension(request_sender));
 
@@ -167,13 +181,36 @@ async fn home() -> axum::response::Response {
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
+    axum::extract::State(config): axum::extract::State<Config>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    use axum::headers::HeaderMapExt;
+    use axum::headers::{Header, HeaderMapExt};
+
+    let domain = config
+        .localhost
+        .then_some("localhost")
+        .expect("non-local connections not supported yet");
     let token = AuthToken::generate();
+
+    let auth_header =
+        axum::headers::Authorization::<axum::headers::authorization::Bearer>::name().to_string();
+    let cookie = cookie::Cookie::build(auth_header, format!("Bearer {}", token.as_str()))
+        .domain(domain)
+        .path(format!("/contract/web/{key}"))
+        .same_site(cookie::SameSite::Strict)
+        .max_age(cookie::time::Duration::days(1))
+        .secure(!config.localhost)
+        .http_only(false)
+        .finish();
+
     let token_header = axum::headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_idx = web_handling::contract_home(key, rs, token).await?;
     let mut response = contract_idx.into_response();
     response.headers_mut().typed_insert(token_header);
+    response.headers_mut().insert(
+        axum::headers::SetCookie::name(),
+        axum::headers::HeaderValue::from_str(&cookie.to_string()).unwrap(),
+    );
+
     Ok(response)
 }
 
