@@ -624,10 +624,10 @@ export class LocutusWsApi {
       this.handleResponse(ev);
     };
     this.ws.addEventListener("open", (_) => {
-      if (!authToken) {
+      if (authToken) {
         const request = new ClientRequestT(
           ClientRequestType.Authenticate,
-          new AuthenticateT(authToken)
+          new AuthenticateT(authToken!)
         );
         const fbb = new flatbuffers.Builder();
         ClientRequest.finishClientRequestBuffer(fbb, request.pack(fbb));
