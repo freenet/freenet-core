@@ -95,13 +95,13 @@ async fn connection_info<B>(
     mut req: axum::http::Request<B>,
     next: axum::middleware::Next<B>,
 ) -> Response {
-    tracing::info!(
-        "headers: {:?}",
-        req.headers()
-            .iter()
-            .flat_map(|(k, v)| v.to_str().ok().map(|v| format!("{k}: {v}")))
-            .collect::<Vec<_>>()
-    );
+    // tracing::info!(
+    //     "headers: {:?}",
+    //     req.headers()
+    //         .iter()
+    //         .flat_map(|(k, v)| v.to_str().ok().map(|v| format!("{k}: {v}")))
+    //         .collect::<Vec<_>>()
+    // );
     let encoding_protoc = match encoding_protoc {
         Ok(protoc) => protoc.0,
         Err(err)
@@ -110,7 +110,6 @@ async fn connection_info<B>(
                 axum::extract::rejection::TypedHeaderRejectionReason::Missing
             ) =>
         {
-            tracing::info!(" from query: {encoding_protocol:?}");
             encoding_protocol.unwrap_or(EncodingProtocol::Flatbuffers)
         }
         Err(other) => return other.into_response(),
@@ -130,7 +129,7 @@ async fn connection_info<B>(
     };
 
     tracing::debug!(
-        "establishing connection with encoding protocol {encoding_protoc}, authenticated: {auth}",
+        "establishing connection with encoding protocol: {encoding_protoc}, authenticated: {auth}",
         auth = auth_token.is_some()
     );
     req.extensions_mut().insert(encoding_protoc);
@@ -189,6 +188,7 @@ async fn web_subpages(
 }
 
 #[derive(Clone, Copy, Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
 enum EncodingProtocol {
     /// Flatbuffers
     Flatbuffers,
