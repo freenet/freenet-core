@@ -10,14 +10,18 @@ ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
 endif
 
-build: \
+build-app: \
 	webapp \
 	posts \
 	publish-webapp \
 	publish-posts
 
+node: \
+	build-tool \
+	run-node
+
 build-tool:
-	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
+	cd $(LOCUTUS_DIR)/crates/locutus-node &&
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
 webapp:
