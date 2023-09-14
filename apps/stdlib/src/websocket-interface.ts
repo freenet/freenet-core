@@ -347,8 +347,8 @@ export class UpdateRequest extends UpdateT {
  * @public
  */
 export class GetRequest extends GetT {
-  constructor(key: ContractKey | null = null, fetchContract: boolean = false) {
-    const contract_key = key?.get_contract_key();
+  constructor(key: ContractKey, fetchContract: boolean = false) {
+    const contract_key = key.get_contract_key();
     super(contract_key, fetchContract);
   }
 }
