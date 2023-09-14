@@ -7,7 +7,7 @@ const config: Config.InitialOptions = {
     },
     roots: ["<rootDir>/tests", "<rootDir>/src"],
     moduleNameMapper: {
-        "host-response": "<rootDir>/src/host-response/host-response.ts",
+        "^(.*)\\.js$": "$1",
     }
 };
 export default config;
