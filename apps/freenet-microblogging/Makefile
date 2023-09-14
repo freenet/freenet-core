@@ -26,6 +26,7 @@ build-tool:
 
 webapp:
 	cd $(WEB_DIR)
+	npm i --force locutus-stdlib
 	npm run build
 
 	ldt build
