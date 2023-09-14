@@ -28,7 +28,7 @@ function getDocument(): Document {
 
 const DOCUMENT: Document = getDocument();
 
-const MODEL_CONTRACT = "4EhpHnF27Hqby5XtqqBSj2xbyBVLdTcfDAbTpnpEkG8o";
+const MODEL_CONTRACT = "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
 const KEY = ContractKey.fromInstanceId(MODEL_CONTRACT);
 
 function getState(hostResponse: GetResponse) {
