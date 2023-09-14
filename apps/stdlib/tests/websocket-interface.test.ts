@@ -1,40 +1,34 @@
 import {Server} from 'mock-socket';
+import {ContractResponseType,} from "../src/host-response";
 import {
-    ContractResponseType,
-} from "../src/host-response";
-import {
-    DelegateResponse,
+    ContractContainer,
+    ContractKey,
+    DelegateResponse, DeltaUpdate,
+    GetRequest,
     GetResponse,
     HostError,
     LocutusWsApi,
+    PutRequest,
     PutResponse,
     ResponseHandler,
-    UpdateNotification,
-    UpdateResponse
+    UpdateData,
+    UpdateNotification, UpdateRequest,
+    UpdateResponse,
+    WasmContractV1
 } from "../src";
+import {ContractType} from "../src/common/contract-type";
+import {ContractCodeT} from "../src/common/contract-code";
+import {RelatedContractsT} from "../src/client-request/related-contracts";
+import {UpdateDataType} from "../src/common/update-data-type";
 
 const TEST_ENCODED_KEY = "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
+const AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
 const WS_URL = "ws://localhost:1234/contract/command/";
-
-/**
- * Convert Uint8Array to ArrayBuffer.
- * @param array : Uint8Array
- */
-function toBuffer(array: Uint8Array): ArrayBuffer {
-    const buffer = new ArrayBuffer(array.length);
-    const view = new Uint8Array(buffer);
-
-    for (let i = 0; i < array.length; i++) {
-        view[i] = array[i];
-    }
-
-    return buffer;
-}
 
 describe("Locutus Websocket API - Result Deserialization", () => {
     let server: Server;
 
-    beforeAll(async () => {
+    beforeAll(() => {
         server = new Server(WS_URL);
     });
 
@@ -72,14 +66,14 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             }
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
         server.clients().forEach(client => {
-            client.send(toBuffer(PUT_OP));
+            client.send(PUT_OP.buffer);
         });
         expect(handledResponse).toEqual(ContractResponseType.PutResponse);
     });
 
-    test("should correctly deserialize Contract Get Response", async () => {
+    test("should correctly deserialize Contract Get Response", () => {
         const GET_OP = new Uint8Array([12, 0, 0, 0, 8, 0, 12, 0, 7, 0, 8, 0, 8, 0, 0,
             0, 0, 0, 0, 1, 12, 0, 0, 0, 8, 0, 14, 0, 7, 0, 8, 0, 8, 0, 0, 0, 0, 0, 0, 1, 16, 0, 0, 0, 0, 0, 10, 0, 12,
             0, 4, 0, 0, 0, 8, 0, 10, 0, 0, 0, 16, 1, 0, 0, 4, 0, 0, 0, 250, 0, 0, 0, 123, 10, 9, 34, 109, 101, 115, 115,
@@ -118,17 +112,16 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             },
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
 
         server.clients().forEach(client => {
-            client.send(toBuffer(GET_OP));
+            client.send(GET_OP.buffer);
         });
 
         expect(handledResponse).toEqual(ContractResponseType.GetResponse);
     });
 
-    // Add test fot UPDATE_NOTIFICATION_OP.
-    test("should correctly deserialize Contract Update Notification", async () => {
+    test("should correctly deserialize Contract Update Notification", () => {
         const UPDATE_NOTIFICATION_OP = new Uint8Array([4, 0, 0, 0, 220, 255, 255, 255, 8, 0, 0, 0,
             0, 0, 0, 1, 232, 255, 255, 255, 8, 0, 0, 0, 0, 0, 0, 3, 204, 255, 255, 255, 16, 0, 0, 0, 52, 0, 0, 0, 8, 0,
             12, 0, 11, 0, 4, 0, 8, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 2, 210, 255, 255, 255, 4, 0, 0, 0, 8, 0, 0, 0, 1, 2, 3,
@@ -155,15 +148,14 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             },
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
         server.clients().forEach(client => {
-            client.send(toBuffer(UPDATE_NOTIFICATION_OP));
+            client.send(UPDATE_NOTIFICATION_OP.buffer);
         });
         expect(handledResponse).toEqual(ContractResponseType.UpdateNotification);
     });
 
-    // Test for UPDATE_OP.
-    test("should correctly deserialize Contract Update", async () => {
+    test("should correctly deserialize Contract Update", () => {
         const UPDATE_OP = new Uint8Array([4, 0, 0, 0, 244, 255, 255, 255, 16, 0, 0, 0, 0, 0, 0, 1,
             8, 0, 12, 0, 11, 0, 4, 0, 8, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 4, 240, 255, 255, 255, 8, 0, 0, 0, 16, 0, 0, 0,
             0, 0, 0, 0, 8, 0, 12, 0, 8, 0, 4, 0, 8, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 8, 0, 4,
@@ -189,10 +181,203 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             },
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
         server.clients().forEach(client => {
-            client.send(toBuffer(UPDATE_OP));
+            client.send(UPDATE_OP.buffer);
         });
         expect(handledResponse).toEqual(ContractResponseType.UpdateResponse);
+    });
+
+    test("should correctly generate a ClientRequest for contract put operation", async () => {
+        // Define the expected Uint8Array request
+        let EXPECTED_PUT_REQ = new Uint8Array([
+            4, 0, 0, 0, 244, 255, 255, 255, 16, 0, 0, 0, 0, 0, 0, 1, 8, 0, 12, 0, 11, 0, 4, 0, 8,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 1, 198, 255, 255, 255, 12, 0, 0, 0, 20, 0, 0, 0, 36, 0,
+            0, 0, 170, 255, 255, 255, 4, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+            8, 0, 10, 0, 9, 0, 4, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 1, 10, 0, 16, 0, 12, 0, 8, 0, 4,
+            0, 10, 0, 0, 0, 12, 0, 0, 0, 76, 0, 0, 0, 92, 0, 0, 0, 176, 255, 255, 255, 8, 0, 0, 0,
+            16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 8, 0, 4, 0, 6, 0, 0, 0, 4, 0, 0, 0, 32, 0, 0, 0,
+            85, 111, 11, 171, 40, 85, 240, 177, 207, 81, 106, 157, 173, 90, 234, 2, 250, 253, 75,
+            210, 62, 7, 6, 34, 75, 26, 229, 230, 107, 167, 17, 108, 8, 0, 0, 0, 1, 2, 3, 4, 5, 6,
+            7, 8, 8, 0, 12, 0, 8, 0, 4, 0, 8, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 8, 0, 0, 0, 1, 2,
+            3, 4, 5, 6, 7, 8, 8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8
+        ]);
+
+        // Build the contract put operation object
+        let data = Array.from(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let codeHash = Array.from(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let contractCode = new ContractCodeT(data, codeHash);
+        let params = Array.from(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let key = ContractKey.fromInstanceId(TEST_ENCODED_KEY);
+        let contract = new WasmContractV1(contractCode, params, key);
+
+        let container = new ContractContainer(ContractType.WasmContractV1, contract);
+
+        let state = Array.from(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let relatedContracts = new RelatedContractsT([]);
+        let putRequest = new PutRequest(container, state, relatedContracts);
+
+        // Create a stubbed response handler
+        const testHandler: ResponseHandler = {
+            onContractPut: (_response: PutResponse): void => {
+            },
+            onContractGet: (_response: GetResponse): void => {
+            },
+            onContractUpdate: (response: UpdateResponse): void => {
+            },
+            onContractUpdateNotification: (_response: UpdateNotification): void => {
+            },
+            onDelegateResponse: (_response: DelegateResponse) => {
+            },
+            onErr: (_err: HostError): void => {
+            },
+            onOpen: () => {
+            },
+        };
+
+        // Flag to indicate if the expected PUT request was received
+        let receivedExpectedPutReq = false;
+
+        // Mock server behavior
+        server.on('connection', socket => {
+            socket.on('message', data => {
+                try {
+                    expect(data).toEqual(EXPECTED_PUT_REQ);
+                    receivedExpectedPutReq = true;
+                } catch (error) {
+                    console.log("Received unexpected message");
+                }
+            });
+        });
+
+        // Instantiate API and perform operations
+        const api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await api.put(putRequest);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // Verify that the expected PUT request was received
+        expect(receivedExpectedPutReq).toEqual(true);
+    });
+
+    test("should correctly generate a ClientRequest for contract get operation", async () => {
+        // Define the expected Uint8Array request
+        let EXPECTED_PUT_REQ = new Uint8Array([
+            4, 0, 0, 0, 244, 255, 255, 255, 16, 0, 0, 0, 0, 0, 0, 1, 8, 0, 12, 0, 11, 0, 4, 0, 8,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 3, 222, 255, 255, 255, 12, 0, 0, 0, 8, 0, 12, 0, 8, 0, 4,
+            0, 8, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 8, 0, 4, 0, 6, 0, 0, 0,
+            4, 0, 0, 0, 32, 0, 0, 0, 85, 111, 11, 171, 40, 85, 240, 177, 207, 81, 106, 157, 173,
+            90, 234, 2, 250, 253, 75, 210, 62, 7, 6, 34, 75, 26, 229, 230, 107, 167, 17, 108
+        ]);
+
+        // Build the contract get operation object
+        let key = ContractKey.fromInstanceId(TEST_ENCODED_KEY);
+        let getRequest = new GetRequest(key, false);
+
+        // Create a stubbed response handler
+        const testHandler: ResponseHandler = {
+            onContractPut: (_response: PutResponse): void => {
+            },
+            onContractGet: (_response: GetResponse): void => {
+            },
+            onContractUpdate: (response: UpdateResponse): void => {
+            },
+            onContractUpdateNotification: (_response: UpdateNotification): void => {
+            },
+            onDelegateResponse: (_response: DelegateResponse) => {
+            },
+            onErr: (_err: HostError): void => {
+            },
+            onOpen: () => {
+            },
+        };
+
+        // Flag to indicate if the expected GET request was received
+        let receivedExpectedGetReq = false;
+
+        // Mock server behavior
+        server.on('connection', socket => {
+            socket.on('message', data => {
+                try {
+                    expect(data).toEqual(EXPECTED_PUT_REQ);
+                    receivedExpectedGetReq = true;
+                } catch (error) {
+                    console.log("Received unexpected message");
+                }
+            });
+        });
+
+        // Instantiate API and perform operations
+        const api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await api.get(getRequest);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // Verify that the expected GET request was received
+        expect(receivedExpectedGetReq).toEqual(true);
+    });
+
+    test("should correctly generate a ClientRequest for contract update operation", async () => {
+        // Define the expected Uint8Array request
+        let EXPECTED_UPDATE_REQ = new Uint8Array([
+            4, 0, 0, 0, 220, 255, 255, 255, 8, 0, 0, 0, 0, 0, 0, 1, 232, 255, 255, 255, 8, 0, 0, 0,
+            0, 0, 0, 2, 204, 255, 255, 255, 16, 0, 0, 0, 52, 0, 0, 0, 8, 0, 12, 0, 11, 0, 4, 0, 8,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 2, 210, 255, 255, 255, 4, 0, 0, 0, 8, 0, 0, 0, 1, 2, 3,
+            4, 5, 6, 7, 8, 8, 0, 12, 0, 8, 0, 4, 0, 8, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 6, 0, 8, 0, 4, 0, 6, 0, 0, 0, 4, 0, 0, 0, 32, 0, 0, 0, 85, 111, 11, 171, 40,
+            85, 240, 177, 207, 81, 106, 157, 173, 90, 234, 2, 250, 253, 75, 210, 62, 7, 6, 34, 75,
+            26, 229, 230, 107, 167, 17, 108
+        ]);
+
+        // Build the contract update operation object
+        let key = ContractKey.fromInstanceId(TEST_ENCODED_KEY);
+
+        let delta = Array.from(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let deltaUpdate = new DeltaUpdate(delta);
+        let updateData = new UpdateData(UpdateDataType.DeltaUpdate, deltaUpdate);
+
+        let updateRequest = new UpdateRequest(key, updateData);
+
+        // Create a stubbed response handler
+        const testHandler: ResponseHandler = {
+            onContractPut: (_response: PutResponse): void => {
+            },
+            onContractGet: (_response: GetResponse): void => {
+            },
+            onContractUpdate: (response: UpdateResponse): void => {
+            },
+            onContractUpdateNotification: (_response: UpdateNotification): void => {
+            },
+            onDelegateResponse: (_response: DelegateResponse) => {
+            },
+            onErr: (_err: HostError): void => {
+            },
+            onOpen: () => {
+            },
+        };
+
+        // Flag to indicate if the expected UPDATE request was received
+        let receivedExpectedUpdateReq = false;
+
+        // Mock server behavior
+        server.on('connection', socket => {
+            socket.on('message', data => {
+                try {
+                    expect(data).toEqual(EXPECTED_UPDATE_REQ);
+                    receivedExpectedUpdateReq = true;
+                } catch (error) {
+                    console.log("Received unexpected message");
+                }
+            });
+        });
+
+        // Instantiate API and perform operations
+        const api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await api.update(updateRequest);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // Verify that the expected UPDATE request was received
+        expect(receivedExpectedUpdateReq).toEqual(true);
     });
 });
