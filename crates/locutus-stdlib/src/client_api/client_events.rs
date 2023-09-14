@@ -1337,113 +1337,27 @@ impl<T> From<ContractResponse<T>> for HostResponse<T> {
 #[cfg(test)]
 mod client_request_test {
     use crate::client_api::{ContractRequest, TryFromFbs};
-    use crate::client_request_generated::client_request::{
-        root_as_client_request, ClientRequest as FbsClientRequest, ClientRequestArgs,
-        ClientRequestType, ContractRequest as FbsContractRequest, ContractRequestArgs,
-        ContractRequestType, Put, PutArgs, RelatedContract,
-        RelatedContracts as FbsRelatedContracts, RelatedContractsArgs,
-    };
-    use crate::common_generated::common::{
-        ContractCode, ContractCodeArgs, ContractContainer, ContractContainerArgs,
-        ContractInstanceId as FbsContractInstanceId, ContractInstanceIdArgs,
-        ContractKey as FbsContractKey, ContractKeyArgs, ContractType, WasmContractV1,
-        WasmContractV1Args,
-    };
+    use crate::client_request_generated::client_request::root_as_client_request;
+    use crate::contract_interface::UpdateData;
 
-    fn build_test_fbs_contract_put_op() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let mut builder = flatbuffers::FlatBufferBuilder::new();
-
-        // generate WasmContractV1 key:ContractKey offset
-        let instance_bytes: Vec<u8> = vec![1, 2, 3, 4];
-        let instance_data = builder.create_vector(instance_bytes.as_slice());
-        let instance_offset = FbsContractInstanceId::create(
-            &mut builder,
-            &ContractInstanceIdArgs {
-                data: Some(instance_data),
-            },
-        );
-        let code_hash_bytes: Vec<u8> = vec![1, 2, 3, 4];
-        let code_hash_data = builder.create_vector(code_hash_bytes.as_slice());
-        let key_offset = FbsContractKey::create(
-            &mut builder,
-            &ContractKeyArgs {
-                instance: Some(instance_offset),
-                code: Some(code_hash_data),
-            },
-        );
-
-        let contract_bytes: Vec<u8> = vec![7, 3, 9, 5];
-        let contract_data = builder.create_vector(contract_bytes.as_slice());
-        let code_hash_bytes: Vec<u8> = vec![1, 2, 3, 4];
-        let contract_code_hash = builder.create_vector(code_hash_bytes.as_slice());
-        let contract_code_offset = ContractCode::create(
-            &mut builder,
-            &ContractCodeArgs {
-                data: Some(contract_data),
-                code_hash: Some(contract_code_hash),
-            },
-        );
-        let params: Vec<u8> = vec![];
-        let contract_params = builder.create_vector(params.as_slice());
-        let contract_version = builder.create_string("1.0.0");
-        let contract_offset = WasmContractV1::create(
-            &mut builder,
-            &WasmContractV1Args {
-                data: Some(contract_code_offset),
-                parameters: Some(contract_params),
-                key: Some(key_offset),
-            },
-        );
-        let container_offset = ContractContainer::create(
-            &mut builder,
-            &ContractContainerArgs {
-                contract_type: ContractType::WasmContractV1,
-                contract: Some(contract_offset.as_union_value()),
-            },
-        );
-        let state_bytes: Vec<u8> = vec![1, 2, 3, 4];
-        let state_data = builder.create_vector(state_bytes.as_slice());
-
-        let contracts = builder.create_vector(&[] as &[flatbuffers::WIPOffset<RelatedContract>]);
-        // Crear una instancia de RelatedContracts con el vector vacío
-        let related_contracts = FbsRelatedContracts::create(
-            &mut builder,
-            &RelatedContractsArgs {
-                contracts: Some(contracts),
-            },
-        );
-
-        let put_offset = Put::create(
-            &mut builder,
-            &PutArgs {
-                container: Some(container_offset),
-                wrapped_state: Some(state_data),
-                related_contracts: Some(related_contracts),
-            },
-        );
-        let contract_request_offset = FbsContractRequest::create(
-            &mut builder,
-            &ContractRequestArgs {
-                contract_request: Some(put_offset.as_union_value()),
-                contract_request_type: ContractRequestType::Put,
-            },
-        );
-        let client_request_offset = FbsClientRequest::create(
-            &mut builder,
-            &ClientRequestArgs {
-                client_request: Some(contract_request_offset.as_union_value()),
-                client_request_type: ClientRequestType::ContractRequest,
-            },
-        );
-        builder.finish(client_request_offset, None);
-        Ok(builder.finished_data().to_vec())
-    }
+    const EXPECTED_ENCODED_CONTRACT_ID: &'static str =
+        "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
 
     #[test]
-    fn test_build_contract_op_from_fbs() -> Result<(), Box<dyn std::error::Error>> {
-        let test_client_request_bytes = build_test_fbs_contract_put_op()?;
-        let request = if let Ok(client_request) = root_as_client_request(&test_client_request_bytes)
-        {
+    fn test_build_contract_put_op_from_fbs() -> Result<(), Box<dyn std::error::Error>> {
+        let put_req_op = vec![
+            4, 0, 0, 0, 244, 255, 255, 255, 16, 0, 0, 0, 0, 0, 0, 1, 8, 0, 12, 0, 11, 0, 4, 0, 8,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 1, 198, 255, 255, 255, 12, 0, 0, 0, 20, 0, 0, 0, 36, 0,
+            0, 0, 170, 255, 255, 255, 4, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+            8, 0, 10, 0, 9, 0, 4, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 1, 10, 0, 16, 0, 12, 0, 8, 0, 4,
+            0, 10, 0, 0, 0, 12, 0, 0, 0, 76, 0, 0, 0, 92, 0, 0, 0, 176, 255, 255, 255, 8, 0, 0, 0,
+            16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 8, 0, 4, 0, 6, 0, 0, 0, 4, 0, 0, 0, 32, 0, 0, 0,
+            85, 111, 11, 171, 40, 85, 240, 177, 207, 81, 106, 157, 173, 90, 234, 2, 250, 253, 75,
+            210, 62, 7, 6, 34, 75, 26, 229, 230, 107, 167, 17, 108, 8, 0, 0, 0, 1, 2, 3, 4, 5, 6,
+            7, 8, 8, 0, 12, 0, 8, 0, 4, 0, 8, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 8, 0, 0, 0, 1, 2,
+            3, 4, 5, 6, 7, 8, 8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
+        let request = if let Ok(client_request) = root_as_client_request(&put_req_op) {
             let contract_request = client_request.client_request_as_contract_request().unwrap();
             ContractRequest::try_decode_fbs(&contract_request)?
         } else {
@@ -1454,16 +1368,82 @@ mod client_request_test {
             ContractRequest::Put {
                 contract,
                 state,
-                related_contracts,
+                related_contracts: _,
             } => {
-                let code_bytes: Vec<u8> = vec![1, 2, 3, 4];
                 assert_eq!(
                     contract.to_string(),
                     "wasm container version 0.0.1 of contract \
-                Contract(8VVb8AYMEf2oWfCa48C2UtSnTt9dLheZyEQvkFkCb6oC)"
+                Contract(D8fdVLbRyMLw5mZtPRpWMFcrXGN2z8Nq8UGcLGPFBg2W)"
                 );
-                assert_eq!(contract.unwrap_v1().data.data(), &[7, 3, 9, 5]);
-                assert_eq!(state.to_vec(), &[1, 2, 3, 4]);
+                assert_eq!(contract.unwrap_v1().data.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+                assert_eq!(state.to_vec(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+            }
+            _ => panic!("wrong contract request type"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_contract_get_op_from_fbs() -> Result<(), Box<dyn std::error::Error>> {
+        let get_req_op = vec![
+            4, 0, 0, 0, 244, 255, 255, 255, 16, 0, 0, 0, 0, 0, 0, 1, 8, 0, 12, 0, 11, 0, 4, 0, 8,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 3, 222, 255, 255, 255, 12, 0, 0, 0, 8, 0, 12, 0, 8, 0, 4,
+            0, 8, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 8, 0, 4, 0, 6, 0, 0, 0,
+            4, 0, 0, 0, 32, 0, 0, 0, 85, 111, 11, 171, 40, 85, 240, 177, 207, 81, 106, 157, 173,
+            90, 234, 2, 250, 253, 75, 210, 62, 7, 6, 34, 75, 26, 229, 230, 107, 167, 17, 108,
+        ];
+        let request = if let Ok(client_request) = root_as_client_request(&get_req_op) {
+            let contract_request = client_request.client_request_as_contract_request().unwrap();
+            ContractRequest::try_decode_fbs(&contract_request)?
+        } else {
+            panic!("failed to decode client request")
+        };
+
+        match request {
+            ContractRequest::Get {
+                key,
+                fetch_contract,
+            } => {
+                assert_eq!(key.encoded_contract_id(), EXPECTED_ENCODED_CONTRACT_ID);
+                assert_eq!(fetch_contract, false);
+            }
+            _ => panic!("wrong contract request type"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_contract_update_op_from_fbs() -> Result<(), Box<dyn std::error::Error>> {
+        let update_op = vec![
+            4, 0, 0, 0, 220, 255, 255, 255, 8, 0, 0, 0, 0, 0, 0, 1, 232, 255, 255, 255, 8, 0, 0, 0,
+            0, 0, 0, 2, 204, 255, 255, 255, 16, 0, 0, 0, 52, 0, 0, 0, 8, 0, 12, 0, 11, 0, 4, 0, 8,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 2, 210, 255, 255, 255, 4, 0, 0, 0, 8, 0, 0, 0, 1, 2, 3,
+            4, 5, 6, 7, 8, 8, 0, 12, 0, 8, 0, 4, 0, 8, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 6, 0, 8, 0, 4, 0, 6, 0, 0, 0, 4, 0, 0, 0, 32, 0, 0, 0, 85, 111, 11, 171, 40,
+            85, 240, 177, 207, 81, 106, 157, 173, 90, 234, 2, 250, 253, 75, 210, 62, 7, 6, 34, 75,
+            26, 229, 230, 107, 167, 17, 108,
+        ];
+        let request = if let Ok(client_request) = root_as_client_request(&update_op) {
+            let contract_request = client_request.client_request_as_contract_request().unwrap();
+            ContractRequest::try_decode_fbs(&contract_request)?
+        } else {
+            panic!("failed to decode client request")
+        };
+
+        match request {
+            ContractRequest::Update { key, data } => {
+                assert_eq!(
+                    key.encoded_contract_id(),
+                    "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9"
+                );
+                match data {
+                    UpdateData::Delta(delta) => {
+                        assert_eq!(delta.to_vec(), &[1, 2, 3, 4, 5, 6, 7, 8])
+                    }
+                    _ => panic!("wrong update data type"),
+                }
             }
             _ => panic!("wrong contract request type"),
         }
