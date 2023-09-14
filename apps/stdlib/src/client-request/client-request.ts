@@ -2,6 +2,7 @@
 
 import * as flatbuffers from 'flatbuffers';
 
+import { Authenticate, AuthenticateT } from '../client-request/authenticate.js';
 import { ClientRequestType, unionToClientRequestType, unionListToClientRequestType } from '../client-request/client-request-type.js';
 import { ContractRequest, ContractRequestT } from '../client-request/contract-request.js';
 import { DelegateRequest, DelegateRequestT } from '../client-request/delegate-request.js';
@@ -94,7 +95,7 @@ unpackTo(_o: ClientRequestT): void {
 export class ClientRequestT implements flatbuffers.IGeneratedObject {
 constructor(
   public clientRequestType: ClientRequestType = ClientRequestType.NONE,
-  public clientRequest: ContractRequestT|DelegateRequestT|DisconnectT|null = null
+  public clientRequest: AuthenticateT|ContractRequestT|DelegateRequestT|DisconnectT|null = null
 ){}
 
 

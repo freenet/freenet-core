@@ -1204,7 +1204,7 @@ impl TryFromTsStd<&rmpv::Value> for ContractKey {
                     .map(|(key, val)| (key.as_str().unwrap(), val)),
             ),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding ContractKey, input value is not a map".to_string(),
                 })
             }
@@ -1213,7 +1213,7 @@ impl TryFromTsStd<&rmpv::Value> for ContractKey {
         let instance_id = match key_map.get("instance") {
             Some(instance_value) => bs58::encode(&instance_value.as_slice().unwrap()).into_string(),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding WrappedContract, instance not found".to_string(),
                 })
             }
@@ -1225,12 +1225,6 @@ impl TryFromTsStd<&rmpv::Value> for ContractKey {
 
 impl<'a> TryFromFbs<&FbsContractKey<'a>> for ContractKey {
     fn try_decode_fbs(key: &FbsContractKey<'a>) -> Result<Self, WsApiError> {
-        tracing::debug!("Key instance: {:?}", key.instance());
-        tracing::debug!("Key instance data: {:?}", key.instance().data());
-        tracing::debug!(
-            "Key instance data bytes: {:?}",
-            key.instance().data().bytes()
-        );
         let key_bytes: [u8; CONTRACT_KEY_SIZE] = key.instance().data().bytes().try_into().unwrap();
         let instance = ContractInstanceId::new(key_bytes);
         let code = key.code().map(|code_hash| CodeHash::new(code_hash.bytes()));
@@ -1444,7 +1438,7 @@ impl TryFromTsStd<&rmpv::Value> for WrappedContract {
                     .map(|(key, val)| (key.as_str().unwrap(), val)),
             ),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding WrappedContract, input value is not a map".to_string(),
                 })
             }
@@ -1453,7 +1447,7 @@ impl TryFromTsStd<&rmpv::Value> for WrappedContract {
         let key = match contract_map.get("key") {
             Some(key_value) => ContractKey::try_decode(*key_value).unwrap(),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding WrappedContract, key not found".to_string(),
                 })
             }
@@ -1466,7 +1460,7 @@ impl TryFromTsStd<&rmpv::Value> for WrappedContract {
                     .into_owned(),
             ),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding WrappedContract, data not found".to_string(),
                 })
             }
@@ -1475,7 +1469,7 @@ impl TryFromTsStd<&rmpv::Value> for WrappedContract {
         let params = match contract_map.get("parameters") {
             Some(params_value) => Parameters::try_decode(*params_value).unwrap().into_owned(),
             _ => {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "Failed decoding WrappedContract, parameters not found".to_string(),
                 })
             }

@@ -97,11 +97,16 @@ table Ok {
   msg:string(required);
 }
 
+table Error {
+  msg:string(required);
+}
+
 union HostResponseType {
   ContractResponse,
   DelegateResponse,
   GenerateRandData,
-  Ok
+  Ok,
+  Error
 }
 
 table HostResponse {

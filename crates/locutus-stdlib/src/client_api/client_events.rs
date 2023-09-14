@@ -167,6 +167,7 @@ pub enum ClientRequest<'a> {
     DelegateOp(#[serde(borrow)] DelegateRequest<'a>),
     ContractOp(#[serde(borrow)] ContractRequest<'a>),
     Disconnect { cause: Option<String> },
+    Authenticate { token: String },
 }
 
 impl ClientRequest<'_> {
@@ -209,6 +210,7 @@ impl ClientRequest<'_> {
                 ClientRequest::DelegateOp(op)
             }
             ClientRequest::Disconnect { cause } => ClientRequest::Disconnect { cause },
+            ClientRequest::Authenticate { token } => ClientRequest::Authenticate { token },
         }
     }
 
@@ -237,6 +239,13 @@ impl ClientRequest<'_> {
                             .cause()
                             .map(|cuase_msg| cuase_msg.to_string());
                         ClientRequest::Disconnect { cause }
+                    }
+                    ClientRequestType::Authenticate => {
+                        let auth_req = client_request.client_request_as_authenticate().unwrap();
+                        let token = auth_req.token();
+                        ClientRequest::Authenticate {
+                            token: token.to_owned(),
+                        }
                     }
                     _ => unreachable!(),
                 },
@@ -324,11 +333,8 @@ impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
 /// Deserializes a `ContractRequest` from a MessagePack encoded request.
 impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
     fn try_decode(msg: &[u8]) -> Result<Self, WsApiError> {
-        let value = rmpv::decode::read_value(&mut Cursor::new(msg)).map_err(|e| {
-            WsApiError::MsgpackDecodeError {
-                cause: format!("{e}"),
-            }
-        })?;
+        let value = rmpv::decode::read_value(&mut Cursor::new(msg))
+            .map_err(|e| WsApiError::deserialization(format!("{e}")))?;
 
         let req: ContractRequest = {
             if value.is_map() {
@@ -381,7 +387,7 @@ impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
                     _ => unreachable!(),
                 }
             } else {
-                return Err(WsApiError::MsgpackDecodeError {
+                return Err(WsApiError::DeserError {
                     cause: "value is not a map".into(),
                 });
             }
@@ -581,6 +587,7 @@ impl Display for ClientRequest<'_> {
                 }
             },
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
+            ClientRequest::Authenticate { .. } => write!(f, "authenticate"),
         }
     }
 }
@@ -652,7 +659,7 @@ impl<'a> TryFromFbs<&FbsDelegateRequest<'a>> for DelegateRequest<'a> {
 }
 
 /// A response to a previous [`ClientRequest`]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 #[non_exhaustive]
 pub enum HostResponse<T = WrappedState> {
     ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),

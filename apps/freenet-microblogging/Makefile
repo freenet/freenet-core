@@ -10,19 +10,24 @@ ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
 endif
 
-build: \
-	build-tool \
+build-app: \
 	webapp \
 	posts \
 	publish-webapp \
 	publish-posts
 
+node: \
+	build-tool \
+	run-node
+
 build-tool:
-	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
+	cd $(LOCUTUS_DIR)/crates/locutus-node &&
 	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
 
 webapp:
 	cd $(WEB_DIR)
+	npm i --force locutus-stdlib
+	npm run build
 
 	ldt build
 	cp ./build/locutus/freenet_microblogging_web ../../../crates/locutus-node/examples/
@@ -36,7 +41,7 @@ publish-webapp:
 posts:
 	cd $(POSTS_DIR)
 
-	${CARGO_TARGET_DIR}/debug/ldt build
+	ldt build
 	cp ./build/locutus/freenet_microblogging_posts ../../../../crates/locutus-node/examples/
 	cp ./build/locutus/contract-state ../../../../crates/locutus-node/examples/freenet_microblogging_posts_state
 
@@ -46,7 +51,7 @@ publish-posts:
 	ldt publish --code build/locutus/freenet_microblogging_posts contract --state build/locutus/contract-state
 
 run-node:
-	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,info locutus-node local
+	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,locutus_node=debug,info locutus-node local
 
 run:
 	cd $(LOCUTUS_DIR)

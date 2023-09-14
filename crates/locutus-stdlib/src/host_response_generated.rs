@@ -233,15 +233,16 @@ pub struct OutboundDelegateMsgTypeUnionTableOffset {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_HOST_RESPONSE_TYPE: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_HOST_RESPONSE_TYPE: u8 = 4;
+pub const ENUM_MAX_HOST_RESPONSE_TYPE: u8 = 5;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_HOST_RESPONSE_TYPE: [HostResponseType; 5] = [
+pub const ENUM_VALUES_HOST_RESPONSE_TYPE: [HostResponseType; 6] = [
   HostResponseType::NONE,
   HostResponseType::ContractResponse,
   HostResponseType::DelegateResponse,
   HostResponseType::GenerateRandData,
   HostResponseType::Ok,
+  HostResponseType::Error,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -254,15 +255,17 @@ impl HostResponseType {
   pub const DelegateResponse: Self = Self(2);
   pub const GenerateRandData: Self = Self(3);
   pub const Ok: Self = Self(4);
+  pub const Error: Self = Self(5);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 4;
+  pub const ENUM_MAX: u8 = 5;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::ContractResponse,
     Self::DelegateResponse,
     Self::GenerateRandData,
     Self::Ok,
+    Self::Error,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
@@ -272,6 +275,7 @@ impl HostResponseType {
       Self::DelegateResponse => Some("DelegateResponse"),
       Self::GenerateRandData => Some("GenerateRandData"),
       Self::Ok => Some("Ok"),
+      Self::Error => Some("Error"),
       _ => None,
     }
   }
@@ -2381,6 +2385,104 @@ impl core::fmt::Debug for Ok<'_> {
       ds.finish()
   }
 }
+pub enum ErrorOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct Error<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for Error<'a> {
+  type Inner = Error<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> Error<'a> {
+  pub const VT_MSG: flatbuffers::VOffsetT = 4;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    Error { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args ErrorArgs<'args>
+  ) -> flatbuffers::WIPOffset<Error<'bldr>> {
+    let mut builder = ErrorBuilder::new(_fbb);
+    if let Some(x) = args.msg { builder.add_msg(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn msg(&self) -> &'a str {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Error::VT_MSG, None).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for Error<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("msg", Self::VT_MSG, true)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct ErrorArgs<'a> {
+    pub msg: Option<flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for ErrorArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    ErrorArgs {
+      msg: None, // required field
+    }
+  }
+}
+
+pub struct ErrorBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> ErrorBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_msg(&mut self, msg: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Error::VT_MSG, msg);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ErrorBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    ErrorBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<Error<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, Error::VT_MSG,"msg");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for Error<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("Error");
+      ds.field("msg", &self.msg());
+      ds.finish()
+  }
+}
 pub enum HostResponseOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -2486,6 +2588,20 @@ impl<'a> HostResponse<'a> {
     }
   }
 
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn response_as_error(&self) -> Option<Error<'a>> {
+    if self.response_type() == HostResponseType::Error {
+      let u = self.response();
+      // Safety:
+      // Created from a valid Table for this object
+      // Which contains a valid union in this slot
+      Some(unsafe { Error::init_from_table(u) })
+    } else {
+      None
+    }
+  }
+
 }
 
 impl flatbuffers::Verifiable for HostResponse<'_> {
@@ -2501,6 +2617,7 @@ impl flatbuffers::Verifiable for HostResponse<'_> {
           HostResponseType::DelegateResponse => v.verify_union_variant::<flatbuffers::ForwardsUOffset<DelegateResponse>>("HostResponseType::DelegateResponse", pos),
           HostResponseType::GenerateRandData => v.verify_union_variant::<flatbuffers::ForwardsUOffset<GenerateRandData>>("HostResponseType::GenerateRandData", pos),
           HostResponseType::Ok => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Ok>>("HostResponseType::Ok", pos),
+          HostResponseType::Error => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Error>>("HostResponseType::Error", pos),
           _ => Ok(()),
         }
      })?
@@ -2579,6 +2696,13 @@ impl core::fmt::Debug for HostResponse<'_> {
         },
         HostResponseType::Ok => {
           if let Some(x) = self.response_as_ok() {
+            ds.field("response", &x)
+          } else {
+            ds.field("response", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        HostResponseType::Error => {
+          if let Some(x) = self.response_as_error() {
             ds.field("response", &x)
           } else {
             ds.field("response", &"InvalidFlatbuffer: Union discriminant does not match value.")
