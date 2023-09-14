@@ -59,6 +59,14 @@ impl AuthToken {
     }
 }
 
+impl std::ops::Deref for AuthToken {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl AuthToken {
     fn deser_auth_token<'de, D>(deser: D) -> Result<Arc<str>, D::Error>
     where

@@ -42,7 +42,7 @@ enum HostCallbackResult {
 }
 
 pub mod local_node {
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
 
     use locutus_core::{
         either::{self, Either},
@@ -56,7 +56,16 @@ pub mod local_node {
         mut executor: Executor,
         socket: SocketAddr,
     ) -> Result<(), DynError> {
-        let (mut http_handle, router) = HttpGateway::as_router();
+        match socket.ip() {
+            IpAddr::V4(ip) if !ip.is_loopback() => {
+                return Err(format!("invalid ip: {ip}, expecting localhost").into())
+            }
+            IpAddr::V6(ip) if !ip.is_loopback() => {
+                return Err(format!("invalid ip: {ip}, expecting localhost").into())
+            }
+            _ => {}
+        }
+        let (mut http_handle, router) = HttpGateway::as_router(&socket);
         let _ws_handle = WebSocketProxy::as_upgrade(socket, router).await?;
         // FIXME: use combinator
         // let mut all_clients =

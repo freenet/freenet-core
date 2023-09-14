@@ -579,6 +579,25 @@ export interface ResponseHandler {
   onOpen: () => void;
 }
 
+const AUTHORIZATION_HEADER: string = "Authorization";
+const ENCODING_PROTOC_HEADER: string = `Encoding-Protocol`;
+const ENCODING_PROTOC: string = "flatbuffers";
+
+function getAuthTokenFromCookie(): string | null {
+  const cookies = document.cookie.split(";");
+  for (let cookie of cookies) {
+    const [cookieName, cookieValue] = cookie.trim().split("=");
+    if (cookieName === "authorization") {
+      const authString = decodeURIComponent(cookieValue).split("Bearer ");
+      if (authString.length == 2) {
+        return authString[1];
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
  * The `LocutusWsApi` provides the API to manage the connection to the host, handle responses, and send requests.
  * @example
@@ -588,11 +607,6 @@ export interface ResponseHandler {
  * const locutusApi = new LocutusWsApi(API_URL, handler);
  * ```
  */
-
-const AUTHORIZATION_HEADER: string = "Authorization";
-const ENCODING_PROTOC_HEADER: string = `Encoding-Protocol`;
-const ENCODING_PROTOC: string = "flatbuffers";
-
 export class LocutusWsApi {
   /**
    * Websocket object for creating and managing a WebSocket connection to a server,
@@ -611,10 +625,15 @@ export class LocutusWsApi {
    * @param handler - The ResponseHandler implementation
    */
   constructor(url: URL, handler: ResponseHandler, authToken?: string) {
-    // let protocols = [`${ENCODING_PROTOC_HEADER}: ${ENCODING_PROTOC}`];
+    const AUTH_TOKEN_PARAM = "authToken";
     if (authToken) {
-      url.searchParams.append("authToken", authToken);
-      //   protocols.push(`${AUTHORIZATION_HEADER}: Bearer ${authToken}`);
+      url.searchParams.append(AUTH_TOKEN_PARAM, authToken);
+    } else {
+      // try to get the auth token from cookies
+      const cookie = getAuthTokenFromCookie();
+      if (cookie) {
+        url.searchParams.append(AUTH_TOKEN_PARAM, cookie);
+      }
     }
     url.searchParams.append("encodingProtocol", ENCODING_PROTOC);
     this.ws = new WebSocket(url);
