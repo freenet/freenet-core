@@ -3,8 +3,6 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::client_api::{TryFromTsStd, WsApiError};
-
 /// Data that forms part of a contract or a delegate along with the WebAssembly code.
 ///
 /// This is supplied to the contract as a parameter to the contract's functions. Parameters are
@@ -46,13 +44,6 @@ impl<'a> From<Vec<u8>> for Parameters<'a> {
 impl<'a> From<&'a [u8]> for Parameters<'a> {
     fn from(s: &'a [u8]) -> Self {
         Parameters(Cow::from(s))
-    }
-}
-
-impl<'a> TryFromTsStd<&'a rmpv::Value> for Parameters<'a> {
-    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
-        let params = value.as_slice().unwrap();
-        Ok(Parameters::from(params))
     }
 }
 

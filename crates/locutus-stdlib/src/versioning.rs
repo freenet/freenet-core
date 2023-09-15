@@ -6,9 +6,8 @@ use std::sync::Arc;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
 
-use crate::client_api::{TryFromFbs, TryFromTsStd, WsApiError};
+use crate::client_api::{TryFromFbs, WsApiError};
 use crate::client_request_generated::client_request::{
     DelegateContainer as FbsDelegateContainer, DelegateType,
 };
@@ -391,46 +390,6 @@ impl ContractCode<'_> {
                 output.extend(self.data());
                 Ok(output)
             }
-        }
-    }
-}
-
-impl TryFromTsStd<&rmpv::Value> for ContractContainer {
-    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
-        let container_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
-            Some(map_value) => HashMap::from_iter(
-                map_value
-                    .iter()
-                    .map(|(key, val)| (key.as_str().unwrap(), val)),
-            ),
-            _ => {
-                return Err(WsApiError::DeserError {
-                    cause: "Failed decoding ContractContainer, input value is not a map"
-                        .to_string(),
-                })
-            }
-        };
-
-        let container_version = match container_map.get("version") {
-            Some(version_value) => (*version_value).as_str().unwrap(),
-            _ => {
-                return Err(WsApiError::DeserError {
-                    cause: "Failed decoding ContractContainer, version not found".to_string(),
-                })
-            }
-        };
-
-        match container_version {
-            "V1" => {
-                let contract =
-                    WrappedContract::try_decode(value).map_err(|e| WsApiError::DeserError {
-                        cause: format!("{e}"),
-                    })?;
-                Ok(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-                    contract,
-                )))
-            }
-            _ => unreachable!(),
         }
     }
 }
