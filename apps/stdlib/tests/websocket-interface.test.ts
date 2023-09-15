@@ -14,6 +14,7 @@ import {
 } from "../src";
 
 const TEST_ENCODED_KEY = "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
+const AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
 const WS_URL = "ws://localhost:1234/contract/command/";
 
 /**
@@ -72,7 +73,7 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             }
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
         server.clients().forEach(client => {
             client.send(toBuffer(PUT_OP));
         });
@@ -118,7 +119,7 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             },
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
 
         server.clients().forEach(client => {
             client.send(toBuffer(GET_OP));
@@ -155,7 +156,7 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             },
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
         server.clients().forEach(client => {
             client.send(toBuffer(UPDATE_NOTIFICATION_OP));
         });
@@ -189,7 +190,7 @@ describe("Locutus Websocket API - Result Deserialization", () => {
             onOpen: () => {
             },
         };
-        const _api = new LocutusWsApi(new URL(WS_URL), testHandler);
+        const _api = new LocutusWsApi(new URL(WS_URL), testHandler, AUTH_TOKEN);
         server.clients().forEach(client => {
             client.send(toBuffer(UPDATE_OP));
         });
