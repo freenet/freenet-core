@@ -18,8 +18,6 @@
 
 # Freenet
 
-## (Formerly Locutus)
-
 The Internet has grown increasingly centralized over the past 25 years, such that a handful of companies now effectively control the Internet infrastructure. The public square is privately owned, threatening freedom of speech and democracy.
 
 Freenet is a software platform that makes it easy to create decentralized alternatives to today's centralized tech companies. These decentralized apps will be easy to use, scalable, and secured through cryptography.
@@ -52,6 +50,10 @@ A very simple contract might require that the state is a list of messages, each 
 
 Freenet is implemented in Rust and will be available across all major operating systems, desktop and mobile.
 
+## What is Locutus?
+
+Locutus was the working title used for this successor to the original Freenet, in March 2023 it was renamed to "Freenet" or "Freenet 2023", this repository was renamed from `locutus` to `freenet-core` in September 2023.
+
 ## Stay up to date
 
 [![Twitter Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
@@ -71,7 +73,7 @@ generously supported our work with a grant.
 
 ### FUTO
 
-FUTO has generously awarded Freenet a Legendary Grant to support Freenet development.
+FUTO has generously awarded Freenet two Legendary Grants to support Freenet development.
 
 ### Supporting Freenet
 
