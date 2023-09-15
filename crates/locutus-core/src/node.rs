@@ -7,7 +7,13 @@
 //! - libp2p: all the connection is handled by libp2p.
 //! - In memory: a simplifying node used for emulation purposes mainly.
 
-use std::{fmt::Display, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    fmt::Display,
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
@@ -20,8 +26,8 @@ use self::{
 };
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
-    config::{GlobalExecutor, CONFIG},
-    contract::{storages::StorageContractHandler, ContractError, MockRuntime},
+    config::GlobalExecutor,
+    contract::{ContractError, NetworkContractHandler},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
         get,
@@ -30,6 +36,7 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
     util::{ExponentialBackoff, IterExt},
+    Config,
 };
 
 use crate::operations::handle_op_request;
@@ -44,6 +51,23 @@ mod op_state;
 mod p2p_impl;
 #[cfg(test)]
 pub(crate) mod test;
+
+#[derive(clap::Parser, Clone, Debug)]
+pub struct NodeConfig {
+    /// Node operation mode.
+    #[clap(value_enum, default_value_t=crate::OperationMode::Local)]
+    pub mode: crate::OperationMode,
+    /// Overrides the default data directory where Locutus contract files are stored.
+    pub node_data_dir: Option<PathBuf>,
+
+    /// Address to bind to
+    #[arg(long, short, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    pub address: IpAddr,
+
+    /// Port to expose api on
+    #[arg(long, short, default_value_t = 50509)]
+    pub port: u16,
+}
 
 pub struct Node(NodeP2P);
 
@@ -65,7 +89,7 @@ impl Node {
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-pub struct NodeConfig<const CLIENTS: usize> {
+pub struct NodeBuilder<const CLIENTS: usize> {
     /// local peer private key in
     pub(crate) local_key: identity::Keypair,
     // optional local info, in case this is an initial bootstrap node
@@ -85,14 +109,14 @@ pub struct NodeConfig<const CLIENTS: usize> {
     pub(crate) clients: [BoxedClient; CLIENTS],
 }
 
-impl<const CLIENTS: usize> NodeConfig<CLIENTS> {
-    pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeConfig<CLIENTS> {
-        let local_key = if let Some(key) = &CONFIG.local_peer_keypair {
+impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
+    pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeBuilder<CLIENTS> {
+        let local_key = if let Some(key) = &Config::get_static_conf().local_peer_keypair {
             key.clone()
         } else {
             identity::Keypair::generate_ed25519()
         };
-        NodeConfig {
+        NodeBuilder {
             local_key,
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
@@ -155,8 +179,8 @@ impl<const CLIENTS: usize> NodeConfig<CLIENTS> {
     }
 
     /// Builds a node using the default backend connection manager.
-    pub fn build(self) -> Result<Node, anyhow::Error> {
-        let node = NodeP2P::build::<StorageContractHandler<MockRuntime>, CLIENTS>(self)?;
+    pub async fn build(self, config: NodeConfig) -> Result<Node, anyhow::Error> {
+        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS>(self, config).await?;
         Ok(Node(node))
     }
 

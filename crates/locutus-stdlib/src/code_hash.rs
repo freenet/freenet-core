@@ -7,7 +7,7 @@ use serde_with::serde_as;
 const CONTRACT_KEY_SIZE: usize = 32;
 
 #[serde_as]
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 #[cfg_attr(
     all(any(test, feature = "testing"), target_family = "unix"),
     derive(arbitrary::Arbitrary)

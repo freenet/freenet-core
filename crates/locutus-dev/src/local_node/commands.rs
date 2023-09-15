@@ -88,10 +88,7 @@ async fn execute_command(
         ClientRequest::DelegateOp(op) => {
             match node.handle_request(ClientId::FIRST, op.into(), None).await {
                 Ok(_res) => todo!(),
-                Err(either::Either::Left(err)) => {
-                    println!("error: {err}");
-                }
-                Err(either::Either::Right(err)) => {
+                Err(err) => {
                     println!("error: {err}");
                 }
             }

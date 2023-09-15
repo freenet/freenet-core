@@ -43,7 +43,7 @@ use crate::{
     operations::OpError,
     ring::PeerKeyLocation,
     util::IterExt,
-    InitPeerNode, NodeConfig,
+    InitPeerNode, NodeBuilder,
 };
 
 /// The default maximum size for a varint length-delimited packet.
@@ -172,7 +172,7 @@ pub(in crate::node) struct P2pConnManager {
 impl P2pConnManager {
     pub fn build<const CLIENTS: usize>(
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
-        config: &NodeConfig<CLIENTS>,
+        config: &NodeBuilder<CLIENTS>,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.

@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 use locutus_runtime::{
     ContractKey, ContractRuntimeInterface, ContractStore, StateStorage, StateStore,
     UpdateModification, ValidateResult,
@@ -7,7 +7,7 @@ use locutus_runtime::{
 use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
-use crate::{config::CONFIG, DynError, WrappedState};
+use crate::{config::Config, DynError, WrappedState};
 
 pub(crate) struct MockRuntime {}
 
@@ -111,8 +111,8 @@ where
     KVStore: StateStorage,
 {
     channel: ContractHandlerChannel<CHListenerHalve>,
-    kv_store: StateStore<KVStore>,
-    contract_store: ContractStore,
+    _kv_store: StateStore<KVStore>,
+    _contract_store: ContractStore,
     _runtime: MockRuntime,
 }
 
@@ -126,9 +126,9 @@ where
     pub fn new(channel: ContractHandlerChannel<CHListenerHalve>, kv_store: KVStore) -> Self {
         MemoryContractHandler {
             channel,
-            kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
-            contract_store: ContractStore::new(
-                CONFIG.config_paths.contracts_dir.clone(),
+            _kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
+            _contract_store: ContractStore::new(
+                Config::get_static_conf().config_paths.contracts_dir.clone(),
                 Self::MAX_MEM_CACHE,
             )
             .unwrap(),
@@ -137,24 +137,22 @@ where
     }
 }
 
-impl From<ContractHandlerChannel<CHListenerHalve>> for MemoryContractHandler {
-    fn from(channel: ContractHandlerChannel<CHListenerHalve>) -> Self {
-        let store = MemKVStore::new();
-        MemoryContractHandler::new(channel, store)
-    }
-}
-
 impl ContractHandler for MemoryContractHandler {
-    type Store = MemKVStore;
+    type Builder = ();
 
-    #[inline(always)]
+    fn build(
+        channel: ContractHandlerChannel<CHListenerHalve>,
+        _config: Self::Builder,
+    ) -> BoxFuture<'static, Result<Self, DynError>>
+    where
+        Self: Sized + 'static,
+    {
+        let store = MemKVStore::new();
+        async move { Ok(MemoryContractHandler::new(channel, store)) }.boxed()
+    }
+
     fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
         &mut self.channel
-    }
-
-    #[inline(always)]
-    fn contract_store(&mut self) -> &mut ContractStore {
-        &mut self.contract_store
     }
 
     fn handle_request<'a, 's: 'a>(
@@ -177,8 +175,8 @@ impl ContractHandler for MemoryContractHandler {
         todo!()
     }
 
-    fn state_store(&mut self) -> &mut locutus_runtime::StateStore<Self::Store> {
-        &mut self.kv_store
+    fn executor(&mut self) -> &mut crate::Executor {
+        todo!()
     }
 }
 

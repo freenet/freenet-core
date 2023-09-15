@@ -152,13 +152,13 @@ async fn execute_command(
 ) -> Result<(), DynError> {
     let contracts_data_path = other
         .contract_data_dir
-        .unwrap_or_else(|| Config::get_conf().config_paths.local_contracts_dir());
+        .unwrap_or_else(|| Config::get_static_conf().config_paths.local_contracts_dir());
     let delegates_data_path = other
         .delegate_data_dir
-        .unwrap_or_else(|| Config::get_conf().config_paths.local_delegates_dir());
+        .unwrap_or_else(|| Config::get_static_conf().config_paths.local_delegates_dir());
     let secrets_data_path = other
         .secret_data_dir
-        .unwrap_or_else(|| Config::get_conf().config_paths.local_secrets_dir());
+        .unwrap_or_else(|| Config::get_static_conf().config_paths.local_secrets_dir());
 
     let contract_store = ContractStore::new(contracts_data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
     let delegate_store = DelegateStore::new(delegates_data_path, DEFAULT_MAX_DELEGATE_SIZE)?;
@@ -177,12 +177,9 @@ async fn execute_command(
     executor
         .handle_request(ClientId::new(0), request, None)
         .await
-        .map_err(|e| match e {
-            either::Either::Right(e) => e,
-            either::Either::Left(e) => {
-                tracing::error!("{e}");
-                e.into()
-            }
+        .map_err(|e| {
+            tracing::error!("{e}");
+            e
         })?;
 
     Ok(())

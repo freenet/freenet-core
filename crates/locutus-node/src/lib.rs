@@ -44,11 +44,8 @@ enum HostCallbackResult {
 pub mod local_node {
     use std::net::{IpAddr, SocketAddr};
 
-    use locutus_core::{
-        either::{self, Either},
-        ClientEventsProxy, Executor, OpenRequest, WebSocketProxy,
-    };
-    use locutus_stdlib::client_api::{ClientRequest, ErrorKind, RequestError};
+    use locutus_core::{ClientEventsProxy, Executor, ExecutorError, OpenRequest, WebSocketProxy};
+    use locutus_stdlib::client_api::{ClientRequest, ErrorKind};
 
     use crate::{DynError, HttpGateway};
 
@@ -82,13 +79,15 @@ pub mod local_node {
 
             let res = match *request {
                 ClientRequest::ContractOp(op) => {
-                    executor.contract_op(op, id, notification_channel).await
+                    executor
+                        .contract_requests(op, id, notification_channel)
+                        .await
                 }
                 ClientRequest::DelegateOp(op) => {
                     let attested_contract = token.and_then(|token| {
                         http_handle.attested_contracts.get(&token).map(|(t, _)| t)
                     });
-                    executor.delegate_op(op, attested_contract)
+                    executor.delegate_request(op, attested_contract)
                 }
                 ClientRequest::Disconnect { cause } => {
                     if let Some(cause) = cause {
@@ -101,28 +100,16 @@ pub mod local_node {
                     {
                         http_handle.attested_contracts.remove(&rm_token);
                     }
-                    Err(Either::Left(Box::new(RequestError::Disconnect)))
+                    continue;
                 }
-                _ => Err(Either::Right("not supported".into())),
+                _ => Err(ExecutorError::other("not supported")),
             };
 
             match res {
                 Ok(res) => {
                     http_handle.send(id, Ok(res)).await?;
                 }
-                Err(either::Left(err)) => {
-                    let request_error = *err.clone();
-                    match *err {
-                        RequestError::Disconnect => {}
-                        _ => {
-                            tracing::error!("{err}");
-                            http_handle
-                                .send(id, Err(ErrorKind::from(request_error).into()))
-                                .await?;
-                        }
-                    }
-                }
-                Err(either::Right(err)) => {
+                Err(err) => {
                     tracing::error!("{err}");
                     http_handle
                         .send(

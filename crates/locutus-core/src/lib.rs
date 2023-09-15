@@ -23,11 +23,11 @@ pub use client_events::{
     combinator::ClientEventsCombinator, AuthToken, BoxedClient, ClientEventsProxy, ClientId,
     HostResult, OpenRequest,
 };
-pub use contract::storages::{Storage, StorageContractHandler};
+pub use contract::storages::Storage;
 pub use either;
-pub use executor::{Executor, OperationMode};
+pub use executor::{Executor, ExecutorError, OperationMode};
 pub use libp2p;
 pub use locutus_runtime;
 pub use node::PeerKey;
-pub use node::{InitPeerNode, NodeConfig};
+pub use node::{InitPeerNode, NodeBuilder, NodeConfig};
 pub use ring::Location;

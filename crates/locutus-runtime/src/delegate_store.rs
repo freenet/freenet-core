@@ -39,7 +39,7 @@ impl From<&DashMap<DelegateKey, CodeHash>> for KeyToCodeMap {
     fn from(vals: &DashMap<DelegateKey, CodeHash>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
-            map.push((r.key().clone(), r.value().clone()));
+            map.push((r.key().clone(), *r.value()));
         }
         Self(map)
     }
@@ -126,7 +126,7 @@ impl DelegateStore {
             let size = delegate_code.as_ref().len() as i64;
             let delegate = Delegate::from((&delegate_code, &params.clone().into_owned()));
             self.delegate_cache
-                .insert(key.code_hash().clone(), delegate_code, size);
+                .insert(*key.code_hash(), delegate_code, size);
             Some(delegate)
         })
     }
@@ -141,7 +141,7 @@ impl DelegateStore {
         Self::update(
             &mut self.key_to_code_part,
             key.clone(),
-            code_hash.clone(),
+            *code_hash,
             KEY_FILE_PATH.get().unwrap(),
             LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
@@ -150,18 +150,15 @@ impl DelegateStore {
         let delegate_path = self.delegates_dir.join(key_path).with_extension("wasm");
         if let Ok((code, _ver)) = DelegateCode::load_versioned_from_path(delegate_path.as_path()) {
             let size = delegate.code().size() as i64;
-            self.delegate_cache.insert(code_hash.clone(), code, size);
+            self.delegate_cache.insert(*code_hash, code, size);
             return Ok(());
         }
 
         // insert in the memory cache
         let data = delegate.code().as_ref();
         let code_size = data.len() as i64;
-        self.delegate_cache.insert(
-            code_hash.clone(),
-            delegate.code().clone().into_owned(),
-            code_size,
-        );
+        self.delegate_cache
+            .insert(*code_hash, delegate.code().clone().into_owned(), code_size);
 
         let version = APIVersion::from(delegate.clone());
         let output: Vec<u8> = delegate.code().to_bytes_versioned(version)?;
@@ -187,7 +184,7 @@ impl DelegateStore {
     }
 
     pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
-        self.key_to_code_part.get(key).map(|r| r.value().clone())
+        self.key_to_code_part.get(key).map(|r| *r.value())
     }
 }
 

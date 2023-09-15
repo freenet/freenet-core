@@ -6,29 +6,73 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use locutus_runtime::{ContractContainer, ContractStore, Parameters, StateStorage, StateStore};
 use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
-use crate::{DynError, WrappedState};
+use crate::{DynError, Executor, NodeConfig, WrappedState};
 
 pub const MAX_MEM_CACHE: i64 = 10_000_000;
 
-pub(crate) trait ContractHandler: From<ContractHandlerChannel<CHListenerHalve>> {
-    type Store: StateStorage;
+pub(crate) trait ContractHandler {
+    type Builder;
+
+    fn build(
+        channel: ContractHandlerChannel<CHListenerHalve>,
+        config: Self::Builder,
+    ) -> BoxFuture<'static, Result<Self, DynError>>
+    where
+        Self: Sized + 'static;
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve>;
-
-    fn contract_store(&mut self) -> &mut ContractStore;
-
-    fn state_store(&mut self) -> &mut StateStore<Self::Store>;
 
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
     ) -> BoxFuture<'a, Result<HostResponse, DynError>>;
+
+    fn executor(&mut self) -> &mut Executor;
+}
+
+pub(crate) struct NetworkContractHandler {
+    executor: Executor,
+    channel: ContractHandlerChannel<CHListenerHalve>,
+}
+
+impl ContractHandler for NetworkContractHandler {
+    type Builder = NodeConfig;
+
+    fn build(
+        channel: ContractHandlerChannel<CHListenerHalve>,
+        config: Self::Builder,
+    ) -> BoxFuture<'static, Result<Self, DynError>>
+    where
+        Self: Sized + 'static,
+    {
+        async {
+            let executor = Executor::from_config(config).await?;
+            Ok(Self { executor, channel })
+        }
+        .boxed()
+    }
+
+    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
+        todo!()
+    }
+
+    fn handle_request<'a, 's: 'a>(
+        &'s mut self,
+        req: ClientRequest<'a>,
+    ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
+        todo!()
+    }
+
+    fn executor(&mut self) -> &mut Executor {
+        &mut self.executor
+    }
 }
 
 pub struct EventId(u64);
@@ -154,21 +198,21 @@ struct InternalCHEvent {
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
     /// Try to push/put a new value into the contract.
-    PushQuery {
+    PutQuery {
         key: ContractKey,
         state: WrappedState,
     },
     /// The response to a push query.
-    PushResponse {
+    PutResponse {
         new_value: Result<WrappedState, DynError>,
     },
     /// Fetch a supposedly existing contract value in this node, and optionally the contract itself.  
-    FetchQuery {
+    GetQuery {
         key: ContractKey,
         fetch_contract: bool,
     },
     /// The response to a FetchQuery event
-    FetchResponse {
+    GetResponse {
         key: ContractKey,
         response: Result<StoreResponse, DynError>,
     },
@@ -190,88 +234,13 @@ pub mod test {
 
     use super::*;
     use crate::{
-        config::{GlobalExecutor, CONFIG},
+        config::GlobalExecutor,
         contract::{
             test::{MemKVStore, SimStoreError},
             MockRuntime,
         },
         WrappedContract,
     };
-
-    #[derive(Debug, thiserror::Error)]
-    pub(crate) enum TestContractStoreError {
-        #[error(transparent)]
-        IOError(#[from] std::io::Error),
-    }
-
-    pub(crate) struct TestContractHandler {
-        channel: ContractHandlerChannel<CHListenerHalve>,
-        kv_store: MemKVStore,
-        contract_store: ContractStore,
-        _runtime: MockRuntime,
-    }
-
-    impl TestContractHandler {
-        pub fn new(channel: ContractHandlerChannel<CHListenerHalve>) -> Self {
-            TestContractHandler {
-                channel,
-                kv_store: MemKVStore::new(),
-                contract_store: ContractStore::new(
-                    CONFIG.config_paths.contracts_dir.clone(),
-                    MAX_MEM_CACHE,
-                )
-                .unwrap(),
-                _runtime: MockRuntime {},
-            }
-        }
-    }
-
-    impl From<ContractHandlerChannel<CHListenerHalve>> for TestContractHandler {
-        fn from(channel: ContractHandlerChannel<CHListenerHalve>) -> Self {
-            TestContractHandler::new(channel)
-        }
-    }
-
-    impl ContractHandler for TestContractHandler {
-        type Store = MemKVStore;
-
-        #[inline(always)]
-        fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
-            &mut self.channel
-        }
-
-        #[inline(always)]
-        fn contract_store(&mut self) -> &mut ContractStore {
-            &mut self.contract_store
-        }
-
-        fn handle_request<'a, 's: 'a>(
-            &'s mut self,
-            _req: ClientRequest<'a>,
-        ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
-            // async fn get_state(
-            //     &self,
-            //     contract: &ContractKey,
-            // ) -> Result<Option<WrappedState>, Self::Error> {
-            //     Ok(self.kv_store.get(contract).cloned())
-            // }
-
-            // async fn update_state(
-            //     &mut self,
-            //     contract: &ContractKey,
-            //     value: WrappedState,
-            // ) -> Result<WrappedState, Self::Error> {
-            //     let new_val = value.clone();
-            //     self.kv_store.insert(*contract, value);
-            //     Ok(new_val)
-            // }
-            todo!()
-        }
-
-        fn state_store(&mut self) -> &mut StateStore<Self::Store> {
-            todo!()
-        }
-    }
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

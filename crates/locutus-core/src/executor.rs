@@ -1,6 +1,8 @@
 //! Contract executor.
 
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::hint::unreachable_unchecked;
 use std::time::{Duration, Instant};
 
 use blake3::traits::digest::generic_array::GenericArray;
@@ -21,10 +23,52 @@ use crate::node::{OpManager, P2pBridge};
 ))]
 use crate::operations::get::GetResult;
 use crate::operations::{self, op_trait::Operation};
+use crate::NodeConfig;
 use crate::{either::Either, ClientId, DynError, HostResult, Storage};
 
-type Error = Either<Box<RequestError>, DynError>;
-type Response = Result<HostResponse, Error>;
+pub struct ExecutorError(Either<Box<RequestError>, DynError>);
+
+impl ExecutorError {
+    pub fn other(value: impl Into<DynError>) -> Self {
+        Self(Either::Right(value.into()))
+    }
+
+    fn request(value: impl Into<RequestError>) -> Self {
+        Self(Either::Left(Box::new(value.into())))
+    }
+}
+
+impl From<RequestError> for ExecutorError {
+    fn from(value: RequestError) -> Self {
+        Self(Either::Left(Box::new(value)))
+    }
+}
+
+impl Display for ExecutorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Either::Left(l) => write!(f, "{}", &**l),
+            Either::Right(r) => write!(f, "{}", &**r),
+        }
+    }
+}
+
+impl From<Box<RequestError>> for ExecutorError {
+    fn from(value: Box<RequestError>) -> Self {
+        Self(Either::Left(value))
+    }
+}
+
+impl From<ExecutorError> for DynError {
+    fn from(value: ExecutorError) -> Self {
+        match value.0 {
+            Either::Left(l) => l as DynError,
+            Either::Right(r) => r,
+        }
+    }
+}
+
+type Response = Result<HostResponse, ExecutorError>;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationMode {
@@ -101,6 +145,47 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub async fn from_config(config: NodeConfig) -> Result<Self, DynError> {
+        const MAX_SIZE: i64 = 10 * 1024 * 1024;
+        const MAX_MEM_CACHE: u32 = 10_000_000;
+        let static_conf = crate::config::Config::get_static_conf();
+
+        let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
+
+        let contract_dir = config
+            .node_data_dir
+            .as_ref()
+            .map(|d| d.join("contracts"))
+            .unwrap_or_else(|| static_conf.config_paths.local_contracts_dir());
+        let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
+
+        let delegate_dir = config
+            .node_data_dir
+            .as_ref()
+            .map(|d| d.join("delegates"))
+            .unwrap_or_else(|| static_conf.config_paths.local_delegates_dir());
+        let delegate_store = DelegateStore::new(delegate_dir, MAX_SIZE)?;
+
+        let secrets_dir = config
+            .node_data_dir
+            .as_ref()
+            .map(|d| d.join("secrets"))
+            .unwrap_or_else(|| static_conf.config_paths.local_secrets_dir());
+        let secret_store = SecretsStore::new(secrets_dir)?;
+
+        Executor::new(
+            contract_store,
+            delegate_store,
+            secret_store,
+            state_store,
+            || {
+                crate::util::set_cleanup_on_exit().unwrap();
+            },
+            OperationMode::Local,
+        )
+        .await
+    }
+
     #[allow(unused_variables)]
     pub async fn new(
         contract_store: ContractStore,
@@ -137,10 +222,11 @@ impl Executor {
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
-                return Err(Box::new(RequestError::from(CoreContractError::Subscribe {
+                return Err(RequestError::from(CoreContractError::Subscribe {
                     key,
                     cause: format!("Peer {cli_id} already subscribed"),
-                })));
+                })
+                .into());
             }
         } else {
             channels.push((cli_id, notification_ch));
@@ -168,7 +254,7 @@ impl Executor {
         related_contracts: RelatedContracts<'static>,
     ) {
         if let Err(err) = self
-            .contract_op(
+            .contract_requests(
                 ContractRequest::Put {
                     contract,
                     state,
@@ -179,7 +265,7 @@ impl Executor {
             )
             .await
         {
-            match err {
+            match err.0 {
                 Either::Left(err) => tracing::error!("req error: {err}"),
                 Either::Right(err) => tracing::error!("other error: {err}"),
             }
@@ -193,19 +279,20 @@ impl Executor {
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
-            ClientRequest::ContractOp(op) => self.contract_op(op, id, updates).await,
-            ClientRequest::DelegateOp(op) => self.delegate_op(op, None),
+            ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
+            ClientRequest::DelegateOp(op) => self.delegate_request(op, None),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
                 }
-                Err(Either::Left(Box::new(RequestError::Disconnect)))
+                Err(RequestError::Disconnect.into())
             }
-            _ => Err(Either::Right("not supported".into())),
+            _ => Err(ExecutorError::other("not supported")),
         }
     }
 
-    pub async fn contract_op(
+    /// Responde to requests made through any API's from client applications locally.
+    pub async fn contract_requests(
         &mut self,
         req: ContractRequest<'_>,
         cli_id: ClientId,
@@ -227,9 +314,8 @@ impl Executor {
             } => self.perform_contract_get(contract, key).await,
             ContractRequest::Subscribe { key, summary } => {
                 let updates =
-                    updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
-                self.register_contract_notifier(key.clone(), cli_id, updates, summary)
-                    .map_err(Either::Left)?;
+                    updates.ok_or_else(|| ExecutorError::other("missing update channel"))?;
+                self.register_contract_notifier(key.clone(), cli_id, updates, summary)?;
                 let res = self.perform_contract_get(false, key.clone()).await?;
                 #[cfg(any(
                     all(not(feature = "local-mode"), not(feature = "network-mode")),
@@ -242,8 +328,153 @@ impl Executor {
                 // by default a subscribe op has an implicit get
                 Ok(res)
             }
-            _ => Err(Either::Right("not supported".into())),
+            _ => Err(ExecutorError::other("not supported")),
         }
+    }
+
+    pub fn delegate_request(
+        &mut self,
+        req: DelegateRequest<'_>,
+        attestaded_contract: Option<&ContractInstanceId>,
+    ) -> Response {
+        match req {
+            DelegateRequest::RegisterDelegate {
+                delegate,
+                cipher,
+                nonce,
+            } => {
+                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+                let key = delegate.key().clone();
+                let arr = GenericArray::from_slice(&cipher);
+                let cipher = XChaCha20Poly1305::new(arr);
+                let nonce = GenericArray::from_slice(&nonce).to_owned();
+                tracing::debug!("registering delegate `{key}");
+                if let Some(contract) = attestaded_contract {
+                    self.delegate_attested_ids
+                        .entry(key.clone())
+                        .or_default()
+                        .push(*contract);
+                }
+                match self.runtime.register_delegate(delegate, cipher, nonce) {
+                    Ok(_) => Ok(DelegateResponse {
+                        key,
+                        values: Vec::new(),
+                    }),
+                    Err(err) => {
+                        tracing::error!("failed registering delegate `{key}`: {err}");
+                        Err(ExecutorError::other(CoreDelegateError::RegisterError(key)))
+                    }
+                }
+            }
+            DelegateRequest::UnregisterDelegate(key) => {
+                self.delegate_attested_ids.remove(&key);
+                match self.runtime.unregister_delegate(&key) {
+                    Ok(_) => Ok(HostResponse::Ok),
+                    Err(err) => {
+                        tracing::error!("failed unregistering delegate `{key}`: {err}");
+                        Ok(HostResponse::Ok)
+                    }
+                }
+            }
+            DelegateRequest::GetSecretRequest {
+                key,
+                params,
+                get_request,
+            } => {
+                let attested = attestaded_contract.and_then(|contract| {
+                    self.delegate_attested_ids
+                        .get(&key)
+                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
+                });
+                match self.runtime.inbound_app_message(
+                    &key,
+                    &params,
+                    attested.map(|c| c.as_bytes()),
+                    vec![InboundDelegateMsg::GetSecretRequest(get_request)],
+                ) {
+                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Err(err) if err.delegate_is_missing() => {
+                        tracing::error!("delegate not found `{key}`");
+                        Err(ExecutorError::request(CoreDelegateError::Missing(key)))
+                    }
+                    Err(err) => Err(ExecutorError::other(format!(
+                        "uncontrolled error while getting secret for `{key}`: {err}"
+                    ))),
+                }
+            }
+            DelegateRequest::ApplicationMessages {
+                key,
+                inbound,
+                params,
+            } => {
+                let attested = attestaded_contract.and_then(|contract| {
+                    self.delegate_attested_ids
+                        .get(&key)
+                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
+                });
+                match self.runtime.inbound_app_message(
+                    &key,
+                    &params,
+                    attested.map(|c| c.as_bytes()),
+                    inbound
+                        .into_iter()
+                        .map(InboundDelegateMsg::into_owned)
+                        .collect(),
+                ) {
+                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Err(err) if err.is_delegate_exec_error() | err.is_execution_error() => {
+                        tracing::error!("failed processing messages for delegate `{key}`: {err}");
+                        Err(ExecutorError::request(CoreDelegateError::ExecutionError(
+                            format!("{err}"),
+                        )))
+                    }
+                    Err(err) if err.delegate_is_missing() => {
+                        tracing::error!("delegate not found `{key}`");
+                        Err(ExecutorError::request(CoreDelegateError::Missing(key)))
+                    }
+                    Err(err) if err.secret_is_missing() => {
+                        tracing::error!("secret not found `{key}`");
+                        Err(ExecutorError::request(CoreDelegateError::MissingSecret {
+                            key,
+                            secret: err.get_secret_id(),
+                        }))
+                    }
+                    Err(err) => {
+                        tracing::error!("failed executing delegate `{key}`: {err}");
+                        Err(ExecutorError::other(format!(
+                            "uncontrolled error while executing `{key}`"
+                        )))
+                    }
+                }
+            }
+            _ => Err(ExecutorError::other("not supported")),
+        }
+    }
+
+    pub(crate) async fn fetch_contract(
+        &mut self,
+        key: ContractKey,
+        fetch_contract: bool,
+    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
+        match self.perform_contract_get(fetch_contract, key).await {
+            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                contract,
+                state,
+                ..
+            })) => Ok((state, contract)),
+            Err(err) => Err(err),
+            Ok(_) => {
+                // Safety: check `perform_contract_get` to indeed check this should never happen
+                unsafe { unreachable_unchecked() }
+            }
+        }
+    }
+
+    pub(crate) async fn store_contract(
+        &mut self,
+        contract: ContractContainer,
+    ) -> Result<(), ContractError> {
+        self.runtime.contract_store.store_contract(contract)
     }
 
     async fn perform_contract_put(
@@ -268,13 +499,10 @@ impl Executor {
         self.send_update_notification(&key, &params, &state)
             .await
             .map_err(|_| {
-                Either::Left(Box::new(
-                    CoreContractError::Put {
-                        key: key.clone(),
-                        cause: "failed while sending notifications".to_owned(),
-                    }
-                    .into(),
-                ))
+                ExecutorError::request(CoreContractError::Put {
+                    key: key.clone(),
+                    cause: "failed while sending notifications".to_owned(),
+                })
             })?;
         Ok(ContractResponse::PutResponse { key }.into())
     }
@@ -288,13 +516,12 @@ impl Executor {
             self.state_store
                 .get_params(&key)
                 .await
-                .map_err(|err| Either::Right(err.into()))?
+                .map_err(ExecutorError::other)?
                 .ok_or_else(|| {
-                    let e = RequestError::ContractError(CoreContractError::Update {
+                    RequestError::ContractError(CoreContractError::Update {
                         cause: format!("missing contract parameters: {key}"),
                         key: key.clone(),
-                    });
-                    Either::Right(e.into())
+                    })
                 })?
         };
         let new_state = {
@@ -302,8 +529,7 @@ impl Executor {
                 .state_store
                 .get(&key)
                 .await
-                .map_err(Into::into)
-                .map_err(Either::Right)?
+                .map_err(ExecutorError::other)?
                 .clone();
             let mut retrieved_contracts = Vec::new();
             retrieved_contracts.push(data);
@@ -316,15 +542,12 @@ impl Executor {
                         .update_state(&key, &parameters, &state, &retrieved_contracts)
                     {
                         Err(err) if err.is_contract_exec_error() => {
-                            return Err(Either::Left(Box::new(
-                                CoreContractError::Update {
-                                    key: key.clone(),
-                                    cause: format!("{err}"),
-                                }
-                                .into(),
-                            )));
+                            return Err(ExecutorError::request(CoreContractError::Update {
+                                key: key.clone(),
+                                cause: format!("{err}"),
+                            }));
                         }
-                        Err(err) => return Err(Either::Right(err.into())),
+                        Err(err) => return Err(ExecutorError::other(err)),
                         Ok(result) => result,
                     };
                 let UpdateModification {
@@ -335,7 +558,7 @@ impl Executor {
                     self.state_store
                         .update(&key, new_state.clone())
                         .await
-                        .map_err(|err| Either::Right(err.into()))?;
+                        .map_err(ExecutorError::other)?;
                     break new_state;
                 } else if !related.is_empty() {
                     // some required contracts are missing
@@ -405,7 +628,7 @@ impl Executor {
                             }
                             Err(other_err) => {
                                 let _ = mode;
-                                return Err(Either::Right(other_err.into()));
+                                return Err(ExecutorError::other(other_err));
                             }
                         }
                     }
@@ -414,7 +637,7 @@ impl Executor {
                         continue;
                     } else if start.elapsed() > Duration::from_secs(10) {
                         /* make this timeout configurable, and anyway should be controlled globally*/
-                        return Err(Either::Left(RequestError::Timeout.into()));
+                        return Err(RequestError::Timeout.into());
                     }
                 } else {
                     // state wasn't updated
@@ -426,8 +649,7 @@ impl Executor {
         let summary = self
             .runtime
             .summarize_state(&key, &parameters, &new_state)
-            .map_err(Into::into)
-            .map_err(Either::Right)?;
+            .map_err(ExecutorError::other)?;
         self.send_update_notification(&key, &parameters, &new_state)
             .await?;
 
@@ -452,9 +674,9 @@ impl Executor {
                 new_state,
             };
             let op: operations::update::UpdateOp =
-                op_request(request).await.map_err(Either::Right)?;
+                op_request(request).await.map_err(ExecutorError::other)?;
             let _update: operations::update::UpdateResult =
-                op.try_into().map_err(Into::into).map_err(Either::Right)?;
+                op.try_into().map_err(ExecutorError::other)?;
         }
 
         Ok(ContractResponse::UpdateResponse { key, summary }.into())
@@ -472,14 +694,14 @@ impl Executor {
                 let Some(contract) = self
                     .get_contract_locally(&key)
                     .await
-                    .map_err(Either::Left)?
+                    .map_err(ExecutorError::request)?
                 else {
-                    return Err(Either::Right(Box::new(RequestError::from(
+                    return Err(ExecutorError::other(RequestError::from(
                         CoreContractError::Get {
                             key: key.clone(),
                             cause: "Missing contract or parameters".into(),
                         },
-                    ))));
+                    )));
                 };
                 got_contract = Some(contract);
             } else if contract {
@@ -494,12 +716,12 @@ impl Executor {
                 .await
                 .map_err(Either::Left)?
             else {
-                return Err(Either::Right(Box::new(RequestError::from(
+                return Err(ExecutorError::other(RequestError::from(
                     CoreContractError::Get {
                         key: key.clone(),
                         cause: "Missing contract or parameters".into(),
                     },
-                ))));
+                )));
             };
             got_contract = Some(contract);
         }
@@ -520,18 +742,18 @@ impl Executor {
                 state,
             }
             .into()),
-            Err(StateStoreError::MissingContract(_)) => Err(Either::Right(Box::new(
+            Err(StateStoreError::MissingContract(_)) => Err(ExecutorError::other(
                 RequestError::from(CoreContractError::Get {
                     key,
-                    cause: "missing contract state".into(),
+                    cause: "Missing contract state".into(),
                 }),
-            ))),
-            Err(err) => Err(Either::Right(Box::new(RequestError::from(
+            )),
+            Err(err) => Err(ExecutorError::other(RequestError::from(
                 CoreContractError::Get {
                     key,
                     cause: format!("{err}"),
                 },
-            )))),
+            ))),
         }
     }
 
@@ -543,7 +765,7 @@ impl Executor {
     async fn get_contract_from_network(
         &mut self,
         key: ContractKey,
-    ) -> Result<Option<ContractContainer>, Error> {
+    ) -> Result<Option<ContractContainer>, ExecutorError> {
         loop {
             if let Ok(Some(contract)) = self.get_contract_locally(&key).await {
                 break Ok(Some(contract));
@@ -554,9 +776,9 @@ impl Executor {
                 ))]
                 {
                     if self.mode == OperationMode::Local {
-                        return Err(Either::Left(Box::new(RequestError::ContractError(
+                        return Err(ExecutorError::request(RequestError::ContractError(
                             CoreContractError::MissingRelated { key: key.id() },
-                        ))));
+                        )));
                     }
                 }
                 match self
@@ -583,7 +805,7 @@ impl Executor {
         feature = "network-mode",
         all(not(feature = "local-mode"), not(feature = "network-mode"))
     ))]
-    async fn subscribe(&self, key: ContractKey) -> Result<(), Error> {
+    async fn subscribe(&self, key: ContractKey) -> Result<(), ExecutorError> {
         #[cfg(any(
             all(not(feature = "local-mode"), not(feature = "network-mode")),
             all(feature = "local-mode", feature = "network-mode")
@@ -595,9 +817,9 @@ impl Executor {
         }
         let request = SubscribeContract { key };
         let op: operations::subscribe::SubscribeOp =
-            op_request(request).await.map_err(Either::Right)?;
+            op_request(request).await.map_err(ExecutorError::other)?;
         let _sub: operations::subscribe::SubscribeResult =
-            op.try_into().map_err(Into::into).map_err(Either::Right)?;
+            op.try_into().map_err(ExecutorError::other)?;
         Ok(())
     }
 
@@ -622,7 +844,7 @@ impl Executor {
         state: WrappedState,
         trying_container: ContractContainer,
         mut related_contracts: RelatedContracts<'a>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ExecutorError> {
         let key = trying_container.key();
         let params = trying_container.params();
 
@@ -642,8 +864,7 @@ impl Executor {
                 self.runtime
                     .contract_store
                     .store_contract(contract)
-                    .map_err(Into::into)
-                    .map_err(Either::Right)?;
+                    .map_err(ExecutorError::other)?;
             }
 
             let result = self
@@ -654,10 +875,9 @@ impl Executor {
                     &trying_state,
                     &related_contracts,
                 )
-                .map_err(Into::into)
                 .map_err(|err| {
                     let _ = self.runtime.contract_store.remove_contract(&trying_key);
-                    Either::Right(err)
+                    ExecutorError::other(err)
                 })?;
 
             let is_valid = match result {
@@ -700,13 +920,10 @@ impl Executor {
             };
 
             if !is_valid {
-                return Err(Either::Left(Box::new(
-                    CoreContractError::Put {
-                        key: trying_key.clone(),
-                        cause: "not valid".to_owned(),
-                    }
-                    .into(),
-                )));
+                return Err(ExecutorError::request(CoreContractError::Put {
+                    key: trying_key.clone(),
+                    cause: "not valid".to_owned(),
+                }));
             }
 
             self.state_store
@@ -716,7 +933,7 @@ impl Executor {
                     trying_params.clone(),
                 )
                 .await
-                .map_err(|err| Either::Right(err.into()))?;
+                .map_err(ExecutorError::other)?;
             if trying_key != original_key {
                 trying_key = original_key.clone();
                 trying_params = original_params.clone();
@@ -726,143 +943,11 @@ impl Executor {
             break;
         }
         if iterations == DEPENDENCY_CYCLE_LIMIT_GUARD {
-            return Err(Either::Left(Box::new(
-                CoreContractError::MissingRelated {
-                    key: original_key.id(),
-                }
-                .into(),
-            )));
+            return Err(ExecutorError::request(CoreContractError::MissingRelated {
+                key: original_key.id(),
+            }));
         }
         Ok(())
-    }
-
-    pub fn delegate_op(
-        &mut self,
-        req: DelegateRequest<'_>,
-        attestaded_contract: Option<&ContractInstanceId>,
-    ) -> Response {
-        match req {
-            DelegateRequest::RegisterDelegate {
-                delegate,
-                cipher,
-                nonce,
-            } => {
-                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = delegate.key().clone();
-                let arr = GenericArray::from_slice(&cipher);
-                let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = GenericArray::from_slice(&nonce).to_owned();
-                tracing::debug!("registering delegate `{key}");
-                if let Some(contract) = attestaded_contract {
-                    self.delegate_attested_ids
-                        .entry(key.clone())
-                        .or_default()
-                        .push(*contract);
-                }
-                match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    }),
-                    Err(err) => {
-                        tracing::error!("failed registering delegate `{key}`: {err}");
-                        Err(Either::Left(Box::new(
-                            CoreDelegateError::RegisterError(key).into(),
-                        )))
-                    }
-                }
-            }
-            DelegateRequest::UnregisterDelegate(key) => {
-                self.delegate_attested_ids.remove(&key);
-                match self.runtime.unregister_delegate(&key) {
-                    Ok(_) => Ok(HostResponse::Ok),
-                    Err(err) => {
-                        tracing::error!("failed unregistering delegate `{key}`: {err}");
-                        Ok(HostResponse::Ok)
-                    }
-                }
-            }
-            DelegateRequest::GetSecretRequest {
-                key,
-                params,
-                get_request,
-            } => {
-                let attested = attestaded_contract.and_then(|contract| {
-                    self.delegate_attested_ids
-                        .get(&key)
-                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
-                });
-                match self.runtime.inbound_app_message(
-                    &key,
-                    &params,
-                    attested.map(|c| c.as_bytes()),
-                    vec![InboundDelegateMsg::GetSecretRequest(get_request)],
-                ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                    Err(err) if err.delegate_is_missing() => {
-                        tracing::error!("delegate not found `{key}`");
-                        Err(Either::Left(Box::new(
-                            CoreDelegateError::Missing(key).into(),
-                        )))
-                    }
-                    Err(err) => Err(Either::Right(
-                        format!("uncontrolled error while getting secret for `{key}`: {err}")
-                            .into(),
-                    )),
-                }
-            }
-            DelegateRequest::ApplicationMessages {
-                key,
-                inbound,
-                params,
-            } => {
-                let attested = attestaded_contract.and_then(|contract| {
-                    self.delegate_attested_ids
-                        .get(&key)
-                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
-                });
-                match self.runtime.inbound_app_message(
-                    &key,
-                    &params,
-                    attested.map(|c| c.as_bytes()),
-                    inbound
-                        .into_iter()
-                        .map(InboundDelegateMsg::into_owned)
-                        .collect(),
-                ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                    Err(err) if err.is_delegate_exec_error() | err.is_execution_error() => {
-                        tracing::error!("failed processing messages for delegate `{key}`: {err}");
-                        Err(Either::Left(Box::new(
-                            CoreDelegateError::ExecutionError(format!("{err}")).into(),
-                        )))
-                    }
-                    Err(err) if err.delegate_is_missing() => {
-                        tracing::error!("delegate not found `{key}`");
-                        Err(Either::Left(Box::new(
-                            CoreDelegateError::Missing(key).into(),
-                        )))
-                    }
-                    Err(err) if err.secret_is_missing() => {
-                        tracing::error!("secret not found `{key}`");
-                        Err(Either::Left(Box::new(
-                            CoreDelegateError::MissingSecret {
-                                key,
-                                secret: err.get_secret_id(),
-                            }
-                            .into(),
-                        )))
-                    }
-                    Err(err) => {
-                        tracing::error!("failed executing delegate `{key}`: {err}");
-                        Err(Either::Right(
-                            format!("uncontrolled error while executing `{key}`").into(),
-                        ))
-                    }
-                }
-            }
-            _ => Err(Either::Right("not supported".into())),
-        }
     }
 
     async fn send_update_notification<'a>(
@@ -870,7 +955,7 @@ impl Executor {
         key: &ContractKey,
         params: &Parameters<'a>,
         new_state: &WrappedState,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ExecutorError> {
         tracing::debug!(contract = %key, "notify of contract update");
         if let Some(notifiers) = self.update_notifications.get_mut(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
@@ -886,14 +971,11 @@ impl Executor {
                             tracing::error!("{err}");
                             let is_contract_exec_error = err.is_contract_exec_error();
                             match is_contract_exec_error {
-                                true => Either::Left(Box::new(
-                                    CoreContractError::Put {
-                                        key: key.clone(),
-                                        cause: format!("{err}"),
-                                    }
-                                    .into(),
-                                )),
-                                _ => Either::Right(err.into()),
+                                true => ExecutorError::request(CoreContractError::Put {
+                                    key: key.clone(),
+                                    cause: format!("{err}"),
+                                }),
+                                _ => ExecutorError::other(err),
                             }
                         })?
                         .to_owned()
@@ -928,7 +1010,7 @@ impl Executor {
     async fn local_state_or_from_network(
         &self,
         id: &ContractInstanceId,
-    ) -> Result<Either<WrappedState, operations::get::GetResult>, Error> {
+    ) -> Result<Either<WrappedState, operations::get::GetResult>, ExecutorError> {
         if let Ok(contract) = self.state_store.get(&(*id).into()).await {
             return Ok(Either::Left(contract));
         };
@@ -936,16 +1018,15 @@ impl Executor {
             key: (*id).into(),
             fetch_contract: true,
         };
-        let op: operations::get::GetOp = op_request(request).await.map_err(Either::Right)?;
-        let get_result: operations::get::GetResult =
-            op.try_into().map_err(Into::into).map_err(Either::Right)?;
+        let op: operations::get::GetOp = op_request(request).await.map_err(ExecutorError::other)?;
+        let get_result: operations::get::GetResult = op.try_into().map_err(ExecutorError::other)?;
         Ok(Either::Right(get_result))
     }
 
     async fn get_contract_locally(
         &self,
         key: &ContractKey,
-    ) -> Result<Option<ContractContainer>, Box<RequestError>> {
+    ) -> Result<Option<ContractContainer>, RequestError> {
         let Some(parameters) = self.state_store.get_params(key).await.map_err(|e| {
             RequestError::ContractError(CoreContractError::Update {
                 cause: format!("{e}"),
