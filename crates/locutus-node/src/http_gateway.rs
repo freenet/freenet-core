@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use locutus_core::*;
+use locutus_core::{util::EncodingProtocol, *};
 use locutus_stdlib::{
     client_api::{
         ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
@@ -15,7 +15,6 @@ use locutus_stdlib::{
 use serde::Deserialize;
 
 use std::collections::VecDeque;
-use std::fmt::Display;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::{
@@ -95,7 +94,7 @@ impl HttpGateway {
 
 async fn connection_info<B>(
     encoding_protoc: Result<
-        axum::TypedHeader<EncodingProtocol>,
+        axum::TypedHeader<EncodingProtocolExt>,
         axum::extract::rejection::TypedHeaderRejection,
     >,
     auth_token: Result<
@@ -117,7 +116,7 @@ async fn connection_info<B>(
     //         .collect::<Vec<_>>()
     // );
     let encoding_protoc = match encoding_protoc {
-        Ok(protoc) => protoc.0,
+        Ok(protoc) => protoc.0 .0,
         Err(err)
             if matches!(
                 err.reason(),
@@ -224,25 +223,9 @@ async fn web_subpages(
         .map(|r| r.into_response())
 }
 
-#[derive(Clone, Copy, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum EncodingProtocol {
-    /// Flatbuffers
-    Flatbuffers,
-    /// Rust native types
-    Native,
-}
+struct EncodingProtocolExt(EncodingProtocol);
 
-impl Display for EncodingProtocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodingProtocol::Flatbuffers => write!(f, "flatbuffers"),
-            EncodingProtocol::Native => write!(f, "native"),
-        }
-    }
-}
-
-impl axum::headers::Header for EncodingProtocol {
+impl axum::headers::Header for EncodingProtocolExt {
     fn name() -> &'static axum::http::HeaderName {
         static HEADER: OnceLock<axum::http::HeaderName> = OnceLock::new();
         HEADER.get_or_init(|| axum::http::HeaderName::from_static("encoding-protocol"))
@@ -256,15 +239,15 @@ impl axum::headers::Header for EncodingProtocol {
         values
             .next()
             .and_then(|val| match val.to_str().ok()? {
-                "native" => Some(EncodingProtocol::Native),
-                "flatbuffers" => Some(EncodingProtocol::Flatbuffers),
+                "native" => Some(EncodingProtocolExt(EncodingProtocol::Native)),
+                "flatbuffers" => Some(EncodingProtocolExt(EncodingProtocol::Flatbuffers)),
                 _ => None,
             })
             .ok_or_else(axum::headers::Error::invalid)
     }
 
     fn encode<E: Extend<axum::http::HeaderValue>>(&self, values: &mut E) {
-        let header = match self {
+        let header = match self.0 {
             EncodingProtocol::Native => axum::http::HeaderValue::from_static("native"),
             EncodingProtocol::Flatbuffers => axum::http::HeaderValue::from_static("flatbuffers"),
         };

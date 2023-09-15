@@ -46,10 +46,6 @@ pub enum Error {
     OtherError(Box<dyn std::error::Error + Send + Sync>),
 }
 
-pub trait TryFromTsStd<T>: Sized {
-    fn try_decode(value: T) -> Result<Self, WsApiError>;
-}
-
 pub trait TryFromFbs<T>: Sized {
     fn try_decode_fbs(value: T) -> Result<Self, WsApiError>;
 }

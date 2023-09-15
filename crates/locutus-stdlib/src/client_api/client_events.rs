@@ -1,5 +1,5 @@
 use flatbuffers::WIPOffset;
-use std::{collections::HashMap, fmt::Display, io::Cursor};
+use std::fmt::Display;
 
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 
@@ -51,7 +51,7 @@ use crate::{
     versioning::ContractContainer,
 };
 
-use super::{TryFromTsStd, WsApiError};
+use super::WsApiError;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientError {
@@ -327,73 +327,6 @@ impl ContractRequest<'_> {
 impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
     fn from(op: ContractRequest<'a>) -> Self {
         ClientRequest::ContractOp(op)
-    }
-}
-
-/// Deserializes a `ContractRequest` from a MessagePack encoded request.
-impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
-    fn try_decode(msg: &[u8]) -> Result<Self, WsApiError> {
-        let value = rmpv::decode::read_value(&mut Cursor::new(msg))
-            .map_err(|e| WsApiError::deserialization(format!("{e}")))?;
-
-        let req: ContractRequest = {
-            if value.is_map() {
-                let value_map: HashMap<&str, &rmpv::Value> = HashMap::from_iter(
-                    value
-                        .as_map()
-                        .unwrap()
-                        .iter()
-                        .map(|(key, val)| (key.as_str().unwrap(), val)),
-                );
-
-                let mut map_keys = Vec::from_iter(value_map.keys().copied());
-                map_keys.sort();
-                match map_keys.as_slice() {
-                    ["container", "relatedContracts", "state"] => {
-                        let contract = value_map.get("container").unwrap();
-                        ContractRequest::Put {
-                            contract: ContractContainer::try_decode(*contract)
-                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            state: WrappedState::try_decode(*value_map.get("state").unwrap())
-                                .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                            related_contracts: RelatedContracts::try_decode(
-                                *value_map.get("relatedContracts").unwrap(),
-                            )
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
-                            .into_owned(),
-                        }
-                    }
-                    ["data", "key"] => ContractRequest::Update {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        data: UpdateData::try_decode(*value_map.get("data").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?
-                            .into_owned(),
-                    },
-                    ["fetchContract", "key"] => ContractRequest::Get {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
-                    },
-                    ["key", "summary"] => ContractRequest::Subscribe {
-                        key: ContractKey::try_decode(*value_map.get("key").unwrap())
-                            .map_err(|err| WsApiError::deserialization(err.to_string()))?,
-                        summary: value_map
-                            .get("summary")
-                            .unwrap()
-                            .as_slice()
-                            .map(|s| StateSummary::from(s).into_owned()),
-                    },
-                    _ => unreachable!(),
-                }
-            } else {
-                return Err(WsApiError::DeserError {
-                    cause: "value is not a map".into(),
-                });
-            }
-        };
-
-        Ok(req)
     }
 }
 

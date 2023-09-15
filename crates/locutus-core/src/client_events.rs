@@ -144,7 +144,7 @@ pub(crate) mod test {
         prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId,
         ContractWasmAPIVersion, DelegateKey, Parameters, RelatedContracts,
     };
-    use locutus_stdlib::client_api::{ContractRequest, TryFromTsStd};
+    use locutus_stdlib::client_api::ContractRequest;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
