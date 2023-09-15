@@ -102,82 +102,88 @@ impl StateStorage for RocksDb {
     }
 }
 
-// #[cfg(test)]
-// mod test {
-//     use std::sync::Arc;
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
 
-//     use crate::{contract::contract_handler_channel, WrappedContract};
-//     use locutus_runtime::{ContractWasmAPIVersion, StateDelta};
-//     use locutus_stdlib::prelude::ContractCode;
+    use crate::{
+        contract::{
+            contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
+        },
+        DynError, WrappedContract,
+    };
+    use locutus_runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
+    use locutus_stdlib::{client_api::ContractRequest, prelude::ContractCode};
 
-//     use super::*;
+    use super::*;
 
-//     // Prepare and get handler for rocksdb
-//     async fn get_handler() -> Result<RocksDbContractHandler<MockRuntime>, RocksDbError> {
-//         let (_, ch_handler) = contract_handler_channel();
-//         let store: ContractStore =
-//             ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
-//         RocksDbContractHandler::new(ch_handler, store, MockRuntime {}).await
-//     }
+    // Prepare and get handler for rocksdb
+    async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {
+        let (_, ch_handler) = contract_handler_channel();
+        // let store: ContractStore =
+        //     ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
+        // RocksDbContractHandler::new(ch_handler, store, MockRuntime {}).await
+        todo!()
+    }
 
-//     #[ignore]
-//     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-//     async fn contract_handler() -> Result<(), DynError> {
-//         // Create a rocksdb handler and initialize the database
-//         let mut handler = get_handler().await?;
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contract_handler() -> Result<(), DynError> {
+        // Create a rocksdb handler and initialize the database
+        let mut handler = get_handler().await?;
 
-//         // Generate a contract
-//         let contract_bytes = b"Test contract value".to_vec();
-//         let contract: ContractContainer =
-//             ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-//                 Arc::new(ContractCode::from(contract_bytes.clone())),
-//                 Parameters::from(vec![]),
-//             )));
+        // Generate a contract
+        let contract_bytes = b"Test contract value".to_vec();
+        let contract: ContractContainer =
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(contract_bytes.clone())),
+                Parameters::from(vec![]),
+            )));
 
-//         // Get contract parts
-//         let state = WrappedState::new(contract_bytes.clone());
-//         handler
-//             .handle_request(
-//                 ContractRequest::Put {
-//                     contract: contract.clone(),
-//                     state: state.clone(),
-//                     related_contracts: Default::default(),
-//                 }
-//                 .into(),
-//             )
-//             .await?
-//             .unwrap_put();
-//         let (get_result_value, _) = handler
-//             .handle_request(
-//                 ContractRequest::Get {
-//                     key: contract.key().clone(),
-//                     fetch_contract: false,
-//                 }
-//                 .into(),
-//             )
-//             .await?
-//             .unwrap_get();
-//         assert_eq!(state, get_result_value);
+        // Get contract parts
+        let state = WrappedState::new(contract_bytes.clone());
+        handler
+            .handle_request(
+                ContractRequest::Put {
+                    contract: contract.clone(),
+                    state: state.clone(),
+                    related_contracts: Default::default(),
+                }
+                .into(),
+            )
+            .await?
+            .unwrap_put();
+        let (get_result_value, _) = handler
+            .handle_request(
+                ContractRequest::Get {
+                    key: contract.key().clone(),
+                    fetch_contract: false,
+                }
+                .into(),
+            )
+            .await?
+            .unwrap_get();
+        assert_eq!(state, get_result_value);
 
-//         // Update the contract state with a new delta
-//         let delta = StateDelta::from(b"New test contract value".to_vec());
-//         handler
-//             .handle_request(
-//                 ContractRequest::Update {
-//                     key: contract.key().clone(),
-//                     data: delta.into(),
-//                 }
-//                 .into(),
-//             )
-//             .await?;
-//         // let (new_get_result_value, _) = handler
-//         //     .handle_request(ContractOps::Get {
-//         //         key: *contract.key(),
-//         //         contract: false,
-//         //     })
-//         //     .await?
-//         //     .unwrap_summary();
-//         // assert_eq!(delta, new_get_result_value);
-//         todo!("get summary and compare with delta");
-//     }
-// }
+        // Update the contract state with a new delta
+        let delta = StateDelta::from(b"New test contract value".to_vec());
+        handler
+            .handle_request(
+                ContractRequest::Update {
+                    key: contract.key().clone(),
+                    data: delta.into(),
+                }
+                .into(),
+            )
+            .await?;
+        // let (new_get_result_value, _) = handler
+        //     .handle_request(ContractOps::Get {
+        //         key: *contract.key(),
+        //         contract: false,
+        //     })
+        //     .await?
+        //     .unwrap_summary();
+        // assert_eq!(delta, new_get_result_value);
+        todo!("get summary and compare with delta");
+    }
+}

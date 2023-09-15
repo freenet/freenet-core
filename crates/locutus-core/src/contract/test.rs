@@ -139,6 +139,7 @@ where
 
 impl ContractHandler for MemoryContractHandler {
     type Builder = ();
+    type Runtime = MockRuntime;
 
     fn build(
         channel: ContractHandlerChannel<CHListenerHalve>,
@@ -175,7 +176,7 @@ impl ContractHandler for MemoryContractHandler {
         todo!()
     }
 
-    fn executor(&mut self) -> &mut crate::Executor {
+    fn executor(&mut self) -> &mut crate::Executor<Self::Runtime> {
         todo!()
     }
 }

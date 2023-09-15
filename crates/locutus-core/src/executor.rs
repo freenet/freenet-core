@@ -131,20 +131,20 @@ impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {}
 /// This executor will monitor the store directories and databases to detect state changes.
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
-pub struct Executor {
+pub struct Executor<R = Runtime> {
     #[cfg(any(
         all(feature = "local-mode", feature = "network-mode"),
         all(not(feature = "local-mode"), not(feature = "network-mode")),
     ))]
     mode: OperationMode,
-    runtime: Runtime,
+    runtime: R,
     state_store: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
 }
 
-impl Executor {
+impl Executor<Runtime> {
     pub async fn from_config(config: NodeConfig) -> Result<Self, DynError> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
@@ -272,10 +272,10 @@ impl Executor {
         }
     }
 
-    pub async fn handle_request(
+    pub async fn handle_request<'a>(
         &mut self,
         id: ClientId,
-        req: ClientRequest<'static>,
+        req: ClientRequest<'a>,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {

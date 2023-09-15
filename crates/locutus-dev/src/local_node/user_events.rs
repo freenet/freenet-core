@@ -243,7 +243,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
             },
             _ => unreachable!(),
         };
-        OpenRequest::new(ClientId::new(0), Box::new(req))
+        OpenRequest::new(ClientId::FIRST, Box::new(req))
     }
 }
 

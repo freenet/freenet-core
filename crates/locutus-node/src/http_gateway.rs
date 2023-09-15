@@ -17,14 +17,7 @@ use serde::Deserialize;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{
     mpsc::{self, error::TryRecvError, UnboundedReceiver},
     Mutex,
@@ -34,9 +27,6 @@ use crate::errors::WebSocketApiError;
 use crate::{web_handling, AuthToken, ClientConnection, DynError, HostCallbackResult};
 
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
-
-/// Each request is unique so we don't keep track of a client session of any sort.
-static REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// A gateway to access and interact with contracts through an HTTP interface.
 ///
@@ -88,7 +78,7 @@ impl HttpGateway {
     }
 
     pub fn next_client_id() -> ClientId {
-        internal_next_client_id()
+        ClientId::next()
     }
 }
 
@@ -149,10 +139,6 @@ async fn connection_info<B>(
     req.extensions_mut().insert(auth_token);
 
     next.run(req).await
-}
-
-fn internal_next_client_id() -> ClientId {
-    ClientId::new(REQUEST_ID.fetch_add(1, Ordering::SeqCst))
 }
 
 async fn new_client_connection(
@@ -504,7 +490,7 @@ impl HttpGateway {
                 assigned_token,
             } => {
                 // is a new client, assign an id and open a channel to communicate responses from the node
-                let cli_id = internal_next_client_id();
+                let cli_id = ClientId::next();
                 notifications
                     .send(HostCallbackResult::NewId { id: cli_id })
                     .map_err(|_e| ErrorKind::NodeUnavailable)?;
