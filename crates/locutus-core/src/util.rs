@@ -190,3 +190,21 @@ pub(crate) mod test {
 
     rnd_bytes!(1024 -> random_bytes_1024);
 }
+
+#[derive(Clone, Copy, serde::Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum EncodingProtocol {
+    /// Flatbuffers
+    Flatbuffers,
+    /// Rust native types
+    Native,
+}
+
+impl std::fmt::Display for EncodingProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodingProtocol::Flatbuffers => write!(f, "flatbuffers"),
+            EncodingProtocol::Native => write!(f, "native"),
+        }
+    }
+}
