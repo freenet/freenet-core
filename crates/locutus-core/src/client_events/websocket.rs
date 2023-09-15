@@ -12,10 +12,10 @@ use tower_http::trace::TraceLayer;
 
 use axum::routing::get;
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
-use locutus_stdlib::client_api::{
-    ClientRequest, ContractRequest, ErrorKind, HostResponse, TryFromTsStd,
-};
+use locutus_stdlib::client_api::{ClientRequest, ErrorKind, HostResponse};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+
+use crate::util::EncodingProtocol;
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 
@@ -198,7 +198,7 @@ async fn handle_socket(
     loop {
         tokio::select! {
             result = client_rx.next() => {
-                if new_request(&request_sender, client_id, result).await.is_err() {
+                if new_request(&request_sender, client_id, result, EncodingProtocol::Flatbuffers).await.is_err() {
                     break;
                 }
             }
@@ -216,26 +216,30 @@ async fn new_request(
     request_sender: &Sender<StaticOpenRequest>,
     id: ClientId,
     result: Option<Result<Message, axum::Error>>,
+    enconding_protoc: EncodingProtocol,
 ) -> Result<(), ()> {
     let msg = match result {
         Some(Ok(msg)) => {
             let data = msg.into_data();
-            let deserialized: ClientRequest = match ContractRequest::try_decode(&data) {
-                Ok(m) => m.into(),
-                Err(e) => {
-                    let _ = request_sender
-                        .send(
-                            OpenRequest::new(
-                                id,
-                                Box::new(ClientRequest::Disconnect {
-                                    cause: Some(format!("{e}")),
-                                }),
+            let deserialized = match enconding_protoc {
+                EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&data) {
+                    Ok(m) => m.into_owned(),
+                    Err(e) => {
+                        let _ = request_sender
+                            .send(
+                                OpenRequest::new(
+                                    id,
+                                    Box::new(ClientRequest::Disconnect {
+                                        cause: Some(format!("{e}")),
+                                    }),
+                                )
+                                .into(),
                             )
-                            .into(),
-                        )
-                        .await;
-                    return Ok(());
-                }
+                            .await;
+                        return Ok(());
+                    }
+                },
+                EncodingProtocol::Native => unreachable!("todo: support this"),
             };
             deserialized
         }
