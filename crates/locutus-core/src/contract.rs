@@ -1,7 +1,8 @@
-use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError, Runtime};
+use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError};
 
 mod handler;
 pub mod storages;
+#[cfg(test)]
 mod test;
 
 pub(crate) use handler::{
@@ -11,9 +12,11 @@ pub(crate) use handler::{
 #[cfg(test)]
 pub(crate) use test::{MemoryContractHandler, MockRuntime};
 
+use crate::executor::ContractExecutor;
+
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
-    CH: ContractHandler<Runtime = Runtime> + Send + 'static,
+    CH: ContractHandler + Send + 'static,
 {
     loop {
         let res = contract_handler.channel().recv_from_listener().await?;

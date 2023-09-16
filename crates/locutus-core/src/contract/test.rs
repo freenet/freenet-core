@@ -1,66 +1,12 @@
 use dashmap::DashMap;
 use futures::{future::BoxFuture, FutureExt};
-use locutus_runtime::{
-    ContractKey, ContractRuntimeInterface, ContractStore, StateStorage, StateStore,
-    UpdateModification, ValidateResult,
-};
+use locutus_runtime::{ContractKey, ContractStore, StateStorage, StateStore};
 use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 
 use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
-use crate::{config::Config, DynError, WrappedState};
+use crate::{config::Config, DynError, Executor, WrappedState};
 
 pub(crate) struct MockRuntime {}
-
-#[allow(unused_variables)]
-impl ContractRuntimeInterface for MockRuntime {
-    fn validate_state(
-        &mut self,
-        key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
-        related: &locutus_runtime::RelatedContracts,
-    ) -> locutus_runtime::RuntimeResult<ValidateResult> {
-        todo!()
-    }
-
-    fn validate_delta(
-        &mut self,
-        key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'_>,
-        delta: &locutus_runtime::StateDelta<'_>,
-    ) -> locutus_runtime::RuntimeResult<bool> {
-        todo!()
-    }
-
-    fn update_state(
-        &mut self,
-        key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
-        data: &[locutus_runtime::UpdateData<'_>],
-    ) -> locutus_runtime::RuntimeResult<UpdateModification<'static>> {
-        todo!()
-    }
-
-    fn summarize_state(
-        &mut self,
-        key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
-    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateSummary<'static>> {
-        todo!()
-    }
-
-    fn get_state_delta(
-        &mut self,
-        key: &ContractKey,
-        parameters: &locutus_runtime::Parameters<'_>,
-        state: &locutus_runtime::WrappedState,
-        delta_to: &locutus_runtime::StateSummary<'_>,
-    ) -> locutus_runtime::RuntimeResult<locutus_runtime::StateDelta<'static>> {
-        todo!()
-    }
-}
 
 #[derive(Default, Clone)]
 pub(crate) struct MemKVStore(DashMap<ContractKey, WrappedState>);
@@ -139,7 +85,7 @@ where
 
 impl ContractHandler for MemoryContractHandler {
     type Builder = ();
-    type Runtime = MockRuntime;
+    type ContractExecutor = Executor<MockRuntime>;
 
     fn build(
         channel: ContractHandlerChannel<CHListenerHalve>,
@@ -176,7 +122,7 @@ impl ContractHandler for MemoryContractHandler {
         todo!()
     }
 
-    fn executor(&mut self) -> &mut crate::Executor<Self::Runtime> {
+    fn executor(&mut self) -> &mut Self::ContractExecutor {
         todo!()
     }
 }

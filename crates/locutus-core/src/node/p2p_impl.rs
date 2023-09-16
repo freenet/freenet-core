@@ -70,7 +70,7 @@ impl NodeP2P {
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
-        CH: ContractHandler<Runtime = locutus_runtime::Runtime> + Send + Sync + 'static,
+        CH: ContractHandler + Send + Sync + 'static,
     {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
@@ -133,10 +133,9 @@ mod test {
     use crate::{
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
-        contract::NetworkContractHandler,
+        contract::MemoryContractHandler,
         node::{test::get_free_port, InitPeerNode},
         ring::Location,
-        NodeConfig,
     };
 
     use futures::StreamExt;
@@ -176,8 +175,6 @@ mod test {
         let peer1_config = InitPeerNode::new(peer1_id, Location::random())
             .listening_ip(Ipv4Addr::LOCALHOST)
             .listening_port(peer1_port);
-        let node_config_1: NodeConfig = todo!();
-        let node_config_2: NodeConfig = todo!();
 
         let peer2_key = Keypair::generate_ed25519();
         let peer2_id: PeerId = peer2_key.public().into();
@@ -193,8 +190,7 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 =
-                Box::new(NodeP2P::build::<NetworkContractHandler, 1>(config, node_config_1).await?);
+            let mut peer1 = Box::new(NodeP2P::build::<MemoryContractHandler, 1>(config, ()).await?);
             peer1.conn_manager.listen_on()?;
             ping_ev_loop(&mut peer1).await.unwrap();
             Ok::<_, anyhow::Error>(())
@@ -205,7 +201,7 @@ mod test {
             let user_events = MemoryEventsGen::new(receiver2, PeerKey::from(peer2_id));
             let mut config = NodeBuilder::new([Box::new(user_events)]);
             config.add_gateway(peer1_config.clone());
-            let mut peer2 = NodeP2P::build::<NetworkContractHandler, 1>(config, node_config_2)
+            let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1>(config, ())
                 .await
                 .unwrap();
             // wait a bit to make sure the first peer is up and listening

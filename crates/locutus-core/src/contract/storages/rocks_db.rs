@@ -120,10 +120,8 @@ mod test {
     // Prepare and get handler for rocksdb
     async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {
         let (_, ch_handler) = contract_handler_channel();
-        // let store: ContractStore =
-        //     ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
-        // RocksDbContractHandler::new(ch_handler, store, MockRuntime {}).await
-        todo!()
+        let handler = NetworkContractHandler::build(ch_handler, ()).await?;
+        Ok(handler)
     }
 
     #[ignore]

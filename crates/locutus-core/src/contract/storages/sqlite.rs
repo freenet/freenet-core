@@ -154,16 +154,13 @@ mod test {
     use locutus_stdlib::client_api::ContractRequest;
     use locutus_stdlib::prelude::ContractCode;
 
-    // use super::SQLiteContractHandler;
     use super::*;
 
     // Prepare and get handler for an in-memory sqlite db
-    async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, SqlDbError> {
+    async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {
         let (_, ch_handler) = contract_handler_channel();
-        // let store: ContractStore =
-        //     ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
-        // SQLiteContractHandler::new(ch_handler, store, MockRuntime {}).await
-        todo!()
+        let handler = NetworkContractHandler::build(ch_handler, ()).await?;
+        Ok(handler)
     }
 
     #[ignore]

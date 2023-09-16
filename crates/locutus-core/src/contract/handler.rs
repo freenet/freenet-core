@@ -15,17 +15,18 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::contract::{ContractError, ContractKey};
+use crate::executor::ContractExecutor;
 use crate::{ClientId, DynError, Executor, NodeConfig, WrappedState};
 
 pub const MAX_MEM_CACHE: i64 = 10_000_000;
 
 pub(crate) trait ContractHandler {
     type Builder;
-    type Runtime;
+    type ContractExecutor: ContractExecutor;
 
     fn build(
         channel: ContractHandlerChannel<CHListenerHalve>,
-        config: Self::Builder,
+        builder: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static;
@@ -37,7 +38,7 @@ pub(crate) trait ContractHandler {
         req: ClientRequest<'a>,
     ) -> BoxFuture<'a, Result<HostResponse, DynError>>;
 
-    fn executor(&mut self) -> &mut Executor<Self::Runtime>;
+    fn executor(&mut self) -> &mut Self::ContractExecutor;
 }
 
 pub(crate) struct NetworkContractHandler<R = Runtime> {
@@ -47,7 +48,7 @@ pub(crate) struct NetworkContractHandler<R = Runtime> {
 
 impl ContractHandler for NetworkContractHandler<Runtime> {
     type Builder = NodeConfig;
-    type Runtime = Runtime;
+    type ContractExecutor = Executor<Runtime>;
 
     fn build(
         channel: ContractHandlerChannel<CHListenerHalve>,
@@ -83,29 +84,28 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
         .boxed()
     }
 
-    fn executor(&mut self) -> &mut Executor {
+    fn executor(&mut self) -> &mut Self::ContractExecutor {
         &mut self.executor
     }
 }
 
 #[cfg(test)]
 impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
-    type Builder = NodeConfig;
-    type Runtime = super::MockRuntime;
+    type Builder = ();
+    type ContractExecutor = Executor<super::MockRuntime>;
 
     fn build(
         channel: ContractHandlerChannel<CHListenerHalve>,
-        config: Self::Builder,
+        _builder: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
-        // async {
-        //     let executor = Executor::from_config(config).await?;
-        //     Ok(Self { executor, channel })
-        // }
-        // .boxed()
-        todo!()
+        async {
+            let executor = Executor::new_mock().await?;
+            Ok(Self { executor, channel })
+        }
+        .boxed()
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
@@ -116,20 +116,17 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
         &'s mut self,
         req: ClientRequest<'a>,
     ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
-        // async {
-        //     // FIXME: pass the missing arguments in the fn
-        //     let updates = None;
-        //     let res = self
-        //         .executor
-        //         .handle_request(ClientId::FIRST, req, updates)
-        //         .await?;
-        //     Ok(res)
-        // }
-        // .boxed()
-        todo!()
+        async {
+            let res = self
+                .executor
+                .handle_request(ClientId::FIRST, req, None)
+                .await?;
+            Ok(res)
+        }
+        .boxed()
     }
 
-    fn executor(&mut self) -> &mut Executor<Self::Runtime> {
+    fn executor(&mut self) -> &mut Self::ContractExecutor {
         &mut self.executor
     }
 }

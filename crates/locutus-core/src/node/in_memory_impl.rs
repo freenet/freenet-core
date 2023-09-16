@@ -54,8 +54,7 @@ impl NodeInMemory {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        // FIXME: add a test version which doesnt require `Runtime = locutus_runtime::Runtime`
-        // GlobalExecutor::spawn(contract::contract_handling(contract_handler));
+        GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
         Ok(NodeInMemory {
             peer_key,

@@ -126,6 +126,16 @@ struct UpdateContract {
 
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {}
 
+#[async_trait::async_trait]
+pub(crate) trait ContractExecutor: Send + Sync + 'static {
+    async fn fetch_contract(
+        &mut self,
+        key: ContractKey,
+        fetch_contract: bool,
+    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError>;
+    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ContractError>;
+}
+
 /// A WASM executor which will run any contracts, delegates, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
@@ -449,32 +459,6 @@ impl Executor<Runtime> {
             }
             _ => Err(ExecutorError::other("not supported")),
         }
-    }
-
-    pub(crate) async fn fetch_contract(
-        &mut self,
-        key: ContractKey,
-        fetch_contract: bool,
-    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
-        match self.perform_contract_get(fetch_contract, key).await {
-            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                contract,
-                state,
-                ..
-            })) => Ok((state, contract)),
-            Err(err) => Err(err),
-            Ok(_) => {
-                // Safety: check `perform_contract_get` to indeed check this should never happen
-                unsafe { unreachable_unchecked() }
-            }
-        }
-    }
-
-    pub(crate) async fn store_contract(
-        &mut self,
-        contract: ContractContainer,
-    ) -> Result<(), ContractError> {
-        self.runtime.contract_store.store_contract(contract)
     }
 
     async fn perform_contract_put(
@@ -1040,6 +1024,64 @@ impl Executor<Runtime> {
             return Ok(None);
         };
         Ok(Some(contract))
+    }
+}
+
+#[cfg(test)]
+impl Executor<crate::contract::MockRuntime> {
+    pub async fn new_mock() -> Result<Self, DynError> {
+        todo!()
+    }
+
+    pub async fn handle_request<'a>(
+        &mut self,
+        _id: ClientId,
+        _req: ClientRequest<'a>,
+        _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
+    ) -> Response {
+        todo!()
+    }
+}
+
+#[async_trait::async_trait]
+impl ContractExecutor for Executor<Runtime> {
+    async fn fetch_contract(
+        &mut self,
+        key: ContractKey,
+        fetch_contract: bool,
+    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
+        match self.perform_contract_get(fetch_contract, key).await {
+            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                contract,
+                state,
+                ..
+            })) => Ok((state, contract)),
+            Err(err) => Err(err),
+            Ok(_) => {
+                // Safety: check `perform_contract_get` to indeed check this should never happen
+                unsafe { unreachable_unchecked() }
+            }
+        }
+    }
+
+    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ContractError> {
+        self.runtime.contract_store.store_contract(contract)
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ContractExecutor for Executor<crate::contract::MockRuntime> {
+    async fn fetch_contract(
+        &mut self,
+        _key: ContractKey,
+        _fetch_contract: bool,
+    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
+        todo!()
+    }
+
+    async fn store_contract(&mut self, _contract: ContractContainer) -> Result<(), ContractError> {
+        todo!()
     }
 }
 
