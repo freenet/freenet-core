@@ -1,7 +1,6 @@
 pub(crate) mod client_events;
 mod config;
 mod contract;
-mod executor;
 mod message;
 mod node;
 mod operations;
@@ -24,8 +23,8 @@ pub use client_events::{
     HostResult, OpenRequest,
 };
 pub use contract::storages::Storage;
+pub use contract::{Executor, ExecutorError, OperationMode};
 pub use either;
-pub use executor::{Executor, ExecutorError, OperationMode};
 pub use libp2p;
 pub use locutus_runtime;
 pub use node::PeerKey;

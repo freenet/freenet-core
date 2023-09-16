@@ -3,8 +3,11 @@ use futures::{future::BoxFuture, FutureExt};
 use locutus_runtime::{ContractKey, ContractStore, StateStorage, StateStore};
 use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 
-use super::handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel};
-use crate::{config::Config, DynError, Executor, WrappedState};
+use super::{
+    handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
+    Executor,
+};
+use crate::{config::Config, DynError, WrappedContract, WrappedState};
 
 pub(crate) struct MockRuntime {}
 
@@ -106,19 +109,6 @@ impl ContractHandler for MemoryContractHandler {
         &'s mut self,
         _req: ClientRequest<'a>,
     ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
-        // async fn get_state(&self, contract: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
-        //     Ok(self.kv_store.get(contract).cloned())
-        // }
-
-        // async fn update_state(
-        //     &mut self,
-        //     contract: &ContractKey,
-        //     value: WrappedState,
-        // ) -> Result<WrappedState, Self::Error> {
-        //     let new_val = value.clone();
-        //     self.kv_store.insert(*contract, value);
-        //     Ok(new_val)
-        // }
         todo!()
     }
 
@@ -127,38 +117,16 @@ impl ContractHandler for MemoryContractHandler {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct SimStoreError(String);
+#[ignore]
+#[test]
+fn serialization() -> Result<(), anyhow::Error> {
+    let bytes = crate::util::test::random_bytes_1024();
+    let mut gen = arbitrary::Unstructured::new(&bytes);
+    let contract: WrappedContract = gen.arbitrary()?;
 
-impl std::fmt::Display for SimStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for SimStoreError {}
-
-impl From<std::io::Error> for SimStoreError {
-    fn from(err: std::io::Error) -> Self {
-        Self(format!("{err}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::WrappedContract;
-
-    #[ignore]
-    #[test]
-    fn serialization() -> Result<(), anyhow::Error> {
-        let bytes = crate::util::test::random_bytes_1024();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-
-        let serialized = bincode::serialize(&contract)?;
-        let deser: WrappedContract = bincode::deserialize(&serialized)?;
-        assert_eq!(deser.code(), contract.code());
-        assert_eq!(deser.key(), contract.key());
-        Ok(())
-    }
+    let serialized = bincode::serialize(&contract)?;
+    let deser: WrappedContract = bincode::deserialize(&serialized)?;
+    assert_eq!(deser.code(), contract.code());
+    assert_eq!(deser.key(), contract.key());
+    Ok(())
 }

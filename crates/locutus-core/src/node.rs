@@ -27,7 +27,7 @@ use self::{
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
     config::GlobalExecutor,
-    contract::{ContractError, NetworkContractHandler},
+    contract::{ContractError, NetworkContractHandler, OperationMode},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
     operations::{
         get,
@@ -55,8 +55,8 @@ pub(crate) mod test;
 #[derive(clap::Parser, Clone, Debug)]
 pub struct NodeConfig {
     /// Node operation mode.
-    #[clap(value_enum, default_value_t=crate::OperationMode::Local)]
-    pub mode: crate::OperationMode,
+    #[clap(value_enum, default_value_t=OperationMode::Local)]
+    pub mode: OperationMode,
     /// Overrides the default data directory where Locutus contract files are stored.
     pub node_data_dir: Option<PathBuf>,
 

@@ -5,18 +5,19 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use futures::future::BoxFuture;
-use futures::FutureExt;
+use futures::{future::BoxFuture, FutureExt};
 use locutus_runtime::{
-    ContractContainer, ContractStore, Parameters, Runtime, StateStorage, StateStore,
+    ContractContainer, ContractKey, ContractStore, Parameters, Runtime, StateStorage, StateStore,
 };
 use locutus_stdlib::client_api::{ClientRequest, HostResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::contract::{ContractError, ContractKey};
-use crate::executor::ContractExecutor;
-use crate::{ClientId, DynError, Executor, NodeConfig, WrappedState};
+use super::{
+    executor::{ContractExecutor, Executor},
+    ContractError,
+};
+use crate::{ClientId, DynError, NodeConfig, WrappedState};
 
 pub const MAX_MEM_CACHE: i64 = 10_000_000;
 
@@ -291,10 +292,7 @@ pub mod test {
     use super::*;
     use crate::{
         config::GlobalExecutor,
-        contract::{
-            test::{MemKVStore, SimStoreError},
-            MockRuntime,
-        },
+        contract::{in_memory::MemKVStore, MockRuntime},
         WrappedContract,
     };
 

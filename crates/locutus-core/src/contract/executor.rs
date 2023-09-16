@@ -6,25 +6,29 @@ use std::hint::unreachable_unchecked;
 use std::time::{Duration, Instant};
 
 use blake3::traits::digest::generic_array::GenericArray;
+use either::Either;
 use locutus_runtime::prelude::*;
-use locutus_stdlib::client_api::HostResponse::DelegateResponse;
 use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractError as CoreContractError, ContractRequest,
-    ContractResponse, DelegateError as CoreDelegateError, DelegateRequest, HostResponse,
+    ContractResponse, DelegateError as CoreDelegateError, DelegateRequest,
+    HostResponse::{self, DelegateResponse},
     RequestError,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::node::{OpManager, P2pBridge};
 #[cfg(any(
     not(feature = "local-mode"),
     feature = "network-mode",
     all(not(feature = "local-mode"), not(feature = "network-mode"))
 ))]
 use crate::operations::get::GetResult;
-use crate::operations::{self, op_trait::Operation};
-use crate::NodeConfig;
-use crate::{either::Either, ClientId, DynError, HostResult, Storage};
+use crate::{
+    node::{OpManager, P2pBridge},
+    operations::{self, op_trait::Operation},
+    ClientId, DynError, HostResult, NodeConfig,
+};
+
+use super::storages::Storage;
 
 pub struct ExecutorError(Either<Box<RequestError>, DynError>);
 

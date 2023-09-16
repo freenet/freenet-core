@@ -1,18 +1,20 @@
 use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError};
 
+mod executor;
 mod handler;
-pub mod storages;
 #[cfg(test)]
-mod test;
+mod in_memory;
+pub mod storages;
 
 pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, NetworkContractHandler, StoreResponse,
 };
 #[cfg(test)]
-pub(crate) use test::{MemoryContractHandler, MockRuntime};
+pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
 
-use crate::executor::ContractExecutor;
+use executor::ContractExecutor;
+pub use executor::{Executor, ExecutorError, OperationMode};
 
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
