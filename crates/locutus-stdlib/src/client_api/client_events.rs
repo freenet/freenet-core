@@ -59,6 +59,27 @@ pub struct ClientError {
 }
 
 impl ClientError {
+    pub fn into_fbs_bytes(self) -> Result<Vec<u8>, Box<ClientError>> {
+        use crate::host_response_generated::host_response::{Error, ErrorArgs};
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let msg_offset = builder.create_string(&self.to_string());
+        let err_offset = Error::create(
+            &mut builder,
+            &ErrorArgs {
+                msg: Some(msg_offset),
+            },
+        );
+        let host_response_offset = FbsHostResponse::create(
+            &mut builder,
+            &HostResponseArgs {
+                response_type: HostResponseType::Ok,
+                response: Some(err_offset.as_union_value()),
+            },
+        );
+        finish_host_response_buffer(&mut builder, host_response_offset);
+        Ok(builder.finished_data().to_vec())
+    }
+
     pub fn kind(&self) -> ErrorKind {
         self.kind.clone()
     }

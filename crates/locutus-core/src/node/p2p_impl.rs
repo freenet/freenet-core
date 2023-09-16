@@ -134,7 +134,7 @@ mod test {
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
         contract::MemoryContractHandler,
-        node::{test::get_free_port, InitPeerNode},
+        node::{tests::get_free_port, InitPeerNode},
         ring::Location,
     };
 

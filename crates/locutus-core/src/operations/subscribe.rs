@@ -450,7 +450,7 @@ mod test {
 
     use super::*;
     use crate::{
-        node::test::{check_connectivity, NodeSpecification, SimNetwork},
+        node::tests::{check_connectivity, NodeSpecification, SimNetwork},
         WrappedContract, WrappedState,
     };
 

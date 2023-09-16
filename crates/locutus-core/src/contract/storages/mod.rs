@@ -13,3 +13,6 @@ use self::rocks_db::RocksDb;
 
 #[cfg(all(feature = "rocks_db", not(feature = "sqlite")))]
 pub type Storage = RocksDb;
+
+#[cfg(test)]
+pub(crate) mod in_memory;

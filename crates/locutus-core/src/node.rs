@@ -50,7 +50,7 @@ mod in_memory_impl;
 mod op_state;
 mod p2p_impl;
 #[cfg(test)]
-pub(crate) mod test;
+pub(crate) mod tests;
 
 #[derive(clap::Parser, Clone, Debug)]
 pub struct NodeConfig {

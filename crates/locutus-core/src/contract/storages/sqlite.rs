@@ -149,7 +149,7 @@ mod test {
     use crate::contract::{
         contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
     };
-    use crate::{DynError, WrappedContract};
+    use crate::{ClientId, DynError, WrappedContract};
     use locutus_runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
     use locutus_stdlib::client_api::ContractRequest;
     use locutus_stdlib::prelude::ContractCode;
@@ -187,6 +187,8 @@ mod test {
                     related_contracts: Default::default(),
                 }
                 .into(),
+                ClientId::FIRST,
+                None,
             )
             .await?
             .unwrap_put();
@@ -197,6 +199,8 @@ mod test {
                     fetch_contract: false,
                 }
                 .into(),
+                ClientId::FIRST,
+                None,
             )
             .await?
             .unwrap_get();
@@ -211,6 +215,8 @@ mod test {
                     data: delta.into(),
                 }
                 .into(),
+                ClientId::FIRST,
+                None,
             )
             .await?;
         // let (new_get_result_value, _) = handler

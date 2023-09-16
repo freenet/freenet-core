@@ -9,9 +9,9 @@ use futures::{future::BoxFuture, FutureExt};
 use locutus_runtime::{
     ContractContainer, ContractKey, ContractStore, Parameters, Runtime, StateStorage, StateStore,
 };
-use locutus_stdlib::client_api::{ClientRequest, HostResponse};
+use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 use super::{
     executor::{ContractExecutor, Executor},
@@ -34,9 +34,13 @@ pub(crate) trait ContractHandler {
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve>;
 
+    /// # Arguments
+    /// - updates: channel to send back updates from contracts to whoever is subscribed to the contract.
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
+        client_id: ClientId,
+        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> BoxFuture<'a, Result<HostResponse, DynError>>;
 
     fn executor(&mut self) -> &mut Self::ContractExecutor;
@@ -72,13 +76,13 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
+        client_id: ClientId,
+        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
-        async {
-            // FIXME: pass the missing arguments in the fn
-            let updates = None;
+        async move {
             let res = self
                 .executor
-                .handle_request(ClientId::FIRST, req, updates)
+                .handle_request(client_id, req, updates)
                 .await?;
             Ok(res)
         }
@@ -116,11 +120,13 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
+        client_id: ClientId,
+        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
-        async {
+        async move {
             let res = self
                 .executor
-                .handle_request(ClientId::FIRST, req, None)
+                .handle_request(client_id, req, updates)
                 .await?;
             Ok(res)
         }
@@ -290,11 +296,7 @@ pub mod test {
     };
 
     use super::*;
-    use crate::{
-        config::GlobalExecutor,
-        contract::{in_memory::MemKVStore, MockRuntime},
-        WrappedContract,
-    };
+    use crate::{config::GlobalExecutor, contract::MockRuntime, WrappedContract};
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

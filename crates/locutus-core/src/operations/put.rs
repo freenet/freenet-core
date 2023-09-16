@@ -787,7 +787,7 @@ mod test {
     use locutus_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
-    use crate::node::test::{check_connectivity, NodeSpecification, SimNetwork};
+    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
 
     use super::*;
 

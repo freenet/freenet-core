@@ -449,10 +449,7 @@ async fn process_host_response(
             let serialized_res = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => match result {
                     Ok(res) => res.into_fbs_bytes()?,
-                    Err(err) => {
-                        tracing::warn!("add an error type for client errors");
-                        return Err(err.into()); // FIXME: add to schema ClientError
-                    }
+                    Err(err) => err.into_fbs_bytes()?,
                 },
                 EncodingProtocol::Native => bincode::serialize(&result)?,
             };

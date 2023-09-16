@@ -679,11 +679,7 @@ impl Executor<Runtime> {
         ))]
         {
             if contract && self.mode == OperationMode::Local {
-                let Some(contract) = self
-                    .get_contract_locally(&key)
-                    .await
-                    .map_err(ExecutorError::request)?
-                else {
+                let Some(contract) = self.get_contract_locally(&key).await? else {
                     return Err(ExecutorError::other(RequestError::from(
                         CoreContractError::Get {
                             key: key.clone(),
@@ -1014,13 +1010,12 @@ impl Executor<Runtime> {
     async fn get_contract_locally(
         &self,
         key: &ContractKey,
-    ) -> Result<Option<ContractContainer>, RequestError> {
-        let Some(parameters) = self.state_store.get_params(key).await.map_err(|e| {
-            RequestError::ContractError(CoreContractError::Update {
-                cause: format!("{e}"),
-                key: key.clone(),
-            })
-        })?
+    ) -> Result<Option<ContractContainer>, ExecutorError> {
+        let Some(parameters) = self
+            .state_store
+            .get_params(key)
+            .await
+            .map_err(ExecutorError::other)?
         else {
             return Ok(None);
         };
@@ -1078,14 +1073,34 @@ impl ContractExecutor for Executor<Runtime> {
 impl ContractExecutor for Executor<crate::contract::MockRuntime> {
     async fn fetch_contract(
         &mut self,
-        _key: ContractKey,
+        key: ContractKey,
         _fetch_contract: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
-        todo!()
+        let Some(parameters) = self
+            .state_store
+            .get_params(&key)
+            .await
+            .map_err(ExecutorError::other)?
+        else {
+            return Err(ExecutorError::other(format!(
+                "missing parameters for contract {key}"
+            )));
+        };
+        let Ok(state) = self.state_store.get(&key).await else {
+            return Err(ExecutorError::other(format!(
+                "missing state for contract {key}"
+            )));
+        };
+        let contract = self
+            .runtime
+            .contract_store
+            .fetch_contract(&key, &parameters);
+        Ok((state, contract))
     }
 
-    async fn store_contract(&mut self, _contract: ContractContainer) -> Result<(), ContractError> {
-        todo!()
+    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ContractError> {
+        self.runtime.contract_store.store_contract(contract)?;
+        Ok(())
     }
 }
 

@@ -963,7 +963,7 @@ mod messages {
 mod test {
     use std::time::Duration;
 
-    use crate::node::test::{check_connectivity, SimNetwork};
+    use crate::node::tests::{check_connectivity, SimNetwork};
 
     /// Given a network of one node and one gateway test that both are connected.
     #[ignore]

@@ -1,58 +1,17 @@
-use dashmap::DashMap;
 use futures::{future::BoxFuture, FutureExt};
-use locutus_runtime::{ContractKey, ContractStore, StateStorage, StateStore};
-use locutus_stdlib::client_api::{ClientRequest, HostResponse};
+use locutus_runtime::{ContractStore, StateStorage, StateStore, WrappedContract};
+use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
     handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
+    storages::in_memory::MemKVStore,
     Executor,
 };
-use crate::{config::Config, DynError, WrappedContract, WrappedState};
+use crate::{config::Config, ClientId, DynError};
 
-pub(crate) struct MockRuntime {}
-
-#[derive(Default, Clone)]
-pub(crate) struct MemKVStore(DashMap<ContractKey, WrappedState>);
-
-#[async_trait::async_trait]
-impl StateStorage for MemKVStore {
-    type Error = String;
-
-    async fn store(
-        &mut self,
-        _key: ContractKey,
-        _state: locutus_runtime::WrappedState,
-    ) -> Result<(), Self::Error> {
-        todo!()
-    }
-
-    async fn get(
-        &self,
-        _key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
-        todo!()
-    }
-
-    async fn store_params(
-        &mut self,
-        _key: ContractKey,
-        _state: locutus_runtime::Parameters<'static>,
-    ) -> Result<(), Self::Error> {
-        todo!()
-    }
-
-    async fn get_params<'a>(
-        &'a self,
-        _key: &'a ContractKey,
-    ) -> Result<Option<locutus_runtime::Parameters<'static>>, Self::Error> {
-        todo!()
-    }
-}
-
-impl MemKVStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
+pub(crate) struct MockRuntime {
+    pub contract_store: ContractStore,
 }
 
 pub(crate) struct MemoryContractHandler<KVStore = MemKVStore>
@@ -61,7 +20,6 @@ where
 {
     channel: ContractHandlerChannel<CHListenerHalve>,
     _kv_store: StateStore<KVStore>,
-    _contract_store: ContractStore,
     _runtime: MockRuntime,
 }
 
@@ -76,12 +34,13 @@ where
         MemoryContractHandler {
             channel,
             _kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
-            _contract_store: ContractStore::new(
-                Config::get_static_conf().config_paths.contracts_dir.clone(),
-                Self::MAX_MEM_CACHE,
-            )
-            .unwrap(),
-            _runtime: MockRuntime {},
+            _runtime: MockRuntime {
+                contract_store: ContractStore::new(
+                    Config::get_static_conf().config_paths.contracts_dir.clone(),
+                    Self::MAX_MEM_CACHE,
+                )
+                .unwrap(),
+            },
         }
     }
 }
@@ -108,6 +67,8 @@ impl ContractHandler for MemoryContractHandler {
     fn handle_request<'a, 's: 'a>(
         &'s mut self,
         _req: ClientRequest<'a>,
+        _client_id: ClientId,
+        _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
         todo!()
     }
