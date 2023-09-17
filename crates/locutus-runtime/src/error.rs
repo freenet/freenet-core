@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use locutus_stdlib::prelude::{ContractKey, DelegateKey, SecretsId};
 
-use crate::{delegate, runtime, secrets_store};
+use crate::{delegate, runtime, secrets_store, DelegateExecError};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
@@ -16,6 +16,16 @@ impl ContractError {
 
     pub fn is_delegate_exec_error(&self) -> bool {
         matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
+    }
+
+    pub fn delegate_auth_access(&self) -> Option<&SecretsId> {
+        match &*self.0 {
+            RuntimeInnerError::DelegateExecError(DelegateExecError::UnauthorizedSecretAccess {
+                secret,
+                ..
+            }) => Some(secret),
+            _ => None,
+        }
     }
 
     pub fn is_execution_error(&self) -> bool {
