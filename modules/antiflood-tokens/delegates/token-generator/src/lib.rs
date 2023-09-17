@@ -15,6 +15,7 @@ struct TokenDelegate;
 impl DelegateInterface for TokenDelegate {
     fn process(
         params: Parameters<'static>,
+        _attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
@@ -153,8 +154,13 @@ fn allocate_token(
             let application_response = match response {
                 Response::Allowed => {
                     let context: DelegateContext = (&*context).try_into()?;
-                    let Some(assignment) = records.assign(&criteria, &params.generator_private_key, assignment_hash) else {
-                        let msg = TokenDelegateMessage::Failure(FailureReason::NoFreeSlot { delegate_id, criteria } );
+                    let Some(assignment) =
+                        records.assign(&criteria, &params.generator_private_key, assignment_hash)
+                    else {
+                        let msg = TokenDelegateMessage::Failure(FailureReason::NoFreeSlot {
+                            delegate_id,
+                            criteria,
+                        });
                         return Ok(vec![OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app, msg.serialize()?).with_context(context),
                         )]);

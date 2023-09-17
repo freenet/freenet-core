@@ -442,18 +442,21 @@ export class DelegateRequest extends DelegateRequestT {
  * @public
  */
 export class PutResponse extends PutResponseT {
-    constructor(public key: ContractKey) {
-        super(key);
-    }
+  constructor(public key: ContractKey) {
+    super(key);
+  }
 
-    static fromPutResponseT(obj: PutResponseT): PutResponse {
-        // Build the contract key
-        let instance = new Uint8Array(obj.key?.instance?.data!);
-        const code = obj.key?.code && obj.key.code.length > 0 ? new Uint8Array(obj.key.code!) : undefined;
-        let key: ContractKey = new ContractKey(instance, code);
+  static fromPutResponseT(obj: PutResponseT): PutResponse {
+    // Build the contract key
+    let instance = new Uint8Array(obj.key?.instance?.data!);
+    const code =
+      obj.key?.code && obj.key.code.length > 0
+        ? new Uint8Array(obj.key.code!)
+        : undefined;
+    let key: ContractKey = new ContractKey(instance, code);
 
-        return new PutResponse(key);
-    }
+    return new PutResponse(key);
+  }
 }
 
 /**
@@ -461,18 +464,25 @@ export class PutResponse extends PutResponseT {
  * @public
  */
 export class GetResponse extends GetResponseT {
-    constructor(public key: ContractKey, public contract: ContractContainer, public state: (number)[] = []) {
-        super(key, contract, state);
-    }
+  constructor(
+    public key: ContractKey,
+    public contract: ContractContainer,
+    public state: number[] = []
+  ) {
+    super(key, contract, state);
+  }
 
-    static fromGetResponseT(obj: GetResponseT): GetResponse {
-        // Build the contract key
-        let instance = new Uint8Array(obj.key?.instance?.data!);
-        const code = obj.key?.code && obj.key.code.length > 0 ? new Uint8Array(obj.key.code!) : undefined;
-        let key: ContractKey = new ContractKey(instance, code);
+  static fromGetResponseT(obj: GetResponseT): GetResponse {
+    // Build the contract key
+    let instance = new Uint8Array(obj.key?.instance?.data!);
+    const code =
+      obj.key?.code && obj.key.code.length > 0
+        ? new Uint8Array(obj.key.code!)
+        : undefined;
+    let key: ContractKey = new ContractKey(instance, code);
 
-        return new GetResponse(key, obj.contract!, obj.state);
-    }
+    return new GetResponse(key, obj.contract!, obj.state);
+  }
 }
 
 /**
@@ -480,18 +490,21 @@ export class GetResponse extends GetResponseT {
  * @public
  */
 export class UpdateResponse extends UpdateResponseT {
-    constructor(public key: ContractKey, public summary: (number)[] = []) {
-        super(key, summary);
-    }
+  constructor(public key: ContractKey, public summary: number[] = []) {
+    super(key, summary);
+  }
 
-    static fromUpdateResponseT(obj: UpdateResponseT): UpdateResponse {
-        // Build the contract key
-        let instance = new Uint8Array(obj.key?.instance?.data!);
-        const code = obj.key?.code && obj.key.code.length > 0 ? new Uint8Array(obj.key.code!) : undefined;
-        let key: ContractKey = new ContractKey(instance, code);
+  static fromUpdateResponseT(obj: UpdateResponseT): UpdateResponse {
+    // Build the contract key
+    let instance = new Uint8Array(obj.key?.instance?.data!);
+    const code =
+      obj.key?.code && obj.key.code.length > 0
+        ? new Uint8Array(obj.key.code!)
+        : undefined;
+    let key: ContractKey = new ContractKey(instance, code);
 
-        return new UpdateResponse(key, obj.summary);
-    }
+    return new UpdateResponse(key, obj.summary);
+  }
 }
 
 /**
@@ -499,19 +512,21 @@ export class UpdateResponse extends UpdateResponseT {
  * @public
  */
 export class UpdateNotification extends UpdateNotificationT {
-    constructor(public key: ContractKey, public update: UpdateData) {
-        super(key, update);
-    }
+  constructor(public key: ContractKey, public update: UpdateData) {
+    super(key, update);
+  }
 
-    static fromUpdateNotificationT(obj: UpdateNotificationT): UpdateNotification {
-        // Build the contract key
-        let instance = new Uint8Array(obj.key?.instance?.data!);
-        const code = obj.key?.code && obj.key.code.length > 0 ? new Uint8Array(obj.key.code!) : undefined;
-        let key: ContractKey = new ContractKey(instance);
+  static fromUpdateNotificationT(obj: UpdateNotificationT): UpdateNotification {
+    // Build the contract key
+    let instance = new Uint8Array(obj.key?.instance?.data!);
+    const code =
+      obj.key?.code && obj.key.code.length > 0
+        ? new Uint8Array(obj.key.code!)
+        : undefined;
+    let key: ContractKey = new ContractKey(instance);
 
-
-        return new UpdateNotification(key, obj.update!);
-    }
+    return new UpdateNotification(key, obj.update!);
+  }
 }
 
 // Delegate
@@ -718,7 +733,7 @@ export class LocutusWsApi {
       let data = new flatbuffers.ByteBuffer(new Uint8Array(ev.data));
       response = HostResponse.getRootAsHostResponse(data).unpack();
     } catch (err) {
-      console.error(err);
+      console.log(`found error: ${err}`);
       return new Error(`${err}`);
     }
     switch (response.responseType) {
@@ -726,24 +741,35 @@ export class LocutusWsApi {
         let host_resp = response.response as ContractResponseT;
         switch (host_resp.contractResponseType) {
           case ContractResponseType.PutResponse:
-            const put_response = PutResponse.fromPutResponseT(host_resp.contractResponse as PutResponseT)
+            const put_response = PutResponse.fromPutResponseT(
+              host_resp.contractResponse as PutResponseT
+            );
             this.responseHandler.onContractPut(put_response);
             break;
           case ContractResponseType.GetResponse:
-            const get_response = GetResponse.fromGetResponseT(host_resp.contractResponse as GetResponseT);
+            const get_response = GetResponse.fromGetResponseT(
+              host_resp.contractResponse as GetResponseT
+            );
             this.responseHandler.onContractGet(get_response);
             break;
           case ContractResponseType.UpdateResponse:
-            const update_response = UpdateResponse.fromUpdateResponseT(host_resp.contractResponse as UpdateResponseT);
+            const update_response = UpdateResponse.fromUpdateResponseT(
+              host_resp.contractResponse as UpdateResponseT
+            );
             this.responseHandler.onContractUpdate(update_response);
             break;
           case ContractResponseType.UpdateNotification:
-            const update_notification = UpdateNotification.fromUpdateNotificationT(host_resp.contractResponse as UpdateNotificationT);
-            this.responseHandler.onContractUpdateNotification(update_notification);
+            const update_notification =
+              UpdateNotification.fromUpdateNotificationT(
+                host_resp.contractResponse as UpdateNotificationT
+              );
+            this.responseHandler.onContractUpdateNotification(
+              update_notification
+            );
             break;
           default:
             const cause = "Contract response type not implemented";
-            console.error(cause);
+            console.log(cause);
             const err: HostError = {
               cause,
             };
@@ -757,13 +783,9 @@ export class LocutusWsApi {
         break;
       case HostResponseType.Ok:
         break;
-      case HostResponseType.Error:
-        const hostError = response.response as ErrorT;
-        this.responseHandler.onErr({ cause: hostError.msg!.toString() });
-        break;
       default:
         const cause = `Received wrong HostResponse type`;
-        console.error(cause);
+        console.log(cause);
         const err: HostError = {
           cause,
         };
