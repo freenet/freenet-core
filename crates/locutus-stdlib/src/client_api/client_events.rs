@@ -134,6 +134,8 @@ pub enum DelegateError {
     Missing(DelegateKey),
     #[error("missing secret `{secret}` for delegate {key}")]
     MissingSecret { key: DelegateKey, secret: SecretsId },
+    #[error("forbidden access to secret: {0}")]
+    ForbiddenSecretAccess(SecretsId),
 }
 
 /// Errors that may happen while interacting with contracts.
