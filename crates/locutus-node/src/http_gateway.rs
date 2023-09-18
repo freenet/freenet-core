@@ -346,17 +346,14 @@ async fn websocket_interface(
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
-                let msg = match encoding_protoc {
+                let serialized_res = match encoding_protoc {
                     EncodingProtocol::Flatbuffers => match response {
                         Ok(res) => res.into_fbs_bytes()?,
-                        Err(err) => {
-                            tracing::warn!("add an error type for client errors");
-                            return Err(err.into()); // FIXME: add to schema ClientError
-                        }
+                        Err(err) => err.into_fbs_bytes()?,
                     },
                     EncodingProtocol::Native => bincode::serialize(&response)?,
                 };
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(serialized_res)).await?;
             }
         }
     }

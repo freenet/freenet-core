@@ -10,7 +10,7 @@ fn main() {
         .arg("../../schemas/flatbuffers/host_response.fbs")
         .status();
     if let Err(err) = status {
-        println!("failed compiling flatbuffers schema: {err}")
+        println!("failed compiling flatbuffers schema: {err}");
+        println!("refer to https://github.com/google/flatbuffers to install the flatc compiler");
     }
-    // TODO try to install flatc from https://github.com/google/flatbuffers and use it to compile schemas
 }
