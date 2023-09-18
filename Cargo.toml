@@ -12,9 +12,6 @@ chrono = { version = "0.4", default-features = true }
 either = "1.8"
 futures = "0.3"
 rand = { version = "0.8" }
-rmp = { version = "0.8" }
-rmpv = { version = "1"}
-rmp-serde = { version = "1" } 
 semver = { version = "1.0.14",  features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

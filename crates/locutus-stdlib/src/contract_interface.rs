@@ -147,20 +147,6 @@ impl<'a> RelatedContracts<'a> {
     }
 }
 
-impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
-    type Error = String;
-
-    fn try_from(value: &'a rmpv::Value) -> Result<Self, Self::Error> {
-        let related_contracts: HashMap<ContractInstanceId, Option<State<'a>>> =
-            HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
-                let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
-                let state = State::from(val.as_slice().unwrap());
-                (id, Some(state))
-            }));
-        Ok(RelatedContracts::from(related_contracts))
-    }
-}
-
 impl<'a> TryFromFbs<&FbsRelatedContracts<'a>> for RelatedContracts<'a> {
     fn try_decode_fbs(related_contracts: &FbsRelatedContracts<'a>) -> Result<Self, WsApiError> {
         let mut map = HashMap::with_capacity(related_contracts.contracts().len());

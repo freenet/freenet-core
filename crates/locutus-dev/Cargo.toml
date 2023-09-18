@@ -29,15 +29,7 @@ tar = "0.4"
 toml = { version = "0.8", features = ["default", "preserve_order"] }
 xz2 = "0.1"
 
-# (mp) message pack feature
-rmp = { version = "0.8", optional = true }
-rmpv = { version = "1", optional = true }
-rmp-serde = {  workspace = true }
-
 # internal
 locutus-core = { path = "../locutus-core", version = "0.0.3" }
 locutus-runtime = { path = "../locutus-runtime", version = "0.0.3" }
 locutus-stdlib = { path = "../locutus-stdlib", version = "0.0.3" }
-
-[features]
-messagepack = ["rmp", "rmpv"]

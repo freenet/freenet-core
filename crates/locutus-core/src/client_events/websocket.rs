@@ -176,13 +176,21 @@ async fn ws_api_handler(
     Extension(request_sender): Extension<Sender<StaticOpenRequest>>,
     Extension(client_sender): Extension<Sender<ClientHandling>>,
 ) -> axum::response::Response {
-    ws.on_upgrade(|socket| handle_socket(socket, request_sender, client_sender))
+    ws.on_upgrade(|socket| {
+        handle_socket(
+            socket,
+            request_sender,
+            client_sender,
+            EncodingProtocol::Native, // FIXME: pass this from somewhere
+        )
+    })
 }
 
 async fn handle_socket(
     socket: WebSocket,
     request_sender: Sender<StaticOpenRequest>,
     client_handler: Sender<ClientHandling>,
+    enconding_protoc: EncodingProtocol,
 ) {
     let client_id = ClientId(CLIENT_ID.fetch_add(1, Ordering::SeqCst));
     let (mut client_tx, mut client_rx) = socket.split();
@@ -203,7 +211,7 @@ async fn handle_socket(
                 }
             }
             response = host_responses.recv() => {
-                let send_err = send_reponse_to_client(&mut client_tx, response.unwrap()).await.is_err();
+                let send_err = send_reponse_to_client(&mut client_tx, response.unwrap(), enconding_protoc).await.is_err();
                 if send_err && client_handler.send(ClientHandling::ClientDisconnected(client_id)).await.is_err() {
                     break;
                 }
@@ -272,8 +280,17 @@ async fn new_request(
 async fn send_reponse_to_client(
     response_stream: &mut SplitSink<WebSocket, Message>,
     response: Result<HostResponse, ClientError>,
+    encoding_protoc: EncodingProtocol,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let serialize = rmp_serde::to_vec(&response).unwrap();
-    response_stream.send(Message::Binary(serialize)).await?;
+    let serialized_res = match encoding_protoc {
+        EncodingProtocol::Flatbuffers => match response {
+            Ok(res) => res.into_fbs_bytes()?,
+            Err(err) => err.into_fbs_bytes()?,
+        },
+        EncodingProtocol::Native => bincode::serialize(&response)?,
+    };
+    response_stream
+        .send(Message::Binary(serialized_res))
+        .await?;
     Ok(())
 }
