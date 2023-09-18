@@ -1,12 +1,12 @@
 [package]
-name = "locutus-core"
-version = "0.0.3"
+name = "freenet-core"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.71.1"
 publish =  true
-description = "Locutus P2P network core network implementation"
+description = "Freenet core software"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/freenet/locutus"
+repository = "https://github.com/freenet/freenet-core"
 
 [dependencies]
 anyhow = "1"

@@ -1,10 +1,10 @@
 [package]
-name = "locutus-dev"
-version = "0.0.3"
+name = "fdev"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.71.1"
 publish = true
-description = "Locutus P2P development tools"
+description = "Freenet development tool"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/freenet/locutus"
 
