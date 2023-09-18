@@ -1,0 +1,95 @@
+namespace common;
+
+table ContractInstanceId {
+    data:[ubyte](required);
+}
+
+table ContractKey {
+  instance:ContractInstanceId(required);
+  code:[ubyte];
+}
+
+table SecretsId {
+  key: [ubyte](required);
+  hash: [ubyte](required);
+}
+
+table ContractCode {
+    data:[ubyte](required);
+    code_hash:[ubyte](required);
+}
+
+table ApplicationMessage {
+    app: ContractInstanceId(required);
+    payload: [ubyte](required);
+    context: [ubyte](required);
+    processed: bool;
+}
+
+table GetSecretRequest {
+    key: SecretsId(required);
+    delegate_context: [ubyte](required);
+    processed: bool;
+}
+
+table GetSecretResponse {
+    key: SecretsId(required);
+    value: [ubyte];
+    delegate_context: [ubyte](required);
+}
+
+table WasmContractV1 {
+    data:ContractCode(required);
+    parameters:[ubyte](required);
+    key:ContractKey(required);
+}
+
+union ContractType {
+    WasmContractV1
+}
+
+table ContractContainer {
+  contract:ContractType(required);
+}
+
+table StateUpdate {
+  state:[ubyte](required);
+}
+
+table DeltaUpdate {
+  delta:[ubyte](required);
+}
+
+table StateAndDeltaUpdate {
+  state:[ubyte](required);
+  delta:[ubyte](required);
+}
+
+table RelatedStateUpdate {
+  related_to:ContractInstanceId(required);
+  state:[ubyte](required);
+}
+
+table RelatedDeltaUpdate {
+  related_to:ContractInstanceId(required);
+  delta:[ubyte](required);
+}
+
+table RelatedStateAndDeltaUpdate {
+  related_to:ContractInstanceId(required);
+  state:[ubyte](required);
+  delta:[ubyte](required);
+}
+
+union UpdateDataType {
+  StateUpdate,
+  DeltaUpdate,
+  StateAndDeltaUpdate,
+  RelatedStateUpdate,
+  RelatedDeltaUpdate,
+  RelatedStateAndDeltaUpdate
+}
+
+table UpdateData {
+    update_data: UpdateDataType(required);
+}

@@ -2,23 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [main]
-    paths-ignore: ["docs/**", "README.md"]
+    branches: [ main ]
+    paths-ignore: [ "docs/**", "README.md" ]
   pull_request:
-    branches: [main]
-    paths-ignore: ["docs/**", "README.md"]
+    branches: [ main ]
+    paths-ignore: [ "docs/**", "README.md" ]
 
 jobs:
   test_all:
     name: Test features
 
     runs-on: ubuntu-latest
+
     strategy:
       max-parallel: 1
       matrix:
         # Disabled temporarily due to space issues on the test container
         #args: ["--no-default-features", "--all-features"]
-        args: ["--no-default-features"]
+        args: [ "--no-default-features" ]
     env:
       LOCUTUS_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -60,7 +61,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        targets: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
+        targets: [ "wasm32-unknown-unknown", "x86_64-unknown-linux-gnu" ]
     env:
       LOCUTUS_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -88,10 +89,11 @@ jobs:
     name: Clippy
 
     runs-on: ubuntu-latest
+
     strategy:
       max-parallel: 1
       matrix:
-        target: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
+        target: [ "wasm32-unknown-unknown", "x86_64-unknown-linux-gnu" ]
     env:
       LOCUTUS_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target

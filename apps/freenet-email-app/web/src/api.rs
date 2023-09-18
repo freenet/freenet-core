@@ -45,7 +45,10 @@ impl WebApi {
     #[cfg(all(target_family = "wasm", feature = "use-node"))]
     fn new() -> Result<Self, String> {
         use futures::{SinkExt, StreamExt};
-        let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
+        let conn = web_sys::WebSocket::new(
+            "ws://localhost:50509/contract/command?encodingProtocol=native",
+        )
+        .unwrap();
         let (send_host_responses, host_responses) = futures::channel::mpsc::unbounded();
         let (send_half, requests) = futures::channel::mpsc::unbounded();
         let result_handler = move |result: Result<HostResponse, ClientError>| {

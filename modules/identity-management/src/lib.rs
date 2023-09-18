@@ -109,6 +109,7 @@ impl TryFrom<&[u8]> for IdentityManagement {
 impl DelegateInterface for IdentityManagement {
     fn process(
         params: Parameters<'static>,
+        _attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let params = IdentityParams::try_from(params)?;

@@ -22,13 +22,14 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::serde_as;
 
-use crate::{
-    client_api::{TryFromTsStd, WsApiError},
-    code_hash::CodeHash,
-    parameters::Parameters,
+use crate::client_api::TryFromFbs;
+use crate::client_request_generated::client_request::RelatedContracts as FbsRelatedContracts;
+use crate::common_generated::common::{
+    ContractKey as FbsContractKey, UpdateData as FbsUpdateData, UpdateDataType,
 };
+use crate::{client_api::WsApiError, code_hash::CodeHash, parameters::Parameters};
 
-const CONTRACT_KEY_SIZE: usize = 32;
+pub(crate) const CONTRACT_KEY_SIZE: usize = 32;
 
 /// Type of errors during interaction with a contract.
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
@@ -160,15 +161,15 @@ impl<'a> TryFrom<&'a rmpv::Value> for RelatedContracts<'a> {
     }
 }
 
-impl<'a> TryFromTsStd<&'a rmpv::Value> for RelatedContracts<'a> {
-    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
-        let related_contracts: HashMap<ContractInstanceId, Option<State<'a>>> =
-            HashMap::from_iter(value.as_map().unwrap().iter().map(|(key, val)| {
-                let id = ContractInstanceId::from_bytes(key.as_slice().unwrap()).unwrap();
-                let state = State::from(val.as_slice().unwrap());
-                (id, Some(state))
-            }));
-        Ok(RelatedContracts::from(related_contracts))
+impl<'a> TryFromFbs<&FbsRelatedContracts<'a>> for RelatedContracts<'a> {
+    fn try_decode_fbs(related_contracts: &FbsRelatedContracts<'a>) -> Result<Self, WsApiError> {
+        let mut map = HashMap::with_capacity(related_contracts.contracts().len());
+        for related in related_contracts.contracts().iter() {
+            let id = ContractInstanceId::from_bytes(related.instance_id().data().bytes()).unwrap();
+            let state = State::from(related.state().bytes());
+            map.insert(id, Some(state));
+        }
+        Ok(RelatedContracts::from(map))
     }
 }
 
@@ -295,65 +296,51 @@ impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
     }
 }
 
-impl<'a> TryFromTsStd<&'a rmpv::Value> for UpdateData<'a> {
-    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
-        let value_map: HashMap<_, _> = HashMap::from_iter(
-            value
-                .as_map()
-                .unwrap()
-                .iter()
-                .map(|(key, val)| (key.as_str().unwrap(), val)),
-        );
-        let mut map_keys = Vec::from_iter(value_map.keys().copied());
-        map_keys.sort();
-        match map_keys.as_slice() {
-            ["delta"] => {
-                let delta = value_map.get("delta").unwrap();
-                Ok(UpdateData::Delta(StateDelta::from(
-                    delta.as_slice().unwrap(),
-                )))
+impl<'a> TryFromFbs<&FbsUpdateData<'a>> for UpdateData<'a> {
+    fn try_decode_fbs(update_data: &FbsUpdateData<'a>) -> Result<Self, WsApiError> {
+        match update_data.update_data_type() {
+            UpdateDataType::StateUpdate => {
+                let update = update_data.update_data_as_state_update().unwrap();
+                let state = State::from(update.state().bytes());
+                Ok(UpdateData::State(state))
             }
-            ["state"] => {
-                let state = value_map.get("state").unwrap();
-                Ok(UpdateData::Delta(StateDelta::from(
-                    state.as_slice().unwrap(),
-                )))
+            UpdateDataType::DeltaUpdate => {
+                let update = update_data.update_data_as_delta_update().unwrap();
+                let delta = StateDelta::from(update.delta().bytes());
+                Ok(UpdateData::Delta(delta))
             }
-            ["delta", "state"] => {
-                let state = value_map.get("state").unwrap();
-                let delta = value_map.get("delta").unwrap();
-                Ok(UpdateData::StateAndDelta {
-                    state: State::from(state.as_slice().unwrap()),
-                    delta: StateDelta::from(delta.as_slice().unwrap()),
-                })
+            UpdateDataType::StateAndDeltaUpdate => {
+                let update = update_data.update_data_as_state_and_delta_update().unwrap();
+                let state = State::from(update.state().bytes());
+                let delta = StateDelta::from(update.delta().bytes());
+                Ok(UpdateData::StateAndDelta { state, delta })
             }
-            ["delta", "relatedTo"] => {
-                let delta = value_map.get("delta").unwrap();
-                let related_to = value_map.get("relatedTo").unwrap();
-                Ok(UpdateData::RelatedDelta {
-                    delta: StateDelta::from(delta.as_slice().unwrap()),
-                    related_to: ContractInstanceId::from_bytes(related_to.as_slice().unwrap())
-                        .unwrap(),
-                })
+            UpdateDataType::RelatedStateUpdate => {
+                let update = update_data.update_data_as_related_state_update().unwrap();
+                let state = State::from(update.state().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedState { related_to, state })
             }
-            ["state", "relatedTo"] => {
-                let state = value_map.get("state").unwrap();
-                let related_to = value_map.get("relatedTo").unwrap();
-                Ok(UpdateData::RelatedState {
-                    state: State::from(state.as_slice().unwrap()),
-                    related_to: ContractInstanceId::from_bytes(related_to.as_slice().unwrap())
-                        .unwrap(),
-                })
+            UpdateDataType::RelatedDeltaUpdate => {
+                let update = update_data.update_data_as_related_delta_update().unwrap();
+                let delta = StateDelta::from(update.delta().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedDelta { related_to, delta })
             }
-            ["delta", "state", "relatedTo"] => {
-                let state = value_map.get("state").unwrap();
-                let delta = value_map.get("delta").unwrap();
-                let related_to = value_map.get("relatedTo").unwrap();
+            UpdateDataType::RelatedStateAndDeltaUpdate => {
+                let update = update_data
+                    .update_data_as_related_state_and_delta_update()
+                    .unwrap();
+                let state = State::from(update.state().bytes());
+                let delta = StateDelta::from(update.delta().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
                 Ok(UpdateData::RelatedStateAndDelta {
-                    state: State::from(state.as_slice().unwrap()),
-                    delta: StateDelta::from(delta.as_slice().unwrap()),
-                    related_to: ContractInstanceId::from_bytes(related_to.as_slice().unwrap())
-                        .unwrap(),
+                    related_to,
+                    state,
+                    delta,
                 })
             }
             _ => unreachable!(),
@@ -884,13 +871,6 @@ impl<'a> From<&'a [u8]> for ContractCode<'a> {
     }
 }
 
-impl<'a> TryFromTsStd<&'a rmpv::Value> for ContractCode<'a> {
-    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
-        let data = value.as_slice().unwrap();
-        Ok(ContractCode::from(data))
-    }
-}
-
 impl PartialEq for ContractCode<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.code_hash == other.code_hash
@@ -952,7 +932,7 @@ impl ContractInstanceId {
     }
 
     /// Build `ContractId` from the binary representation.
-    fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, bs58::decode::Error> {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, bs58::decode::Error> {
         let mut spec = [0; CONTRACT_KEY_SIZE];
         bs58::decode(bytes)
             .with_alphabet(bs58::Alphabet::BITCOIN)
@@ -1126,31 +1106,12 @@ impl std::fmt::Display for ContractKey {
     }
 }
 
-impl TryFromTsStd<&rmpv::Value> for ContractKey {
-    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
-        let key_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
-            Some(map_value) => HashMap::from_iter(
-                map_value
-                    .iter()
-                    .map(|(key, val)| (key.as_str().unwrap(), val)),
-            ),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding ContractKey, input value is not a map".to_string(),
-                })
-            }
-        };
-
-        let instance_id = match key_map.get("instance") {
-            Some(instance_value) => bs58::encode(&instance_value.as_slice().unwrap()).into_string(),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, instance not found".to_string(),
-                })
-            }
-        };
-
-        Ok(ContractKey::from_id(instance_id).unwrap())
+impl<'a> TryFromFbs<&FbsContractKey<'a>> for ContractKey {
+    fn try_decode_fbs(key: &FbsContractKey<'a>) -> Result<Self, WsApiError> {
+        let key_bytes: [u8; CONTRACT_KEY_SIZE] = key.instance().data().bytes().try_into().unwrap();
+        let instance = ContractInstanceId::new(key_bytes);
+        let code = key.code().map(|code_hash| CodeHash::new(code_hash.bytes()));
+        Ok(ContractKey { instance, code })
     }
 }
 
@@ -1228,13 +1189,6 @@ impl From<Vec<u8>> for WrappedState {
 impl From<&'_ [u8]> for WrappedState {
     fn from(bytes: &[u8]) -> Self {
         Self::new(bytes.to_owned())
-    }
-}
-
-impl TryFromTsStd<&rmpv::Value> for WrappedState {
-    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
-        let state = value.as_slice().unwrap().to_vec();
-        Ok(WrappedState::from(state))
     }
 }
 
@@ -1348,56 +1302,6 @@ impl WrappedContract {
     {
         let data: Parameters<'de> = Deserialize::deserialize(deser)?;
         Ok(data.into_owned())
-    }
-}
-
-impl TryFromTsStd<&rmpv::Value> for WrappedContract {
-    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
-        let contract_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
-            Some(map_value) => HashMap::from_iter(
-                map_value
-                    .iter()
-                    .map(|(key, val)| (key.as_str().unwrap(), val)),
-            ),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, input value is not a map".to_string(),
-                })
-            }
-        };
-
-        let key = match contract_map.get("key") {
-            Some(key_value) => ContractKey::try_decode(*key_value).unwrap(),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, key not found".to_string(),
-                })
-            }
-        };
-
-        let data = match contract_map.get("data") {
-            Some(contract_data_value) => Arc::new(
-                ContractCode::try_decode(*contract_data_value)
-                    .unwrap()
-                    .into_owned(),
-            ),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, data not found".to_string(),
-                })
-            }
-        };
-
-        let params = match contract_map.get("parameters") {
-            Some(params_value) => Parameters::try_decode(*params_value).unwrap().into_owned(),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding WrappedContract, parameters not found".to_string(),
-                })
-            }
-        };
-
-        Ok(Self { data, params, key })
     }
 }
 

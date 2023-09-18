@@ -805,6 +805,12 @@ impl Executor {
                             CoreDelegateError::Missing(key).into(),
                         )))
                     }
+                    Err(err) if err.delegate_auth_access().is_some() => {
+                        let id = err.delegate_auth_access().unwrap();
+                        Err(Either::Left(Box::new(RequestError::DelegateError(
+                            CoreDelegateError::ForbiddenSecretAccess(id.clone()),
+                        ))))
+                    }
                     Err(err) => Err(Either::Right(
                         format!("uncontrolled error while getting secret for `{key}`: {err}")
                             .into(),

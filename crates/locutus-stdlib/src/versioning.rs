@@ -6,10 +6,14 @@ use std::sync::Arc;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
 
-use crate::client_api::{TryFromTsStd, WsApiError};
+use crate::client_api::{TryFromFbs, WsApiError};
+use crate::client_request_generated::client_request::{
+    DelegateContainer as FbsDelegateContainer, DelegateType,
+};
+use crate::common_generated::common::{ContractContainer as FbsContractContainer, ContractType};
 use crate::parameters::Parameters;
+use crate::prelude::ContractWasmAPIVersion::V1;
 use crate::prelude::{CodeHash, Delegate, DelegateCode, DelegateKey, WrappedContract};
 use crate::{contract_interface::ContractKey, prelude::ContractCode};
 
@@ -103,6 +107,22 @@ where
                     delegate,
                 )))
             }
+        }
+    }
+}
+
+impl<'a> TryFromFbs<&FbsDelegateContainer<'a>> for DelegateContainer {
+    fn try_decode_fbs(container: &FbsDelegateContainer<'a>) -> Result<Self, WsApiError> {
+        match container.delegate_type() {
+            DelegateType::WasmDelegateV1 => {
+                let delegate = container.delegate_as_wasm_delegate_v1().unwrap();
+                let data = DelegateCode::from(delegate.data().data().bytes().to_vec());
+                let params = Parameters::from(delegate.parameters().bytes().to_vec());
+                Ok(DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
+                    Delegate::from((&data, &params)),
+                )))
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -374,41 +394,19 @@ impl ContractCode<'_> {
     }
 }
 
-impl TryFromTsStd<&rmpv::Value> for ContractContainer {
-    fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
-        let container_map: HashMap<&str, &rmpv::Value> = match value.as_map() {
-            Some(map_value) => HashMap::from_iter(
-                map_value
-                    .iter()
-                    .map(|(key, val)| (key.as_str().unwrap(), val)),
-            ),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding ContractContainer, input value is not a map"
-                        .to_string(),
-                })
-            }
-        };
-
-        let container_version = match container_map.get("version") {
-            Some(version_value) => (*version_value).as_str().unwrap(),
-            _ => {
-                return Err(WsApiError::MsgpackDecodeError {
-                    cause: "Failed decoding ContractContainer, version not found".to_string(),
-                })
-            }
-        };
-
-        match container_version {
-            "V1" => {
-                let contract = WrappedContract::try_decode(value).map_err(|e| {
-                    WsApiError::MsgpackDecodeError {
-                        cause: format!("{e}"),
-                    }
-                })?;
-                Ok(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-                    contract,
-                )))
+impl<'a> TryFromFbs<&FbsContractContainer<'a>> for ContractContainer {
+    fn try_decode_fbs(value: &FbsContractContainer<'a>) -> Result<Self, WsApiError> {
+        match value.contract_type() {
+            ContractType::WasmContractV1 => {
+                let contract = value.contract_as_wasm_contract_v1().unwrap();
+                let data = Arc::new(ContractCode::from(contract.data().data().bytes().to_vec()));
+                let params = Parameters::from(contract.parameters().bytes().to_vec());
+                let key = ContractKey::from((&params, &*data));
+                Ok(ContractContainer::from(V1(WrappedContract {
+                    data,
+                    params,
+                    key,
+                })))
             }
             _ => unreachable!(),
         }

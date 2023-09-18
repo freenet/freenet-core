@@ -46,15 +46,15 @@ serde-wasm-bindgen = { version = "0.5" }
 [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 version = "0.3"
 features = [
-  "BinaryType",
-  "Blob",
-  "console",
-  "ErrorEvent",
-#   "FileReader",
-#   "MessageEvent",
-#   "ProgressEvent",
-  "WebSocket",
-  "Window"
+    "BinaryType",
+    "Blob",
+    "console",
+    "ErrorEvent",
+    #   "FileReader",
+    #   "MessageEvent",
+    #   "ProgressEvent",
+    "WebSocket",
+    "Window"
 ]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
