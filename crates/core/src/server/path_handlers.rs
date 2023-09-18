@@ -5,24 +5,21 @@ use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
 use locutus_runtime::{
-    freenet_stdlib::web::{WebApp, WebContractError},
-    ContractContainer, ContractKey, State,
-};
-
-use freenet_core::{
-    locutus_runtime::freenet_stdlib::client_api::{
-        ClientRequest, ContractRequest, ContractResponse, HostResponse,
+    freenet_stdlib::{
+        client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
+        web::{WebApp, WebContractError},
     },
-    *,
+    ContractContainer, ContractKey, State,
 };
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
-use crate::{errors::WebSocketApiError, AuthToken};
-use crate::{ClientConnection, HostCallbackResult};
+use crate::AuthToken;
+
+use super::{errors::WebSocketApiError, ClientConnection, HostCallbackResult};
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-pub(crate) async fn contract_home(
+pub(super) async fn contract_home(
     key: String,
     request_sender: mpsc::Sender<ClientConnection>,
     assigned_token: AuthToken,
@@ -151,7 +148,7 @@ pub(crate) async fn contract_home(
     Ok(response)
 }
 
-pub async fn variable_content(
+pub(super) async fn variable_content(
     key: String,
     req_path: String,
 ) -> Result<impl IntoResponse, Box<WebSocketApiError>> {

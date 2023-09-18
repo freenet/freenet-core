@@ -4,17 +4,13 @@ use freenet_stdlib::client_api::ErrorKind;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
-pub enum WebSocketApiError {
+pub(super) enum WebSocketApiError {
     /// Something went wrong when calling the user repo.
     InvalidParam {
         error_cause: String,
     },
     NodeError {
         error_cause: String,
-    },
-    HttpError {
-        code: StatusCode,
-        cause: Option<String>,
     },
     AxumError {
         error: ErrorKind,
@@ -26,7 +22,6 @@ impl WebSocketApiError {
         match self {
             WebSocketApiError::InvalidParam { .. } => StatusCode::BAD_REQUEST,
             WebSocketApiError::NodeError { .. } => StatusCode::BAD_GATEWAY,
-            WebSocketApiError::HttpError { code, .. } => *code,
             WebSocketApiError::AxumError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -37,19 +32,6 @@ impl WebSocketApiError {
                 format!("Invalid request params: {}", error_cause)
             }
             WebSocketApiError::NodeError { error_cause } => format!("Node error: {}", error_cause),
-            WebSocketApiError::HttpError { code, cause } => {
-                let error_message = match *code {
-                    StatusCode::BAD_REQUEST => "Bad Request",
-                    StatusCode::BAD_GATEWAY => "Bad Gateway",
-                    StatusCode::NOT_FOUND => "Not Found",
-                    _ => "Internal Server Error",
-                };
-                if let Some(cause) = cause {
-                    format!("HTTP error: {} ({cause})", error_message)
-                } else {
-                    format!("HTTP error: {}", error_message)
-                }
-            }
             WebSocketApiError::AxumError { error } => format!("Axum error: {}", error),
         }
     }
@@ -75,10 +57,6 @@ impl IntoResponse for WebSocketApiError {
                 (StatusCode::BAD_REQUEST, cause)
             }
             WebSocketApiError::NodeError { error_cause: cause } => (StatusCode::BAD_GATEWAY, cause),
-            WebSocketApiError::HttpError { code, cause } => (
-                code,
-                cause.unwrap_or_else(|| "INTERNAL SERVER ERROR".to_owned()),
-            ),
             WebSocketApiError::AxumError { error } => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}"))
             }

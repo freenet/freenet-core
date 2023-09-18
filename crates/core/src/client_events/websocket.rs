@@ -1,73 +1,214 @@
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::WebSocketUpgrade;
-use axum::{Extension, Router};
 use std::{
-    collections::HashMap,
-    error::Error,
-    future::Future,
-    net::SocketAddr,
-    sync::atomic::{AtomicUsize, Ordering},
+    collections::{HashMap, VecDeque},
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
-use tower_http::trace::TraceLayer;
 
-use axum::routing::get;
-use freenet_stdlib::client_api::{ClientRequest, ErrorKind, HostResponse};
-use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use axum::{
+    extract::{
+        ws::{Message, WebSocket},
+        Query, WebSocketUpgrade,
+    },
+    response::{IntoResponse, Response},
+    routing::get,
+    Extension, Router,
+};
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse},
+    prelude::ContractInstanceId,
+};
+use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
+use locutus_runtime::ContractKey;
+use serde::Deserialize;
+use tokio::sync::{mpsc, Mutex};
 
-use crate::util::EncodingProtocol;
+use crate::{
+    server::{ClientConnection, HostCallbackResult},
+    util::EncodingProtocol,
+    AuthToken, DynError,
+};
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 
-const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
-
-pub struct WebSocketProxy {
-    server_request: Receiver<StaticOpenRequest>,
-    server_response: Sender<(ClientId, HostResult)>,
+pub(crate) struct WebSocketProxy {
+    proxy_server_request: mpsc::Receiver<ClientConnection>,
+    response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
+    pub(crate) attested_contracts: HashMap<AuthToken, (ContractInstanceId, ClientId)>,
 }
 
-type NewResponseSender = Sender<Result<HostResponse, ClientError>>;
-
 impl WebSocketProxy {
-    /// Starts this as an upgrade to an existing HTTP connection at the `/ws-api` URL
-    pub fn as_upgrade<T>(
-        socket: T,
-        server_config: Router,
-    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>>
+    pub fn as_router(
+        server_routing: Router,
+        proxy_server_request: mpsc::Receiver<ClientConnection>,
+        request_sender_to_server: mpsc::Sender<ClientConnection>,
+    ) -> (Self, Router) {
+        let router = server_routing
+            .route("/contract/command", get(websocket_commands))
+            .layer(Extension(request_sender_to_server))
+            .layer(axum::middleware::from_fn(connection_info));
+
+        (
+            WebSocketProxy {
+                proxy_server_request,
+                response_channels: HashMap::new(),
+                attested_contracts: HashMap::new(),
+            },
+            router,
+        )
+    }
+
+    async fn internal_proxy_recv(
+        &mut self,
+        msg: ClientConnection,
+    ) -> Result<Option<OpenRequest>, ClientError> {
+        match msg {
+            ClientConnection::NewConnection {
+                notifications,
+                assigned_token,
+            } => {
+                // is a new client, assign an id and open a channel to communicate responses from the node
+                let cli_id = ClientId::next();
+                notifications
+                    .send(HostCallbackResult::NewId { id: cli_id })
+                    .map_err(|_e| ErrorKind::NodeUnavailable)?;
+                self.response_channels.insert(cli_id, notifications);
+                if let Some((assigned_token, contract)) = assigned_token {
+                    self.attested_contracts
+                        .insert(assigned_token, (contract, cli_id));
+                }
+                Ok(None)
+            }
+            ClientConnection::Request {
+                client_id,
+                req,
+                auth_token,
+            } => {
+                let open_req = match &*req {
+                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
+                        // intercept subscription messages because they require a callback subscription channel
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        if let Some(ch) = self.response_channels.get(&client_id) {
+                            ch.send(HostCallbackResult::SubscriptionChannel {
+                                key: key.clone(),
+                                id: client_id,
+                                callback: rx,
+                            })
+                            .map_err(|_| ErrorKind::ChannelClosed)?;
+                            OpenRequest::new(client_id, req)
+                                .with_notification(tx)
+                                .with_token(auth_token)
+                        } else {
+                            tracing::warn!("client: {client_id} not found");
+                            return Err(ErrorKind::UnknownClient(client_id.into()).into());
+                        }
+                    }
+                    _ => {
+                        // just forward the request to the node
+                        OpenRequest::new(client_id, req).with_token(auth_token)
+                    }
+                };
+                Ok(Some(open_req))
+            }
+        }
+    }
+}
+
+async fn connection_info<B>(
+    encoding_protoc: Result<
+        axum::TypedHeader<EncodingProtocolExt>,
+        axum::extract::rejection::TypedHeaderRejection,
+    >,
+    auth_token: Result<
+        axum::TypedHeader<axum::headers::Authorization<axum::headers::authorization::Bearer>>,
+        axum::extract::rejection::TypedHeaderRejection,
+    >,
+    Query(ConnectionInfo {
+        auth_token: auth_token_q,
+        encoding_protocol,
+    }): Query<ConnectionInfo>,
+    mut req: axum::http::Request<B>,
+    next: axum::middleware::Next<B>,
+) -> Response {
+    // tracing::info!(
+    //     "headers: {:?}",
+    //     req.headers()
+    //         .iter()
+    //         .flat_map(|(k, v)| v.to_str().ok().map(|v| format!("{k}: {v}")))
+    //         .collect::<Vec<_>>()
+    // );
+    let encoding_protoc = match encoding_protoc {
+        Ok(protoc) => protoc.0 .0,
+        Err(err)
+            if matches!(
+                err.reason(),
+                axum::extract::rejection::TypedHeaderRejectionReason::Missing
+            ) =>
+        {
+            encoding_protocol.unwrap_or(EncodingProtocol::Flatbuffers)
+        }
+        Err(other) => return other.into_response(),
+    };
+
+    let auth_token = match auth_token {
+        Ok(auth_token) => Some(AuthToken::from(auth_token.token().to_owned())),
+        Err(err)
+            if matches!(
+                err.reason(),
+                axum::extract::rejection::TypedHeaderRejectionReason::Missing
+            ) =>
+        {
+            auth_token_q
+        }
+        Err(other) => return other.into_response(),
+    };
+
+    tracing::debug!(
+        "establishing connection with encoding protocol: {encoding_protoc}, authenticated: {auth}",
+        auth = auth_token.is_some()
+    );
+    req.extensions_mut().insert(encoding_protoc);
+    req.extensions_mut().insert(auth_token);
+
+    next.run(req).await
+}
+
+struct EncodingProtocolExt(EncodingProtocol);
+
+impl axum::headers::Header for EncodingProtocolExt {
+    fn name() -> &'static axum::http::HeaderName {
+        static HEADER: OnceLock<axum::http::HeaderName> = OnceLock::new();
+        HEADER.get_or_init(|| axum::http::HeaderName::from_static("encoding-protocol"))
+    }
+
+    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
     where
-        T: Into<SocketAddr>,
+        Self: Sized,
+        I: Iterator<Item = &'i axum::http::HeaderValue>,
     {
-        Self::start_server_internal(socket.into(), server_config)
+        values
+            .next()
+            .and_then(|val| match val.to_str().ok()? {
+                "native" => Some(EncodingProtocolExt(EncodingProtocol::Native)),
+                "flatbuffers" => Some(EncodingProtocolExt(EncodingProtocol::Flatbuffers)),
+                _ => None,
+            })
+            .ok_or_else(axum::headers::Error::invalid)
     }
 
-    /// Starts the websocket connection at the default `/ws-api` URL
-    pub fn start_server<T>(
-        socket: T,
-    ) -> impl Future<Output = Result<Self, Box<dyn Error + Send + Sync + 'static>>>
-    where
-        T: Into<SocketAddr>,
-    {
-        let router = Router::default();
-        Self::start_server_internal(socket.into(), router)
+    fn encode<E: Extend<axum::http::HeaderValue>>(&self, values: &mut E) {
+        let header = match self.0 {
+            EncodingProtocol::Native => axum::http::HeaderValue::from_static("native"),
+            EncodingProtocol::Flatbuffers => axum::http::HeaderValue::from_static("flatbuffers"),
+        };
+        values.extend([header]);
     }
+}
 
-    async fn start_server_internal(
-        socket: SocketAddr,
-        router: Router,
-    ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
-        let (request_sender, server_request) = channel(PARALLELISM);
-        let (server_response, response_receiver) = channel(PARALLELISM);
-        let (new_client_up, new_clients) = channel(PARALLELISM);
-
-        let server = serve(request_sender, new_client_up, socket, router);
-        tokio::spawn(server);
-        tokio::spawn(responses(new_clients, response_receiver));
-
-        Ok(Self {
-            server_request,
-            server_response,
-        })
-    }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionInfo {
+    auth_token: Option<AuthToken>,
+    encoding_protocol: Option<EncodingProtocol>,
 }
 
 // work around for rustc issue #64552
@@ -81,216 +222,296 @@ impl From<OpenRequest<'static>> for StaticOpenRequest {
 
 impl ClientEventsProxy for WebSocketProxy {
     fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
-        Box::pin(async move {
-            let req = self
-                .server_request
-                .recv()
-                .await
-                .map(|r| r.0)
-                .ok_or(ErrorKind::ChannelClosed)?;
-            Ok(req)
-        })
+        async move {
+            loop {
+                let msg = self.proxy_server_request.recv().await;
+                if let Some(msg) = msg {
+                    if let Some(reply) = self.internal_proxy_recv(msg).await? {
+                        break Ok(reply.into_owned());
+                    }
+                } else {
+                    todo!()
+                }
+            }
+        }
+        .boxed()
     }
 
     fn send(
         &mut self,
-        client: ClientId,
-        response: Result<HostResponse, ClientError>,
+        id: ClientId,
+        result: Result<HostResponse, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>> {
-        Box::pin(async move {
-            self.server_response
-                .send((client, response))
-                .await
-                .map_err(|_| ErrorKind::ChannelClosed)?;
+        async move {
+            if let Some(ch) = self.response_channels.remove(&id) {
+                let should_rm = result
+                    .as_ref()
+                    .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
+                    .err()
+                    .unwrap_or(false);
+                if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
+                    // still alive connection, keep it
+                    self.response_channels.insert(id, ch);
+                } else {
+                    tracing::info!("dropped connection to client #{id}");
+                }
+            } else {
+                tracing::warn!("client: {id} not found");
+            }
             Ok(())
-        })
+        }
+        .boxed()
     }
 }
 
-async fn serve(
-    request_sender: Sender<StaticOpenRequest>,
-    new_responses: Sender<ClientHandling>,
-    socket: SocketAddr,
-    server_config: Router,
-) {
-    let (req_sender, new_res) = (request_sender.clone(), new_responses.clone());
-    let request_receiver = server_config
-        .route("/ws-api", get(ws_api_handler))
-        .layer(Extension(req_sender))
-        .layer(Extension(new_res))
-        .layer(TraceLayer::new_for_http());
-
-    tracing::info!("listening on {}", socket);
-    axum::Server::bind(&socket)
-        .serve(request_receiver.into_make_service())
-        .await
-        .unwrap();
+async fn websocket_commands(
+    ws: WebSocketUpgrade,
+    Extension(auth_token): Extension<Option<AuthToken>>,
+    Extension(encoding_protoc): Extension<EncodingProtocol>,
+    Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
+) -> axum::response::Response {
+    let on_upgrade = move |ws: WebSocket| async move {
+        if let Err(e) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
+            tracing::error!("{e}");
+        }
+    };
+    ws.on_upgrade(on_upgrade)
 }
 
-enum ClientHandling {
-    NewClient(ClientId, NewResponseSender),
-    ClientDisconnected(ClientId),
-}
-
-async fn responses(
-    mut client_handler: Receiver<ClientHandling>,
-    mut response_receiver: Receiver<(ClientId, HostResult)>,
-) {
-    let mut clients = HashMap::new();
+async fn websocket_interface(
+    request_sender: mpsc::Sender<ClientConnection>,
+    mut auth_token: Option<AuthToken>,
+    encoding_protoc: EncodingProtocol,
+    ws: WebSocket,
+) -> Result<(), DynError> {
+    let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
+    let (mut tx, mut rx) = ws.split();
+    let listeners: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
     loop {
-        tokio::select! {
-            new_client = client_handler.recv() => {
-                match new_client {
-                    Some(ClientHandling::NewClient(client_id, responses)) => {
-                        clients.insert(client_id, responses);
-                    }
-                    Some(ClientHandling::ClientDisconnected(client_id)) => {
-                        clients.remove(&client_id);
-                    }
-                    None => return,
-                }
-            }
-            host_result = response_receiver.recv() => {
-                match host_result {
-                    Some((client_id, response)) => {
-                        if let Some(ch) = clients.get_mut(&client_id) {
-                            if Sender::send(ch, response).await.is_err() {
-                                tracing::error!("Tried to send an a response to an unregistered client");
-                                return;
+        let active_listeners = listeners.clone();
+        let listeners_task = async move {
+            loop {
+                let mut lock = active_listeners.lock().await;
+                let active_listeners = &mut *lock;
+                for _ in 0..active_listeners.len() {
+                    if let Some((key, mut listener)) = active_listeners.pop_front() {
+                        match listener.try_recv() {
+                            Ok(r) => {
+                                active_listeners.push_back((key, listener));
+                                return Ok(r);
                             }
-                        } else {
-                           return;
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                active_listeners.push_back((key, listener));
+                            }
+                            Err(err @ mpsc::error::TryRecvError::Disconnected) => {
+                                return Err(Box::new(err) as DynError)
+                            }
                         }
                     }
-                    None => return,
                 }
+                std::mem::drop(lock);
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }
-    }
-}
+        };
 
-static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
-
-async fn ws_api_handler(
-    ws: WebSocketUpgrade,
-    Extension(request_sender): Extension<Sender<StaticOpenRequest>>,
-    Extension(client_sender): Extension<Sender<ClientHandling>>,
-) -> axum::response::Response {
-    ws.on_upgrade(|socket| {
-        handle_socket(
-            socket,
-            request_sender,
-            client_sender,
-            EncodingProtocol::Native, // FIXME: pass this from somewhere
-        )
-    })
-}
-
-async fn handle_socket(
-    socket: WebSocket,
-    request_sender: Sender<StaticOpenRequest>,
-    client_handler: Sender<ClientHandling>,
-    enconding_protoc: EncodingProtocol,
-) {
-    let client_id = ClientId(CLIENT_ID.fetch_add(1, Ordering::SeqCst));
-    let (mut client_tx, mut client_rx) = socket.split();
-    let (rx, mut host_responses) = channel(1);
-    if client_handler
-        .send(ClientHandling::NewClient(client_id, rx))
-        .await
-        .is_err()
-    {
-        let _ = client_tx.send(Message::Binary(vec![])).await;
-        return;
-    }
-    loop {
-        tokio::select! {
-            result = client_rx.next() => {
-                if new_request(&request_sender, client_id, result, EncodingProtocol::Flatbuffers).await.is_err() {
-                    break;
+        let client_req_task = async {
+            let next_msg = match rx
+                .next()
+                .await
+                .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
+            {
+                Err(err) => {
+                    tracing::debug!(err = %err, "client channel error");
+                    return Err(Some(err.into()));
                 }
-            }
-            response = host_responses.recv() => {
-                let send_err = send_reponse_to_client(&mut client_tx, response.unwrap(), enconding_protoc).await.is_err();
-                if send_err && client_handler.send(ClientHandling::ClientDisconnected(client_id)).await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-async fn new_request(
-    request_sender: &Sender<StaticOpenRequest>,
-    id: ClientId,
-    result: Option<Result<Message, axum::Error>>,
-    enconding_protoc: EncodingProtocol,
-) -> Result<(), ()> {
-    let msg = match result {
-        Some(Ok(msg)) => {
-            let data = msg.into_data();
-            let deserialized = match enconding_protoc {
-                EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&data) {
-                    Ok(m) => m.into_owned(),
-                    Err(e) => {
-                        let _ = request_sender
-                            .send(
-                                OpenRequest::new(
-                                    id,
-                                    Box::new(ClientRequest::Disconnect {
-                                        cause: Some(format!("{e}")),
-                                    }),
-                                )
-                                .into(),
-                            )
-                            .await;
-                        return Ok(());
-                    }
-                },
-                EncodingProtocol::Native => unreachable!("todo: support this"),
+                Ok(v) => v,
             };
-            deserialized
+            process_client_request(
+                client_id,
+                next_msg,
+                &request_sender,
+                &mut auth_token,
+                encoding_protoc,
+            )
+            .await
+        };
+
+        tokio::select! { biased;
+            msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut tx).await } => {
+                let active_listeners = listeners.clone();
+                if let Some(NewSubscription { key, callback }) = msg? {
+                    tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
+                    let active_listeners = &mut *active_listeners.lock().await;
+                    active_listeners.push_back((key, callback));
+                }
+            }
+            process_client_request = client_req_task => {
+                match process_client_request {
+                    Ok(Some(error)) => {
+                        tx.send(error).await?;
+                    }
+                    Ok(None) => continue,
+                    Err(None) => return Ok(()),
+                    Err(Some(err)) => return Err(err),
+                }
+            }
+            response = listeners_task => {
+                let response = response?;
+                match &response {
+                    Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
+                    Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
+                }
+                let serialized_res = match encoding_protoc {
+                    EncodingProtocol::Flatbuffers => match response {
+                        Ok(res) => res.into_fbs_bytes()?,
+                        Err(err) => err.into_fbs_bytes()?,
+                    },
+                    EncodingProtocol::Native => bincode::serialize(&response)?,
+                };
+                tx.send(Message::Binary(serialized_res)).await?;
+            }
         }
-        Some(Err(e)) => {
-            let _ = request_sender
-                .send(
-                    OpenRequest::new(
-                        id,
-                        Box::new(ClientRequest::Disconnect {
-                            cause: Some(format!("{e}")),
-                        }),
-                    )
-                    .into(),
-                )
-                .await;
-            return Err(());
-        }
-        None => return Err(()),
-    };
-    if request_sender
-        .send(OpenRequest::new(id, Box::new(msg)).into())
-        .await
-        .is_err()
-    {
-        return Err(());
     }
-    Ok(())
 }
 
-async fn send_reponse_to_client(
-    response_stream: &mut SplitSink<WebSocket, Message>,
-    response: Result<HostResponse, ClientError>,
+async fn new_client_connection(
+    request_sender: &mpsc::Sender<ClientConnection>,
+) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
+    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    request_sender
+        .send(ClientConnection::NewConnection {
+            notifications: response_sender,
+            assigned_token: None,
+        })
+        .await
+        .map_err(|_| ErrorKind::NodeUnavailable)?;
+    match response_recv.recv().await {
+        Some(HostCallbackResult::NewId { id: client_id, .. }) => Ok((response_recv, client_id)),
+        None => Err(ErrorKind::NodeUnavailable.into()),
+        other => unreachable!("received unexpected message: {other:?}"),
+    }
+}
+
+struct NewSubscription {
+    key: ContractKey,
+    callback: mpsc::UnboundedReceiver<HostResult>,
+}
+
+async fn process_client_request(
+    client_id: ClientId,
+    msg: Result<Message, axum::Error>,
+    request_sender: &mpsc::Sender<ClientConnection>,
+    auth_token: &mut Option<AuthToken>,
     encoding_protoc: EncodingProtocol,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let serialized_res = match encoding_protoc {
-        EncodingProtocol::Flatbuffers => match response {
-            Ok(res) => res.into_fbs_bytes()?,
-            Err(err) => err.into_fbs_bytes()?,
-        },
-        EncodingProtocol::Native => bincode::serialize(&response)?,
+) -> Result<Option<Message>, Option<DynError>> {
+    let msg = match msg {
+        Ok(Message::Binary(data)) => data,
+        Ok(Message::Text(data)) => data.into_bytes(),
+        Ok(Message::Close(_)) => return Err(None),
+        Ok(Message::Ping(_)) => return Ok(Some(Message::Pong(vec![0, 3, 2]))),
+        Ok(m) => {
+            tracing::debug!(msg = ?m, "received random message");
+            return Ok(None);
+        }
+        Err(err) => return Err(Some(err.into())),
     };
-    response_stream
-        .send(Message::Binary(serialized_res))
-        .await?;
-    Ok(())
+
+    // Try to deserialize the ClientRequest message
+    let req = {
+        match encoding_protoc {
+            EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
+                Ok(decoded) => decoded.into_owned(),
+                Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes()))),
+            },
+            EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
+                Ok(decoded) => decoded.into_owned(),
+                Err(err) => {
+                    let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+                        ErrorKind::DeserializationError {
+                            cause: format!("{err}"),
+                        }
+                        .into(),
+                    ))
+                    .map_err(|err| Some(err.into()))?;
+                    return Ok(Some(Message::Binary(result_error)));
+                }
+            },
+        }
+    };
+    if let ClientRequest::Authenticate { token } = &req {
+        *auth_token = Some(AuthToken::from(token.clone()));
+    }
+
+    tracing::debug!(req = %req, "received client request");
+    request_sender
+        .send(ClientConnection::Request {
+            client_id,
+            req: Box::new(req),
+            auth_token: auth_token.clone(),
+        })
+        .await
+        .map_err(|err| Some(err.into()))?;
+    Ok(None)
+}
+
+async fn process_host_response(
+    msg: Option<HostCallbackResult>,
+    client_id: ClientId,
+    encoding_protoc: EncodingProtocol,
+    tx: &mut SplitSink<WebSocket, Message>,
+) -> Result<Option<NewSubscription>, DynError> {
+    match msg {
+        Some(HostCallbackResult::Result { id, result }) => {
+            debug_assert_eq!(id, client_id);
+            let result = match result {
+                Ok(res) => {
+                    tracing::debug!(response = %res, cli_id = %id, "sending response");
+                    match res {
+                        HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }) => Ok(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }
+                        .into()),
+                        other => Ok(other),
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(response = %err, cli_id = %id, "sending response error");
+                    Err(err)
+                }
+            };
+            let serialized_res = match encoding_protoc {
+                EncodingProtocol::Flatbuffers => match result {
+                    Ok(res) => res.into_fbs_bytes()?,
+                    Err(err) => err.into_fbs_bytes()?,
+                },
+                EncodingProtocol::Native => bincode::serialize(&result)?,
+            };
+            tx.send(Message::Binary(serialized_res)).await?;
+            Ok(None)
+        }
+        Some(HostCallbackResult::SubscriptionChannel { key, id, callback }) => {
+            debug_assert_eq!(id, client_id);
+            Ok(Some(NewSubscription { key, callback }))
+        }
+        Some(HostCallbackResult::NewId { id: cli_id }) => {
+            tracing::debug!(%cli_id, "new client registered");
+            Ok(None)
+        }
+        None => {
+            let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+                ErrorKind::NodeUnavailable.into(),
+            ))?;
+            tx.send(Message::Binary(result_error)).await?;
+            tx.send(Message::Close(None)).await?;
+            tracing::warn!("node shut down while handling responses for {client_id}");
+            Err(format!("node shut down while handling responses for {client_id}").into())
+        }
+    }
 }

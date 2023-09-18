@@ -1462,6 +1462,7 @@ checksum = "6999dc1837253364c2ebb0704ba97994bd874e8f195d665c50b7548f6ea92764"
 name = "fdev"
 version = "0.0.4"
 dependencies = [
+ "anyhow",
  "bincode",
  "bs58",
  "clap",
@@ -1569,9 +1570,11 @@ dependencies = [
  "bincode",
  "blake3",
  "bs58",
+ "bytes",
  "chacha20poly1305 0.10.1",
  "clap",
  "config",
+ "cookie",
  "crossbeam",
  "ctrlc",
  "dashmap",
@@ -1871,6 +1874,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
 
 [[package]]
+name = "h2"
+version = "0.3.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91fc23aa11be92976ef4729127f1a74adf36d8436f7816b185d18df956790833"
+dependencies = [
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "http",
+ "indexmap 1.9.3",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2040,6 +2062,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2795,32 +2818,6 @@ checksum = "c1cc9717a20b1bb222f333e6a92fd32f7d8a18ddc5a3191a11af45dcbf4dcd16"
 dependencies = [
  "autocfg",
  "scopeguard",
-]
-
-[[package]]
-name = "locutus"
-version = "0.0.4"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bincode",
- "byteorder",
- "bytes",
- "clap",
- "cookie",
- "fdev",
- "freenet-core",
- "freenet-stdlib",
- "futures",
- "serde",
- "serde_json",
- "tar",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "xz2",
 ]
 
 [[package]]
@@ -5201,6 +5198,7 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

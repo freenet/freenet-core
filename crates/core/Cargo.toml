@@ -18,11 +18,14 @@ arbitrary = { version = "1", features = ["derive"], optional = true}
 asynchronous-codec = "0.6"
 async-trait = "0.1"
 arrayvec = { workspace = true }
+axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path", "headers", "query", "http2"] }
 bincode = "1"
 blake3 = { workspace = true }
+bytes = "1"
 bs58 = "0.5"
 chacha20poly1305 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+cookie = "0.17"
 config = { version = "0.13.0", features = [ "toml" ] } 
 crossbeam = "0.8.2"
 ctrlc = { version = "3.4", features = ["termination"] }
@@ -50,18 +53,17 @@ serde_with = { workspace = true }
 stretto = { version = "0.8", features = ["async", "sync"] }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs"] }
+tower-http = { version = "0.4", features = ["trace", "fs"] }
 unsigned-varint = "0.7"
 uuid = { version = "1", features = ["serde", "v4", "v1"] }
 sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"], optional = true }
 # TODO(kakoc): clang should be installed for rocksdb; write about that in prerequisites/dev guide
 rocksdb = { version = "0.21.0", default-features = false, optional = true }
-axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "http1"] }
 pav_regression = "0.4.0"
 itertools = "0.11"
 ordered-float = "3.9.1"
 
 # Tracing deps
-tower-http = { version = "0.4", features = ["trace"] }
 tracing = { version = "0.1", optional = true }
 opentelemetry = { version = "0.20.0", default-features = false, features = ["rt-tokio", "trace"], optional = true }
 opentelemetry-jaeger = { version = "0.19.0", features = ["rt-tokio","collector_client", "isahc"], optional = true }

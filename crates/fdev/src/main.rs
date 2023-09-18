@@ -1,5 +1,18 @@
+use std::borrow::Cow;
+
 use clap::Parser;
-use fdev::{
+use freenet_stdlib::client_api::ClientRequest;
+use tracing_subscriber::EnvFilter;
+
+mod build;
+mod commands;
+mod config;
+mod inspect;
+mod local_node;
+mod new_package;
+mod util;
+
+use crate::{
     build::build_package,
     commands::{put, update},
     config::{Config, SubCommand},
@@ -7,7 +20,18 @@ use fdev::{
     local_node::run_local_node_client,
     new_package::create_new_package,
 };
-use tracing_subscriber::EnvFilter;
+
+type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest<'static>>;
+type CommandSender = tokio::sync::mpsc::Sender<ClientRequest<'static>>;
+type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("Configuration error: {0}")]
+    MissConfiguration(Cow<'static, str>),
+    #[error("Command failed: {0}")]
+    CommandFailed(&'static str),
+}
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -23,8 +47,8 @@ async fn main() -> Result<(), anyhow::Error> {
         SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
         SubCommand::Publish(publish_config) => put(publish_config, config.additional).await,
         SubCommand::Execute(cmd_config) => match cmd_config.command {
-            fdev::config::NodeCommand::Put(put_config) => put(put_config, config.additional).await,
-            fdev::config::NodeCommand::Update(update_config) => {
+            config::NodeCommand::Put(put_config) => put(put_config, config.additional).await,
+            config::NodeCommand::Update(update_config) => {
                 update(update_config, config.additional).await
             }
         },

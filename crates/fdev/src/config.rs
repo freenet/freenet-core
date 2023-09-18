@@ -125,18 +125,6 @@ impl Display for PackageType {
     }
 }
 
-impl BuildToolCliConfig {
-    pub fn with_version(mut self, version: Version) -> Self {
-        self.version = version;
-        self
-    }
-
-    pub fn with_features(mut self, features: Option<String>) -> Self {
-        self.features = features;
-        self
-    }
-}
-
 impl Default for BuildToolCliConfig {
     fn default() -> Self {
         Self {
