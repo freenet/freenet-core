@@ -1,5 +1,5 @@
 use crate::{util, ContractError, Runtime, RuntimeResult};
-use locutus_stdlib::prelude::{
+use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
     OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
@@ -413,7 +413,7 @@ impl DelegateRuntimeInterface for Runtime {
 #[cfg(test)]
 mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
-    use locutus_stdlib::prelude::{
+    use freenet_stdlib::prelude::{
         ContractCode, ContractInstanceId, Delegate, DelegateWasmAPIVersion, Parameters,
     };
     use serde::{Deserialize, Serialize};

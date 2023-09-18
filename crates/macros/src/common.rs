@@ -6,14 +6,14 @@ pub fn set_logger() -> TokenStream {
     quote! {
         #[cfg(feature = "trace")]
         {
-            use ::locutus_stdlib::prelude::{tracing_subscriber as tra};
+            use ::freenet_stdlib::prelude::{tracing_subscriber as tra};
             if let Err(err) = tra::fmt()
-                .with_env_filter("warn,locutus_stdlib=trace")
+                .with_env_filter("warn,freenet_stdlib=trace")
                 .try_init()
             {
-                return ::locutus_stdlib::prelude::ContractInterfaceResult::from(
-                    Err::<::locutus_stdlib::prelude::ValidateResult, _>(
-                        ::locutus_stdlib::prelude::ContractError::Other(format!("{}", err))
+                return ::freenet_stdlib::prelude::ContractInterfaceResult::from(
+                    Err::<::freenet_stdlib::prelude::ValidateResult, _>(
+                        ::freenet_stdlib::prelude::ContractError::Other(format!("{}", err))
                     )
                 ).into_raw();
             }

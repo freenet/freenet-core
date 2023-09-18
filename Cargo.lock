@@ -1459,6 +1459,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6999dc1837253364c2ebb0704ba97994bd874e8f195d665c50b7548f6ea92764"
 
 [[package]]
+name = "fdev"
+version = "0.0.4"
+dependencies = [
+ "bincode",
+ "bs58",
+ "clap",
+ "either",
+ "freenet-core",
+ "freenet-stdlib",
+ "futures",
+ "glob",
+ "locutus-runtime",
+ "pico-args",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tar",
+ "thiserror",
+ "tokio",
+ "toml 0.8.0",
+ "tracing",
+ "tracing-subscriber",
+ "xz2",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1527,6 +1554,99 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a62bc1cf6f830c2ec14a513a9fb124d0a213a629668a4186f329db21fe045652"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "freenet-core"
+version = "0.0.4"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "arrayvec",
+ "async-trait",
+ "asynchronous-codec",
+ "axum",
+ "bincode",
+ "blake3",
+ "bs58",
+ "chacha20poly1305 0.10.1",
+ "clap",
+ "config",
+ "crossbeam",
+ "ctrlc",
+ "dashmap",
+ "directories",
+ "either",
+ "freenet-stdlib",
+ "futures",
+ "itertools",
+ "libp2p",
+ "locutus-runtime",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry-jaeger",
+ "ordered-float 3.9.1",
+ "parking_lot",
+ "pav_regression",
+ "pico-args",
+ "rand",
+ "rocksdb",
+ "serde",
+ "serde_with",
+ "sqlx",
+ "stretto",
+ "thiserror",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "unsigned-varint",
+ "uuid",
+]
+
+[[package]]
+name = "freenet-macros"
+version = "0.0.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.37",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.0.4"
+dependencies = [
+ "arbitrary",
+ "arrayvec",
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros",
+ "futures",
+ "js-sys",
+ "once_cell",
+ "rand",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen 0.6.0",
+ "serde_bytes",
+ "serde_json",
+ "serde_with",
+ "tar",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "wasmer",
+ "web-sys",
+ "xz2",
 ]
 
 [[package]]
@@ -2679,7 +2799,7 @@ dependencies = [
 
 [[package]]
 name = "locutus"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2689,10 +2809,10 @@ dependencies = [
  "bytes",
  "clap",
  "cookie",
+ "fdev",
+ "freenet-core",
+ "freenet-stdlib",
  "futures",
- "locutus-core",
- "locutus-dev",
- "locutus-stdlib",
  "serde",
  "serde_json",
  "tar",
@@ -2701,96 +2821,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xz2",
-]
-
-[[package]]
-name = "locutus-core"
-version = "0.0.3"
-dependencies = [
- "anyhow",
- "arbitrary",
- "arrayvec",
- "async-trait",
- "asynchronous-codec",
- "axum",
- "bincode",
- "blake3",
- "bs58",
- "chacha20poly1305 0.10.1",
- "clap",
- "config",
- "crossbeam",
- "ctrlc",
- "dashmap",
- "directories",
- "either",
- "futures",
- "itertools",
- "libp2p",
- "locutus-runtime",
- "locutus-stdlib",
- "once_cell",
- "opentelemetry",
- "opentelemetry-jaeger",
- "ordered-float 3.9.1",
- "parking_lot",
- "pav_regression",
- "pico-args",
- "rand",
- "rocksdb",
- "serde",
- "serde_with",
- "sqlx",
- "stretto",
- "thiserror",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "unsigned-varint",
- "uuid",
-]
-
-[[package]]
-name = "locutus-dev"
-version = "0.0.3"
-dependencies = [
- "bincode",
- "bs58",
- "clap",
- "either",
- "futures",
- "glob",
- "locutus-core",
- "locutus-runtime",
- "locutus-stdlib",
- "pico-args",
- "semver",
- "serde",
- "serde_json",
- "serde_with",
- "tar",
- "thiserror",
- "tokio",
- "toml 0.8.0",
- "tracing",
- "tracing-subscriber",
- "xz2",
-]
-
-[[package]]
-name = "locutus-macros"
-version = "0.0.3"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.37",
 ]
 
 [[package]]
 name = "locutus-runtime"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "arbitrary",
  "arrayvec",
@@ -2803,8 +2838,8 @@ dependencies = [
  "chrono",
  "dashmap",
  "either",
+ "freenet-stdlib",
  "futures",
- "locutus-stdlib",
  "notify",
  "once_cell",
  "rand",
@@ -2822,41 +2857,6 @@ dependencies = [
  "varuint",
  "walkdir",
  "wasmer",
-]
-
-[[package]]
-name = "locutus-stdlib"
-version = "0.0.3"
-dependencies = [
- "arbitrary",
- "arrayvec",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chrono",
- "flatbuffers",
- "futures",
- "js-sys",
- "locutus-macros",
- "once_cell",
- "rand",
- "semver",
- "serde",
- "serde-wasm-bindgen 0.6.0",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "tar",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "wasmer",
- "web-sys",
- "xz2",
 ]
 
 [[package]]

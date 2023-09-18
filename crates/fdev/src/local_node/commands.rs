@@ -1,5 +1,5 @@
-use locutus_core::ClientId;
-use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
+use freenet_core::ClientId;
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 
 use crate::{CommandReceiver, DynError};
 

@@ -112,8 +112,8 @@ mod test {
         },
         ClientId, DynError, WrappedContract,
     };
+    use freenet_stdlib::{client_api::ContractRequest, prelude::ContractCode};
     use locutus_runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
-    use locutus_stdlib::{client_api::ContractRequest, prelude::ContractCode};
 
     use super::*;
 

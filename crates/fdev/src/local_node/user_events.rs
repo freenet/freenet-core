@@ -7,12 +7,12 @@ use std::{
 };
 
 use either::Either;
-use futures::future::BoxFuture;
-use locutus_core::{ClientEventsProxy, ClientId, OpenRequest};
-use locutus_runtime::prelude::*;
-use locutus_stdlib::client_api::{
+use freenet_core::{ClientEventsProxy, ClientId, OpenRequest};
+use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse,
 };
+use futures::future::BoxFuture;
+use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{util, CommandSender, DynError};

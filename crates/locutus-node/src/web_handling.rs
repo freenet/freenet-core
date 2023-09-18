@@ -5,12 +5,12 @@ use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
 use locutus_runtime::{
-    locutus_stdlib::web::{WebApp, WebContractError},
+    freenet_stdlib::web::{WebApp, WebContractError},
     ContractContainer, ContractKey, State,
 };
 
-use locutus_core::{
-    locutus_runtime::locutus_stdlib::client_api::{
+use freenet_core::{
+    locutus_runtime::freenet_stdlib::client_api::{
         ClientRequest, ContractRequest, ContractResponse, HostResponse,
     },
     *,

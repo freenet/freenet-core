@@ -1,16 +1,12 @@
 [package]
 name = "locutus"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.71.1"
 publish = true
 description = "Locutus P2P network main node implementation"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/freenet/locutus"
-
-[[bin]]
-name = "locutus-node"
-path = "src/bin/node.rs"
 
 [[bin]]
 name = "ldt"
@@ -36,6 +32,6 @@ xz2 = "0.1"
 tower-http = { version = "0.4", features = ["trace", "fs"] }
 
 # internal:
-locutus-core = { path = "../locutus-core", version = "0.0.3" }
-locutus-dev = { path = "../locutus-dev", version = "0.0.3" }
-locutus-stdlib = { path = "../locutus-stdlib", version = "0.0.3" }
+freenet-core = { path = "../core", version = "0.0.4" }
+fdev = { path = "../fdev", version = "0.0.4" }
+freenet-stdlib = { path = "../stdlib", version = "0.0.4" }

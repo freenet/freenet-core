@@ -34,7 +34,7 @@ pub mod prelude {
     pub use crate::delegate_interface::*;
     pub use crate::parameters::*;
     pub use crate::versioning::*;
-    pub use locutus_macros::{contract, delegate};
+    pub use freenet_macros::{contract, delegate};
 
     pub use bincode;
     pub use blake3;

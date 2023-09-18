@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::atomic::AtomicI64};
 
-use locutus_stdlib::{
+use freenet_stdlib::{
     buf::{BufferBuilder, BufferMut},
     prelude::*,
 };

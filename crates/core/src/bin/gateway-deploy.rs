@@ -1,8 +1,8 @@
 use std::error::Error;
 
 use clap::Parser;
+use freenet_core::*;
 use libp2p::identity::Keypair;
-use locutus_core::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use locutus_stdlib::prelude::{ContractCode, DelegateCode};
+use freenet_stdlib::prelude::{ContractCode, DelegateCode};
 
 use crate::{DynError, Error};
 

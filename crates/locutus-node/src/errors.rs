@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use locutus_stdlib::client_api::ErrorKind;
+use freenet_stdlib::client_api::ErrorKind;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]

@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use locutus_core::{Config, Executor, OperationMode, Storage};
+use freenet_core::{Config, Executor, OperationMode, Storage};
 use locutus_runtime::{ContractStore, DelegateStore, SecretsStore, StateStore};
 use tokio::sync::RwLock;
 
@@ -29,7 +29,7 @@ impl AppState {
                     SecretsStore::default(),
                     state_store,
                     || {
-                        locutus_core::util::set_cleanup_on_exit().unwrap();
+                        freenet_core::util::set_cleanup_on_exit().unwrap();
                     },
                     OperationMode::Local,
                 )

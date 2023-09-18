@@ -446,7 +446,7 @@ mod messages {
 mod test {
     use std::collections::HashMap;
 
-    use locutus_stdlib::client_api::ContractRequest;
+    use freenet_stdlib::client_api::ContractRequest;
 
     use super::*;
     use crate::{

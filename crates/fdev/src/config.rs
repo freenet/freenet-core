@@ -2,7 +2,7 @@ use std::{fmt::Display, path::PathBuf};
 
 use crate::{commands::PutType, local_node::LocalNodeCliConfig};
 use clap::ValueEnum;
-use locutus_core::OperationMode;
+use freenet_core::OperationMode;
 use semver::Version;
 
 #[derive(clap::Parser, Clone)]

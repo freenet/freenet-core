@@ -1,13 +1,13 @@
 use std::{fs::File, io::Read, path::PathBuf};
 
-use locutus_core::{
+use freenet_core::{
     locutus_runtime::StateDelta, ClientId, Config, Executor, OperationMode, Storage,
 };
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, DelegateRequest};
 use locutus_runtime::{
     ContractContainer, ContractInstanceId, ContractStore, DelegateContainer, DelegateStore,
     Parameters, SecretsStore, StateStore,
 };
-use locutus_stdlib::client_api::{ClientRequest, ContractRequest, DelegateRequest};
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},
@@ -105,8 +105,8 @@ async fn put_delegate(
 "Using default cipher and nonce. 
 For additional hardening is recommended to use a different cipher and nonce to encrypt secrets in storage.");
         (
-            ::locutus_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
-            ::locutus_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+            ::freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+            ::freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
         )
     } else {
         let mut cipher = [0; 32];

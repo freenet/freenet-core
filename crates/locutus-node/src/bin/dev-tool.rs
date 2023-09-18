@@ -1,5 +1,5 @@
 use clap::Parser;
-use locutus_dev::{
+use fdev::{
     build::build_package,
     commands::{put, update},
     config::{Config, SubCommand},
@@ -23,10 +23,8 @@ async fn main() -> Result<(), anyhow::Error> {
         SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
         SubCommand::Publish(publish_config) => put(publish_config, config.additional).await,
         SubCommand::Execute(cmd_config) => match cmd_config.command {
-            locutus_dev::config::NodeCommand::Put(put_config) => {
-                put(put_config, config.additional).await
-            }
-            locutus_dev::config::NodeCommand::Update(update_config) => {
+            fdev::config::NodeCommand::Put(put_config) => put(put_config, config.additional).await,
+            fdev::config::NodeCommand::Update(update_config) => {
                 update(update_config, config.additional).await
             }
         },

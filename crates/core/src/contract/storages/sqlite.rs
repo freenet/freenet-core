@@ -150,9 +150,9 @@ mod test {
         contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
     };
     use crate::{ClientId, DynError, WrappedContract};
+    use freenet_stdlib::client_api::ContractRequest;
+    use freenet_stdlib::prelude::ContractCode;
     use locutus_runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
-    use locutus_stdlib::client_api::ContractRequest;
-    use locutus_stdlib::prelude::ContractCode;
 
     use super::*;
 

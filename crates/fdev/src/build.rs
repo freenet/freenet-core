@@ -10,7 +10,7 @@ use std::{
 };
 use tar::Builder;
 
-use locutus_runtime::{locutus_stdlib::web::WebApp, ContractCode};
+use locutus_runtime::{freenet_stdlib::web::WebApp, ContractCode};
 
 use crate::{
     config::{BuildToolCliConfig, PackageType},
@@ -592,7 +592,7 @@ mod contract {
             let mut buf = vec![];
             File::open(cwd.join("build").join("locutus").join(DEFAULT_OUTPUT_NAME))?
                 .read_to_end(&mut buf)?;
-            let state = locutus_runtime::locutus_stdlib::prelude::State::from(buf);
+            let state = locutus_runtime::freenet_stdlib::prelude::State::from(buf);
             let mut web = WebApp::try_from(state.as_ref()).unwrap();
 
             let target = env::temp_dir().join("locutus-unpack-state");

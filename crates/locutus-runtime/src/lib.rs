@@ -16,7 +16,7 @@ pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
-pub use locutus_stdlib;
+pub use freenet_stdlib;
 pub use prelude::*;
 
 pub mod prelude {
@@ -29,5 +29,5 @@ pub mod prelude {
     pub use super::runtime::{ContractExecError, Runtime};
     pub use super::secrets_store::SecretsStore;
     pub use super::state_store::{StateStorage, StateStore, StateStoreError};
-    pub use locutus_stdlib::prelude::*;
+    pub use freenet_stdlib::prelude::*;
 }

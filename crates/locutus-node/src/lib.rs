@@ -2,12 +2,12 @@ pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod web_handling;
 
-pub use http_gateway::HttpGateway;
-use locutus_core::{locutus_runtime::ContractKey, AuthToken, ClientId, HostResult};
-use locutus_stdlib::{
+use freenet_core::{locutus_runtime::ContractKey, AuthToken, ClientId, HostResult};
+use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
     prelude::ContractInstanceId,
 };
+pub use http_gateway::HttpGateway;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -44,8 +44,8 @@ enum HostCallbackResult {
 pub mod local_node {
     use std::net::{IpAddr, SocketAddr};
 
-    use locutus_core::{ClientEventsProxy, Executor, ExecutorError, OpenRequest, WebSocketProxy};
-    use locutus_stdlib::client_api::{ClientRequest, ErrorKind};
+    use freenet_core::{ClientEventsProxy, Executor, ExecutorError, OpenRequest, WebSocketProxy};
+    use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
 
     use crate::{DynError, HttpGateway};
 

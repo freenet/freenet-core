@@ -11,8 +11,8 @@ use std::{
 use tower_http::trace::TraceLayer;
 
 use axum::routing::get;
+use freenet_stdlib::client_api::{ClientRequest, ErrorKind, HostResponse};
 use futures::{future::BoxFuture, stream::SplitSink, SinkExt, StreamExt};
-use locutus_stdlib::client_api::{ClientRequest, ErrorKind, HostResponse};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::util::EncodingProtocol;

@@ -1,6 +1,6 @@
 [package]
 name = "freenet-macros"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.71.1"
 publish = true 

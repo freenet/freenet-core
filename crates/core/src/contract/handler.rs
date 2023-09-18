@@ -5,11 +5,11 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
+use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use futures::{future::BoxFuture, FutureExt};
 use locutus_runtime::{
     ContractContainer, ContractKey, ContractStore, Parameters, Runtime, StateStorage, StateStore,
 };
-use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -289,11 +289,11 @@ pub(crate) enum ContractHandlerEvent {
 pub mod test {
     use std::sync::Arc;
 
-    use locutus_runtime::{ContractStore, ContractWasmAPIVersion};
-    use locutus_stdlib::{
+    use freenet_stdlib::{
         client_api::{ClientRequest, HostResponse},
         prelude::ContractCode,
     };
+    use locutus_runtime::{ContractStore, ContractWasmAPIVersion};
 
     use super::*;
     use crate::{config::GlobalExecutor, contract::MockRuntime, WrappedContract};

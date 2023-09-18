@@ -783,8 +783,8 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use freenet_stdlib::client_api::ContractRequest;
     use locutus_runtime::{ContractWasmAPIVersion, WrappedContract};
-    use locutus_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
     use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};

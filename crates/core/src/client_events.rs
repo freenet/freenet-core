@@ -1,6 +1,6 @@
+use freenet_stdlib::client_api::ClientRequest;
+use freenet_stdlib::client_api::{ClientError, HostResponse};
 use futures::future::BoxFuture;
-use locutus_stdlib::client_api::ClientRequest;
-use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::atomic::AtomicUsize;
@@ -147,12 +147,12 @@ pub(crate) mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use freenet_stdlib::client_api::ContractRequest;
     use futures::FutureExt;
     use locutus_runtime::{
         prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId,
         ContractWasmAPIVersion, DelegateKey, Parameters, RelatedContracts,
     };
-    use locutus_stdlib::client_api::ContractRequest;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 

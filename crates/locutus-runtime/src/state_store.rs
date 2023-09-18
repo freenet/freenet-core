@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::{ContractKey, Parameters};
+use freenet_stdlib::prelude::{ContractKey, Parameters};
 use stretto::AsyncCache;
 
 use crate::{DynError, WrappedState};

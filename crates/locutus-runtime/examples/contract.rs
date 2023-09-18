@@ -1,6 +1,6 @@
 //! This contract just checks that macros compile etc.
 // ANCHOR: contractifce
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 
 pub const RANDOM_SIGNATURE: &[u8] = &[6, 8, 2, 5, 6, 9, 9, 10];
 

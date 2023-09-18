@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 
 use crate::contract::*;
 use crate::{secrets_store::SecretsStore, tests::setup_test_contract, DelegateStore, Runtime};

@@ -1,6 +1,5 @@
 use clap::Parser;
-use locutus_core::NodeConfig;
-use locutus_core::{Executor, OperationMode};
+use freenet_core::{Executor, NodeConfig, OperationMode};
 use std::net::SocketAddr;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -19,7 +18,8 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
     let ip = config.address;
     let executor = Executor::from_config(config).await?;
     let socket: SocketAddr = (ip, port).into();
-    locutus::local_node::run_local_node(executor, socket).await
+    // freenet_core::local_node::run_local_node(executor, socket).await
+    todo!()
 }
 
 fn main() -> Result<(), DynError> {

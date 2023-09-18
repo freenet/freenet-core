@@ -1,6 +1,6 @@
 [package]
 name = "locutus-runtime"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.71.1"
 publish = true 
@@ -40,15 +40,15 @@ wasmer = { workspace = true, features = [ "sys"] }
 varuint = "0.6"
 
 # internal
-locutus-stdlib = { path = "../locutus-stdlib", features = ["archive"], version = "0.0.3" }
+freenet-stdlib = { path = "../stdlib", features = ["archive"], version = "0.0.4" }
 
 [features]
 default = [ "wasmer-default" ]
 wasmer-default = [ 	
 	"wasmer/cranelift",
 ]
-testing = ["arbitrary", "locutus-stdlib/testing"]
-trace = ["locutus-stdlib/trace"]
+testing = ["arbitrary", "freenet-stdlib/testing"]
+trace = ["freenet-stdlib/trace"]
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }

@@ -3,10 +3,10 @@ use std::pin::Pin;
 use std::task::Context;
 use std::{collections::HashMap, task::Poll};
 
+use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use futures::future::BoxFuture;
 use futures::task::AtomicWaker;
 use futures::FutureExt;
-use locutus_stdlib::client_api::{ErrorKind, HostResponse};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::{BoxedClient, ClientError, HostResult};
@@ -243,7 +243,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use locutus_stdlib::client_api::ClientRequest;
+    use freenet_stdlib::client_api::ClientRequest;
 
     use super::*;
 

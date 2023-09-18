@@ -15,8 +15,8 @@ use std::{
     time::Duration,
 };
 
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
-use locutus_stdlib::client_api::{ClientRequest, ContractRequest};
 
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;

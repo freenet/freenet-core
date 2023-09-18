@@ -5,8 +5,8 @@ use axum::extract::{Path, Query, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use locutus_core::{util::EncodingProtocol, *};
-use locutus_stdlib::{
+use freenet_core::{util::EncodingProtocol, *};
+use freenet_stdlib::{
     client_api::{
         ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
     },

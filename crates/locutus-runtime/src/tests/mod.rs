@@ -4,7 +4,7 @@ use std::{
     sync::{atomic::AtomicUsize, Arc},
 };
 
-use locutus_stdlib::prelude::{
+use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
 };
 

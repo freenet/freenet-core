@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, iter::FromIterator, path::PathBuf, sync::Arc};
 
 use dashmap::DashMap;
-use locutus_stdlib::prelude::{APIVersion, CodeHash, ContractCode, Parameters, WrappedContract};
+use freenet_stdlib::prelude::{APIVersion, CodeHash, ContractCode, Parameters, WrappedContract};
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
 

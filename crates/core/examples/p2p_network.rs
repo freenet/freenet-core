@@ -7,11 +7,11 @@ use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
 };
-use locutus_core::*;
+use freenet_core::*;
 use locutus_runtime::prelude::{
     ContractContainer, ContractWasmAPIVersion, WrappedContract, WrappedState,
 };
-use locutus_stdlib::{
+use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
     prelude::{ContractCode, Parameters},
 };

@@ -665,8 +665,8 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use freenet_stdlib::client_api::ContractRequest;
     use locutus_runtime::{ContractContainer, ContractWasmAPIVersion};
-    use locutus_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
     use super::*;

@@ -1,7 +1,7 @@
 use blake3::traits::digest::generic_array::GenericArray;
 use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20Poly1305, XNonce};
 use dashmap::DashMap;
-use locutus_stdlib::client_api::DelegateRequest;
+use freenet_stdlib::client_api::DelegateRequest;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,7 +15,7 @@ use std::{
 
 use crate::store::{StoreEntriesContainer, StoreFsManagement};
 use crate::RuntimeResult;
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 
 type SecretKey = [u8; 32];
 

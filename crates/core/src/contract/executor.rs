@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use blake3::traits::digest::generic_array::GenericArray;
 use either::Either;
-use locutus_runtime::prelude::*;
-use locutus_stdlib::client_api::{
+use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractError as CoreContractError, ContractRequest,
     ContractResponse, DelegateError as CoreDelegateError, DelegateRequest,
     HostResponse::{self, DelegateResponse},
     RequestError,
 };
+use locutus_runtime::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(any(
