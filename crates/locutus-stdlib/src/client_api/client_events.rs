@@ -155,6 +155,8 @@ pub enum DelegateError {
     Missing(DelegateKey),
     #[error("missing secret `{secret}` for delegate {key}")]
     MissingSecret { key: DelegateKey, secret: SecretsId },
+    #[error("forbidden access to secret: {0}")]
+    ForbiddenSecretAccess(SecretsId),
 }
 
 /// Errors that may happen while interacting with contracts.
@@ -1361,8 +1363,7 @@ mod client_request_test {
     use crate::client_request_generated::client_request::root_as_client_request;
     use crate::contract_interface::UpdateData;
 
-    const EXPECTED_ENCODED_CONTRACT_ID: &'static str =
-        "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
+    const EXPECTED_ENCODED_CONTRACT_ID: &str = "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
 
     #[test]
     fn test_build_contract_put_op_from_fbs() -> Result<(), Box<dyn std::error::Error>> {
@@ -1427,7 +1428,7 @@ mod client_request_test {
                 fetch_contract,
             } => {
                 assert_eq!(key.encoded_contract_id(), EXPECTED_ENCODED_CONTRACT_ID);
-                assert_eq!(fetch_contract, false);
+                assert!(!fetch_contract);
             }
             _ => panic!("wrong contract request type"),
         }
