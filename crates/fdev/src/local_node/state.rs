@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, sync::Arc};
 
 use freenet_core::{Config, Executor, OperationMode, Storage};
-use locutus_runtime::{ContractStore, DelegateStore, SecretsStore, StateStore};
+use freenet_stdlib::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::{local_node::DeserializationFmt, DynError};

@@ -1,18 +1,16 @@
 //! Handle the `web` part of the bundles.
 
-use axum::response::{Html, IntoResponse};
-use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
-use locutus_runtime::{
-    freenet_stdlib::{
-        client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
-        web::{WebApp, WebContractError},
-    },
-    ContractContainer, ContractKey, State,
+use axum::response::{Html, IntoResponse};
+use bytes::Bytes;
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
+    web::{WebApp, WebContractError},
 };
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
+use crate::runtime::{ContractContainer, ContractKey, State};
 use crate::AuthToken;
 
 use super::{errors::WebSocketApiError, ClientConnection, HostCallbackResult};

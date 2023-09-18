@@ -1,14 +1,14 @@
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
-use stretto::Cache;
-
-use crate::store::{StoreEntriesContainer, StoreFsManagement};
-use crate::RuntimeResult;
 use freenet_stdlib::prelude::{
     APIVersion, CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, Parameters,
 };
+use serde::{Deserialize, Serialize};
+use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
+use stretto::Cache;
+
+use super::store::{StoreEntriesContainer, StoreFsManagement};
+use super::RuntimeResult;
 
 const DEFAULT_MAX_SIZE: i64 = 10 * 1024 * 1024 * 20;
 

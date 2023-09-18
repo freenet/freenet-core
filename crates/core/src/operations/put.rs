@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 pub(crate) use self::messages::PutMsg;
-use locutus_runtime::{prelude::ContractKey, ContractContainer};
+use crate::runtime::{prelude::ContractKey, ContractContainer};
 
 use super::{OpEnum, OpError, OperationResult};
 use crate::{
@@ -783,8 +783,8 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use crate::runtime::{ContractWasmAPIVersion, WrappedContract};
     use freenet_stdlib::client_api::ContractRequest;
-    use locutus_runtime::{ContractWasmAPIVersion, WrappedContract};
     use std::collections::HashMap;
 
     use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};

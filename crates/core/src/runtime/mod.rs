@@ -1,5 +1,3 @@
-extern crate core;
-
 mod contract;
 mod contract_store;
 mod delegate;
@@ -14,9 +12,6 @@ mod store;
 pub(crate) mod tests;
 pub mod util;
 
-type DynError = Box<dyn std::error::Error + Send + Sync>;
-
-pub use freenet_stdlib;
 pub use prelude::*;
 
 pub mod prelude {

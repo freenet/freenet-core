@@ -1,9 +1,3 @@
-use blake3::traits::digest::generic_array::GenericArray;
-use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20Poly1305, XNonce};
-use dashmap::DashMap;
-use freenet_stdlib::client_api::DelegateRequest;
-use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -13,9 +7,17 @@ use std::{
     sync::Arc,
 };
 
-use crate::store::{StoreEntriesContainer, StoreFsManagement};
-use crate::RuntimeResult;
-use freenet_stdlib::prelude::*;
+use blake3::traits::digest::generic_array::GenericArray;
+use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20Poly1305, XNonce};
+use dashmap::DashMap;
+use freenet_stdlib::{client_api::DelegateRequest, prelude::*};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+
+use super::{
+    store::{StoreEntriesContainer, StoreFsManagement},
+    RuntimeResult,
+};
 
 type SecretKey = [u8; 32];
 

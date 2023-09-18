@@ -5,6 +5,7 @@ use std::fmt::Display;
 use std::hint::unreachable_unchecked;
 use std::time::{Duration, Instant};
 
+use crate::runtime::prelude::*;
 use blake3::traits::digest::generic_array::GenericArray;
 use either::Either;
 use freenet_stdlib::client_api::{
@@ -13,7 +14,6 @@ use freenet_stdlib::client_api::{
     HostResponse::{self, DelegateResponse},
     RequestError,
 };
-use locutus_runtime::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(any(
@@ -1107,7 +1107,7 @@ impl ContractExecutor for Executor<crate::contract::MockRuntime> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use locutus_runtime::{ContractStore, StateStore};
+    use crate::runtime::{ContractStore, StateStore};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {

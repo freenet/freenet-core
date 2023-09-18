@@ -1,7 +1,7 @@
 use std::hash::Hash;
 
+use crate::runtime::{ContractInstanceId, DelegateKey};
 use dashmap::DashMap;
-use locutus_runtime::{ContractInstanceId, DelegateKey};
 
 use crate::ring::PeerKeyLocation;
 

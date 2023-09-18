@@ -2,18 +2,15 @@ use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail};
 use clap::Parser;
+use freenet_core::*;
+use freenet_stdlib::{
+    client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
+    prelude::*,
+};
 use futures::future::BoxFuture;
 use libp2p::{
     identity::{ed25519, Keypair},
     PeerId,
-};
-use freenet_core::*;
-use locutus_runtime::prelude::{
-    ContractContainer, ContractWasmAPIVersion, WrappedContract, WrappedState,
-};
-use freenet_stdlib::{
-    client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
-    prelude::{ContractCode, Parameters},
 };
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 

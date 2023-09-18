@@ -147,12 +147,12 @@ pub(crate) mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use freenet_stdlib::client_api::ContractRequest;
-    use futures::FutureExt;
-    use locutus_runtime::{
+    use crate::runtime::{
         prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId,
         ContractWasmAPIVersion, DelegateKey, Parameters, RelatedContracts,
     };
+    use freenet_stdlib::client_api::ContractRequest;
+    use futures::FutureExt;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 

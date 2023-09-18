@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
+use crate::runtime::prelude::ContractKey;
+use crate::runtime::ContractContainer;
 use either::Either;
-use locutus_runtime::prelude::ContractKey;
-use locutus_runtime::ContractContainer;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{

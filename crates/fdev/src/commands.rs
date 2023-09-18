@@ -1,13 +1,14 @@
 use std::{fs::File, io::Read, path::PathBuf};
 
-use freenet_core::{
-    locutus_runtime::StateDelta, ClientId, Config, Executor, OperationMode, Storage,
+use freenet_core::{ClientId, Config, Executor, OperationMode, Storage};
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest, DelegateRequest},
+    prelude::*,
 };
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, DelegateRequest};
-use locutus_runtime::{
-    ContractContainer, ContractInstanceId, ContractStore, DelegateContainer, DelegateStore,
-    Parameters, SecretsStore, StateStore,
-};
+// use locutus_runtime::{
+//     ContractContainer, ContractInstanceId, ContractStore, DelegateContainer, DelegateStore,
+//     Parameters, SecretsStore, StateStore,
+// };
 
 use crate::{
     config::{BaseConfig, PutConfig, UpdateConfig},

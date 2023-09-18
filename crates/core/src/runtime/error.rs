@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use freenet_stdlib::prelude::{ContractKey, DelegateKey, SecretsId};
 
-use crate::{delegate, runtime, secrets_store, DelegateExecError};
+use super::{delegate, runtime, secrets_store, DelegateExecError};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 

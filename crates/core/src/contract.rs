@@ -1,4 +1,4 @@
-use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError};
+use crate::runtime::{prelude::ContractKey, ContractError as ContractRtError};
 
 mod executor;
 mod handler;

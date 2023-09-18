@@ -10,7 +10,7 @@ use std::{
 };
 use tar::Builder;
 
-use locutus_runtime::{freenet_stdlib::web::WebApp, ContractCode};
+use freenet_stdlib::web::WebApp;
 
 use crate::{
     config::{BuildToolCliConfig, PackageType},
@@ -120,6 +120,8 @@ fn get_default_ouput_dir(cwd: &Path) -> std::io::Result<PathBuf> {
 }
 
 mod contract {
+    use freenet_stdlib::prelude::ContractCode;
+
     use super::*;
 
     pub(super) fn package_contract(
@@ -592,7 +594,7 @@ mod contract {
             let mut buf = vec![];
             File::open(cwd.join("build").join("locutus").join(DEFAULT_OUTPUT_NAME))?
                 .read_to_end(&mut buf)?;
-            let state = locutus_runtime::freenet_stdlib::prelude::State::from(buf);
+            let state = freenet_stdlib::prelude::State::from(buf);
             let mut web = WebApp::try_from(state.as_ref()).unwrap();
 
             let target = env::temp_dir().join("locutus-unpack-state");
@@ -668,7 +670,7 @@ mod contract {
 }
 
 mod delegate {
-    use locutus_runtime::DelegateCode;
+    use freenet_stdlib::prelude::DelegateCode;
 
     use super::*;
 

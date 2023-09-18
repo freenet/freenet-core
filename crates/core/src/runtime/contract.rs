@@ -4,7 +4,7 @@ use freenet_stdlib::prelude::{
 };
 use wasmer::TypedFunction;
 
-use crate::{ContractExecError, RuntimeResult};
+use super::{ContractExecError, RuntimeResult};
 
 type FfiReturnTy = i64;
 
@@ -66,7 +66,7 @@ pub trait ContractRuntimeInterface {
     ) -> RuntimeResult<StateDelta<'static>>;
 }
 
-impl ContractRuntimeInterface for crate::Runtime {
+impl ContractRuntimeInterface for super::Runtime {
     fn validate_state(
         &mut self,
         key: &ContractKey,

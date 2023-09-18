@@ -1,6 +1,6 @@
+use crate::runtime::{ContractStore, StateStorage, StateStore, WrappedContract};
 use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use futures::{future::BoxFuture, FutureExt};
-use locutus_runtime::{ContractStore, StateStorage, StateStore, WrappedContract};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{

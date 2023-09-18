@@ -8,7 +8,7 @@ use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
 };
 
-use crate::ContractStore;
+use super::ContractStore;
 
 mod contract;
 mod time;
@@ -63,7 +63,7 @@ pub(crate) fn setup_test_contract(
     name: &str,
 ) -> Result<(ContractStore, ContractKey), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let mut store = ContractStore::new(crate::tests::test_dir("contract"), 10_000)?;
+    let mut store = ContractStore::new(test_dir("contract"), 10_000)?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),

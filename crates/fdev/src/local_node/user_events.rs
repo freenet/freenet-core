@@ -8,11 +8,11 @@ use std::{
 
 use either::Either;
 use freenet_core::{ClientEventsProxy, ClientId, OpenRequest};
-use freenet_stdlib::client_api::{
-    ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse,
+use freenet_stdlib::{
+    client_api::{ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse},
+    prelude::*,
 };
 use futures::future::BoxFuture;
-use locutus_runtime::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{util, CommandSender, DynError};

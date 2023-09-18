@@ -2,7 +2,7 @@
 
 use wasmer::TypedFunction;
 
-use crate::{DelegateStore, Runtime, SecretsStore};
+use super::super::{DelegateStore, Runtime, SecretsStore};
 
 #[test]
 fn now() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,15 +1,16 @@
-use crate::{util, ContractError, Runtime, RuntimeResult};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
     OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
 };
-
-use crate::error::RuntimeInnerError;
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
 use wasmer::{Instance, TypedFunction};
+
+use super::error::RuntimeInnerError;
+use super::{util, ContractError, Runtime, RuntimeResult};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -419,8 +420,10 @@ mod test {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
+    use super::super::{
+        delegate_store::DelegateStore, ContractStore, SecretsStore, WrappedContract,
+    };
     use super::*;
-    use crate::{delegate_store::DelegateStore, ContractStore, SecretsStore, WrappedContract};
 
     const TEST_DELEGATE_1: &str = "test_delegate_1";
 
@@ -446,9 +449,9 @@ mod test {
     ) -> Result<(DelegateContainer, Runtime), Box<dyn std::error::Error>> {
         const TEST_PREFIX: &str = "delegate-api";
         let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-        let contracts_dir = crate::tests::test_dir(TEST_PREFIX);
-        let delegates_dir = crate::tests::test_dir(TEST_PREFIX);
-        let secrets_dir = crate::tests::test_dir(TEST_PREFIX);
+        let contracts_dir = super::super::tests::test_dir(TEST_PREFIX);
+        let delegates_dir = super::super::tests::test_dir(TEST_PREFIX);
+        let secrets_dir = super::super::tests::test_dir(TEST_PREFIX);
 
         let contract_store = ContractStore::new(contracts_dir, 10_000)?;
         let delegate_store = DelegateStore::new(delegates_dir, 10_000)?;
@@ -458,7 +461,7 @@ mod test {
             Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
 
         let delegate = {
-            let bytes = crate::tests::get_test_module(name)?;
+            let bytes = super::super::tests::get_test_module(name)?;
             DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
                 &bytes.into(),
                 &vec![].into(),

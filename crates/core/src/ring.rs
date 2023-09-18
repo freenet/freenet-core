@@ -22,9 +22,9 @@ use std::{
     },
 };
 
+use crate::runtime::prelude::ContractKey;
 use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
-use locutus_runtime::prelude::ContractKey;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 

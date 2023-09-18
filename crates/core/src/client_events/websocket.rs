@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use crate::runtime::ContractKey;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -18,7 +19,6 @@ use freenet_stdlib::{
     prelude::ContractInstanceId,
 };
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
-use locutus_runtime::ContractKey;
 use serde::Deserialize;
 use tokio::sync::{mpsc, Mutex};
 

@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use locutus_runtime::{ContractError, Parameters, StateStorage, StateStoreError};
+use crate::runtime::{ContractError, Parameters, StateStorage, StateStoreError};
 use once_cell::sync::Lazy;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteRow},
@@ -62,7 +62,7 @@ impl StateStorage for Pool {
     async fn store(
         &mut self,
         key: ContractKey,
-        state: locutus_runtime::WrappedState,
+        state: crate::runtime::WrappedState,
     ) -> Result<(), Self::Error> {
         sqlx::query(
             "INSERT INTO states (contract, state) 
@@ -80,7 +80,7 @@ impl StateStorage for Pool {
     async fn get(
         &self,
         key: &ContractKey,
-    ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
+    ) -> Result<Option<crate::runtime::WrappedState>, Self::Error> {
         match sqlx::query("SELECT state FROM states WHERE contract = ?")
             .bind(key.bytes())
             .map(|row: SqliteRow| Some(WrappedState::new(row.get("state"))))
@@ -149,10 +149,10 @@ mod test {
     use crate::contract::{
         contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
     };
+    use crate::runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
     use crate::{ClientId, DynError, WrappedContract};
     use freenet_stdlib::client_api::ContractRequest;
     use freenet_stdlib::prelude::ContractCode;
-    use locutus_runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
 
     use super::*;
 

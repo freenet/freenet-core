@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use locutus_runtime::{ContractContainer, ContractKey};
+use crate::runtime::{ContractContainer, ContractKey};
 
 use crate::message::InnerMessage;
 use crate::operations::op_trait::Operation;
@@ -665,8 +665,8 @@ mod messages {
 
 #[cfg(test)]
 mod test {
+    use crate::runtime::{ContractContainer, ContractWasmAPIVersion};
     use freenet_stdlib::client_api::ContractRequest;
-    use locutus_runtime::{ContractContainer, ContractWasmAPIVersion};
     use std::collections::HashMap;
 
     use super::*;

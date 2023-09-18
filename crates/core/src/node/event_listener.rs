@@ -7,7 +7,7 @@ use crate::{
     WrappedState,
 };
 
-use locutus_runtime::prelude::ContractKey;
+use crate::runtime::prelude::ContractKey;
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;
 
@@ -175,8 +175,8 @@ mod test_utils {
         },
     };
 
+    use crate::runtime::WrappedState;
     use dashmap::DashMap;
-    use locutus_runtime::WrappedState;
     use parking_lot::RwLock;
 
     use super::*;

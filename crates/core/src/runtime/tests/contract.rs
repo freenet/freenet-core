@@ -1,7 +1,9 @@
 use freenet_stdlib::prelude::*;
 
-use crate::contract::*;
-use crate::{secrets_store::SecretsStore, tests::setup_test_contract, DelegateStore, Runtime};
+use super::super::contract::*;
+use super::super::{
+    secrets_store::SecretsStore, tests::setup_test_contract, DelegateStore, Runtime,
+};
 
 const TEST_CONTRACT_1: &str = "test_contract_1";
 

@@ -5,10 +5,11 @@ use freenet_stdlib::prelude::{APIVersion, CodeHash, ContractCode, Parameters, Wr
 use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
-use crate::store::{StoreEntriesContainer, StoreFsManagement};
-use crate::{error::RuntimeInnerError, ContractContainer, ContractWasmAPIVersion, RuntimeResult};
-
-use super::ContractKey;
+use super::{
+    error::RuntimeInnerError,
+    store::{StoreEntriesContainer, StoreFsManagement},
+    ContractContainer, ContractKey, ContractWasmAPIVersion, RuntimeResult,
+};
 
 #[derive(Serialize, Deserialize, Default)]
 struct KeyToCodeMap(Vec<(ContractKey, CodeHash)>);

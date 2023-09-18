@@ -7,12 +7,13 @@ mod operations;
 mod resource_manager;
 mod ring;
 mod router;
+mod runtime;
 #[cfg(feature = "websocket")]
 pub mod server;
 pub mod util;
 
-pub type WrappedContract = locutus_runtime::prelude::WrappedContract;
-pub type WrappedState = locutus_runtime::prelude::WrappedState;
+pub type WrappedContract = crate::runtime::prelude::WrappedContract;
+pub type WrappedState = crate::runtime::prelude::WrappedState;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -26,7 +27,6 @@ pub use contract::storages::Storage;
 pub use contract::{Executor, ExecutorError, OperationMode};
 pub use either;
 pub use libp2p;
-pub use locutus_runtime;
 pub use node::PeerKey;
 pub use node::{InitPeerNode, NodeBuilder, NodeConfig};
 pub use ring::Location;

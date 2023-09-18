@@ -2,11 +2,11 @@ pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod path_handlers;
 
+use crate::runtime::ContractKey;
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
     prelude::ContractInstanceId,
 };
-use locutus_runtime::ContractKey;
 
 use crate::{AuthToken, ClientId, HostResult};
 

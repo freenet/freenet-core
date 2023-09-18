@@ -10,7 +10,8 @@ use std::{
     time::Duration,
 };
 
-use crate::{error::RuntimeInnerError, DynError, RuntimeResult};
+use super::{error::RuntimeInnerError, RuntimeResult};
+use crate::DynError;
 
 pub(crate) trait StoreEntriesContainer: Serialize + DeserializeOwned + Default {
     type MemContainer: Send + Sync + 'static;
