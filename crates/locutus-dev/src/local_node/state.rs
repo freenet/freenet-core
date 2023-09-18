@@ -18,7 +18,7 @@ impl AppState {
     const MAX_MEM_CACHE: u32 = 10_000_000;
 
     pub async fn new(config: &LocalNodeCliConfig) -> Result<Self, DynError> {
-        let contract_dir = Config::get_conf().config_paths.local_contracts_dir();
+        let contract_dir = Config::get_static_conf().config_paths.local_contracts_dir();
         let contract_store = ContractStore::new(contract_dir, config.max_contract_size)?;
         let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE).unwrap();
         Ok(AppState {

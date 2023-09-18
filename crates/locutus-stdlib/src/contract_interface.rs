@@ -1024,7 +1024,7 @@ where
         let code_hash = code_data.hash();
         Self {
             instance: id,
-            code: Some(code_hash.clone()),
+            code: Some(*code_hash),
         }
     }
 }

@@ -23,7 +23,7 @@ use crate::{
     message::{Message, NodeEvent},
     ring::Ring,
     util::IterExt,
-    NodeConfig,
+    NodeBuilder,
 };
 
 use super::OpManager;
@@ -65,28 +65,31 @@ impl NodeP2P {
             .await
     }
 
-    pub(crate) fn build<CH, const CLIENTS: usize>(
-        config: NodeConfig<CLIENTS>,
+    pub(crate) async fn build<CH, const CLIENTS: usize>(
+        builder: NodeBuilder<CLIENTS>,
+        ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
     {
-        let peer_key = PeerKey::from(config.local_key.public());
-        let gateways = config.get_gateways()?;
+        let peer_key = PeerKey::from(builder.local_key.public());
+        let gateways = builder.get_gateways()?;
 
         let conn_manager = {
-            let transport = Self::config_transport(&config.local_key)?;
-            P2pConnManager::build(transport, &config)?
+            let transport = Self::config_transport(&builder.local_key)?;
+            P2pConnManager::build(transport, &builder)?
         };
 
-        let ring = Ring::new(&config, &gateways)?;
+        let ring = Ring::new(&builder, &gateways)?;
         let (notification_tx, notification_channel) = mpsc::channel(100);
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
-        let contract_handler = CH::from(ch_channel);
+        let contract_handler = CH::build(ch_channel, ch_builder)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
-        let clients = ClientEventsCombinator::new(config.clients);
+        let clients = ClientEventsCombinator::new(builder.clients);
         GlobalExecutor::spawn(client_event_handling(op_storage.clone(), clients));
 
         Ok(NodeP2P {
@@ -94,7 +97,7 @@ impl NodeP2P {
             conn_manager,
             notification_channel,
             op_storage,
-            is_gateway: config.location.is_some(),
+            is_gateway: builder.location.is_some(),
         })
     }
 
@@ -130,8 +133,8 @@ mod test {
     use crate::{
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
-        contract::TestContractHandler,
-        node::{test::get_free_port, InitPeerNode},
+        contract::MemoryContractHandler,
+        node::{tests::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -182,12 +185,12 @@ mod test {
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
             let user_events = MemoryEventsGen::new(receiver1, PeerKey::from(peer1_id));
-            let mut config = NodeConfig::new([Box::new(user_events)]);
+            let mut config = NodeBuilder::new([Box::new(user_events)]);
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 = Box::new(NodeP2P::build::<TestContractHandler, 1>(config)?);
+            let mut peer1 = Box::new(NodeP2P::build::<MemoryContractHandler, 1>(config, ()).await?);
             peer1.conn_manager.listen_on()?;
             ping_ev_loop(&mut peer1).await.unwrap();
             Ok::<_, anyhow::Error>(())
@@ -196,9 +199,11 @@ mod test {
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
             let user_events = MemoryEventsGen::new(receiver2, PeerKey::from(peer2_id));
-            let mut config = NodeConfig::new([Box::new(user_events)]);
+            let mut config = NodeBuilder::new([Box::new(user_events)]);
             config.add_gateway(peer1_config.clone());
-            let mut peer2 = NodeP2P::build::<TestContractHandler, 1>(config).unwrap();
+            let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1>(config, ())
+                .await
+                .unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2

@@ -963,13 +963,13 @@ mod messages {
 mod test {
     use std::time::Duration;
 
-    use crate::node::test::{check_connectivity, SimNetwork};
+    use crate::node::tests::{check_connectivity, SimNetwork};
 
     /// Given a network of one node and one gateway test that both are connected.
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_connects_to_gw() {
-        let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2);
+        let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2).await;
         sim_nodes.build().await;
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(sim_nodes.connected("node-0"));
@@ -981,7 +981,7 @@ mod test {
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nodes.build().await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await
     }
@@ -992,7 +992,7 @@ mod test {
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 1000, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 1000, 2).await;
         sim_nodes.build().await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(10)).await
     }

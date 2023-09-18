@@ -450,7 +450,7 @@ mod test {
 
     use super::*;
     use crate::{
-        node::test::{check_connectivity, NodeSpecification, SimNetwork},
+        node::tests::{check_connectivity, NodeSpecification, SimNetwork},
         WrappedContract, WrappedState,
     };
 
@@ -492,7 +492,7 @@ mod test {
             ("node-0".to_string(), first_node),
             ("node-1".to_string(), second_node),
         ]);
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nodes.build_with_specs(subscribe_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 

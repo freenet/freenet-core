@@ -37,7 +37,7 @@ impl From<&DashMap<ContractKey, CodeHash>> for KeyToCodeMap {
     fn from(vals: &DashMap<ContractKey, CodeHash>) -> Self {
         let mut map = vec![];
         for r in vals.iter() {
-            map.push((r.key().clone(), r.value().clone()));
+            map.push((r.key().clone(), *r.value()));
         }
         Self(map)
     }
@@ -139,8 +139,7 @@ impl ContractStore {
             };
             // add back the contract part to the mem store
             let size = data.data().len() as i64;
-            self.contract_cache
-                .insert(code_hash.clone(), data.clone(), size);
+            self.contract_cache.insert(*code_hash, data.clone(), size);
             Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                 WrappedContract::new(data, params),
             )))
@@ -166,7 +165,7 @@ impl ContractStore {
         Self::update(
             &mut self.key_to_code_part,
             key.clone(),
-            code_hash.clone(),
+            *code_hash,
             KEY_FILE_PATH.get().unwrap(),
             LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
@@ -175,8 +174,7 @@ impl ContractStore {
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
             let size = code.data().len() as i64;
-            self.contract_cache
-                .insert(code_hash.clone(), Arc::new(code), size);
+            self.contract_cache.insert(*code_hash, Arc::new(code), size);
             return Ok(());
         }
 
@@ -184,7 +182,7 @@ impl ContractStore {
         let size = code.data().len() as i64;
         let data = code.data().to_vec();
         self.contract_cache
-            .insert(code_hash.clone(), Arc::new(ContractCode::from(data)), size);
+            .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
 
         let version = APIVersion::from(contract);
         let output: Vec<u8> = code.to_bytes_versioned(version)?;
@@ -196,7 +194,7 @@ impl ContractStore {
 
     pub fn get_contract_path(&mut self, key: &ContractKey) -> RuntimeResult<PathBuf> {
         let contract_hash = match key.code_hash() {
-            Some(k) => k.clone(),
+            Some(k) => *k,
             None => self.code_hash_from_key(key).ok_or_else(|| {
                 tracing::warn!("trying to get partially unspecified contract `{key}`");
                 RuntimeInnerError::UnwrapContract
@@ -208,7 +206,7 @@ impl ContractStore {
 
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract_hash = match key.code_hash() {
-            Some(k) => k.clone(),
+            Some(k) => *k,
             None => self.code_hash_from_key(key).ok_or_else(|| {
                 tracing::warn!("trying to get partially unspecified contract `{key}`");
                 RuntimeInnerError::UnwrapContract
@@ -223,7 +221,7 @@ impl ContractStore {
     }
 
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {
-        self.key_to_code_part.get(key).map(|r| r.value().clone())
+        self.key_to_code_part.get(key).map(|r| *r.value())
     }
 }
 

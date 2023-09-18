@@ -591,13 +591,13 @@ async fn put_contract(
 ) -> Result<WrappedState, OpError> {
     // after the contract has been cached, push the update query
     match op_storage
-        .notify_contract_handler(ContractHandlerEvent::PushQuery { key, state })
+        .notify_contract_handler(ContractHandlerEvent::PutQuery { key, state })
         .await
     {
-        Ok(ContractHandlerEvent::PushResponse {
+        Ok(ContractHandlerEvent::PutResponse {
             new_value: Ok(new_val),
         }) => Ok(new_val),
-        Ok(ContractHandlerEvent::PushResponse {
+        Ok(ContractHandlerEvent::PutResponse {
             new_value: Err(_err),
         }) => {
             // return Err(OpError::from(ContractError::StorageError(err)));
@@ -787,7 +787,7 @@ mod test {
     use locutus_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
-    use crate::node::test::{check_connectivity, NodeSpecification, SimNetwork};
+    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
 
     use super::*;
 
@@ -804,7 +804,7 @@ mod test {
         let contract_val: WrappedState = gen.arbitrary()?;
         let new_value = WrappedState::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         let mut locations = sim_nodes.get_locations_by_node();
         let node0_loc = locations.remove("node-0").unwrap();
         let node1_loc = locations.remove("node-1").unwrap();

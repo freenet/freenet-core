@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     node::{self, PeerKey},
-    NodeConfig,
+    NodeBuilder,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -115,7 +115,7 @@ impl Ring {
     const MAX_HOPS_TO_LIVE: usize = 10;
 
     pub fn new<const CLIENTS: usize>(
-        config: &NodeConfig<CLIENTS>,
+        config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
     ) -> Result<Self, anyhow::Error> {
         let peer_key = PeerKey::from(config.local_key.public());
@@ -561,7 +561,7 @@ mod test {
 
         let (_, receiver) = channel((0, peer_key));
         let user_events = MemoryEventsGen::new(receiver, peer_key);
-        let config = NodeConfig::new([Box::new(user_events)]);
+        let config = NodeBuilder::new([Box::new(user_events)]);
         let ring = Ring::new(&config, &[]).unwrap();
 
         fn build_pk(loc: Location) -> PeerKeyLocation {

@@ -88,7 +88,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         bundle.posts_contract.key().encoded_contract_id()
     );
 
-    let contract_dir = Config::get_conf().config_paths.local_contracts_dir();
+    let contract_dir = Config::get_static_conf().config_paths.local_contracts_dir();
     let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
     let mut local_node = Executor::new(

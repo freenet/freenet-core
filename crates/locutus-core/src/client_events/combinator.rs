@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Context;
 use std::{collections::HashMap, task::Poll};
 
@@ -15,8 +14,6 @@ use crate::client_events::OpenRequest;
 use crate::{ClientEventsProxy, ClientId};
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
-
-static COMBINATOR_INDEXES: AtomicUsize = AtomicUsize::new(0);
 
 /// This type allows combining different sources of events into one and interoperation between them.
 pub struct ClientEventsCombinator<const N: usize> {
@@ -102,9 +99,7 @@ impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
                                     .entry(external)
                                     .or_insert_with(|| {
                                         // add a new mapped external client id
-                                        let internal = ClientId(
-                                            COMBINATOR_INDEXES.fetch_add(1, Ordering::SeqCst),
-                                        );
+                                        let internal = ClientId::next();
                                         self.internal_clients.insert(internal, (idx, external));
                                         internal
                                     });

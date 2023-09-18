@@ -1,6 +1,7 @@
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail};
+use clap::Parser;
 use futures::future::BoxFuture;
 use libp2p::{
     identity::{ed25519, Keypair},
@@ -25,13 +26,14 @@ async fn start_gateway(
     user_events: UserEvents,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // todo: send user events though ws interface
-    let mut config = NodeConfig::new([Box::new(user_events)]);
-    config
+    let mut builder = NodeBuilder::new([Box::new(user_events)]);
+    builder
         .with_ip(Ipv4Addr::LOCALHOST)
         .with_port(port)
         .with_key(key)
         .with_location(location);
-    config.build()?.run().await
+    let config = NodeConfig::parse();
+    builder.build(config).await?.run().await
 }
 
 async fn start_new_peer(
@@ -39,9 +41,10 @@ async fn start_new_peer(
     user_events: UserEvents,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // todo: send user events though ws interface
-    let mut config = NodeConfig::new([Box::new(user_events)]);
-    config.add_gateway(gateway_config);
-    config.build()?.run().await
+    let mut builder = NodeBuilder::new([Box::new(user_events)]);
+    builder.add_gateway(gateway_config);
+    let config = NodeConfig::parse();
+    builder.build(config).await?.run().await
 }
 
 async fn run_test(manager: EventManager) -> Result<(), anyhow::Error> {

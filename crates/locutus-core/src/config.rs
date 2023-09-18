@@ -16,11 +16,12 @@ use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
+use crate::DynError;
+
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
 
-pub(crate) static CONFIG: Lazy<Config> =
-    Lazy::new(|| Config::load_conf().expect("Failed to load configuration"));
+static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Initialize the executor once.
@@ -153,8 +154,12 @@ impl ConfigPaths {
 }
 
 impl Config {
-    pub fn get_conf() -> &'static Config {
-        &CONFIG
+    pub fn set_from_cli() -> Result<(), DynError> {
+        todo!()
+    }
+
+    pub fn get_static_conf() -> &'static Config {
+        CONFIG.get_or_init(|| Config::load_conf().expect("Failed to load configuration"))
     }
 
     fn load_conf() -> std::io::Result<Config> {

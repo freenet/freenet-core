@@ -59,6 +59,27 @@ pub struct ClientError {
 }
 
 impl ClientError {
+    pub fn into_fbs_bytes(self) -> Result<Vec<u8>, Box<ClientError>> {
+        use crate::host_response_generated::host_response::{Error, ErrorArgs};
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let msg_offset = builder.create_string(&self.to_string());
+        let err_offset = Error::create(
+            &mut builder,
+            &ErrorArgs {
+                msg: Some(msg_offset),
+            },
+        );
+        let host_response_offset = FbsHostResponse::create(
+            &mut builder,
+            &HostResponseArgs {
+                response_type: HostResponseType::Ok,
+                response: Some(err_offset.as_union_value()),
+            },
+        );
+        finish_host_response_buffer(&mut builder, host_response_offset);
+        Ok(builder.finished_data().to_vec())
+    }
+
     pub fn kind(&self) -> ErrorKind {
         self.kind.clone()
     }
@@ -1342,8 +1363,7 @@ mod client_request_test {
     use crate::client_request_generated::client_request::root_as_client_request;
     use crate::contract_interface::UpdateData;
 
-    const EXPECTED_ENCODED_CONTRACT_ID: &'static str =
-        "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
+    const EXPECTED_ENCODED_CONTRACT_ID: &str = "6kVs66bKaQAC6ohr8b43SvJ95r36tc2hnG7HezmaJHF9";
 
     #[test]
     fn test_build_contract_put_op_from_fbs() -> Result<(), Box<dyn std::error::Error>> {
@@ -1408,7 +1428,7 @@ mod client_request_test {
                 fetch_contract,
             } => {
                 assert_eq!(key.encoded_contract_id(), EXPECTED_ENCODED_CONTRACT_ID);
-                assert_eq!(fetch_contract, false);
+                assert!(!fetch_contract);
             }
             _ => panic!("wrong contract request type"),
         }

@@ -207,7 +207,7 @@ impl DelegateKey {
         let params = params.as_ref();
         let wasm_code = wasm_code.as_ref();
         let key = generate_id(params, wasm_code);
-        let code_hash = wasm_code.hash().clone();
+        let code_hash = *wasm_code.hash();
         Self { key, code_hash }
     }
 
@@ -267,7 +267,7 @@ where
         let key = generate_id(parameters, code_data);
         Self {
             key,
-            code_hash: code_data.hash().clone(),
+            code_hash: *code_data.hash(),
         }
     }
 }

@@ -20,7 +20,7 @@ use crate::{
     contract::MemoryContractHandler,
     node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
-    NodeConfig, WrappedState,
+    NodeBuilder, WrappedState,
 };
 
 use super::PeerKey;
@@ -78,7 +78,7 @@ struct GatewayConfig {
 }
 
 impl SimNetwork {
-    pub fn new(
+    pub async fn new(
         gateways: usize,
         nodes: usize,
         ring_max_htl: usize,
@@ -101,7 +101,7 @@ impl SimNetwork {
             min_connections,
         };
         net.build_gateways(gateways);
-        net.build_nodes(nodes);
+        net.build_nodes(nodes).await;
         net
     }
 
@@ -116,7 +116,7 @@ impl SimNetwork {
             let port = get_free_port().unwrap();
             let location = Location::random();
 
-            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new(
+            let mut config = NodeBuilder::new([Box::new(MemoryEventsGen::new(
                 self.receiver_ch.clone(),
                 PeerKey::from(id),
             ))]);
@@ -171,7 +171,7 @@ impl SimNetwork {
     }
 
     #[instrument(skip(self))]
-    fn build_nodes(&mut self, num: usize) {
+    async fn build_nodes(&mut self, num: usize) {
         let gateways: Vec<_> = self
             .gateways
             .iter()
@@ -184,7 +184,7 @@ impl SimNetwork {
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().to_peer_id();
 
-            let mut config = NodeConfig::new([Box::new(MemoryEventsGen::new(
+            let mut config = NodeBuilder::new([Box::new(MemoryEventsGen::new(
                 self.receiver_ch.clone(),
                 PeerKey::from(id),
             ))]);
@@ -210,7 +210,9 @@ impl SimNetwork {
             let node = NodeInMemory::build::<MemoryContractHandler>(
                 config,
                 Some(Box::new(self.event_listener.clone())),
+                (),
             )
+            .await
             .unwrap();
             self.nodes.push((node, label));
         }

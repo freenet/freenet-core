@@ -1,20 +1,20 @@
-use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError, Parameters};
+use locutus_runtime::{prelude::ContractKey, ContractError as ContractRtError};
 
+mod executor;
 mod handler;
-pub mod storages;
-mod test;
-
 #[cfg(test)]
-pub(crate) use handler::test::TestContractHandler;
+mod in_memory;
+pub mod storages;
+
 pub(crate) use handler::{
     contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, StoreResponse,
+    ContractHandlerEvent, NetworkContractHandler, StoreResponse,
 };
 #[cfg(test)]
-pub(crate) use test::MemoryContractHandler;
-pub(crate) use test::MockRuntime;
+pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
 
-use crate::DynError;
+use executor::ContractExecutor;
+pub use executor::{Executor, ExecutorError, OperationMode};
 
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
@@ -25,45 +25,48 @@ where
         match res {
             (
                 _id,
-                ContractHandlerEvent::FetchQuery {
+                ContractHandlerEvent::GetQuery {
                     key,
                     fetch_contract,
                 },
             ) => {
-                let _contract = if fetch_contract {
-                    let params = Parameters::from(vec![]); // FIXME
-                    contract_handler
-                        .contract_store()
-                        .fetch_contract(&key, &params)
-                } else {
-                    None
-                };
-                let _contract = if fetch_contract {
-                    let params = Parameters::from(vec![]); // FIXME
-                    contract_handler
-                        .contract_store()
-                        .fetch_contract(&key, &params)
-                } else {
-                    None
-                };
-                todo!("get state from state store");
-                // let response = Ok(StoreResponse {
-                //     state: None,
-                //     contract: _contract,
-                // });
-                // contract_handler
-                //     .channel()
-                //     .send_to_listener(
-                //         _id,
-                //         ContractHandlerEvent::FetchResponse {
-                //             key,
-                //             response: _response,
-                //         },
-                //     )
-                //     .await?;
+                match contract_handler
+                    .executor()
+                    .fetch_contract(key.clone(), fetch_contract)
+                    .await
+                {
+                    Ok((state, contract)) => {
+                        contract_handler
+                            .channel()
+                            .send_to_listener(
+                                _id,
+                                ContractHandlerEvent::GetResponse {
+                                    key,
+                                    response: Ok(StoreResponse {
+                                        state: Some(state),
+                                        contract,
+                                    }),
+                                },
+                            )
+                            .await?;
+                    }
+                    Err(err) => {
+                        tracing::warn!("error while executing get contract query: {err}");
+                        contract_handler
+                            .channel()
+                            .send_to_listener(
+                                _id,
+                                ContractHandlerEvent::GetResponse {
+                                    key,
+                                    response: Err(err.into()),
+                                },
+                            )
+                            .await?;
+                    }
+                }
             }
             (id, ContractHandlerEvent::Cache(contract)) => {
-                match contract_handler.contract_store().store_contract(contract) {
+                match contract_handler.executor().store_contract(contract).await {
                     Ok(_) => {
                         contract_handler
                             .channel()
@@ -81,7 +84,7 @@ where
             }
             (
                 _id,
-                ContractHandlerEvent::PushQuery {
+                ContractHandlerEvent::PutQuery {
                     key: _key,
                     state: _state,
                 },
@@ -124,6 +127,4 @@ pub(crate) enum ContractError {
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]
     NoEvHandlerResponse,
-    #[error("failed while storing a contract")]
-    StorageError(DynError),
 }

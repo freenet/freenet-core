@@ -183,11 +183,11 @@ where
 
                         return_msg = None;
                         new_state = None;
-                    } else if let ContractHandlerEvent::FetchResponse {
+                    } else if let ContractHandlerEvent::GetResponse {
                         response: value,
                         key: returned_key,
                     } = op_storage
-                        .notify_contract_handler(ContractHandlerEvent::FetchQuery {
+                        .notify_contract_handler(ContractHandlerEvent::GetQuery {
                             key: key.clone(),
                             fetch_contract,
                         })
@@ -372,7 +372,7 @@ where
                     }
 
                     op_storage
-                        .notify_contract_handler(ContractHandlerEvent::PushQuery {
+                        .notify_contract_handler(ContractHandlerEvent::PutQuery {
                             key: key.clone(),
                             state: value.clone(),
                         })
@@ -671,7 +671,7 @@ mod test {
 
     use super::*;
     use crate::{
-        node::test::{check_connectivity, NodeSpecification, SimNetwork},
+        node::tests::{check_connectivity, NodeSpecification, SimNetwork},
         WrappedContract, WrappedState,
     };
 
@@ -714,7 +714,7 @@ mod test {
         ]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
@@ -753,7 +753,7 @@ mod test {
         let get_specs = HashMap::from_iter([("node-1".to_string(), node_1)]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
@@ -814,7 +814,7 @@ mod test {
         ]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 3);
+        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 3).await;
         sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 

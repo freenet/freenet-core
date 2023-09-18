@@ -1,11 +1,6 @@
-use std::{collections::HashMap, str::FromStr};
+use std::str::FromStr;
 
-use futures::{future::BoxFuture, FutureExt};
-use locutus_runtime::{
-    ContractContainer, ContractError, ContractExecError, ContractRuntimeInterface, ContractStore,
-    Parameters, StateStorage, StateStore, StateStoreError, ValidateResult,
-};
-use locutus_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
+use locutus_runtime::{ContractError, Parameters, StateStorage, StateStoreError};
 use once_cell::sync::Lazy;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteRow},
@@ -13,18 +8,17 @@ use sqlx::{
 };
 
 use crate::contract::ContractKey;
-use crate::DynError;
-use crate::{config::CONFIG, contract::test::MockRuntime, WrappedState};
-
-use super::super::handler::{CHListenerHalve, MAX_MEM_CACHE};
-use super::super::{ContractHandler, ContractHandlerChannel};
+use crate::{config::Config, WrappedState};
 
 // Is fine to clone this as it wraps by an Arc.
 static POOL: Lazy<SqlitePool> = Lazy::new(|| {
     let opts = if cfg!(test) {
         SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
     } else {
-        let conn_str = CONFIG.config_paths.db_dir.join("locutus.db");
+        let conn_str = Config::get_static_conf()
+            .config_paths
+            .db_dir
+            .join("locutus.db");
         tracing::info!("loading contract store from {conn_str:?}");
         SqliteConnectOptions::new()
             .create_if_missing(true)
@@ -148,171 +142,25 @@ pub enum SqlDbError {
     StateStore(#[from] StateStoreError),
 }
 
-pub struct SQLiteContractHandler<R> {
-    channel: ContractHandlerChannel<CHListenerHalve>,
-    store: ContractStore,
-    runtime: R,
-    state_store: StateStore<Pool>,
-    params: HashMap<ContractKey, Parameters<'static>>,
-}
-
-impl<R> SQLiteContractHandler<R>
-where
-    R: ContractRuntimeInterface + 'static,
-{
-    /// number of max bytes allowed to be stored in the cache
-    const MEM_SIZE: u32 = 10_000_000;
-
-    async fn new(
-        channel: ContractHandlerChannel<CHListenerHalve>,
-        store: ContractStore,
-        runtime: R,
-    ) -> Result<Self, SqlDbError> {
-        Ok(SQLiteContractHandler {
-            channel,
-            store,
-            runtime,
-            state_store: StateStore::new(Pool::new().await?, Self::MEM_SIZE)?,
-            params: HashMap::default(),
-        })
-    }
-
-    async fn get_contract(
-        &self,
-        key: &ContractKey,
-        fetch_contract: bool,
-    ) -> Result<(WrappedState, Option<ContractContainer>), SqlDbError> {
-        let state = self.state_store.get(key).await?;
-        let contract = fetch_contract
-            .then(|| {
-                let params = self.params.get(key).ok_or(SqlDbError::ContractNotFound)?;
-                self.store
-                    .fetch_contract(key, params)
-                    .ok_or(SqlDbError::ContractNotFound)
-            })
-            .transpose()?;
-        Ok((state, contract))
-    }
-}
-
-impl From<ContractHandlerChannel<CHListenerHalve>> for SQLiteContractHandler<MockRuntime> {
-    fn from(channel: ContractHandlerChannel<CHListenerHalve>) -> Self {
-        let store =
-            ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
-        let runtime = MockRuntime {};
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current()
-                .block_on(SQLiteContractHandler::new(channel, store, runtime))
-        })
-        .expect("handler initialization")
-    }
-}
-
-impl<R> ContractHandler for SQLiteContractHandler<R>
-where
-    R: ContractRuntimeInterface + Send + Sync + 'static,
-    Self: From<ContractHandlerChannel<CHListenerHalve>>,
-{
-    type Store = Pool;
-
-    #[inline(always)]
-    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
-        &mut self.channel
-    }
-
-    #[inline(always)]
-    fn contract_store(&mut self) -> &mut ContractStore {
-        &mut self.store
-    }
-
-    fn handle_request<'a, 's: 'a>(
-        &'s mut self,
-        req: ClientRequest<'a>,
-    ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
-        async move {
-            match req {
-                ClientRequest::ContractOp(ops) => match ops {
-                    ContractRequest::Get {
-                        key,
-                        fetch_contract,
-                    } => {
-                        let (state, contract) = self.get_contract(&key, fetch_contract).await?;
-                        Ok(ContractResponse::GetResponse {
-                            key,
-                            contract,
-                            state,
-                        }
-                        .into())
-                    }
-                    ContractRequest::Put {
-                        contract,
-                        state,
-                        related_contracts,
-                    } => {
-                        let key = contract.key();
-                        let params = contract.params();
-                        match self.get_contract(&key, false).await {
-                            Ok((_old_state, _)) => {
-                                return Err(
-                                    ContractError::from(ContractExecError::DoublePut(key)).into()
-                                )
-                            }
-                            Err(SqlDbError::ContractNotFound) => {}
-                            Err(other) => return Err(other.into()),
-                        }
-
-                        let result = self.runtime.validate_state(
-                            &key,
-                            &params,
-                            &state,
-                            &related_contracts,
-                        )?;
-                        // FIXME: should deal with additional related contracts requested
-                        if result != ValidateResult::Valid {
-                            todo!("return error");
-                        }
-                        self.state_store
-                            .store(key, state, params.into_owned())
-                            .await?;
-                        todo!()
-                    }
-                    _ => {
-                        tracing::error!("op not supported");
-                        Err("op not supported".into())
-                    }
-                },
-                _ => {
-                    tracing::error!("op not supported");
-                    Err("op not supported".into())
-                }
-            }
-        }
-        .boxed()
-    }
-
-    fn state_store(&mut self) -> &mut StateStore<Self::Store> {
-        &mut self.state_store
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
 
-    use crate::contract::contract_handler_channel;
-    use crate::WrappedContract;
-    use locutus_runtime::{ContractWasmAPIVersion, StateDelta};
+    use crate::contract::{
+        contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
+    };
+    use crate::{ClientId, DynError, WrappedContract};
+    use locutus_runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
+    use locutus_stdlib::client_api::ContractRequest;
     use locutus_stdlib::prelude::ContractCode;
 
-    use super::SQLiteContractHandler;
     use super::*;
 
     // Prepare and get handler for an in-memory sqlite db
-    async fn get_handler() -> Result<SQLiteContractHandler<MockRuntime>, SqlDbError> {
+    async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {
         let (_, ch_handler) = contract_handler_channel();
-        let store: ContractStore =
-            ContractStore::new(CONFIG.config_paths.contracts_dir.clone(), MAX_MEM_CACHE).unwrap();
-        SQLiteContractHandler::new(ch_handler, store, MockRuntime {}).await
+        let handler = NetworkContractHandler::build(ch_handler, ()).await?;
+        Ok(handler)
     }
 
     #[ignore]
@@ -322,7 +170,7 @@ mod test {
         let mut handler = get_handler().await?;
 
         // Generate a contract
-        let contract_bytes = b"Test contract value".to_vec();
+        let contract_bytes = b"test contract value".to_vec();
         let contract: ContractContainer =
             ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
                 Arc::new(ContractCode::from(contract_bytes.clone())),
@@ -339,6 +187,8 @@ mod test {
                     related_contracts: Default::default(),
                 }
                 .into(),
+                ClientId::FIRST,
+                None,
             )
             .await?
             .unwrap_put();
@@ -349,6 +199,8 @@ mod test {
                     fetch_contract: false,
                 }
                 .into(),
+                ClientId::FIRST,
+                None,
             )
             .await?
             .unwrap_get();
@@ -363,6 +215,8 @@ mod test {
                     data: delta.into(),
                 }
                 .into(),
+                ClientId::FIRST,
+                None,
             )
             .await?;
         // let (new_get_result_value, _) = handler

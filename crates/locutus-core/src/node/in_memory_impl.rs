@@ -18,7 +18,7 @@ use crate::{
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
     util::IterExt,
-    NodeConfig, WrappedState,
+    NodeBuilder, WrappedState,
 };
 
 pub(super) struct NodeInMemory {
@@ -33,23 +33,26 @@ pub(super) struct NodeInMemory {
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub fn build<CH>(
-        config: NodeConfig<1>,
+    pub async fn build<CH>(
+        builder: NodeBuilder<1>,
         event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
+        ch_builder: CH::Builder,
     ) -> Result<NodeInMemory, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
     {
-        let peer_key = PeerKey::from(config.local_key.public());
+        let peer_key = PeerKey::from(builder.local_key.public());
         let conn_manager = MemoryConnManager::new(peer_key);
-        let gateways = config.get_gateways()?;
-        let is_gateway = config.local_ip.zip(config.local_port).is_some();
+        let gateways = builder.get_gateways()?;
+        let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
 
-        let ring = Ring::new(&config, &gateways)?;
+        let ring = Ring::new(&builder, &gateways)?;
         let (notification_tx, notification_channel) = mpsc::channel(100);
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
-        let contract_handler = CH::from(ch_channel);
+        let contract_handler = CH::build(ch_channel, ch_builder)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
@@ -97,7 +100,7 @@ impl NodeInMemory {
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                 .await?;
             self.op_storage
-                .notify_contract_handler(ContractHandlerEvent::PushQuery {
+                .notify_contract_handler(ContractHandlerEvent::PutQuery {
                     key: key.clone(),
                     state,
                 })

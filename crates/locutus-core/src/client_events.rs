@@ -3,6 +3,7 @@ use locutus_stdlib::client_api::ClientRequest;
 use locutus_stdlib::client_api::{ClientError, HostResponse};
 use std::fmt::Debug;
 use std::fmt::Display;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ pub type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
-pub struct ClientId(pub(crate) usize);
+pub struct ClientId(usize);
 
 impl From<ClientId> for usize {
     fn from(val: ClientId) -> Self {
@@ -25,11 +26,18 @@ impl From<ClientId> for usize {
     }
 }
 
+static CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
+
 impl ClientId {
     pub const FIRST: Self = ClientId(0);
 
-    pub fn new(id: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) const fn new(id: usize) -> ClientId {
         Self(id)
+    }
+
+    pub fn next() -> Self {
+        ClientId(CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -148,7 +156,7 @@ pub(crate) mod test {
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
-    use crate::node::{test::EventId, PeerKey};
+    use crate::node::{tests::EventId, PeerKey};
     use crate::{WrappedContract, WrappedState};
 
     use super::*;
