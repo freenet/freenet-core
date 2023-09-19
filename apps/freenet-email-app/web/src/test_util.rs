@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use locutus_aft_interface::{Tier, TokenAssignment};
-use locutus_stdlib::prelude::ContractInstanceId;
+use freenet_aft_interface::{Tier, TokenAssignment};
+use freenet_stdlib::prelude::ContractInstanceId;
 use rand_chacha::rand_core::OsRng;
 use rsa::RsaPrivateKey;
 

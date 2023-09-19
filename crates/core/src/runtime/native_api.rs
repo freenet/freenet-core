@@ -26,8 +26,8 @@ pub(crate) mod time {
     pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
         let utc_now = Function::new_typed(store, utc_now);
         imports.register_namespace(
-            "locutus_time",
-            [("__loc__time__utc_now".to_owned(), utc_now.into())],
+            "freenet_time",
+            [("__frnt__time__utc_now".to_owned(), utc_now.into())],
         );
     }
 
@@ -53,8 +53,8 @@ pub(crate) mod log {
     pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {
         let utc_now = Function::new_typed(store, info);
         imports.register_namespace(
-            "locutus_logger",
-            [("__loc__logger__info".to_owned(), utc_now.into())],
+            "freenet_logger",
+            [("__frnt__logger__info".to_owned(), utc_now.into())],
         );
     }
 

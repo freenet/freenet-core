@@ -1,17 +1,17 @@
 [package]
-name = "locutus-token-allocation-record"
+name = "freenet-token-allocation-record"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 bincode = { workspace = true }
 chrono = { workspace = true }
-locutus-stdlib = { workspace = true, features = ["contract"] }
+freenet-stdlib = { workspace = true, features = ["contract"] }
 rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-locutus-aft-interface = { path = "../../interfaces" }
+freenet-aft-interface = { path = "../../interfaces" }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

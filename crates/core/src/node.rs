@@ -57,7 +57,7 @@ pub struct NodeConfig {
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]
     pub mode: OperationMode,
-    /// Overrides the default data directory where Locutus contract files are stored.
+    /// Overrides the default data directory where Freenet contract files are stored.
     pub node_data_dir: Option<PathBuf>,
 
     /// Address to bind to

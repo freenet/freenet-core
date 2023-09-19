@@ -15,7 +15,7 @@ routing](https://en.wikipedia.org/wiki/Small-world_routing#Greedy_routing).
 Freenet uses [isotonic regression](https://github.com/sanity/pav.rs), a method
 for estimating a monotonically increasing or decreasing function given a set of
 data, to predict the response time from a peer based on its ring distance from
-the target location of the request. 
+the target location of the request.
 
 This estimation is then adjusted by the average difference between the isotonic
 regression estimate and the actual response time from previous interactions with
@@ -25,7 +25,7 @@ with the lowest estimated response time.
 ### Router Initialization and Event Handling
 
 When a new
-[Router](https://github.com/freenet/locutus/blob/main/crates/locutus-core/src/router.rs)
+[Router](https://github.com/freenet/freenet-core/blob/main/crates/core/src/router.rs)
 is created, it's initialized with a history of routing events. These events are
 processed to generate the initial state of the isotonic estimators. For example,
 failure outcomes and success durations are computed for each event in the

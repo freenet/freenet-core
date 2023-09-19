@@ -76,7 +76,7 @@ pub struct UpdateConfig {
 #[derive(clap::Parser, Clone)]
 pub struct PutConfig {
     /// A path to the compiled WASM code file. This must be a valid packaged contract or component,
-    /// (built using the `ldt` tool). Not an arbitrary WASM file.
+    /// (built using the `fdev` tool). Not an arbitrary WASM file.
     #[arg(long)]
     pub(crate) code: PathBuf,
     /// A path to the file parameters for the contract/delegate. If not specified, will be published

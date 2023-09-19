@@ -6,8 +6,8 @@ Make sure docker is installed and working, and has the `docker compose` command.
 
 ## Contract DB Storage
 
-The docker image stores its data at `/root/.local/share/locutus` inside the
-container. This is mapped to `/tmp/locutus-docker` outside the container.
+The docker image stores its data at `/root/.local/share/freenet` inside the
+container. This is mapped to `/tmp/freenet-docker` outside the container.
 
 ## Build the base docker image of Locutus
 
@@ -15,7 +15,7 @@ All the docker related files are in the `docker` subdirectory.
 
 Requires that Docker be installed and working. Then, in the root directory of the repo:
 
-To build the docker locutus container:
+To build the docker freenet container:
 
 ```sh
 cd docker
@@ -31,16 +31,16 @@ Make sure the node is stopped and re-started after new contracts are added.
 docker compose up
 ```
 
-## Running the `ldt` tool from the docker image
+## Running the `fdev` tool from the docker image
 
-There is a shell script in the `docker` sub directory which makes running `ldt`
+There is a shell script in the `docker` sub directory which makes running `fdev`
 from inside the container against source held outside the container easier. It
-behaves just like the `ldt` tool, except as stated below.
+behaves just like the `fdev` tool, except as stated below.
 
-### Getting help from `ldt`
+### Getting help from `fdev`
 
 ```sh
-/location/of/locutus/docker/ldt.sh --help
+/location/of/freenet/docker/fdev.sh --help
 ```
 
 ### Building Contracts
@@ -56,7 +56,7 @@ To BUILD a contract, we need to define 1 or 2 env vars:
 eg (in the root of the project):
 
 ```sh
-CONTRACT_SRC_DIR=./web /location/of/locutus/docker/ldt.sh build
+CONTRACT_SRC_DIR=./web /location/of/freenet/docker/fdev.sh build
 ```
 
 ### Publishing Contracts
@@ -64,5 +64,5 @@ CONTRACT_SRC_DIR=./web /location/of/locutus/docker/ldt.sh build
 From the base directory of the contract project.
 
 ```sh
-/location/of/locutus/docker/ldt.sh publish --code target/wasm32-unknown-unknown/release/freenet_microblogging_web.wasm --state web/build/locutus/contract-state
+/location/of/freenet/docker/fdev.sh publish --code target/wasm32-unknown-unknown/release/freenet_microblogging_web.wasm --state web/build/freenet/contract-state
 ```

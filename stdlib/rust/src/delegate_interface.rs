@@ -429,7 +429,7 @@ impl AsRef<[u8]> for DelegateContext {
 pub enum InboundDelegateMsg<'a> {
     ApplicationMessage(ApplicationMessage),
     GetSecretResponse(GetSecretResponse),
-    // todo: remove this and replace by native locutus_stdlib contract api calls
+    // todo: remove this and replace by native freenet_stdlib contract api calls
     RandomBytes(Vec<u8>),
     UserResponse(#[serde(borrow)] UserInputResponse<'a>),
     GetSecretRequest(GetSecretRequest),

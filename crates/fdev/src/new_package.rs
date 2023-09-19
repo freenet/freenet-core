@@ -44,7 +44,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
         state: None,
     };
     let serialized = toml::to_string(&locutus_file_config)?.into_bytes();
-    let path = cwd.join("locutus").with_extension("toml");
+    let path = cwd.join("freenet").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
     Ok(())
@@ -62,7 +62,7 @@ fn create_regular_contract(cwd: &Path) -> Result<(), DynError> {
         state: None,
     };
     let serialized = toml::to_string(&locutus_file_config)?.into_bytes();
-    let path = cwd.join("locutus").with_extension("toml");
+    let path = cwd.join("freenet").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
     Ok(())
@@ -100,7 +100,7 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
 
     // add the stdlib dependency
     let child = Command::new("cargo")
-        .args(["add", "locutus-stdlib"])
+        .args(["add", "freenet-stdlib"])
         .current_dir(&dest_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -153,7 +153,7 @@ fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
         })?;
     pipe_std_streams(child)?;
     // todo: change pacakge.json:
-    // - include dependencies: locutus-stdlib
+    // - include dependencies: freenet-stdlib
 
     let child = Command::new(TSC)
         .args(["--init", "--pretty"])

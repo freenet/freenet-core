@@ -205,7 +205,7 @@ mod test {
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
         let cdelegate_dir = std::env::temp_dir()
-            .join("locutus-test")
+            .join("freenet-test")
             .join("delegates-store-test");
         std::fs::create_dir_all(&cdelegate_dir)?;
         let mut store = DelegateStore::new(cdelegate_dir, 10_000)?;

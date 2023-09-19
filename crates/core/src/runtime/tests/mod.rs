@@ -16,7 +16,7 @@ mod time;
 static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn test_dir(prefix: &str) -> PathBuf {
-    let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
+    let test_dir = std::env::temp_dir().join("freenet-test").join(format!(
         "{prefix}-test-{}",
         TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));

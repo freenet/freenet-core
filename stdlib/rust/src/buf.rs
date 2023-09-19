@@ -345,7 +345,7 @@ mod test {
 
     const TEST_MODULE: &str = r#"
         (module
-            (func $initiate_buffer (import "locutus" "initiate_buffer") (param i32) (result i64))
+            (func $initiate_buffer (import "freenet" "initiate_buffer") (param i32) (result i64))
             (memory $locutus_mem (export "memory") 20)
             (export "initiate_buffer" (func $initiate_buffer))
         )"#;
@@ -357,7 +357,7 @@ mod test {
 
         let init_buf_fn = Function::new_typed(&mut store, initiate_buffer);
         let imports = imports! {
-            "locutus" => { "initiate_buffer" => init_buf_fn }
+            "freenet" => { "initiate_buffer" => init_buf_fn }
         };
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         Ok((store, instance))

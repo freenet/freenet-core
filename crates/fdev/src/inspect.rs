@@ -4,7 +4,7 @@ use freenet_stdlib::prelude::{ContractCode, DelegateCode};
 
 use crate::{DynError, Error};
 
-/// Inspect a contract, delegate or locutus kernel compatible executable code properties.
+/// Inspect a contract, delegate or freenet kernel compatible executable code properties.
 #[derive(clap::Parser, Clone)]
 pub struct InspectCliConfig {
     #[clap(subcommand)]

@@ -9,14 +9,14 @@
 
 ## Interface
 
-Locutus contracts must implement the contract interface from [crates/locutus-stdlib/src/contract_interface.rs](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/contract_interface.rs):
+Locutus contracts must implement the contract interface from [stdlib/rust/src/contract_interface.rs](https://github.com/freenet/freenet-core/blob/main/stdlib/rust/src/contract_interface.rs):
 
 ```rust,no_run,noplayground
-{{#include ../../crates/locutus-stdlib/src/contract_interface.rs:contractifce}}
+{{#include ../../stdlib/rust/src/contract_interface.rs:contractifce}}
 ```
 
 `Parameters`, `State`, and `StateDelta` are all wrappers around simple `[u8]` byte arrays for maximum efficiency and flexibility.
 
 ## Contract Interaction
 
-In the (hopefully) near future we'll be adding the ability for contracts to read each other's state while validating and updating their own, see [issue #167](https://github.com/freenet/locutus/issues/167) for the latest on this.
+In the (hopefully) near future we'll be adding the ability for contracts to read each other's state while validating and updating their own, see [issue #167](https://github.com/freenet/freenet-core/issues/167) for the latest on this.

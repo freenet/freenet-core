@@ -12,12 +12,12 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 
-        let path = std::env::temp_dir().join("locutus");
+        let path = std::env::temp_dir().join("freenet");
         tracing::info!("Removing content stored at {path:?}");
 
         let rm = std::process::Command::new("rm")
             .arg("-rf")
-            .arg(path.to_str().expect("correct path to locutus tmp"))
+            .arg(path.to_str().expect("correct path to freenet tmp"))
             .spawn();
 
         if rm.is_ok() {

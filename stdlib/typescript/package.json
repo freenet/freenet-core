@@ -28,10 +28,10 @@
     "flatc-schemas": "bash -c \"flatc --ts --gen-object-api -o ./src ../../schemas/flatbuffers/*\""
   },
   "license": "MIT+APACHE-2.0",
-  "homepage": "https://github.com/freenet/locutus",
+  "homepage": "https://github.com/freenet/freenet-core",
   "repository": {
     "type": "git",
-    "url": "https://github.com/freenet/locutus.git"
+    "url": "https://github.com/freenet/freenet-core.git"
   },
   "author": {
     "name": "The Freenet Foundation Inc."

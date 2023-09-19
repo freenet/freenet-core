@@ -6,7 +6,7 @@ rust-version = "1.71.1"
 publish = true
 description = "Freeenet standard library"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/freenet/locutus"
+repository = "https://github.com/freenet/freenet-core"
 
 [dependencies]
 arbitrary = { version = "1", optional = true, features = ["derive"] }

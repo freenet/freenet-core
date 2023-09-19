@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
 const PRIVATE_KEY: [u8; 3] = [1, 2, 3];

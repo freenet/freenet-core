@@ -48,19 +48,10 @@ impl WebApi {
                 let response: HostResult = match bincode::deserialize(&bytes) {
                     Ok(val) => val,
                     Err(err) => {
-                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({})));
-                        if let Ok(untyped) = rmpv::decode::read_value(&mut &*bytes) {
-                            eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
-                                "error": format!("{err}"),
-                                "source": "host response deserialization",
-                                "json": format!("{untyped}")
-                            })));
-                        } else {
-                            eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
-                                "error": format!("{err}"),
-                                "source": "host response deserialization"
-                            })));
-                        }
+                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
+                            "error": format!("{err}"),
+                            "source": "host response deserialization"
+                        })));
                         return;
                     }
                 };

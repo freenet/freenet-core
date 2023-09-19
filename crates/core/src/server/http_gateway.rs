@@ -29,7 +29,7 @@ impl HttpGateway {
             IpAddr::V6(ip) if ip.is_loopback() => true,
             _ => false,
         };
-        let contract_web_path = std::env::temp_dir().join("locutus").join("webs");
+        let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
         std::fs::create_dir_all(contract_web_path).unwrap();
 
         let config = Config { localhost };

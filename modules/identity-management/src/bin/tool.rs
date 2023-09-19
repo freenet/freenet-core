@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
+use freenet_stdlib::prelude::Parameters;
 use identity_management::IdentityParams;
-use locutus_stdlib::prelude::Parameters;
 use p384::SecretKey;
 
 const HELP: &str = r#"

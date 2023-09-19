@@ -199,7 +199,7 @@ async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiErro
 
 fn contract_web_path(key: &ContractKey) -> PathBuf {
     std::env::temp_dir()
-        .join("locutus")
+        .join("freenet")
         .join("webs")
         .join(key.encoded_contract_id())
         .join("web")
@@ -226,13 +226,13 @@ fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>>
 fn get_path() {
     let req_path = "/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/state.html";
     let base_dir =
-        PathBuf::from("/tmp/locutus/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/");
+        PathBuf::from("/tmp/freenet/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/");
     let uri: axum::http::Uri = req_path.parse().unwrap();
     let parsed = get_file_path(uri).unwrap();
     let result = base_dir.join(parsed);
     assert_eq!(
         std::path::PathBuf::from(
-            "/tmp/locutus/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/state.html"
+            "/tmp/freenet/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/state.html"
         ),
         result
     );

@@ -12,7 +12,7 @@ impl RocksDb {
         let path = Config::get_static_conf()
             .config_paths
             .db_dir
-            .join("locutus.db");
+            .join("freenet.db");
         tracing::info!("loading contract store from {path:?}");
 
         let mut opts = Options::default();

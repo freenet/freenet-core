@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 
 use chrono::{DateTime, Utc};
-use locutus_aft_interface::{
+use freenet_aft_interface::{
     InvalidReason as TokenInvalidReason, Tier, TokenAllocationRecord, TokenAssignment,
     TokenAssignmentHash,
 };
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 use rsa::{
     pkcs1v15::{SigningKey, VerifyingKey},
     sha2::Sha256,
@@ -198,7 +198,8 @@ impl Inbox {
         let mut some_missing = false;
         let mut missing = vec![];
         for message in &self.messages {
-            let Some(records) = allocation_records.get(&message.token_assignment.token_record) else {
+            let Some(records) = allocation_records.get(&message.token_assignment.token_record)
+            else {
                 missing.push(message.token_assignment.token_record);
                 some_missing = true;
                 continue;
@@ -240,7 +241,7 @@ impl Inbox {
                                 .unwrap()
                                 .split_whitespace()
                                 .collect::<String>();
-                            // locutus_stdlib::log::info(&format!("veryifying key inbox: `{pk}`"));
+                            // freenet_stdlib::log::info(&format!("veryifying key inbox: `{pk}`"));
                         }
                         _ => {}
                     }
@@ -463,7 +464,7 @@ impl ContractInterface for Inbox {
                 .map_err(|err| ContractError::Other(format!("{err}")))?;
             inbox.remove_messages(rm_messages);
             // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
-            //inbox.last_update = locutus_stdlib::time::now();
+            //inbox.last_update = freenet_stdlib::time::now();
             let serialized = inbox.serialize()?;
             Ok(UpdateModification::valid(serialized.into()))
         } else {
@@ -509,7 +510,7 @@ mod tests {
         .map_err(|e| format!("{e}"))
         .unwrap();
 
-        use locutus_stdlib::prelude::blake3::traits::digest::Digest;
+        use freenet_stdlib::prelude::blake3::traits::digest::Digest;
         let digest = Sha256::digest(STATE_UPDATE).to_vec();
         let signature = private_key
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SubsecRound, Timelike, Utc};
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 use rsa::{
     pkcs1v15::{Signature, VerifyingKey},
     sha2::Sha256,
@@ -525,8 +525,12 @@ impl TokenAllocationRecord {
     }
 
     pub fn assignment_exists(&self, record: &TokenAssignment) -> bool {
-        let Some(assignments) = self.tokens_by_tier.get(&record.tier) else { return false };
-        let Ok(_idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else { return false };
+        let Some(assignments) = self.tokens_by_tier.get(&record.tier) else {
+            return false;
+        };
+        let Ok(_idx) = assignments.binary_search_by(|t| t.time_slot.cmp(&record.time_slot)) else {
+            return false;
+        };
         true
     }
 
@@ -725,7 +729,7 @@ impl TokenAssignment {
             // not signed by the private key of this generator
             #[cfg(target_family = "wasm")]
             {
-                locutus_stdlib::log::info(&format!(
+                freenet_stdlib::log::info(&format!(
                     "failed verification of message `{msg:?}` with signature: `{sig}`",
                     sig = self.signature
                 ));

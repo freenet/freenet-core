@@ -231,7 +231,7 @@ mod test {
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
         let secrets_dir = std::env::temp_dir()
-            .join("locutus-test")
+            .join("freenet-test")
             .join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 

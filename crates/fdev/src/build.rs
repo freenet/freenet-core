@@ -114,7 +114,7 @@ fn get_out_lib(
 }
 
 fn get_default_ouput_dir(cwd: &Path) -> std::io::Result<PathBuf> {
-    let output = cwd.join("build").join("locutus");
+    let output = cwd.join("build").join("freenet");
     fs::create_dir_all(&output)?;
     Ok(output)
 }
@@ -413,13 +413,13 @@ mod contract {
     }
 
     fn get_config(cwd: &Path) -> Result<BuildToolConfig, DynError> {
-        let config_file = cwd.join("locutus.toml");
+        let config_file = cwd.join("freenet.toml");
         if config_file.exists() {
             let mut f_content = vec![];
             File::open(config_file)?.read_to_end(&mut f_content)?;
             Ok(toml::from_str(std::str::from_utf8(&f_content)?)?)
         } else {
-            Err("could not locate `locutus.toml` config file in current dir".into())
+            Err("could not locate `freenet.toml` config file in current dir".into())
         }
     }
 
@@ -592,12 +592,12 @@ mod contract {
             build_web_state(&config, EmbeddedDeps::default(), &cwd)?;
 
             let mut buf = vec![];
-            File::open(cwd.join("build").join("locutus").join(DEFAULT_OUTPUT_NAME))?
+            File::open(cwd.join("build").join("freenet").join(DEFAULT_OUTPUT_NAME))?
                 .read_to_end(&mut buf)?;
             let state = freenet_stdlib::prelude::State::from(buf);
             let mut web = WebApp::try_from(state.as_ref()).unwrap();
 
-            let target = env::temp_dir().join("locutus-unpack-state");
+            let target = env::temp_dir().join("freenet-unpack-state");
             let e = web.unpack(&target);
             let unpacked_successfully = target.join("index.html").exists();
 
@@ -638,7 +638,7 @@ mod contract {
 
             assert!(cwd
                 .join("build")
-                .join("locutus")
+                .join("freenet")
                 .join(DEFAULT_OUTPUT_NAME)
                 .exists());
 

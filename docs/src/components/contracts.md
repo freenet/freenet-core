@@ -38,12 +38,12 @@ between peers, but this approach is very inefficient for large states. Instead,
 Freenet contracts utilize a much more efficient and flexible approach to state
 synchronization by providing an implementation of three functions:
 
-* `summarize_state` - Returns a concise summary of the contract's
+- `summarize_state` - Returns a concise summary of the contract's
   state.
-* `get_state_delta` - Compares the contract's state against the summary of
+- `get_state_delta` - Compares the contract's state against the summary of
   another state and returns the difference between the two, the "delta".
 
-* `update_state` - Applies a delta to the contract's state, updating it to
+- `update_state` - Applies a delta to the contract's state, updating it to
   bring it in sync with the other state.
 
 Contracts can implement these functions however they wish depending on the
@@ -52,15 +52,17 @@ type of data being synchronized.
 ##### Step-by-step
 
 PeerA and PeerB need to synchronize their states. The algorithm for efficient
-   state synchronization comprises the following steps:
+state synchronization comprises the following steps:
 
 1. **Summarize State by Initiator**: PeerA compiles a concise summary of its
    current state using the `summarize_state` function.
-   * This summary is transmitted to PeerB
+
+   - This summary is transmitted to PeerB
 
 2. **Compare State at Receiver**: PeerB uses `get_state_delta` to compare the
    summary against its own state.
-   * If they are different, proceed to the next step; if not, synchronization is
+
+   - If they are different, proceed to the next step; if not, synchronization is
      complete.
 
 3. **Send Delta**: If the states are different, PeerB calculates the delta and
@@ -98,10 +100,10 @@ language for writing contracts.
 Rust contracts implement the `ContractInterface` trait, which defines the
 functions that the kernel calls to interact with the contract. This trait is
 defined in the
-[locutus-stdlib](https://github.com/freenet/locutus/blob/main/crates/locutus-stdlib/src/contract_interface.rs#L424).
+[freenet-stdlib](https://github.com/freenet/freenet-core/blob/main/stdlib/rust/src/contract_interface.rs#L424).
 
 ```rust,no_run,noplayground
-{{#include ../../../crates/locutus-stdlib/src/contract_interface.rs:contractifce}}
+{{#include ../../../stdlib/rust/src/contract_interface.rs:contractifce}}
 ```
 
 #### Flexibility versus Convenience

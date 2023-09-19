@@ -701,7 +701,7 @@ mod messages {
             /// max hops to live
             htl: usize,
             // FIXME: remove skip list once we deduplicate at top msg handling level
-            // using this is a tmp workaround until (https://github.com/freenet/locutus/issues/13) is done
+            // using this is a tmp workaround until (https://github.com/freenet/freenet-core/issues/13) is done
             skip_list: Vec<PeerKey>,
         },
         /// Internal node instruction that  a change (either a first time insert or an update).

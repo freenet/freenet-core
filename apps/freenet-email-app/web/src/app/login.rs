@@ -2,8 +2,8 @@ use std::hash::Hasher;
 use std::{cell::RefCell, rc::Rc};
 
 use dioxus::prelude::*;
+use freenet_stdlib::prelude::ContractKey;
 use identity_management::IdentityManagement;
-use locutus_stdlib::prelude::ContractKey;
 use once_cell::unsync::Lazy;
 use rand::rngs::OsRng;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};

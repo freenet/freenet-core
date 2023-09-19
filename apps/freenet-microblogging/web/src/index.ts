@@ -12,10 +12,10 @@ import {
   UpdateData,
   DeltaUpdate,
   DelegateResponse,
-} from "locutus-stdlib/websocket-interface";
+} from "freenet-stdlib/websocket-interface";
 
 import "./scss/styles.scss";
-import { UpdateDataType } from "locutus-stdlib/common";
+import { UpdateDataType } from "freenet-stdlib/common";
 
 // import * as bootstrap from "bootstrap";
 

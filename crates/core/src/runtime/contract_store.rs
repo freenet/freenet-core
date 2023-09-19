@@ -233,7 +233,7 @@ mod test {
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
         let contract_dir = std::env::temp_dir()
-            .join("locutus-test")
+            .join("freenet-test")
             .join("contract-store-test");
         std::fs::create_dir_all(&contract_dir)?;
         let mut store = ContractStore::new(contract_dir, 10_000)?;

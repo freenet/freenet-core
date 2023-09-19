@@ -1127,7 +1127,7 @@ mod test {
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
-        let tmp_path = std::env::temp_dir().join("locutus-test");
+        let tmp_path = std::env::temp_dir().join("freenet-test");
         let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
         let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;

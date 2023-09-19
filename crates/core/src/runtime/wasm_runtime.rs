@@ -52,7 +52,7 @@ impl RunningInstance {
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
         let set_id: TypedFunction<i64, ()> = instance
             .exports
-            .get_typed_function(&rt.wasm_store, "__locutus_set_id")
+            .get_typed_function(&rt.wasm_store, "__frnt_set_id")
             .unwrap();
         let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         set_id.call(&mut rt.wasm_store, id).unwrap();

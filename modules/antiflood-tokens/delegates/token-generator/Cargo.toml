@@ -1,21 +1,21 @@
 [package]
-name = "locutus-token-generator"
+name = "freenet-token-generator"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 bincode = { workspace = true }
 bs58 = { workspace = true }
-locutus-stdlib = { workspace = true }
+freenet-stdlib = { workspace = true }
 rsa = { workspace = true, features = ["sha2", "pem"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-locutus-aft-interface = { path = "../../interfaces" }
+freenet-aft-interface = { path = "../../interfaces" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 chrono = { workspace = true, features = ["alloc", "serde"] }
-locutus-stdlib = { workspace = true, features = ["contract"] }
+freenet-stdlib = { workspace = true, features = ["contract"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 chrono = { workspace = true, features = ["clock", "alloc", "serde"]}
@@ -26,8 +26,8 @@ once_cell = "1"
 chacha20poly1305 = "0.10"
 rand = { version = "0.8", features = ["std"] }
 rand_chacha = { version = "0.3" }
-locutus-stdlib = { workspace = true, features = ["testing"] }
-locutus-runtime = { path = "../../../../crates/locutus-runtime", version = "0.0.3" }
+freenet-stdlib = { workspace = true, features = ["testing"] }
+freenet-core = { path = "../../../../crates/core", version = "0.0.4" }
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
 
 [lib]

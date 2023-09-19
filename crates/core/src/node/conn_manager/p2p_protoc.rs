@@ -51,9 +51,9 @@ use crate::{
 /// The default maximum size for a varint length-delimited packet.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024;
 
-const CURRENT_AGENT_VER: &str = "/locutus/agent/0.1.0";
-const CURRENT_PROTOC_VER: &str = "/locutus/0.1.0";
-const CURRENT_PROTOC_VER_STR: &str = "/locutus/0.1.0";
+const CURRENT_AGENT_VER: &str = "/freenet/agent/0.1.0";
+const CURRENT_PROTOC_VER: &str = "/freenet/0.1.0";
+const CURRENT_PROTOC_VER_STR: &str = "/freenet/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 
 fn config_behaviour(
@@ -93,7 +93,7 @@ fn config_behaviour(
         ping,
         identify: identify::Behaviour::new(ident_config),
         auto_nat,
-        locutus: LocutusBehaviour {
+        freenet: FreenetBehaviour {
             outbound: VecDeque::new(),
             routing_table,
             connected: HashMap::new(),
@@ -228,7 +228,7 @@ impl P2pConnManager {
 
         loop {
             let net_msg = self.swarm.select_next_some().map(|event| match event {
-                SwarmEvent::Behaviour(NetEvent::Locutus(msg)) => {
+                SwarmEvent::Behaviour(NetEvent::Freenet(msg)) => {
                     tracing::debug!("Message inbound: {:?}", msg);
                     Ok(Left(*msg))
                 }
@@ -373,7 +373,7 @@ impl P2pConnManager {
                     );
                     self.swarm
                         .behaviour_mut()
-                        .locutus
+                        .freenet
                         .outbound
                         .push_front((peer.0, Left(*msg)));
                 }
@@ -458,7 +458,7 @@ enum ConnMngrActions {
 }
 
 /// Manages network connections with different peers and event routing within the swarm.
-pub(in crate::node) struct LocutusBehaviour {
+pub(in crate::node) struct FreenetBehaviour {
     // FIFO queue for outbound messages
     outbound: VecDeque<(PeerId, Either<Message, NodeEvent>)>,
     // FIFO queue for inbound messages
@@ -468,7 +468,7 @@ pub(in crate::node) struct LocutusBehaviour {
     openning_connection: HashSet<PeerId>,
 }
 
-impl NetworkBehaviour for LocutusBehaviour {
+impl NetworkBehaviour for FreenetBehaviour {
     type ConnectionHandler = Handler;
 
     type ToSwarm = Message;
@@ -617,23 +617,23 @@ enum SubstreamState {
     AwaitingFirst { conn_id: UniqConnId },
     FreeStream {
         conn_id: UniqConnId,
-        substream: LocutusStream<NegotiatedSubstream>,
+        substream: FreenetStream<NegotiatedSubstream>,
     },
     /// Waiting to send a message to the remote.
     PendingSend {
         conn_id: UniqConnId,
-        substream: LocutusStream<NegotiatedSubstream>,
+        substream: FreenetStream<NegotiatedSubstream>,
         msg: Box<Either<Message, NodeEvent>>,
     },
     /// Waiting to flush the substream so that the data arrives to the remote.
     PendingFlush {
         conn_id: UniqConnId,
-        substream: LocutusStream<NegotiatedSubstream>,
+        substream: FreenetStream<NegotiatedSubstream>,
     },
     /// Waiting for an answer back from the remote.
     WaitingMsg {
         conn_id: UniqConnId,
-        substream: LocutusStream<NegotiatedSubstream>,
+        substream: FreenetStream<NegotiatedSubstream>,
     },
     /// An error happened on the substream and we should report the error to the user.
     ReportError { error: ConnectionError },
@@ -684,7 +684,7 @@ impl Handler {
     }
 }
 
-type HandlePollingEv = ConnectionHandlerEvent<LocutusProtocol, (), HandlerEvent, ConnectionError>;
+type HandlePollingEv = ConnectionHandlerEvent<FreenetProtocol, (), HandlerEvent, ConnectionError>;
 
 impl ConnectionHandler for Handler {
     /// Event received from the network by the handler
@@ -695,16 +695,16 @@ impl ConnectionHandler for Handler {
 
     type Error = ConnectionError;
 
-    type InboundProtocol = LocutusProtocol;
+    type InboundProtocol = FreenetProtocol;
 
-    type OutboundProtocol = LocutusProtocol;
+    type OutboundProtocol = FreenetProtocol;
 
     type InboundOpenInfo = ();
 
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(LocutusProtocol, ())
+        SubstreamProtocol::new(FreenetProtocol, ())
     }
 
     fn on_behaviour_event(&mut self, msg: Self::FromBehaviour) {
@@ -749,7 +749,7 @@ impl ConnectionHandler for Handler {
                 match stream {
                     SubstreamState::OutPendingOpen { msg, conn_id } => {
                         let event = ConnectionHandlerEvent::OutboundSubstreamRequest {
-                            protocol: SubstreamProtocol::new(LocutusProtocol, ()),
+                            protocol: SubstreamProtocol::new(FreenetProtocol, ()),
                         };
                         self.substreams
                             .push(SubstreamState::AwaitingFirst { conn_id });
@@ -978,9 +978,9 @@ impl ConnectionHandler for Handler {
     }
 }
 
-pub(crate) struct LocutusProtocol;
+pub(crate) struct FreenetProtocol;
 
-impl UpgradeInfo for LocutusProtocol {
+impl UpgradeInfo for FreenetProtocol {
     type Info = &'static str;
     type InfoIter = std::iter::Once<Self::Info>;
 
@@ -989,7 +989,7 @@ impl UpgradeInfo for LocutusProtocol {
     }
 }
 
-pub(crate) type LocutusStream<S> = stream::AndThen<
+pub(crate) type FreenetStream<S> = stream::AndThen<
     sink::With<
         stream::ErrInto<Framed<S, UviBytes<io::Cursor<Vec<u8>>>>, ConnectionError>,
         io::Cursor<Vec<u8>>,
@@ -1001,11 +1001,11 @@ pub(crate) type LocutusStream<S> = stream::AndThen<
     fn(BytesMut) -> future::Ready<Result<Message, ConnectionError>>,
 >;
 
-impl<S> InboundUpgrade<S> for LocutusProtocol
+impl<S> InboundUpgrade<S> for FreenetProtocol
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    type Output = LocutusStream<S>;
+    type Output = FreenetStream<S>;
     type Error = ConnectionError;
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
@@ -1014,11 +1014,11 @@ where
     }
 }
 
-impl<S> OutboundUpgrade<S> for LocutusProtocol
+impl<S> OutboundUpgrade<S> for FreenetProtocol
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    type Output = LocutusStream<S>;
+    type Output = FreenetStream<S>;
     type Error = ConnectionError;
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
@@ -1027,7 +1027,7 @@ where
     }
 }
 
-fn frame_stream<S>(incoming: S) -> future::Ready<Result<LocutusStream<S>, ConnectionError>>
+fn frame_stream<S>(incoming: S) -> future::Ready<Result<FreenetStream<S>, ConnectionError>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1058,7 +1058,7 @@ fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
 ///
 /// - [Identify](https://github.com/libp2p/specs/tree/master/identify) libp2p protocol.
 /// - [Ping](https://docs.rs/libp2p/latest/libp2p/ping/index.html) `/ipfs/ping/1.0.0` protocol.
-/// - Locutus ring protocol, which handles the messages.
+/// - Freenet ring protocol, which handles the messages.
 /// - [AutoNAT](https://github.com/libp2p/specs/tree/master/autonat) libp2p protocol.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 #[behaviour(event_process = false)]
@@ -1066,13 +1066,13 @@ fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
 pub(in crate::node) struct NetBehaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
-    locutus: LocutusBehaviour,
+    freenet: FreenetBehaviour,
     auto_nat: autonat::Behaviour,
 }
 
 #[derive(Debug)]
 pub(in crate::node) enum NetEvent {
-    Locutus(Box<Message>),
+    Freenet(Box<Message>),
     Identify(Box<identify::Event>),
     Ping(ping::Event),
     Autonat(autonat::Event),
@@ -1098,6 +1098,6 @@ impl From<ping::Event> for NetEvent {
 
 impl From<Message> for NetEvent {
     fn from(event: Message) -> NetEvent {
-        Self::Locutus(Box::new(event))
+        Self::Freenet(Box::new(event))
     }
 }

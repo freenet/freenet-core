@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::{
+use freenet_stdlib::prelude::{
     blake3::{traits::digest::Digest, Hasher as Blake3},
     *,
 };

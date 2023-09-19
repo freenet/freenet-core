@@ -29,7 +29,7 @@ static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_as
 
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
-const APPLICATION: &str = "Locutus";
+const APPLICATION: &str = "Freenet";
 
 pub struct Config {
     pub bootstrap_ip: IpAddr,
@@ -91,7 +91,7 @@ impl ConfigPaths {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
         let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
-            std::env::temp_dir().join("locutus")
+            std::env::temp_dir().join("freenet")
         } else {
             project_dir.data_dir().into()
         };
@@ -164,7 +164,7 @@ impl Config {
 
     fn load_conf() -> std::io::Result<Config> {
         let settings = config::Config::builder()
-            .add_source(config::Environment::with_prefix("LOCUTUS"))
+            .add_source(config::Environment::with_prefix("FREENET"))
             .build()
             .unwrap();
         let local_peer_keypair = if let Ok(path_to_key) = settings

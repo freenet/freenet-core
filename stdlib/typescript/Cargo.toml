@@ -1,5 +1,5 @@
 [package]
-name = "locutus-js-stdlib"
+name = "freenet-js-stdlib"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.71.1"
@@ -9,7 +9,7 @@ publish = false
 [workspace]
 
 [dependencies]
-locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+freenet-stdlib = { path = "../rust" }
 
 [lib]
 crate-type = ["cdylib"]

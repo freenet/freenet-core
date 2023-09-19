@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 use p384::{FieldBytes, Scalar, SecretKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -124,7 +124,7 @@ impl DelegateInterface for IdentityManagement {
                     IdentityMsg::CreateIdentity { alias, key, extra } => {
                         #[cfg(all(target_family = "wasm", feature = "contract"))]
                         {
-                            locutus_stdlib::log::info(&format!(
+                            freenet_stdlib::log::info(&format!(
                                 "create alias new {alias} for {}",
                                 params.as_secret_id()
                             ));
@@ -138,7 +138,7 @@ impl DelegateInterface for IdentityManagement {
                     IdentityMsg::Init => {
                         #[cfg(all(target_family = "wasm", feature = "contract"))]
                         {
-                            locutus_stdlib::log::info(&format!(
+                            freenet_stdlib::log::info(&format!(
                                 "initialize secret {}",
                                 params.as_secret_id()
                             ));
@@ -167,7 +167,7 @@ impl DelegateInterface for IdentityManagement {
             }) => {
                 #[cfg(all(target_family = "wasm", feature = "contract"))]
                 {
-                    locutus_stdlib::log::info(&format!(
+                    freenet_stdlib::log::info(&format!(
                         "got request for {}",
                         params.as_secret_id()
                     ));

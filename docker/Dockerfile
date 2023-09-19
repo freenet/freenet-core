@@ -22,7 +22,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup target add wasm32-unknown-unknown
 
 # Go to a non-root Work directory so npm install works.
-WORKDIR /src/locutus
+WORKDIR /src/freenet
 
 # NodeJS/NPM Dependencies
 RUN npx --package typescript tsc --init
@@ -31,11 +31,11 @@ RUN npm install --global webpack-cli
 RUN npm install @msgpack/msgpack
 RUN npm install bs58
 
-# Copy the locutus source
+# Copy the freenet source
 COPY . .
 
 # Build it
-WORKDIR /src/locutus/crates/locutus-node
+WORKDIR /src/freenet/crates/core
 RUN cargo install --path . 
  
-CMD ["locutus-node","-b","0.0.0.0"]
+CMD ["freenet","-b","0.0.0.0"]

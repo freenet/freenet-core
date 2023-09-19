@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use locutus_aft_interface::*;
-use locutus_stdlib::prelude::*;
+use freenet_aft_interface::*;
+use freenet_stdlib::prelude::*;
 use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 
@@ -259,7 +259,7 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         #[cfg(target_family = "wasm")]
         #[inline(always)]
         fn current() -> DateTime<Utc> {
-            locutus_stdlib::time::now()
+            freenet_stdlib::time::now()
         }
         #[cfg(not(target_family = "wasm"))]
         #[inline(always)]
@@ -284,7 +284,7 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
                     .unwrap()
                     .split_whitespace()
                     .collect::<String>();
-                // locutus_stdlib::log::info(&format!(
+                // freenet_stdlib::log::info(&format!(
                 //     "signed message {msg:?} with pub key: `{pk}`, signature: {signature}"
                 // ));
             }

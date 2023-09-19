@@ -14,7 +14,7 @@ panic = 'abort'
 strip = true
 
 [workspace.dependencies]
-locutus-stdlib = { path = "../../crates/locutus-stdlib", default-features = false }
+freenet-stdlib = { path = "../../stdlib/rust", default-features = false }
 
 #[target.wasm32-unknown-unknown]
 #rustflags = ["-C", "link-arg=--import-memory"]

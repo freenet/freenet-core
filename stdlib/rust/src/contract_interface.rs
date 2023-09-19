@@ -343,7 +343,7 @@ impl<'a> TryFromFbs<&FbsUpdateData<'a>> for UpdateData<'a> {
 /// Implementing `ContractInterface` on a type:
 ///
 /// ```
-/// # use locutus_stdlib::prelude::*;
+/// # use freenet_stdlib::prelude::*;
 /// struct Contract;
 ///
 /// #[contract]
@@ -1224,7 +1224,7 @@ impl std::fmt::Display for WrappedState {
     }
 }
 
-/// Just as `locutus_stdlib::Contract` but with some convenience impl.
+/// Just as `freenet_stdlib::Contract` but with some convenience impl.
 #[non_exhaustive]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WrappedContract {
