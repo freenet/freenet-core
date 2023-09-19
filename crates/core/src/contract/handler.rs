@@ -5,10 +5,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use crate::runtime::{
-    ContractContainer, ContractKey, ContractStore, Parameters, Runtime, StateStorage, StateStore,
-};
 use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -17,7 +15,12 @@ use super::{
     executor::{ContractExecutor, Executor},
     ContractError,
 };
-use crate::{ClientId, DynError, NodeConfig, WrappedState};
+use crate::{
+    client_events::ClientId,
+    node::NodeConfig,
+    runtime::{ContractStore, Runtime, StateStorage, StateStore},
+    DynError,
+};
 
 pub const MAX_MEM_CACHE: i64 = 10_000_000;
 
@@ -289,14 +292,14 @@ pub(crate) enum ContractHandlerEvent {
 pub mod test {
     use std::sync::Arc;
 
-    use crate::runtime::{ContractStore, ContractWasmAPIVersion};
+    use crate::runtime::ContractStore;
     use freenet_stdlib::{
         client_api::{ClientRequest, HostResponse},
-        prelude::ContractCode,
+        prelude::*,
     };
 
     use super::*;
-    use crate::{config::GlobalExecutor, contract::MockRuntime, WrappedContract};
+    use crate::{config::GlobalExecutor, contract::MockRuntime};
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

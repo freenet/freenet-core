@@ -13,7 +13,7 @@ use super::{
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
-pub(crate) struct RunningInstance {
+pub(super) struct RunningInstance {
     pub id: i64,
     pub instance: Instance,
 }
@@ -24,7 +24,7 @@ impl Drop for RunningInstance {
     }
 }
 
-pub(crate) struct InstanceInfo {
+pub(super) struct InstanceInfo {
     pub start_ptr: i64,
     key: Key,
 }
@@ -88,21 +88,21 @@ pub enum ContractExecError {
 
 pub struct Runtime {
     /// Working memory store used by the inner engine
-    pub(crate) wasm_store: Store,
+    pub(super) wasm_store: Store,
     /// includes all the necessary imports to interact with the native runtime environment
-    pub(crate) top_level_imports: Imports,
+    pub(super) top_level_imports: Imports,
     /// assigned growable host memory
-    pub(crate) host_memory: Option<Memory>,
+    pub(super) host_memory: Option<Memory>,
 
-    pub(crate) secret_store: SecretsStore,
-    pub(crate) delegate_store: DelegateStore,
+    pub(super) secret_store: SecretsStore,
+    pub(super) delegate_store: DelegateStore,
     /// loaded delegate modules
-    pub(crate) delegate_modules: HashMap<DelegateKey, Module>,
+    pub(super) delegate_modules: HashMap<DelegateKey, Module>,
 
     /// Local contract storage.
-    pub contract_store: ContractStore,
+    pub(crate) contract_store: ContractStore,
     /// loaded contract modules
-    pub(crate) contract_modules: HashMap<ContractKey, Module>,
+    pub(super) contract_modules: HashMap<ContractKey, Module>,
 }
 
 impl Runtime {
@@ -141,7 +141,7 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn init_buf<T>(&mut self, instance: &Instance, data: T) -> RuntimeResult<BufferMut>
+    pub(super) fn init_buf<T>(&mut self, instance: &Instance, data: T) -> RuntimeResult<BufferMut>
     where
         T: AsRef<[u8]>,
     {
@@ -159,7 +159,7 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn linear_mem(&self, instance: &Instance) -> RuntimeResult<WasmLinearMem> {
+    pub(super) fn linear_mem(&self, instance: &Instance) -> RuntimeResult<WasmLinearMem> {
         let memory = self
             .host_memory
             .as_ref()
@@ -172,7 +172,7 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn prepare_contract_call(
+    pub(super) fn prepare_contract_call(
         &mut self,
         key: &ContractKey,
         parameters: &Parameters,
@@ -200,7 +200,7 @@ impl Runtime {
         RunningInstance::new(self, instance, Key::Contract(key.id()))
     }
 
-    pub(crate) fn prepare_delegate_call(
+    pub(super) fn prepare_delegate_call(
         &mut self,
         params: &Parameters,
         key: &DelegateKey,

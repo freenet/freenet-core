@@ -2,19 +2,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::runtime::{ContractContainer, ContractKey};
+use freenet_stdlib::prelude::*;
 
-use crate::message::InnerMessage;
-use crate::operations::op_trait::Operation;
-use crate::operations::OpInitialization;
 use crate::{
     config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
-    message::{Message, Transaction, TxType},
+    message::{InnerMessage, Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
+    operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
+    DynError,
 };
-use crate::{DynError, WrappedState};
 
 use super::{OpEnum, OpError, OperationResult};
 
@@ -665,15 +663,11 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::runtime::{ContractContainer, ContractWasmAPIVersion};
     use freenet_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
     use super::*;
-    use crate::{
-        node::tests::{check_connectivity, NodeSpecification, SimNetwork},
-        WrappedContract, WrappedState,
-    };
+    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -9,9 +9,7 @@ use futures::task::AtomicWaker;
 use futures::FutureExt;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-use super::{BoxedClient, ClientError, HostResult};
-use crate::client_events::OpenRequest;
-use crate::{ClientEventsProxy, ClientId};
+use super::{BoxedClient, ClientError, ClientId, HostResult, OpenRequest};
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
@@ -57,7 +55,7 @@ impl<const N: usize> ClientEventsCombinator<N> {
     }
 }
 
-impl<const N: usize> ClientEventsProxy for ClientEventsCombinator<N> {
+impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
     fn recv<'a>(&'_ mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
@@ -246,6 +244,7 @@ mod test {
     use freenet_stdlib::client_api::ClientRequest;
 
     use super::*;
+    use crate::client_events::ClientEventsProxy;
 
     struct SampleProxy {
         id: usize,

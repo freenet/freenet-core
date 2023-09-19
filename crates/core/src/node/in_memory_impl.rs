@@ -1,8 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::runtime::prelude::ContractKey;
-use crate::runtime::ContractContainer;
 use either::Either;
+use freenet_stdlib::prelude::*;
 use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
@@ -15,10 +14,10 @@ use crate::{
     config::GlobalExecutor,
     contract::{self, ContractError, ContractHandler, ContractHandlerEvent},
     message::{Message, NodeEvent, TransactionType},
+    node::NodeBuilder,
     operations::OpError,
     ring::{PeerKeyLocation, Ring},
     util::IterExt,
-    NodeBuilder, WrappedState,
 };
 
 pub(super) struct NodeInMemory {

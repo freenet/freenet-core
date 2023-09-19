@@ -12,21 +12,30 @@ mod runtime;
 pub mod server;
 pub mod util;
 
-pub type WrappedContract = crate::runtime::prelude::WrappedContract;
-pub type WrappedState = crate::runtime::prelude::WrappedState;
-
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-// exports:
-pub use crate::config::Config;
-pub use client_events::{
-    combinator::ClientEventsCombinator, AuthToken, BoxedClient, ClientEventsProxy, ClientId,
-    HostResult, OpenRequest,
-};
-pub use contract::storages::Storage;
-pub use contract::{Executor, ExecutorError, OperationMode};
-pub use either;
-pub use libp2p;
-pub use node::PeerKey;
-pub use node::{InitPeerNode, NodeBuilder, NodeConfig};
-pub use ring::Location;
+/// Exports to build a running local node.
+pub mod local_node {
+    use super::*;
+    pub use contract::Executor;
+    pub use contract::OperationMode;
+    pub use node::NodeConfig;
+}
+
+/// Exports to build a running network simulation.
+pub mod network_sim {
+    // todo: streamline this
+    use super::*;
+    pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
+    pub use node::{InitPeerNode, NodeBuilder, NodeConfig};
+    pub use ring::Location;
+}
+
+/// Exports for the dev tool.
+pub mod dev_tool {
+    use super::*;
+    pub use crate::config::Config;
+    pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
+    pub use contract::{storages::Storage, Executor, OperationMode};
+    pub use runtime::{ContractStore, DelegateStore, SecretsStore, StateStore};
+}

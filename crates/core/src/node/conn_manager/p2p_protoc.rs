@@ -39,11 +39,13 @@ use super::{ConnectionBridge, ConnectionError};
 use crate::{
     config::{self, GlobalExecutor},
     message::{Message, NodeEvent, TransactionType},
-    node::{handle_cancelled_op, join_ring_request, process_message, OpManager, PeerKey},
+    node::{
+        handle_cancelled_op, join_ring_request, process_message, InitPeerNode, NodeBuilder,
+        OpManager, PeerKey,
+    },
     operations::OpError,
     ring::PeerKeyLocation,
     util::IterExt,
-    InitPeerNode, NodeBuilder,
 };
 
 /// The default maximum size for a varint length-delimited packet.

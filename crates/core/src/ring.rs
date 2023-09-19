@@ -22,16 +22,13 @@ use std::{
     },
 };
 
-use crate::runtime::prelude::ContractKey;
 use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
+use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    node::{self, PeerKey},
-    NodeBuilder,
-};
+use crate::node::{self, NodeBuilder, PeerKey};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// The location of a peer in the ring. This location allows routing towards the peer.

@@ -2,13 +2,12 @@ pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod path_handlers;
 
-use crate::runtime::ContractKey;
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
-    prelude::ContractInstanceId,
+    prelude::*,
 };
 
-use crate::{AuthToken, ClientId, HostResult};
+use crate::client_events::{AuthToken, ClientId, HostResult};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -49,8 +48,9 @@ pub mod local_node {
     use tower_http::trace::TraceLayer;
 
     use crate::{
-        client_events::websocket::WebSocketProxy, ClientEventsProxy, DynError, Executor,
-        ExecutorError, OpenRequest,
+        client_events::{websocket::WebSocketProxy, ClientEventsProxy, OpenRequest},
+        contract::{Executor, ExecutorError},
+        DynError,
     };
 
     use super::http_gateway::HttpGateway;

@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use crate::runtime::ContractKey;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -16,16 +15,17 @@ use axum::{
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse},
-    prelude::ContractInstanceId,
+    prelude::*,
 };
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::{
+    client_events::AuthToken,
     server::{ClientConnection, HostCallbackResult},
     util::EncodingProtocol,
-    AuthToken, DynError,
+    DynError,
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};

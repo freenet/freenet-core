@@ -21,9 +21,9 @@ use crate::{
     config::{self, GlobalExecutor},
     contract::{self, ContractHandler},
     message::{Message, NodeEvent},
+    node::NodeBuilder,
     ring::Ring,
     util::IterExt,
-    NodeBuilder,
 };
 
 use super::OpManager;

@@ -26,6 +26,7 @@ use self::{
 };
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
+    config::Config,
     config::GlobalExecutor,
     contract::{ContractError, NetworkContractHandler, OperationMode},
     message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
@@ -36,7 +37,6 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
     util::{ExponentialBackoff, IterExt},
-    Config,
 };
 
 use crate::operations::handle_op_request;

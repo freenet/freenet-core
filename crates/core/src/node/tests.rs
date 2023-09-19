@@ -5,9 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::runtime::prelude::ContractKey;
-use crate::runtime::ContractContainer;
 use freenet_stdlib::client_api::ClientRequest;
+use freenet_stdlib::prelude::*;
 use itertools::Itertools;
 use libp2p::{identity, PeerId};
 use rand::Rng;
@@ -18,9 +17,8 @@ use crate::{
     client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
     contract::MemoryContractHandler,
-    node::{event_listener::TestEventListener, InitPeerNode, NodeInMemory},
+    node::{event_listener::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
-    NodeBuilder, WrappedState,
 };
 
 use super::PeerKey;

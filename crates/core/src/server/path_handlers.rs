@@ -6,12 +6,12 @@ use axum::response::{Html, IntoResponse};
 use bytes::Bytes;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
+    prelude::*,
     web::{WebApp, WebContractError},
 };
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
-use crate::runtime::{ContractContainer, ContractKey, State};
-use crate::AuthToken;
+use crate::client_events::AuthToken;
 
 use super::{errors::WebSocketApiError, ClientConnection, HostCallbackResult};
 

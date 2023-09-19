@@ -1,5 +1,11 @@
-use crate::runtime::{ContractStore, StateStorage, StateStore, WrappedContract};
-use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+use crate::{
+    client_events::ClientId,
+    runtime::{ContractStore, StateStorage, StateStore},
+};
+use freenet_stdlib::{
+    client_api::{ClientError, ClientRequest, HostResponse},
+    prelude::WrappedContract,
+};
 use futures::{future::BoxFuture, FutureExt};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -8,7 +14,7 @@ use super::{
     storages::in_memory::MemKVStore,
     Executor,
 };
-use crate::{config::Config, ClientId, DynError};
+use crate::{config::Config, DynError};
 
 pub(crate) struct MockRuntime {
     pub contract_store: ContractStore,

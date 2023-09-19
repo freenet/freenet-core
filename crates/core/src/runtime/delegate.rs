@@ -40,7 +40,7 @@ pub enum DelegateExecError {
     UnexpectedMessage(&'static str),
 }
 
-pub trait DelegateRuntimeInterface {
+pub(crate) trait DelegateRuntimeInterface {
     fn inbound_app_message(
         &mut self,
         key: &DelegateKey,
@@ -414,15 +414,11 @@ impl DelegateRuntimeInterface for Runtime {
 #[cfg(test)]
 mod test {
     use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
-    use freenet_stdlib::prelude::{
-        ContractCode, ContractInstanceId, Delegate, DelegateWasmAPIVersion, Parameters,
-    };
+    use freenet_stdlib::prelude::*;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
-    use super::super::{
-        delegate_store::DelegateStore, ContractStore, SecretsStore, WrappedContract,
-    };
+    use super::super::{delegate_store::DelegateStore, ContractStore, SecretsStore};
     use super::*;
 
     const TEST_DELEGATE_1: &str = "test_delegate_1";

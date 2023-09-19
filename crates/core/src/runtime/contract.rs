@@ -8,7 +8,7 @@ use super::{ContractExecError, RuntimeResult};
 
 type FfiReturnTy = i64;
 
-pub trait ContractRuntimeInterface {
+pub(crate) trait ContractRuntimeInterface {
     /// Verify that the state is valid, given the parameters. This will be used before a peer
     /// caches a new state.
     fn validate_state(

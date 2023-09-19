@@ -5,7 +5,6 @@ use std::fmt::Display;
 use std::hint::unreachable_unchecked;
 use std::time::{Duration, Instant};
 
-use crate::runtime::prelude::*;
 use blake3::traits::digest::generic_array::GenericArray;
 use either::Either;
 use freenet_stdlib::client_api::{
@@ -14,6 +13,7 @@ use freenet_stdlib::client_api::{
     HostResponse::{self, DelegateResponse},
     RequestError,
 };
+use freenet_stdlib::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(any(
@@ -22,10 +22,15 @@ use tokio::sync::mpsc::UnboundedSender;
     all(not(feature = "local-mode"), not(feature = "network-mode"))
 ))]
 use crate::operations::get::GetResult;
+use crate::runtime::{
+    ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
+    SecretsStore, StateStore, StateStoreError,
+};
 use crate::{
-    node::{OpManager, P2pBridge},
+    client_events::{ClientId, HostResult},
+    node::{NodeConfig, OpManager, P2pBridge},
     operations::{self, op_trait::Operation},
-    ClientId, DynError, HostResult, NodeConfig,
+    DynError,
 };
 
 use super::storages::Storage;
@@ -137,7 +142,10 @@ pub(crate) trait ContractExecutor: Send + Sync + 'static {
         key: ContractKey,
         fetch_contract: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError>;
-    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ContractError>;
+    async fn store_contract(
+        &mut self,
+        contract: ContractContainer,
+    ) -> Result<(), crate::runtime::ContractError>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.
@@ -1063,7 +1071,10 @@ impl ContractExecutor for Executor<Runtime> {
         }
     }
 
-    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ContractError> {
+    async fn store_contract(
+        &mut self,
+        contract: ContractContainer,
+    ) -> Result<(), crate::runtime::ContractError> {
         self.runtime.contract_store.store_contract(contract)
     }
 }
@@ -1098,7 +1109,10 @@ impl ContractExecutor for Executor<crate::contract::MockRuntime> {
         Ok((state, contract))
     }
 
-    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ContractError> {
+    async fn store_contract(
+        &mut self,
+        contract: ContractContainer,
+    ) -> Result<(), crate::runtime::ContractError> {
         self.runtime.contract_store.store_contract(contract)?;
         Ok(())
     }

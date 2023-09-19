@@ -1,7 +1,7 @@
 use std::hash::Hash;
 
-use crate::runtime::{ContractInstanceId, DelegateKey};
 use dashmap::DashMap;
+use freenet_stdlib::prelude::*;
 
 use crate::ring::PeerKeyLocation;
 

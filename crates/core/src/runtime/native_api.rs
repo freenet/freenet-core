@@ -4,13 +4,13 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use wasmer::{Function, Imports};
 
-use super::runtime::InstanceInfo;
+use super::wasm_runtime::InstanceInfo;
 
 /// This is a map of starting addresses of the instance memory space.
 ///
 /// A hackish way of having the information necessary to compute the address
 /// at which bytes must be written when calling host functions from the WASM modules.
-pub(crate) static MEM_ADDR: Lazy<DashMap<InstanceId, InstanceInfo>> = Lazy::new(DashMap::default);
+pub(super) static MEM_ADDR: Lazy<DashMap<InstanceId, InstanceInfo>> = Lazy::new(DashMap::default);
 
 type InstanceId = i64;
 

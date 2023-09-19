@@ -1,5 +1,5 @@
 use clap::Parser;
-use freenet_core::{Executor, NodeConfig, OperationMode};
+use freenet_core::local_node::{Executor, NodeConfig, OperationMode};
 use std::net::SocketAddr;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;

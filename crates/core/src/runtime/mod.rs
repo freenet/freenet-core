@@ -2,27 +2,23 @@ mod contract;
 mod contract_store;
 mod delegate;
 mod delegate_store;
-pub(crate) mod error;
+mod error;
 mod native_api;
-mod runtime;
 mod secrets_store;
 mod state_store;
 mod store;
 #[cfg(test)]
-pub(crate) mod tests;
-pub mod util;
+mod tests;
+mod util;
+mod wasm_runtime;
 
-pub use prelude::*;
-
-pub mod prelude {
-    pub use super::contract::ContractRuntimeInterface;
-    pub use super::contract_store::ContractStore;
-    pub use super::delegate::{DelegateExecError, DelegateRuntimeInterface};
-    pub use super::delegate_store::DelegateStore;
-    pub use super::error::ContractError;
-    pub use super::error::RuntimeResult;
-    pub use super::runtime::{ContractExecError, Runtime};
-    pub use super::secrets_store::SecretsStore;
-    pub use super::state_store::{StateStorage, StateStore, StateStoreError};
-    pub use freenet_stdlib::prelude::*;
-}
+pub(crate) use contract::ContractRuntimeInterface;
+pub use contract_store::ContractStore;
+pub(crate) use delegate::{DelegateExecError, DelegateRuntimeInterface};
+pub use delegate_store::DelegateStore;
+pub(crate) use error::ContractError;
+pub(crate) use error::RuntimeResult;
+pub use secrets_store::SecretsStore;
+pub use state_store::StateStore;
+pub(crate) use state_store::{StateStorage, StateStoreError};
+pub(crate) use wasm_runtime::{ContractExecError, Runtime};

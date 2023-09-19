@@ -75,7 +75,7 @@ tracing-opentelemetry = { version = "0.21.0", optional = true }
 tracing-subscriber = { version = "0.3.16", optional = true }
 
 # internal deps
-freenet-stdlib = { path = "../stdlib", version = "0.0.4", features = ["net"] }
+freenet-stdlib = { path = "../stdlib", version = "0.0.4", features = ["net", "archive"] }
 # locutus-runtime = { path = "../locutus-runtime", version = "0.0.4" }
 
 [dev-dependencies]

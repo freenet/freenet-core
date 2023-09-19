@@ -1,14 +1,17 @@
 use std::str::FromStr;
 
-use crate::runtime::{ContractError, Parameters, StateStorage, StateStoreError};
+use freenet_stdlib::prelude::*;
 use once_cell::sync::Lazy;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteRow},
     ConnectOptions, Row, SqlitePool,
 };
 
-use crate::contract::ContractKey;
-use crate::{config::Config, WrappedState};
+use crate::{
+    config::Config,
+    contract::ContractKey,
+    runtime::{ContractError, StateStorage, StateStoreError},
+};
 
 // Is fine to clone this as it wraps by an Arc.
 static POOL: Lazy<SqlitePool> = Lazy::new(|| {
@@ -59,11 +62,7 @@ impl Pool {
 impl StateStorage for Pool {
     type Error = SqlDbError;
 
-    async fn store(
-        &mut self,
-        key: ContractKey,
-        state: crate::runtime::WrappedState,
-    ) -> Result<(), Self::Error> {
+    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
         sqlx::query(
             "INSERT INTO states (contract, state) 
                      VALUES ($1, $2) 
@@ -77,10 +76,7 @@ impl StateStorage for Pool {
         Ok(())
     }
 
-    async fn get(
-        &self,
-        key: &ContractKey,
-    ) -> Result<Option<crate::runtime::WrappedState>, Self::Error> {
+    async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         match sqlx::query("SELECT state FROM states WHERE contract = ?")
             .bind(key.bytes())
             .map(|row: SqliteRow| Some(WrappedState::new(row.get("state"))))
@@ -146,15 +142,13 @@ pub enum SqlDbError {
 mod test {
     use std::sync::Arc;
 
+    use freenet_stdlib::client_api::ContractRequest;
+    use freenet_stdlib::prelude::*;
+
     use crate::contract::{
         contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
     };
-    use crate::runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
-    use crate::{ClientId, DynError, WrappedContract};
-    use freenet_stdlib::client_api::ContractRequest;
-    use freenet_stdlib::prelude::ContractCode;
-
-    use super::*;
+    use crate::{client_events::ClientId, DynError};
 
     // Prepare and get handler for an in-memory sqlite db
     async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {

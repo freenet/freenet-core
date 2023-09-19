@@ -1,7 +1,7 @@
-use freenet_stdlib::prelude::{ContractKey, Parameters};
+use freenet_stdlib::prelude::*;
 use stretto::AsyncCache;
 
-use crate::{DynError, WrappedState};
+use crate::DynError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {

@@ -1,13 +1,13 @@
+use freenet_stdlib::prelude::*;
+
 use super::PeerKey;
 use crate::{
     contract::StoreResponse,
     message::{Message, Transaction},
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
     ring::{Location, PeerKeyLocation},
-    WrappedState,
 };
 
-use crate::runtime::prelude::ContractKey;
 #[cfg(test)]
 pub(super) use test_utils::TestEventListener;
 
@@ -175,7 +175,6 @@ mod test_utils {
         },
     };
 
-    use crate::runtime::WrappedState;
     use dashmap::DashMap;
     use parking_lot::RwLock;
 

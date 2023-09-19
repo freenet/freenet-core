@@ -1,4 +1,5 @@
-use crate::runtime::{prelude::ContractKey, ContractError as ContractRtError};
+use crate::runtime::ContractError as ContractRtError;
+use freenet_stdlib::prelude::*;
 
 mod executor;
 mod handler;

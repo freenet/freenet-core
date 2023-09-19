@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::runtime::prelude::*;
+use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::operations::op_trait::Operation;
@@ -449,10 +449,7 @@ mod test {
     use freenet_stdlib::client_api::ContractRequest;
 
     use super::*;
-    use crate::{
-        node::tests::{check_connectivity, NodeSpecification, SimNetwork},
-        WrappedContract, WrappedState,
-    };
+    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use freenet_stdlib::prelude::{ContractKey, DelegateKey, SecretsId};
 
-use super::{delegate, runtime, secrets_store, DelegateExecError};
+use super::{delegate, secrets_store, wasm_runtime, DelegateExecError};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
@@ -87,7 +87,7 @@ impl_err!(std::io::Error);
 impl_err!(secrets_store::SecretStoreError);
 impl_err!(bincode::Error);
 impl_err!(delegate::DelegateExecError);
-impl_err!(runtime::ContractExecError);
+impl_err!(wasm_runtime::ContractExecError);
 impl_err!(wasmer::CompileError);
 impl_err!(wasmer::ExportError);
 impl_err!(wasmer::InstantiationError);
@@ -123,7 +123,7 @@ pub(crate) enum RuntimeInnerError {
     ContractNotFound(ContractKey),
 
     #[error(transparent)]
-    ContractExecError(#[from] runtime::ContractExecError),
+    ContractExecError(#[from] wasm_runtime::ContractExecError),
 
     #[error("failed while unwrapping contract to raw bytes")]
     UnwrapContract,

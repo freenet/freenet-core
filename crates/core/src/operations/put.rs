@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 pub(crate) use self::messages::PutMsg;
-use crate::runtime::{prelude::ContractKey, ContractContainer};
+use freenet_stdlib::prelude::*;
 
 use super::{OpEnum, OpError, OperationResult};
 use crate::{
@@ -18,7 +18,6 @@ use crate::{
     node::{ConnectionBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
-    WrappedState,
 };
 
 pub(crate) struct PutOp {
@@ -783,13 +782,13 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use crate::runtime::{ContractWasmAPIVersion, WrappedContract};
-    use freenet_stdlib::client_api::ContractRequest;
     use std::collections::HashMap;
 
-    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
+    use freenet_stdlib::client_api::ContractRequest;
+    use freenet_stdlib::prelude::*;
 
     use super::*;
+    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

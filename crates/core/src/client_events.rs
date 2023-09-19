@@ -13,7 +13,7 @@ pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
 
-pub type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
+pub(crate) type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
 pub type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -139,6 +139,7 @@ pub trait ClientEventsProxy {
         response: Result<HostResponse, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>>;
 }
+
 #[cfg(test)]
 pub(crate) mod test {
     // FIXME: remove unused
@@ -147,17 +148,13 @@ pub(crate) mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::runtime::{
-        prelude::ContractKey, ContractCode, ContractContainer, ContractInstanceId,
-        ContractWasmAPIVersion, DelegateKey, Parameters, RelatedContracts,
-    };
     use freenet_stdlib::client_api::ContractRequest;
+    use freenet_stdlib::prelude::*;
     use futures::FutureExt;
     use rand::{prelude::Rng, thread_rng};
     use tokio::sync::watch::Receiver;
 
     use crate::node::{tests::EventId, PeerKey};
-    use crate::{WrappedContract, WrappedState};
 
     use super::*;
 

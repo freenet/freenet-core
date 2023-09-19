@@ -1,6 +1,9 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use freenet_core::{Config, Executor, OperationMode, Storage};
+use freenet_core::dev_tool::{
+    Config, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore, StateStore,
+    Storage,
+};
 use freenet_stdlib::prelude::*;
 use tokio::sync::RwLock;
 

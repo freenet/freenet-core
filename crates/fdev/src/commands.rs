@@ -1,6 +1,9 @@
 use std::{fs::File, io::Read, path::PathBuf};
 
-use freenet_core::{ClientId, Config, Executor, OperationMode, Storage};
+use freenet_core::dev_tool::{
+    ClientId, Config, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore,
+    StateStore, Storage,
+};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest},
     prelude::*,

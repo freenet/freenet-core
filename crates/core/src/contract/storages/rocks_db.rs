@@ -1,7 +1,8 @@
-use crate::runtime::{Parameters, StateStorage};
+use freenet_stdlib::prelude::*;
 use rocksdb::{Options, DB};
 
-use crate::{config::Config, contract::ContractKey, WrappedState};
+use crate::runtime::StateStorage;
+use crate::{config::Config, contract::ContractKey};
 
 pub struct RocksDb(DB);
 
@@ -33,21 +34,14 @@ impl RocksDb {
 impl StateStorage for RocksDb {
     type Error = rocksdb::Error;
 
-    async fn store(
-        &mut self,
-        key: ContractKey,
-        state: crate::runtime::WrappedState,
-    ) -> Result<(), Self::Error> {
+    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
         self.0
             .put([key.bytes(), RocksDb::STATE_SUFFIX].concat(), state)?;
 
         Ok(())
     }
 
-    async fn get(
-        &self,
-        key: &ContractKey,
-    ) -> Result<Option<crate::runtime::WrappedState>, Self::Error> {
+    async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         match self.0.get([key.bytes(), RocksDb::STATE_SUFFIX].concat()) {
             Ok(result) => {
                 if let Some(r) = result.map(|r| Some(WrappedState::new(r))) {
@@ -106,16 +100,15 @@ impl StateStorage for RocksDb {
 mod test {
     use std::sync::Arc;
 
-    use crate::runtime::{ContractContainer, ContractWasmAPIVersion, StateDelta};
+    use freenet_stdlib::{client_api::ContractRequest, prelude::*};
+
     use crate::{
+        client_events::ClientId,
         contract::{
             contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
         },
-        ClientId, DynError, WrappedContract,
+        DynError,
     };
-    use freenet_stdlib::{client_api::ContractRequest, prelude::ContractCode};
-
-    use super::*;
 
     // Prepare and get handler for rocksdb
     async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {
