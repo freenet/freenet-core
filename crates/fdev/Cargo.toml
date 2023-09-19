@@ -32,5 +32,4 @@ xz2 = "0.1"
 
 # internal
 freenet-core = { path = "../core", version = "0.0.4" }
-# locutus-runtime = { path = "../locutus-runtime", version = "0.0.4" }
-freenet-stdlib = { path = "../stdlib", version = "0.0.4" }
+freenet-stdlib = { path = "../../stdlib/rust", version = "0.0.4" }
