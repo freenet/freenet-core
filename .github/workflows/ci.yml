@@ -17,7 +17,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        args: ["--no-default-features", "--all-features"]
+        args: ["--no-default-features", "--features default"]
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -29,69 +29,28 @@ jobs:
           access_token: ${{ github.token }}
 
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install stdlib packages
-        working-directory: stdlib/typescript
-        run: npm run dev.package
 
       - name: Build
         run: |
           cargo build --locked 
           cargo install --path ./crates/core
 
-      - name: Test - default
-        run: cargo test
-
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
-
-  build_target:
-    name: Build targets
-
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      matrix:
-        targets: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
-    env:
-      FREENET_LOG: error
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-
-    steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.11.0
-        with:
-          access_token: ${{ github.token }}
-
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build - freenet-stdlib
-        working-directory: stdlib/rust
-        run: cargo build --target ${{ matrix.targets }}
 
   clippy_check:
     name: Clippy
 
     runs-on: ubuntu-latest
 
-    strategy:
-      max-parallel: 1
-      matrix:
-        target: ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -103,21 +62,18 @@ jobs:
           access_token: ${{ github.token }}
 
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: clippy
-          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
       - name: clippy
         run: cargo clippy -- -D warnings
-
-      - name: clippy - freenet-stdlib
-        working-directory: stdlib/rust
-        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
 
   fmt_check:
     name: Fmt
@@ -126,6 +82,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
