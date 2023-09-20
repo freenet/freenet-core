@@ -1,6 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["rust", "rust-macros"]
-
-[profile.dev.package."*"]
-opt-level = 3

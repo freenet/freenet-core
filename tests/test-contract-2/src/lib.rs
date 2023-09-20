@@ -1,5 +1,3 @@
-use freenet_stdlib::prelude::*;
-
 #[no_mangle]
 pub extern "C" fn time_func() {
     freenet_stdlib::log::info("trying to get time");

@@ -38,7 +38,7 @@ struct Delegate;
 #[delegate]
 impl DelegateInterface for Delegate {
     fn process(
-        params: Parameters<'static>,
+        _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
