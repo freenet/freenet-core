@@ -2,8 +2,8 @@
 
 .ONESHELL:
 
-LOCUTUS_DIR := $(abspath ../../)
-DELEGATE_DIR := $(LOCUTUS_DIR)/modules/identity-management
+FREENET_DIR := $(abspath ../../)
+DELEGATE_DIR := $(FREENET_DIR)/modules/identity-management
 
 ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
@@ -16,8 +16,8 @@ all:
 	$(MAKE) build
 
 build-tool:
-	cd $(LOCUTUS_DIR)/crates/freenet-node && cargo build --release
-	cargo install --path $(LOCUTUS_DIR)/crates/freenet-node
+	cargo install --path $(FREENET_DIR)/crates/core
+	cargo install --path $(FREENET_DIR)/crates/fdev
 	
 build: \
 	build-delegate \

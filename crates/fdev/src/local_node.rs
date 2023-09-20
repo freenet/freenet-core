@@ -16,7 +16,7 @@ pub async fn run_local_node_client(
     }
 
     if config.clean_exit {
-        freenet_core::util::set_cleanup_on_exit()?;
+        freenet::util::set_cleanup_on_exit()?;
     }
 
     let app_state = state::AppState::new(&config).await?;

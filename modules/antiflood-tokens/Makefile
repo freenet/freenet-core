@@ -16,14 +16,14 @@ all:
 	$(MAKE) build-tool &&
 	$(MAKE) build-token-allocation
 
-build-token-allocation: \
+build: \
 	build-token-allocation-contract \
 	build-token-generator \
 	generate-token-allocation-code-hash generate-token-generator-delegate-code-hash
 
 build-tool:
-	cd $(FREENET_DIR)/crates/freenet-node && cargo build --release
-	cargo install --path $(FREENET_DIR)/crates/freenet-node
+	cargo install --force --path $(FREENET_DIR)/crates/core
+	cargo install --force --path $(FREENET_DIR)/crates/fdev
 	
 build-token-allocation-contract:
 	cd $(AFT_RECORD)
@@ -35,13 +35,13 @@ build-token-generator:
 
 generate-token-allocation-code-hash:
 	cd $(AFT_RECORD)
-	hash=$$(bash -c "fdev inspect build/freenet/locutus_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
+	hash=$$(bash -c "fdev inspect build/freenet/freenet_token_allocation_record code | grep 'code hash:' | cut -d' ' -f3")
 	mkdir -p $(AFT_RECORD)/build
 	echo -n $$hash > $(AFT_RECORD)/build/token_allocation_record_code_hash
 
 generate-token-generator-delegate-code-hash:
 	cd $(AFT_GENERATOR)
-	hash=$$(bash -c "fdev inspect build/freenet/locutus_token_generator delegate | grep 'code hash:' | cut -d' ' -f3")
+	hash=$$(bash -c "fdev inspect build/freenet/freenet_token_generator delegate | grep 'code hash:' | cut -d' ' -f3")
 	mkdir -p $(AFT_GENERATOR)/build
 	echo -n $$hash > $(AFT_GENERATOR)/build/token_generator_code_hash
 

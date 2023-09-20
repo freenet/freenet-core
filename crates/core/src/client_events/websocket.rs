@@ -30,28 +30,36 @@ use crate::{
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 
+#[derive(Clone)]
+struct WebSocketRequest(mpsc::Sender<ClientConnection>);
+
+impl std::ops::Deref for WebSocketRequest {
+    type Target = mpsc::Sender<ClientConnection>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub(crate) struct WebSocketProxy {
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
-    pub(crate) attested_contracts: HashMap<AuthToken, (ContractInstanceId, ClientId)>,
 }
 
+const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
+
 impl WebSocketProxy {
-    pub fn as_router(
-        server_routing: Router,
-        proxy_server_request: mpsc::Receiver<ClientConnection>,
-        request_sender_to_server: mpsc::Sender<ClientConnection>,
-    ) -> (Self, Router) {
+    pub fn as_router(server_routing: Router) -> (Self, Router) {
+        let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
+
         let router = server_routing
             .route("/contract/command", get(websocket_commands))
-            .layer(Extension(request_sender_to_server))
+            .layer(Extension(WebSocketRequest(proxy_request_sender)))
             .layer(axum::middleware::from_fn(connection_info));
-
         (
             WebSocketProxy {
                 proxy_server_request,
                 response_channels: HashMap::new(),
-                attested_contracts: HashMap::new(),
             },
             router,
         )
@@ -62,20 +70,13 @@ impl WebSocketProxy {
         msg: ClientConnection,
     ) -> Result<Option<OpenRequest>, ClientError> {
         match msg {
-            ClientConnection::NewConnection {
-                notifications,
-                assigned_token,
-            } => {
+            ClientConnection::NewConnection { callbacks, .. } => {
                 // is a new client, assign an id and open a channel to communicate responses from the node
                 let cli_id = ClientId::next();
-                notifications
+                callbacks
                     .send(HostCallbackResult::NewId { id: cli_id })
                     .map_err(|_e| ErrorKind::NodeUnavailable)?;
-                self.response_channels.insert(cli_id, notifications);
-                if let Some((assigned_token, contract)) = assigned_token {
-                    self.attested_contracts
-                        .insert(assigned_token, (contract, cli_id));
-                }
+                self.response_channels.insert(cli_id, callbacks);
                 Ok(None)
             }
             ClientConnection::Request {
@@ -111,6 +112,45 @@ impl WebSocketProxy {
             }
         }
     }
+}
+
+struct EncodingProtocolExt(EncodingProtocol);
+
+impl axum::headers::Header for EncodingProtocolExt {
+    fn name() -> &'static axum::http::HeaderName {
+        static HEADER: OnceLock<axum::http::HeaderName> = OnceLock::new();
+        HEADER.get_or_init(|| axum::http::HeaderName::from_static("encoding-protocol"))
+    }
+
+    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
+    where
+        Self: Sized,
+        I: Iterator<Item = &'i axum::http::HeaderValue>,
+    {
+        values
+            .next()
+            .and_then(|val| match val.to_str().ok()? {
+                "native" => Some(EncodingProtocolExt(EncodingProtocol::Native)),
+                "flatbuffers" => Some(EncodingProtocolExt(EncodingProtocol::Flatbuffers)),
+                _ => None,
+            })
+            .ok_or_else(axum::headers::Error::invalid)
+    }
+
+    fn encode<E: Extend<axum::http::HeaderValue>>(&self, values: &mut E) {
+        let header = match self.0 {
+            EncodingProtocol::Native => axum::http::HeaderValue::from_static("native"),
+            EncodingProtocol::Flatbuffers => axum::http::HeaderValue::from_static("flatbuffers"),
+        };
+        values.extend([header]);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionInfo {
+    auth_token: Option<AuthToken>,
+    encoding_protocol: Option<EncodingProtocol>,
 }
 
 async fn connection_info<B>(
@@ -172,103 +212,11 @@ async fn connection_info<B>(
     next.run(req).await
 }
 
-struct EncodingProtocolExt(EncodingProtocol);
-
-impl axum::headers::Header for EncodingProtocolExt {
-    fn name() -> &'static axum::http::HeaderName {
-        static HEADER: OnceLock<axum::http::HeaderName> = OnceLock::new();
-        HEADER.get_or_init(|| axum::http::HeaderName::from_static("encoding-protocol"))
-    }
-
-    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
-    where
-        Self: Sized,
-        I: Iterator<Item = &'i axum::http::HeaderValue>,
-    {
-        values
-            .next()
-            .and_then(|val| match val.to_str().ok()? {
-                "native" => Some(EncodingProtocolExt(EncodingProtocol::Native)),
-                "flatbuffers" => Some(EncodingProtocolExt(EncodingProtocol::Flatbuffers)),
-                _ => None,
-            })
-            .ok_or_else(axum::headers::Error::invalid)
-    }
-
-    fn encode<E: Extend<axum::http::HeaderValue>>(&self, values: &mut E) {
-        let header = match self.0 {
-            EncodingProtocol::Native => axum::http::HeaderValue::from_static("native"),
-            EncodingProtocol::Flatbuffers => axum::http::HeaderValue::from_static("flatbuffers"),
-        };
-        values.extend([header]);
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnectionInfo {
-    auth_token: Option<AuthToken>,
-    encoding_protocol: Option<EncodingProtocol>,
-}
-
-// work around for rustc issue #64552
-struct StaticOpenRequest(OpenRequest<'static>);
-
-impl From<OpenRequest<'static>> for StaticOpenRequest {
-    fn from(val: OpenRequest<'static>) -> Self {
-        StaticOpenRequest(val)
-    }
-}
-
-impl ClientEventsProxy for WebSocketProxy {
-    fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
-        async move {
-            loop {
-                let msg = self.proxy_server_request.recv().await;
-                if let Some(msg) = msg {
-                    if let Some(reply) = self.internal_proxy_recv(msg).await? {
-                        break Ok(reply.into_owned());
-                    }
-                } else {
-                    todo!()
-                }
-            }
-        }
-        .boxed()
-    }
-
-    fn send(
-        &mut self,
-        id: ClientId,
-        result: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<Result<(), ClientError>> {
-        async move {
-            if let Some(ch) = self.response_channels.remove(&id) {
-                let should_rm = result
-                    .as_ref()
-                    .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
-                    .err()
-                    .unwrap_or(false);
-                if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
-                    // still alive connection, keep it
-                    self.response_channels.insert(id, ch);
-                } else {
-                    tracing::info!("dropped connection to client #{id}");
-                }
-            } else {
-                tracing::warn!("client: {id} not found");
-            }
-            Ok(())
-        }
-        .boxed()
-    }
-}
-
 async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
-    Extension(rs): Extension<mpsc::Sender<ClientConnection>>,
+    Extension(rs): Extension<WebSocketRequest>,
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
         if let Err(e) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
@@ -279,7 +227,7 @@ async fn websocket_commands(
 }
 
 async fn websocket_interface(
-    request_sender: mpsc::Sender<ClientConnection>,
+    request_sender: WebSocketRequest,
     mut auth_token: Option<AuthToken>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
@@ -376,12 +324,12 @@ async fn websocket_interface(
 }
 
 async fn new_client_connection(
-    request_sender: &mpsc::Sender<ClientConnection>,
+    request_sender: &WebSocketRequest,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection {
-            notifications: response_sender,
+            callbacks: response_sender,
             assigned_token: None,
         })
         .await
@@ -513,5 +461,49 @@ async fn process_host_response(
             tracing::warn!("node shut down while handling responses for {client_id}");
             Err(format!("node shut down while handling responses for {client_id}").into())
         }
+    }
+}
+
+impl ClientEventsProxy for WebSocketProxy {
+    fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
+        async move {
+            loop {
+                let msg = self.proxy_server_request.recv().await;
+                if let Some(msg) = msg {
+                    if let Some(reply) = self.internal_proxy_recv(msg).await? {
+                        break Ok(reply.into_owned());
+                    }
+                } else {
+                    todo!()
+                }
+            }
+        }
+        .boxed()
+    }
+
+    fn send(
+        &mut self,
+        id: ClientId,
+        result: Result<HostResponse, ClientError>,
+    ) -> BoxFuture<Result<(), ClientError>> {
+        async move {
+            if let Some(ch) = self.response_channels.remove(&id) {
+                let should_rm = result
+                    .as_ref()
+                    .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
+                    .err()
+                    .unwrap_or(false);
+                if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
+                    // still alive connection, keep it
+                    self.response_channels.insert(id, ch);
+                } else {
+                    tracing::info!("dropped connection to client #{id}");
+                }
+            } else {
+                tracing::warn!("client: {id} not found");
+            }
+            Ok(())
+        }
+        .boxed()
     }
 }

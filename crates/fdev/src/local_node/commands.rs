@@ -1,4 +1,4 @@
-use freenet_core::dev_tool::ClientId;
+use freenet::dev_tool::ClientId;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 
 use crate::{CommandReceiver, DynError};

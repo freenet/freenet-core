@@ -2,7 +2,7 @@ use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail};
 use clap::Parser;
-use freenet_core::network_sim::*;
+use freenet::network_sim::*;
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
     prelude::*,

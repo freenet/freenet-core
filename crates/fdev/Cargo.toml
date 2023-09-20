@@ -31,5 +31,5 @@ toml = { version = "0.8", features = ["default", "preserve_order"] }
 xz2 = "0.1"
 
 # internal
-freenet-core = { path = "../core", version = "0.0.4" }
+freenet = { path = "../core", version = "0.0.4" }
 freenet-stdlib = { path = "../../stdlib/rust", version = "0.0.4" }

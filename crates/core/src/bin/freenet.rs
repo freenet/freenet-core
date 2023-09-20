@@ -1,5 +1,5 @@
 use clap::Parser;
-use freenet_core::local_node::{Executor, NodeConfig, OperationMode};
+use freenet::local_node::{Executor, NodeConfig, OperationMode};
 use std::net::SocketAddr;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -18,7 +18,7 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
     let ip = config.address;
     let executor = Executor::from_config(config).await?;
     let socket: SocketAddr = (ip, port).into();
-    freenet_core::server::local_node::run_local_node(executor, socket).await
+    freenet::server::local_node::run_local_node(executor, socket).await
 }
 
 fn main() -> Result<(), DynError> {

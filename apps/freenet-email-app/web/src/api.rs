@@ -357,7 +357,7 @@ mod identity_management {
     ) -> Result<DelegateKey, DynError> {
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let secret_id = params.as_secret_id();
-        let params = params.try_into()?;
+        let params = Parameters::try_from(params)?;
         let key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
         crate::log::debug!("loading aliases ({key})");
         let request = DelegateRequest::GetSecretRequest {

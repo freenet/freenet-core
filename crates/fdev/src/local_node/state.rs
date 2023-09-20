@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, sync::Arc};
 
-use freenet_core::dev_tool::{
+use freenet::dev_tool::{
     Config, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore, StateStore,
     Storage,
 };
@@ -32,7 +32,7 @@ impl AppState {
                     SecretsStore::default(),
                     state_store,
                     || {
-                        freenet_core::util::set_cleanup_on_exit().unwrap();
+                        freenet::util::set_cleanup_on_exit().unwrap();
                     },
                     OperationMode::Local,
                 )

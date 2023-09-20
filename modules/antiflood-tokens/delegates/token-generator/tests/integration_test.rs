@@ -11,10 +11,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use freenet_aft_interface::{
-    AllocationCriteria, DelegateParameters, Tier, TokenAllocationRecord, TokenAssignment,
-};
-use freenet_core::runtime::{
+use freenet::runtime::{
     ContractStore,
     DelegateRuntimeInterface,
     DelegateStore,
@@ -23,6 +20,9 @@ use freenet_core::runtime::{
     SecretsStore,
     // ApplicationMessage,
     // SecretsId,
+};
+use freenet_aft_interface::{
+    AllocationCriteria, DelegateParameters, Tier, TokenAllocationRecord, TokenAssignment,
 };
 use freenet_stdlib::prelude::*;
 

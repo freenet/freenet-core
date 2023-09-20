@@ -1,5 +1,5 @@
 [package]
-name = "freenet-core"
+name = "freenet"
 version = "0.0.4"
 edition = "2021"
 rust-version = "1.71.1"
@@ -18,7 +18,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true}
 asynchronous-codec = "0.6"
 async-trait = "0.1"
 arrayvec = { workspace = true }
-axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path", "headers", "query", "http2"] }
+axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path", "headers", "query", "http1"] }
 bincode = "1"
 blake3 = { workspace = true }
 bytes = "1"

@@ -7,7 +7,7 @@ use std::{
 };
 
 use either::Either;
-use freenet_core::dev_tool::{ClientEventsProxy, ClientId, OpenRequest};
+use freenet::dev_tool::{ClientEventsProxy, ClientId, OpenRequest};
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse},
     prelude::*,

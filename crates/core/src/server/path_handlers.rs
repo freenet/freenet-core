@@ -13,13 +13,16 @@ use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
 use crate::client_events::AuthToken;
 
-use super::{errors::WebSocketApiError, ClientConnection, HostCallbackResult};
+use super::{
+    errors::WebSocketApiError, http_gateway::HttpGatewayRequest, ClientConnection,
+    HostCallbackResult,
+};
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 pub(super) async fn contract_home(
     key: String,
-    request_sender: mpsc::Sender<ClientConnection>,
+    request_sender: HttpGatewayRequest,
     assigned_token: AuthToken,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let key = ContractKey::from_id(key)
@@ -30,7 +33,7 @@ pub(super) async fn contract_home(
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection {
-            notifications: response_sender,
+            callbacks: response_sender,
             assigned_token: Some((assigned_token, key.clone().into())),
         })
         .await
@@ -127,7 +130,7 @@ pub(super) async fn contract_home(
         }
         None => {
             return Err(WebSocketApiError::NodeError {
-                error_cause: "Not contact found".to_string(),
+                error_cause: format!("Contract not found: {key}"),
             });
         }
         other => unreachable!("received unexpected node response: {other:?}"),

@@ -53,10 +53,15 @@ impl From<WebSocketApiError> for Response {
 impl IntoResponse for WebSocketApiError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
-            WebSocketApiError::InvalidParam { error_cause: cause } => {
-                (StatusCode::BAD_REQUEST, cause)
+            WebSocketApiError::InvalidParam { error_cause } => {
+                (StatusCode::BAD_REQUEST, error_cause)
             }
-            WebSocketApiError::NodeError { error_cause: cause } => (StatusCode::BAD_GATEWAY, cause),
+            WebSocketApiError::NodeError { error_cause }
+                if error_cause.starts_with("Contract not found") =>
+            {
+                (StatusCode::NOT_FOUND, error_cause)
+            }
+            WebSocketApiError::NodeError { error_cause } => (StatusCode::BAD_GATEWAY, error_cause),
             WebSocketApiError::AxumError { error } => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}"))
             }

@@ -13,7 +13,7 @@ use crate::client_events::{AuthToken, ClientId, HostResult};
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ClientConnection {
     NewConnection {
-        notifications: tokio::sync::mpsc::UnboundedSender<HostCallbackResult>,
+        callbacks: tokio::sync::mpsc::UnboundedSender<HostCallbackResult>,
         assigned_token: Option<(AuthToken, ContractInstanceId)>,
     },
     Request {
@@ -44,7 +44,7 @@ pub mod local_node {
 
     use axum::Router;
     use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
-    use tokio::sync::mpsc;
+    use futures::TryFutureExt;
     use tower_http::trace::TraceLayer;
 
     use crate::{
@@ -55,14 +55,15 @@ pub mod local_node {
 
     use super::http_gateway::HttpGateway;
 
-    const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
-
-    async fn serve(socket: SocketAddr, router: Router) {
+    fn serve(socket: SocketAddr, router: Router) {
         tracing::info!("listening on {}", socket);
-        axum::Server::bind(&socket)
-            .serve(router.into_make_service())
-            .await
-            .expect("Server unable to start");
+        tokio::spawn(
+            axum::Server::bind(&socket)
+                .serve(router.into_make_service())
+                .map_err(|e| {
+                    tracing::error!("error while running HTTP gateway server: {e}");
+                }),
+        );
     }
 
     pub async fn run_local_node(
@@ -78,24 +79,37 @@ pub mod local_node {
             }
             _ => {}
         }
-        let (proxy_request_sender, request_to_server) = mpsc::channel(PARALLELISM);
-        let router = HttpGateway::as_router(&socket);
-        let (mut ws_proxy, router) =
-            WebSocketProxy::as_router(router, request_to_server, proxy_request_sender);
+        let (mut gw, gw_router) = HttpGateway::as_router(&socket);
+        let (mut ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
 
-        // FIXME: use combinator
+        serve(socket, ws_router.layer(TraceLayer::new_for_http()));
+
+        // FIXME: use combinator instead
         // let mut all_clients =
         //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
-        serve(socket, router.layer(TraceLayer::new_for_http())).await;
-
+        enum Receiver {
+            Ws,
+            Gw,
+        }
+        let mut receiver;
         loop {
+            let req = tokio::select! {
+                req = ws_proxy.recv() => {
+                    receiver = Receiver::Ws;
+                    req?
+                }
+                req = gw.recv() => {
+                    receiver = Receiver::Gw;
+                    req?
+                }
+            };
             let OpenRequest {
                 id,
                 request,
                 notification_channel,
                 token,
                 ..
-            } = ws_proxy.recv().await?;
+            } = req;
             tracing::trace!(cli_id = %id, "got request -> {request}");
 
             let res = match *request {
@@ -105,8 +119,8 @@ pub mod local_node {
                         .await
                 }
                 ClientRequest::DelegateOp(op) => {
-                    let attested_contract = token
-                        .and_then(|token| ws_proxy.attested_contracts.get(&token).map(|(t, _)| t));
+                    let attested_contract =
+                        token.and_then(|token| gw.attested_contracts.get(&token).map(|(t, _)| t));
                     executor.delegate_request(op, attested_contract)
                 }
                 ClientRequest::Disconnect { cause } => {
@@ -114,12 +128,12 @@ pub mod local_node {
                         tracing::info!("disconnecting cause: {cause}");
                     }
                     // todo: token must live for a bit to allow reconnections
-                    if let Some(rm_token) = ws_proxy
+                    if let Some(rm_token) = gw
                         .attested_contracts
                         .iter()
                         .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
                     {
-                        ws_proxy.attested_contracts.remove(&rm_token);
+                        gw.attested_contracts.remove(&rm_token);
                     }
                     continue;
                 }
@@ -128,19 +142,25 @@ pub mod local_node {
 
             match res {
                 Ok(res) => {
-                    ws_proxy.send(id, Ok(res)).await?;
+                    match receiver {
+                        Receiver::Ws => ws_proxy.send(id, Ok(res)).await?,
+                        Receiver::Gw => gw.send(id, Ok(res)).await?,
+                    };
                 }
                 Err(err) => {
                     tracing::error!("{err}");
-                    ws_proxy
-                        .send(
-                            id,
-                            Err(ErrorKind::Unhandled {
-                                cause: format!("{err}"),
-                            }
-                            .into()),
-                        )
-                        .await?;
+                    let err = Err(ErrorKind::Unhandled {
+                        cause: format!("{err}"),
+                    }
+                    .into());
+                    match receiver {
+                        Receiver::Ws => {
+                            ws_proxy.send(id, err).await?;
+                        }
+                        Receiver::Gw => {
+                            gw.send(id, err).await?;
+                        }
+                    };
                 }
             }
         }

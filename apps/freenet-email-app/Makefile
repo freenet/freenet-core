@@ -24,8 +24,8 @@ build: \
 	publish-webapp
 
 build-tool:
-	cd $(FREENET_DIR)/crates/core && cargo build --release
-	cargo install --path $(FREENET_DIR)/crates/core
+	cargo install --force --path $(FREENET_DIR)/crates/core
+	cargo install --force --path $(FREENET_DIR)/crates/fdev
 
 generate-id-manager-key:
 	FILE="$(IDENTITY_DELEGATE)/build/identity-manager-key.private.pem"
@@ -33,10 +33,7 @@ generate-id-manager-key:
 		cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(IDENTITY_DELEGATE)/build/"
 	fi
 
-build-inbox: \
-	generate-inbox-contract-code-hash
-
-generate-inbox-contract-code-hash:
+build-inbox:
 	cd $(INBOX_DIR)
 	fdev build --features contract
 	hash=$$(bash -c "fdev inspect build/freenet/freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3")
