@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
 const PRIVATE_KEY: [u8; 3] = [1, 2, 3];
@@ -38,7 +38,7 @@ struct Delegate;
 #[delegate]
 impl DelegateInterface for Delegate {
     fn process(
-        params: Parameters<'static>,
+        _params: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {

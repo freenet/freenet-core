@@ -9,7 +9,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-locutus-stdlib = { path = "../../crates/locutus-stdlib", features = ["contract"] }
+freenet-stdlib = { path = "../../stdlib/rust", features = ["contract"] }
 
 [features]
-trace = ["locutus-stdlib/trace"]
+trace = ["freenet-stdlib/trace"]

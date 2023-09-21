@@ -3,7 +3,7 @@ use super::*;
 mod token_assignment {
     use super::*;
     use chrono::{NaiveDate, Timelike};
-    use locutus_aft_interface::Tier;
+    use freenet_aft_interface::Tier;
     use once_cell::sync::Lazy;
     use rsa::{pkcs1v15::Signature, RsaPublicKey};
 

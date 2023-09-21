@@ -12,9 +12,9 @@ use chacha20poly1305::{
 use chrono::{DateTime, Utc};
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use locutus_aft_interface::{Tier, TokenAssignment, TokenAssignmentHash};
-use locutus_stdlib::prelude::StateSummary;
-use locutus_stdlib::{
+use freenet_aft_interface::{Tier, TokenAssignment, TokenAssignmentHash};
+use freenet_stdlib::prelude::StateSummary;
+use freenet_stdlib::{
     client_api::ContractRequest,
     prelude::{
         blake3::{self, traits::digest::Digest},
@@ -541,7 +541,7 @@ impl InboxModel {
 
 #[cfg(test)]
 mod tests {
-    use locutus_stdlib::prelude::ContractCode;
+    use freenet_stdlib::prelude::ContractCode;
 
     use super::*;
 

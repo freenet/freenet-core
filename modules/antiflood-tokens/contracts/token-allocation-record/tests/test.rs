@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use locutus_stdlib::prelude::{ContractInterface, Parameters, State, StateDelta, UpdateData};
-use locutus_token_allocation_record::TokenAllocContract;
+use freenet_stdlib::prelude::{ContractInterface, Parameters, State, StateDelta, UpdateData};
+use freenet_token_allocation_record::TokenAllocContract;
 
 #[test]
 fn test() {
     const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
-    let path = Path::new(MANIFEST_DIR).join("build/locutus/contract-state");
+    let path = Path::new(MANIFEST_DIR).join("build/freenet/contract-state");
     let init_state: State = std::fs::read(path).unwrap().into();
     let params: Parameters = vec![
         123, 34, 103, 101, 110, 101, 114, 97, 116, 111, 114, 95, 112, 117, 98, 108, 105, 99, 95,

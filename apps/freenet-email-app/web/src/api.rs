@@ -4,8 +4,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::OnceLock};
 use dioxus::prelude::UseSharedState;
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
 use futures::SinkExt;
-use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
-use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+use freenet_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
+use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 
 use crate::app::{ContractType, InboxController};
 use crate::DynError;
@@ -24,7 +24,7 @@ struct WebApi {
     client_errors: UnboundedReceiver<AsyncActionResult>,
     send_half: ClientRequester,
     error_sender: NodeResponses,
-    api: locutus_stdlib::client_api::WebApi,
+    api: freenet_stdlib::client_api::WebApi,
     connecting: Option<futures::channel::oneshot::Receiver<()>>,
 }
 
@@ -66,7 +66,7 @@ impl WebApi {
             let _ = tx.send(());
             crate::log::debug!("connected to websocket");
         };
-        let mut api = locutus_stdlib::client_api::WebApi::start(
+        let mut api = freenet_stdlib::client_api::WebApi::start(
             conn,
             result_handler,
             |err| {
@@ -116,12 +116,12 @@ impl WebApiRequestClient {
     #[cfg(feature = "use-node")]
     pub async fn send(
         &mut self,
-        request: locutus_stdlib::client_api::ClientRequest<'static>,
-    ) -> Result<(), locutus_stdlib::client_api::Error> {
+        request: freenet_stdlib::client_api::ClientRequest<'static>,
+    ) -> Result<(), freenet_stdlib::client_api::Error> {
         self.sender
             .send(request)
             .await
-            .map_err(|_| locutus_stdlib::client_api::Error::ChannelClosed)?;
+            .map_err(|_| freenet_stdlib::client_api::Error::ChannelClosed)?;
         self.sender.flush().await.unwrap();
         Ok(())
     }
@@ -129,8 +129,8 @@ impl WebApiRequestClient {
     #[cfg(not(feature = "use-node"))]
     pub async fn send(
         &mut self,
-        request: locutus_stdlib::client_api::ClientRequest<'static>,
-    ) -> Result<(), locutus_stdlib::client_api::Error> {
+        request: freenet_stdlib::client_api::ClientRequest<'static>,
+    ) -> Result<(), freenet_stdlib::client_api::Error> {
         tracing::debug!(?request, "emulated request");
         Ok(())
     }
@@ -152,7 +152,7 @@ impl From<WebApiRequestClient> for NodeResponses {
 
 #[cfg(feature = "use-node")]
 mod contract_api {
-    use locutus_stdlib::{client_api::ContractRequest, prelude::*};
+    use freenet_stdlib::{client_api::ContractRequest, prelude::*};
 
     use super::*;
 
@@ -178,7 +178,7 @@ mod contract_api {
 
 #[cfg(feature = "use-node")]
 mod delegate_api {
-    use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
+    use freenet_stdlib::{client_api::DelegateRequest, prelude::*};
 
     use super::*;
 
@@ -203,7 +203,7 @@ mod delegate_api {
 
 #[cfg(feature = "use-node")]
 mod inbox_management {
-    use locutus_stdlib::prelude::*;
+    use freenet_stdlib::prelude::*;
     use rsa::RsaPrivateKey;
 
     use freenet_email_inbox::{InboxParams, InboxSettings};
@@ -211,7 +211,7 @@ mod inbox_management {
     use super::*;
 
     const INBOX_CODE: &[u8] =
-        include_bytes!("../../contracts/inbox/build/locutus/freenet_email_inbox");
+        include_bytes!("../../contracts/inbox/build/freenet/freenet_email_inbox");
 
     thread_local! {
         pub(super) static CREATED_INBOX: RefCell<Vec<(Rc<str>, ContractKey)>> = RefCell::new(Vec::new());
@@ -241,13 +241,13 @@ mod inbox_management {
 
 #[cfg(feature = "use-node")]
 mod token_record_management {
-    use locutus_aft_interface::{TokenAllocationRecord, TokenDelegateParameters};
-    use locutus_stdlib::prelude::*;
+    use freenet_aft_interface::{TokenAllocationRecord, TokenDelegateParameters};
+    use freenet_stdlib::prelude::*;
     use rsa::RsaPrivateKey;
 
     use super::*;
 
-    const TOKEN_RECORD_CODE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/locutus/locutus_token_allocation_record");
+    const TOKEN_RECORD_CODE: &[u8] = include_bytes!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/freenet/freenet_token_allocation_record");
 
     thread_local! {
         pub(super) static CREATED_AFT_RECORD: RefCell<Vec<(Rc<str>, ContractKey)>> = RefCell::new(Vec::new());
@@ -277,8 +277,8 @@ mod token_record_management {
 
 #[cfg(feature = "use-node")]
 mod token_generator_management {
-    use locutus_aft_interface::DelegateParameters;
-    use locutus_stdlib::prelude::DelegateKey;
+    use freenet_aft_interface::DelegateParameters;
+    use freenet_stdlib::prelude::DelegateKey;
     use rsa::RsaPrivateKey;
 
     use super::*;
@@ -286,7 +286,7 @@ mod token_generator_management {
     const TOKEN_GEN_CODE_HASH: &str =
         include_str!("../../../../modules/antiflood-tokens/delegates/token-generator/build/token_generator_code_hash");
     const TOKEN_GEN_CODE: &[u8] =
-        include_bytes!("../../../../modules/antiflood-tokens/delegates/token-generator/build/locutus/locutus_token_generator");
+        include_bytes!("../../../../modules/antiflood-tokens/delegates/token-generator/build/freenet/freenet_token_generator");
 
     thread_local! {
         pub(super) static CREATED_AFT_GEN: RefCell<Vec<(Rc<str>, DelegateKey)>> = RefCell::new(Vec::new());
@@ -314,7 +314,7 @@ mod identity_management {
     use std::rc::Rc;
 
     use ::identity_management::*;
-    use locutus_stdlib::{client_api::DelegateRequest, prelude::*};
+    use freenet_stdlib::{client_api::DelegateRequest, prelude::*};
     use rsa::RsaPrivateKey;
 
     use crate::aft::AftRecords;
@@ -326,7 +326,7 @@ mod identity_management {
     const ID_MANAGER_CODE_HASH: &str =
         include_str!("../../../../modules/identity-management/build/identity_management_code_hash");
     const ID_MANAGER_CODE: &[u8] =
-        include_bytes!("../../../../modules/identity-management/build/locutus/identity_management");
+        include_bytes!("../../../../modules/identity-management/build/freenet/identity_management");
     const ID_MANAGER_KEY: &[u8] =
         include_bytes!("../../../../modules/identity-management/build/identity-manager-params");
 
@@ -357,7 +357,7 @@ mod identity_management {
     ) -> Result<DelegateKey, DynError> {
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let secret_id = params.as_secret_id();
-        let params = params.try_into()?;
+        let params = Parameters::try_from(params)?;
         let key = DelegateKey::from_params(ID_MANAGER_CODE_HASH, &params)?;
         crate::log::debug!("loading aliases ({key})");
         let request = DelegateRequest::GetSecretRequest {
@@ -500,7 +500,7 @@ pub(crate) async fn node_comms(
     // todo don't unwrap inside this function, propagate errors to the UI somehow
     use freenet_email_inbox::Inbox as StoredInbox;
     use futures::StreamExt;
-    use locutus_stdlib::{
+    use freenet_stdlib::{
         client_api::{ContractError, ContractResponse, DelegateError, ErrorKind, RequestError},
         prelude::*,
     };
@@ -953,7 +953,7 @@ pub(crate) async fn node_comms(
                 }
                 for msg in values {
                     match msg {
-                        locutus_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
+                        freenet_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(msg) => {
                             let token = match TokenDelegateMessage::try_from(msg.payload.as_slice())
                             {
                                 Ok(r) => r,

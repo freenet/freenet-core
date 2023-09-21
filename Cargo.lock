@@ -87,9 +87,9 @@ dependencies = [
 
 [[package]]
 name = "aho-corasick"
-version = "1.0.5"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c378d78423fdad8089616f827526ee33c19f2fddbd5de1629152c9593ba4783"
+checksum = "0f2135563fb5c609d2b2b87c1e8ce7bc41b0b45430fa9661f457981503dd5bf0"
 dependencies = [
  "memchr",
 ]
@@ -1052,9 +1052,9 @@ dependencies = [
 
 [[package]]
 name = "curl-sys"
-version = "0.4.65+curl-8.2.1"
+version = "0.4.66+curl-8.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "961ba061c9ef2fe34bbd12b807152d96f0badd2bebe7b90ce6c8c8b7572a0986"
+checksum = "70c44a72e830f0e40ad90dda8a6ab6ed6314d39776599a58a2e5e37fbc6db5b9"
 dependencies = [
  "cc",
  "libc",
@@ -1062,7 +1062,7 @@ dependencies = [
  "openssl-sys",
  "pkg-config",
  "vcpkg",
- "winapi",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1459,6 +1459,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6999dc1837253364c2ebb0704ba97994bd874e8f195d665c50b7548f6ea92764"
 
 [[package]]
+name = "fdev"
+version = "0.0.4"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "bs58",
+ "clap",
+ "either",
+ "freenet",
+ "freenet-stdlib",
+ "futures",
+ "glob",
+ "pico-args",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tar",
+ "thiserror",
+ "tokio",
+ "toml 0.8.0",
+ "tracing",
+ "tracing-subscriber",
+ "xz2",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1527,6 +1554,104 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a62bc1cf6f830c2ec14a513a9fb124d0a213a629668a4186f329db21fe045652"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "freenet"
+version = "0.0.4"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "arrayvec",
+ "async-trait",
+ "asynchronous-codec",
+ "axum",
+ "bincode",
+ "blake3",
+ "bs58",
+ "bytes",
+ "chacha20poly1305 0.10.1",
+ "chrono",
+ "clap",
+ "config",
+ "cookie",
+ "crossbeam",
+ "ctrlc",
+ "dashmap",
+ "directories",
+ "either",
+ "freenet-stdlib",
+ "futures",
+ "itertools",
+ "libp2p",
+ "notify",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry-jaeger",
+ "ordered-float 3.9.1",
+ "parking_lot",
+ "pav_regression",
+ "pico-args",
+ "rand",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "sqlx",
+ "stretto",
+ "thiserror",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "unsigned-varint",
+ "uuid",
+ "wasmer",
+]
+
+[[package]]
+name = "freenet-macros"
+version = "0.0.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.37",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.0.5"
+dependencies = [
+ "arbitrary",
+ "arrayvec",
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros",
+ "futures",
+ "js-sys",
+ "once_cell",
+ "rand",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen 0.6.0",
+ "serde_bytes",
+ "serde_json",
+ "serde_with",
+ "tar",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "wasmer",
+ "web-sys",
+ "xz2",
 ]
 
 [[package]]
@@ -1822,9 +1947,9 @@ dependencies = [
 
 [[package]]
 name = "hermit-abi"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "443144c8cdadd93ebf52ddb4056d257f5b52c04d3c804e657d19eb73fc33668b"
+checksum = "d77f7ec81a6d05a3abb01ab6eb7590f6083d08449fe5a1c8b1e620283546ccb7"
 
 [[package]]
 name = "hex"
@@ -2678,188 +2803,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "locutus"
-version = "0.0.3"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bincode",
- "byteorder",
- "bytes",
- "clap",
- "cookie",
- "futures",
- "locutus-core",
- "locutus-dev",
- "locutus-stdlib",
- "serde",
- "serde_json",
- "tar",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "xz2",
-]
-
-[[package]]
-name = "locutus-core"
-version = "0.0.3"
-dependencies = [
- "anyhow",
- "arbitrary",
- "arrayvec",
- "async-trait",
- "asynchronous-codec",
- "axum",
- "bincode",
- "blake3",
- "bs58",
- "chacha20poly1305 0.10.1",
- "clap",
- "config",
- "crossbeam",
- "ctrlc",
- "dashmap",
- "directories",
- "either",
- "futures",
- "itertools",
- "libp2p",
- "locutus-runtime",
- "locutus-stdlib",
- "once_cell",
- "opentelemetry",
- "opentelemetry-jaeger",
- "ordered-float 3.9.1",
- "parking_lot",
- "pav_regression",
- "pico-args",
- "rand",
- "rocksdb",
- "serde",
- "serde_with",
- "sqlx",
- "stretto",
- "thiserror",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "unsigned-varint",
- "uuid",
-]
-
-[[package]]
-name = "locutus-dev"
-version = "0.0.3"
-dependencies = [
- "bincode",
- "bs58",
- "clap",
- "either",
- "futures",
- "glob",
- "locutus-core",
- "locutus-runtime",
- "locutus-stdlib",
- "pico-args",
- "semver",
- "serde",
- "serde_json",
- "serde_with",
- "tar",
- "thiserror",
- "tokio",
- "toml 0.8.0",
- "tracing",
- "tracing-subscriber",
- "xz2",
-]
-
-[[package]]
-name = "locutus-macros"
-version = "0.0.3"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.37",
-]
-
-[[package]]
-name = "locutus-runtime"
-version = "0.0.3"
-dependencies = [
- "arbitrary",
- "arrayvec",
- "async-trait",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chacha20poly1305 0.10.1",
- "chrono",
- "dashmap",
- "either",
- "futures",
- "locutus-stdlib",
- "notify",
- "once_cell",
- "rand",
- "rmp-serde",
- "rmpv",
- "rsa",
- "serde",
- "serde_bytes",
- "serde_json",
- "stretto",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "varuint",
- "walkdir",
- "wasmer",
-]
-
-[[package]]
-name = "locutus-stdlib"
-version = "0.0.3"
-dependencies = [
- "arbitrary",
- "arrayvec",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chrono",
- "flatbuffers",
- "futures",
- "js-sys",
- "locutus-macros",
- "once_cell",
- "rand",
- "semver",
- "serde",
- "serde-wasm-bindgen 0.6.0",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "tar",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "wasmer",
- "web-sys",
- "xz2",
-]
-
-[[package]]
 name = "log"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3241,7 +3184,6 @@ dependencies = [
  "num-iter",
  "num-traits",
  "rand",
- "serde",
  "smallvec",
  "zeroize",
 ]
@@ -4137,38 +4079,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmp"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f9860a6cc38ed1da53456442089b4dfa35e7cedaa326df63017af88385e6b20"
-dependencies = [
- "byteorder",
- "num-traits",
- "paste",
-]
-
-[[package]]
-name = "rmp-serde"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bffea85eea980d8a74453e5d02a8d93028f3c34725de143085a844ebe953258a"
-dependencies = [
- "byteorder",
- "rmp",
- "serde",
-]
-
-[[package]]
-name = "rmpv"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e0e0214a4a2b444ecce41a4025792fc31f77c7bb89c46d253953ea8c65701ec"
-dependencies = [
- "num-traits",
- "rmp",
-]
-
-[[package]]
 name = "rocksdb"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4205,8 +4115,6 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
- "serde",
- "sha2",
  "signature",
  "spki",
  "subtle",
@@ -5520,9 +5428,9 @@ checksum = "1dd624098567895118886609431a7c3b8f516e41d30e0643f03d94592a147e36"
 
 [[package]]
 name = "unicode-width"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0edd1e5b14653f783770bce4a4dabb4a5108a5370a5f5d8cfe8710c361f6c8b"
+checksum = "e51733f11c9c4f72aa0c160008246859e340b00807569a0da0e7a1079b27ba85"
 
 [[package]]
 name = "unicode-xid"
@@ -5617,12 +5525,6 @@ name = "valuable"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
-
-[[package]]
-name = "varuint"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "896414bb0f21aba00ff26b0a8a3679331b5a86886f217c9d9396b919a7bf4ac6"
 
 [[package]]
 name = "vcpkg"
@@ -5760,9 +5662,9 @@ checksum = "ca6ad05a4870b2bf5fe995117d3728437bd27d7cd5f06f13c17443ef369775a1"
 
 [[package]]
 name = "wasm-encoder"
-version = "0.32.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ba64e81215916eaeb48fee292f29401d69235d62d8b8fd92a7b2844ec5ae5f7"
+checksum = "b39de0723a53d3c8f54bed106cfbc0d06b3e4d945c5c5022115a61e3b29183ae"
 dependencies = [
  "leb128",
 ]
@@ -5910,9 +5812,9 @@ dependencies = [
 
 [[package]]
 name = "wast"
-version = "64.0.0"
+version = "65.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a259b226fd6910225aa7baeba82f9d9933b6d00f2ce1b49b80fa4214328237cc"
+checksum = "5fd8c1cbadf94a0b0d1071c581d3cfea1b7ed5192c79808dd15406e508dd0afb"
 dependencies = [
  "leb128",
  "memchr",
@@ -5922,9 +5824,9 @@ dependencies = [
 
 [[package]]
 name = "wat"
-version = "1.0.71"
+version = "1.0.73"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53253d920ab413fca1c7dc2161d601c79b4fdf631d0ba51dd4343bf9b556c3f6"
+checksum = "3209e35eeaf483714f4c6be93f4a03e69aad5f304e3fa66afa7cb90fe1c8051f"
 dependencies = [
  "wast",
 ]

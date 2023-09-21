@@ -11,18 +11,20 @@ use std::process::Command;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use locutus_aft_interface::{
+use freenet::runtime::{
+    ContractStore,
+    DelegateRuntimeInterface,
+    DelegateStore,
+    // InboundDelegateMsg,
+    Runtime,
+    SecretsStore,
+    // ApplicationMessage,
+    // SecretsId,
+};
+use freenet_aft_interface::{
     AllocationCriteria, DelegateParameters, Tier, TokenAllocationRecord, TokenAssignment,
 };
-use locutus_runtime::{
-    ApplicationMessage, ContractContainer, ContractInstanceId, ContractKey, ContractStore,
-    DelegateRuntimeInterface, DelegateStore, InboundDelegateMsg, Runtime, SecretsId, SecretsStore,
-    WasmAPIVersion,
-};
-use locutus_stdlib::prelude::{
-    ContractCode, Delegate, DelegateCode, DelegateContext, OutboundDelegateMsg, Parameters,
-    WrappedContract,
-};
+use freenet_stdlib::prelude::*;
 
 static TEST_NO: AtomicUsize = AtomicUsize::new(0);
 
@@ -77,7 +79,7 @@ struct Context {
 }
 
 fn test_dir(prefix: &str) -> PathBuf {
-    let test_dir = std::env::temp_dir().join("locutus-test").join(format!(
+    let test_dir = std::env::temp_dir().join("freenet-test").join(format!(
         "{prefix}-test-{}",
         TEST_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));

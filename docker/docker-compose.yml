@@ -1,14 +1,14 @@
 version: "3"
 services:
-  locutus:
+  freenet:
     build:
       context: ..
       dockerfile: ./docker/Dockerfile
-    image: locutus:docker
+    image: freenet:docker
     ports:
       - target: 50509
         published: 50599
         protocol: tcp
-        mode: host    
+        mode: host
     volumes:
-      - /tmp/locutus-docker:/root/.local/share/locutus
+      - /tmp/freenet-docker:/root/.local/share/freenet

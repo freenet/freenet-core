@@ -21,10 +21,10 @@ Once you have a working installation of Cargo you can install the Locutus dev
 tools:
 
 ```bash
-cargo install locutus
+cargo install freenet
 ```
 
-This command will install `ldt` (Locutus Dev Tool) and a working Freenet kernel that can
+This command will install `fdev` (Locutus Dev Tool) and a working Freenet kernel that can
 be used for local development.
 
 ### Node.js and TypeScript
@@ -57,7 +57,7 @@ This command should output the version of TypeScript that you installed.
 ## Creating a new contract
 
 You can create a new [contract](glossary.md#contract) skeleton by executing the
-`new` command with `ldt`. Two contract types are supported currently by the
+`new` command with `fdev`. Two contract types are supported currently by the
 tool, regular [contracts](glossary.md#contract), and [web
 application](glossary.md#web-application) [container
 contracts](glossary.md#container-contract). Currently, the following
@@ -79,7 +79,7 @@ We will need to create a directory that will hold our web app and initialize it:
 mkdir -p my-app/web
 mkdir -p my-app/backend
 cd my-app/web
-ldt new web-app
+fdev new web-app
 ```
 
 will create the skeleton for a web application and its container contract for
@@ -107,19 +107,19 @@ To make our contract unique so it doesn't collide with an existing contract, we
 can generate a random signature that will be embedded with the contract.
 
 <!--
-What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `locutus-stdlib`.
+What would happen in case of a collision with an existing contract? (That would be if we try to publish a contract that has the same combination of code and parameters.) Then it would fail to publish our contract in the network and would get a rejection because we would be trying to update an existing contract. And we would have to make a slight change in the code/parameters so this collision is avoided. To make this work, there needs to exist a type, which requires (this can be only done once, at the top level of the library crate) implementing the `ContractInterface` trait from `freenet-stdlib`.
 -->
 
 For example in the `lib.rs` file we will write the following:
 
 ```rust,no_run,noplayground
-{{#include ../../crates/locutus-runtime/examples/contract.rs:contractifce}}
+{{#include ../../stdlib/examples/contract.rs:contractifce}}
 ```
 
 That's a lot of information, let's unpack it:
 
 ```rust,noplayground
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 ```
 
 Here we are importing the necessary types and traits to write a Locutus contract
@@ -175,7 +175,7 @@ applications and interfacing with your local node, so we will make our
 ```json
 {
   "dependencies": {
-    "@locutus/locutus-stdlib": "0.0.2"
+    "@freenet/freenet-stdlib": "0.0.2"
   }
 }
 ```
@@ -278,14 +278,14 @@ contract. So we will create a new contract in a different directory for it:
 
 ```bash
 cd ../backend
-ldt new contract
+fdev new contract
 ```
 
 This will create a regular contract, and we will need to implement the interface
 on a type that will handle our contract code. For example:
 
 ```rust,noplayground
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 
 pub const RANDOM_SIGNATURE: &[u8] = &[6, 8, 2, 5, 6, 9, 9, 10];
 
@@ -347,7 +347,7 @@ In order to do that, we can again use the development tool to help us out with
 the process. But before doing that, let's take a look at the manifesto format
 and understand the different parameters that allow us to specify how this
 contract should be compiled (check the [manifest](./manifest.md) details for
-more information). In the web app directory, we have a `locutus.toml` file which
+more information). In the web app directory, we have a `freenet.toml` file which
 contains something similar to:
 
 ```toml
@@ -382,7 +382,7 @@ TODO: Publishing to the real functioning Locutus network is not yet supported.
 -->
 
 Currently, wep applications follow a standarized build procedure in case you use
-`ldt` and assumptions about your system. For example, in the case of a `type =
+`fdev` and assumptions about your system. For example, in the case of a `type =
 "webapp"` contract, if nothing is specified, it will assume you have `npm` and
 the `tsc` compiler available at the directory level, as well as `webpack`
 installed.
@@ -432,10 +432,10 @@ Now that we understand the details, and after making any necessary changes, in
 each contract directory we run the following commands:
 
 ```bash
-ldt build
+fdev build
 ```
 
-This command will read your contract manifest file (`locutus.toml`) and take
+This command will read your contract manifest file (`freenet.toml`) and take
 care of building the contract and packaging it, ready for the node and the
 network to consume it.
 
@@ -443,7 +443,7 @@ network to consume it.
 TODO: Elsewhere in the documentation, explain the intricate details of building and deploying contracts, in case the use-case doesn't fit with the current tooling, so they know the necessary steeps to interact with the node at a lower level.
 -->
 
-Under the `./build/locutus` directory, you will see both a `*.wasm` file, which
+Under the `./build/freenet` directory, you will see both a `*.wasm` file, which
 is the contract file, and `contract-state`, in case it applies, which is the
 initial state that will be uploaded when initially putting the contract.
 
@@ -463,7 +463,7 @@ is running by running the following command as a background process or in
 another terminal; since we have installed it:
 
 ```bash
-locutus-node
+freenet
 ```
 
 You should see some logs printed via the stdout of the process indicating that
@@ -473,8 +473,8 @@ Once the HTTP gateway is running, we are ready to publish the contracts to our
 local Locutus node:
 
 ```bash
-cd ../backend && ldt publish --code="./build/locutus/backend.wasm" --state="./build/locutus/contract-state"
-cd ../web && ldt publish --code="./build/locutus/web.wasm" --state="./build/locutus/contract-state"
+cd ../backend && fdev publish --code="./build/freenet/backend.wasm" --state="./build/freenet/contract-state"
+cd ../web && fdev publish --code="./build/freenet/web.wasm" --state="./build/freenet/contract-state"
 ```
 
 In this case, we're not passing any parameters (so our parameters will be an

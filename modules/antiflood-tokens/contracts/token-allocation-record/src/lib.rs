@@ -1,7 +1,7 @@
-use locutus_aft_interface::{
+use freenet_aft_interface::{
     AllocationError, TokenAllocationRecord, TokenAssignment, TokenDelegateParameters,
 };
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256, RsaPublicKey};
 
 pub struct TokenAllocContract;
@@ -160,7 +160,7 @@ fn log_succesful_ver(pub_key: &RsaPublicKey, target: &str) {
             .unwrap()
             .split_whitespace()
             .collect::<String>();
-        // locutus_stdlib::log::info(&format!(
+        // freenet_stdlib::log::info(&format!(
         //     "successful verification with key: {pk} @ {target}"
         // ));
     }
@@ -176,7 +176,7 @@ fn log_verification_err(pub_key: &RsaPublicKey, target: &str) {
             .unwrap()
             .split_whitespace()
             .collect::<String>();
-        locutus_stdlib::log::info(&format!("erroneous verification with key: {pk} @ {target}"));
+        freenet_stdlib::log::info(&format!("erroneous verification with key: {pk} @ {target}"));
     }
 }
 

@@ -212,7 +212,10 @@ impl InboxView {
                 let content = content.clone();
                 let mut client = client.clone();
                 let Some(id) = crate::inbox::InboxModel::id_for_alias(from) else {
-                    crate::log::error(format!("alias `{from}` not stored"), Some(TryNodeAction::SendMessage));
+                    crate::log::error(
+                        format!("alias `{from}` not stored"),
+                        Some(TryNodeAction::SendMessage),
+                    );
                     continue;
                 };
                 let to = recipient_encoded_key.clone();
@@ -335,10 +338,9 @@ pub(crate) struct User {
 impl User {
     #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
     fn new() -> Self {
-        const RSA_PRIV_0_PEM: &str = include_str!("../examples/rsa4096-id-0-priv.pem");
-        const RSA_PRIV_1_PEM: &str = include_str!("../examples/rsa4096-id-1-priv.pem");
-        let key0 = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_0_PEM).unwrap();
-        let key1 = RsaPrivateKey::from_pkcs1_pem(RSA_PRIV_1_PEM).unwrap();
+        use rand_chacha::rand_core::OsRng;
+        let key0 = RsaPrivateKey::new(&mut OsRng, 4096).unwrap();
+        let key1 = RsaPrivateKey::new(&mut OsRng, 4096).unwrap();
         let identified = true;
         User {
             logged: false,

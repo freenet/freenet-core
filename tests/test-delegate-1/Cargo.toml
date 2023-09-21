@@ -11,10 +11,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-locutus-stdlib = { path = "../../crates/locutus-stdlib" }
+freenet-stdlib = { path = "../../stdlib/rust" }
 serde = "1"
 serde_json = "1"
 bincode = "1"
 
 [features]
-trace = ["locutus-stdlib/trace"]
+trace = ["freenet-stdlib/trace"]

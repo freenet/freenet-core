@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 p384 =  { version = "0.13", default-features = false, features = ["serde", "pem", "pkcs8", "arithmetic"] }
-locutus-stdlib = { version = "0.0.3", path = "../../crates/locutus-stdlib" }
+freenet-stdlib = { version = "0.0.5" }
 serde = "1"
 serde_json = "1"
 
@@ -22,4 +22,4 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-contract = ["locutus-stdlib/contract"]
+contract = ["freenet-stdlib/contract"]

@@ -2,13 +2,13 @@ use std::sync::atomic::AtomicU32;
 use std::{cell::RefCell, collections::HashMap};
 
 use chrono::{DateTime, Utc};
-use locutus_aft_interface::{
+use freenet_aft_interface::{
     AllocationCriteria, DelegateParameters, RequestNewToken, Tier, TokenAllocationRecord,
     TokenAllocationSummary, TokenAssignment, TokenDelegateMessage, TokenDelegateParameters,
 };
-use locutus_stdlib::client_api::{ContractRequest, DelegateRequest};
-use locutus_stdlib::prelude::UpdateData::{Delta, State as StateUpdate};
-use locutus_stdlib::prelude::{
+use freenet_stdlib::client_api::{ContractRequest, DelegateRequest};
+use freenet_stdlib::prelude::UpdateData::{Delta, State as StateUpdate};
+use freenet_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, ContractKey, DelegateKey, InboundDelegateMsg,
     Parameters, State, UpdateData,
 };
@@ -53,7 +53,7 @@ struct PendingAssignmentRegister {
     /// time at which the request started
     start: DateTime<Utc>,
     // time_slot: DateTime<Utc>,
-    // tier: locutus_aft_interface::Tier,
+    // tier: freenet_aft_interface::Tier,
     record: TokenAssignment,
     inbox: InboxContract,
 }
@@ -196,7 +196,7 @@ impl AftRecords {
         let inbox_key =
             ContractKey::from_params(crate::inbox::INBOX_CODE_HASH, inbox_params.clone())?;
         let delegate_params =
-            locutus_aft_interface::DelegateParameters::new(generator_id.key.clone());
+            freenet_aft_interface::DelegateParameters::new(generator_id.key.clone());
 
         let record_params = TokenDelegateParameters::new(sender_key.clone());
         let token_record: ContractInstanceId = ContractKey::from_params(

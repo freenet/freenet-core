@@ -2,15 +2,15 @@
 
 .ONESHELL:
 
-LOCUTUS_DIR := $(abspath ../../)
-WEB_DIR := $(LOCUTUS_DIR)/apps/freenet-microblogging/web
-POSTS_DIR := $(LOCUTUS_DIR)/apps/freenet-microblogging/contracts/posts
+FREENET_DIR := $(abspath ../../)
+WEB_DIR := $(FREENET_DIR)/apps/freenet-microblogging/web
+POSTS_DIR := $(FREENET_DIR)/apps/freenet-microblogging/contracts/posts
 
 ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
 endif
 
-build-app: \
+build: \
 	webapp \
 	posts \
 	publish-webapp \
@@ -21,39 +21,40 @@ node: \
 	run-node
 
 build-tool:
-	cd $(LOCUTUS_DIR)/crates/locutus-node &&
-	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
+	cd $(FREENET_DIR)/crates/core &&
+	cargo install --path --force $(FREENET_DIR)/crates/core
+	cargo install --path --force $(FREENET_DIR)/crates/fdev
 
 webapp:
 	cd $(WEB_DIR)
-	npm i --force locutus-stdlib
+	npm i --force freenet-stdlib
 	npm run build
 
-	ldt build
-	cp ./build/locutus/freenet_microblogging_web ../../../crates/locutus-node/examples/
-	cp ./build/locutus/contract-state ../../../crates/locutus-node/examples/freenet_microblogging_web_state
+	fdev build
+	cp ./build/freenet/freenet_microblogging_web ../../../crates/core/examples/
+	cp ./build/freenet/contract-state ../../../crates/core/examples/freenet_microblogging_web_state
 
 publish-webapp:
 	cd $(WEB_DIR)
 
-	ldt publish --code build/locutus/freenet_microblogging_web contract --state build/locutus/contract-state
+	fdev publish --code build/freenet/freenet_microblogging_web contract --state build/freenet/contract-state
 
 posts:
 	cd $(POSTS_DIR)
 
-	ldt build
-	cp ./build/locutus/freenet_microblogging_posts ../../../../crates/locutus-node/examples/
-	cp ./build/locutus/contract-state ../../../../crates/locutus-node/examples/freenet_microblogging_posts_state
+	fdev build
+	cp ./build/freenet/freenet_microblogging_posts ../../../../crates/core/examples/
+	cp ./build/freenet/contract-state ../../../../crates/core/examples/freenet_microblogging_posts_state
 
 publish-posts:
 	cd $(POSTS_DIR)
 
-	ldt publish --code build/locutus/freenet_microblogging_posts contract --state build/locutus/contract-state
+	fdev publish --code build/freenet/freenet_microblogging_posts contract --state build/freenet/contract-state
 
 run-node:
-	RUST_BACKTRACE=1 RUST_LOG=locutus=debug,locutus_core=debug,locutus_node=debug,info locutus-node local
+	RUST_BACKTRACE=1 RUST_LOG=freenet=debug,locutus_core=debug,locutus_node=debug,info freenet local
 
 run:
-	cd $(LOCUTUS_DIR)
-	cd crates/locutus-node/examples
+	cd $(FREENET_DIR)
+	cd crates/core/examples
 	cargo run --example contract_browsing

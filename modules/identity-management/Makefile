@@ -2,8 +2,8 @@
 
 .ONESHELL:
 
-LOCUTUS_DIR := $(abspath ../../)
-DELEGATE_DIR := $(LOCUTUS_DIR)/modules/identity-management
+FREENET_DIR := $(abspath ../../)
+DELEGATE_DIR := $(FREENET_DIR)/modules/identity-management
 
 ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
@@ -16,8 +16,8 @@ all:
 	$(MAKE) build
 
 build-tool:
-	cd $(LOCUTUS_DIR)/crates/locutus-node && cargo build --release
-	cargo install --path $(LOCUTUS_DIR)/crates/locutus-node
+	cargo install --path $(FREENET_DIR)/crates/core
+	cargo install --path $(FREENET_DIR)/crates/fdev
 	
 build: \
 	build-delegate \
@@ -26,11 +26,11 @@ build: \
 
 build-delegate:
 	cd $(DELEGATE_DIR)
-	ldt build --package-type delegate --features contract
+	fdev build --package-type delegate --features contract
 
 generate-delegate-code-hash:
 	cd $(DELEGATE_DIR)
-	hash=$$(bash -c "ldt inspect build/locutus/identity_management delegate | grep 'code hash:' | cut -d' ' -f3")
+	hash=$$(bash -c "fdev inspect build/freenet/identity_management delegate | grep 'code hash:' | cut -d' ' -f3")
 	mkdir -p $(DELEGATE_DIR)/build
 	echo -n $$hash > $(DELEGATE_DIR)/build/identity_management_code_hash
 

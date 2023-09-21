@@ -7,7 +7,7 @@ resolver = "2"
 publish = false
 
 [dependencies]
-locutus-stdlib = { workspace = true }
+freenet-stdlib = { workspace = true }
 
 [lib]
 crate-type = ["cdylib"]

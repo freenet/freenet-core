@@ -1,6 +1,6 @@
 <div align="center">
   <!-- Github Actions -->
-  <a href="https://github.com/freenet/locutus/actions/workflows/ci.yml">
+  <a href="https://github.com/freenet/freenet-core/actions/workflows/ci.yml">
     <img src="https://img.shields.io/github/actions/workflow/status/freenet/locutus/ci.yml?branch=main&label=tests&style=flat-square" alt="continuous integration status" />
   </a>
   <a href="https://crates.io/crates/locutus">
@@ -60,7 +60,7 @@ Locutus was the working title used for this successor to the original Freenet, i
 
 ## Chat with us
 
-We're in [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). If you have questions you can also [ask here](https://github.com/freenet/locutus/discussions).
+We're in [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on [Matrix](https://matrix.org/). If you have questions you can also [ask here](https://github.com/freenet/freenet-core/discussions).
 
 Many developers are active in [r/freenet](https://www.reddit.com/r/Freenet/), but remember that Reddit engages in political and ideological censorship so don't make this your only point of contact with us.
 

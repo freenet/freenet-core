@@ -1,6 +1,6 @@
 # The Manifest Format
 
-The `locutus.toml` file for each UI component/contract is called its _manifest_.
+The `freenet.toml` file for each UI component/contract is called its _manifest_.
 It is written in the [TOML](https://toml.io/) format. Manifest files consist of
 the following sections:
 
@@ -52,7 +52,7 @@ output_dir = "./other/output/dir/"
 ```
 
 An optional path to the output directory for the build artifacts. If not set the
-output will be written to the relative directory `./build/locutus` from the
+output will be written to the relative directory `./build/freenet` from the
 manifest file directory.
 
 ## The `[webapp]` section

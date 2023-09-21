@@ -1,5 +1,5 @@
 [package]
-name = "locutus-aft-interface"
+name = "freenet-aft-interface"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
-locutus-stdlib = { workspace = true, features = ["contract"] }
+freenet-stdlib = { workspace = true, features = ["contract"] }
 rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

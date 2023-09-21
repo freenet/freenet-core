@@ -1,6 +1,7 @@
 - [Introduction](introduction.md)
 
 # Components
+
 - [Overview](components/overview.md)
 - [Contracts](components/contracts.md)
 - [Delegates](components/delegates.md)
@@ -15,7 +16,7 @@
 
 - [Tutorial: Create an App](tutorial.md)
 - [Contract interfaces](contract-interface.md)
-- [locutus.toml format](manifest.md)
+- [freenet.toml format](manifest.md)
 
 # Examples
 

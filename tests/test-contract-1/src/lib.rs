@@ -1,4 +1,4 @@
-use locutus_stdlib::prelude::*;
+use freenet_stdlib::prelude::*;
 
 struct Contract;
 
