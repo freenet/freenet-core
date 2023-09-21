@@ -35,8 +35,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install stdlib packages
+        working-directory: stdlib/typescript
+        run: npm run dev.package
 
       - name: Build
         run: |
