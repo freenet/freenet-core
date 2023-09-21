@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "arbitrary",
  "arrayvec",

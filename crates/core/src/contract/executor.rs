@@ -45,6 +45,17 @@ impl ExecutorError {
     fn request(value: impl Into<RequestError>) -> Self {
         Self(Either::Left(Box::new(value.into())))
     }
+
+    pub fn is_request(&self) -> bool {
+        matches!(self.0, Either::Left(_))
+    }
+
+    pub fn unwrap_request(self) -> RequestError {
+        match self.0 {
+            Either::Left(err) => *err,
+            Either::Right(_) => panic!(),
+        }
+    }
 }
 
 impl From<RequestError> for ExecutorError {

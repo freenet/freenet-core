@@ -21,6 +21,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 wasmer = "4.2.0"
 
+freenet-stdlib = "0.0.5"
+
 [profile.dev.package."*"]
 opt-level = 3
 

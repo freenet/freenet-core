@@ -32,4 +32,4 @@ xz2 = "0.1"
 
 # internal
 freenet = { path = "../core", version = "0.0.4" }
-freenet-stdlib = { path = "../../stdlib/rust", version = "0.0.4" }
+freenet-stdlib = { path = "../../stdlib/rust", version = "0.0.5" }

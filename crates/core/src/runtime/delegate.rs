@@ -74,8 +74,9 @@ impl Runtime {
             param_buf.ptr()
         };
         let attested_buf_ptr = {
-            let mut attested_buf = self.init_buf(instance, attested.unwrap_or(&[]))?;
-            attested_buf.write(params)?;
+            let bytes = attested.unwrap_or(&[]);
+            let mut attested_buf = self.init_buf(instance, bytes)?;
+            attested_buf.write(bytes)?;
             attested_buf.ptr()
         };
         let msg_ptr = {

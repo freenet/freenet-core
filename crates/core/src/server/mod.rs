@@ -147,6 +147,17 @@ pub mod local_node {
                         Receiver::Gw => gw.send(id, Ok(res)).await?,
                     };
                 }
+                Err(err) if err.is_request() => {
+                    let err = ErrorKind::RequestError(err.unwrap_request());
+                    match receiver {
+                        Receiver::Ws => {
+                            ws_proxy.send(id, Err(err.into())).await?;
+                        }
+                        Receiver::Gw => {
+                            gw.send(id, Err(err.into())).await?;
+                        }
+                    };
+                }
                 Err(err) => {
                     tracing::error!("{err}");
                     let err = Err(ErrorKind::Unhandled {
