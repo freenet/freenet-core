@@ -42,7 +42,7 @@ where
             _kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
             _runtime: MockRuntime {
                 contract_store: ContractStore::new(
-                    Config::get_static_conf().config_paths.contracts_dir.clone(),
+                    Config::get_static_conf().contracts_dir(),
                     Self::MAX_MEM_CACHE,
                 )
                 .unwrap(),

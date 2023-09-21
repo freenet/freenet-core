@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 
@@ -16,7 +17,7 @@ use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
-use crate::DynError;
+use crate::{local_node::OperationMode, DynError};
 
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
@@ -37,7 +38,8 @@ pub struct Config {
     pub bootstrap_id: Option<PeerId>,
     pub local_peer_keypair: Option<identity::Keypair>,
     pub log_level: tracing::log::LevelFilter,
-    pub config_paths: ConfigPaths,
+    config_paths: ConfigPaths,
+    local_mode: AtomicBool,
 
     #[cfg(feature = "websocket")]
     pub(crate) ws: WebSocketApiConfig,
@@ -79,10 +81,10 @@ impl WebSocketApiConfig {
 
 #[derive(Debug)]
 pub struct ConfigPaths {
-    pub(crate) contracts_dir: PathBuf,
-    pub(crate) delegates_dir: PathBuf,
-    pub(crate) secrets_dir: PathBuf,
-    pub(crate) db_dir: PathBuf,
+    contracts_dir: PathBuf,
+    delegates_dir: PathBuf,
+    secrets_dir: PathBuf,
+    db_dir: PathBuf,
     app_data_dir: PathBuf,
 }
 
@@ -117,6 +119,7 @@ impl ConfigPaths {
 
         if !db_dir.exists() {
             fs::create_dir_all(&db_dir)?;
+            fs::create_dir_all(db_dir.join("local"))?;
         }
 
         Ok(Self {
@@ -127,35 +130,50 @@ impl ConfigPaths {
             app_data_dir,
         })
     }
-
-    pub fn local_contracts_dir(&self) -> PathBuf {
-        self.contracts_dir.join("local")
-    }
-
-    pub fn contracts_dir(&self) -> &Path {
-        &self.contracts_dir
-    }
-
-    pub fn local_delegates_dir(&self) -> PathBuf {
-        self.delegates_dir.join("local")
-    }
-
-    pub fn delegates_dir(&self) -> &Path {
-        &self.delegates_dir
-    }
-
-    pub fn local_secrets_dir(&self) -> PathBuf {
-        self.secrets_dir.join("local")
-    }
-
-    pub fn secrets_dir(&self) -> &Path {
-        &self.secrets_dir
-    }
 }
 
 impl Config {
     pub fn set_from_cli() -> Result<(), DynError> {
         todo!()
+    }
+
+    pub fn set_op_mode(mode: OperationMode) {
+        let local_mode = matches!(mode, OperationMode::Local);
+        Self::get_static_conf()
+            .local_mode
+            .store(local_mode, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn db_dir(&self) -> PathBuf {
+        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            self.config_paths.db_dir.join("local")
+        } else {
+            self.config_paths.db_dir.to_owned()
+        }
+    }
+
+    pub fn contracts_dir(&self) -> PathBuf {
+        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            self.config_paths.contracts_dir.join("local")
+        } else {
+            self.config_paths.contracts_dir.to_owned()
+        }
+    }
+
+    pub fn delegates_dir(&self) -> PathBuf {
+        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            self.config_paths.delegates_dir.join("local")
+        } else {
+            self.config_paths.delegates_dir.to_owned()
+        }
+    }
+
+    pub fn secrets_dir(&self) -> PathBuf {
+        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            self.config_paths.secrets_dir.join("local")
+        } else {
+            self.config_paths.delegates_dir.to_owned()
+        }
     }
 
     pub fn get_static_conf() -> &'static Config {
@@ -195,6 +213,8 @@ impl Config {
         let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
         let config_paths = ConfigPaths::new()?;
 
+        let local_mode = settings.get_string("local_mode").is_ok();
+
         Ok(Config {
             bootstrap_ip,
             bootstrap_port,
@@ -202,6 +222,7 @@ impl Config {
             local_peer_keypair,
             log_level,
             config_paths,
+            local_mode: AtomicBool::new(local_mode),
             #[cfg(feature = "websocket")]
             ws: WebSocketApiConfig::from_config(&settings),
         })

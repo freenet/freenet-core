@@ -40,6 +40,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .init();
     let cwd = std::env::current_dir()?;
     let config = Config::parse();
+    freenet::config::Config::set_op_mode(config.additional.mode);
     let r = match config.sub_command {
         SubCommand::RunLocal(local_node_config) => run_local_node_client(local_node_config).await,
         SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),

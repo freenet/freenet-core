@@ -10,7 +10,7 @@ ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
 endif
 
-build-app: \
+build: \
 	webapp \
 	posts \
 	publish-webapp \
@@ -22,7 +22,8 @@ node: \
 
 build-tool:
 	cd $(FREENET_DIR)/crates/core &&
-	cargo install --path $(FREENET_DIR)/crates/core
+	cargo install --path --force $(FREENET_DIR)/crates/core
+	cargo install --path --force $(FREENET_DIR)/crates/fdev
 
 webapp:
 	cd $(WEB_DIR)

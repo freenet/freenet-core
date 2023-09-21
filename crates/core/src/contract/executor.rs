@@ -189,21 +189,21 @@ impl Executor<Runtime> {
             .node_data_dir
             .as_ref()
             .map(|d| d.join("contracts"))
-            .unwrap_or_else(|| static_conf.config_paths.local_contracts_dir());
+            .unwrap_or_else(|| static_conf.contracts_dir());
         let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
 
         let delegate_dir = config
             .node_data_dir
             .as_ref()
             .map(|d| d.join("delegates"))
-            .unwrap_or_else(|| static_conf.config_paths.local_delegates_dir());
+            .unwrap_or_else(|| static_conf.delegates_dir());
         let delegate_store = DelegateStore::new(delegate_dir, MAX_SIZE)?;
 
         let secrets_dir = config
             .node_data_dir
             .as_ref()
             .map(|d| d.join("secrets"))
-            .unwrap_or_else(|| static_conf.config_paths.local_secrets_dir());
+            .unwrap_or_else(|| static_conf.secrets_dir());
         let secret_store = SecretsStore::new(secrets_dir)?;
 
         Executor::new(

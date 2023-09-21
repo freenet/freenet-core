@@ -29,7 +29,7 @@ pub struct BaseConfig {
     pub(crate) secret_data_dir: Option<PathBuf>,
     /// Node operation mode.
     #[arg(value_enum, default_value_t=OperationMode::Local)]
-    pub(crate) mode: OperationMode,
+    pub mode: OperationMode,
 }
 
 #[derive(clap::Subcommand, Clone)]

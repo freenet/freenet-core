@@ -1,5 +1,5 @@
 pub(crate) mod client_events;
-mod config;
+pub mod config;
 mod contract;
 mod message;
 mod node;
