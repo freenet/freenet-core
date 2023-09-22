@@ -1,14 +1,12 @@
 use tokio::sync::mpsc::error::SendError;
 
 use self::op_trait::Operation;
-use crate::operations::get::GetOp;
-use crate::operations::put::PutOp;
-use crate::operations::subscribe::SubscribeOp;
 use crate::{
+    client_events::{ClientId, HostResult},
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
-    operations::join_ring::JoinRingOp,
+    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp},
     ring::RingError,
 };
 
@@ -35,7 +33,8 @@ pub(crate) async fn handle_op_request<Op, CB>(
     op_storage: &OpManager,
     conn_manager: &mut CB,
     msg: Op::Message,
-) -> Result<(), OpError>
+    client_id: Option<ClientId>,
+) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation<CB>,
     CB: ConnectionBridge,
@@ -45,7 +44,8 @@ where
     let result = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, &msg)?;
         sender = s;
-        op.process_message(conn_manager, op_storage, msg).await
+        op.process_message(conn_manager, op_storage, msg, client_id)
+            .await
     };
     handle_op_result(
         op_storage,
@@ -61,7 +61,7 @@ async fn handle_op_result<CB>(
     conn_manager: &mut CB,
     result: Result<OperationResult, (OpError, Transaction)>,
     sender: Option<PeerKey>,
-) -> Result<(), OpError>
+) -> Result<Option<OpEnum>, OpError>
 where
     CB: ConnectionBridge,
 {
@@ -69,7 +69,7 @@ where
     match result {
         Err((OpError::StatePushed, _)) => {
             // do nothing and continue, the operation will just continue later on
-            return Ok(());
+            return Ok(None);
         }
         Err((err, tx_id)) => {
             if let Some(sender) = sender {
@@ -87,6 +87,14 @@ where
                 conn_manager.send(&target.peer, msg).await?;
             }
             op_storage.push(id, updated_state)?;
+        }
+
+        Ok(OperationResult {
+            return_msg: None,
+            state: Some(final_state),
+        }) if final_state.is_final() => {
+            // operation finished_completely with result
+            return Ok(Some(final_state));
         }
         Ok(OperationResult {
             return_msg: None,
@@ -112,7 +120,7 @@ where
             // operation finished_completely
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) enum OpEnum {
@@ -132,6 +140,20 @@ impl OpEnum {
             Subscribe(op) => *<SubscribeOp as Operation<CB>>::id(op),
         }
     }
+
+    fn is_final(&self) -> bool {
+        match self {
+            OpEnum::JoinRing(op) if op.finished() => true,
+            OpEnum::Put(op) if op.finished() => true,
+            OpEnum::Get(op) if op.finished() => true,
+            OpEnum::Subscribe(op) if op.finished() => true,
+            _ => false,
+        }
+    }
+
+    pub fn to_host_result(&self, _client_id: ClientId) -> HostResult {
+        todo!()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -148,7 +170,7 @@ pub(crate) enum OpError {
     #[error("cannot perform a state transition from the current state with the provided input (tx: {0})")]
     InvalidStateTransition(Transaction),
     #[error("failed notifying back to the node message loop, channel closed")]
-    NotificationError(#[from] Box<SendError<Message>>),
+    NotificationError(#[from] Box<SendError<(Message, Option<ClientId>)>>),
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
@@ -163,8 +185,8 @@ pub(crate) enum OpError {
     StatePushed,
 }
 
-impl From<SendError<Message>> for OpError {
-    fn from(err: SendError<Message>) -> OpError {
+impl From<SendError<(Message, Option<ClientId>)>> for OpError {
+    fn from(err: SendError<(Message, Option<ClientId>)>) -> OpError {
         OpError::NotificationError(Box::new(err))
     }
 }

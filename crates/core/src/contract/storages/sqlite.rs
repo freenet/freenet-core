@@ -142,15 +142,20 @@ mod test {
     use freenet_stdlib::client_api::ContractRequest;
     use freenet_stdlib::prelude::*;
 
-    use crate::contract::{
-        contract_handler_channel, ContractHandler, MockRuntime, NetworkContractHandler,
+    use crate::{
+        client_events::ClientId,
+        contract::{
+            contract_handler_channel, executor::executor_channel_test, ContractHandler,
+            MockRuntime, NetworkContractHandler,
+        },
+        DynError,
     };
-    use crate::{client_events::ClientId, DynError};
 
     // Prepare and get handler for an in-memory sqlite db
     async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {
         let (_, ch_handler) = contract_handler_channel();
-        let handler = NetworkContractHandler::build(ch_handler, ()).await?;
+        let (_, executor_sender) = executor_channel_test();
+        let handler = NetworkContractHandler::build(ch_handler, executor_sender, ()).await?;
         Ok(handler)
     }
 

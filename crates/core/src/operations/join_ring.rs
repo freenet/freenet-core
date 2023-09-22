@@ -6,6 +6,7 @@ use super::{OpError, OperationResult};
 use crate::operations::op_trait::Operation;
 use crate::operations::OpInitialization;
 use crate::{
+    client_events::ClientId,
     config::PEER_TIMEOUT,
     message::{InnerMessage, Message, Transaction},
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
@@ -31,6 +32,10 @@ pub(crate) struct JoinRingOp {
 impl JoinRingOp {
     pub fn has_backoff(&self) -> bool {
         self.backoff.is_some()
+    }
+
+    pub(super) fn finished(&self) -> bool {
+        todo!()
     }
 }
 
@@ -89,6 +94,7 @@ impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
         input: Self::Message,
+        _client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let mut return_msg = None;

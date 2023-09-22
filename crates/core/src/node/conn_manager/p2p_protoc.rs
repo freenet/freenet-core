@@ -32,13 +32,15 @@ use libp2p::{
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use unsigned_varint::codec::UviBytes;
 
-use super::{ConnectionBridge, ConnectionError};
+use super::{ConnectionBridge, ConnectionError, EventLoopNotifications};
 use crate::{
+    client_events::ClientId,
     config::{self, GlobalExecutor},
-    message::{Message, NodeEvent, TransactionType},
+    contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
+    message::{Message, NodeEvent, Transaction, TransactionType},
     node::{
         handle_cancelled_op, join_ring_request, process_message, InitPeerNode, NodeBuilder,
         OpManager, PeerKey,
@@ -199,7 +201,7 @@ impl P2pConnManager {
             swarm.add_external_address(remote_addr);
         }
 
-        let (tx_bridge_cmd, rx_bridge_cmd) = channel(100);
+        let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
         let bridge = P2pBridge::new(tx_bridge_cmd);
 
         let gateways = config.get_gateways()?;
@@ -222,15 +224,20 @@ impl P2pConnManager {
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
-        mut notification_channel: Receiver<Either<Message, NodeEvent>>,
+        mut notification_channel: EventLoopNotifications,
+        mut executor_channel: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+        cli_response_sender: ClientResponsesSender,
     ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
+        let mut pending_from_executor = HashSet::new();
+        let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
+
         loop {
-            let net_msg = self.swarm.select_next_some().map(|event| match event {
+            let network_msg = self.swarm.select_next_some().map(|event| match event {
                 SwarmEvent::Behaviour(NetEvent::Freenet(msg)) => {
                     tracing::debug!("Message inbound: {:?}", msg);
-                    Ok(Left(*msg))
+                    Ok(Left((*msg, None)))
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     Ok(Right(ConnMngrActions::ConnectionClosed {
@@ -299,9 +306,9 @@ impl P2pConnManager {
                 }
             });
 
-            let notification_msg = notification_channel.recv().map(|m| match m {
+            let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
-                Some(Left(msg)) => Ok(Left(msg)),
+                Some(Left((msg, cli_id))) => Ok(Left((msg, cli_id))),
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
             });
 
@@ -315,13 +322,24 @@ impl P2pConnManager {
             });
 
             let msg: Result<_, ConnectionError> = tokio::select! {
-                msg = net_msg => { msg }
+                msg = network_msg => { msg }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
+                (event_id, contract_handler_event) = op_manager.recv_from_handler() => {
+                    if let Some(client_id) = event_id.client_id() {
+                        let transaction = contract_handler_event.into_network_op(&op_manager).await;
+                        tx_to_client.insert(transaction, client_id);
+                    }
+                    continue;
+                }
+                id = executor_channel.transaction_from_executor() => {
+                    pending_from_executor.insert(id);
+                    continue;
+                }
             };
 
             match msg {
-                Ok(Left(msg)) => {
+                Ok(Left((msg, client_id))) => {
                     let cb = self.bridge.clone();
                     match msg {
                         Message::Canceled(tx) => {
@@ -356,11 +374,24 @@ impl P2pConnManager {
                             continue;
                         }
                         msg => {
+                            let executor_callback = pending_from_executor
+                                .remove(msg.id())
+                                .then(|| executor_channel.clone());
+                            let pending_client_req = tx_to_client.get(msg.id()).copied();
+                            let client_req_handler_callback = if pending_client_req.is_some() {
+                                debug_assert!(client_id.is_none());
+                                Some(cli_response_sender.clone())
+                            } else {
+                                None
+                            };
                             GlobalExecutor::spawn(process_message(
                                 Ok(msg),
                                 op_manager.clone(),
                                 cb,
                                 None,
+                                executor_callback,
+                                client_req_handler_callback,
+                                client_id,
                             ));
                         }
                     }
@@ -415,7 +446,15 @@ impl P2pConnManager {
                 }
                 Err(err) => {
                     let cb = self.bridge.clone();
-                    GlobalExecutor::spawn(process_message(Err(err), op_manager.clone(), cb, None));
+                    GlobalExecutor::spawn(process_message(
+                        Err(err),
+                        op_manager.clone(),
+                        cb,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ));
                 }
                 Ok(Right(NoAction)) | Ok(Right(NodeAction(NodeEvent::ConfirmedInbound))) => {}
             }

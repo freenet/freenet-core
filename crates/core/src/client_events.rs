@@ -93,7 +93,7 @@ impl From<String> for AuthToken {
 
 #[non_exhaustive]
 pub struct OpenRequest<'a> {
-    pub id: ClientId,
+    pub client_id: ClientId,
     pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<UnboundedSender<HostResult>>,
     pub token: Option<AuthToken>,
@@ -109,7 +109,7 @@ impl<'a> OpenRequest<'a> {
 
     pub fn new(id: ClientId, request: Box<ClientRequest<'a>>) -> Self {
         Self {
-            id,
+            client_id: id,
             request,
             notification_channel: None,
             token: None,

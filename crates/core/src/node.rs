@@ -21,15 +21,18 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;
 use self::{
-    event_listener::{EventListener, EventLog},
+    event_log::{EventLog, EventLogListener},
     p2p_impl::NodeP2P,
 };
 use crate::{
-    client_events::{BoxedClient, ClientEventsProxy, OpenRequest},
+    client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::Config,
     config::GlobalExecutor,
-    contract::{ContractError, NetworkContractHandler, OperationMode},
-    message::{InnerMessage, Message, NodeEvent, Transaction, TransactionType, TxType},
+    contract::{
+        ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
+        NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
+    },
+    message::{InnerMessage, Message, Transaction, TransactionType, TxType},
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
@@ -44,7 +47,7 @@ pub(crate) use conn_manager::{p2p_protoc::P2pBridge, ConnectionBridge, Connectio
 pub(crate) use op_state::OpManager;
 
 mod conn_manager;
-mod event_listener;
+mod event_log;
 #[cfg(test)]
 mod in_memory_impl;
 mod op_state;
@@ -299,110 +302,132 @@ where
 }
 
 /// Process client events.
-async fn client_event_handling<ClientEv>(op_storage: Arc<OpManager>, mut client_events: ClientEv)
-where
+async fn client_event_handling<ClientEv>(
+    op_storage: Arc<OpManager>,
+    mut client_events: ClientEv,
+    mut client_responses: ClientResponses,
+) where
     ClientEv: ClientEventsProxy + Send + Sync + 'static,
 {
     loop {
-        // fixme: send back responses to client
-        let OpenRequest {
-            id: _id, request, ..
-        } = client_events.recv().await.unwrap(); // fixme: deal with this unwrap
-        if let ClientRequest::Disconnect { .. } = *request {
-            if let Err(err) = op_storage.notify_internal_op(NodeEvent::ShutdownNode).await {
-                tracing::error!("{}", err);
+        tokio::select! {
+            client_request = client_events.recv() => {
+                let req = match client_request {
+                    Ok(req) => req,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "client error");
+                        continue;
+                    }
+                };
+                if let ClientRequest::Disconnect { .. } = &*req.request {
+                    // todo: notify executor of disconnect
+                    continue;
+                }
+                process_open_request(req, op_storage.clone()).await;
             }
-            break;
+            res = client_responses.recv() => {
+                if let Some((cli_id, res)) = res {
+                    if let Err(err) = client_events.send(cli_id, res).await {
+                        tracing::error!("channel closed: {err}");
+                        break;
+                    }
+                }
+            }
         }
+    }
+}
 
-        let op_storage_cp = op_storage.clone();
-        GlobalExecutor::spawn(async move {
-            match *request {
-                ClientRequest::ContractOp(ops) => match ops {
-                    ContractRequest::Put {
-                        state,
+#[inline]
+async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpManager>) {
+    // this will indirectly start actions on the local contract executor
+    let op_storage_cp = op_storage.clone();
+    let fut = async move {
+        let client_id = request.client_id;
+        match *request.request {
+            ClientRequest::ContractOp(ops) => match ops {
+                ContractRequest::Put {
+                    state,
+                    contract,
+                    related_contracts,
+                } => {
+                    // Initialize a put op.
+                    tracing::debug!(
+                        "Received put from user event @ {}",
+                        &op_storage_cp.ring.peer_key
+                    );
+                    let op = put::start_op(
                         contract,
-                        related_contracts,
-                    } => {
-                        // Initialize a put op.
-                        tracing::debug!(
-                            "Received put from user event @ {}",
-                            &op_storage_cp.ring.peer_key
-                        );
-                        let op = put::start_op(
-                            contract,
-                            state,
-                            op_storage_cp.ring.max_hops_to_live,
-                            &op_storage_cp.ring.peer_key,
-                        );
-                        if let Err(err) = put::request_put(&op_storage_cp, op).await {
-                            tracing::error!("{}", err);
-                        }
-                        todo!("use `related_contracts`: {related_contracts:?}")
+                        state,
+                        op_storage_cp.ring.max_hops_to_live,
+                        &op_storage_cp.ring.peer_key,
+                    );
+                    if let Err(err) = put::request_put(&op_storage_cp, op, Some(client_id)).await {
+                        tracing::error!("{}", err);
                     }
-                    ContractRequest::Update {
-                        key: _key,
-                        data: _delta,
-                    } => {
-                        todo!()
+                    todo!("use `related_contracts`: {related_contracts:?}")
+                }
+                ContractRequest::Update {
+                    key: _key,
+                    data: _delta,
+                } => {
+                    todo!()
+                }
+                ContractRequest::Get {
+                    key,
+                    fetch_contract: contract,
+                } => {
+                    // Initialize a get op.
+                    tracing::debug!(
+                        "Received get from user event @ {}",
+                        &op_storage_cp.ring.peer_key
+                    );
+                    let op = get::start_op(key, contract, &op_storage_cp.ring.peer_key);
+                    if let Err(err) = get::request_get(&op_storage_cp, op, Some(client_id)).await {
+                        tracing::error!("{}", err);
                     }
-                    ContractRequest::Get {
-                        key,
-                        fetch_contract: contract,
-                    } => {
-                        // Initialize a get op.
-                        tracing::debug!(
-                            "Received get from user event @ {}",
-                            &op_storage_cp.ring.peer_key
-                        );
-                        let op = get::start_op(key, contract, &op_storage_cp.ring.peer_key);
-                        if let Err(err) = get::request_get(&op_storage_cp, op).await {
-                            tracing::error!("{}", err);
-                        }
-                    }
-                    ContractRequest::Subscribe { key, .. } => {
-                        // Initialize a subscribe op.
-                        loop {
-                            // FIXME: this will block the event loop until the subscribe op succeeds
-                            //        instead the op should be deferred for later execution
-                            let op = subscribe::start_op(key.clone(), &op_storage_cp.ring.peer_key);
-                            match subscribe::request_subscribe(&op_storage_cp, op).await {
-                                Err(OpError::ContractError(ContractError::ContractNotFound(
-                                    key,
-                                ))) => {
-                                    tracing::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
-                                    let get_op = get::start_op(
-                                        key.clone(),
-                                        true,
-                                        &op_storage_cp.ring.peer_key,
-                                    );
-                                    if let Err(err) = get::request_get(&op_storage_cp, get_op).await
-                                    {
-                                        tracing::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
-                                        tokio::time::sleep(Duration::from_secs(5)).await;
-                                    }
+                }
+                ContractRequest::Subscribe { key, .. } => {
+                    // Initialize a subscribe op.
+                    loop {
+                        // FIXME: this will block the event loop until the subscribe op succeeds
+                        //        instead the op should be deferred for later execution
+                        let op = subscribe::start_op(key.clone(), &op_storage_cp.ring.peer_key);
+                        match subscribe::request_subscribe(&op_storage_cp, op, Some(client_id))
+                            .await
+                        {
+                            Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
+                                tracing::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
+                                let get_op =
+                                    get::start_op(key.clone(), true, &op_storage_cp.ring.peer_key);
+                                if let Err(err) =
+                                    get::request_get(&op_storage_cp, get_op, Some(client_id)).await
+                                {
+                                    tracing::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
                                 }
-                                Err(err) => {
-                                    tracing::error!("{}", err);
-                                    break;
-                                }
-                                Ok(()) => break,
                             }
+                            Err(err) => {
+                                tracing::error!("{}", err);
+                                break;
+                            }
+                            Ok(()) => break,
                         }
-                        todo!()
                     }
-                    _ => {
-                        tracing::error!("op not supported");
-                    }
-                },
-                ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
-                ClientRequest::Disconnect { .. } => unreachable!(),
+                    todo!()
+                }
                 _ => {
                     tracing::error!("op not supported");
                 }
+            },
+            ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
+            ClientRequest::Disconnect { .. } => unreachable!(),
+            _ => {
+                tracing::error!("op not supported");
             }
-        });
-    }
+        }
+    };
+
+    GlobalExecutor::spawn(fut);
 }
 
 macro_rules! log_handling_msg {
@@ -416,9 +441,24 @@ macro_rules! log_handling_msg {
 }
 
 #[inline(always)]
-fn report_result(op_result: Result<(), OpError>) {
-    if let Err(err) = op_result {
-        tracing::debug!("Finished tx w/ error: {}", err)
+async fn report_result(
+    op_result: Result<Option<OpEnum>, OpError>,
+    executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
+    client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
+) {
+    match op_result {
+        Ok(Some(res)) => {
+            if let Some((client_id, cb)) = client_req_handler_callback {
+                let _ = cb.send((client_id, res.to_host_result(client_id)));
+            }
+            if let Some(mut cb) = executor_callback {
+                cb.response(res).await;
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::debug!("Finished tx w/ error: {}", err)
+        }
     }
 }
 
@@ -426,10 +466,14 @@ async fn process_message<CB>(
     msg: Result<Message, ConnectionError>,
     op_storage: Arc<OpManager>,
     mut conn_manager: CB,
-    event_listener: Option<Box<dyn EventListener + Send + Sync>>,
+    event_listener: Option<Box<dyn EventLogListener + Send + Sync>>,
+    executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
+    client_req_handler_callback: Option<ClientResponsesSender>,
+    client_id: Option<ClientId>,
 ) where
     CB: ConnectionBridge,
 {
+    let cli_req = client_id.zip(client_req_handler_callback);
     match msg {
         Ok(msg) => {
             if let Some(mut listener) = event_listener {
@@ -442,23 +486,32 @@ async fn process_message<CB>(
                         &op_storage,
                         &mut conn_manager,
                         op,
+                        client_id,
                     )
                     .await;
-                    report_result(op_result);
+                    report_result(op_result, executor_callback, cli_req).await;
                 }
                 Message::Put(op) => {
                     log_handling_msg!("put", *op.id(), op_storage);
-                    let op_result =
-                        handle_op_request::<put::PutOp, _>(&op_storage, &mut conn_manager, op)
-                            .await;
-                    report_result(op_result);
+                    let op_result = handle_op_request::<put::PutOp, _>(
+                        &op_storage,
+                        &mut conn_manager,
+                        op,
+                        client_id,
+                    )
+                    .await;
+                    report_result(op_result, executor_callback, cli_req).await;
                 }
                 Message::Get(op) => {
                     log_handling_msg!("get", op.id(), op_storage);
-                    let op_result =
-                        handle_op_request::<get::GetOp, _>(&op_storage, &mut conn_manager, op)
-                            .await;
-                    report_result(op_result);
+                    let op_result = handle_op_request::<get::GetOp, _>(
+                        &op_storage,
+                        &mut conn_manager,
+                        op,
+                        client_id,
+                    )
+                    .await;
+                    report_result(op_result, executor_callback, cli_req).await;
                 }
                 Message::Subscribe(op) => {
                     log_handling_msg!("subscribe", op.id(), op_storage);
@@ -466,15 +519,16 @@ async fn process_message<CB>(
                         &op_storage,
                         &mut conn_manager,
                         op,
+                        client_id,
                     )
                     .await;
-                    report_result(op_result);
+                    report_result(op_result, executor_callback, cli_req).await;
                 }
                 _ => {}
             }
         }
         Err(err) => {
-            report_result(Err(err.into()));
+            report_result(Err(err.into()), executor_callback, cli_req).await;
         }
     }
 }

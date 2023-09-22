@@ -1,6 +1,7 @@
 #![allow(unused)] // FIXME: remove this
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
@@ -9,12 +10,16 @@ use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use super::executor::{ExecutorHalve, ExecutorToEventLoopChannel};
 use super::{
     executor::{ContractExecutor, Executor},
     ContractError,
 };
+use crate::client_events::HostResult;
+use crate::message::Transaction;
+use crate::node::OpManager;
 use crate::{
     client_events::ClientId,
     node::NodeConfig,
@@ -24,18 +29,53 @@ use crate::{
 
 pub const MAX_MEM_CACHE: i64 = 10_000_000;
 
+pub(crate) struct ClientResponses(UnboundedReceiver<(ClientId, HostResult)>);
+
+impl ClientResponses {
+    pub fn channel() -> (Self, ClientResponsesSender) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self(rx), ClientResponsesSender(tx))
+    }
+}
+
+impl std::ops::Deref for ClientResponses {
+    type Target = UnboundedReceiver<(ClientId, HostResult)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ClientResponses {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ClientResponsesSender(UnboundedSender<(ClientId, HostResult)>);
+
+impl std::ops::Deref for ClientResponsesSender {
+    type Target = UnboundedSender<(ClientId, HostResult)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub(crate) trait ContractHandler {
     type Builder;
     type ContractExecutor: ContractExecutor;
 
     fn build(
-        channel: ContractHandlerChannel<CHListenerHalve>,
+        contract_handler_channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         builder: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static;
 
-    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve>;
+    fn channel(&mut self) -> &mut ContractHandlerToEventLoopChannel<ContractHandlerHalve>;
 
     /// # Arguments
     /// - updates: channel to send back updates from contracts to whoever is subscribed to the contract.
@@ -51,7 +91,7 @@ pub(crate) trait ContractHandler {
 
 pub(crate) struct NetworkContractHandler<R = Runtime> {
     executor: Executor<R>,
-    channel: ContractHandlerChannel<CHListenerHalve>,
+    channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
 }
 
 impl ContractHandler for NetworkContractHandler<Runtime> {
@@ -59,20 +99,22 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
     type ContractExecutor = Executor<Runtime>;
 
     fn build(
-        channel: ContractHandlerChannel<CHListenerHalve>,
+        channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         config: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
         async {
-            let executor = Executor::from_config(config).await?;
+            let mut executor = Executor::from_config(config).await?;
+            executor.event_loop_channel(executor_request_sender);
             Ok(Self { executor, channel })
         }
         .boxed()
     }
 
-    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
+    fn channel(&mut self) -> &mut ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
         &mut self.channel
     }
 
@@ -103,7 +145,8 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
     type ContractExecutor = Executor<super::MockRuntime>;
 
     fn build(
-        channel: ContractHandlerChannel<CHListenerHalve>,
+        channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+        _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         _builder: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
@@ -116,7 +159,7 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
         .boxed()
     }
 
-    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
+    fn channel(&mut self) -> &mut ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
         &mut self.channel
     }
 
@@ -141,46 +184,66 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
     }
 }
 
-pub struct EventId(u64);
+#[derive(Eq)]
+pub(crate) struct EventId {
+    id: u64,
+    client_id: Option<ClientId>,
+}
+
+impl EventId {
+    pub fn client_id(&self) -> Option<ClientId> {
+        self.client_id
+    }
+}
+
+impl PartialEq for EventId {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Hash for EventId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
 
 /// A bidirectional channel which keeps track of the initiator half
 /// and sends the corresponding response to the listener of the operation.
-pub(crate) struct ContractHandlerChannel<End> {
+pub(crate) struct ContractHandlerToEventLoopChannel<End: sealed::ChannelHalve> {
     rx: mpsc::UnboundedReceiver<InternalCHEvent>,
     tx: mpsc::UnboundedSender<InternalCHEvent>,
-    //TODO:  change queue to btree once pop_first is stabilized
-    // (https://github.com/rust-lang/rust/issues/62924)
-    queue: VecDeque<(u64, ContractHandlerEvent)>,
+    queue: BTreeMap<u64, ContractHandlerEvent>,
     _halve: PhantomData<End>,
 }
 
-pub(crate) struct CHListenerHalve;
-pub(crate) struct CHSenderHalve;
+pub(crate) struct ContractHandlerHalve;
+pub(crate) struct NetEventListener;
 
 mod sealed {
-    use super::{CHListenerHalve, CHSenderHalve};
+    use super::{ContractHandlerHalve, NetEventListener};
     pub(crate) trait ChannelHalve {}
-    impl ChannelHalve for CHListenerHalve {}
-    impl ChannelHalve for CHSenderHalve {}
+    impl ChannelHalve for ContractHandlerHalve {}
+    impl ChannelHalve for NetEventListener {}
 }
 
 pub(crate) fn contract_handler_channel() -> (
-    ContractHandlerChannel<CHSenderHalve>,
-    ContractHandlerChannel<CHListenerHalve>,
+    ContractHandlerToEventLoopChannel<NetEventListener>,
+    ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
 ) {
     let (notification_tx, notification_channel) = mpsc::unbounded_channel();
     let (ch_tx, ch_listener) = mpsc::unbounded_channel();
     (
-        ContractHandlerChannel {
+        ContractHandlerToEventLoopChannel {
             rx: notification_channel,
             tx: ch_tx,
-            queue: VecDeque::new(),
+            queue: BTreeMap::new(),
             _halve: PhantomData,
         },
-        ContractHandlerChannel {
+        ContractHandlerToEventLoopChannel {
             rx: ch_listener,
             tx: notification_tx,
-            queue: VecDeque::new(),
+            queue: BTreeMap::new(),
             _halve: PhantomData,
         },
     )
@@ -195,18 +258,19 @@ static EV_ID: AtomicU64 = AtomicU64::new(0);
 // kind of event and can be optimized on a case basis
 const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
 
-impl ContractHandlerChannel<CHSenderHalve> {
+impl ContractHandlerToEventLoopChannel<NetEventListener> {
     /// Send an event to the contract handler and receive a response event if successful.
     pub async fn send_to_handler(
         &mut self,
         ev: ContractHandlerEvent,
+        client_id: Option<ClientId>,
     ) -> Result<ContractHandlerEvent, ContractError> {
         let id = EV_ID.fetch_add(1, SeqCst);
         self.tx
-            .send(InternalCHEvent { ev, id })
+            .send(InternalCHEvent { ev, id, client_id })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
-        if let Ok(pos) = self.queue.binary_search_by_key(&id, |(k, _v)| *k) {
-            Ok(self.queue.remove(pos).unwrap().1)
+        if let Some(handler) = self.queue.remove(&id) {
+            Ok(handler)
         } else {
             let started_op = Instant::now();
             loop {
@@ -217,34 +281,46 @@ impl ContractHandlerChannel<CHSenderHalve> {
                     if msg.id == id {
                         return Ok(msg.ev);
                     } else {
-                        self.queue.push_front((id, msg.ev)); // should never be duplicates
+                        self.queue.insert(id, msg.ev); // should never be duplicates
                     }
                 }
                 tokio::time::sleep(Duration::from_nanos(100)).await;
             }
         }
     }
+
+    // todo: use
+    pub async fn recv_from_handler(&mut self) -> (EventId, ContractHandlerEvent) {
+        todo!()
+    }
 }
 
-impl ContractHandlerChannel<CHListenerHalve> {
-    pub async fn send_to_listener(
+impl ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
+    pub async fn send_to_event_loop(
         &self,
         id: EventId,
         ev: ContractHandlerEvent,
     ) -> Result<(), ContractError> {
         self.tx
-            .send(InternalCHEvent { ev, id: id.0 })
+            .send(InternalCHEvent {
+                ev,
+                id: id.id,
+                client_id: id.client_id,
+            })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))
     }
 
-    pub async fn recv_from_listener(
+    pub async fn recv_from_event_loop(
         &mut self,
     ) -> Result<(EventId, ContractHandlerEvent), ContractError> {
-        if let Some((id, ev)) = self.queue.pop_front() {
-            return Ok((EventId(id), ev));
-        }
         if let Some(msg) = self.rx.recv().await {
-            return Ok((EventId(msg.id), msg.ev));
+            return Ok((
+                EventId {
+                    id: msg.id,
+                    client_id: msg.client_id,
+                },
+                msg.ev,
+            ));
         }
         Err(ContractError::NoEvHandlerResponse)
     }
@@ -259,6 +335,7 @@ pub(crate) struct StoreResponse {
 struct InternalCHEvent {
     ev: ContractHandlerEvent,
     id: u64,
+    client_id: Option<ClientId>,
 }
 
 #[derive(Debug)]
@@ -288,6 +365,12 @@ pub(crate) enum ContractHandlerEvent {
     CacheResult(Result<(), ContractError>),
 }
 
+impl ContractHandlerEvent {
+    pub async fn into_network_op(self, op_manager: &OpManager) -> Transaction {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 pub mod test {
     use std::sync::Arc;
@@ -313,12 +396,12 @@ pub mod test {
                     Parameters::from(vec![]),
                 )));
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(contract))
+                .send_to_handler(ContractHandlerEvent::Cache(contract), None)
                 .await
         });
 
         let (id, ev) =
-            tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_listener())
+            tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_event_loop())
                 .await??;
 
         if let ContractHandlerEvent::Cache(contract) = ev {
@@ -329,7 +412,7 @@ pub mod test {
             ));
             tokio::time::timeout(
                 Duration::from_millis(100),
-                rcv_halve.send_to_listener(id, ContractHandlerEvent::Cache(contract)),
+                rcv_halve.send_to_event_loop(id, ContractHandlerEvent::Cache(contract)),
             )
             .await??;
         } else {
