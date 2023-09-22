@@ -1,7 +1,7 @@
 // TODO: complete update logic in the network
 
 pub(crate) use self::messages::UpdateMsg;
-use crate::node::ConnectionBridge;
+use crate::{client_events::ClientId, node::ConnectionBridge};
 
 use super::{op_trait::Operation, OpError};
 
@@ -37,6 +37,7 @@ impl<CB: ConnectionBridge> Operation<CB> for UpdateOp {
         _conn_manager: &'a mut CB,
         _op_storage: &'a crate::node::OpManager,
         _input: Self::Message,
+        _client_id: Option<ClientId>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
     > {
@@ -45,8 +46,11 @@ impl<CB: ConnectionBridge> Operation<CB> for UpdateOp {
 }
 
 mod messages {
+    use serde::{Deserialize, Serialize};
+
     use crate::message::{InnerMessage, Transaction};
 
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum UpdateMsg {}
 
     impl InnerMessage for UpdateMsg {

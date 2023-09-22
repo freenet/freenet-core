@@ -12,6 +12,7 @@ use freenet_stdlib::prelude::*;
 
 use super::{OpEnum, OpError, OperationResult};
 use crate::{
+    client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::ContractHandlerEvent,
     message::{InnerMessage, Message, Transaction, TxType},
@@ -25,7 +26,15 @@ pub(crate) struct PutOp {
     state: Option<PutState>,
     /// time left until time out, when this reaches zero it will be removed from the state
     _ttl: Duration,
+    done: bool,
 }
+
+impl PutOp {
+    pub(super) fn finished(&self) -> bool {
+        self.done
+    }
+}
+
 pub(crate) struct PutResult {}
 
 impl TryFrom<PutOp> for PutResult {
@@ -61,6 +70,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(PutState::ReceivedRequest),
+                        done: false,
                         id: tx,
                         _ttl: PEER_TIMEOUT,
                     },
@@ -80,10 +90,12 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
         input: Self::Message,
+        client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
             let new_state;
+            let mut done = false;
 
             match input {
                 PutMsg::RequestPut {
@@ -140,7 +152,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                             .within_caching_distance(&Location::from(&key))
                     {
                         tracing::debug!("Contract `{}` not cached @ peer {}", key, target.peer);
-                        match try_to_cache_contract(op_storage, &contract, &key).await {
+                        match try_to_cache_contract(op_storage, &contract, &key, client_id).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -156,7 +168,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
 
                     // after the contract has been cached, push the update query
                     tracing::debug!("Attempting contract value update");
-                    let new_value = put_contract(op_storage, key.clone(), value).await?;
+                    let new_value = put_contract(op_storage, key.clone(), value, client_id).await?;
                     tracing::debug!("Contract successfully updated");
                     // if the change was successful, communicate this back to the requestor and broadcast the change
                     conn_manager
@@ -197,7 +209,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                     );
 
                     match try_to_broadcast(
-                        id,
+                        (id, client_id),
                         op_storage,
                         self.state,
                         broadcast_to,
@@ -224,7 +236,8 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                     let target = op_storage.ring.own_location();
 
                     tracing::debug!("Attempting contract value update");
-                    let new_value = put_contract(op_storage, key.clone(), new_value).await?;
+                    let new_value =
+                        put_contract(op_storage, key.clone(), new_value, client_id).await?;
                     tracing::debug!("Contract successfully updated");
 
                     let broadcast_to = op_storage
@@ -247,7 +260,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                     );
 
                     match try_to_broadcast(
-                        id,
+                        (id, client_id),
                         op_storage,
                         self.state,
                         broadcast_to,
@@ -326,6 +339,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                             tracing::debug!("Successfully updated value for {}", contract,);
                             new_state = None;
                             return_msg = None;
+                            done = true;
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     };
@@ -355,7 +369,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                         .ring
                         .within_caching_distance(&Location::from(&key));
                     if !cached_contract && within_caching_dist {
-                        match try_to_cache_contract(op_storage, &contract, &key).await {
+                        match try_to_cache_contract(op_storage, &contract, &key, client_id).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -367,7 +381,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                         });
                     }
                     // after the contract has been cached, push the update query
-                    let new_value = put_contract(op_storage, key, new_value).await?;
+                    let new_value = put_contract(op_storage, key, new_value, client_id).await?;
 
                     //update skip list
                     skip_list.push(peer_loc.peer);
@@ -391,7 +405,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, self._ttl)
+            build_op_result(self.id, new_state, return_msg, self._ttl, done)
         })
     }
 }
@@ -401,10 +415,12 @@ fn build_op_result(
     state: Option<PutState>,
     msg: Option<PutMsg>,
     ttl: Duration,
+    done: bool,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(PutOp {
         id,
         state,
+        done,
         _ttl: ttl,
     });
     Ok(OperationResult {
@@ -417,10 +433,11 @@ async fn try_to_cache_contract<'a>(
     op_storage: &'a OpManager,
     contract: &ContractContainer,
     key: &ContractKey,
+    client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     // this node does not have the contract, so instead store the contract and execute the put op.
     let res = op_storage
-        .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
+        .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), client_id)
         .await?;
     if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
         op_storage.ring.contract_cached(key);
@@ -435,7 +452,7 @@ async fn try_to_cache_contract<'a>(
 }
 
 async fn try_to_broadcast(
-    id: Transaction,
+    (id, client_id): (Transaction, Option<ClientId>),
     op_storage: &OpManager,
     state: Option<PutState>,
     broadcast_to: Vec<PeerKeyLocation>,
@@ -471,10 +488,15 @@ async fn try_to_broadcast(
                 let op = PutOp {
                     id,
                     state: new_state,
+                    done: false,
                     _ttl: ttl,
                 };
                 op_storage
-                    .notify_op_change(Message::from(return_msg.unwrap()), OpEnum::Put(op))
+                    .notify_op_change(
+                        Message::from(return_msg.unwrap()),
+                        OpEnum::Put(op),
+                        client_id,
+                    )
                     .await?;
                 return Err(OpError::StatePushed);
             }
@@ -509,6 +531,7 @@ pub(crate) fn start_op(
     PutOp {
         id,
         state,
+        done: false,
         _ttl: PEER_TIMEOUT,
     }
 }
@@ -529,7 +552,11 @@ enum PutState {
 }
 
 /// Request to insert/update a value into a contract.
-pub(crate) async fn request_put(op_storage: &OpManager, put_op: PutOp) -> Result<(), OpError> {
+pub(crate) async fn request_put(
+    op_storage: &OpManager,
+    put_op: PutOp,
+    client_id: Option<ClientId>,
+) -> Result<(), OpError> {
     let key = if let Some(PutState::PrepareRequest { contract, .. }) = put_op.state.clone() {
         contract.key()
     } else {
@@ -570,11 +597,12 @@ pub(crate) async fn request_put(op_storage: &OpManager, put_op: PutOp) -> Result
             let op = PutOp {
                 state: new_state,
                 id,
+                done: false,
                 _ttl: put_op._ttl,
             };
 
             op_storage
-                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Put(op))
+                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Put(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::InvalidStateTransition(put_op.id)),
@@ -587,10 +615,11 @@ async fn put_contract(
     op_storage: &OpManager,
     key: ContractKey,
     state: WrappedState,
+    client_id: Option<ClientId>,
 ) -> Result<WrappedState, OpError> {
     // after the contract has been cached, push the update query
     match op_storage
-        .notify_contract_handler(ContractHandlerEvent::PutQuery { key, state })
+        .notify_contract_handler(ContractHandlerEvent::PutQuery { key, state }, client_id)
         .await
     {
         Ok(ContractHandlerEvent::PutResponse {

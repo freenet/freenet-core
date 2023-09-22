@@ -13,7 +13,10 @@ use uuid::{
 
 use crate::{
     node::{ConnectionError, PeerKey},
-    operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg},
+    operations::{
+        get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg,
+        update::UpdateMsg,
+    },
     ring::{Location, PeerKeyLocation},
 };
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
@@ -89,6 +92,8 @@ where
 }
 
 mod sealed_msg_type {
+    use crate::operations::update::UpdateMsg;
+
     use super::*;
 
     pub(crate) trait SealedTxType {
@@ -111,6 +116,7 @@ mod sealed_msg_type {
         Put,
         Get,
         Subscribe,
+        Update,
         Canceled,
     }
 
@@ -136,7 +142,8 @@ mod sealed_msg_type {
         JoinRing -> JoinRingMsg,
         Put -> PutMsg,
         Get -> GetMsg,
-        Subscribe -> SubscribeMsg
+        Subscribe -> SubscribeMsg,
+        Update -> UpdateMsg
     });
 }
 
@@ -146,11 +153,12 @@ pub(crate) enum Message {
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
+    Update(UpdateMsg),
     /// Failed a transaction, informing of cancellation.
     Canceled(Transaction),
 }
 
-pub(crate) trait InnerMessage {
+pub(crate) trait InnerMessage: Into<Message> {
     fn id(&self) -> &Transaction;
 }
 
@@ -194,6 +202,7 @@ impl Message {
             Put(op) => op.id(),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
+            Update(_op) => todo!(),
             Canceled(tx) => tx,
         }
     }
@@ -205,6 +214,7 @@ impl Message {
             Put(op) => op.target(),
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
+            Update(_op) => todo!(),
             Canceled(_) => None,
         }
     }
@@ -217,6 +227,7 @@ impl Message {
             Put(op) => op.terminal(),
             Get(op) => op.terminal(),
             Subscribe(op) => op.terminal(),
+            Update(_op) => todo!(),
             Canceled(_) => true,
         }
     }
@@ -231,6 +242,7 @@ impl Display for Message {
             Put(msg) => msg.fmt(f)?,
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
+            Update(_op) => todo!(),
             Canceled(msg) => msg.fmt(f)?,
         };
         write!(f, "}}")

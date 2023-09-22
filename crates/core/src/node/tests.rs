@@ -17,7 +17,7 @@ use crate::{
     client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
     contract::MemoryContractHandler,
-    node::{event_listener::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
+    node::{event_log::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
 };
 

@@ -3,21 +3,21 @@ use std::{collections::BTreeMap, time::Instant};
 use dashmap::DashMap;
 use either::Either;
 use parking_lot::RwLock;
-use tokio::sync::{
-    mpsc::{error::SendError, Sender},
-    Mutex,
-};
+use tokio::sync::{mpsc::error::SendError, Mutex};
 
 use crate::{
-    contract::{CHSenderHalve, ContractError, ContractHandlerChannel, ContractHandlerEvent},
-    message::{Message, NodeEvent, Transaction, TransactionType},
+    contract::{
+        ContractError, ContractHandlerEvent, ContractHandlerToEventLoopChannel, NetEventListener,
+    },
+    dev_tool::ClientId,
+    message::{Message, Transaction, TransactionType},
     operations::{
         get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpEnum, OpError,
     },
     ring::Ring,
 };
 
-use super::PeerKey;
+use super::{conn_manager::EventLoopNotificationsSender, PeerKey};
 
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
@@ -26,8 +26,9 @@ pub(crate) struct OpManager {
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
-    notification_channel: Sender<Either<Message, NodeEvent>>,
-    contract_handler: Mutex<ContractHandlerChannel<CHSenderHalve>>,
+    to_event_listener: EventLoopNotificationsSender,
+    // todo: remove the need for a mutex here
+    ch_outbound: Mutex<ContractHandlerToEventLoopChannel<NetEventListener>>,
     // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
     _ops_ttl: RwLock<BTreeMap<Instant, Vec<Transaction>>>,
     pub ring: Ring,
@@ -42,10 +43,10 @@ macro_rules! check_id_op {
 }
 
 impl OpManager {
-    pub fn new(
+    pub(super) fn new(
         ring: Ring,
-        notification_channel: Sender<Either<Message, NodeEvent>>,
-        contract_handler: ContractHandlerChannel<CHSenderHalve>,
+        notification_channel: EventLoopNotificationsSender,
+        contract_handler: ContractHandlerToEventLoopChannel<NetEventListener>,
     ) -> Self {
         Self {
             join_ring: DashMap::default(),
@@ -53,8 +54,8 @@ impl OpManager {
             get: DashMap::default(),
             subscribe: DashMap::default(),
             ring,
-            notification_channel,
-            contract_handler: Mutex::new(contract_handler),
+            to_event_listener: notification_channel,
+            ch_outbound: Mutex::new(contract_handler),
             _ops_ttl: RwLock::new(BTreeMap::new()),
         }
     }
@@ -69,33 +70,39 @@ impl OpManager {
         &self,
         msg: Message,
         op: OpEnum,
-    ) -> Result<(), SendError<Message>> {
+        client_id: Option<ClientId>,
+    ) -> Result<(), SendError<(Message, Option<ClientId>)>> {
         // push back the state to the stack
         self.push(*msg.id(), op).expect("infallible");
-        self.notification_channel
-            .send(Either::Left(msg))
+        self.to_event_listener
+            .send(Either::Left((msg, client_id)))
             .await
             .map_err(|err| SendError(err.0.unwrap_left()))
     }
 
-    /// Send an internal message to this node event loop.
-    pub async fn notify_internal_op(&self, msg: NodeEvent) -> Result<(), SendError<NodeEvent>> {
-        self.notification_channel
-            .send(Either::Right(msg))
-            .await
-            .map_err(|err| SendError(err.0.unwrap_right()))
-    }
+    // /// Send an internal message to this node event loop.
+    // pub async fn notify_internal_op(&self, msg: NodeEvent) -> Result<(), SendError<NodeEvent>> {
+    //     self.to_event_listener
+    //         .send(Either::Right(msg))
+    //         .await
+    //         .map_err(|err| SendError(err.0.unwrap_right()))
+    // }
 
     /// Send an event to the contract handler and await a response event from it if successful.
     pub async fn notify_contract_handler(
         &self,
         msg: ContractHandlerEvent,
+        client_id: Option<ClientId>,
     ) -> Result<ContractHandlerEvent, ContractError> {
-        self.contract_handler
+        self.ch_outbound
             .lock()
             .await
-            .send_to_handler(msg)
+            .send_to_handler(msg, client_id)
             .await
+    }
+
+    pub async fn recv_from_handler(&self) -> (crate::contract::EventId, ContractHandlerEvent) {
+        todo!()
     }
 
     pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
@@ -134,6 +141,7 @@ impl OpManager {
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(OpEnum::Subscribe),
+            TransactionType::Update => todo!(),
             TransactionType::Canceled => unreachable!(),
         }
     }

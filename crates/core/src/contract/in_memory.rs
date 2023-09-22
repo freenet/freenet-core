@@ -10,7 +10,8 @@ use futures::{future::BoxFuture, FutureExt};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
-    handler::{CHListenerHalve, ContractHandler, ContractHandlerChannel},
+    executor::{ExecutorHalve, ExecutorToEventLoopChannel},
+    handler::{ContractHandler, ContractHandlerHalve, ContractHandlerToEventLoopChannel},
     storages::in_memory::MemKVStore,
     Executor,
 };
@@ -24,7 +25,7 @@ pub(crate) struct MemoryContractHandler<KVStore = MemKVStore>
 where
     KVStore: StateStorage,
 {
-    channel: ContractHandlerChannel<CHListenerHalve>,
+    channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
     _kv_store: StateStore<KVStore>,
     _runtime: MockRuntime,
 }
@@ -36,7 +37,10 @@ where
 {
     const MAX_MEM_CACHE: i64 = 10_000_000;
 
-    pub fn new(channel: ContractHandlerChannel<CHListenerHalve>, kv_store: KVStore) -> Self {
+    pub fn new(
+        channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+        kv_store: KVStore,
+    ) -> Self {
         MemoryContractHandler {
             channel,
             _kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
@@ -56,7 +60,8 @@ impl ContractHandler for MemoryContractHandler {
     type ContractExecutor = Executor<MockRuntime>;
 
     fn build(
-        channel: ContractHandlerChannel<CHListenerHalve>,
+        channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+        _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         _config: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
@@ -66,7 +71,7 @@ impl ContractHandler for MemoryContractHandler {
         async move { Ok(MemoryContractHandler::new(channel, store)) }.boxed()
     }
 
-    fn channel(&mut self) -> &mut ContractHandlerChannel<CHListenerHalve> {
+    fn channel(&mut self) -> &mut ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
         &mut self.channel
     }
 

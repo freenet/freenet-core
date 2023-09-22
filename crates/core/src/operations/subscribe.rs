@@ -5,13 +5,13 @@ use std::time::Duration;
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::operations::op_trait::Operation;
-use crate::operations::OpInitialization;
 use crate::{
+    client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::ContractError,
     message::{Message, Transaction, TxType},
     node::{ConnectionBridge, OpManager, PeerKey},
+    operations::{op_trait::Operation, OpInitialization},
     ring::{PeerKeyLocation, RingError},
 };
 
@@ -25,6 +25,12 @@ pub(crate) struct SubscribeOp {
     id: Transaction,
     state: Option<SubscribeState>,
     _ttl: Duration,
+}
+
+impl SubscribeOp {
+    pub fn finished(&self) -> bool {
+        todo!()
+    }
 }
 
 pub(crate) enum SubscribeResult {}
@@ -84,6 +90,7 @@ impl<CB: ConnectionBridge> Operation<CB> for SubscribeOp {
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
         input: Self::Message,
+        client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -247,6 +254,8 @@ impl<CB: ConnectionBridge> Operation<CB> for SubscribeOp {
                         sender.peer
                     );
                     op_storage.ring.add_subscription(key);
+                    let _ = client_id;
+                    // todo: should inform back to the network event loop?
 
                     match self.state {
                         Some(SubscribeState::AwaitingResponse { .. }) => {
@@ -312,6 +321,7 @@ enum SubscribeState {
 pub(crate) async fn request_subscribe(
     op_storage: &OpManager,
     sub_op: SubscribeOp,
+    client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let (target, _id) =
         if let Some(SubscribeState::PrepareRequest { id, key }) = sub_op.state.clone() {
@@ -344,7 +354,11 @@ pub(crate) async fn request_subscribe(
                 _ttl: sub_op._ttl,
             };
             op_storage
-                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Subscribe(op))
+                .notify_op_change(
+                    msg.map(Message::from).unwrap(),
+                    OpEnum::Subscribe(op),
+                    client_id,
+                )
                 .await?;
         }
         _ => return Err(OpError::InvalidStateTransition(sub_op.id)),

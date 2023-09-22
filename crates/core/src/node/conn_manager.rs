@@ -1,10 +1,17 @@
 //! Types and definitions to handle all socket communication for the peer nodes.
 
+use std::ops::{Deref, DerefMut};
+
+use either::Either;
 use libp2p::swarm::StreamUpgradeError;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::PeerKey;
-use crate::message::Message;
+use crate::{
+    client_events::ClientId,
+    message::{Message, NodeEvent},
+};
 
 #[cfg(test)]
 pub(crate) mod in_memory;
@@ -74,5 +81,43 @@ impl Clone for ConnectionError {
             Self::Upgrade(err) => Self::Upgrade(err.clone()),
             Self::NegotiationFailed => Self::NegotiationFailed,
         }
+    }
+}
+
+pub(super) struct EventLoopNotifications(Receiver<Either<(Message, Option<ClientId>), NodeEvent>>);
+
+impl EventLoopNotifications {
+    pub fn channel() -> (EventLoopNotifications, EventLoopNotificationsSender) {
+        let (notification_tx, notification_rx) = mpsc::channel(100);
+        (
+            EventLoopNotifications(notification_rx),
+            EventLoopNotificationsSender(notification_tx),
+        )
+    }
+}
+
+impl Deref for EventLoopNotifications {
+    type Target = Receiver<Either<(Message, Option<ClientId>), NodeEvent>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for EventLoopNotifications {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+pub(super) struct EventLoopNotificationsSender(
+    Sender<Either<(Message, Option<ClientId>), NodeEvent>>,
+);
+
+impl Deref for EventLoopNotificationsSender {
+    type Target = Sender<Either<(Message, Option<ClientId>), NodeEvent>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
