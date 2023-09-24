@@ -5,6 +5,7 @@ mod message;
 mod node;
 mod operations;
 mod resource_manager;
+mod topology_manager;
 mod ring;
 mod router;
 mod runtime;
