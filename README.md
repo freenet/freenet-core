@@ -76,7 +76,7 @@ systems, desktop and mobile.
 ## What is Locutus?
 
 Locutus was the working title used for this successor to the original Freenet,
-in March 2023 it was renamed to "Freenet" or "Freenet 2023", this repository was
+in March 2023 it was renamed to "Freenet", this repository was
 renamed from `locutus` to `freenet-core` in September 2023.
 
 ## What is Hyphanet?
