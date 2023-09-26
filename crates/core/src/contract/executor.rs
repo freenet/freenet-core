@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::hint::unreachable_unchecked;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blake3::traits::digest::generic_array::GenericArray;
@@ -14,21 +14,24 @@ use freenet_stdlib::client_api::{
     RequestError,
 };
 use freenet_stdlib::prelude::*;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self};
 
+use crate::message::Transaction;
+use crate::node::OpManager;
 #[cfg(any(
     not(feature = "local-mode"),
     feature = "network-mode",
     all(not(feature = "local-mode"), not(feature = "network-mode"))
 ))]
 use crate::operations::get::GetResult;
+use crate::operations::{OpEnum, OpError};
 use crate::runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
     SecretsStore, StateStore, StateStoreError,
 };
 use crate::{
     client_events::{ClientId, HostResult},
-    node::{NodeConfig, OpManager, P2pBridge},
+    node::{NodeConfig, P2pBridge},
     operations::{self, op_trait::Operation},
     DynError,
 };
@@ -98,27 +101,90 @@ pub enum OperationMode {
     Network,
 }
 
-#[cfg(any(
-    not(feature = "local-mode"),
-    feature = "network-mode",
-    all(not(feature = "local-mode"), not(feature = "network-mode"))
-))]
-// for now just mocking up requests to the network
-async fn op_request<Op, M>(_request: M) -> Result<Op, DynError>
-where
-    Op: Operation<P2pBridge>,
-    M: ComposeNetworkMessage<Op>,
-{
+pub(crate) struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
+    op_manager: Arc<OpManager>,
+    end: End,
+}
+
+pub(crate) fn executor_channel(
+    op_manager: Arc<OpManager>,
+) -> (
+    ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+    ExecutorToEventLoopChannel<ExecutorHalve>,
+) {
+    let (sender, _b) = mpsc::channel(1);
+    let listener_halve = ExecutorToEventLoopChannel {
+        op_manager: op_manager.clone(),
+        end: NetworkEventListenerHalve,
+    };
+    let sender_halve = ExecutorToEventLoopChannel {
+        op_manager: op_manager.clone(),
+        end: ExecutorHalve { sender },
+    };
+    (listener_halve, sender_halve)
+}
+
+#[cfg(test)]
+pub(crate) fn executor_channel_test() -> (
+    ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+    ExecutorToEventLoopChannel<ExecutorHalve>,
+) {
     todo!()
 }
 
+impl ExecutorToEventLoopChannel<ExecutorHalve> {
+    async fn send_to_event_loop<Op, T>(&mut self, message: T) -> Result<(), DynError>
+    where
+        T: ComposeNetworkMessage<Op>,
+        Op: Operation<P2pBridge> + Send + 'static,
+    {
+        let op = message.initiate_op(&self.op_manager);
+        self.end.sender.send(*op.id()).await?;
+        <T as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager).await?;
+        Ok(())
+    }
+}
+
+impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+    pub async fn transaction_from_executor(&mut self) -> Transaction {
+        todo!()
+    }
+
+    pub async fn response(&mut self, _result: OpEnum) {
+        todo!()
+    }
+}
+
+impl Clone for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+    fn clone(&self) -> Self {
+        todo!()
+    }
+}
+
+pub(crate) struct NetworkEventListenerHalve;
+pub(crate) struct ExecutorHalve {
+    sender: mpsc::Sender<Transaction>,
+}
+
+mod sealed {
+    use super::{ExecutorHalve, NetworkEventListenerHalve};
+    pub(crate) trait ChannelHalve {}
+    impl ChannelHalve for NetworkEventListenerHalve {}
+    impl ChannelHalve for ExecutorHalve {}
+}
+
 #[allow(unused)]
+#[async_trait::async_trait]
 trait ComposeNetworkMessage<Op>
 where
     Self: Sized,
-    Op: Operation<P2pBridge>,
+    Op: Operation<P2pBridge> + Send + 'static,
 {
-    fn get_message(self, manager: &OpManager) -> Op::Message {
+    fn initiate_op(self, op_manager: &OpManager) -> Op {
+        todo!()
+    }
+
+    async fn resume_op(op: Op, op_manager: &OpManager) -> Result<Transaction, OpError> {
         todo!()
     }
 }
@@ -129,7 +195,21 @@ struct GetContract {
     fetch_contract: bool,
 }
 
-impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {}
+#[async_trait::async_trait]
+impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
+    fn initiate_op(self, op_manager: &OpManager) -> operations::get::GetOp {
+        operations::get::start_op(self.key, self.fetch_contract, &op_manager.ring.peer_key)
+    }
+
+    async fn resume_op(
+        op: operations::get::GetOp,
+        op_manager: &OpManager,
+    ) -> Result<Transaction, OpError> {
+        let id = *<operations::get::GetOp as Operation<P2pBridge>>::id(&op);
+        operations::get::request_get(op_manager, op, None).await?;
+        Ok(id)
+    }
+}
 
 #[allow(unused)]
 struct SubscribeContract {
@@ -172,9 +252,90 @@ pub struct Executor<R = Runtime> {
     mode: OperationMode,
     runtime: R,
     state_store: StateStore<Storage>,
-    update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
+    update_notifications: HashMap<ContractKey, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
+    #[cfg(any(
+        not(feature = "local-mode"),
+        feature = "network-mode",
+        all(not(feature = "local-mode"), not(feature = "network-mode"))
+    ))]
+    event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
+}
+
+#[cfg(any(
+    not(feature = "local-mode"),
+    feature = "network-mode",
+    all(not(feature = "local-mode"), not(feature = "network-mode"))
+))]
+impl Executor<Runtime> {
+    pub(crate) fn event_loop_channel(
+        &mut self,
+        channel: ExecutorToEventLoopChannel<ExecutorHalve>,
+    ) {
+        self.event_loop_channel = Some(channel);
+    }
+
+    async fn subscribe(&mut self, key: ContractKey) -> Result<(), ExecutorError> {
+        #[cfg(any(
+            all(not(feature = "local-mode"), not(feature = "network-mode")),
+            all(feature = "local-mode", feature = "network-mode")
+        ))]
+        {
+            if self.mode == OperationMode::Local {
+                return Ok(());
+            }
+        }
+        let request = SubscribeContract { key };
+        let op: operations::subscribe::SubscribeOp = self
+            .op_request(request)
+            .await
+            .map_err(ExecutorError::other)?;
+        let _sub: operations::subscribe::SubscribeResult =
+            op.try_into().map_err(ExecutorError::other)?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn local_state_or_from_network(
+        &mut self,
+        id: &ContractInstanceId,
+    ) -> Result<Either<WrappedState, operations::get::GetResult>, ExecutorError> {
+        if let Ok(contract) = self.state_store.get(&(*id).into()).await {
+            return Ok(Either::Left(contract));
+        };
+        let request: GetContract = GetContract {
+            key: (*id).into(),
+            fetch_contract: true,
+        };
+        let op: operations::get::GetOp = self
+            .op_request(request)
+            .await
+            .map_err(ExecutorError::other)?;
+        let get_result: operations::get::GetResult = op.try_into().map_err(ExecutorError::other)?;
+        Ok(Either::Right(get_result))
+    }
+
+    // FIXME: must add suspension and resuming when doing this,
+    // otherwise it may be possible to end up in a deadlock waiting for a tree of contract
+    // dependencies to be resolved
+    async fn op_request<Op, M>(&mut self, request: M) -> Result<Op, DynError>
+    where
+        Op: Operation<P2pBridge> + Send + 'static,
+        M: ComposeNetworkMessage<Op>,
+    {
+        debug_assert!(self.event_loop_channel.is_some());
+        let channel = match self.event_loop_channel.as_mut() {
+            Some(ch) => ch,
+            None => {
+                // Safety: this should be always set if network mode is ambiguous
+                // or using network mode unequivocally
+                unsafe { std::hint::unreachable_unchecked() }
+            }
+        };
+        channel.send_to_event_loop(request).await?;
+        todo!()
+    }
 }
 
 impl Executor<Runtime> {
@@ -241,6 +402,12 @@ impl Executor<Runtime> {
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
             delegate_attested_ids: HashMap::default(),
+            #[cfg(any(
+                not(feature = "local-mode"),
+                feature = "network-mode",
+                all(not(feature = "local-mode"), not(feature = "network-mode"))
+            ))]
+            event_loop_channel: None,
         })
     }
 
@@ -309,7 +476,7 @@ impl Executor<Runtime> {
         &mut self,
         id: ClientId,
         req: ClientRequest<'a>,
-        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
+        updates: Option<mpsc::UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
@@ -329,7 +496,7 @@ impl Executor<Runtime> {
         &mut self,
         req: ContractRequest<'_>,
         cli_id: ClientId,
-        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
+        updates: Option<mpsc::UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         match req {
             ContractRequest::Put {
@@ -594,6 +761,7 @@ impl Executor<Runtime> {
                                 let state = match self.local_state_or_from_network(&id).await? {
                                     Either::Left(state) => state,
                                     Either::Right(GetResult { state, contract }) => {
+                                        let contract = contract.unwrap(); // fixme: deal with unwrap
                                         self.verify_and_store_contract(
                                             state.clone(),
                                             contract,
@@ -680,8 +848,10 @@ impl Executor<Runtime> {
                 key: key.clone(),
                 new_state,
             };
-            let op: operations::update::UpdateOp =
-                op_request(request).await.map_err(ExecutorError::other)?;
+            let op: operations::update::UpdateOp = self
+                .op_request(request)
+                .await
+                .map_err(ExecutorError::other)?;
             let _update: operations::update::UpdateResult =
                 op.try_into().map_err(ExecutorError::other)?;
         }
@@ -789,6 +959,7 @@ impl Executor<Runtime> {
                     .await?
                 {
                     Either::Right(GetResult { state, contract }) => {
+                        let contract = contract.unwrap(); // fixme: deal with unwrap
                         self.verify_and_store_contract(
                             state,
                             contract.clone(),
@@ -801,29 +972,6 @@ impl Executor<Runtime> {
                 }
             }
         }
-    }
-
-    #[cfg(any(
-        not(feature = "local-mode"),
-        feature = "network-mode",
-        all(not(feature = "local-mode"), not(feature = "network-mode"))
-    ))]
-    async fn subscribe(&self, key: ContractKey) -> Result<(), ExecutorError> {
-        #[cfg(any(
-            all(not(feature = "local-mode"), not(feature = "network-mode")),
-            all(feature = "local-mode", feature = "network-mode")
-        ))]
-        {
-            if self.mode == OperationMode::Local {
-                return Ok(());
-            }
-        }
-        let request = SubscribeContract { key };
-        let op: operations::subscribe::SubscribeOp =
-            op_request(request).await.map_err(ExecutorError::other)?;
-        let _sub: operations::subscribe::SubscribeResult =
-            op.try_into().map_err(ExecutorError::other)?;
-        Ok(())
     }
 
     async fn get_local_contract(
@@ -908,10 +1056,11 @@ impl Executor<Runtime> {
                                         *related = Some(state.into());
                                     }
                                     Either::Right(result) => {
+                                        let contract = result.contract.unwrap(); // fixme: deal with unwrap
                                         trying_key = (*id).into();
-                                        trying_params = result.contract.params();
+                                        trying_params = contract.params();
                                         trying_state = result.state;
-                                        trying_contract = Some(result.contract);
+                                        trying_contract = Some(contract);
                                         continue;
                                     }
                                 }
@@ -1004,28 +1153,6 @@ impl Executor<Runtime> {
         Ok(())
     }
 
-    #[cfg(any(
-        not(feature = "local-mode"),
-        feature = "network-mode",
-        all(not(feature = "local-mode"), not(feature = "network-mode")),
-    ))]
-    #[inline]
-    async fn local_state_or_from_network(
-        &self,
-        id: &ContractInstanceId,
-    ) -> Result<Either<WrappedState, operations::get::GetResult>, ExecutorError> {
-        if let Ok(contract) = self.state_store.get(&(*id).into()).await {
-            return Ok(Either::Left(contract));
-        };
-        let request: GetContract = GetContract {
-            key: (*id).into(),
-            fetch_contract: true,
-        };
-        let op: operations::get::GetOp = op_request(request).await.map_err(ExecutorError::other)?;
-        let get_result: operations::get::GetResult = op.try_into().map_err(ExecutorError::other)?;
-        Ok(Either::Right(get_result))
-    }
-
     async fn get_contract_locally(
         &self,
         key: &ContractKey,
@@ -1055,7 +1182,7 @@ impl Executor<crate::contract::MockRuntime> {
         &mut self,
         _id: ClientId,
         _req: ClientRequest<'a>,
-        _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
+        _updates: Option<mpsc::UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
         todo!()
     }
@@ -1077,7 +1204,7 @@ impl ContractExecutor for Executor<Runtime> {
             Err(err) => Err(err),
             Ok(_) => {
                 // Safety: check `perform_contract_get` to indeed check this should never happen
-                unsafe { unreachable_unchecked() }
+                unsafe { std::hint::unreachable_unchecked() }
             }
         }
     }

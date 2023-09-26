@@ -105,7 +105,7 @@ pub mod local_node {
                 }
             };
             let OpenRequest {
-                id,
+                client_id: id,
                 request,
                 notification_channel,
                 token,

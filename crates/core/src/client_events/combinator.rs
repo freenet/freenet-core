@@ -84,7 +84,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                 .map(|res| {
                     match res {
                         Ok(OpenRequest {
-                            id: external,
+                            client_id: external,
                             request,
                             notification_channel,
                             token,
@@ -103,7 +103,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                                     });
 
                             Ok(OpenRequest {
-                                id,
+                                client_id: id,
                                 request,
                                 notification_channel,
                                 token,
@@ -162,9 +162,9 @@ async fn client_fn(
             }
             client_msg = client.recv() => {
                 match client_msg {
-                    Ok(OpenRequest {id,  request, notification_channel, token}) => {
-                        tracing::debug!("received msg @ combinator from external id {id}, msg: {request}");
-                        if tx_host.send(Ok(OpenRequest { id,  request, notification_channel, token })).await.is_err() {
+                    Ok(OpenRequest { client_id,  request, notification_channel, token }) => {
+                        tracing::debug!("received msg @ combinator from external id {client_id}, msg: {request}");
+                        if tx_host.send(Ok(OpenRequest { client_id,  request, notification_channel, token })).await.is_err() {
                             break;
                         }
                     }
@@ -308,7 +308,7 @@ mod test {
         .unwrap();
 
         for i in 0..3 {
-            let OpenRequest { id, .. } = combinator.recv().await.unwrap();
+            let OpenRequest { client_id: id, .. } = combinator.recv().await.unwrap();
             eprintln!("received: {id:?}");
             assert_eq!(ClientId::new(i), id);
         }

@@ -21,9 +21,9 @@ struct ListenerLogId(usize);
 ///
 /// This type then can emit it's own information to adjacent systems
 /// or is a no-op.
-pub(crate) trait EventListener {
+pub(crate) trait EventLogListener {
     fn event_received(&mut self, ev: EventLog);
-    fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static>;
+    fn trait_clone(&self) -> Box<dyn EventLogListener + Send + Sync + 'static>;
 }
 
 #[allow(dead_code)] // fixme: remove this
@@ -112,13 +112,13 @@ struct MessageLog {
 #[derive(Clone)]
 pub(super) struct EventRegister {}
 
-impl EventListener for EventRegister {
+impl EventLogListener for EventRegister {
     fn event_received(&mut self, _log: EventLog) {
         // let (_msg_log, _log_id) = create_log(log);
         // TODO: save log
     }
 
-    fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static> {
+    fn trait_clone(&self) -> Box<dyn EventLogListener + Send + Sync + 'static> {
         Box::new(self.clone())
     }
 }
@@ -321,7 +321,7 @@ mod test_utils {
         }
     }
 
-    impl super::EventListener for TestEventListener {
+    impl super::EventLogListener for TestEventListener {
         fn event_received(&mut self, log: EventLog) {
             let tx = log.tx;
             let mut logs = self.logs.write();
@@ -331,7 +331,7 @@ mod test_utils {
             self.tx_log.entry(*tx).or_default().push(log_id);
         }
 
-        fn trait_clone(&self) -> Box<dyn EventListener + Send + Sync + 'static> {
+        fn trait_clone(&self) -> Box<dyn EventLogListener + Send + Sync + 'static> {
             Box::new(self.clone())
         }
     }

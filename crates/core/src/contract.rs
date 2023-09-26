@@ -7,30 +7,32 @@ mod handler;
 mod in_memory;
 pub mod storages;
 
+pub(crate) use executor::{
+    executor_channel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+};
 pub(crate) use handler::{
-    contract_handler_channel, CHSenderHalve, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, NetworkContractHandler, StoreResponse,
+    contract_handler_channel, ClientResponses, ClientResponsesSender, ContractHandler,
+    ContractHandlerEvent, ContractHandlerToEventLoopChannel, EventId, NetEventListener,
+    NetworkContractHandler, StoreResponse,
 };
 #[cfg(test)]
 pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
 
-use executor::ContractExecutor;
 pub use executor::{Executor, ExecutorError, OperationMode};
+
+use executor::ContractExecutor;
 
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
 {
     loop {
-        let res = contract_handler.channel().recv_from_listener().await?;
-        match res {
-            (
-                _id,
-                ContractHandlerEvent::GetQuery {
-                    key,
-                    fetch_contract,
-                },
-            ) => {
+        let (id, event) = contract_handler.channel().recv_from_event_loop().await?;
+        match event {
+            ContractHandlerEvent::GetQuery {
+                key,
+                fetch_contract,
+            } => {
                 match contract_handler
                     .executor()
                     .fetch_contract(key.clone(), fetch_contract)
@@ -39,8 +41,8 @@ where
                     Ok((state, contract)) => {
                         contract_handler
                             .channel()
-                            .send_to_listener(
-                                _id,
+                            .send_to_event_loop(
+                                id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
                                     response: Ok(StoreResponse {
@@ -55,8 +57,8 @@ where
                         tracing::warn!("error while executing get contract query: {err}");
                         contract_handler
                             .channel()
-                            .send_to_listener(
-                                _id,
+                            .send_to_event_loop(
+                                id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
                                     response: Err(err.into()),
@@ -66,30 +68,27 @@ where
                     }
                 }
             }
-            (id, ContractHandlerEvent::Cache(contract)) => {
+            ContractHandlerEvent::Cache(contract) => {
                 match contract_handler.executor().store_contract(contract).await {
                     Ok(_) => {
                         contract_handler
                             .channel()
-                            .send_to_listener(id, ContractHandlerEvent::CacheResult(Ok(())))
+                            .send_to_event_loop(id, ContractHandlerEvent::CacheResult(Ok(())))
                             .await?;
                     }
                     Err(err) => {
                         let err = ContractError::ContractRuntimeError(err);
                         contract_handler
                             .channel()
-                            .send_to_listener(id, ContractHandlerEvent::CacheResult(Err(err)))
+                            .send_to_event_loop(id, ContractHandlerEvent::CacheResult(Err(err)))
                             .await?;
                     }
                 }
             }
-            (
-                _id,
-                ContractHandlerEvent::PutQuery {
-                    key: _key,
-                    state: _state,
-                },
-            ) => {
+            ContractHandlerEvent::PutQuery {
+                key: _key,
+                state: _state,
+            } => {
                 // let _put_result = contract_handler
                 //     .handle_request(ClientRequest::Put {
                 //         contract: todo!(),
