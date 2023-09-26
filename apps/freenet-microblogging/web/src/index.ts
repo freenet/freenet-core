@@ -3,7 +3,7 @@ import {
   GetResponse,
   HostError,
   ContractKey,
-  LocutusWsApi,
+  FreenetWsApi,
   PutResponse,
   UpdateNotification,
   UpdateResponse,
@@ -146,7 +146,7 @@ const handler = {
 };
 
 const API_URL = new URL(`ws://${location.host}/contract/command`);
-const locutusApi = new LocutusWsApi(API_URL, handler);
+const locutusApi = new FreenetWsApi(API_URL, handler);
 
 async function loadState() {
   const key = ContractKey.fromInstanceId(MODEL_CONTRACT);
