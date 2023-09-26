@@ -2,7 +2,7 @@ name: Sync Issues with Pivotal Tracker
 
 on:
   issues:
-    types: [labeled]
+    types: [labeled, opened]
     
 jobs:
   sync:
