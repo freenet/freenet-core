@@ -16,8 +16,11 @@ endif
 
 .PHONY: build clean
 
+all: \
+	$(MAKE) build-tool \
+	$(MAKE) build
+
 build: \
-	build-tool \
 	generate-id-manager-key \
 	build-inbox \
 	build-webapp \
