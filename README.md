@@ -10,7 +10,7 @@
   <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
     <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
-  <a href="https://docs.rs/locutus">
+  <a href="https://docs.rs/freenet">
     <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square&label=api%20docs"
       alt="docs.rs docs" />
   </a>
@@ -42,14 +42,14 @@ building decentralized applications using our SDK and testing them locally.
 
 Examples of what can be built on Freenet include:
 
-* Decentralized email (with a gateway to legacy email via the @freenet.org
+- Decentralized email (with a gateway to legacy email via the @freenet.org
   domain)
-* Decentralized microblogging (think Twitter or Facebook)
-* Instant Messaging (Whatsapp, Signal)
-* Online Store (Amazon)
-* Discussion (Reddit, HN)
-* Video discovery (Youtube, TikTok)
-* Search (Google, Bing)
+- Decentralized microblogging (think Twitter or Facebook)
+- Instant Messaging (Whatsapp, Signal)
+- Online Store (Amazon)
+- Discussion (Reddit, HN)
+- Video discovery (Youtube, TikTok)
+- Search (Google, Bing)
 
 All will be completely decentralized, scalable, and cryptographically secure. We
 want Freenet to be useful out-of-the-box, so we plan to provide reference
@@ -61,7 +61,7 @@ Freenet is a decentralized key-value database. It uses the same [small
 world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as
 the original Freenet design, but each key is a cryptographic contract
 implemented in [Web Assembly](https://webassembly.org/), and the value
-associated with each contract is called its *state*. The role of the
+associated with each contract is called its _state_. The role of the
 cryptographic contract is to specify what state is allowed for this contract,
 and how the state is modified.
 
@@ -116,14 +116,14 @@ development.
 ### Supporting Freenet
 
 If you are in a position to fund our continued efforts please contact us on
-[twitter](https://twitter.com/FreenetOrg) or by email at *ian at freenet dot
-org*.
+[twitter](https://twitter.com/FreenetOrg) or by email at _ian at freenet dot
+org_.
 
 ## License
 
 This project is licensed under either of:
 
-* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
   <http://www.apache.org/licenses/LICENSE-2.0>)
-* MIT license ([LICENSE-MIT](LICENSE-MIT) or
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
   <http://opensource.org/licenses/MIT>)

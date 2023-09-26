@@ -3,8 +3,8 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "daily"
-    open-pull-requests-limit: 9999
+      interval: "weekly"
+    open-pull-requests-limit: 50
 
   - package-ecosystem: "github-actions"
     directory: "/"

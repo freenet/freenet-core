@@ -175,7 +175,7 @@ applications and interfacing with your local node, so we will make our
 ```json
 {
   "dependencies": {
-    "@freenet/freenet-stdlib": "0.0.2"
+    "@freenetorg/freenet-stdlib": "0.0.6"
   }
 }
 ```
@@ -196,11 +196,11 @@ import {
   GetResponse,
   HostError,
   Key,
-  LocutusWsApi,
+  FreenetWsApi,
   PutResponse,
   UpdateNotification,
   UpdateResponse,
-} from "@locutus/locutus-stdlib/webSocketInterface";
+} from "@freenetorg/freenet-stdlib/websocket-interface";
 
 const handler = {
   onPut: (_response: PutResponse) => {},
@@ -212,7 +212,7 @@ const handler = {
 };
 
 const API_URL = new URL(`ws://${location.host}/contract/command/`);
-const locutusApi = new LocutusWsApi(API_URL, handler);
+const locutusApi = new FreenetWsApi(API_URL, handler);
 
 const CONTRACT = "DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1";
 
