@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use wasmer::{Instance, TypedFunction};
 
 use super::error::RuntimeInnerError;
-use super::{util, ContractError, Runtime, RuntimeResult};
+use super::{ContractError, Runtime, RuntimeResult};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -216,16 +216,6 @@ impl Runtime {
                     context.user_response.insert(req_id, response);
                     last_context = DelegateContext::new(bincode::serialize(&context).unwrap());
                 }
-                OutboundDelegateMsg::RandomBytesRequest(bytes) => {
-                    let mut bytes = vec![0; bytes];
-                    util::generate_random_bytes(&mut bytes);
-                    let inbound = InboundDelegateMsg::RandomBytes(bytes);
-                    let new_outbound_msgs =
-                        self.exec_inbound(params, attested, &inbound, process_func, instance)?;
-                    for msg in new_outbound_msgs.into_iter() {
-                        outbound_msgs.push_back(msg);
-                    }
-                }
                 OutboundDelegateMsg::ContextUpdated(context) => {
                     last_context = context;
                 }
@@ -334,24 +324,6 @@ impl DelegateRuntimeInterface for Runtime {
                         params,
                         attested,
                         &mut real_outbound,
-                        &mut results,
-                    )?;
-                }
-                InboundDelegateMsg::RandomBytes(bytes) => {
-                    let mut outbound = VecDeque::from(self.exec_inbound(
-                        params,
-                        attested,
-                        &InboundDelegateMsg::RandomBytes(bytes),
-                        &process_func,
-                        &running.instance,
-                    )?);
-                    self.get_outbound(
-                        delegate_key,
-                        &running.instance,
-                        &process_func,
-                        params,
-                        attested,
-                        &mut outbound,
                         &mut results,
                     )?;
                 }
