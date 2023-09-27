@@ -3,8 +3,8 @@
   <a href="https://github.com/freenet/freenet-core/actions/workflows/ci.yml">
     <img src="https://img.shields.io/github/actions/workflow/status/freenet/locutus/ci.yml?branch=main&label=tests&style=flat-square" alt="continuous integration status" />
   </a>
-  <a href="https://crates.io/crates/locutus">
-    <img src="https://img.shields.io/crates/v/locutus.svg?style=flat-square"
+  <a href="https://crates.io/crates/freenet">
+    <img src="https://img.shields.io/crates/v/freenet.svg?style=flat-square"
     alt="Crates.io version" />
   </a>
   <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
