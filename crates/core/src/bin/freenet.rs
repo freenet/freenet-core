@@ -16,6 +16,7 @@ async fn run(config: NodeConfig) -> Result<(), DynError> {
 async fn run_local(config: NodeConfig) -> Result<(), DynError> {
     let port = config.port;
     let ip = config.address;
+    freenet::config::Config::set_op_mode(OperationMode::Local);
     let executor = Executor::from_config(config).await?;
     let socket: SocketAddr = (ip, port).into();
     freenet::server::local_node::run_local_node(executor, socket).await

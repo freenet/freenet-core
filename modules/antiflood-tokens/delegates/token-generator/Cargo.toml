@@ -27,7 +27,7 @@ chacha20poly1305 = "0.10"
 rand = { version = "0.8", features = ["std"] }
 rand_chacha = { version = "0.3" }
 freenet-stdlib = { workspace = true, features = ["testing"] }
-freenet = { path = "../../../../crates/core", version = "0.0.4" }
+freenet = { path = "../../../../crates/core", version = "0.0.5" }
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
 
 [lib]

@@ -45,7 +45,7 @@ To build the delegate, go to the `identity-management` folder and run the follow
 make build
 ```
 
-This command will compile the delegate and generate a binary file inside the `build/locutus/` folder. It
+This command will compile the delegate and generate a binary file inside the `build/freenet/` folder. It
 generates the build folder if it doesn't exist. In addition, the build command will generate:
 
 - `build/identity_management_code_hash` <-- this file contains the hash of the delegate's wasm code
@@ -88,7 +88,7 @@ To build the Antiflood Token System, go to the `antiflood-tokens` folder and run
 make build
 ```
 
-This command will compile the contract and the delegate and generate a binary file inside the `build/locutus/` folder.
+This command will compile the contract and the delegate and generate a binary file inside the `build/freenet/` folder.
 It generates the build folder if it doesn't exist.
 
 - `contracts/token-allocation-record/build/identity_management_code_hash` <-- this file contains the hash of the
@@ -145,8 +145,8 @@ After building the app, what remains is to run the local node and the web app. T
 
 During the development process, changes inside the web app will be automatically reloaded if it is running.
 
-If you, instead, want to access the published app via the `build` command, go to your browser and write an URL like:
-`http://localhost:50509/contract/web/5vavA8Wh7ZQRbqqNhtQvdszGFCrE9he67aLB4F3jGLws/`
+If you, instead, want to access the published app via the `build` command, go to your browser and write an URL like (with the node running):
+`http://localhost:50509/contract/web/5zrr81Nbvk6PjkrXjXXFpDfrNZZvhx2JCc7BZTBHUKDo/`
 
 The hash may be different and you can get it when you run the build command.
 
