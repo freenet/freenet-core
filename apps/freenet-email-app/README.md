@@ -1,6 +1,6 @@
-# Freenet Email App Setup Guide
+# Freenet Messaging App Setup Guide
 
-Freenet Email App is a descentralized email application that runs on top of Freenet.
+Freenet Messaging App is a descentralized messaging application that runs on top of Freenet.
 
 ## Introduction
 
@@ -10,17 +10,16 @@ local node, which simulates a node on the network.
 
 ## Prerequisites
 
-* Install the latest version of Rust and Cargo (for Windows
+- Install the latest version of Rust and Cargo (for Windows
   see [here](https://rustup.rs/)):
   ```bash
   curl https://sh.rustup.rs -sSf | sh
   ```
-* Install the Locutus Dev Tool (LDT). Use cargo to install it:
+- Install the Freeenet development tool (fdev) and a working Freenet kernel that can be used for local development. Use cargo to install it:
   ```bash
   cargo install freenet
+  cargo install fdev
   ```
-  This command will install fdev (Locutus Dev Tool) and a working Freenet kernel that
-  can be used for local development.
 
 ## Prepare the Freenet email contracts and delegates
 
@@ -33,12 +32,12 @@ to contacts.
 This delegate is located inside the modules folder of freenet-core:
 
 - `freenet-core/`
-    - `modules/`
-        - `identity-management/` <-- here is located the identity management delegate
-            - `build/` <-- the generated folder that contains the compiled delegate binary with version + wasm code
-            - `src/` <-- this folder contains the source code of the delegate
-            - `Makefile` <-- this file contains the build instructions for the delegate
-            - ...
+  - `modules/`
+    - `identity-management/` <-- here is located the identity management delegate
+      - `build/` <-- the generated folder that contains the compiled delegate binary with version + wasm code
+      - `src/` <-- this folder contains the source code of the delegate
+      - `Makefile` <-- this file contains the build instructions for the delegate
+      - ...
 
 To build the delegate, go to the `identity-management` folder and run the following command:
 
@@ -66,22 +65,22 @@ assignments.
 This system is located inside the modules folder of freenet-core:
 
 - `freenet-core/`
-    - `modules/`
-        - `antiflood-tokens/` <-- here is located the antiflood tokens system
-            - `contracts/` <-- this folder contains the contract source code
-                - `token-allocation-record/` <-- this folder contains the token allocation record contract
-                    - `build/` <-- the generated folder that contains the compiled contract binary with version + wasm
-                      code
-                    - `src/` <-- this folder contains the source code of the contract
-                    - ...
-            - `delegates/` <-- this folder contains the delegate source code
-                - `token-generator/` <-- this folder contains the token generator delegate
-                    - `build/` <-- the generated folder that contains the compiled delegate binary with version + wasm
-                      code
-                    - `src/` <-- this folder contains the source code of the delegate
-                    - ...
-            - `Makefile` <-- this file contains the build instructions for building the delegate and the contract
-            - ...
+  - `modules/`
+    - `antiflood-tokens/` <-- here is located the antiflood tokens system
+      - `contracts/` <-- this folder contains the contract source code
+        - `token-allocation-record/` <-- this folder contains the token allocation record contract
+          - `build/` <-- the generated folder that contains the compiled contract binary with version + wasm
+            code
+          - `src/` <-- this folder contains the source code of the contract
+          - ...
+      - `delegates/` <-- this folder contains the delegate source code
+        - `token-generator/` <-- this folder contains the token generator delegate
+          - `build/` <-- the generated folder that contains the compiled delegate binary with version + wasm
+            code
+          - `src/` <-- this folder contains the source code of the delegate
+          - ...
+      - `Makefile` <-- this file contains the build instructions for building the delegate and the contract
+      - ...
 
 To build the Antiflood Token System, go to the `antiflood-tokens` folder and run the following command:
 
@@ -90,8 +89,7 @@ make build
 ```
 
 This command will compile the contract and the delegate and generate a binary file inside the `build/locutus/` folder.
-It
-generates the build folder if it doesn't exist.
+It generates the build folder if it doesn't exist.
 
 - `contracts/token-allocation-record/build/identity_management_code_hash` <-- this file contains the hash of the
   contract's wasm code
@@ -106,23 +104,23 @@ and the contract that will be responsible for maintaining the inboxes.
 The app is located inside the `apps/freenet-email-app` folder:
 
 - `freenet-core/`
-    - `apps/`
-        - `freenet-email-app/` <-- here is located the email app
-            - `contracts/` <-- this folder contains the contract source code
-                - `inbox/` <-- this folder contains the email inbox contract
-                    - `build/` <-- the generated folder that contains the compiled contract binary with version + wasm
-                      code
-                    - `src/` <-- this folder contains the source code of the contract
-                    - ...
-            - `web/` <-- this folder contains the web app source code, web app built with Rust Dioxus framework
-                - `build/` <-- the generated folder that contains the compiled web app binary with version + wasm
-                  code
-                - `container/` <-- this folder contains the web contract container, a simple contract associated
-                  with the web app, as the state.
-                - `src/` <-- this folder contains the source code of the web app
-                - ...
-            - `Makefile` <-- this file contains the build instructions for building and running the web app, and
-              the local node.
+  - `apps/`
+    - `freenet-email-app/` <-- here is located the email app
+      - `contracts/` <-- this folder contains the contract source code
+        - `inbox/` <-- this folder contains the email inbox contract
+          - `build/` <-- the generated folder that contains the compiled contract binary with version + wasm
+            code
+          - `src/` <-- this folder contains the source code of the contract
+          - ...
+      - `web/` <-- this folder contains the web app source code, web app built with Rust Dioxus framework
+        - `build/` <-- the generated folder that contains the compiled web app binary with version + wasm
+          code
+        - `container/` <-- this folder contains the web contract container, a simple contract associated
+          with the web app, as the state.
+        - `src/` <-- this folder contains the source code of the web app
+        - ...
+      - `Makefile` <-- this file contains the build instructions for building and running the web app, and
+        the local node.
 
 To build the email application, go to the `apps/freenet-email-app` folder and run the following command:
 
@@ -131,21 +129,26 @@ make build
 ```
 
 This command will compile the inbox and web contracts and the delegate, generate a binary files
-inside the respective `build/locutus/` folders and publish the web contract. It generates the build folder if it doesn't
+inside the respective `build/freenet/` folders and publish the web contract. It generates the build folder if it doesn't
 exist.
 
-After building the app, what remains is to run the local node and the web app. To do that, run the following commanda:
+After building the app, what remains is to run the local node and the web app. To do that, run the following command:
 
 1. Run the local node:
-    ```bash
-    make run-node
-    ```
+   ```bash
+   make run-node
+   ```
 2. Run the web app:
-    ```bash
-    make run-web
-    ```
+   ```bash
+   make run-web
+   ```
 
 During the development process, changes inside the web app will be automatically reloaded if it is running.
+
+If you, instead, want to access the published app via the `build` command, go to your browser and write an URL like:
+`http://localhost:50509/contract/web/5vavA8Wh7ZQRbqqNhtQvdszGFCrE9he67aLB4F3jGLws/`
+
+The hash may be different and you can get it when you run the build command.
 
 ## Troubleshooting
 
@@ -155,4 +158,3 @@ If any of the delegates or contracts definition change, is necessary to rebuild 
 Probably the contract or delegate hash has changed and the node is trying to find the old version.
 
 If the error persists, we recommend to make a clean build of all the delegates and contracts, and restart the node.
-
