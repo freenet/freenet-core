@@ -5,12 +5,12 @@ mod message;
 mod node;
 mod operations;
 mod resource_manager;
-mod topology_manager;
 mod ring;
 mod router;
 mod runtime;
 #[cfg(feature = "websocket")]
 pub mod server;
+mod topology_manager;
 pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;

@@ -391,7 +391,7 @@ impl Ring {
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
-pub struct Location(f64);
+pub struct Location(pub f64);
 
 impl Location {
     pub fn new(location: f64) -> Self {

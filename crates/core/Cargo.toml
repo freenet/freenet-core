@@ -76,6 +76,7 @@ tracing-subscriber = { version = "0.3.16", optional = true }
 
 # internal deps
 freenet-stdlib = { path = "../../stdlib/rust", version = "0.0.5", features = ["net", "archive"] }
+nalgebra = "0.32.3"
 
 [dev-dependencies]
 tracing = "0.1"
