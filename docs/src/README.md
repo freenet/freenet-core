@@ -2,22 +2,22 @@
 
 # Introduction
 
-## What is Locutus?
+## What is Freenet?
 
-Locutus is a global, [observable](https://en.wikipedia.org/wiki/Small-world_network), decentralized key-value store. Values are arbitrary blocks of data, called the contract's "state." Keys are cryptographic contracts that specify:
+Freenet is a global, [observable](https://en.wikipedia.org/wiki/Small-world_network), decentralized key-value store. Values are arbitrary blocks of data, called the contract's "state." Keys are cryptographic contracts that specify:
 
 - Whether a given state is permitted under this contract
 - How the state can be modified over time
 - How two valid states can be merged
 - How to efficiently synchronize a contract's state between peers
 
-Locutus is a true decentralized peer-to-peer network, and is robust and scalable, through its use of a [small-world network](https://en.wikipedia.org/wiki/Small-world_network).
+Freenet is a true decentralized peer-to-peer network, and is robust and scalable, through its use of a [small-world network](https://en.wikipedia.org/wiki/Small-world_network).
 
-Applications on Locutus can be built in any language that is supported by web browsers, including JavaScript and WebAssembly. These applications are distributed over Locutus and can create, retrieve, and update contracts through a WebSocket connection to the local Locutus peer.
+Applications on Freenet can be built in any language that is supported by web browsers, including JavaScript and WebAssembly. These applications are distributed over Freenet and can create, retrieve, and update contracts through a WebSocket connection to the local Freenet peer.
 
 ## Writing a Contract
 
-Locutus contracts can be written in any language that compiles to WebAssembly.
+Freenet contracts can be written in any language that compiles to WebAssembly.
 This includes [Rust](https://www.rust-lang.org/), and
 [AssemblyScript](https://www.assemblyscript.org/), among many others.
 
@@ -27,17 +27,17 @@ A contract can be retrieved using a key, which is a cryptographic hash derived f
 
 ## Small world routing
 
-Locutus peers self-organize into a [small-world network](https://en.wikipedia.org/wiki/Small-world_routing) to allow contracts to be found in a fast, scalable, and decentralized way.
+Freenet peers self-organize into a [small-world network](https://en.wikipedia.org/wiki/Small-world_routing) to allow contracts to be found in a fast, scalable, and decentralized way.
 
-Every peer in Locutus is assigned a number between 0 and 1 when it first joins the network, this is the peer's "location". The small world network topology ensures that peers with similar locations are more likely to be connected.
+Every peer in Freenet is assigned a number between 0 and 1 when it first joins the network, this is the peer's "location". The small world network topology ensures that peers with similar locations are more likely to be connected.
 
 Contracts also have a location, which is derived from the contract's key. Peers cache contracts close to their locations.
 
 ## Writing an Application
 
-Creating a decentralized application on Locutus is very similar to creating a normal web application. You can use familiar frameworks like React, Bootstrap, Angular, Vue.js, and so on.
+Creating a decentralized application on Freenet is very similar to creating a normal web application. You can use familiar frameworks like React, Bootstrap, Angular, Vue.js, and so on.
 
-The main difference is that instead of connecting to a REST API running on a server, the web application connects to the Locutus peer running on the local computer through a [WebSocket](https://en.wikipedia.org/wiki/WebSocket) connection.
+The main difference is that instead of connecting to a REST API running on a server, the web application connects to the Freenet peer running on the local computer through a [WebSocket](https://en.wikipedia.org/wiki/WebSocket) connection.
 
 Through this the application can:
 
@@ -51,11 +51,11 @@ Contracts are extremely flexible. they can be used to create decentralized data 
 
 ## Delegate Ecosystem
 
-Applications in Locutus don't need to be built from scratch, they can be built on top of components provided by us or others.
+Applications in Freenet don't need to be built from scratch, they can be built on top of components provided by us or others.
 
 ### Reputation system
 
-Allows users to build up reputation over time based on feedback from those they interact with. Think of the feedback system in services like Uber, but with Locutus it will be entirely decentralized and cryptographically secure. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
+Allows users to build up reputation over time based on feedback from those they interact with. Think of the feedback system in services like Uber, but with Freenet it will be entirely decentralized and cryptographically secure. It can be used for things like spam prevention (with IM and email), or fraud prevention (with an online store).
 
 This is conceptually similar to Freenet's [Web of Trust](http://www.draketo.de/english/freenet/friendly-communication-with-anonymity) plugin.
 
