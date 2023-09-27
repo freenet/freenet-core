@@ -22,7 +22,7 @@ cd docker
 docker compose build
 ```
 
-## Running Locutus Node from the docker image
+## Running Freenet from the docker image
 
 Note: Currently the node will not pick up new contracts when they are published.
 Make sure the node is stopped and re-started after new contracts are added.

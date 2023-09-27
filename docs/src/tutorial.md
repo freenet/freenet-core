@@ -15,16 +15,16 @@ Mac (for Windows see [here](https://rustup.rs)):
 curl https://sh.rustup.rs -sSf | sh
 ```
 
-### Locutus Dev Tool (LDT)
+### Freenet Dev Tool (LDT)
 
-Once you have a working installation of Cargo you can install the Locutus dev
+Once you have a working installation of Cargo you can install the Freenet dev
 tools:
 
 ```bash
 cargo install freenet
 ```
 
-This command will install `fdev` (Locutus Dev Tool) and a working Freenet kernel that can
+This command will install `fdev` (Freenet development tool) and a working Freenet kernel that can
 be used for local development.
 
 ### Node.js and TypeScript
@@ -83,13 +83,13 @@ fdev new web-app
 ```
 
 will create the skeleton for a web application and its container contract for
-Locutus ready for development at the `my-app/web` directory.
+Freenet ready for development at the `my-app/web` directory.
 
 ## Making a container contract
 
 The first thing that we need is to write the code for our container contract.
 This contract's role is to contain the web application code itself, allowing it
-to be distributed over Locutus.
+to be distributed over Freenet.
 
 The `new` command has created the source ready to be modified for us, in your
 favorite editor open the following file:
@@ -122,7 +122,7 @@ That's a lot of information, let's unpack it:
 use freenet_stdlib::prelude::*;
 ```
 
-Here we are importing the necessary types and traits to write a Locutus contract
+Here we are importing the necessary types and traits to write a Freenet contract
 successfully using Rust.
 
 ```rust,noplayground
@@ -167,7 +167,7 @@ which does not do anything yet. To change this, we will start developing our web
 application.
 
 To do that, we can go and modify the code of the contract state, which in this
-case is the web application. Locutus offers a standard library (stdlib) that can
+case is the web application. Freenet offers a standard library (stdlib) that can
 be used with Typescript/JavaScript to facilitate the development of web
 applications and interfacing with your local node, so we will make our
 `package.json` contains the dependency:
@@ -378,7 +378,7 @@ HTTP gateway access and then we can re-use it for publishing additional
 contracts.
 
 <!--
-TODO: Publishing to the real functioning Locutus network is not yet supported.
+TODO: Publishing to the real functioning Freenet network is not yet supported.
 -->
 
 Currently, wep applications follow a standarized build procedure in case you use
@@ -470,7 +470,7 @@ You should see some logs printed via the stdout of the process indicating that
 the node HTTP gateway is running.
 
 Once the HTTP gateway is running, we are ready to publish the contracts to our
-local Locutus node:
+local Freenet node:
 
 ```bash
 cd ../backend && fdev publish --code="./build/freenet/backend.wasm" --state="./build/freenet/contract-state"
@@ -497,7 +497,7 @@ to new contracts, and evolving it over time.
 
 ## Limitations
 
-- Publishing to the Locutus network is not yet supported.
+- Publishing to the Freenet network is not yet supported.
 - Only Rust is currently supported for contract development, but we'll support
   more languages like [AssemblyScript](https://www.assemblyscript.org/) in the
   future.
