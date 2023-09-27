@@ -40,7 +40,7 @@ fn ideal_proportion_within_x(x: f64, c: f64) -> f64 {
 }
 
 /// Calculate the actual proportion of peers within distance X.
-fn actual_proportion_within_x(connection_distances: &Vec<f64>, x: f64) -> f64 {
+fn actual_proportion_within_x(connection_distances: &[f64], x: f64) -> f64 {
     let count = connection_distances.iter().filter(|&&r| r <= x).count();
     count as f64 / connection_distances.len() as f64
 }
@@ -52,7 +52,7 @@ fn actual_proportion_within_x(connection_distances: &Vec<f64>, x: f64) -> f64 {
 /// - 0.0 is ideal, indicating a perfect match with the ideal small-world topology.
 /// - A negative value indicates the network is not clustered enough (lacks short-range links).
 /// - A positive value indicates the network is too clustered (lacks long-range links).
-pub(crate) fn small_world_deviation_metric(connection_distances: Vec<f64>) -> f64 {
+pub(crate) fn small_world_deviation_metric(connection_distances: &[f64]) -> f64 {
     let c = calculate_normalization_constant();
     let mut sum = 0.0;
     let step = 0.01;
