@@ -70,7 +70,6 @@ pub mod local_node {
         mut executor: Executor,
         socket: SocketAddr,
     ) -> Result<(), DynError> {
-        crate::config::Config::set_op_mode(crate::local_node::OperationMode::Local);
         match socket.ip() {
             IpAddr::V4(ip) if !ip.is_loopback() => {
                 return Err(format!("invalid ip: {ip}, expecting localhost").into())
