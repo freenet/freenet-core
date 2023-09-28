@@ -1460,7 +1460,7 @@ checksum = "25cbce373ec4653f1a01a31e8a5e5ec0c622dc27ff9c4e6606eefef5cbbed4a5"
 
 [[package]]
 name = "fdev"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -1612,6 +1612,8 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e9fac5b43bee97b6ee49a376ca9e26eedf8bd581efcb176e4a534304f8b4279"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1621,6 +1623,8 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebd193c150c4f7f9f44068ee7f5181d4c4374ceb1b37965e1edd968d3730f35a"
 dependencies = [
  "arbitrary",
  "arrayvec",
@@ -1634,7 +1638,6 @@ dependencies = [
  "futures",
  "js-sys",
  "once_cell",
- "rand",
  "semver",
  "serde",
  "serde-wasm-bindgen 0.6.0",
@@ -1648,7 +1651,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
- "wasmer",
  "web-sys",
  "xz2",
 ]
