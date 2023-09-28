@@ -31,34 +31,34 @@ pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), D
 
 fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
     let package_type = cli_config.package_type;
-    const RUST_TARGET_ARGS: &[&str] = &["build", "--release", "--lib", "--target"];
+    const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
+    let release: &[&str] = if cli_config.debug {
+        &[]
+    } else {
+        &["--release"]
+    };
     let target = WASM_TARGET;
+    let cmd_args = cli_config
+        .features
+        .as_ref()
+        .iter()
+        .flat_map(|x| ["--features", x.as_str()])
+        .chain(release.iter().copied())
+        .collect::<Vec<_>>();
     use std::io::IsTerminal;
     let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
         RUST_TARGET_ARGS
             .iter()
             .copied()
             .chain([target, "--color", "always"])
-            .chain(
-                cli_config
-                    .features
-                    .as_ref()
-                    .iter()
-                    .flat_map(|x| ["--features", x.as_str()]),
-            )
+            .chain(cmd_args)
             .collect::<Vec<_>>()
     } else {
         RUST_TARGET_ARGS
             .iter()
             .copied()
             .chain([target])
-            .chain(
-                cli_config
-                    .features
-                    .as_ref()
-                    .iter()
-                    .flat_map(|x| ["--features", x.as_str()]),
-            )
+            .chain(cmd_args)
             .collect::<Vec<_>>()
     };
 
@@ -79,7 +79,7 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Re
 
 fn get_out_lib(
     work_dir: &Path,
-    _cli_config: &BuildToolCliConfig,
+    cli_config: &BuildToolCliConfig,
 ) -> Result<(String, PathBuf), DynError> {
     const ERR: &str = "Cargo.toml definition incorrect";
 
@@ -100,6 +100,11 @@ fn get_out_lib(
         .as_str()
         .ok_or_else(|| Error::MissConfiguration(ERR.into()))?
         .replace('-', "_");
+    let opt_dir = if !cli_config.debug {
+        "release"
+    } else {
+        "debug"
+    };
     let output_lib = env::var("CARGO_TARGET_DIR")
         .map_err(|e| {
             println!("Missing environment variable `CARGO_TARGET_DIR");
@@ -107,7 +112,7 @@ fn get_out_lib(
         })?
         .parse::<PathBuf>()?
         .join(target)
-        .join("release")
+        .join(opt_dir)
         .join(&package_name)
         .with_extension("wasm");
     Ok((package_name, output_lib))
