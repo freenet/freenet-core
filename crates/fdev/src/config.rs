@@ -105,8 +105,13 @@ pub struct BuildToolCliConfig {
     #[arg(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
     pub(crate) version: Version,
 
+    /// Output object type.
     #[arg(long, value_enum, default_value_t=PackageType::default())]
     pub(crate) package_type: PackageType,
+
+    /// Compile in debug mode instead of release.
+    #[arg(long)]
+    pub(crate) debug: bool,
 }
 
 #[derive(Default, Debug, Clone, Copy, ValueEnum)]
@@ -131,6 +136,7 @@ impl Default for BuildToolCliConfig {
             features: None,
             version: Version::new(0, 0, 1),
             package_type: PackageType::default(),
+            debug: false,
         }
     }
 }

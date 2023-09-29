@@ -12,7 +12,7 @@ mod token_assignment {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        DateTime::<Utc>::from_utc(naive, Utc)
+        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
     }
 
     const TEST_TIER: Tier = Tier::Day1;

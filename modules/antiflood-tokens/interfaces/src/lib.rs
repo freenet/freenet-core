@@ -314,7 +314,7 @@ fn get_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         .unwrap()
         .and_hms_opt(0, 0, 0)
         .unwrap();
-    DateTime::<Utc>::from_utc(naive, Utc)
+    DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
 }
 
 #[non_exhaustive]
