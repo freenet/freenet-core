@@ -21,6 +21,7 @@ arrayvec = { workspace = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path", "headers", "query", "http1"] }
 bincode = "1"
 blake3 = { workspace = true }
+byteorder = "1"
 bytes = "1"
 bs58 = "0.5"
 chacha20poly1305 = { workspace = true }
@@ -66,6 +67,8 @@ ordered-float = "3.9.1"
 notify = "6"
 wasmer = { workspace = true, features = [ "sys"] }
 chrono = { workspace = true }
+tar = { version = "0.4.38" }
+xz2 = { version = "0.1" }
 
 # Tracing deps
 tracing = { version = "0.1", optional = true }
@@ -75,7 +78,7 @@ tracing-opentelemetry = { version = "0.21.0", optional = true }
 tracing-subscriber = { version = "0.3.16", optional = true }
 
 # internal deps
-freenet-stdlib = { workspace = true, features = ["net", "archive"] }
+freenet-stdlib = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 tracing = "0.1"

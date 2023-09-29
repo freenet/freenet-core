@@ -12,10 +12,10 @@ import {
   UpdateData,
   DeltaUpdate,
   DelegateResponse,
-} from "freenet-stdlib/websocket-interface";
+} from "@freenetorg/freenet-stdlib";
+import { UpdateDataType } from "@freenetorg/freenet-stdlib/common";
 
 import "./scss/styles.scss";
-import { UpdateDataType } from "freenet-stdlib/common";
 
 // import * as bootstrap from "bootstrap";
 
@@ -29,7 +29,7 @@ function getDocument(): Document {
 
 const DOCUMENT: Document = getDocument();
 
-const MODEL_CONTRACT = "Hz1TGDBXtD6c1E74shUWMm9EdXjDDbPY1JxdTZsK2xwc";
+const MODEL_CONTRACT = "AgWvW6kwUpMfZcuzSrVddzgfMK2uPPew2UtDCdob9bkj";
 const KEY = ContractKey.fromInstanceId(MODEL_CONTRACT);
 
 function getState(hostResponse: GetResponse) {
@@ -76,7 +76,7 @@ async function sendUpdate() {
     );
     const update = new UpdateData(UpdateDataType.DeltaUpdate, delta);
     let updateRequest = new UpdateRequest(KEY, update);
-    await locutusApi.update(updateRequest);
+    await freenetApi.update(updateRequest);
   }
 }
 
@@ -126,7 +126,7 @@ async function subscribeToUpdates() {
     KEY,
     new Array<number>()
   );
-  await locutusApi.subscribe(subscribe_request);
+  await freenetApi.subscribe(subscribe_request);
 }
 
 const handler = {
@@ -146,14 +146,14 @@ const handler = {
 };
 
 const API_URL = new URL(`ws://${location.host}/contract/command`);
-const locutusApi = new FreenetWsApi(API_URL, handler);
+const freenetApi = new FreenetWsApi(API_URL, handler);
 
 async function loadState() {
   const key = ContractKey.fromInstanceId(MODEL_CONTRACT);
   const fetchContract = false;
   const getRequest: GetRequest = new GetRequest(key, fetchContract);
 
-  await locutusApi.get(getRequest);
+  await freenetApi.get(getRequest);
 }
 
 window.addEventListener("load", function (_ev: Event) {
