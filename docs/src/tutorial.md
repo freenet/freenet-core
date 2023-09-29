@@ -1,6 +1,6 @@
 # Getting Started
 
-This tutorial will show you how to build decentralized software on Freenet.
+This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-microblogging` app (located in under the `apps/freenet-microblogging` directory in the `freenet-core` repository).
 
 <!-- toc -->
 
@@ -15,7 +15,7 @@ Mac (for Windows see [here](https://rustup.rs)):
 curl https://sh.rustup.rs -sSf | sh
 ```
 
-### Freenet Dev Tool (LDT)
+### Freenet development tool (fdev)
 
 Once you have a working installation of Cargo you can install the Freenet dev
 tools:
@@ -200,19 +200,21 @@ import {
   PutResponse,
   UpdateNotification,
   UpdateResponse,
+  DelegateResponse,
 } from "@freenetorg/freenet-stdlib/websocket-interface";
 
 const handler = {
-  onPut: (_response: PutResponse) => {},
-  onGet: (_response: GetResponse) => {},
-  onUpdate: (_up: UpdateResponse) => {},
-  onUpdateNotification: (_notif: UpdateNotification) => {},
+  onContractPut: (_response: PutResponse) => {},
+  onContractGet: (_response: GetResponse) => {},
+  onContractUpdate: (_up: UpdateResponse) => {},
+  onContractUpdateNotification: (_notif: UpdateNotification) => {},
+  onDelegateResponse: (_response: DelegateResponse) => {},
   onErr: (err: HostError) => {},
   onOpen: () => {},
 };
 
 const API_URL = new URL(`ws://${location.host}/contract/command/`);
-const locutusApi = new FreenetWsApi(API_URL, handler);
+const freenetApi = new FreenetWsApi(API_URL, handler);
 
 const CONTRACT = "DCBi7HNZC3QUZRiZLFZDiEduv5KHgZfgBk8WwTiheGq1";
 
@@ -221,7 +223,7 @@ async function loadState() {
     key: Key.fromSpec(CONTRACT),
     fetch_contract: false,
   };
-  await locutusApi.get(getRequest);
+  await freenetApi.get(getRequest);
 }
 ```
 
@@ -238,7 +240,7 @@ const handler = {
 };
 
 const API_URL = new URL(`ws://${location.host}/contract/command/`);
-const locutusApi = new LocutusWsApi(API_URL, handler);
+const freenetApi = new FreenetWsApi(API_URL, handler);
 ```
 
 This type provides a convenient interface to the WebSocket API. It receives an
@@ -253,7 +255,7 @@ async function loadState() {
     key: Key.fromSpec(CONTRACT),
     fetch_contract: false,
   };
-  await locutusApi.get(getRequest);
+  await freenetApi.get(getRequest);
 }
 ```
 
@@ -331,9 +333,10 @@ render them in our browser. We can do that, for example, using the API:
 ```typescript
 function getUpdateNotification(notification: UpdateNotification) {
   let decoder = new TextDecoder("utf8");
-  let updatesBox = document.getElementById("updates") as HTMLPreElement;
-  let newUpdate = decoder.decode(Uint8Array.from(notification.update));
-  let newUpdateJson = JSON.parse(newUpdate);
+  let updatesBox = DOCUMENT.getElementById("updates") as HTMLPreElement;
+  let delta = notification.update?.updateData as DeltaUpdate;
+  let newUpdate = decoder.decode(Uint8Array.from(delta.delta));
+  let newUpdateJson = JSON.parse(newUpdate.replace("\x00", ""));
   updatesBox.textContent = updatesBox.textContent + newUpdateJson;
 }
 ```
