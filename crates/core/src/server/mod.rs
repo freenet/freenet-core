@@ -1,3 +1,4 @@
+pub(crate) mod app_packaging;
 pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod path_handlers;
@@ -8,6 +9,8 @@ use freenet_stdlib::{
 };
 
 use crate::client_events::{AuthToken, ClientId, HostResult};
+
+pub use app_packaging::WebApp;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]

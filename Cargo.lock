@@ -1583,6 +1583,7 @@ dependencies = [
  "bincode",
  "blake3",
  "bs58",
+ "byteorder",
  "bytes",
  "chacha20poly1305 0.10.1",
  "chrono",
@@ -1615,6 +1616,7 @@ dependencies = [
  "sqlx",
  "statrs",
  "stretto",
+ "tar",
  "thiserror",
  "tokio",
  "tower-http",
@@ -1624,6 +1626,7 @@ dependencies = [
  "unsigned-varint",
  "uuid",
  "wasmer",
+ "xz2",
 ]
 
 [[package]]
@@ -1639,9 +1642,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebd193c150c4f7f9f44068ee7f5181d4c4374ceb1b37965e1edd968d3730f35a"
+checksum = "6a408ccb448697333c9e3f8a935976c223db980d2fb6a076ae7c89851c6ed17a"
 dependencies = [
  "arbitrary",
  "arrayvec",
@@ -1661,7 +1664,6 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "serde_with",
- "tar",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
@@ -1669,7 +1671,6 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "web-sys",
- "xz2",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+use freenet::server::WebApp;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::{
@@ -9,8 +10,6 @@ use std::{
     process::{Command, Stdio},
 };
 use tar::Builder;
-
-use freenet_stdlib::web::WebApp;
 
 use crate::{
     config::{BuildToolCliConfig, PackageType},
@@ -137,6 +136,7 @@ mod contract {
         compile_contract(&config, &cli_config, cwd)?;
         match config.contract.c_type.unwrap_or(ContractType::Standard) {
             ContractType::WebApp => {
+                println!("Packaging standard Freenet web app contract type");
                 let embedded =
                     if let Some(d) = config.webapp.as_ref().and_then(|a| a.dependencies.as_ref()) {
                         let deps = include_deps(d)?;
@@ -146,7 +146,10 @@ mod contract {
                     };
                 build_web_state(&config, embedded, cwd)?
             }
-            ContractType::Standard => build_generic_state(&mut config, cwd)?,
+            ContractType::Standard => {
+                println!("Packaging generic contract type");
+                build_generic_state(&mut config, cwd)?
+            }
         }
         Ok(())
     }
