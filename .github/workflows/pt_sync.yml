@@ -2,7 +2,7 @@ name: Sync Issues with Pivotal Tracker
 
 on:
   issues:
-    types: [labeled]
+    types: [labeled, opened]
     
 jobs:
   sync:
@@ -15,5 +15,5 @@ jobs:
           PT_PROJECT_ID: ${{ secrets.PT_PROJECT_ID }}
           GH_REPOSITORY: ${{ github.repository }}
           GH_ACCESS_TOKEN: ${{ github.token }}
-        if: github.event.label.name == 'planned'
+        if: github.event.label.name == 'planned' || github.event.action == 'opened'
         run: python .github/scripts/pt_sync.py

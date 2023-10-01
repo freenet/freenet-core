@@ -9,7 +9,7 @@
 
 ## Interface
 
-Locutus contracts must implement the contract interface from [stdlib/rust/src/contract_interface.rs](https://github.com/freenet/freenet-core/blob/main/stdlib/rust/src/contract_interface.rs):
+Freenet contracts must implement the contract interface from [stdlib/rust/src/contract_interface.rs](https://github.com/freenet/freenet-core/blob/main/stdlib/rust/src/contract_interface.rs):
 
 ```rust,no_run,noplayground
 {{#include ../../stdlib/rust/src/contract_interface.rs:contractifce}}

@@ -62,9 +62,6 @@ impl DelegateInterface for TokenDelegate {
             InboundDelegateMsg::GetSecretResponse(GetSecretResponse { .. }) => Err(
                 DelegateError::Other("unexpected message type: get secret".into()),
             ),
-            InboundDelegateMsg::RandomBytes(_) => Err(DelegateError::Other(
-                "unexpected message type: radom bytes".into(),
-            )),
             InboundDelegateMsg::GetSecretRequest(_) => unreachable!(),
         }
     }

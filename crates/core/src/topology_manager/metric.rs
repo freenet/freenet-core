@@ -1,5 +1,3 @@
-extern crate nalgebra as na;
-
 /*
 This module provides a metric called `SmallWorldDeviationMetric` to quantify
 how well a given peer's connections in a peer-to-peer network approximate an

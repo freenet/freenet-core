@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use either::Either;
 use libp2p::{
     core::{
         muxing,
@@ -11,16 +10,19 @@ use libp2p::{
     identity::Keypair,
     noise, tcp, yamux, PeerId, Transport,
 };
-use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    client_event_handling, conn_manager::p2p_protoc::P2pConnManager, join_ring_request, PeerKey,
+    client_event_handling,
+    conn_manager::{p2p_protoc::P2pConnManager, EventLoopNotifications},
+    join_ring_request, PeerKey,
 };
 use crate::{
     client_events::combinator::ClientEventsCombinator,
     config::{self, GlobalExecutor},
-    contract::{self, ContractHandler},
-    message::{Message, NodeEvent},
+    contract::{
+        self, ClientResponsesSender, ContractHandler, ExecutorToEventLoopChannel,
+        NetworkEventListenerHalve,
+    },
     node::NodeBuilder,
     ring::Ring,
     util::IterExt,
@@ -31,10 +33,12 @@ use super::OpManager;
 pub(super) struct NodeP2P {
     pub(crate) peer_key: PeerKey,
     pub(crate) op_storage: Arc<OpManager>,
-    notification_channel: Receiver<Either<Message, NodeEvent>>,
+    notification_channel: EventLoopNotifications,
     pub(super) conn_manager: P2pConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
+    executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+    cli_response_sender: ClientResponsesSender,
 }
 
 impl NodeP2P {
@@ -60,8 +64,14 @@ impl NodeP2P {
         }
 
         // start the p2p event loop
+        // todo: pass  `cli_response_sender`
         self.conn_manager
-            .run_event_listener(self.op_storage.clone(), self.notification_channel)
+            .run_event_listener(
+                self.op_storage.clone(),
+                self.notification_channel,
+                self.executor_listener,
+                self.cli_response_sender,
+            )
             .await
     }
 
@@ -81,16 +91,22 @@ impl NodeP2P {
         };
 
         let ring = Ring::new(&builder, &gateways)?;
-        let (notification_tx, notification_channel) = mpsc::channel(100);
-        let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
-        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
-        let contract_handler = CH::build(ch_channel, ch_builder)
+        let (notification_channel, notification_tx) = EventLoopNotifications::channel();
+        let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
+        let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
+        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ch_outbound));
+        let (executor_listener, executor_sender) = contract::executor_channel(op_storage.clone());
+        let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
         let clients = ClientEventsCombinator::new(builder.clients);
-        GlobalExecutor::spawn(client_event_handling(op_storage.clone(), clients));
+        GlobalExecutor::spawn(client_event_handling(
+            op_storage.clone(),
+            clients,
+            client_responses,
+        ));
 
         Ok(NodeP2P {
             peer_key,
@@ -98,6 +114,8 @@ impl NodeP2P {
             notification_channel,
             op_storage,
             is_gateway: builder.location.is_some(),
+            executor_listener,
+            cli_response_sender,
         })
     }
 

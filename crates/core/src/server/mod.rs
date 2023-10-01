@@ -1,3 +1,4 @@
+pub(crate) mod app_packaging;
 pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod path_handlers;
@@ -8,6 +9,8 @@ use freenet_stdlib::{
 };
 
 use crate::client_events::{AuthToken, ClientId, HostResult};
+
+pub use app_packaging::WebApp;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -70,7 +73,6 @@ pub mod local_node {
         mut executor: Executor,
         socket: SocketAddr,
     ) -> Result<(), DynError> {
-        crate::config::Config::set_op_mode(crate::local_node::OperationMode::Local);
         match socket.ip() {
             IpAddr::V4(ip) if !ip.is_loopback() => {
                 return Err(format!("invalid ip: {ip}, expecting localhost").into())
@@ -105,7 +107,7 @@ pub mod local_node {
                 }
             };
             let OpenRequest {
-                id,
+                client_id: id,
                 request,
                 notification_channel,
                 token,

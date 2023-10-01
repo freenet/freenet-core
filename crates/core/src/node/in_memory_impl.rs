@@ -2,17 +2,22 @@ use std::{collections::HashMap, sync::Arc};
 
 use either::Either;
 use freenet_stdlib::prelude::*;
-use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
-    client_event_handling, conn_manager::in_memory::MemoryConnManager,
-    event_listener::EventListener, handle_cancelled_op, join_ring_request, op_state::OpManager,
+    client_event_handling,
+    conn_manager::{in_memory::MemoryConnManager, EventLoopNotifications},
+    event_log::EventLogListener,
+    handle_cancelled_op, join_ring_request,
+    op_state::OpManager,
     process_message, PeerKey,
 };
 use crate::{
     client_events::ClientEventsProxy,
     config::GlobalExecutor,
-    contract::{self, ContractError, ContractHandler, ContractHandlerEvent},
+    contract::{
+        self, executor_channel, ClientResponsesSender, ContractError, ContractHandler,
+        ContractHandlerEvent, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+    },
     message::{Message, NodeEvent, TransactionType},
     node::NodeBuilder,
     operations::OpError,
@@ -24,17 +29,18 @@ pub(super) struct NodeInMemory {
     pub peer_key: PeerKey,
     pub op_storage: Arc<OpManager>,
     gateways: Vec<PeerKeyLocation>,
-    notification_channel: Receiver<Either<Message, NodeEvent>>,
+    notification_channel: EventLoopNotifications,
     conn_manager: MemoryConnManager,
-    event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
+    event_listener: Option<Box<dyn EventLogListener + Send + Sync + 'static>>,
     is_gateway: bool,
+    _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
 }
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
     pub async fn build<CH>(
         builder: NodeBuilder<1>,
-        event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
+        event_listener: Option<Box<dyn EventLogListener + Send + Sync + 'static>>,
         ch_builder: CH::Builder,
     ) -> Result<NodeInMemory, anyhow::Error>
     where
@@ -46,10 +52,11 @@ impl NodeInMemory {
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
 
         let ring = Ring::new(&builder, &gateways)?;
-        let (notification_tx, notification_channel) = mpsc::channel(100);
+        let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
-        let contract_handler = CH::build(ch_channel, ch_builder)
+        let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
+        let contract_handler = CH::build(ch_channel, executor_sender, ch_builder)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -63,6 +70,7 @@ impl NodeInMemory {
             notification_channel,
             event_listener,
             is_gateway,
+            _executor_listener,
         })
     }
 
@@ -84,8 +92,13 @@ impl NodeInMemory {
                 anyhow::bail!("requires at least one gateway");
             }
         }
-        GlobalExecutor::spawn(client_event_handling(self.op_storage.clone(), user_events));
-        self.run_event_listener().await
+        let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
+        GlobalExecutor::spawn(client_event_handling(
+            self.op_storage.clone(),
+            user_events,
+            client_responses,
+        ));
+        self.run_event_listener(cli_response_sender).await
     }
 
     pub async fn append_contracts<'a>(
@@ -96,13 +109,16 @@ impl NodeInMemory {
         for (contract, state) in contracts {
             let key = contract.key();
             self.op_storage
-                .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
+                .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), None)
                 .await?;
             self.op_storage
-                .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                    key: key.clone(),
-                    state,
-                })
+                .notify_contract_handler(
+                    ContractHandlerEvent::PutQuery {
+                        key: key.clone(),
+                        state,
+                    },
+                    None,
+                )
                 .await?;
             tracing::debug!(
                 "Appended contract {} to peer {}",
@@ -129,12 +145,15 @@ impl NodeInMemory {
     }
 
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
-    async fn run_event_listener(&mut self) -> Result<(), anyhow::Error> {
+    async fn run_event_listener(
+        &mut self,
+        _client_responses: ClientResponsesSender, // fixme: use this
+    ) -> Result<(), anyhow::Error> {
         loop {
             let msg = tokio::select! {
                 msg = self.conn_manager.recv() => { msg.map(Either::Left) }
                 msg = self.notification_channel.recv() => if let Some(msg) = msg {
-                    Ok(msg)
+                    Ok(msg.map_left(|(msg, _cli_id)| msg))
                 } else {
                     anyhow::bail!("notification channel shutdown, fatal error");
                 }
@@ -198,6 +217,9 @@ impl NodeInMemory {
                 op_storage,
                 conn_manager,
                 event_listener,
+                None,
+                None,
+                None,
             ));
         }
     }

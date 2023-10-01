@@ -7,15 +7,16 @@ use bytes::Bytes;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
-    web::{WebApp, WebContractError},
 };
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
 use crate::client_events::AuthToken;
 
 use super::{
-    errors::WebSocketApiError, http_gateway::HttpGatewayRequest, ClientConnection,
-    HostCallbackResult,
+    app_packaging::{WebApp, WebContractError},
+    errors::WebSocketApiError,
+    http_gateway::HttpGatewayRequest,
+    ClientConnection, HostCallbackResult,
 };
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";

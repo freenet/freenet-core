@@ -2,10 +2,10 @@
 
 ## Application
 
-Software that uses Locutus as a back-end. This includes native software
-distributed independenly of Locutus but which uses Locutus as a back-end
-(perhaps bundling Locutus), and [web applications](glossary#web-application)
-that are distributed over Locutus and run in a web browser.
+Software that uses Freenet as a back-end. This includes native software
+distributed independenly of Freenet but which uses Freenet as a back-end
+(perhaps bundling Freenet), and [web applications](glossary#web-application)
+that are distributed over Freenet and run in a web browser.
 
 ## Contract
 
@@ -24,7 +24,7 @@ the web proxy.
 For example, if the contract id is
 `6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2` then visiting
 `http://localhost:PORT/contract/web/6C2KyVMtqw8D5wWa8Y7e14VmDNXXXv9CQ3m44PC9YbD2`
-will cause the application/component to be retrieved from Locutus, decompressed,
+will cause the application/component to be retrieved from Freenet, decompressed,
 and sent to the browser where it can execute.
 
 ## Contract State
@@ -78,7 +78,7 @@ consistency](https://en.wikipedia.org/wiki/Eventual_consistency).
 
 ## Web Application
 
-Software built on Locutus and distributed through Locutus.
+Software built on Freenet and distributed through Freenet.
 
 Applications run in the browser and can be built with tools like React,
 TypeScript, and Vue.js. An application may use multiple components and

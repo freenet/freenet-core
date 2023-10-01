@@ -3,14 +3,14 @@
   <a href="https://github.com/freenet/freenet-core/actions/workflows/ci.yml">
     <img src="https://img.shields.io/github/actions/workflow/status/freenet/locutus/ci.yml?branch=main&label=tests&style=flat-square" alt="continuous integration status" />
   </a>
-  <a href="https://crates.io/crates/locutus">
-    <img src="https://img.shields.io/crates/v/locutus.svg?style=flat-square"
+  <a href="https://crates.io/crates/freenet">
+    <img src="https://img.shields.io/crates/v/freenet.svg?style=flat-square"
     alt="Crates.io version" />
   </a>
   <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
     <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
-  <a href="https://docs.rs/locutus">
+  <a href="https://docs.rs/freenet">
     <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square&label=api%20docs"
       alt="docs.rs docs" />
   </a>
@@ -42,14 +42,14 @@ building decentralized applications using our SDK and testing them locally.
 
 Examples of what can be built on Freenet include:
 
-* Decentralized email (with a gateway to legacy email via the @freenet.org
+- Decentralized email (with a gateway to legacy email via the @freenet.org
   domain)
-* Decentralized microblogging (think Twitter or Facebook)
-* Instant Messaging (Whatsapp, Signal)
-* Online Store (Amazon)
-* Discussion (Reddit, HN)
-* Video discovery (Youtube, TikTok)
-* Search (Google, Bing)
+- Decentralized microblogging (think Twitter or Facebook)
+- Instant Messaging (Whatsapp, Signal)
+- Online Store (Amazon)
+- Discussion (Reddit, HN)
+- Video discovery (Youtube, TikTok)
+- Search (Google, Bing)
 
 All will be completely decentralized, scalable, and cryptographically secure. We
 want Freenet to be useful out-of-the-box, so we plan to provide reference
@@ -61,7 +61,7 @@ Freenet is a decentralized key-value database. It uses the same [small
 world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as
 the original Freenet design, but each key is a cryptographic contract
 implemented in [Web Assembly](https://webassembly.org/), and the value
-associated with each contract is called its *state*. The role of the
+associated with each contract is called its _state_. The role of the
 cryptographic contract is to specify what state is allowed for this contract,
 and how the state is modified.
 
@@ -76,8 +76,14 @@ systems, desktop and mobile.
 ## What is Locutus?
 
 Locutus was the working title used for this successor to the original Freenet,
-in March 2023 it was renamed to "Freenet" or "Freenet 2023", this repository was
+in March 2023 it was renamed to "Freenet", this repository was
 renamed from `locutus` to `freenet-core` in September 2023.
+
+## What is Hyphanet?
+
+The original Freenet codebase is now called Hyphanet. It is still actively
+developed by the same maintainers as before, and is available
+[here](https://www.hyphanet.org).
 
 ## Stay up to date
 
@@ -110,14 +116,14 @@ development.
 ### Supporting Freenet
 
 If you are in a position to fund our continued efforts please contact us on
-[twitter](https://twitter.com/FreenetOrg) or by email at *ian at freenet dot
-org*.
+[twitter](https://twitter.com/FreenetOrg) or by email at _ian at freenet dot
+org_.
 
 ## License
 
 This project is licensed under either of:
 
-* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
   <http://www.apache.org/licenses/LICENSE-2.0>)
-* MIT license ([LICENSE-MIT](LICENSE-MIT) or
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
   <http://opensource.org/licenses/MIT>)

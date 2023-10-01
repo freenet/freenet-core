@@ -5,6 +5,7 @@ use std::pin::Pin;
 use futures::Future;
 
 use crate::{
+    client_events::ClientId,
     message::{InnerMessage, Transaction},
     node::OpManager,
     operations::{OpError, OpInitialization, OperationResult},
@@ -33,5 +34,6 @@ where
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
         input: Self::Message,
+        client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }

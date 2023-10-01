@@ -5,6 +5,7 @@ use std::time::Duration;
 use freenet_stdlib::prelude::*;
 
 use crate::{
+    client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, Message, Transaction, TxType},
@@ -28,20 +29,29 @@ const MAX_GET_RETRY_HOPS: usize = 1;
 pub(crate) struct GetOp {
     id: Transaction,
     state: Option<GetState>,
+    result: Option<GetResult>,
     _ttl: Duration,
+}
+impl GetOp {
+    pub(super) fn finished(&self) -> bool {
+        self.result.is_some()
+    }
 }
 
 #[allow(dead_code)]
 pub(crate) struct GetResult {
     pub state: WrappedState,
-    pub contract: ContractContainer,
+    pub contract: Option<ContractContainer>,
 }
 
 impl TryFrom<GetOp> for GetResult {
     type Error = OpError;
 
-    fn try_from(_value: GetOp) -> Result<Self, Self::Error> {
-        todo!()
+    fn try_from(value: GetOp) -> Result<Self, Self::Error> {
+        match value.result {
+            Some(r) => Ok(r),
+            _ => todo!(),
+        }
     }
 }
 
@@ -73,6 +83,7 @@ where
                     op: Self {
                         state: Some(GetState::ReceivedRequest),
                         id: tx,
+                        result: None,
                         _ttl: PEER_TIMEOUT,
                     },
                     sender,
@@ -92,10 +103,12 @@ where
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
         input: Self::Message,
+        client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
             let new_state;
+            let mut result = None;
 
             match input {
                 GetMsg::RequestGet {
@@ -156,6 +169,7 @@ where
                                     sender: op_storage.ring.own_location(),
                                     target: sender, // return to requester
                                 }),
+                                None,
                                 self._ttl,
                             );
                         }
@@ -185,10 +199,13 @@ where
                         response: value,
                         key: returned_key,
                     } = op_storage
-                        .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                            key: key.clone(),
-                            fetch_contract,
-                        })
+                        .notify_contract_handler(
+                            ContractHandlerEvent::GetQuery {
+                                key: key.clone(),
+                                fetch_contract,
+                            },
+                            client_id,
+                        )
                         .await?
                     {
                         match check_contract_found(
@@ -308,13 +325,13 @@ where
                     };
                 }
                 GetMsg::ReturnGet {
+                    id,
                     key,
                     value:
                         StoreResponse {
                             state: Some(value),
                             contract,
                         },
-                    id,
                     sender,
                     target,
                 } => {
@@ -331,12 +348,13 @@ where
                         if let Some(contract) = &contract {
                             // store contract first
                             op_storage
-                                .notify_contract_handler(ContractHandlerEvent::Cache(
-                                    contract.clone(),
-                                ))
+                                .notify_contract_handler(
+                                    ContractHandlerEvent::Cache(contract.clone()),
+                                    client_id,
+                                )
                                 .await?;
                             let key = contract.key();
-                            tracing::debug!("Contract `{}` successfully put", key);
+                            tracing::debug!("Contract `{}` successfully cached", key);
                         } else {
                             // no contract, consider this like an error ignoring the incoming update value
                             tracing::warn!(
@@ -347,6 +365,7 @@ where
                             let op = GetOp {
                                 id,
                                 state: self.state,
+                                result: None,
                                 _ttl: self._ttl,
                             };
 
@@ -363,6 +382,7 @@ where
                                         target,
                                     }),
                                     OpEnum::Get(op),
+                                    None,
                                 )
                                 .await?;
                             return Err(OpError::StatePushed);
@@ -370,10 +390,13 @@ where
                     }
 
                     op_storage
-                        .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                            key: key.clone(),
-                            state: value.clone(),
-                        })
+                        .notify_contract_handler(
+                            ContractHandlerEvent::PutQuery {
+                                key: key.clone(),
+                                state: value.clone(),
+                            },
+                            client_id,
+                        )
                         .await?;
 
                     match self.state {
@@ -384,10 +407,18 @@ where
                                 );
                                 new_state = None;
                                 return_msg = None;
+                                result = Some(GetResult {
+                                    state: value.clone(),
+                                    contract,
+                                });
                             } else {
                                 tracing::debug!("Get response received for contract {}", key);
                                 new_state = None;
                                 return_msg = None;
+                                result = Some(GetResult {
+                                    state: value.clone(),
+                                    contract,
+                                });
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
@@ -410,7 +441,7 @@ where
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, self._ttl)
+            build_op_result(self.id, new_state, return_msg, result, self._ttl)
         })
     }
 }
@@ -419,11 +450,13 @@ fn build_op_result(
     id: Transaction,
     state: Option<GetState>,
     msg: Option<GetMsg>,
+    result: Option<GetResult>,
     ttl: Duration,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(GetOp {
         id,
         state,
+        result,
         _ttl: ttl,
     });
     Ok(OperationResult {
@@ -493,6 +526,7 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> 
     GetOp {
         id,
         state,
+        result: None,
         _ttl: PEER_TIMEOUT,
     }
 }
@@ -516,7 +550,11 @@ enum GetState {
 }
 
 /// Request to get the current value from a contract.
-pub(crate) async fn request_get(op_storage: &OpManager, get_op: GetOp) -> Result<(), OpError> {
+pub(crate) async fn request_get(
+    op_storage: &OpManager,
+    get_op: GetOp,
+    client_id: Option<ClientId>,
+) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = get_op.state.clone()
     {
         // the initial request must provide:
@@ -554,20 +592,21 @@ pub(crate) async fn request_get(op_storage: &OpManager, get_op: GetOp) -> Result
             });
 
             let msg = Some(GetMsg::RequestGet {
+                id,
                 key,
                 target,
-                id,
                 fetch_contract,
             });
 
             let op = GetOp {
                 id,
                 state: new_state,
+                result: None,
                 _ttl: get_op._ttl,
             };
 
             op_storage
-                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Get(op))
+                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Get(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::InvalidStateTransition(get_op.id)),
@@ -578,11 +617,11 @@ pub(crate) async fn request_get(op_storage: &OpManager, get_op: GetOp) -> Result
 mod messages {
     use std::fmt::Display;
 
+    use serde::{Deserialize, Serialize};
+
     use crate::{contract::StoreResponse, message::InnerMessage};
 
     use super::*;
-
-    use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum GetMsg {
