@@ -52,7 +52,7 @@ fn actual_proportion_within_x(connection_distances: &[f64], x: f64) -> f64 {
 /// - 0.0 is ideal, indicating a perfect match with the ideal small-world topology.
 /// - A negative value indicates the network is not clustered enough (lacks short-range links).
 /// - A positive value indicates the network is too clustered (lacks long-range links).
-pub(crate) fn small_world_deviation_metric(connection_distances: &[f64]) -> f64 {
+pub(crate) fn measure_small_worldness(connection_distances: &[f64]) -> f64 {
     let c = calculate_normalization_constant();
     let mut sum = 0.0;
     let step = 0.01;
@@ -75,17 +75,17 @@ mod tests {
     fn test_small_world_deviation_metric() {
         // Ideal case: distances drawn from an r^-1 distribution
         let ideal_distances: Vec<f64> = vec![0.1, 0.2, 0.05, 0.4, 0.3]; // Replace with actual ideal distances
-        let metric_ideal = small_world_deviation_metric(ideal_distances);
+        let metric_ideal = measure_small_worldness(&ideal_distances);
         assert!(metric_ideal.abs() < 0.1); // The metric should be close to zero for the ideal case
 
         // Non-ideal case 1: mostly short distances
-        let non_ideal_1: Vec<f64> = vec![0.01, 0.02, 0.03, 0.04, 0.05];
-        let metric_non_ideal_1 = small_world_deviation_metric(non_ideal_1);
+        let non_ideal_1: &[f64] = &[0.01, 0.02, 0.03, 0.04, 0.05];
+        let metric_non_ideal_1 = measure_small_worldness(&non_ideal_1);
         assert!(metric_non_ideal_1 > 0.1); // The metric should be significantly positive
 
         // Non-ideal case 2: mostly long distances
-        let non_ideal_2: Vec<f64> = vec![0.4, 0.45, 0.48, 0.49, 0.5];
-        let metric_non_ideal_2 = small_world_deviation_metric(non_ideal_2);
+        let non_ideal_2: &[f64] = &[0.4, 0.45, 0.48, 0.49, 0.5];
+        let metric_non_ideal_2 = measure_small_worldness(&non_ideal_2);
         assert!(metric_non_ideal_2 < -0.1); // The metric should be significantly negative
     }
 }
