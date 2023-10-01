@@ -38,6 +38,10 @@ publish-webapp:
 posts:
 	cd $(POSTS_DIR)
 	fdev build
+	hash=$$(bash -c "fdev inspect build/freenet/freenet_microblogging_posts key | grep 'code key:' | cut -d' ' -f3")
+	mkdir -p $(WEB_DIR)/build
+	echo $$hash
+	echo -n $$hash > $(WEB_DIR)/src/model_code_hash.txt
 
 publish-posts:
 	cd $(POSTS_DIR)
