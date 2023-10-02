@@ -63,7 +63,7 @@ sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"], optiona
 rocksdb = { version = "0.21.0", default-features = false, optional = true }
 pav_regression = "0.4.0"
 itertools = "0.11"
-ordered-float = "3.9.1"
+ordered-float = "4.1.0"
 notify = "6"
 wasmer = { workspace = true, features = [ "sys"] }
 chrono = { workspace = true }
