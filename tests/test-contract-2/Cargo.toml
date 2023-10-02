@@ -12,4 +12,5 @@ crate-type = ["cdylib"]
 freenet-stdlib = { path = "../../stdlib/rust", features = ["contract"] }
 
 [features]
+freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]
