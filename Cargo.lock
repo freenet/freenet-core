@@ -1615,8 +1615,6 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e9fac5b43bee97b6ee49a376ca9e26eedf8bd581efcb176e4a534304f8b4279"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1626,8 +1624,6 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a408ccb448697333c9e3f8a935976c223db980d2fb6a076ae7c89851c6ed17a"
 dependencies = [
  "arbitrary",
  "arrayvec",
@@ -1641,6 +1637,7 @@ dependencies = [
  "futures",
  "js-sys",
  "once_cell",
+ "rand",
  "semver",
  "serde",
  "serde-wasm-bindgen 0.6.0",
@@ -1653,6 +1650,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
+ "wasmer",
  "web-sys",
 ]
 
