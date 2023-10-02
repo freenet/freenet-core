@@ -18,6 +18,8 @@ the ideal. A positive value indicates a lack of long-range links, and a negative
 value indicates a lack of short-range links.
 */
 
+use crate::ring::Distance;
+
 /// Calculate the normalization constant C for the ideal r^-1 distribution.
 /// The integral is approximated using trapezoidal rule.
 fn calculate_normalization_constant() -> f64 {
@@ -38,8 +40,8 @@ fn ideal_proportion_within_x(x: f64, c: f64) -> f64 {
 }
 
 /// Calculate the actual proportion of peers within distance X.
-fn actual_proportion_within_x(connection_distances: &[f64], x: f64) -> f64 {
-    let count = connection_distances.iter().filter(|&&r| r <= x).count();
+fn actual_proportion_within_x(connection_distances: &[Distance], x: &Distance) -> f64 {
+    let count = connection_distances.iter().filter(|&&r| r <= *x).count();
     count as f64 / connection_distances.len() as f64
 }
 
@@ -50,14 +52,14 @@ fn actual_proportion_within_x(connection_distances: &[f64], x: f64) -> f64 {
 /// - 0.0 is ideal, indicating a perfect match with the ideal small-world topology.
 /// - A negative value indicates the network is not clustered enough (lacks short-range links).
 /// - A positive value indicates the network is too clustered (lacks long-range links).
-pub(crate) fn measure_small_worldness(connection_distances: &[f64]) -> f64 {
+pub(crate) fn measure_small_worldness(connection_distances: &[Distance]) -> f64 {
     let c = calculate_normalization_constant();
     let mut sum = 0.0;
     let step = 0.01;
     let mut x = step;
     while x <= 0.5 {
         let ideal = ideal_proportion_within_x(x, c);
-        let actual = actual_proportion_within_x(&connection_distances, x);
+        let actual = actual_proportion_within_x(&connection_distances, &Distance::new(x));
         sum += actual - ideal;
         x += step;
     }
@@ -67,22 +69,24 @@ pub(crate) fn measure_small_worldness(connection_distances: &[f64]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+
     use super::*;
 
     #[test]
     fn test_small_world_deviation_metric() {
         // Ideal case: distances drawn from an r^-1 distribution
-        let ideal_distances: Vec<f64> = vec![0.1, 0.2, 0.05, 0.4, 0.3]; // Replace with actual ideal distances
+        let ideal_distances: Vec<Distance> = vec![0.1, 0.2, 0.05, 0.4, 0.3].iter().map(|d| Distance::new(*d)).collect_vec(); 
         let metric_ideal = measure_small_worldness(&ideal_distances);
         assert!(metric_ideal.abs() < 0.1); // The metric should be close to zero for the ideal case
 
         // Non-ideal case 1: mostly short distances
-        let non_ideal_1: &[f64] = &[0.01, 0.02, 0.03, 0.04, 0.05];
+        let non_ideal_1 : Vec<Distance> = vec![0.01, 0.02, 0.03, 0.04, 0.05].iter().map(|d| Distance::new(*d)).collect_vec();
         let metric_non_ideal_1 = measure_small_worldness(&non_ideal_1);
         assert!(metric_non_ideal_1 > 0.1); // The metric should be significantly positive
 
         // Non-ideal case 2: mostly long distances
-        let non_ideal_2: &[f64] = &[0.4, 0.45, 0.48, 0.49, 0.5];
+        let non_ideal_2: Vec<Distance> = vec![0.4, 0.45, 0.48, 0.49, 0.5].iter().map(|d| Distance::new(*d)).collect_vec();
         let metric_non_ideal_2 = measure_small_worldness(&non_ideal_2);
         assert!(metric_non_ideal_2 < -0.1); // The metric should be significantly negative
     }

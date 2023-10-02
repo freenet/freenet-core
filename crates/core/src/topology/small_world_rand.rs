@@ -1,25 +1,26 @@
 use rand::Rng;
 
+use crate::ring::Distance;
+
 // Function to generate a random link distance based on Kleinberg's d^{-1} distribution
-pub(crate) fn random_link_distance(d_min: f64) -> f64 {
+pub(crate) fn random_link_distance(d_min: Distance) -> Distance {
     let d_max = 0.5;
 
     // Generate a uniform random number between 0 and 1
     let u: f64 = rand::thread_rng().gen_range(0.0..1.0);
     
     // Correct Inverse CDF: F^{-1}(u) = d_min * (d_max / d_min).powf(u)
-    let d = d_min * (d_max / d_min).powf(u);
+    let d = d_min.as_f64() * (d_max / d_min.as_f64()).powf(u);
     
-    return d;
+    Distance::new(d)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::topology_manager::metric::measure_small_worldness;
+    use crate::topology::metric::measure_small_worldness;
 
     use super::*;
     use statrs::distribution::*;
-    use tracing_subscriber::Layer;
     
     #[test]
     fn chi_squared_test() {
@@ -31,7 +32,7 @@ mod tests {
         
         // Generate a bunch of link distances
         for _ in 0..n {
-            let d = random_link_distance(d_min);
+            let d = random_link_distance(Distance::new(d_min)).as_f64();
             let bin_index = ((d - d_min) / (d_max - d_min) * (num_bins as f64)).floor() as usize;
             if bin_index < num_bins {
                 bins[bin_index] += 1;
@@ -62,8 +63,7 @@ mod tests {
 
     #[test]
     fn metric_test() {
-        let d_min = 0.01;
-        let d_max = 0.5;
+        let d_min = Distance::new(0.01);
         let n = 1000;  // Number of samples
         let mut distances = vec![];
         // Generate a bunch of link distances

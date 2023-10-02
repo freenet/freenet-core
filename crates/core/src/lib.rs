@@ -10,7 +10,7 @@ mod router;
 mod runtime;
 #[cfg(feature = "websocket")]
 pub mod server;
-mod topology_manager;
+mod topology;
 pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;

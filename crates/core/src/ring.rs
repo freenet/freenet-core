@@ -28,6 +28,9 @@ use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use rand::prelude::*;
+use std::{cmp::Ordering, hash::Hash};
+
 use crate::node::{self, NodeBuilder, PeerKey};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -391,7 +394,7 @@ impl Ring {
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
-pub struct Location(pub f64);
+pub struct Location(f64);
 
 impl Location {
     pub fn new(location: f64) -> Self {
@@ -400,6 +403,11 @@ impl Location {
             "Location must be in the range [0, 1]"
         );
         Location(location)
+    }
+
+    /// Returns a new location rounded to ensure it is between 0.0 and 1.0
+    pub fn new_rounded(location : f64) -> Self {
+        Self::new(location.rem_euclid(1.0))
     }
 
     /// Returns a new random location.
@@ -417,6 +425,10 @@ impl Location {
         } else {
             Distance::new(1.0f64 - d)
         }
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        self.0
     }
 }
 
