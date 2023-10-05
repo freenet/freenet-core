@@ -1,10 +1,10 @@
 use crate::network_sim::Location;
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, info, warn};
-use tracing_subscriber::field::debug;
+use tracing::{debug, info, warn, instrument};
 
 use super::*;
 
+#[derive(Debug)]
 struct SimulatedNetwork {
     nodes: Vec<SimulatedNode>,
     connections: HashMap<NodeRef, HashSet<NodeRef>>,
@@ -32,20 +32,19 @@ impl SimulatedNetwork {
     }
 
     fn connect(&mut self, a: NodeRef, b: NodeRef) {
-        debug!("Connecting {:?} to {:?}", a, b);
+        info!("Connecting {:?} and {:?}", a, b);
         self.connections.entry(a).or_default().insert(b);
         self.connections.entry(b).or_default().insert(a);
     }
 
     fn disconnect(&mut self, a: NodeRef, b: NodeRef) {
-        debug!("Disconnecting {:?} from {:?}", a, b);
+        info!("Disconnecting {:?} and {:?}", a, b);
         self.connections.entry(a).or_default().remove(&b);
         self.connections.entry(b).or_default().remove(&a);
     }
 
     fn route(&self, source: &NodeRef, destination: Location) -> Result<Vec<NodeRef>, RouteError> {
-        debug!("Routing from {:?} to {:?}", source, destination);
-
+        info!("Routing from {:?} to {:?}", source, destination);
         let mut current = *source; // Dereference to copy
         let mut visited = Vec::new();
         let mut recent_nodes = Vec::new(); // To track the sequence of last N nodes
@@ -114,7 +113,7 @@ impl SimulatedNetwork {
         target: Location,
         tolerance: Distance,
     ) -> Option<Vec<NodeRef>> {
-        debug!("Joining via {:?} with target {:?}", source, target);
+        info!("Joining via {:?} with target {:?}", source, target);
         let join_route = self.route(source, target);
         let join_route: Vec<NodeRef> = match join_route {
             Ok(route) => route,
