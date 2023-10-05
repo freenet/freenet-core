@@ -1,37 +1,73 @@
+#![allow(unused_variables, dead_code)]
+
 mod metric;
 mod small_world_rand;
+#[cfg(test)]
+mod simulation;
 
-use std::collections::{BTreeMap, HashMap};
-use rand::Rng;
 use crate::ring::*;
 
-const DEFAULT_MIN_DISTANCE : f64 = 0.01;
+const DEFAULT_MIN_DISTANCE: f64 = 0.01;
 
-/// Identifies a location on the ring where
-pub(crate) fn select_join_target_location(my_location: &Location, peer_statistics: &PeerStatistics) -> Location {
-    let min_distance = peer_statistics
-        .location_map
-        .keys()
-        .map(|location| location.distance(my_location))
-        .min()
-        .map_or(Distance::new(0.5), |d| d);
+pub(crate) enum TopologyStrategy {
+    Simple,
+    SmallWorld,
+    LoadBalancing,
+}
 
-    let min_distance = if min_distance.as_f64() > DEFAULT_MIN_DISTANCE {
-        min_distance
+pub(crate) struct JoinTargetInfo {
+    pub target: Location,
+    pub threshold: Distance,
+    pub strategy: TopologyStrategy,
+}
+
+impl TopologyStrategy {
+    pub(crate) fn select_join_target_location(&self, my_location: &Location, peer_statistics: &PeerStatistics) -> JoinTargetInfo {
+        match self {
+            TopologyStrategy::Simple => random_strategy(my_location, peer_statistics, TopologyStrategy::Simple),
+            TopologyStrategy::SmallWorld => small_world_metric_strategy(my_location, peer_statistics, TopologyStrategy::SmallWorld),
+            TopologyStrategy::LoadBalancing => load_balancing_strategy(my_location, peer_statistics, TopologyStrategy::LoadBalancing),
+        }
+    }
+}
+
+pub(crate) fn random_strategy(my_location: &Location, peer_statistics: &PeerStatistics, strategy: TopologyStrategy) -> JoinTargetInfo {
+    unimplemented!()
+}
+
+pub(crate) fn small_world_metric_strategy(my_location: &Location, peer_statistics: &PeerStatistics, strategy: TopologyStrategy) -> JoinTargetInfo {
+    unimplemented!()
+}
+
+pub(crate) fn load_balancing_strategy(my_location: &Location, peer_statistics: &PeerStatistics, strategy: TopologyStrategy) -> JoinTargetInfo {
+    unimplemented!()
+}
+
+pub(crate) fn select_strategy(num_neighbors: usize) -> TopologyStrategy {
+    if num_neighbors < 10 {
+        TopologyStrategy::Simple
     } else {
-        Distance::new(DEFAULT_MIN_DISTANCE)
-    };
-
-    let dist = small_world_rand::random_link_distance(min_distance);
-    
-    let mut rng = rand::thread_rng();
-    let direction: f64 = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
-
-    Location::new_rounded(my_location.as_f64() + (direction * dist.as_f64()))
+        // Randomly select between the three strategies based on your criteria
+        unimplemented!()
+    }
 }
 
 pub(crate) struct RequestsPerMinute(f64);
 
+pub(crate) struct PeerInfo {
+    pub location: Location,
+    pub requests_per_minute: RequestsPerMinute,
+    pub strategy: TopologyStrategy,
+}
+
 pub(crate) struct PeerStatistics {
-    pub(crate) location_map : BTreeMap<Location, Vec<RequestsPerMinute>>,
+    pub(crate) peers: Vec<PeerInfo>,
+}
+
+impl PeerStatistics {
+    pub(crate) fn new() -> Self {
+        Self {
+            peers: Vec::new(),
+        }
+    }
 }
