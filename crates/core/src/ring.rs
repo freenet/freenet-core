@@ -406,7 +406,7 @@ impl Location {
     }
 
     /// Returns a new location rounded to ensure it is between 0.0 and 1.0
-    pub fn new_rounded(location : f64) -> Self {
+    pub fn new_rounded(location: f64) -> Self {
         Self::new(location.rem_euclid(1.0))
     }
 

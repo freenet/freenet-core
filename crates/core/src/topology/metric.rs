@@ -66,7 +66,6 @@ pub(crate) fn measure_small_worldness(connection_distances: &[Distance]) -> f64 
     sum * step // Multiply by step size to complete the trapezoidal rule
 }
 
-
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -76,17 +75,26 @@ mod tests {
     #[test]
     fn test_small_world_deviation_metric() {
         // Ideal case: distances drawn from an r^-1 distribution
-        let ideal_distances: Vec<Distance> = vec![0.1, 0.2, 0.05, 0.4, 0.3].iter().map(|d| Distance::new(*d)).collect_vec(); 
+        let ideal_distances: Vec<Distance> = vec![0.1, 0.2, 0.05, 0.4, 0.3]
+            .iter()
+            .map(|d| Distance::new(*d))
+            .collect_vec();
         let metric_ideal = measure_small_worldness(&ideal_distances);
         assert!(metric_ideal.abs() < 0.1); // The metric should be close to zero for the ideal case
 
         // Non-ideal case 1: mostly short distances
-        let non_ideal_1 : Vec<Distance> = vec![0.01, 0.02, 0.03, 0.04, 0.05].iter().map(|d| Distance::new(*d)).collect_vec();
+        let non_ideal_1: Vec<Distance> = vec![0.01, 0.02, 0.03, 0.04, 0.05]
+            .iter()
+            .map(|d| Distance::new(*d))
+            .collect_vec();
         let metric_non_ideal_1 = measure_small_worldness(&non_ideal_1);
         assert!(metric_non_ideal_1 > 0.1); // The metric should be significantly positive
 
         // Non-ideal case 2: mostly long distances
-        let non_ideal_2: Vec<Distance> = vec![0.4, 0.45, 0.48, 0.49, 0.5].iter().map(|d| Distance::new(*d)).collect_vec();
+        let non_ideal_2: Vec<Distance> = vec![0.4, 0.45, 0.48, 0.49, 0.5]
+            .iter()
+            .map(|d| Distance::new(*d))
+            .collect_vec();
         let metric_non_ideal_2 = measure_small_worldness(&non_ideal_2);
         assert!(metric_non_ideal_2 < -0.1); // The metric should be significantly negative
     }

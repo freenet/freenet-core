@@ -930,7 +930,7 @@ mod messages {
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRequest {
         StartReq {
-            target: PeerKeyLocation, 
+            target: PeerKeyLocation,
             req_peer: PeerKey,
             hops_to_live: usize,
             max_hops_to_live: usize,

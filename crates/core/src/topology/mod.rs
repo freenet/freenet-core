@@ -1,9 +1,8 @@
 #![allow(unused_variables, dead_code)]
 
 mod metric;
-mod small_world_rand;
-#[cfg(test)]
 mod simulation;
+mod small_world_rand;
 
 use crate::ring::*;
 
@@ -22,24 +21,50 @@ pub(crate) struct JoinTargetInfo {
 }
 
 impl TopologyStrategy {
-    pub(crate) fn select_join_target_location(&self, my_location: &Location, peer_statistics: &PeerStatistics) -> JoinTargetInfo {
+    pub(crate) fn select_join_target_location(
+        &self,
+        my_location: &Location,
+        peer_statistics: &PeerStatistics,
+    ) -> JoinTargetInfo {
         match self {
-            TopologyStrategy::Simple => random_strategy(my_location, peer_statistics, TopologyStrategy::Simple),
-            TopologyStrategy::SmallWorld => small_world_metric_strategy(my_location, peer_statistics, TopologyStrategy::SmallWorld),
-            TopologyStrategy::LoadBalancing => load_balancing_strategy(my_location, peer_statistics, TopologyStrategy::LoadBalancing),
+            TopologyStrategy::Simple => {
+                random_strategy(my_location, peer_statistics, TopologyStrategy::Simple)
+            }
+            TopologyStrategy::SmallWorld => small_world_metric_strategy(
+                my_location,
+                peer_statistics,
+                TopologyStrategy::SmallWorld,
+            ),
+            TopologyStrategy::LoadBalancing => load_balancing_strategy(
+                my_location,
+                peer_statistics,
+                TopologyStrategy::LoadBalancing,
+            ),
         }
     }
 }
 
-pub(crate) fn random_strategy(my_location: &Location, peer_statistics: &PeerStatistics, strategy: TopologyStrategy) -> JoinTargetInfo {
+pub(crate) fn random_strategy(
+    my_location: &Location,
+    peer_statistics: &PeerStatistics,
+    strategy: TopologyStrategy,
+) -> JoinTargetInfo {
     unimplemented!()
 }
 
-pub(crate) fn small_world_metric_strategy(my_location: &Location, peer_statistics: &PeerStatistics, strategy: TopologyStrategy) -> JoinTargetInfo {
+pub(crate) fn small_world_metric_strategy(
+    my_location: &Location,
+    peer_statistics: &PeerStatistics,
+    strategy: TopologyStrategy,
+) -> JoinTargetInfo {
     unimplemented!()
 }
 
-pub(crate) fn load_balancing_strategy(my_location: &Location, peer_statistics: &PeerStatistics, strategy: TopologyStrategy) -> JoinTargetInfo {
+pub(crate) fn load_balancing_strategy(
+    my_location: &Location,
+    peer_statistics: &PeerStatistics,
+    strategy: TopologyStrategy,
+) -> JoinTargetInfo {
     unimplemented!()
 }
 
@@ -66,8 +91,6 @@ pub(crate) struct PeerStatistics {
 
 impl PeerStatistics {
     pub(crate) fn new() -> Self {
-        Self {
-            peers: Vec::new(),
-        }
+        Self { peers: Vec::new() }
     }
 }
