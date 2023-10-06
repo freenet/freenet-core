@@ -1,7 +1,7 @@
 {
   "dependencies": {
     "@freenetorg/freenet-stdlib": "^0.0.8",
-    "bootstrap": "5.3.1",
+    "bootstrap": "5.3.2",
     "module-alias": "^2.2.2"
   },
   "main": "src/index.ts",
