@@ -8,7 +8,7 @@ use super::*;
 struct SimulatedNetwork {
     nodes: Vec<SimulatedNode>,
     connections: HashMap<NodeRef, HashSet<NodeRef>>,
-    requests: HashMap<NodeRef, HashMap<NodeRef, u64>>, // origin node -> destination node -> requests
+    requests: HashMap<NodeRef, (u64, HashMap<NodeRef, u64>)>, // origin node -> destination node -> requests
 }
 
 impl SimulatedNetwork {
@@ -32,6 +32,9 @@ impl SimulatedNetwork {
     }
 
     fn connect(&mut self, a: NodeRef, b: NodeRef) {
+        // throw an error if a == b
+        assert!(a != b, "Cannot connect a node to itself");
+
         info!("Connecting {:?} and {:?}", a, b);
         self.connections.entry(a).or_default().insert(b);
         self.connections.entry(b).or_default().insert(a);
@@ -107,6 +110,16 @@ impl SimulatedNetwork {
         }
     }
 
+    fn record_request(&mut self, a: &NodeRef, b: &NodeRef) {
+        let (count, dest_map) = self.requests.entry(*a).or_insert((0, HashMap::new()));
+        *count += 1;
+        *dest_map.entry(*b).or_insert(0) += 1;
+    }
+
+    fn reset_recorded_requests(&mut self) {
+        self.requests.clear();
+    }
+
     fn get_join_peers(
         &self,
         source: &NodeRef,
@@ -135,6 +148,22 @@ impl SimulatedNetwork {
         }
 
         Option::Some(joiners)
+    }
+
+    fn join(&mut self, node: NodeRef, target: Location, tolerance: Distance) {
+        info!("Joining {:?} with target {:?}", node, target);
+        let joiners = self.get_join_peers(&node, target, tolerance);
+        let joiners: Vec<NodeRef> = match joiners {
+            Some(joiners) => joiners,
+            None => {
+                warn!("Error joining network");
+                return;
+            }
+        };
+
+        for joiner in joiners.iter() {
+            self.connect(node, *joiner);
+        }
     }
 }
 
