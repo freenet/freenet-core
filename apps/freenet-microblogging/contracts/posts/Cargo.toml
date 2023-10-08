@@ -22,4 +22,5 @@ serde = "1"
 serde_json = "1"
 
 [features]
+default = ["freenet-main-contract"]
 freenet-main-contract = []

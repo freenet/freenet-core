@@ -19,7 +19,7 @@ thiserror = "1"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["freenet-main-contract"]
 contract = []
 freenet-main-contract = []
 wasmbind = ["chrono/wasmbind"]
