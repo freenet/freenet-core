@@ -97,7 +97,7 @@ fn test_join_success() {
     let destination = net.nodes[c.index].location;
     let tolerance = Distance::new(0.4); // Changed to a valid value
 
-    let join_result = net.join(&a, destination, tolerance);
+    let join_result = net.get_join_peers(&a, destination, tolerance);
 
     assert!(join_result.is_some());
     assert_eq!(join_result.unwrap(), vec![b, c]);
@@ -111,7 +111,7 @@ fn test_join_failure() {
     let destination = Location::random();
     let tolerance = Distance::new(0.4); // Changed to a valid value
 
-    let join_result = net.join(&a, destination, tolerance);
+    let join_result = net.get_join_peers(&a, destination, tolerance);
 
     assert!(join_result.is_none());
 }
@@ -124,9 +124,9 @@ fn test_join_with_tolerance() {
     net.connect(a, b);
 
     let destination = net.nodes[b.index].location;
-    let tolerance = Distance::new(0.1); // Changed to a valid value
+    let tolerance = Distance::new(0.1); 
 
-    let join_result = net.join(&a, destination, tolerance);
+    let join_result = net.get_join_peers(&a, destination, tolerance);
 
     assert!(join_result.is_some());
     assert_eq!(join_result.unwrap(), vec![b]);

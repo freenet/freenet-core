@@ -107,7 +107,7 @@ impl SimulatedNetwork {
         }
     }
 
-    fn join(
+    fn get_join_peers(
         &self,
         source: &NodeRef,
         target: Location,
@@ -130,7 +130,7 @@ impl SimulatedNetwork {
             let distance = node_location.distance(target);
             if distance < tolerance {
                 info!("Found node {:?} within tolerance", node);
-                joiners.push(node.clone());
+                joiners.push(*node);
             }
         }
 
