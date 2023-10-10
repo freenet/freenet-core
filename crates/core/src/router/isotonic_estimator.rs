@@ -103,7 +103,7 @@ impl IsotonicEstimator {
 
             self.peer_adjustments
                 .entry(event.peer)
-                .or_insert_with(Adjustment::default)
+                .or_default()
                 .add(adjustment);
         }
     }

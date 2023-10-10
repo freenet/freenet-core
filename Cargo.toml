@@ -21,7 +21,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 wasmer = "4.2.0"
 
-freenet-stdlib = { path = "./stdlib/rust/", version = "0.0.8" }
+freenet-stdlib = { path = "./stdlib/rust/", version = "0.0.8", features = ["unstable"]   }
 # freenet-stdlib = { version = "0.0.7" }
 
 [profile.dev.package."*"]
