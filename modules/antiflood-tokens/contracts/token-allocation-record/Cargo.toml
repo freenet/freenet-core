@@ -15,3 +15,7 @@ freenet-aft-interface = { path = "../../interfaces" }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
