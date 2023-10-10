@@ -48,7 +48,7 @@ impl StateStorage for RocksDb {
                         "failed getting contract: `{key}` {}",
                         key.encoded_code_hash()
                             .map(|ch| format!("(with code hash: `{ch}`)"))
-                            .unwrap_or(String::new())
+                            .unwrap_or_default()
                     );
                     Ok(None)
                 }

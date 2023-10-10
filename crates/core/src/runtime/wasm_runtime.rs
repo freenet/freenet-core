@@ -1,7 +1,10 @@
 use std::{collections::HashMap, sync::atomic::AtomicI64};
 
 use freenet_stdlib::{
-    buf::{BufferBuilder, BufferMut},
+    memory::{
+        buf::{BufferBuilder, BufferMut},
+        WasmLinearMem,
+    },
     prelude::*,
 };
 use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
@@ -148,7 +151,7 @@ impl Runtime {
         let data = data.as_ref();
         let initiate_buffer: TypedFunction<u32, i64> = instance
             .exports
-            .get_typed_function(&self.wasm_store, "initiate_buffer")?;
+            .get_typed_function(&self.wasm_store, "__frnt__initiate_buffer")?;
         let builder_ptr = initiate_buffer.call(&mut self.wasm_store, data.len() as u32)?;
         let linear_mem = self.linear_mem(instance)?;
         unsafe {
@@ -166,10 +169,7 @@ impl Runtime {
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?
             .view(&self.wasm_store);
-        Ok(WasmLinearMem {
-            start_ptr: memory.data_ptr() as *const _,
-            size: memory.data_size(),
-        })
+        Ok(unsafe { WasmLinearMem::new(memory.data_ptr() as *const _, memory.data_size()) })
     }
 
     pub(super) fn prepare_contract_call(
