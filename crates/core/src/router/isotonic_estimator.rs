@@ -1,7 +1,7 @@
 use crate::ring::{Distance, Location, PeerKeyLocation};
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
-use std::{collections::HashMap, fmt,};
+use std::{collections::HashMap, fmt};
 
 const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
