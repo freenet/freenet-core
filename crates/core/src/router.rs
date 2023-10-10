@@ -5,7 +5,7 @@ mod util;
 use crate::ring::{Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::Serialize;
-use std::time::Duration;
+use std::{time::Duration, fmt,};
 use util::{Mean, TransferSpeed};
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,6 +234,15 @@ impl Router {
 pub(crate) enum RoutingError {
     InsufficientDataError,
     EstimationError(String),
+}
+
+impl fmt::Display for RoutingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RoutingError::InsufficientDataError => write!(f, "Insufficient data provided"),
+            RoutingError::EstimationError(err_msg) => write!(f, "Estimation error: {}", err_msg),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
