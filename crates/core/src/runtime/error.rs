@@ -82,7 +82,7 @@ macro_rules! impl_err {
 }
 
 impl_err!(Box<dyn std::error::Error + Send + Sync>);
-impl_err!(freenet_stdlib::buf::Error);
+impl_err!(freenet_stdlib::memory::buf::Error);
 impl_err!(std::io::Error);
 impl_err!(secrets_store::SecretStoreError);
 impl_err!(bincode::Error);
@@ -100,7 +100,7 @@ pub(crate) enum RuntimeInnerError {
     Any(#[from] Box<dyn std::error::Error + Send + Sync>),
 
     #[error(transparent)]
-    BufferError(#[from] freenet_stdlib::buf::Error),
+    BufferError(#[from] freenet_stdlib::memory::buf::Error),
 
     #[error(transparent)]
     IOError(#[from] std::io::Error),

@@ -11,3 +11,7 @@ freenet-stdlib = { workspace = true }
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
