@@ -32,3 +32,7 @@ tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []

@@ -11,7 +11,6 @@
 //! - final location
 
 use std::{
-    borrow::Borrow,
     collections::BTreeMap,
     convert::TryFrom,
     fmt::Display,
@@ -438,7 +437,7 @@ impl From<&ContractKey> for Location {
     fn from(key: &ContractKey) -> Self {
         let mut value = 0.0;
         let mut divisor = 256.0;
-        for byte in key.borrow().bytes().iter().take(7) {
+        for byte in key.bytes().iter().take(7) {
             value += *byte as f64 / divisor;
             divisor *= 256.0;
         }
@@ -472,7 +471,7 @@ impl Ord for Location {
 
 impl PartialOrd for Location {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -523,7 +522,7 @@ impl PartialEq for Distance {
 #[allow(clippy::incorrect_partial_ord_impl_on_ord_type)]
 impl PartialOrd for Distance {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -531,7 +530,8 @@ impl Eq for Distance {}
 
 impl Ord for Distance {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other)
+        self.0
+            .partial_cmp(&other.0)
             .expect("always should return a cmp value")
     }
 }

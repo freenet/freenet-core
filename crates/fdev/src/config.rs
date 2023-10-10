@@ -121,6 +121,15 @@ pub(crate) enum PackageType {
     Delegate,
 }
 
+impl PackageType {
+    pub fn feature(&self) -> &'static str {
+        match self {
+            PackageType::Contract => "freenet-main-contract",
+            PackageType::Delegate => "freenet-main-delegate",
+        }
+    }
+}
+
 impl Display for PackageType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
