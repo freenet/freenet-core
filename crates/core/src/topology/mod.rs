@@ -31,17 +31,13 @@ impl TopologyStrategy {
         peer_statistics: &PeerStatistics,
     ) -> JoinTargetInfo {
         match self {
-            TopologyStrategy::Random => {
-                random_strategy(my_location, peer_statistics)
+            TopologyStrategy::Random => random_strategy(my_location, peer_statistics),
+            TopologyStrategy::SmallWorld => {
+                small_world_metric_strategy(my_location, peer_statistics)
             }
-            TopologyStrategy::SmallWorld => small_world_metric_strategy(
-                my_location,
-                peer_statistics,
-            ),
-            TopologyStrategy::LoadBalancing => load_balancing_strategy(
-                my_location,
-                peer_statistics,
-            ),
+            TopologyStrategy::LoadBalancing => {
+                load_balancing_strategy(my_location, peer_statistics)
+            }
         }
     }
 }
@@ -60,7 +56,11 @@ pub(crate) fn random_strategy(
     }
     let distance_to_target = random_link_distance(min_distance);
 
-    let direction = if rand::thread_rng().gen_bool(0.5) { 1.0 } else { -1.0 };
+    let direction = if rand::thread_rng().gen_bool(0.5) {
+        1.0
+    } else {
+        -1.0
+    };
     let target = Location::new_rounded(my_location.as_f64() * direction);
     let threshold = Distance::new(distance_to_target.as_f64() / 2.0);
     JoinTargetInfo {
