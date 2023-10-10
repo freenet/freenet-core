@@ -192,19 +192,19 @@ impl Router {
         if !self.has_sufficient_historical_data() {
             return Err(RoutingError::InsufficientDataError);
         }
-
+    
         let time_to_response_start_estimate = self
             .response_start_time_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .unwrap();
+            .map_err(|e| RoutingError::EstimationError(format!("Response Start Time Estimation failed: {}", e)))?;
         let failure_estimate = self
             .failure_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .unwrap();
+            .map_err(|e| RoutingError::EstimationError(format!("Failure Estimation failed: {}", e)))?;
         let transfer_rate_estimate = self
             .transfer_rate_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .unwrap();
+            .map_err(|e| RoutingError::EstimationError(format!("Transfer Rate Estimation failed: {}", e)))?;    
 
         // This is a fairly naive approach, assuming that the cost of a failure is a multiple
         // of the cost of success.
@@ -233,6 +233,7 @@ impl Router {
 #[derive(Debug)]
 pub(crate) enum RoutingError {
     InsufficientDataError,
+    EstimationError(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
