@@ -5,7 +5,7 @@ mod util;
 use crate::ring::{Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::Serialize;
-use std::time::Duration;
+use std::{fmt, time::Duration};
 use util::{Mean, TransferSpeed};
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,15 +193,24 @@ impl Router {
         let time_to_response_start_estimate = self
             .response_start_time_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .unwrap();
+            .map_err(|e| {
+                RoutingError::EstimationError(format!(
+                    "Response Start Time Estimation failed: {}",
+                    e
+                ))
+            })?;
         let failure_estimate = self
             .failure_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .unwrap();
+            .map_err(|e| {
+                RoutingError::EstimationError(format!("Failure Estimation failed: {}", e))
+            })?;
         let transfer_rate_estimate = self
             .transfer_rate_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .unwrap();
+            .map_err(|e| {
+                RoutingError::EstimationError(format!("Transfer Rate Estimation failed: {}", e))
+            })?;
 
         // This is a fairly naive approach, assuming that the cost of a failure is a multiple
         // of the cost of success.
@@ -230,6 +239,16 @@ impl Router {
 #[derive(Debug)]
 enum RoutingError {
     InsufficientDataError,
+    EstimationError(String),
+}
+
+impl fmt::Display for RoutingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RoutingError::InsufficientDataError => write!(f, "Insufficient data provided"),
+            RoutingError::EstimationError(err_msg) => write!(f, "Estimation error: {}", err_msg),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
