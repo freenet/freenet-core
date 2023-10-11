@@ -36,14 +36,15 @@ use crate::{
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
-        put, subscribe, OpEnum, OpError,
+        put, subscribe, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
+    router::{RouteEvent, RouteOutcome},
     util::{ExponentialBackoff, IterExt},
 };
 
 use crate::operations::handle_op_request;
-pub(crate) use conn_manager::{p2p_protoc::P2pBridge, ConnectionBridge, ConnectionError};
+pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use op_state::OpManager;
 
 mod conn_manager;
@@ -440,19 +441,53 @@ macro_rules! log_handling_msg {
     };
 }
 
-#[inline(always)]
 async fn report_result(
     op_result: Result<Option<OpEnum>, OpError>,
+    op_storage: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
 ) {
     match op_result {
-        Ok(Some(res)) => {
+        Ok(Some(op_res)) => {
             if let Some((client_id, cb)) = client_req_handler_callback {
-                let _ = cb.send((client_id, res.to_host_result(client_id)));
+                let _ = cb.send((client_id, op_res.to_host_result(client_id)));
+            }
+            // check operations.rs:handle_op_result to see what's the meaning of each state
+            // in case more cases want to be handled when feeding information to the OpManager
+
+            match op_res.outcome() {
+                OpOutcome::ContractOpSuccess {
+                    target_peer,
+                    contract_location,
+                    first_response_time,
+                    payload_size,
+                    payload_transfer_time,
+                } => {
+                    op_storage.ring.routing_finished(RouteEvent {
+                        peer: *target_peer,
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: first_response_time,
+                            payload_size,
+                            payload_transfer_time,
+                        },
+                    });
+                }
+                // todo: handle failures, need to track timeouts and other potential failures
+                // OpOutcome::ContractOpFailure {
+                //     target_peer: Some(target_peer),
+                //     contract_location,
+                // } => {
+                //     op_storage.ring.routing_finished(RouteEvent {
+                //         peer: *target_peer,
+                //         contract_location,
+                //         outcome: RouteOutcome::Failure,
+                //     });
+                // }
+                OpOutcome::Incomplete | OpOutcome::Irrelevant => {}
             }
             if let Some(mut cb) = executor_callback {
-                cb.response(res).await;
+                cb.response(op_res).await;
             }
         }
         Ok(None) => {}
@@ -489,7 +524,7 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(op_result, &op_storage, executor_callback, cli_req).await;
                 }
                 Message::Put(op) => {
                     log_handling_msg!("put", *op.id(), op_storage);
@@ -500,7 +535,7 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(op_result, &op_storage, executor_callback, cli_req).await;
                 }
                 Message::Get(op) => {
                     log_handling_msg!("get", op.id(), op_storage);
@@ -511,7 +546,7 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(op_result, &op_storage, executor_callback, cli_req).await;
                 }
                 Message::Subscribe(op) => {
                     log_handling_msg!("subscribe", op.id(), op_storage);
@@ -522,13 +557,13 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(op_result, &op_storage, executor_callback, cli_req).await;
                 }
                 _ => {}
             }
         }
         Err(err) => {
-            report_result(Err(err.into()), executor_callback, cli_req).await;
+            report_result(Err(err.into()), &op_storage, executor_callback, cli_req).await;
         }
     }
 }

@@ -1,6 +1,6 @@
-use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use std::{future::Future, time::Instant};
 
 use freenet_stdlib::prelude::*;
 
@@ -15,7 +15,7 @@ use crate::{
     DynError,
 };
 
-use super::{OpEnum, OpError, OperationResult};
+use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
 pub(crate) use self::messages::GetMsg;
 
@@ -30,15 +30,97 @@ pub(crate) struct GetOp {
     id: Transaction,
     state: Option<GetState>,
     result: Option<GetResult>,
+    stats: Option<GetStats>,
     _ttl: Duration,
 }
+
+struct GetStats {
+    caching_peer: Option<PeerKeyLocation>,
+    contract_location: Location,
+    /// (start, end)
+    first_response_time: Option<(Instant, Option<Instant>)>,
+    /// (start, end)
+    transfer_time: Option<(Instant, Option<Instant>)>,
+    step: RecordingStats,
+}
+
+/// While timing, at what particular step we are now.
+#[derive(Clone, Copy, Default)]
+enum RecordingStats {
+    #[default]
+    Uninitialized,
+    InitGet,
+    TransferNotStarted,
+    TransferStarted,
+    Completed,
+}
+
 impl GetOp {
-    pub(super) fn finished(&self) -> bool {
-        self.result.is_some()
+    pub(super) fn outcome(&self) -> OpOutcome {
+        if let Some((
+            GetResult { state, contract },
+            GetStats {
+                caching_peer: Some(target_peer),
+                contract_location,
+                first_response_time: Some((response_start, Some(response_end))),
+                transfer_time: Some((transfer_start, Some(transfer_end))),
+                ..
+            },
+        )) = self.result.as_ref().zip(self.stats.as_ref())
+        {
+            let payload_size = state.size()
+                + contract
+                    .as_ref()
+                    .map(|c| c.data().len())
+                    .unwrap_or_default();
+            OpOutcome::ContractOpSuccess {
+                target_peer,
+                contract_location: *contract_location,
+                payload_size,
+                first_response_time: *response_end - *response_start,
+                payload_transfer_time: *transfer_end - *transfer_start,
+            }
+        } else {
+            OpOutcome::Incomplete
+        }
+    }
+
+    pub(super) fn finalized(&self) -> bool {
+        self.stats
+            .as_ref()
+            .map(|s| s.transfer_time.is_some())
+            .unwrap_or(false)
+    }
+
+    pub(super) fn record_transfer(&mut self) {
+        if let Some(stats) = self.stats.as_mut() {
+            match stats.step {
+                RecordingStats::Uninitialized => {
+                    stats.first_response_time = Some((Instant::now(), None));
+                    stats.step = RecordingStats::InitGet;
+                }
+                RecordingStats::InitGet => {
+                    if let Some((_, e)) = stats.first_response_time.as_mut() {
+                        *e = Some(Instant::now());
+                    }
+                    stats.step = RecordingStats::TransferNotStarted;
+                }
+                RecordingStats::TransferNotStarted => {
+                    stats.transfer_time = Some((Instant::now(), None));
+                    stats.step = RecordingStats::TransferStarted;
+                }
+                RecordingStats::TransferStarted => {
+                    if let Some((_, e)) = stats.transfer_time.as_mut() {
+                        *e = Some(Instant::now());
+                    }
+                    stats.step = RecordingStats::Completed;
+                }
+                RecordingStats::Completed => {}
+            }
+        }
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct GetResult {
     pub state: WrappedState,
     pub contract: Option<ContractContainer>,
@@ -55,10 +137,7 @@ impl TryFrom<GetOp> for GetResult {
     }
 }
 
-impl<CB: ConnectionBridge> Operation<CB> for GetOp
-where
-    CB: std::marker::Send,
-{
+impl Operation for GetOp {
     type Message = GetMsg;
     type Result = GetResult;
 
@@ -74,7 +153,7 @@ where
         let result = match op_storage.pop(msg.id()) {
             Some(OpEnum::Get(get_op)) => {
                 Ok(OpInitialization { op: get_op, sender })
-                // was an existing operation, the other peer messaged back
+                // was an existing operation, other peer messaged back
             }
             Some(_) => return Err(OpError::OpNotPresent(tx)),
             None => {
@@ -84,6 +163,7 @@ where
                         state: Some(GetState::ReceivedRequest),
                         id: tx,
                         result: None,
+                        stats: None, // don't care about stats in target peers
                         _ttl: PEER_TIMEOUT,
                     },
                     sender,
@@ -98,7 +178,7 @@ where
         &self.id
     }
 
-    fn process_message<'a>(
+    fn process_message<'a, CB: ConnectionBridge>(
         self,
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
@@ -109,6 +189,7 @@ where
             let return_msg;
             let new_state;
             let mut result = None;
+            let mut stats = self.stats;
 
             match input {
                 GetMsg::RequestGet {
@@ -124,6 +205,13 @@ where
                     ));
                     tracing::debug!("Seek contract {} @ {} (tx: {})", key, target.peer, id);
                     new_state = self.state;
+                    stats = Some(GetStats {
+                        contract_location: Location::from(&key),
+                        caching_peer: None,
+                        transfer_time: None,
+                        first_response_time: None,
+                        step: Default::default(),
+                    });
                     return_msg = Some(GetMsg::SeekNode {
                         key,
                         id,
@@ -142,6 +230,10 @@ where
                     htl,
                 } => {
                     let is_cached_contract = op_storage.ring.is_contract_cached(&key);
+                    if let Some(s) = stats.as_mut() {
+                        s.caching_peer = Some(target);
+                    }
+
                     if !is_cached_contract {
                         tracing::warn!(
                             "Contract `{}` not found while processing a get request at node @ {}",
@@ -170,6 +262,7 @@ where
                                     target: sender, // return to requester
                                 }),
                                 None,
+                                stats,
                                 self._ttl,
                             );
                         }
@@ -274,6 +367,7 @@ where
                             fetch_contract,
                             ..
                         }) => {
+                            // todo: register in the stats for the outcome of the op that failed to get a response from this peer
                             if retries < MAX_RETRIES {
                                 // no response received from this peer, so skip it in the next iteration
                                 skip_list.push(target.peer);
@@ -367,6 +461,7 @@ where
                                 state: self.state,
                                 result: None,
                                 _ttl: self._ttl,
+                                stats,
                             };
 
                             op_storage
@@ -441,7 +536,7 @@ where
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, result, self._ttl)
+            build_op_result(self.id, new_state, return_msg, result, stats, self._ttl)
         })
     }
 }
@@ -451,12 +546,14 @@ fn build_op_result(
     state: Option<GetState>,
     msg: Option<GetMsg>,
     result: Option<GetResult>,
+    stats: Option<GetStats>,
     ttl: Duration,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(GetOp {
         id,
         state,
         result,
+        stats,
         _ttl: ttl,
     });
     Ok(OperationResult {
@@ -510,14 +607,11 @@ fn check_contract_found(
     }
 }
 
-pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> GetOp {
-    tracing::debug!(
-        "Requesting get contract {} @ loc({})",
-        key,
-        Location::from(&key)
-    );
+pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, this_peer: &PeerKey) -> GetOp {
+    let contract_location = Location::from(&key);
+    tracing::debug!("Requesting get contract {} @ loc({contract_location})", key,);
 
-    let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), id);
+    let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), this_peer);
     let state = Some(GetState::PrepareRequest {
         key,
         id,
@@ -527,11 +621,17 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, id: &PeerKey) -> 
         id,
         state,
         result: None,
+        stats: Some(GetStats {
+            contract_location,
+            caching_peer: None,
+            transfer_time: None,
+            first_response_time: None,
+            step: Default::default(),
+        }),
         _ttl: PEER_TIMEOUT,
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone)]
 enum GetState {
     /// A new petition for a get op.
     ReceivedRequest,
@@ -555,19 +655,18 @@ pub(crate) async fn request_get(
     get_op: GetOp,
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
-    let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = get_op.state.clone()
-    {
+    let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
         // the initial request must provide:
         // - a location in the network where the contract resides
         // - and the key of the contract value to get
         (
             op_storage
                 .ring
-                .closest_caching(&key, 1, &[])
+                .closest_caching(key, 1, &[])
                 .into_iter()
                 .next()
                 .ok_or(RingError::EmptyRing)?,
-            id,
+            *id,
         )
     } else {
         return Err(OpError::UnexpectedOpState);
@@ -578,7 +677,7 @@ pub(crate) async fn request_get(
         id
     );
 
-    match get_op.state.clone() {
+    match get_op.state {
         Some(GetState::PrepareRequest {
             fetch_contract,
             key,
@@ -591,22 +690,26 @@ pub(crate) async fn request_get(
                 fetch_contract,
             });
 
-            let msg = Some(GetMsg::RequestGet {
+            let msg = GetMsg::RequestGet {
                 id,
                 key,
                 target,
                 fetch_contract,
-            });
+            };
 
             let op = GetOp {
                 id,
                 state: new_state,
                 result: None,
+                stats: get_op.stats.map(|mut s| {
+                    s.caching_peer = Some(target);
+                    s
+                }),
                 _ttl: get_op._ttl,
             };
 
             op_storage
-                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Get(op), client_id)
+                .notify_op_change(Message::from(msg), OpEnum::Get(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::InvalidStateTransition(get_op.id)),
@@ -625,11 +728,6 @@ mod messages {
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum GetMsg {
-        /// Internal node call to route to a peer close to the contract.
-        FetchRouting {
-            id: Transaction,
-            target: PeerKeyLocation,
-        },
         RequestGet {
             id: Transaction,
             target: PeerKeyLocation,
@@ -656,7 +754,6 @@ mod messages {
     impl InnerMessage for GetMsg {
         fn id(&self) -> &Transaction {
             match self {
-                Self::FetchRouting { id, .. } => id,
                 Self::RequestGet { id, .. } => id,
                 Self::SeekNode { id, .. } => id,
                 Self::ReturnGet { id, .. } => id,
@@ -674,7 +771,6 @@ mod messages {
 
         pub fn target(&self) -> Option<&PeerKeyLocation> {
             match self {
-                Self::FetchRouting { target, .. } => Some(target),
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestGet { target, .. } => Some(target),
                 Self::ReturnGet { target, .. } => Some(target),
@@ -683,7 +779,7 @@ mod messages {
 
         pub fn terminal(&self) -> bool {
             use GetMsg::*;
-            matches!(self, ReturnGet { .. } | SeekNode { .. })
+            matches!(self, ReturnGet { .. })
         }
     }
 
@@ -691,7 +787,6 @@ mod messages {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let id = self.id();
             match self {
-                Self::FetchRouting { .. } => write!(f, "FetchRouting(id: {id})"),
                 Self::RequestGet { .. } => write!(f, "RequestGet(id: {id})"),
                 Self::SeekNode { .. } => write!(f, "SeekNode(id: {id})"),
                 Self::ReturnGet { .. } => write!(f, "ReturnGet(id: {id})"),

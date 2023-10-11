@@ -17,7 +17,7 @@ pub(crate) struct Router {
 }
 
 impl Router {
-    fn new(history: &[RouteEvent]) -> Self {
+    pub fn new(history: &[RouteEvent]) -> Self {
         let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
             .map(|re| IsotonicEvent {
@@ -107,7 +107,7 @@ impl Router {
         }
     }
 
-    fn add_event(&mut self, event: RouteEvent) {
+    pub fn add_event(&mut self, event: RouteEvent) {
         match event.outcome {
             RouteOutcome::Success {
                 time_to_response_start,
@@ -143,14 +143,11 @@ impl Router {
         }
     }
 
-    pub(crate) fn select_peer<'a, I>(
+    pub fn select_peer<'a>(
         &self,
-        peers: I,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         contract_location: &Location,
-    ) -> Option<&'a PeerKeyLocation>
-    where
-        I: IntoIterator<Item = &'a PeerKeyLocation>,
-    {
+    ) -> Option<&'a PeerKeyLocation> {
         if !self.has_sufficient_historical_data() {
             // Find the peer with the minimum distance to the contract location,
             // ignoring peers with no location
@@ -240,7 +237,7 @@ impl Router {
 }
 
 #[derive(Debug)]
-pub(crate) enum RoutingError {
+enum RoutingError {
     InsufficientDataError,
     EstimationError(String),
 }
@@ -255,22 +252,22 @@ impl fmt::Display for RoutingError {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub(crate) struct RoutingPrediction {
-    pub failure_probability: f64,
-    pub xfer_speed: TransferSpeed,
-    pub time_to_response_start: f64,
-    pub expected_total_time: f64,
+struct RoutingPrediction {
+    failure_probability: f64,
+    xfer_speed: TransferSpeed,
+    time_to_response_start: f64,
+    expected_total_time: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) struct RouteEvent {
-    peer: PeerKeyLocation,
-    contract_location: Location,
-    outcome: RouteOutcome,
+    pub peer: PeerKeyLocation,
+    pub contract_location: Location,
+    pub outcome: RouteOutcome,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub(crate) enum RouteOutcome {
+pub enum RouteOutcome {
     Success {
         time_to_response_start: Duration,
         payload_size: usize,
