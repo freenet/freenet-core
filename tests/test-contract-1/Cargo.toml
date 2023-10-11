@@ -9,7 +9,9 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-freenet-stdlib = { path = "../../stdlib/rust" }
+freenet-stdlib = { path = "../../stdlib/rust", features = ["contract"] }
 
 [features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]

@@ -28,39 +28,42 @@ pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), D
     }
 }
 
-fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
-    let package_type = cli_config.package_type;
-    const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
+fn compile_options(cli_config: &BuildToolCliConfig) -> impl Iterator<Item = &str> {
     let release: &[&str] = if cli_config.debug {
         &[]
     } else {
         &["--release"]
     };
-    let target = WASM_TARGET;
-    let cmd_args = cli_config
-        .features
-        .as_ref()
-        .iter()
-        .flat_map(|x| ["--features", x.as_str()])
-        .chain(release.iter().copied())
-        .collect::<Vec<_>>();
+    let feature_list = cli_config.features.iter().flat_map(|s| {
+        s.split(',')
+            .filter(|p| *p != cli_config.package_type.feature())
+    });
+    let features = ["--features", cli_config.package_type.feature()]
+        .into_iter()
+        .chain(feature_list);
+    features.chain(release.iter().copied())
+}
+
+fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
+    const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
     use std::io::IsTerminal;
     let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
         RUST_TARGET_ARGS
             .iter()
             .copied()
-            .chain([target, "--color", "always"])
-            .chain(cmd_args)
+            .chain([WASM_TARGET, "--color", "always"])
+            .chain(compile_options(cli_config))
             .collect::<Vec<_>>()
     } else {
         RUST_TARGET_ARGS
             .iter()
             .copied()
-            .chain([target])
-            .chain(cmd_args)
+            .chain([WASM_TARGET])
+            .chain(compile_options(cli_config))
             .collect::<Vec<_>>()
     };
 
+    let package_type = cli_config.package_type;
     println!("Compiling {package_type} with rust");
     let child = Command::new("cargo")
         .args(&cmd_args)

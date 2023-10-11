@@ -122,7 +122,7 @@ impl DelegateInterface for IdentityManagement {
                 let msg = IdentityMsg::try_from(&*payload)?;
                 let action = match msg {
                     IdentityMsg::CreateIdentity { alias, key, extra } => {
-                        #[cfg(all(target_family = "wasm", feature = "contract"))]
+                        #[cfg(feature = "contract")]
                         {
                             freenet_stdlib::log::info(&format!(
                                 "create alias new {alias} for {}",
@@ -136,7 +136,7 @@ impl DelegateInterface for IdentityManagement {
                         serde_json::to_vec(&IdentityMsg::DeleteIdentity { alias }).unwrap()
                     }
                     IdentityMsg::Init => {
-                        #[cfg(all(target_family = "wasm", feature = "contract"))]
+                        #[cfg(feature = "contract")]
                         {
                             freenet_stdlib::log::info(&format!(
                                 "initialize secret {}",
@@ -165,7 +165,7 @@ impl DelegateInterface for IdentityManagement {
                 context,
                 ..
             }) => {
-                #[cfg(all(target_family = "wasm", feature = "contract"))]
+                #[cfg(feature = "contract")]
                 {
                     freenet_stdlib::log::info(&format!(
                         "got request for {}",

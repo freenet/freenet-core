@@ -1,7 +1,7 @@
 use crate::ring::{Distance, Location, PeerKeyLocation};
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
@@ -103,7 +103,7 @@ impl IsotonicEstimator {
 
             self.peer_adjustments
                 .entry(event.peer)
-                .or_insert_with(Adjustment::default)
+                .or_default()
                 .add(adjustment);
         }
     }
@@ -158,6 +158,14 @@ pub(crate) enum EstimatorType {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EstimationError {
     InsufficientData, // Error indicating that there is not enough data for estimation
+}
+
+impl fmt::Display for EstimationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EstimationError::InsufficientData => write!(f, "Insufficient data for estimation"),
+        }
+    }
 }
 
 /// A routing event is a single request to a peer for a contract, and some value indicating
