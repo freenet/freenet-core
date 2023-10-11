@@ -10,6 +10,7 @@
 //! - next node
 //! - final location
 
+use std::hash::Hash;
 use std::{
     collections::BTreeMap,
     convert::TryFrom,
@@ -27,10 +28,10 @@ use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use rand::prelude::*;
-use std::{cmp::Ordering, hash::Hash};
-
-use crate::node::{self, NodeBuilder, PeerKey};
+use crate::{
+    node::{self, NodeBuilder, PeerKey},
+    router::Router,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// The location of a peer in the ring. This location allows routing towards the peer.
@@ -68,6 +69,7 @@ pub(crate) struct Ring {
     pub peer_key: PeerKey,
     max_connections: usize,
     min_connections: usize,
+    router: Arc<RwLock<Router>>,
     connections_by_location: Arc<RwLock<BTreeMap<Location, PeerKeyLocation>>>,
     location_for_peer: Arc<RwLock<BTreeMap<PeerKey, Location>>>,
     /// contracts in the ring cached by this node
@@ -146,11 +148,14 @@ impl Ring {
             Self::MAX_CONNECTIONS
         };
 
+        let router = Router::new(&[]);
+
         let ring = Ring {
             rnd_if_htl_above,
             max_hops_to_live,
             max_connections,
             min_connections,
+            router: Arc::new(RwLock::new(router)),
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
             location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
             cached_contracts: DashSet::new(),
@@ -319,6 +324,10 @@ impl Ring {
         conn_by_dist.sort_by_key(|&(dist, _)| dist);
         let iter = conn_by_dist.into_iter().map(|(_, v)| *v.1).take(n);
         iter.collect()
+    }
+
+    pub fn routing_finished(&self, event: crate::router::RouteEvent) {
+        self.router.write().add_event(event);
     }
 
     /// Get a random peer from the known ring connections.

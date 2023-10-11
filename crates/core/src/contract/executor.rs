@@ -31,7 +31,7 @@ use crate::runtime::{
 };
 use crate::{
     client_events::{ClientId, HostResult},
-    node::{NodeConfig, P2pBridge},
+    node::NodeConfig,
     operations::{self, op_trait::Operation},
     DynError,
 };
@@ -136,7 +136,7 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
     async fn send_to_event_loop<Op, T>(&mut self, message: T) -> Result<(), DynError>
     where
         T: ComposeNetworkMessage<Op>,
-        Op: Operation<P2pBridge> + Send + 'static,
+        Op: Operation + Send + 'static,
     {
         let op = message.initiate_op(&self.op_manager);
         self.end.sender.send(*op.id()).await?;
@@ -178,7 +178,7 @@ mod sealed {
 trait ComposeNetworkMessage<Op>
 where
     Self: Sized,
-    Op: Operation<P2pBridge> + Send + 'static,
+    Op: Operation + Send + 'static,
 {
     fn initiate_op(self, op_manager: &OpManager) -> Op {
         todo!()
@@ -205,7 +205,7 @@ impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
         op: operations::get::GetOp,
         op_manager: &OpManager,
     ) -> Result<Transaction, OpError> {
-        let id = *<operations::get::GetOp as Operation<P2pBridge>>::id(&op);
+        let id = *op.id();
         operations::get::request_get(op_manager, op, None).await?;
         Ok(id)
     }
@@ -321,7 +321,7 @@ impl Executor<Runtime> {
     // dependencies to be resolved
     async fn op_request<Op, M>(&mut self, request: M) -> Result<Op, DynError>
     where
-        Op: Operation<P2pBridge> + Send + 'static,
+        Op: Operation + Send + 'static,
         M: ComposeNetworkMessage<Op>,
     {
         debug_assert!(self.event_loop_channel.is_some());

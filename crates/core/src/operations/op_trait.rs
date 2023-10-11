@@ -7,11 +7,11 @@ use futures::Future;
 use crate::{
     client_events::ClientId,
     message::{InnerMessage, Transaction},
-    node::OpManager,
+    node::{ConnectionBridge, OpManager},
     operations::{OpError, OpInitialization, OperationResult},
 };
 
-pub(crate) trait Operation<CB>
+pub(crate) trait Operation
 where
     Self: Sized + TryInto<Self::Result>,
 {
@@ -24,12 +24,10 @@ where
         msg: &Self::Message,
     ) -> Result<OpInitialization<Self>, OpError>;
 
-    //     fn new(transaction: Transaction, builder: Self::Builder) -> Self;
-
     fn id(&self) -> &Transaction;
 
     #[allow(clippy::type_complexity)]
-    fn process_message<'a>(
+    fn process_message<'a, CB: ConnectionBridge>(
         self,
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,

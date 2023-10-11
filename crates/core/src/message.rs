@@ -1,9 +1,6 @@
 //! Main message type which encapsulated all the messaging between nodes.
 
-use std::{
-    fmt::Display,
-    time::{Duration, SystemTime},
-};
+use std::{fmt::Display, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use uuid::{
@@ -45,13 +42,7 @@ static UUID_CONTEXT: Context = Context::new(14);
 impl Transaction {
     pub fn new(ty: TransactionTypeId, initial_peer: &PeerKey) -> Transaction {
         // using v1 UUID to keep to keep track of the creation ts
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("infallible");
-        let now_secs = now.as_secs();
-        let now_nanos = now.as_nanos();
-        let now_nanos = now_nanos - (now_secs as u128 * 1_000_000_000);
-        let ts = Timestamp::from_unix(&UUID_CONTEXT, now_secs, now_nanos as u32);
+        let ts: Timestamp = uuid::timestamp::Timestamp::now(&UUID_CONTEXT);
 
         // event in the net this UUID should be unique since peer keys are unique
         // however some id collision may be theoretically possible if two transactions
@@ -61,8 +52,8 @@ impl Transaction {
         let b = &mut [0; 6];
         b.copy_from_slice(&initial_peer.to_bytes()[0..6]);
         let id = Uuid::new_v1(ts, b);
-        // 2 word size for 64-bits platforms most likely since msg type
-        // probably will be aligned to 64 bytes
+
+        // 3 word size for 64-bits platforms
         Self { id, ty }
     }
 
@@ -230,6 +221,11 @@ impl Message {
             Update(_op) => todo!(),
             Canceled(_) => true,
         }
+    }
+
+    pub fn track_stats(&self) -> bool {
+        use Message::*;
+        !matches!(self, JoinRing(_) | Subscribe(_) | Canceled(_))
     }
 }
 

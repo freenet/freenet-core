@@ -34,6 +34,7 @@ pub(crate) struct OpManager {
     pub ring: Ring,
 }
 
+#[cfg(debug_assertions)]
 macro_rules! check_id_op {
     ($get_ty:expr, $var:path) => {
         if !matches!($get_ty, $var) {
@@ -108,18 +109,22 @@ impl OpManager {
     pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
         match op {
             OpEnum::JoinRing(tx) => {
+                #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::JoinRing);
                 self.join_ring.insert(id, *tx);
             }
             OpEnum::Put(tx) => {
+                #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::Put);
                 self.put.insert(id, tx);
             }
             OpEnum::Get(tx) => {
+                #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::Get);
                 self.get.insert(id, tx);
             }
             OpEnum::Subscribe(tx) => {
+                #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::Subscribe);
                 self.subscribe.insert(id, tx);
             }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::sync::mpsc::error::SendError;
 
 use self::op_trait::Operation;
@@ -6,8 +8,7 @@ use crate::{
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
-    operations::{get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp},
-    ring::RingError,
+    ring::{Location, PeerKeyLocation, RingError},
 };
 
 pub(crate) mod get;
@@ -36,7 +37,7 @@ pub(crate) async fn handle_op_request<Op, CB>(
     client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
-    Op: Operation<CB>,
+    Op: Operation,
     CB: ConnectionBridge,
 {
     let sender;
@@ -92,7 +93,7 @@ where
         Ok(OperationResult {
             return_msg: None,
             state: Some(final_state),
-        }) if final_state.is_final() => {
+        }) if final_state.finalized() => {
             // operation finished_completely with result
             return Ok(Some(final_state));
         }
@@ -101,7 +102,7 @@ where
             state: Some(updated_state),
         }) => {
             // interim state
-            let id = OpEnum::id::<CB>(&updated_state);
+            let id = *updated_state.id();
             op_storage.push(id, updated_state)?;
         }
         Ok(OperationResult {
@@ -131,29 +132,47 @@ pub(crate) enum OpEnum {
 }
 
 impl OpEnum {
-    fn id<CB: ConnectionBridge>(&self) -> Transaction {
-        use OpEnum::*;
-        match self {
-            JoinRing(op) => *<JoinRingOp as Operation<CB>>::id(op),
-            Put(op) => *<PutOp as Operation<CB>>::id(op),
-            Get(op) => *<GetOp as Operation<CB>>::id(op),
-            Subscribe(op) => *<SubscribeOp as Operation<CB>>::id(op),
-        }
-    }
-
-    fn is_final(&self) -> bool {
-        match self {
-            OpEnum::JoinRing(op) if op.finished() => true,
-            OpEnum::Put(op) if op.finished() => true,
-            OpEnum::Get(op) if op.finished() => true,
-            OpEnum::Subscribe(op) if op.finished() => true,
-            _ => false,
+    delegate::delegate! {
+        to match self {
+            OpEnum::JoinRing(op) => op,
+            OpEnum::Put(op) => op,
+            OpEnum::Get(op) => op,
+            OpEnum::Subscribe(op) => op,
+        } {
+            pub fn id(&self) -> &Transaction;
+            pub fn outcome(&self) -> OpOutcome;
+            pub fn finalized(&self) -> bool;
+            pub fn record_transfer(&mut self);
         }
     }
 
     pub fn to_host_result(&self, _client_id: ClientId) -> HostResult {
         todo!()
     }
+}
+
+pub(crate) enum OpOutcome<'a> {
+    /// An op which involves a contract completed successfully.
+    ContractOpSuccess {
+        target_peer: &'a PeerKeyLocation,
+        contract_location: Location,
+        /// Time the operation took to initiate.
+        first_response_time: Duration,
+        /// Size of the payload (contract, state, etc.) in bytes.
+        payload_size: usize,
+        /// Transfer time of the payload.
+        payload_transfer_time: Duration,
+    },
+    // todo: handle failures stats when it does not complete successfully
+    // /// An op which involves a contract completed unsuccessfully.
+    // ContractOpFailure {
+    //     target_peer: Option<&'a PeerKeyLocation>,
+    //     contract_location: Location,
+    // },
+    /// In transit contract operation.
+    Incomplete,
+    /// This operation stats are not relevant for this peer.
+    Irrelevant,
 }
 
 #[derive(Debug, thiserror::Error)]

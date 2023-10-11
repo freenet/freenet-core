@@ -32,7 +32,7 @@ use super::OpManager;
 
 pub(super) struct NodeP2P {
     pub(crate) peer_key: PeerKey,
-    pub(crate) op_storage: Arc<OpManager>,
+    pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotifications,
     pub(super) conn_manager: P2pConnManager,
     // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
@@ -54,7 +54,7 @@ impl NodeP2P {
                     None,
                     self.peer_key,
                     gateway,
-                    &self.op_storage,
+                    &self.op_manager,
                     &mut self.conn_manager.bridge,
                 )
                 .await?;
@@ -67,7 +67,7 @@ impl NodeP2P {
         // todo: pass  `cli_response_sender`
         self.conn_manager
             .run_event_listener(
-                self.op_storage.clone(),
+                self.op_manager.clone(),
                 self.notification_channel,
                 self.executor_listener,
                 self.cli_response_sender,
@@ -85,11 +85,6 @@ impl NodeP2P {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
 
-        let conn_manager = {
-            let transport = Self::config_transport(&builder.local_key)?;
-            P2pConnManager::build(transport, &builder)?
-        };
-
         let ring = Ring::new(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
@@ -99,6 +94,11 @@ impl NodeP2P {
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
+
+        let conn_manager = {
+            let transport = Self::config_transport(&builder.local_key)?;
+            P2pConnManager::build(transport, &builder, op_storage.clone())?
+        };
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
         let clients = ClientEventsCombinator::new(builder.clients);
@@ -112,7 +112,7 @@ impl NodeP2P {
             peer_key,
             conn_manager,
             notification_channel,
-            op_storage,
+            op_manager: op_storage,
             is_gateway: builder.location.is_some(),
             executor_listener,
             cli_response_sender,
