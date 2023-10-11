@@ -62,6 +62,7 @@ fn config_behaviour(
     local_key: &Keypair,
     gateways: &[InitPeerNode],
     _public_addr: &Option<Multiaddr>,
+    op_manager: Arc<OpManager>,
 ) -> NetBehaviour {
     let routing_table: HashMap<_, _> = gateways
         .iter()
@@ -101,6 +102,7 @@ fn config_behaviour(
             connected: HashMap::new(),
             openning_connection: HashSet::new(),
             inbound: VecDeque::new(),
+            op_manager,
         },
     }
 }
@@ -177,6 +179,7 @@ impl P2pConnManager {
     pub fn build<const CLIENTS: usize>(
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeBuilder<CLIENTS>,
+        op_manager: Arc<OpManager>,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
@@ -191,7 +194,12 @@ impl P2pConnManager {
 
         let builder = SwarmBuilder::with_executor(
             transport,
-            config_behaviour(&config.local_key, &config.remote_nodes, &public_addr),
+            config_behaviour(
+                &config.local_key,
+                &config.remote_nodes,
+                &public_addr,
+                op_manager,
+            ),
             PeerId::from(config.local_key.public()),
             global_executor,
         );
@@ -505,6 +513,7 @@ pub(in crate::node) struct FreenetBehaviour {
     routing_table: HashMap<PeerId, HashSet<Multiaddr>>,
     connected: HashMap<PeerId, ConnectionId>,
     openning_connection: HashSet<PeerId>,
+    op_manager: Arc<OpManager>,
 }
 
 impl NetworkBehaviour for FreenetBehaviour {
@@ -526,7 +535,7 @@ impl NetworkBehaviour for FreenetBehaviour {
             .entry(peer_id)
             .or_default()
             .insert(remote_addr.clone());
-        Ok(Handler::new())
+        Ok(Handler::new(self.op_manager.clone()))
     }
 
     fn handle_established_outbound_connection(
@@ -543,7 +552,7 @@ impl NetworkBehaviour for FreenetBehaviour {
             .entry(peer_id)
             .or_default()
             .insert(addr.clone());
-        Ok(Handler::new())
+        Ok(Handler::new(self.op_manager.clone()))
     }
 
     fn on_connection_handler_event(
@@ -634,6 +643,7 @@ pub(in crate::node) struct Handler {
     uniq_conn_id: UniqConnId,
     protocol_status: ProtocolStatus,
     pending: Vec<Message>,
+    op_manager: Arc<OpManager>,
 }
 
 #[allow(dead_code)]
@@ -668,6 +678,7 @@ enum SubstreamState {
     PendingFlush {
         conn_id: UniqConnId,
         substream: FreenetStream<NegotiatedSubstream>,
+        op_id: Option<Transaction>,
     },
     /// Waiting for an answer back from the remote.
     WaitingMsg {
@@ -685,13 +696,14 @@ impl SubstreamState {
 }
 
 impl Handler {
-    fn new() -> Self {
+    fn new(op_manager: Arc<OpManager>) -> Self {
         Self {
             substreams: vec![],
             keep_alive: KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT),
             uniq_conn_id: 0,
             protocol_status: ProtocolStatus::Unconfirmed,
             pending: Vec::new(),
+            op_manager,
         }
     }
 
@@ -831,17 +843,31 @@ impl ConnectionHandler for Handler {
                                 }
                                 _ => break,
                             },
-                            Left(msg) => match Sink::start_send(Pin::new(&mut substream), msg) {
-                                Ok(()) => {
-                                    stream = SubstreamState::PendingFlush { substream, conn_id };
+                            Left(msg) => {
+                                let op_id = msg.id();
+                                if msg.track_stats() {
+                                    if let Some(mut op) = self.op_manager.pop(op_id) {
+                                        op.record_transfer();
+                                        let _ = self.op_manager.push(*op_id, op);
+                                    }
                                 }
-                                Err(err) => {
-                                    let event = ConnectionHandlerEvent::NotifyBehaviour(
-                                        HandlerEvent::Inbound(Right(NodeEvent::Error(err))),
-                                    );
-                                    return Poll::Ready(event);
+                                let op_id = *op_id;
+                                match Sink::start_send(Pin::new(&mut substream), msg) {
+                                    Ok(()) => {
+                                        stream = SubstreamState::PendingFlush {
+                                            substream,
+                                            conn_id,
+                                            op_id: Some(op_id),
+                                        };
+                                    }
+                                    Err(err) => {
+                                        let event = ConnectionHandlerEvent::NotifyBehaviour(
+                                            HandlerEvent::Inbound(Right(NodeEvent::Error(err))),
+                                        );
+                                        return Poll::Ready(event);
+                                    }
                                 }
-                            },
+                            }
                         },
                         Poll::Pending => {
                             stream = SubstreamState::PendingSend {
@@ -861,14 +887,24 @@ impl ConnectionHandler for Handler {
                     SubstreamState::PendingFlush {
                         mut substream,
                         conn_id,
+                        op_id,
                     } => match Sink::poll_flush(Pin::new(&mut substream), cx) {
                         Poll::Ready(Ok(())) => {
+                            if let Some(op_id) = op_id {
+                                if let Some(mut op) = self.op_manager.pop(&op_id) {
+                                    op.record_transfer();
+                                    let _ = self.op_manager.push(op_id, op);
+                                }
+                            }
                             stream = SubstreamState::WaitingMsg { substream, conn_id };
                             continue;
                         }
                         Poll::Pending => {
-                            self.substreams
-                                .push(SubstreamState::PendingFlush { substream, conn_id });
+                            self.substreams.push(SubstreamState::PendingFlush {
+                                substream,
+                                conn_id,
+                                op_id,
+                            });
                             break;
                         }
                         Poll::Ready(Err(err)) => {
@@ -883,6 +919,11 @@ impl ConnectionHandler for Handler {
                         conn_id,
                     } => match Stream::poll_next(Pin::new(&mut substream), cx) {
                         Poll::Ready(Some(Ok(msg))) => {
+                            let op_id = msg.id();
+                            if let Some(mut op) = self.op_manager.pop(op_id) {
+                                op.record_transfer();
+                                let _ = self.op_manager.push(*op_id, op);
+                            }
                             if !msg.terminal() {
                                 // received a message, the other peer is waiting for an answer
                                 self.substreams

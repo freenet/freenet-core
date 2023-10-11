@@ -17,7 +17,7 @@ impl TryFrom<UpdateOp> for UpdateResult {
     }
 }
 
-impl<CB: ConnectionBridge> Operation<CB> for UpdateOp {
+impl Operation for UpdateOp {
     type Message = UpdateMsg;
     type Result = UpdateResult;
 
@@ -32,7 +32,7 @@ impl<CB: ConnectionBridge> Operation<CB> for UpdateOp {
         todo!()
     }
 
-    fn process_message<'a>(
+    fn process_message<'a, CB: ConnectionBridge>(
         self,
         _conn_manager: &'a mut CB,
         _op_storage: &'a crate::node::OpManager,
