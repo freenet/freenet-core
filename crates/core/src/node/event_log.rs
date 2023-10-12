@@ -1,3 +1,5 @@
+use std::{io, path::Path};
+
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
@@ -140,31 +142,106 @@ impl EventRegister {
     }
 
     async fn record_logs(mut log_recv: mpsc::Receiver<LogMessage>) {
+        const MAX_LOG_RECORDS: usize = 100_000;
+
+        async fn num_lines(path: &Path) -> io::Result<usize> {
+            use tokio::fs::File;
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let file = File::open(path).await.expect("Failed to open log file");
+            let reader = BufReader::new(file);
+            let mut num_lines = 0;
+            let mut lines = reader.lines();
+            while lines.next_line().await?.is_some() {
+                num_lines += 1;
+            }
+            Ok(num_lines)
+        }
+
+        async fn truncate_lines(
+            file: &mut tokio::fs::File,
+            lines_to_keep: usize,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt};
+
+            file.seek(io::SeekFrom::Start(0)).await?;
+            let file_metadata = file.metadata().await?;
+            let file_size = file_metadata.len();
+            let mut reader = tokio::io::BufReader::new(file);
+
+            let mut buffer = Vec::with_capacity(file_size as usize);
+            let mut lines_count = 0;
+
+            let mut line = Vec::new();
+            let mut discard_bytes = 0;
+
+            while lines_count < lines_to_keep {
+                let bytes_read = reader.read_until(b'\n', &mut line).await?;
+                if bytes_read == 0 {
+                    // EOF
+                    break;
+                }
+                lines_count += 1;
+                discard_bytes += bytes_read;
+                line.clear();
+            }
+
+            // Copy the rest of the file to the buffer
+            while let Ok(bytes_read) = reader.read_buf(&mut buffer).await {
+                if bytes_read == 0 {
+                    // EOF
+                    break;
+                }
+            }
+
+            // Seek back to the beginning and write the remaining content            let file = reader.into_inner();
+            let file = reader.into_inner();
+            file.seek(io::SeekFrom::Start(0)).await?;
+            file.write_all(&buffer).await?;
+
+            // Truncate the file to the new size
+            file.set_len(file_size - discard_bytes as u64).await?;
+            file.seek(io::SeekFrom::End(0)).await?;
+            Ok(())
+        }
+
         use tokio::io::AsyncWriteExt;
         let event_log_path = crate::config::Config::get_static_conf().event_log();
         let mut event_log = match OpenOptions::new().write(true).open(&event_log_path).await {
             Ok(file) => file,
             Err(err) => {
-                tracing::error!("failed openning log file {:?} with: {err}", event_log_path);
-                panic!("failed openning log file"); // todo: propagate this to the main thread
+                tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
+                panic!("Failed openning log file"); // todo: propagate this to the main thread
             }
         };
         let mut num_written = 0;
         let mut buf = vec![];
         while let Some(log) = log_recv.recv().await {
             if let Err(err) = bincode::serialize_into(&mut buf, &log) {
-                tracing::error!("failed serializing log: {err}");
-                panic!("failed serializing log");
+                tracing::error!("Failed serializing log: {err}");
+                panic!("Failed serializing log");
             }
             buf.push(b'\n');
             num_written += 1;
             if num_written == 100 {
                 if let Err(err) = event_log.write_all(&buf).await {
-                    tracing::error!("failed writting to event log: {err}");
-                    panic!("failed writting event log");
+                    tracing::error!("Failed writting to event log: {err}");
+                    panic!("Failed writting event log");
                 }
                 num_written = 0;
                 buf.clear();
+            }
+
+            // Check the number of lines and truncate if needed
+            let num_lines = num_lines(event_log_path.as_path())
+                .await
+                .expect("non IO error");
+            if num_lines > MAX_LOG_RECORDS {
+                let truncate_to = num_lines - MAX_LOG_RECORDS + 900; // make some extra space removing 1000 old records
+                if let Err(err) = truncate_lines(&mut event_log, truncate_to).await {
+                    tracing::error!("Failed truncating log file: {:?}", err);
+                    panic!("Failed truncating log file");
+                }
             }
         }
     }
