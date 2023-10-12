@@ -19,6 +19,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
+    time::Duration,
 };
 
 use anyhow::bail;
@@ -28,7 +29,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    node::{self, NodeBuilder, PeerKey},
+    config::GlobalExecutor,
+    node::{self, EventLogRegister, EventRegister, NodeBuilder, PeerKey},
     router::Router,
 };
 
@@ -114,7 +116,7 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<const CLIENTS: usize>(
+    pub fn new<const CLIENTS: usize, EL: EventLogRegister>(
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
     ) -> Result<Self, anyhow::Error> {
@@ -147,14 +149,15 @@ impl Ring {
             Self::MAX_CONNECTIONS
         };
 
-        let router = Router::new(&[]);
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+        GlobalExecutor::spawn(Self::refresh_router::<EL>(router.clone()));
 
         let ring = Ring {
             rnd_if_htl_above,
             max_hops_to_live,
             max_connections,
             min_connections,
-            router: Arc::new(RwLock::new(router)),
+            router,
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
             location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
             cached_contracts: DashSet::new(),
@@ -178,6 +181,21 @@ impl Ring {
         }
 
         Ok(ring)
+    }
+
+    async fn refresh_router<EL: EventLogRegister>(router: Arc<RwLock<Router>>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let history = if std::any::type_name::<EL>() == std::any::type_name::<EventRegister>() {
+                EventRegister::get_router_events(10_000).await.unwrap()
+            } else {
+                vec![]
+            };
+            let router_ref = &mut *router.write();
+            *router_ref = Router::new(&history);
+        }
     }
 
     #[inline(always)]
@@ -570,7 +588,7 @@ mod test {
         let (_, receiver) = channel((0, peer_key));
         let user_events = MemoryEventsGen::new(receiver, peer_key);
         let config = NodeBuilder::new([Box::new(user_events)]);
-        let ring = Ring::new(&config, &[]).unwrap();
+        let ring = Ring::new::<1, node::TestEventListener>(&config, &[]).unwrap();
 
         fn build_pk(loc: Location) -> PeerKeyLocation {
             PeerKeyLocation {

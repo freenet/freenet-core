@@ -42,8 +42,8 @@ use crate::{
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
     message::{Message, NodeEvent, Transaction, TransactionType},
     node::{
-        handle_cancelled_op, join_ring_request, process_message, InitPeerNode, NodeBuilder,
-        OpManager, PeerKey,
+        handle_cancelled_op, join_ring_request, process_message, EventLogRegister, InitPeerNode,
+        NodeBuilder, OpManager, PeerKey,
     },
     operations::OpError,
     ring::PeerKeyLocation,
@@ -173,6 +173,7 @@ pub(in crate::node) struct P2pConnManager {
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
     /// last valid observed public address
     public_addr: Option<Multiaddr>,
+    event_listener: Box<dyn EventLogRegister>,
 }
 
 impl P2pConnManager {
@@ -180,6 +181,7 @@ impl P2pConnManager {
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeBuilder<CLIENTS>,
         op_manager: Arc<OpManager>,
+        event_listener: &dyn EventLogRegister,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
@@ -219,6 +221,7 @@ impl P2pConnManager {
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
             public_addr,
+            event_listener: event_listener.trait_clone(),
         })
     }
 
@@ -396,7 +399,7 @@ impl P2pConnManager {
                                 Ok(msg),
                                 op_manager.clone(),
                                 cb,
-                                None,
+                                self.event_listener.trait_clone(),
                                 executor_callback,
                                 client_req_handler_callback,
                                 client_id,
@@ -458,7 +461,7 @@ impl P2pConnManager {
                         Err(err),
                         op_manager.clone(),
                         cb,
-                        None,
+                        self.event_listener.trait_clone(),
                         None,
                         None,
                         None,

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub(super) struct Mean {
     sum: f64,
     count: u64,

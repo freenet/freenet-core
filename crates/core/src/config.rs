@@ -86,6 +86,7 @@ pub struct ConfigPaths {
     secrets_dir: PathBuf,
     db_dir: PathBuf,
     app_data_dir: PathBuf,
+    event_log: PathBuf,
 }
 
 impl ConfigPaths {
@@ -122,12 +123,21 @@ impl ConfigPaths {
             fs::create_dir_all(db_dir.join("local"))?;
         }
 
+        let event_log = app_data_dir.join("_EVENT_LOG");
+        if !event_log.exists() {
+            fs::write(&event_log, [])?;
+            let mut local_file = event_log.clone();
+            local_file.set_file_name("_EVENT_LOG_LOCAL");
+            fs::write(local_file, [])?;
+        }
+
         Ok(Self {
             contracts_dir,
             delegates_dir,
             secrets_dir,
             db_dir,
             app_data_dir,
+            event_log,
         })
     }
 }
@@ -176,8 +186,24 @@ impl Config {
         }
     }
 
+    pub fn event_log(&self) -> PathBuf {
+        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut local_file = self.config_paths.event_log.clone();
+            local_file.set_file_name("_EVENT_LOG_LOCAL");
+            local_file
+        } else {
+            self.config_paths.event_log.to_owned()
+        }
+    }
+
     pub fn get_static_conf() -> &'static Config {
-        CONFIG.get_or_init(|| Config::load_conf().expect("Failed to load configuration"))
+        CONFIG.get_or_init(|| match Config::load_conf() {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::error!("failed while loading configuration: {err}");
+                panic!("Failed while loading configuration")
+            }
+        })
     }
 
     fn load_conf() -> std::io::Result<Config> {
