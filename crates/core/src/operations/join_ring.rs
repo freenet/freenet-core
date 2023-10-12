@@ -126,6 +126,7 @@ impl Operation for JoinRingOp {
                     );
 
                     let new_location = Location::random();
+                    // FIXME: don't try to forward to peers which have already been tried (add a rejected_by list)
                     let accepted_by = if op_storage.ring.should_accept(&new_location) {
                         tracing::debug!("Accepting connection from {}", req_peer,);
                         HashSet::from_iter([this_node_loc])
@@ -951,6 +952,15 @@ mod messages {
         }
     }
 
+    /*
+    
+    Peer A ---> Peer B (forward) ----> Peer C
+                |----- (forward) ---------> Peer D
+    
+
+    Peer A ---> Peer B (forward) ----> Peer C ----> Peer D
+
+     */
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRequest {
         StartReq {

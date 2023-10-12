@@ -205,9 +205,9 @@ impl SimNetwork {
             self.event_listener
                 .add_node(label.clone(), PeerKey::from(id));
 
-            let node = NodeInMemory::build::<MemoryContractHandler>(
+            let node = NodeInMemory::build::<MemoryContractHandler, TestEventListener>(
                 config,
-                Some(Box::new(self.event_listener.clone())),
+                self.event_listener.clone(),
                 (),
             )
             .await
