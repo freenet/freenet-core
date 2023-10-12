@@ -651,7 +651,7 @@ pub(crate) async fn request_put(
     // - and the value to put
     let target = op_storage
         .ring
-        .closest_caching(&key, 1, &[sender.peer])
+        .closest_caching(&key, &[sender.peer])
         .into_iter()
         .next()
         .ok_or(RingError::EmptyRing)?;
@@ -737,9 +737,9 @@ async fn forward_changes<CB>(
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    let forward_to = op_storage.ring.closest_caching(&key, 1, skip_list);
+    let forward_to = op_storage.ring.closest_caching(&key, skip_list);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
-    for peer in forward_to {
+    if let Some(peer) = forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
         let other_distance = contract_loc.distance(other_loc);
         let self_distance = contract_loc.distance(own_loc);

@@ -146,8 +146,12 @@ impl Operation for SubscribeOp {
                         tracing::info!("Contract {} not found while processing info", key);
                         tracing::info!("Trying to found the contract from another node");
 
-                        let new_target =
-                            op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
+                        let Some(new_target) =
+                            op_storage.ring.closest_caching(&key, &[sender.peer])
+                        else {
+                            tracing::warn!("no peer found while trying getting contract {key}");
+                            return Err(OpError::RingError(RingError::NoCachingPeers(key)));
+                        };
                         let new_htl = htl + 1;
 
                         if new_htl > MAX_RETRIES {
@@ -220,7 +224,7 @@ impl Operation for SubscribeOp {
                                 skip_list.push(sender.peer);
                                 if let Some(target) = op_storage
                                     .ring
-                                    .closest_caching(&key, 1, skip_list.as_slice())
+                                    .closest_caching(&key, skip_list.as_slice())
                                     .into_iter()
                                     .next()
                                 {
@@ -337,7 +341,7 @@ pub(crate) async fn request_subscribe(
         (
             op_storage
                 .ring
-                .closest_caching(key, 1, &[])
+                .closest_caching(key, &[])
                 .into_iter()
                 .next()
                 .ok_or(RingError::EmptyRing)?,

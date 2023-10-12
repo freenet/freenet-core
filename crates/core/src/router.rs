@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use util::{Mean, TransferSpeed};
 
-// Important: Need to periodically rebuild the Router using `history` for better predictions.
+/// # Usage
+/// Important when using this type:
+/// Need to periodically rebuild the Router using `history` for better predictions.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Router {
     response_start_time_estimator: IsotonicEstimator,
