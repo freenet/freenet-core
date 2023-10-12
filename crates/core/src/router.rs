@@ -4,10 +4,11 @@ mod util;
 
 use crate::ring::{Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use serde::Serialize;
-use std::{fmt, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use util::{Mean, TransferSpeed};
 
+// Important: Need to periodically rebuild the Router using `history` for better predictions.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Router {
     response_start_time_estimator: IsotonicEstimator,
@@ -193,23 +194,23 @@ impl Router {
         let time_to_response_start_estimate = self
             .response_start_time_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .map_err(|e| {
-                RoutingError::EstimationError(format!(
-                    "Response Start Time Estimation failed: {}",
-                    e
-                ))
+            .map_err(|source| RoutingError::EstimationError {
+                estimation: "start time",
+                source,
             })?;
         let failure_estimate = self
             .failure_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .map_err(|e| {
-                RoutingError::EstimationError(format!("Failure Estimation failed: {}", e))
+            .map_err(|source| RoutingError::EstimationError {
+                estimation: "failure",
+                source,
             })?;
         let transfer_rate_estimate = self
             .transfer_rate_estimator
             .estimate_retrieval_time(peer, contract_location)
-            .map_err(|e| {
-                RoutingError::EstimationError(format!("Transfer Rate Estimation failed: {}", e))
+            .map_err(|source| RoutingError::EstimationError {
+                estimation: "transfer rate",
+                source,
             })?;
 
         // This is a fairly naive approach, assuming that the cost of a failure is a multiple
@@ -236,19 +237,16 @@ impl Router {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum RoutingError {
+    #[error("Insufficient data provided")]
     InsufficientDataError,
-    EstimationError(String),
-}
-
-impl fmt::Display for RoutingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RoutingError::InsufficientDataError => write!(f, "Insufficient data provided"),
-            RoutingError::EstimationError(err_msg) => write!(f, "Estimation error: {}", err_msg),
-        }
-    }
+    #[error("failed {estimation} estimation: {source}")]
+    EstimationError {
+        estimation: &'static str,
+        #[source]
+        source: isotonic_estimator::EstimationError,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -259,14 +257,14 @@ struct RoutingPrediction {
     expected_total_time: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RouteEvent {
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
     pub outcome: RouteOutcome,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RouteOutcome {
     Success {
         time_to_response_start: Duration,

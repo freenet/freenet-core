@@ -14,7 +14,7 @@ use libp2p::{
 use super::{
     client_event_handling,
     conn_manager::{p2p_protoc::P2pConnManager, EventLoopNotifications},
-    join_ring_request, PeerKey,
+    join_ring_request, EventLogRegister, PeerKey,
 };
 use crate::{
     client_events::combinator::ClientEventsCombinator,
@@ -35,7 +35,6 @@ pub(super) struct NodeP2P {
     pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotifications,
     pub(super) conn_manager: P2pConnManager,
-    // event_listener: Option<Box<dyn EventListener + Send + Sync + 'static>>,
     is_gateway: bool,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     cli_response_sender: ClientResponsesSender,
@@ -75,8 +74,9 @@ impl NodeP2P {
             .await
     }
 
-    pub(crate) async fn build<CH, const CLIENTS: usize>(
+    pub(crate) async fn build<CH, const CLIENTS: usize, EL: EventLogRegister>(
         builder: NodeBuilder<CLIENTS>,
+        event_listener: EL,
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
@@ -85,7 +85,8 @@ impl NodeP2P {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
 
-        let ring = Ring::new(&builder, &gateways)?;
+        let event_listener: Box<dyn EventLogRegister> = Box::new(event_listener);
+        let ring = Ring::new::<CLIENTS, EL>(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
@@ -97,7 +98,7 @@ impl NodeP2P {
 
         let conn_manager = {
             let transport = Self::config_transport(&builder.local_key)?;
-            P2pConnManager::build(transport, &builder, op_storage.clone())?
+            P2pConnManager::build(transport, &builder, op_storage.clone(), &*event_listener)?
         };
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
@@ -152,7 +153,7 @@ mod test {
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
         contract::MemoryContractHandler,
-        node::{tests::get_free_port, InitPeerNode},
+        node::{event_log, tests::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -208,7 +209,14 @@ mod test {
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
                 .with_key(peer1_key);
-            let mut peer1 = Box::new(NodeP2P::build::<MemoryContractHandler, 1>(config, ()).await?);
+            let mut peer1 = Box::new(
+                NodeP2P::build::<MemoryContractHandler, 1, _>(
+                    config,
+                    event_log::TestEventListener::new(),
+                    (),
+                )
+                .await?,
+            );
             peer1.conn_manager.listen_on()?;
             ping_ev_loop(&mut peer1).await.unwrap();
             Ok::<_, anyhow::Error>(())
@@ -219,9 +227,13 @@ mod test {
             let user_events = MemoryEventsGen::new(receiver2, PeerKey::from(peer2_id));
             let mut config = NodeBuilder::new([Box::new(user_events)]);
             config.add_gateway(peer1_config.clone());
-            let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1>(config, ())
-                .await
-                .unwrap();
+            let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1, _>(
+                config,
+                event_log::TestEventListener::new(),
+                (),
+            )
+            .await
+            .unwrap();
             // wait a bit to make sure the first peer is up and listening
             tokio::time::sleep(Duration::from_millis(10)).await;
             peer2

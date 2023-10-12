@@ -6,10 +6,9 @@ use freenet_stdlib::prelude::*;
 use super::{
     client_event_handling,
     conn_manager::{in_memory::MemoryConnManager, EventLoopNotifications},
-    event_log::EventLogListener,
     handle_cancelled_op, join_ring_request,
     op_state::OpManager,
-    process_message, PeerKey,
+    process_message, EventLogRegister, PeerKey,
 };
 use crate::{
     client_events::ClientEventsProxy,
@@ -31,16 +30,16 @@ pub(super) struct NodeInMemory {
     gateways: Vec<PeerKeyLocation>,
     notification_channel: EventLoopNotifications,
     conn_manager: MemoryConnManager,
-    event_listener: Option<Box<dyn EventLogListener + Send + Sync + 'static>>,
+    event_listener: Box<dyn EventLogRegister + Send + Sync + 'static>,
     is_gateway: bool,
     _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
 }
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub async fn build<CH>(
+    pub async fn build<CH, EL: EventLogRegister>(
         builder: NodeBuilder<1>,
-        event_listener: Option<Box<dyn EventLogListener + Send + Sync + 'static>>,
+        event_listener: EL,
         ch_builder: CH::Builder,
     ) -> Result<NodeInMemory, anyhow::Error>
     where
@@ -51,7 +50,7 @@ impl NodeInMemory {
         let gateways = builder.get_gateways()?;
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
 
-        let ring = Ring::new(&builder, &gateways)?;
+        let ring = Ring::new::<1, EL>(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
@@ -68,7 +67,7 @@ impl NodeInMemory {
             op_storage,
             gateways,
             notification_channel,
-            event_listener,
+            event_listener: Box::new(event_listener),
             is_gateway,
             _executor_listener,
         })
@@ -207,10 +206,7 @@ impl NodeInMemory {
 
             let op_storage = self.op_storage.clone();
             let conn_manager = self.conn_manager.clone();
-            let event_listener = self
-                .event_listener
-                .as_ref()
-                .map(|listener| listener.trait_clone());
+            let event_listener = self.event_listener.trait_clone();
 
             GlobalExecutor::spawn(process_message(
                 msg,

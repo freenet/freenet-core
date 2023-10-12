@@ -31,31 +31,32 @@ pub(crate) struct PutOp {
 
 impl PutOp {
     pub(super) fn outcome(&self) -> OpOutcome {
-        match &self.stats {
-            Some(PutStats {
-                contract_location,
-                payload_size,
-                // first_response_time: Some((response_start, Some(response_end))),
-                transfer_time: Some((transfer_start, Some(transfer_end))),
-                target: Some(target),
-                ..
-            }) => {
-                let payload_transfer_time = *transfer_end - *transfer_start;
-                // todo: check if this is correct
-                // in puts both times are equivalent since when the transfer is initialized
-                // it already contains the payload
-                let first_response_time = payload_transfer_time.clone();
-                OpOutcome::ContractOpSuccess {
-                    target_peer: target,
-                    contract_location: *contract_location,
-                    payload_size: *payload_size,
-                    payload_transfer_time,
-                    first_response_time,
-                }
-            }
-            Some(_) => OpOutcome::Incomplete,
-            None => OpOutcome::Irrelevant,
-        }
+        // todo: track in the future
+        // match &self.stats {
+        //     Some(PutStats {
+        //         contract_location,
+        //         payload_size,
+        //         // first_response_time: Some((response_start, Some(response_end))),
+        //         transfer_time: Some((transfer_start, Some(transfer_end))),
+        //         target: Some(target),
+        //         ..
+        //     }) => {
+        //         let payload_transfer_time: Duration = *transfer_end - *transfer_start;
+        //         // in puts both times are equivalent since when the transfer is initialized
+        //         // it already contains the payload
+        //         let first_response_time = payload_transfer_time;
+        //         OpOutcome::ContractOpSuccess {
+        //             target_peer: target,
+        //             contract_location: *contract_location,
+        //             payload_size: *payload_size,
+        //             payload_transfer_time,
+        //             first_response_time,
+        //         }
+        //     }
+        //     Some(_) => OpOutcome::Incomplete,
+        //     None => OpOutcome::Irrelevant,
+        // }
+        OpOutcome::Irrelevant
     }
 
     pub(super) fn finalized(&self) -> bool {
@@ -85,8 +86,8 @@ impl PutOp {
 }
 
 struct PutStats {
-    contract_location: Location,
-    payload_size: usize,
+    // contract_location: Location,
+    // payload_size: usize,
     // /// (start, end)
     // first_response_time: Option<(Instant, Option<Instant>)>,
     /// (start, end)
@@ -596,7 +597,7 @@ pub(crate) fn start_op(
     );
 
     let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), peer);
-    let payload_size = contract.data().len();
+    // let payload_size = contract.data().len();
     let state = Some(PutState::PrepareRequest {
         contract,
         value,
@@ -607,8 +608,8 @@ pub(crate) fn start_op(
         id,
         state,
         stats: Some(PutStats {
-            contract_location,
-            payload_size,
+            // contract_location,
+            // payload_size,
             target: None,
             // first_response_time: None,
             transfer_time: None,
