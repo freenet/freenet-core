@@ -268,8 +268,12 @@ impl Operation for GetOp {
                         }
 
                         let new_htl = htl - 1;
-                        let new_target =
-                            op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
+                        let Some(new_target) =
+                            op_storage.ring.closest_caching(&key, &[sender.peer])
+                        else {
+                            tracing::warn!("no peer found while trying getting contract {key}");
+                            return Err(OpError::RingError(RingError::NoCachingPeers(key)));
+                        };
 
                         continue_seeking(
                             conn_manager,
@@ -373,7 +377,7 @@ impl Operation for GetOp {
                                 skip_list.push(target.peer);
                                 if let Some(target) = op_storage
                                     .ring
-                                    .closest_caching(&key, 1, skip_list.as_slice())
+                                    .closest_caching(&key, skip_list.as_slice())
                                     .into_iter()
                                     .next()
                                 {
@@ -662,7 +666,7 @@ pub(crate) async fn request_get(
         (
             op_storage
                 .ring
-                .closest_caching(key, 1, &[])
+                .closest_caching(key, &[])
                 .into_iter()
                 .next()
                 .ok_or(RingError::EmptyRing)?,

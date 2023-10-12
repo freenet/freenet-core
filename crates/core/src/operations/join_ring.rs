@@ -795,14 +795,8 @@ where
             "Selecting close peer to forward request (requester: {})",
             req_peer.peer
         );
-        ring.routing(
-            &new_peer_loc.location.unwrap(),
-            Some(&req_peer.peer),
-            1,
-            &[],
-        )
-        .pop()
-        .filter(|&pkl| pkl.peer != new_peer_loc.peer)
+        ring.routing(&new_peer_loc.location.unwrap(), Some(&req_peer.peer), &[])
+            .and_then(|pkl| (pkl.peer != new_peer_loc.peer).then_some(pkl))
     };
 
     if let Some(forward_to) = forward_to {
@@ -953,10 +947,10 @@ mod messages {
     }
 
     /*
-    
+
     Peer A ---> Peer B (forward) ----> Peer C
                 |----- (forward) ---------> Peer D
-    
+
 
     Peer A ---> Peer B (forward) ----> Peer C ----> Peer D
 
