@@ -918,8 +918,8 @@ mod test {
 
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         let mut locations = sim_nodes.get_locations_by_node();
-        let node0_loc = locations.remove("node-0").unwrap();
-        let node1_loc = locations.remove("node-1").unwrap();
+        let node0_loc = locations.remove(&"node-0".into()).unwrap();
+        let node1_loc = locations.remove(&"node-1".into()).unwrap();
 
         // both own the contract, and one triggers an update
         let node_0 = NodeSpecification {
@@ -961,9 +961,9 @@ mod test {
 
         // establish network
         let put_specs = HashMap::from_iter([
-            ("node-0".to_string(), node_0),
-            ("node-1".to_string(), node_1),
-            ("gateway-0".to_string(), gw_0),
+            ("node-0".into(), node_0),
+            ("node-1".into(), node_1),
+            ("gateway-0".into(), gw_0),
         ]);
 
         sim_nodes.build_with_specs(put_specs).await;
@@ -972,9 +972,9 @@ mod test {
 
         // trigger the put op @ gw-0, this
         sim_nodes
-            .trigger_event("gateway-0", 1, Some(Duration::from_secs(3)))
+            .trigger_event(&"gateway-0".into(), 1, Some(Duration::from_secs(3)))
             .await?;
-        assert!(sim_nodes.has_put_contract("gateway-0", &key, &new_value));
+        assert!(sim_nodes.has_put_contract(&"gateway-0".into(), &key, &new_value));
         assert!(sim_nodes.event_listener.contract_broadcasted(&key));
         Ok(())
     }

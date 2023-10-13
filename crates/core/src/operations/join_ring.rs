@@ -1006,7 +1006,7 @@ mod test {
         let mut sim_nodes = SimNetwork::new(1, 1, 1, 1, 2, 2).await;
         sim_nodes.build().await;
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(sim_nodes.connected("node-0"));
+        assert!(sim_nodes.connected(&"node-0".into()));
     }
 
     /// Once a gateway is left without remaining open slots, ensure forwarding connects

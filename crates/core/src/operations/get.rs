@@ -807,7 +807,6 @@ mod test {
     use super::*;
     use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
 
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 1usize;
@@ -840,10 +839,7 @@ mod test {
             contract_subscribers: HashMap::new(),
         };
 
-        let get_specs = HashMap::from_iter([
-            ("node-0".to_string(), node_0),
-            ("gateway-0".to_string(), gw_0),
-        ]);
+        let get_specs = HashMap::from_iter([("node-0".into(), node_0), ("gateway-0".into(), gw_0)]);
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
@@ -852,10 +848,10 @@ mod test {
 
         // trigger get @ node-0, which does not own the contract
         sim_nodes
-            .trigger_event("node-0", 1, Some(Duration::from_millis(100)))
+            .trigger_event(&"node-0".into(), 1, Some(Duration::from_millis(100)))
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(sim_nodes.has_got_contract("node-0", &key));
+        assert!(sim_nodes.has_got_contract(&"node-0".into(), &key));
         Ok(())
     }
 
@@ -882,7 +878,7 @@ mod test {
             contract_subscribers: HashMap::new(),
         };
 
-        let get_specs = HashMap::from_iter([("node-1".to_string(), node_1)]);
+        let get_specs = HashMap::from_iter([("node-1".into(), node_1)]);
 
         // establish network
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
@@ -891,9 +887,9 @@ mod test {
 
         // trigger get @ node-1, which does not own the contract
         sim_nodes
-            .trigger_event("node-1", 1, Some(Duration::from_millis(100)))
+            .trigger_event(&"node-1".into(), 1, Some(Duration::from_millis(100)))
             .await?;
-        assert!(!sim_nodes.has_got_contract("node-1", &key));
+        assert!(!sim_nodes.has_got_contract(&"node-1".into(), &key));
         Ok(())
     }
 
@@ -940,9 +936,9 @@ mod test {
         };
 
         let get_specs = HashMap::from_iter([
-            ("node-0".to_string(), node_0),
-            ("node-1".to_string(), node_1),
-            ("gateway-0".to_string(), gw_0),
+            ("node-0".into(), node_0),
+            ("node-1".into(), node_1),
+            ("gateway-0".into(), gw_0),
         ]);
 
         // establish network
@@ -951,9 +947,9 @@ mod test {
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         sim_nodes
-            .trigger_event("node-0", 1, Some(Duration::from_millis(500)))
+            .trigger_event(&"node-0".into(), 1, Some(Duration::from_millis(500)))
             .await?;
-        assert!(sim_nodes.has_got_contract("node-0", &key));
+        assert!(sim_nodes.has_got_contract(&"node-0".into(), &key));
         Ok(())
     }
 }
