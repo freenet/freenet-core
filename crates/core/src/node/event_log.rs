@@ -411,13 +411,13 @@ pub(super) mod test_utils {
     use parking_lot::RwLock;
 
     use super::*;
-    use crate::{message::TxType, ring::Distance};
+    use crate::{message::TxType, node::tests::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
-        node_labels: Arc<DashMap<String, PeerKey>>,
+        node_labels: Arc<DashMap<NodeLabel, PeerKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
         logs: Arc<RwLock<Vec<LogMessage>>>,
     }
@@ -431,7 +431,7 @@ pub(super) mod test_utils {
             }
         }
 
-        pub fn add_node(&mut self, label: String, peer: PeerKey) {
+        pub fn add_node(&mut self, label: NodeLabel, peer: PeerKey) {
             self.node_labels.insert(label, peer);
         }
 

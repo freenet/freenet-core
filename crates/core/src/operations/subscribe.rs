@@ -506,8 +506,8 @@ mod test {
         };
 
         let subscribe_specs = HashMap::from_iter([
-            ("node-0".to_string(), first_node),
-            ("node-1".to_string(), second_node),
+            ("node-0".into(), first_node),
+            ("node-1".into(), second_node),
         ]);
         let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nodes.build_with_specs(subscribe_specs).await;
