@@ -1,5 +1,6 @@
-use std::{io, path::Path};
+use std::{io, path::Path, time::SystemTime};
 
+use chrono::{DateTime, Utc};
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,7 @@ impl<'a> EventLog<'a> {
 #[derive(Serialize, Deserialize)]
 struct LogMessage {
     tx: Transaction,
+    datetime: DateTime<Utc>,
     peer_id: PeerKey,
     kind: EventKind,
 }
@@ -134,15 +136,20 @@ pub(crate) struct EventRegister {
     log_sender: mpsc::Sender<LogMessage>,
 }
 
+/// Records from a new session must have higher than this ts.
+static NEW_RECORDS_TS: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+
 impl EventRegister {
     pub fn new() -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
+        NEW_RECORDS_TS.set(SystemTime::now()).expect("non set");
         GlobalExecutor::spawn(Self::record_logs(log_recv));
         Self { log_sender }
     }
 
     async fn record_logs(mut log_recv: mpsc::Receiver<LogMessage>) {
         const MAX_LOG_RECORDS: usize = 100_000;
+        const BATCH_SIZE: usize = 100;
 
         async fn num_lines(path: &Path) -> io::Result<usize> {
             use tokio::fs::File;
@@ -206,7 +213,7 @@ impl EventRegister {
         }
 
         use tokio::io::AsyncWriteExt;
-        let event_log_path = crate::config::Config::get_static_conf().event_log();
+        let event_log_path = crate::config::Config::conf().event_log();
         let mut event_log = match OpenOptions::new().write(true).open(&event_log_path).await {
             Ok(file) => file,
             Err(err) => {
@@ -215,21 +222,47 @@ impl EventRegister {
             }
         };
         let mut num_written = 0;
-        let mut buf = vec![];
+        let mut batch_buf = Vec::with_capacity(BATCH_SIZE * 1024);
+        let mut log_batch = Vec::with_capacity(BATCH_SIZE);
         while let Some(log) = log_recv.recv().await {
-            if let Err(err) = bincode::serialize_into(&mut buf, &log) {
-                tracing::error!("Failed serializing log: {err}");
-                panic!("Failed serializing log");
+            log_batch.push(log);
+
+            if log_batch.len() >= BATCH_SIZE {
+                let moved_batch = std::mem::replace(&mut log_batch, Vec::with_capacity(BATCH_SIZE));
+                let serialization_task = tokio::task::spawn_blocking(move || {
+                    let mut batch_serialized_data = Vec::new();
+                    for log_item in &moved_batch {
+                        if let Err(err) =
+                            bincode::serialize_into(&mut batch_serialized_data, log_item)
+                        {
+                            // Handle the error appropriately
+                            tracing::error!("Failed serializing log: {err}");
+                            return Err(err);
+                        }
+                        batch_serialized_data.push(b'\n');
+                    }
+                    Ok(batch_serialized_data)
+                });
+
+                match serialization_task.await {
+                    Ok(Ok(mut serialized_data)) => {
+                        batch_buf.append(&mut serialized_data);
+                        num_written += log_batch.len();
+                        log_batch.clear(); // Clear the batch for new data
+                    }
+                    _ => {
+                        panic!("Failed serializing log");
+                    }
+                }
             }
-            buf.push(b'\n');
-            num_written += 1;
-            if num_written == 100 {
-                if let Err(err) = event_log.write_all(&buf).await {
+
+            if num_written >= BATCH_SIZE {
+                if let Err(err) = event_log.write_all(&batch_buf).await {
                     tracing::error!("Failed writting to event log: {err}");
                     panic!("Failed writting event log");
                 }
                 num_written = 0;
-                buf.clear();
+                batch_buf.clear();
             }
 
             // Check the number of lines and truncate if needed
@@ -252,7 +285,7 @@ impl EventRegister {
         const MAX_EVENT_HISTORY: usize = 10_000;
         let event_num = max_event_number.min(MAX_EVENT_HISTORY);
 
-        let event_log_path = crate::config::Config::get_static_conf().event_log();
+        let event_log_path = crate::config::Config::conf().event_log();
         let mut event_log = OpenOptions::new().read(true).open(event_log_path).await?;
 
         let mut buf = [0; BUF_SIZE];
@@ -260,6 +293,12 @@ impl EventRegister {
         let mut partial_record = vec![];
         let mut record_start = 0;
 
+        let new_records_ts = NEW_RECORDS_TS
+            .get()
+            .expect("set on initialization")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("should be older than unix epoch")
+            .as_secs() as i64;
         while records.len() < event_num {
             let bytes_read = event_log.read(&mut buf).await?;
             if bytes_read == 0 {
@@ -281,7 +320,10 @@ impl EventRegister {
                         rec
                     };
                     if let EventKind::Route(outcome) = deser_record.kind {
-                        records.push(outcome);
+                        let record_ts = deser_record.datetime.timestamp();
+                        if record_ts > new_records_ts {
+                            records.push(outcome);
+                        }
                     }
                 }
                 if records.len() == event_num {
@@ -299,6 +341,7 @@ impl EventRegister {
 impl EventLogRegister for EventRegister {
     fn event_received<'a>(&'a mut self, log: EventLog) -> BoxFuture<'a, Result<(), DynError>> {
         let log_msg = LogMessage {
+            datetime: Utc::now(),
             tx: *log.tx,
             kind: log.kind,
             peer_id: *log.peer_id,
@@ -502,6 +545,7 @@ pub(super) mod test_utils {
             let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
             let EventLog { peer_id, kind, .. } = log;
             let msg_log = LogMessage {
+                datetime: Utc::now(),
                 tx: *log.tx,
                 peer_id: *peer_id,
                 kind,

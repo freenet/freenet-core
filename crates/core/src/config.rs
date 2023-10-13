@@ -149,7 +149,7 @@ impl Config {
 
     pub fn set_op_mode(mode: OperationMode) {
         let local_mode = matches!(mode, OperationMode::Local);
-        Self::get_static_conf()
+        Self::conf()
             .local_mode
             .store(local_mode, std::sync::atomic::Ordering::SeqCst);
     }
@@ -196,7 +196,7 @@ impl Config {
         }
     }
 
-    pub fn get_static_conf() -> &'static Config {
+    pub fn conf() -> &'static Config {
         CONFIG.get_or_init(|| match Config::load_conf() {
             Ok(config) => config,
             Err(err) => {
