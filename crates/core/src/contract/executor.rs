@@ -342,7 +342,7 @@ impl Executor<Runtime> {
     pub async fn from_config(config: NodeConfig) -> Result<Self, DynError> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
-        let static_conf = crate::config::Config::get_static_conf();
+        let static_conf = crate::config::Config::conf();
 
         let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
 
