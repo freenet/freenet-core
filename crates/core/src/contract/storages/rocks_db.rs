@@ -9,7 +9,7 @@ pub struct RocksDb(DB);
 impl RocksDb {
     #[cfg_attr(feature = "sqlite", allow(unused))]
     pub async fn new() -> Result<Self, rocksdb::Error> {
-        let path = Config::get_static_conf().db_dir().join("freenet.db");
+        let path = Config::conf().db_dir().join("freenet.db");
         tracing::info!("loading contract store from {path:?}");
 
         let mut opts = Options::default();

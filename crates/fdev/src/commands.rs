@@ -156,13 +156,13 @@ async fn execute_command(
 ) -> Result<(), DynError> {
     let contracts_data_path = other
         .contract_data_dir
-        .unwrap_or_else(|| Config::get_static_conf().contracts_dir());
+        .unwrap_or_else(|| Config::conf().contracts_dir());
     let delegates_data_path = other
         .delegate_data_dir
-        .unwrap_or_else(|| Config::get_static_conf().delegates_dir());
+        .unwrap_or_else(|| Config::conf().delegates_dir());
     let secrets_data_path = other
         .secret_data_dir
-        .unwrap_or_else(|| Config::get_static_conf().secrets_dir());
+        .unwrap_or_else(|| Config::conf().secrets_dir());
 
     let contract_store = ContractStore::new(contracts_data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
     let delegate_store = DelegateStore::new(delegates_data_path, DEFAULT_MAX_DELEGATE_SIZE)?;

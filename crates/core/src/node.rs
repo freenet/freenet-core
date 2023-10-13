@@ -115,7 +115,7 @@ pub struct NodeBuilder<const CLIENTS: usize> {
 
 impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeBuilder<CLIENTS> {
-        let local_key = if let Some(key) = &Config::get_static_conf().local_peer_keypair {
+        let local_key = if let Some(key) = &Config::conf().local_peer_keypair {
             key.clone()
         } else {
             identity::Keypair::generate_ed25519()

@@ -18,7 +18,7 @@ static POOL: Lazy<SqlitePool> = Lazy::new(|| {
     let opts = if cfg!(test) {
         SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
     } else {
-        let conn_str = Config::get_static_conf().db_dir().join("freenet.db");
+        let conn_str = Config::conf().db_dir().join("freenet.db");
         tracing::info!("loading contract store from {conn_str:?}");
         SqliteConnectOptions::new()
             .create_if_missing(true)
