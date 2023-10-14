@@ -3,7 +3,7 @@ use crate::ring::Distance;
 use super::*;
 
 #[derive(Debug)]
-struct Network {
+struct SimulatedNetwork {
     current_time: u64,
     nodes: Vec<SimulatedNode>,
     connections: HashMap<NodeRef, HashSet<NodeRef>>,
@@ -37,12 +37,12 @@ impl EventStatTracker {
     }
 }
 
-impl Network {
-    fn tick(&mut self) {
+impl SimulatedNetwork {
+    pub(crate) fn tick(&mut self) {
         self.current_time += 1;
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             current_time: 0,
             nodes: Vec::new(),
