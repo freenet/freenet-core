@@ -2,15 +2,15 @@
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use std::{collections::HashSet, time::Instant};
 
 pub(crate) use self::messages::PutMsg;
 use freenet_stdlib::prelude::*;
 
-use super::{OpEnum, OpError, OperationResult};
+use super::{OpEnum, OpError, OpOutcome, OperationResult};
 use crate::{
     client_events::ClientId,
     config::PEER_TIMEOUT,
@@ -24,15 +24,85 @@ use crate::{
 pub(crate) struct PutOp {
     id: Transaction,
     state: Option<PutState>,
+    stats: Option<PutStats>,
     /// time left until time out, when this reaches zero it will be removed from the state
     _ttl: Duration,
-    done: bool,
 }
 
 impl PutOp {
-    pub(super) fn finished(&self) -> bool {
-        self.done
+    pub(super) fn outcome(&self) -> OpOutcome {
+        // todo: track in the future
+        // match &self.stats {
+        //     Some(PutStats {
+        //         contract_location,
+        //         payload_size,
+        //         // first_response_time: Some((response_start, Some(response_end))),
+        //         transfer_time: Some((transfer_start, Some(transfer_end))),
+        //         target: Some(target),
+        //         ..
+        //     }) => {
+        //         let payload_transfer_time: Duration = *transfer_end - *transfer_start;
+        //         // in puts both times are equivalent since when the transfer is initialized
+        //         // it already contains the payload
+        //         let first_response_time = payload_transfer_time;
+        //         OpOutcome::ContractOpSuccess {
+        //             target_peer: target,
+        //             contract_location: *contract_location,
+        //             payload_size: *payload_size,
+        //             payload_transfer_time,
+        //             first_response_time,
+        //         }
+        //     }
+        //     Some(_) => OpOutcome::Incomplete,
+        //     None => OpOutcome::Irrelevant,
+        // }
+        OpOutcome::Irrelevant
     }
+
+    pub(super) fn finalized(&self) -> bool {
+        self.stats
+            .as_ref()
+            .map(|s| matches!(s.step, RecordingStats::Completed))
+            .unwrap_or(false)
+    }
+
+    pub(super) fn record_transfer(&mut self) {
+        if let Some(stats) = self.stats.as_mut() {
+            match stats.step {
+                RecordingStats::Uninitialized => {
+                    stats.transfer_time = Some((Instant::now(), None));
+                    stats.step = RecordingStats::InitPut;
+                }
+                RecordingStats::InitPut => {
+                    if let Some((_, e)) = stats.transfer_time.as_mut() {
+                        *e = Some(Instant::now());
+                    }
+                    stats.step = RecordingStats::Completed;
+                }
+                RecordingStats::Completed => {}
+            }
+        }
+    }
+}
+
+struct PutStats {
+    // contract_location: Location,
+    // payload_size: usize,
+    // /// (start, end)
+    // first_response_time: Option<(Instant, Option<Instant>)>,
+    /// (start, end)
+    transfer_time: Option<(Instant, Option<Instant>)>,
+    target: Option<PeerKeyLocation>,
+    step: RecordingStats,
+}
+
+/// While timing, at what particular step we are now.
+#[derive(Clone, Copy, Default)]
+enum RecordingStats {
+    #[default]
+    Uninitialized,
+    InitPut,
+    Completed,
 }
 
 pub(crate) struct PutResult {}
@@ -40,12 +110,19 @@ pub(crate) struct PutResult {}
 impl TryFrom<PutOp> for PutResult {
     type Error = OpError;
 
-    fn try_from(_value: PutOp) -> Result<Self, Self::Error> {
-        todo!()
+    fn try_from(op: PutOp) -> Result<Self, Self::Error> {
+        if let Some(true) = op
+            .stats
+            .map(|s| matches!(s.step, RecordingStats::Completed))
+        {
+            Ok(PutResult {})
+        } else {
+            Err(OpError::UnexpectedOpState)
+        }
     }
 }
 
-impl<CB: ConnectionBridge> Operation<CB> for PutOp {
+impl Operation for PutOp {
     type Message = PutMsg;
     type Result = PutResult;
 
@@ -70,7 +147,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(PutState::ReceivedRequest),
-                        done: false,
+                        stats: None, // don't care for stats in the target peers
                         id: tx,
                         _ttl: PEER_TIMEOUT,
                     },
@@ -85,7 +162,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
         &self.id
     }
 
-    fn process_message<'a>(
+    fn process_message<'a, CB: ConnectionBridge>(
         self,
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
@@ -95,7 +172,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
         Box::pin(async move {
             let return_msg;
             let new_state;
-            let mut done = false;
+            let stats = self.stats;
 
             match input {
                 PutMsg::RequestPut {
@@ -339,7 +416,6 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                             tracing::debug!("Successfully updated value for {}", contract,);
                             new_state = None;
                             return_msg = None;
-                            done = true;
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     };
@@ -405,7 +481,7 @@ impl<CB: ConnectionBridge> Operation<CB> for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, self._ttl, done)
+            build_op_result(self.id, new_state, return_msg, self._ttl, stats)
         })
     }
 }
@@ -415,12 +491,12 @@ fn build_op_result(
     state: Option<PutState>,
     msg: Option<PutMsg>,
     ttl: Duration,
-    done: bool,
+    stats: Option<PutStats>,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(PutOp {
         id,
         state,
-        done,
+        stats,
         _ttl: ttl,
     });
     Ok(OperationResult {
@@ -488,7 +564,7 @@ async fn try_to_broadcast(
                 let op = PutOp {
                     id,
                     state: new_state,
-                    done: false,
+                    stats: None,
                     _ttl: ttl,
                 };
                 op_storage
@@ -514,15 +590,15 @@ pub(crate) fn start_op(
     peer: &PeerKey,
 ) -> PutOp {
     let key = contract.key();
+    let contract_location = Location::from(&key);
     tracing::debug!(
-        "Requesting put to contract {} @ loc({})",
+        "Requesting put to contract {} @ loc({contract_location})",
         key,
-        Location::from(&key)
     );
 
     let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), peer);
+    // let payload_size = contract.data().len();
     let state = Some(PutState::PrepareRequest {
-        id,
         contract,
         value,
         htl,
@@ -531,16 +607,21 @@ pub(crate) fn start_op(
     PutOp {
         id,
         state,
-        done: false,
+        stats: Some(PutStats {
+            // contract_location,
+            // payload_size,
+            target: None,
+            // first_response_time: None,
+            transfer_time: None,
+            step: Default::default(),
+        }),
         _ttl: PEER_TIMEOUT,
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone)]
 enum PutState {
     ReceivedRequest,
     PrepareRequest {
-        id: Transaction,
         contract: ContractContainer,
         value: WrappedState,
         htl: usize,
@@ -554,10 +635,10 @@ enum PutState {
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put(
     op_storage: &OpManager,
-    put_op: PutOp,
+    mut put_op: PutOp,
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
-    let key = if let Some(PutState::PrepareRequest { contract, .. }) = put_op.state.clone() {
+    let key = if let Some(PutState::PrepareRequest { contract, .. }) = &put_op.state {
         contract.key()
     } else {
         return Err(OpError::UnexpectedOpState);
@@ -570,14 +651,17 @@ pub(crate) async fn request_put(
     // - and the value to put
     let target = op_storage
         .ring
-        .closest_caching(&key, 1, &[sender.peer])
+        .closest_caching(&key, &[sender.peer])
         .into_iter()
         .next()
         .ok_or(RingError::EmptyRing)?;
 
     let id = put_op.id;
+    if let Some(stats) = &mut put_op.stats {
+        stats.target = Some(target);
+    }
 
-    match put_op.state.clone() {
+    match put_op.state {
         Some(PutState::PrepareRequest {
             contract,
             value,
@@ -586,23 +670,23 @@ pub(crate) async fn request_put(
         }) => {
             let key = contract.key();
             let new_state = Some(PutState::AwaitingResponse { contract: key });
-            let msg = Some(PutMsg::RequestPut {
+            let msg = PutMsg::RequestPut {
                 id,
                 contract,
                 value,
                 htl,
                 target,
-            });
+            };
 
             let op = PutOp {
                 state: new_state,
                 id,
-                done: false,
+                stats: put_op.stats,
                 _ttl: put_op._ttl,
             };
 
             op_storage
-                .notify_op_change(msg.map(Message::from).unwrap(), OpEnum::Put(op), client_id)
+                .notify_op_change(Message::from(msg), OpEnum::Put(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::InvalidStateTransition(put_op.id)),
@@ -653,9 +737,9 @@ async fn forward_changes<CB>(
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    let forward_to = op_storage.ring.closest_caching(&key, 1, skip_list);
+    let forward_to = op_storage.ring.closest_caching(&key, skip_list);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
-    for peer in forward_to {
+    if let Some(peer) = forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
         let other_distance = contract_loc.distance(other_loc);
         let self_distance = contract_loc.distance(own_loc);

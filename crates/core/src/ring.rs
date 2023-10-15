@@ -19,6 +19,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
+    time::Duration,
 };
 
 use anyhow::bail;
@@ -27,10 +28,11 @@ use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use rand::prelude::*;
-use std::{cmp::Ordering, hash::Hash};
-
-use crate::node::{self, NodeBuilder, PeerKey};
+use crate::{
+    config::GlobalExecutor,
+    node::{self, EventLogRegister, EventRegister, NodeBuilder, PeerKey},
+    router::Router,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// The location of a peer in the ring. This location allows routing towards the peer.
@@ -68,6 +70,7 @@ pub(crate) struct Ring {
     pub peer_key: PeerKey,
     max_connections: usize,
     min_connections: usize,
+    router: Arc<RwLock<Router>>,
     connections_by_location: Arc<RwLock<BTreeMap<Location, PeerKeyLocation>>>,
     location_for_peer: Arc<RwLock<BTreeMap<PeerKey, Location>>>,
     /// contracts in the ring cached by this node
@@ -113,7 +116,7 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<const CLIENTS: usize>(
+    pub fn new<const CLIENTS: usize, EL: EventLogRegister>(
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
     ) -> Result<Self, anyhow::Error> {
@@ -146,11 +149,15 @@ impl Ring {
             Self::MAX_CONNECTIONS
         };
 
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+        GlobalExecutor::spawn(Self::refresh_router::<EL>(router.clone()));
+
         let ring = Ring {
             rnd_if_htl_above,
             max_hops_to_live,
             max_connections,
             min_connections,
+            router,
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
             location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
             cached_contracts: DashSet::new(),
@@ -174,6 +181,21 @@ impl Ring {
         }
 
         Ok(ring)
+    }
+
+    async fn refresh_router<EL: EventLogRegister>(router: Arc<RwLock<Router>>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let history = if std::any::type_name::<EL>() == std::any::type_name::<EventRegister>() {
+                EventRegister::get_router_events(10_000).await.unwrap()
+            } else {
+                vec![]
+            };
+            let router_ref = &mut *router.write();
+            *router_ref = Router::new(&history);
+        }
     }
 
     #[inline(always)]
@@ -281,30 +303,25 @@ impl Ring {
         Some(conn_by_dist[idx])
     }
 
-    /// Return the closest peers to a contract location which are caching it,
-    /// excluding whichever peers in the skip list.
+    /// Return the most optimal peer caching a given contract.
     #[inline]
     pub fn closest_caching(
         &self,
         contract_key: &ContractKey,
-        n: usize,
         skip_list: &[PeerKey],
-    ) -> Vec<PeerKeyLocation> {
-        // Right now we return just the closest known peers to that location.
-        // In the future this may change to the ones closest which are actually already caching it.
-        self.routing(&Location::from(contract_key), None, n, skip_list)
+    ) -> Option<PeerKeyLocation> {
+        self.routing(&Location::from(contract_key), None, skip_list)
     }
 
-    /// Find the closest number of peers to a given location. Result is returned sorted by proximity.
+    /// Route an op to the most optimal target.
     pub fn routing(
         &self,
         target: &Location,
         requesting: Option<&PeerKey>,
-        n: usize,
         skip_list: &[PeerKey],
-    ) -> Vec<PeerKeyLocation> {
+    ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
-        let mut conn_by_dist: Vec<_> = connections
+        let peers = connections
             .iter()
             .filter(|(_, pkloc)| {
                 if let Some(requester) = requesting {
@@ -314,11 +331,13 @@ impl Ring {
                 }
                 !skip_list.contains(&pkloc.peer)
             })
-            .map(|(loc, peer)| (loc.distance(target), (loc, peer)))
-            .collect();
-        conn_by_dist.sort_by_key(|&(dist, _)| dist);
-        let iter = conn_by_dist.into_iter().map(|(_, v)| *v.1).take(n);
-        iter.collect()
+            .map(|(_, peer)| peer);
+        let router = &*self.router.read();
+        router.select_peer(peers, target).cloned()
+    }
+
+    pub fn routing_finished(&self, event: crate::router::RouteEvent) {
+        self.router.write().add_event(event);
     }
 
     /// Get a random peer from the known ring connections.
@@ -573,7 +592,7 @@ mod test {
         let (_, receiver) = channel((0, peer_key));
         let user_events = MemoryEventsGen::new(receiver, peer_key);
         let config = NodeBuilder::new([Box::new(user_events)]);
-        let ring = Ring::new(&config, &[]).unwrap();
+        let ring = Ring::new::<1, node::TestEventListener>(&config, &[]).unwrap();
 
         fn build_pk(loc: Location) -> PeerKeyLocation {
             PeerKeyLocation {
@@ -591,32 +610,28 @@ mod test {
 
         assert_eq!(
             Location(0.0),
-            ring.routing(&Location(0.9), None, 1, &[])
-                .first()
+            ring.routing(&Location(0.9), None, &[])
                 .unwrap()
                 .location
                 .unwrap()
         );
         assert_eq!(
             Location(0.0),
-            ring.routing(&Location(0.1), None, 1, &[])
-                .first()
+            ring.routing(&Location(0.1), None, &[])
                 .unwrap()
                 .location
                 .unwrap()
         );
         assert_eq!(
             Location(0.5),
-            ring.routing(&Location(0.41), None, 1, &[])
-                .first()
+            ring.routing(&Location(0.41), None, &[])
                 .unwrap()
                 .location
                 .unwrap()
         );
         assert_eq!(
             Location(0.3),
-            ring.routing(&Location(0.39), None, 1, &[])
-                .first()
+            ring.routing(&Location(0.39), None, &[])
                 .unwrap()
                 .location
                 .unwrap()

@@ -15,7 +15,7 @@ use crate::{
     ring::{PeerKeyLocation, RingError},
 };
 
-use super::{OpEnum, OpError, OperationResult};
+use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
 pub(crate) use self::messages::SubscribeMsg;
 
@@ -28,9 +28,15 @@ pub(crate) struct SubscribeOp {
 }
 
 impl SubscribeOp {
-    pub fn finished(&self) -> bool {
-        todo!()
+    pub(super) fn outcome(&self) -> OpOutcome {
+        OpOutcome::Irrelevant
     }
+
+    pub(super) fn finalized(&self) -> bool {
+        matches!(self.state, Some(SubscribeState::Completed))
+    }
+
+    pub(super) fn record_transfer(&mut self) {}
 }
 
 pub(crate) enum SubscribeResult {}
@@ -43,7 +49,7 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
     }
 }
 
-impl<CB: ConnectionBridge> Operation<CB> for SubscribeOp {
+impl Operation for SubscribeOp {
     type Message = SubscribeMsg;
     type Result = SubscribeResult;
 
@@ -85,7 +91,7 @@ impl<CB: ConnectionBridge> Operation<CB> for SubscribeOp {
         &self.id
     }
 
-    fn process_message<'a>(
+    fn process_message<'a, CB: ConnectionBridge>(
         self,
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
@@ -140,8 +146,12 @@ impl<CB: ConnectionBridge> Operation<CB> for SubscribeOp {
                         tracing::info!("Contract {} not found while processing info", key);
                         tracing::info!("Trying to found the contract from another node");
 
-                        let new_target =
-                            op_storage.ring.closest_caching(&key, 1, &[sender.peer])[0];
+                        let Some(new_target) =
+                            op_storage.ring.closest_caching(&key, &[sender.peer])
+                        else {
+                            tracing::warn!("no peer found while trying getting contract {key}");
+                            return Err(OpError::RingError(RingError::NoCachingPeers(key)));
+                        };
                         let new_htl = htl + 1;
 
                         if new_htl > MAX_RETRIES {
@@ -214,7 +224,7 @@ impl<CB: ConnectionBridge> Operation<CB> for SubscribeOp {
                                 skip_list.push(sender.peer);
                                 if let Some(target) = op_storage
                                     .ring
-                                    .closest_caching(&key, 1, skip_list.as_slice())
+                                    .closest_caching(&key, skip_list.as_slice())
                                     .into_iter()
                                     .next()
                                 {
@@ -300,7 +310,6 @@ pub(crate) fn start_op(key: ContractKey, peer: &PeerKey) -> SubscribeOp {
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
     PrepareRequest {
@@ -323,42 +332,39 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
-    let (target, _id) =
-        if let Some(SubscribeState::PrepareRequest { id, key }) = sub_op.state.clone() {
-            if !op_storage.ring.is_contract_cached(&key) {
-                return Err(OpError::ContractError(ContractError::ContractNotFound(key)));
-            }
-            (
-                op_storage
-                    .ring
-                    .closest_caching(&key, 1, &[])
-                    .into_iter()
-                    .next()
-                    .ok_or(RingError::EmptyRing)?,
-                id,
-            )
-        } else {
-            return Err(OpError::UnexpectedOpState);
-        };
+    let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
+        if !op_storage.ring.is_contract_cached(key) {
+            return Err(OpError::ContractError(ContractError::ContractNotFound(
+                key.clone(),
+            )));
+        }
+        (
+            op_storage
+                .ring
+                .closest_caching(key, &[])
+                .into_iter()
+                .next()
+                .ok_or(RingError::EmptyRing)?,
+            *id,
+        )
+    } else {
+        return Err(OpError::UnexpectedOpState);
+    };
 
-    match sub_op.state.clone() {
+    match sub_op.state {
         Some(SubscribeState::PrepareRequest { id, key, .. }) => {
             let new_state = Some(SubscribeState::AwaitingResponse {
                 skip_list: vec![],
                 retries: 0,
             });
-            let msg = Some(SubscribeMsg::RequestSub { id, key, target });
+            let msg = SubscribeMsg::RequestSub { id, key, target };
             let op = SubscribeOp {
                 id,
                 state: new_state,
                 _ttl: sub_op._ttl,
             };
             op_storage
-                .notify_op_change(
-                    msg.map(Message::from).unwrap(),
-                    OpEnum::Subscribe(op),
-                    client_id,
-                )
+                .notify_op_change(Message::from(msg), OpEnum::Subscribe(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::InvalidStateTransition(sub_op.id)),

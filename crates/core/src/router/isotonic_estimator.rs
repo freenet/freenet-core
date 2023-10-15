@@ -1,7 +1,7 @@
 use crate::ring::{Distance, Location, PeerKeyLocation};
 use pav_regression::pav::{IsotonicRegression, Point};
 use serde::Serialize;
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 
 const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
@@ -13,9 +13,9 @@ const MIN_POINTS_FOR_REGRESSION: usize = 5;
 /// outcome of the peer's previous requests.
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct IsotonicEstimator {
-    pub(crate) global_regression: IsotonicRegression,
-    pub(crate) peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
+pub(super) struct IsotonicEstimator {
+    pub global_regression: IsotonicRegression,
+    pub peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
 }
 
 impl IsotonicEstimator {
@@ -148,30 +148,23 @@ impl IsotonicEstimator {
     }
 }
 
-pub(crate) enum EstimatorType {
+pub(super) enum EstimatorType {
     /// Where the estimated value is expected to increase as distance increases
     Positive,
     /// Where the estimated value is expected to decrease as distance increases
     Negative,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum EstimationError {
-    InsufficientData, // Error indicating that there is not enough data for estimation
-}
-
-impl fmt::Display for EstimationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EstimationError::InsufficientData => write!(f, "Insufficient data for estimation"),
-        }
-    }
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(super) enum EstimationError {
+    #[error("Insufficient data for estimation")]
+    InsufficientData,
 }
 
 /// A routing event is a single request to a peer for a contract, and some value indicating
 /// the result of the request, such as the time it took to retrieve the contract.
 #[derive(Debug, Clone)]
-pub(crate) struct IsotonicEvent {
+pub(super) struct IsotonicEvent {
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
     /// The result of the routing event, which is used to train the estimator, typically the time
@@ -187,7 +180,7 @@ impl IsotonicEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct Adjustment {
+pub(super) struct Adjustment {
     sum: f64,
     count: u64,
 }

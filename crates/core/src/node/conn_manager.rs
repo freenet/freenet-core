@@ -27,6 +27,14 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 pub(crate) trait ConnectionBridge: Send + Sync {
     async fn add_connection(&mut self, peer: PeerKey) -> ConnResult<()>;
 
+    // todo: LRU connection drop IF we can connect to other peer
+    // at least have a minimum of connection time alive to consider dropping it
+
+    // If we get a join request and are at MAX_CONNECTIONS:
+    // 1. Ensure it's been N minutes since the last peer removal.
+    // 2. Drop the peer with the fewest outbound requests/minute that's at least M minutes old.
+    // This promotes peer turnover to prevent network stagnation.
+
     async fn drop_connection(&mut self, peer: &PeerKey) -> ConnResult<()>;
 
     async fn send(&self, target: &PeerKey, msg: Message) -> ConnResult<()>;

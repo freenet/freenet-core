@@ -1,11 +1,23 @@
+use std::{io, path::Path, time::SystemTime};
+
+use chrono::{DateTime, Utc};
 use freenet_stdlib::prelude::*;
+use futures::{future::BoxFuture, FutureExt};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    fs::OpenOptions,
+    sync::mpsc::{self},
+};
 
 use super::PeerKey;
 use crate::{
+    config::GlobalExecutor,
     contract::StoreResponse,
     message::{Message, Transaction},
     operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
     ring::{Location, PeerKeyLocation},
+    router::RouteEvent,
+    DynError,
 };
 
 #[cfg(test)]
@@ -21,9 +33,15 @@ struct ListenerLogId(usize);
 ///
 /// This type then can emit it's own information to adjacent systems
 /// or is a no-op.
-pub(crate) trait EventLogListener {
-    fn event_received(&mut self, ev: EventLog);
-    fn trait_clone(&self) -> Box<dyn EventLogListener + Send + Sync + 'static>;
+pub(crate) trait EventLogRegister: std::any::Any + Send + Sync + 'static {
+    fn event_received<'a>(&'a mut self, ev: EventLog) -> BoxFuture<'a, Result<(), DynError>>;
+    fn trait_clone(&self) -> Box<dyn EventLogRegister>;
+    fn as_any(&self) -> &dyn std::any::Any
+    where
+        Self: Sized,
+    {
+        self as _
+    }
 }
 
 #[allow(dead_code)] // fixme: remove this
@@ -34,7 +52,19 @@ pub(crate) struct EventLog<'a> {
 }
 
 impl<'a> EventLog<'a> {
-    pub fn new(msg: &'a Message, op_storage: &'a OpManager) -> Self {
+    pub fn route_event(
+        tx: &'a Transaction,
+        op_storage: &'a OpManager,
+        route_event: &RouteEvent,
+    ) -> Self {
+        EventLog {
+            tx,
+            peer_id: &op_storage.ring.peer_key,
+            kind: EventKind::Route(route_event.clone()),
+        }
+    }
+
+    pub fn from_msg(msg: &'a Message, op_storage: &'a OpManager) -> Self {
         let kind = match msg {
             Message::JoinRing(JoinRingMsg::Connected { sender, target, .. }) => {
                 EventKind::Connected {
@@ -47,47 +77,37 @@ impl<'a> EventLog<'a> {
                 contract, target, ..
             }) => {
                 let key = contract.key();
-                EventKind::Put(
-                    PutEvent::Request {
-                        performer: target.peer,
-                        key,
-                    },
-                    *msg.id(),
-                )
+                EventKind::Put(PutEvent::Request {
+                    performer: target.peer,
+                    key,
+                })
             }
-            Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => EventKind::Put(
-                PutEvent::PutSuccess {
+            Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
+                EventKind::Put(PutEvent::PutSuccess {
                     requester: op_storage.ring.peer_key,
                     value: new_value.clone(),
-                },
-                *msg.id(),
-            ),
+                })
+            }
             Message::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
                 key,
                 ..
-            }) => EventKind::Put(
-                PutEvent::BroadcastEmitted {
-                    broadcast_to: broadcast_to.clone(),
-                    key: key.clone(),
-                    value: new_value.clone(),
-                },
-                *msg.id(),
-            ),
+            }) => EventKind::Put(PutEvent::BroadcastEmitted {
+                broadcast_to: broadcast_to.clone(),
+                key: key.clone(),
+                value: new_value.clone(),
+            }),
             Message::Put(PutMsg::BroadcastTo {
                 sender,
                 new_value,
                 key,
                 ..
-            }) => EventKind::Put(
-                PutEvent::BroadcastReceived {
-                    requester: sender.peer,
-                    key: key.clone(),
-                    value: new_value.clone(),
-                },
-                *msg.id(),
-            ),
+            }) => EventKind::Put(PutEvent::BroadcastReceived {
+                requester: sender.peer,
+                key: key.clone(),
+                value: new_value.clone(),
+            }),
             Message::Get(GetMsg::ReturnGet {
                 key,
                 value: StoreResponse { state: Some(_), .. },
@@ -103,41 +123,253 @@ impl<'a> EventLog<'a> {
     }
 }
 
-#[cfg(test)]
-struct MessageLog {
+#[derive(Serialize, Deserialize)]
+struct LogMessage {
+    tx: Transaction,
+    datetime: DateTime<Utc>,
     peer_id: PeerKey,
     kind: EventKind,
 }
 
 #[derive(Clone)]
-pub(super) struct EventRegister {}
+pub(crate) struct EventRegister {
+    log_sender: mpsc::Sender<LogMessage>,
+}
 
-impl EventLogListener for EventRegister {
-    fn event_received(&mut self, _log: EventLog) {
-        // let (_msg_log, _log_id) = create_log(log);
-        // TODO: save log
+/// Records from a new session must have higher than this ts.
+static NEW_RECORDS_TS: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+
+impl EventRegister {
+    pub fn new() -> Self {
+        let (log_sender, log_recv) = mpsc::channel(1000);
+        NEW_RECORDS_TS.set(SystemTime::now()).expect("non set");
+        GlobalExecutor::spawn(Self::record_logs(log_recv));
+        Self { log_sender }
     }
 
-    fn trait_clone(&self) -> Box<dyn EventLogListener + Send + Sync + 'static> {
+    async fn record_logs(mut log_recv: mpsc::Receiver<LogMessage>) {
+        const MAX_LOG_RECORDS: usize = 100_000;
+        const BATCH_SIZE: usize = 100;
+
+        async fn num_lines(path: &Path) -> io::Result<usize> {
+            use tokio::fs::File;
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let file = File::open(path).await.expect("Failed to open log file");
+            let reader = BufReader::new(file);
+            let mut num_lines = 0;
+            let mut lines = reader.lines();
+            while lines.next_line().await?.is_some() {
+                num_lines += 1;
+            }
+            Ok(num_lines)
+        }
+
+        async fn truncate_lines(
+            file: &mut tokio::fs::File,
+            lines_to_keep: usize,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt};
+
+            file.seek(io::SeekFrom::Start(0)).await?;
+            let file_metadata = file.metadata().await?;
+            let file_size = file_metadata.len();
+            let mut reader = tokio::io::BufReader::new(file);
+
+            let mut buffer = Vec::with_capacity(file_size as usize);
+            let mut lines_count = 0;
+
+            let mut line = Vec::new();
+            let mut discard_bytes = 0;
+
+            while lines_count < lines_to_keep {
+                let bytes_read = reader.read_until(b'\n', &mut line).await?;
+                if bytes_read == 0 {
+                    // EOF
+                    break;
+                }
+                lines_count += 1;
+                discard_bytes += bytes_read;
+                line.clear();
+            }
+
+            // Copy the rest of the file to the buffer
+            while let Ok(bytes_read) = reader.read_buf(&mut buffer).await {
+                if bytes_read == 0 {
+                    // EOF
+                    break;
+                }
+            }
+
+            // Seek back to the beginning and write the remaining content            let file = reader.into_inner();
+            let file = reader.into_inner();
+            file.seek(io::SeekFrom::Start(0)).await?;
+            file.write_all(&buffer).await?;
+
+            // Truncate the file to the new size
+            file.set_len(file_size - discard_bytes as u64).await?;
+            file.seek(io::SeekFrom::End(0)).await?;
+            Ok(())
+        }
+
+        use tokio::io::AsyncWriteExt;
+        let event_log_path = crate::config::Config::conf().event_log();
+        let mut event_log = match OpenOptions::new().write(true).open(&event_log_path).await {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
+                panic!("Failed openning log file"); // todo: propagate this to the main thread
+            }
+        };
+        let mut num_written = 0;
+        let mut batch_buf = Vec::with_capacity(BATCH_SIZE * 1024);
+        let mut log_batch = Vec::with_capacity(BATCH_SIZE);
+        while let Some(log) = log_recv.recv().await {
+            log_batch.push(log);
+
+            if log_batch.len() >= BATCH_SIZE {
+                let moved_batch = std::mem::replace(&mut log_batch, Vec::with_capacity(BATCH_SIZE));
+                let serialization_task = tokio::task::spawn_blocking(move || {
+                    let mut batch_serialized_data = Vec::new();
+                    for log_item in &moved_batch {
+                        if let Err(err) =
+                            bincode::serialize_into(&mut batch_serialized_data, log_item)
+                        {
+                            // Handle the error appropriately
+                            tracing::error!("Failed serializing log: {err}");
+                            return Err(err);
+                        }
+                        batch_serialized_data.push(b'\n');
+                    }
+                    Ok(batch_serialized_data)
+                });
+
+                match serialization_task.await {
+                    Ok(Ok(mut serialized_data)) => {
+                        batch_buf.append(&mut serialized_data);
+                        num_written += log_batch.len();
+                        log_batch.clear(); // Clear the batch for new data
+                    }
+                    _ => {
+                        panic!("Failed serializing log");
+                    }
+                }
+            }
+
+            if num_written >= BATCH_SIZE {
+                if let Err(err) = event_log.write_all(&batch_buf).await {
+                    tracing::error!("Failed writting to event log: {err}");
+                    panic!("Failed writting event log");
+                }
+                num_written = 0;
+                batch_buf.clear();
+            }
+
+            // Check the number of lines and truncate if needed
+            let num_lines = num_lines(event_log_path.as_path())
+                .await
+                .expect("non IO error");
+            if num_lines > MAX_LOG_RECORDS {
+                let truncate_to = num_lines - MAX_LOG_RECORDS + 900; // make some extra space removing 1000 old records
+                if let Err(err) = truncate_lines(&mut event_log, truncate_to).await {
+                    tracing::error!("Failed truncating log file: {:?}", err);
+                    panic!("Failed truncating log file");
+                }
+            }
+        }
+    }
+
+    pub async fn get_router_events(max_event_number: usize) -> Result<Vec<RouteEvent>, DynError> {
+        use tokio::io::AsyncReadExt;
+        const BUF_SIZE: usize = 4096;
+        const MAX_EVENT_HISTORY: usize = 10_000;
+        let event_num = max_event_number.min(MAX_EVENT_HISTORY);
+
+        let event_log_path = crate::config::Config::conf().event_log();
+        let mut event_log = OpenOptions::new().read(true).open(event_log_path).await?;
+
+        let mut buf = [0; BUF_SIZE];
+        let mut records = Vec::with_capacity(event_num);
+        let mut partial_record = vec![];
+        let mut record_start = 0;
+
+        let new_records_ts = NEW_RECORDS_TS
+            .get()
+            .expect("set on initialization")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("should be older than unix epoch")
+            .as_secs() as i64;
+        while records.len() < event_num {
+            let bytes_read = event_log.read(&mut buf).await?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+
+            let mut found_newline = false;
+            for (i, byte) in buf.iter().enumerate().take(bytes_read) {
+                if byte == &b'\n' {
+                    found_newline = true;
+                    let rec = &buf[record_start..i];
+                    let deser_record: LogMessage = if partial_record.is_empty() {
+                        record_start = i + 1;
+                        bincode::deserialize(rec)?
+                    } else {
+                        partial_record.extend(rec);
+                        let rec = bincode::deserialize(&partial_record)?;
+                        partial_record.clear();
+                        rec
+                    };
+                    if let EventKind::Route(outcome) = deser_record.kind {
+                        let record_ts = deser_record.datetime.timestamp();
+                        if record_ts > new_records_ts {
+                            records.push(outcome);
+                        }
+                    }
+                }
+                if records.len() == event_num {
+                    break; // Reached the desired event number
+                }
+            }
+            if !found_newline {
+                break; // No more data to read, and event_num not reached
+            }
+        }
+        Ok(records)
+    }
+}
+
+impl EventLogRegister for EventRegister {
+    fn event_received<'a>(&'a mut self, log: EventLog) -> BoxFuture<'a, Result<(), DynError>> {
+        let log_msg = LogMessage {
+            datetime: Utc::now(),
+            tx: *log.tx,
+            kind: log.kind,
+            peer_id: *log.peer_id,
+        };
+        async { Ok(self.log_sender.send(log_msg).await?) }.boxed()
+    }
+
+    fn trait_clone(&self) -> Box<dyn EventLogRegister> {
         Box::new(self.clone())
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize)]
 enum EventKind {
     Connected {
         loc: Location,
         from: PeerKey,
         to: PeerKeyLocation,
     },
-    Put(PutEvent, Transaction),
+    Put(PutEvent),
     Get {
         key: ContractKey,
     },
+    Route(RouteEvent),
     Unknown,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 enum PutEvent {
     Request {
         performer: PeerKey,
@@ -166,7 +398,7 @@ enum PutEvent {
 }
 
 #[cfg(test)]
-mod test_utils {
+pub(super) mod test_utils {
     use std::{
         collections::HashMap,
         sync::{
@@ -183,22 +415,11 @@ mod test_utils {
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
-    #[inline]
-    fn create_log(log: EventLog) -> (MessageLog, ListenerLogId) {
-        let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
-        let EventLog { peer_id, kind, .. } = log;
-        let msg_log = MessageLog {
-            peer_id: *peer_id,
-            kind,
-        };
-        (msg_log, log_id)
-    }
-
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
         node_labels: Arc<DashMap<String, PeerKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<RwLock<Vec<MessageLog>>>,
+        logs: Arc<RwLock<Vec<LogMessage>>>,
     }
 
     impl TestEventListener {
@@ -228,7 +449,7 @@ mod test_utils {
         ) -> bool {
             let logs = self.logs.read();
             let put_ops = logs.iter().filter_map(|l| match &l.kind {
-                EventKind::Put(ev, id) => Some((id, ev)),
+                EventKind::Put(ev) => Some((&l.tx, ev)),
                 _ => None,
             });
             let put_ops: HashMap<_, Vec<_>> = put_ops.fold(HashMap::new(), |mut acc, (id, ev)| {
@@ -266,8 +487,8 @@ mod test_utils {
         pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
             let logs = self.logs.read();
             let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
-                EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. }, id)
-                | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }, id) => Some((id, ev)),
+                EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. })
+                | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }) => Some((&l.tx, ev)),
                 _ => None,
             });
             let put_broadcast_by_tx: HashMap<_, Vec<_>> =
@@ -319,19 +540,32 @@ mod test_utils {
                 .collect::<HashMap<_, _>>()
                 .into_iter()
         }
+
+        fn create_log(log: EventLog) -> (LogMessage, ListenerLogId) {
+            let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
+            let EventLog { peer_id, kind, .. } = log;
+            let msg_log = LogMessage {
+                datetime: Utc::now(),
+                tx: *log.tx,
+                peer_id: *peer_id,
+                kind,
+            };
+            (msg_log, log_id)
+        }
     }
 
-    impl super::EventLogListener for TestEventListener {
-        fn event_received(&mut self, log: EventLog) {
+    impl super::EventLogRegister for TestEventListener {
+        fn event_received<'a>(&'a mut self, log: EventLog) -> BoxFuture<'a, Result<(), DynError>> {
             let tx = log.tx;
             let mut logs = self.logs.write();
-            let (msg_log, log_id) = create_log(log);
+            let (msg_log, log_id) = Self::create_log(log);
             logs.push(msg_log);
             std::mem::drop(logs);
             self.tx_log.entry(*tx).or_default().push(log_id);
+            async { Ok(()) }.boxed()
         }
 
-        fn trait_clone(&self) -> Box<dyn EventLogListener + Send + Sync + 'static> {
+        fn trait_clone(&self) -> Box<dyn EventLogRegister> {
             Box::new(self.clone())
         }
     }

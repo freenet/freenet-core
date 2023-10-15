@@ -2,7 +2,7 @@ use futures::Future;
 use std::pin::Pin;
 use std::{collections::HashSet, time::Duration};
 
-use super::{OpError, OperationResult};
+use super::{OpError, OpOutcome, OperationResult};
 use crate::operations::op_trait::Operation;
 use crate::operations::OpInitialization;
 use crate::{
@@ -34,9 +34,15 @@ impl JoinRingOp {
         self.backoff.is_some()
     }
 
-    pub(super) fn finished(&self) -> bool {
-        todo!()
+    pub(super) fn outcome(&self) -> OpOutcome {
+        OpOutcome::Irrelevant
     }
+
+    pub(super) fn finalized(&self) -> bool {
+        matches!(self.state, Some(JRState::Connected))
+    }
+
+    pub(super) fn record_transfer(&mut self) {}
 }
 
 pub(crate) struct JoinRingResult {}
@@ -49,7 +55,7 @@ impl TryFrom<JoinRingOp> for JoinRingResult {
     }
 }
 
-impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
+impl Operation for JoinRingOp {
     type Message = JoinRingMsg;
     type Result = JoinRingResult;
 
@@ -89,7 +95,7 @@ impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
         &self.id
     }
 
-    fn process_message<'a>(
+    fn process_message<'a, CB: ConnectionBridge>(
         self,
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
@@ -120,6 +126,7 @@ impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
                     );
 
                     let new_location = Location::random();
+                    // FIXME: don't try to forward to peers which have already been tried (add a rejected_by list)
                     let accepted_by = if op_storage.ring.should_accept(&new_location) {
                         tracing::debug!("Accepting connection from {}", req_peer,);
                         HashSet::from_iter([this_node_loc])
@@ -292,9 +299,11 @@ impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
                             }
                             _ => return Err(OpError::InvalidStateTransition(self.id)),
                         };
-                        if let Some(state) = new_state.clone() {
+                        if let Some(state) = new_state {
                             if state.is_connected() {
                                 new_state = None;
+                            } else {
+                                new_state = Some(state);
                             }
                         };
                     }
@@ -447,9 +456,11 @@ impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     }
-                    if let Some(state) = new_state.clone() {
+                    if let Some(state) = new_state {
                         if state.is_connected() {
                             new_state = None;
+                        } else {
+                            new_state = Some(state)
                         }
                     };
                 }
@@ -471,7 +482,7 @@ impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     }
-                    if let Some(state) = new_state.clone() {
+                    if let Some(state) = new_state {
                         if !state.is_connected() {
                             return Err(OpError::InvalidStateTransition(id));
                         } else {
@@ -494,7 +505,7 @@ impl<CB: ConnectionBridge> Operation<CB> for JoinRingOp {
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     };
-                    if let Some(state) = new_state.clone() {
+                    if let Some(state) = new_state {
                         if !state.is_connected() {
                             return Err(OpError::InvalidStateTransition(id));
                         } else {
@@ -626,7 +637,6 @@ mod states {
     }
 }
 
-#[derive(Debug, Clone)]
 enum JRState {
     Initializing,
     Connecting(ConnectionInfo),
@@ -704,21 +714,23 @@ pub(crate) async fn join_ring_request<CB>(
     tx: Transaction,
     op_storage: &OpManager,
     conn_manager: &mut CB,
-    mut join_op: JoinRingOp,
+    join_op: JoinRingOp,
 ) -> Result<(), OpError>
 where
     CB: ConnectionBridge,
 {
+    let JoinRingOp {
+        id,
+        state,
+        backoff,
+        _ttl,
+        ..
+    } = join_op;
     let ConnectionInfo {
         gateway,
         this_peer,
         max_hops_to_live,
-    } = join_op
-        .state
-        .as_mut()
-        .expect("Infallible")
-        .clone()
-        .try_unwrap_connecting()?;
+    } = state.expect("infallible").try_unwrap_connecting()?;
 
     tracing::info!(
         "Joining ring via {} (at {}) (tx: {})",
@@ -738,7 +750,20 @@ where
         },
     });
     conn_manager.send(&gateway.peer, join_req).await?;
-    op_storage.push(tx, OpEnum::JoinRing(Box::new(join_op)))?;
+    op_storage.push(
+        tx,
+        OpEnum::JoinRing(Box::new(JoinRingOp {
+            id,
+            state: Some(JRState::Connecting(ConnectionInfo {
+                gateway,
+                this_peer,
+                max_hops_to_live,
+            })),
+            gateway: Box::new(gateway),
+            backoff,
+            _ttl,
+        })),
+    )?;
     Ok(())
 }
 
@@ -770,14 +795,8 @@ where
             "Selecting close peer to forward request (requester: {})",
             req_peer.peer
         );
-        ring.routing(
-            &new_peer_loc.location.unwrap(),
-            Some(&req_peer.peer),
-            1,
-            &[],
-        )
-        .pop()
-        .filter(|&pkl| pkl.peer != new_peer_loc.peer)
+        ring.routing(&new_peer_loc.location.unwrap(), Some(&req_peer.peer), &[])
+            .and_then(|pkl| (pkl.peer != new_peer_loc.peer).then_some(pkl))
     };
 
     if let Some(forward_to) = forward_to {
@@ -927,6 +946,15 @@ mod messages {
         }
     }
 
+    /*
+
+    Peer A ---> Peer B (forward) ----> Peer C
+                |----- (forward) ---------> Peer D
+
+
+    Peer A ---> Peer B (forward) ----> Peer C ----> Peer D
+
+     */
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRequest {
         StartReq {

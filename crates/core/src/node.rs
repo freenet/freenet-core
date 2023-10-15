@@ -20,10 +20,7 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;
-use self::{
-    event_log::{EventLog, EventLogListener},
-    p2p_impl::NodeP2P,
-};
+use self::{event_log::EventLog, p2p_impl::NodeP2P};
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::Config,
@@ -36,14 +33,18 @@ use crate::{
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
-        put, subscribe, OpEnum, OpError,
+        put, subscribe, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
+    router::{RouteEvent, RouteOutcome},
     util::{ExponentialBackoff, IterExt},
 };
 
 use crate::operations::handle_op_request;
-pub(crate) use conn_manager::{p2p_protoc::P2pBridge, ConnectionBridge, ConnectionError};
+pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
+#[cfg(test)]
+pub(crate) use event_log::test_utils::TestEventListener;
+pub(crate) use event_log::{EventLogRegister, EventRegister};
 pub(crate) use op_state::OpManager;
 
 mod conn_manager;
@@ -114,7 +115,7 @@ pub struct NodeBuilder<const CLIENTS: usize> {
 
 impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeBuilder<CLIENTS> {
-        let local_key = if let Some(key) = &Config::get_static_conf().local_peer_keypair {
+        let local_key = if let Some(key) = &Config::conf().local_peer_keypair {
             key.clone()
         } else {
             identity::Keypair::generate_ed25519()
@@ -183,7 +184,11 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
 
     /// Builds a node using the default backend connection manager.
     pub async fn build(self, config: NodeConfig) -> Result<Node, anyhow::Error> {
-        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS>(self, config).await?;
+        let event_log = event_log::EventRegister::new();
+        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, event_log::EventRegister>(
+            self, event_log, config,
+        )
+        .await?;
         Ok(Node(node))
     }
 
@@ -440,19 +445,61 @@ macro_rules! log_handling_msg {
     };
 }
 
-#[inline(always)]
 async fn report_result(
     op_result: Result<Option<OpEnum>, OpError>,
+    op_storage: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
+    event_listener: &mut Box<dyn EventLogRegister>,
 ) {
     match op_result {
-        Ok(Some(res)) => {
+        Ok(Some(op_res)) => {
             if let Some((client_id, cb)) = client_req_handler_callback {
-                let _ = cb.send((client_id, res.to_host_result(client_id)));
+                let _ = cb.send((client_id, op_res.to_host_result(client_id)));
+            }
+            // check operations.rs:handle_op_result to see what's the meaning of each state
+            // in case more cases want to be handled when feeding information to the OpManager
+
+            match op_res.outcome() {
+                OpOutcome::ContractOpSuccess {
+                    target_peer,
+                    contract_location,
+                    first_response_time,
+                    payload_size,
+                    payload_transfer_time,
+                } => {
+                    let event = RouteEvent {
+                        peer: *target_peer,
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: first_response_time,
+                            payload_size,
+                            payload_transfer_time,
+                        },
+                    };
+                    if let Err(err) = event_listener
+                        .event_received(EventLog::route_event(op_res.id(), op_storage, &event))
+                        .await
+                    {
+                        tracing::warn!("failed logging event: {err}");
+                    }
+                    op_storage.ring.routing_finished(event);
+                }
+                // todo: handle failures, need to track timeouts and other potential failures
+                // OpOutcome::ContractOpFailure {
+                //     target_peer: Some(target_peer),
+                //     contract_location,
+                // } => {
+                //     op_storage.ring.routing_finished(RouteEvent {
+                //         peer: *target_peer,
+                //         contract_location,
+                //         outcome: RouteOutcome::Failure,
+                //     });
+                // }
+                OpOutcome::Incomplete | OpOutcome::Irrelevant => {}
             }
             if let Some(mut cb) = executor_callback {
-                cb.response(res).await;
+                cb.response(op_res).await;
             }
         }
         Ok(None) => {}
@@ -466,7 +513,7 @@ async fn process_message<CB>(
     msg: Result<Message, ConnectionError>,
     op_storage: Arc<OpManager>,
     mut conn_manager: CB,
-    event_listener: Option<Box<dyn EventLogListener + Send + Sync>>,
+    mut event_listener: Box<dyn EventLogRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<ClientId>,
@@ -476,8 +523,11 @@ async fn process_message<CB>(
     let cli_req = client_id.zip(client_req_handler_callback);
     match msg {
         Ok(msg) => {
-            if let Some(mut listener) = event_listener {
-                listener.event_received(EventLog::new(&msg, &op_storage));
+            if let Err(err) = event_listener
+                .event_received(EventLog::from_msg(&msg, &op_storage))
+                .await
+            {
+                tracing::warn!("failed logging event: {err}");
             }
             match msg {
                 Message::JoinRing(op) => {
@@ -489,7 +539,14 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(
+                        op_result,
+                        &op_storage,
+                        executor_callback,
+                        cli_req,
+                        &mut event_listener,
+                    )
+                    .await;
                 }
                 Message::Put(op) => {
                     log_handling_msg!("put", *op.id(), op_storage);
@@ -500,7 +557,14 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(
+                        op_result,
+                        &op_storage,
+                        executor_callback,
+                        cli_req,
+                        &mut event_listener,
+                    )
+                    .await;
                 }
                 Message::Get(op) => {
                     log_handling_msg!("get", op.id(), op_storage);
@@ -511,7 +575,14 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(
+                        op_result,
+                        &op_storage,
+                        executor_callback,
+                        cli_req,
+                        &mut event_listener,
+                    )
+                    .await;
                 }
                 Message::Subscribe(op) => {
                     log_handling_msg!("subscribe", op.id(), op_storage);
@@ -522,13 +593,27 @@ async fn process_message<CB>(
                         client_id,
                     )
                     .await;
-                    report_result(op_result, executor_callback, cli_req).await;
+                    report_result(
+                        op_result,
+                        &op_storage,
+                        executor_callback,
+                        cli_req,
+                        &mut event_listener,
+                    )
+                    .await;
                 }
                 _ => {}
             }
         }
         Err(err) => {
-            report_result(Err(err.into()), executor_callback, cli_req).await;
+            report_result(
+                Err(err.into()),
+                &op_storage,
+                executor_callback,
+                cli_req,
+                &mut event_listener,
+            )
+            .await;
         }
     }
 }

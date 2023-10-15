@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Mean {
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(super) struct Mean {
     sum: f64,
     count: u64,
 }
@@ -35,8 +35,8 @@ impl Default for Mean {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-pub(crate) struct TransferSpeed {
-    pub(crate) bytes_per_second: f64,
+pub(super) struct TransferSpeed {
+    pub bytes_per_second: f64,
 }
 
 impl TransferSpeed {
