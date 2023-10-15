@@ -38,5 +38,5 @@ pub mod dev_tool {
     pub use crate::config::Config;
     pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
-    pub use runtime::{ContractStore, DelegateStore, SecretsStore, StateStore};
+    pub use runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }

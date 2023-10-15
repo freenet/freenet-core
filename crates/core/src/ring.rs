@@ -484,7 +484,8 @@ impl Eq for Location {}
 
 impl Ord for Location {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other)
+        self.0
+            .partial_cmp(&other.0)
             .expect("always should return a cmp value")
     }
 }

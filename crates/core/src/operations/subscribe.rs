@@ -509,7 +509,16 @@ mod test {
             ("node-0".into(), first_node),
             ("node-1".into(), second_node),
         ]);
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
+        let mut sim_nodes = SimNetwork::new(
+            "successful_subscribe_op_between_nodes",
+            NUM_GW,
+            NUM_NODES,
+            3,
+            2,
+            4,
+            2,
+        )
+        .await;
         sim_nodes.build_with_specs(subscribe_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 

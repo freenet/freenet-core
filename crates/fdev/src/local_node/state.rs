@@ -24,17 +24,22 @@ impl AppState {
         let contract_dir = Config::conf().contracts_dir();
         let contract_store = ContractStore::new(contract_dir, config.max_contract_size)?;
         let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE).unwrap();
+        let rt = freenet::dev_tool::Runtime::build(
+            contract_store,
+            DelegateStore::default(),
+            SecretsStore::default(),
+            false,
+        )
+        .unwrap();
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
                 Executor::new(
-                    contract_store,
-                    DelegateStore::default(),
-                    SecretsStore::default(),
                     state_store,
                     || {
                         freenet::util::set_cleanup_on_exit().unwrap();
                     },
                     OperationMode::Local,
+                    rt,
                 )
                 .await?,
             )),
