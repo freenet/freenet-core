@@ -141,19 +141,19 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
 
 #[cfg(test)]
 impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
-    type Builder = ();
+    type Builder = String;
     type ContractExecutor = Executor<super::MockRuntime>;
 
     fn build(
         channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
         _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
-        _builder: Self::Builder,
+        test: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
-        async {
-            let executor = Executor::new_mock().await?;
+        async move {
+            let executor = Executor::new_mock(&test).await?;
             Ok(Self { executor, channel })
         }
         .boxed()

@@ -211,7 +211,7 @@ mod test {
                 NodeP2P::build::<MemoryContractHandler, 1, _>(
                     config,
                     event_log::TestEventListener::new(),
-                    (),
+                    "ping-listener".into(),
                 )
                 .await?,
             );
@@ -228,7 +228,7 @@ mod test {
             let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1, _>(
                 config,
                 event_log::TestEventListener::new(),
-                (),
+                "ping-dialer".into(),
             )
             .await
             .unwrap();

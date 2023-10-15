@@ -45,6 +45,7 @@ pub fn get_dynamic_port() -> u16 {
 
 /// A simulated in-memory network topology.
 pub(crate) struct SimNetwork {
+    name: String,
     pub labels: HashMap<NodeLabel, PeerKey>,
     pub event_listener: TestEventListener,
     user_ev_controller: Sender<(EventId, PeerKey)>,
@@ -115,6 +116,7 @@ struct GatewayConfig {
 
 impl SimNetwork {
     pub async fn new(
+        name: &str,
         gateways: usize,
         nodes: usize,
         ring_max_htl: usize,
@@ -125,6 +127,7 @@ impl SimNetwork {
         assert!(gateways > 0 && nodes > 0);
         let (user_ev_controller, receiver_ch) = channel((0, PeerKey::random()));
         let mut net = Self {
+            name: name.into(),
             event_listener: TestEventListener::new(),
             labels: HashMap::new(),
             user_ev_controller,
@@ -196,7 +199,7 @@ impl SimNetwork {
             let gateway = NodeInMemory::build::<MemoryContractHandler, _>(
                 this_node,
                 self.event_listener.clone(),
-                (),
+                format!("{}-{label}", self.name, label = this_config.label),
             )
             .await
             .unwrap();
@@ -244,7 +247,7 @@ impl SimNetwork {
             let node = NodeInMemory::build::<MemoryContractHandler, _>(
                 config,
                 self.event_listener.clone(),
-                (),
+                format!("{}-{label}", self.name),
             )
             .await
             .unwrap();

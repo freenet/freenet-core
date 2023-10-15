@@ -629,51 +629,48 @@ where
     CM: ConnectionBridge + Send + Sync,
 {
     tracing::warn!("Failed tx `{}`, potentially attempting a retry", tx);
-    match tx.tx_type() {
-        TransactionType::JoinRing => {
-            const MSG: &str = "Fatal error: unable to connect to the network";
-            // the attempt to join the network failed, this could be a fatal error since the node
-            // is useless without connecting to the network, we will retry with exponential backoff
-            match op_storage.pop(&tx) {
-                Some(OpEnum::JoinRing(op)) if op.has_backoff() => {
-                    if let JoinRingOp {
-                        backoff: Some(backoff),
-                        gateway,
-                        ..
-                    } = *op
-                    {
-                        if cfg!(test) {
-                            join_ring_request(None, peer_key, &gateway, op_storage, conn_manager)
-                                .await?;
-                        } else {
-                            join_ring_request(
-                                Some(backoff),
-                                peer_key,
-                                &gateway,
-                                op_storage,
-                                conn_manager,
-                            )
+    if let TransactionType::JoinRing = tx.tx_type() {
+        const MSG: &str = "Fatal error: unable to connect to the network";
+        // the attempt to join the network failed, this could be a fatal error since the node
+        // is useless without connecting to the network, we will retry with exponential backoff
+        match op_storage.pop(&tx) {
+            Some(OpEnum::JoinRing(op)) if op.has_backoff() => {
+                if let JoinRingOp {
+                    backoff: Some(backoff),
+                    gateway,
+                    ..
+                } = *op
+                {
+                    if cfg!(test) {
+                        join_ring_request(None, peer_key, &gateway, op_storage, conn_manager)
                             .await?;
-                        }
-                    }
-                }
-                None | Some(OpEnum::JoinRing(_)) => {
-                    let rand_gw = gateways
-                        .shuffle()
-                        .take(1)
-                        .next()
-                        .expect("at least one gateway");
-                    if !cfg!(test) {
-                        tracing::error!("{}", MSG);
                     } else {
-                        tracing::debug!("{}", MSG);
+                        join_ring_request(
+                            Some(backoff),
+                            peer_key,
+                            &gateway,
+                            op_storage,
+                            conn_manager,
+                        )
+                        .await?;
                     }
-                    join_ring_request(None, peer_key, rand_gw, op_storage, conn_manager).await?;
                 }
-                _ => {}
             }
+            None | Some(OpEnum::JoinRing(_)) => {
+                let rand_gw = gateways
+                    .shuffle()
+                    .take(1)
+                    .next()
+                    .expect("at least one gateway");
+                if !cfg!(test) {
+                    tracing::error!("{}", MSG);
+                } else {
+                    tracing::debug!("{}", MSG);
+                }
+                join_ring_request(None, peer_key, rand_gw, op_storage, conn_manager).await?;
+            }
+            _ => {}
         }
-        _ => unreachable!(),
     }
     Ok(())
 }

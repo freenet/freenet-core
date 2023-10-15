@@ -109,10 +109,11 @@ mod test {
     };
 
     // Prepare and get handler for rocksdb
-    async fn get_handler() -> Result<NetworkContractHandler<MockRuntime>, DynError> {
+    async fn get_handler(test: &str) -> Result<NetworkContractHandler<MockRuntime>, DynError> {
         let (_, ch_handler) = contract_handler_channel();
         let (_, executor_sender) = executor_channel_test();
-        let handler = NetworkContractHandler::build(ch_handler, executor_sender, ()).await?;
+        let handler =
+            NetworkContractHandler::build(ch_handler, executor_sender, test.to_string()).await?;
         Ok(handler)
     }
 
@@ -120,7 +121,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contract_handler() -> Result<(), DynError> {
         // Create a rocksdb handler and initialize the database
-        let mut handler = get_handler().await?;
+        let mut handler = get_handler("contract_handler").await?;
 
         // Generate a contract
         let contract_bytes = b"Test contract value".to_vec();

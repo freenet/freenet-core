@@ -237,6 +237,11 @@ pub(crate) trait ContractExecutor: Send + Sync + 'static {
         &mut self,
         contract: ContractContainer,
     ) -> Result<(), crate::runtime::ContractError>;
+    async fn upsert_contract_state(
+        &mut self,
+        key: ContractKey,
+        state: Either<WrappedState, StateDelta<'static>>,
+    ) -> Result<WrappedState, crate::runtime::ContractError>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.
@@ -338,8 +343,46 @@ impl Executor<Runtime> {
     }
 }
 
-impl Executor<Runtime> {
-    pub async fn from_config(config: NodeConfig) -> Result<Self, DynError> {
+impl<R> Executor<R> {
+    pub async fn new(
+        state_store: StateStore<Storage>,
+        ctrl_handler: impl FnOnce(),
+        mode: OperationMode,
+        runtime: R,
+    ) -> Result<Self, DynError> {
+        ctrl_handler();
+
+        Ok(Self {
+            #[cfg(any(
+                all(feature = "local-mode", feature = "network-mode"),
+                all(not(feature = "local-mode"), not(feature = "network-mode")),
+            ))]
+            mode,
+            runtime,
+            state_store,
+            update_notifications: HashMap::default(),
+            subscriber_summaries: HashMap::default(),
+            delegate_attested_ids: HashMap::default(),
+            #[cfg(any(
+                not(feature = "local-mode"),
+                feature = "network-mode",
+                all(not(feature = "local-mode"), not(feature = "network-mode"))
+            ))]
+            event_loop_channel: None,
+        })
+    }
+
+    async fn get_stores(
+        config: &NodeConfig,
+    ) -> Result<
+        (
+            ContractStore,
+            DelegateStore,
+            SecretsStore,
+            StateStore<Storage>,
+        ),
+        DynError,
+    > {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let static_conf = crate::config::Config::conf();
@@ -367,48 +410,24 @@ impl Executor<Runtime> {
             .unwrap_or_else(|| static_conf.secrets_dir());
         let secret_store = SecretsStore::new(secrets_dir)?;
 
+        Ok((contract_store, delegate_store, secret_store, state_store))
+    }
+}
+
+impl Executor<Runtime> {
+    pub async fn from_config(config: NodeConfig) -> Result<Self, DynError> {
+        let (contract_store, delegate_store, secret_store, state_store) =
+            Self::get_stores(&config).await?;
+        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         Executor::new(
-            contract_store,
-            delegate_store,
-            secret_store,
             state_store,
             || {
                 crate::util::set_cleanup_on_exit().unwrap();
             },
             OperationMode::Local,
+            rt,
         )
         .await
-    }
-
-    #[allow(unused_variables)]
-    pub async fn new(
-        contract_store: ContractStore,
-        delegate_store: DelegateStore,
-        secret_store: SecretsStore,
-        contract_state: StateStore<Storage>,
-        ctrl_handler: impl FnOnce(),
-        mode: OperationMode,
-    ) -> Result<Self, DynError> {
-        ctrl_handler();
-
-        Ok(Self {
-            #[cfg(any(
-                all(feature = "local-mode", feature = "network-mode"),
-                all(not(feature = "local-mode"), not(feature = "network-mode")),
-            ))]
-            mode,
-            runtime: Runtime::build(contract_store, delegate_store, secret_store, false).unwrap(),
-            state_store: contract_state,
-            update_notifications: HashMap::default(),
-            subscriber_summaries: HashMap::default(),
-            delegate_attested_ids: HashMap::default(),
-            #[cfg(any(
-                not(feature = "local-mode"),
-                feature = "network-mode",
-                all(not(feature = "local-mode"), not(feature = "network-mode"))
-            ))]
-            event_loop_channel: None,
-        })
     }
 
     pub fn register_contract_notifier(
@@ -1174,8 +1193,22 @@ impl Executor<Runtime> {
 
 #[cfg(test)]
 impl Executor<crate::contract::MockRuntime> {
-    pub async fn new_mock() -> Result<Self, DynError> {
-        todo!()
+    pub async fn new_mock(test: &str) -> Result<Self, DynError> {
+        let tmp_path = std::env::temp_dir().join(format!("freenet-executor-{test}"));
+
+        let contracts_data_dir = tmp_path.join("contracts");
+        let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
+
+        let state_store = StateStore::new(Storage::new().await?, u16::MAX as u32).unwrap();
+
+        let executor = Executor::new(
+            state_store,
+            || {},
+            OperationMode::Local,
+            super::MockRuntime { contract_store },
+        )
+        .await?;
+        Ok(executor)
     }
 
     pub async fn handle_request<'a>(
@@ -1214,6 +1247,14 @@ impl ContractExecutor for Executor<Runtime> {
         contract: ContractContainer,
     ) -> Result<(), crate::runtime::ContractError> {
         self.runtime.contract_store.store_contract(contract)
+    }
+
+    async fn upsert_contract_state(
+        &mut self,
+        _key: ContractKey,
+        _state: Either<WrappedState, StateDelta<'static>>,
+    ) -> Result<WrappedState, crate::runtime::ContractError> {
+        todo!()
     }
 }
 
@@ -1254,12 +1295,28 @@ impl ContractExecutor for Executor<crate::contract::MockRuntime> {
         self.runtime.contract_store.store_contract(contract)?;
         Ok(())
     }
+
+    async fn upsert_contract_state(
+        &mut self,
+        _key: ContractKey,
+        state: Either<WrappedState, StateDelta<'static>>,
+    ) -> Result<WrappedState, crate::runtime::ContractError> {
+        // todo: instead allow to perform mutations per contract based on incoming value so we can track
+        // state values over the network
+        match state {
+            Either::Left(state) => Ok(state),
+            Either::Right(delta) => Ok(WrappedState::from(delta.as_ref())),
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::runtime::{ContractStore, StateStore};
+    use crate::{
+        contract::MockRuntime,
+        runtime::{ContractStore, StateStore},
+    };
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
@@ -1270,14 +1327,12 @@ mod test {
         let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         Executor::new(
-            contract_store,
-            DelegateStore::default(),
-            SecretsStore::default(),
             state_store,
             || {
                 counter += 1;
             },
             OperationMode::Local,
+            MockRuntime { contract_store },
         )
         .await
         .expect("local node with handle");

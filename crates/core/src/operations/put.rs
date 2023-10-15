@@ -916,7 +916,16 @@ mod test {
         let contract_val: WrappedState = gen.arbitrary()?;
         let new_value = WrappedState::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
+        let mut sim_nodes = SimNetwork::new(
+            "successful_put_op_between_nodes",
+            NUM_GW,
+            NUM_NODES,
+            3,
+            2,
+            4,
+            2,
+        )
+        .await;
         let mut locations = sim_nodes.get_locations_by_node();
         let node0_loc = locations.remove(&"node-0".into()).unwrap();
         let node1_loc = locations.remove(&"node-1".into()).unwrap();

@@ -9,6 +9,7 @@ use crate::{
     message::{InnerMessage, Message, Transaction, TransactionType},
     node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
+    DynError,
 };
 
 pub(crate) mod get;
@@ -183,6 +184,8 @@ pub(crate) enum OpError {
     RingError(#[from] RingError),
     #[error(transparent)]
     ContractError(#[from] ContractError),
+    #[error(transparent)]
+    ExecutorError(DynError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,

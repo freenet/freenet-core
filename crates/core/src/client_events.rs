@@ -145,8 +145,8 @@ pub(crate) mod test {
     // FIXME: remove unused
     #![allow(unused)]
 
-    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::{collections::HashMap, time::Duration};
 
     use freenet_stdlib::client_api::ContractRequest;
     use freenet_stdlib::prelude::*;
@@ -264,37 +264,39 @@ pub(crate) mod test {
 
     impl ClientEventsProxy for MemoryEventsGen {
         fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
-            // async move {
-            //     loop {
-            //         if self.signal.changed().await.is_ok() {
-            //             let (ev_id, pk) = *self.signal.borrow();
-            //             if pk == self.id && !self.random {
-            //                 let res = OpenRequest {
-            //                     id: ClientId(1),
-            //                     request: self
-            //                         .generate_deterministic_event(&ev_id)
-            //                         .expect("event not found"),
-            //                     notification_channel: None,
-            //                 };
-            //                 return Ok(res);
-            //             } else if pk == self.id {
-            //                 let res = OpenRequest {
-            //                     id: ClientId(1),
-            //                     request: self.generate_rand_event(),
-            //                     notification_channel: None,
-            //                 };
-            //                 return Ok(res);
-            //             }
-            //         } else {
-            //             log::debug!("sender half of user event gen dropped");
-            //             // probably the process finished, wait for a bit and then kill the thread
-            //             tokio::time::sleep(Duration::from_secs(1)).await;
-            //             panic!("finished orphan background thread");
-            //         }
-            //     }
-            // }
-            // .boxed()
-            todo!("fixme")
+            async {
+                loop {
+                    if self.signal.changed().await.is_ok() {
+                        let (ev_id, pk) = *self.signal.borrow();
+                        if pk == self.id && !self.random {
+                            let res = OpenRequest {
+                                client_id: ClientId::FIRST,
+                                request: self
+                                    .generate_deterministic_event(&ev_id)
+                                    .expect("event not found")
+                                    .into(),
+                                notification_channel: None,
+                                token: None,
+                            };
+                            return Ok(res.into_owned());
+                        } else if pk == self.id {
+                            let res = OpenRequest {
+                                client_id: ClientId::FIRST,
+                                request: self.generate_rand_event().into(),
+                                notification_channel: None,
+                                token: None,
+                            };
+                            return Ok(res.into_owned());
+                        }
+                    } else {
+                        tracing::debug!("sender half of user event gen dropped");
+                        // probably the process finished, wait for a bit and then kill the thread
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        panic!("finished orphan background thread");
+                    }
+                }
+            }
+            .boxed()
         }
 
         fn send(

@@ -293,8 +293,8 @@ impl Operation for GetOp {
                         return_msg = None;
                         new_state = None;
                     } else if let ContractHandlerEvent::GetResponse {
-                        response: value,
                         key: returned_key,
+                        response: value,
                     } = op_storage
                         .notify_contract_handler(
                             ContractHandlerEvent::GetQuery {
@@ -330,10 +330,17 @@ impl Operation for GetOp {
                             Some(GetState::ReceivedRequest) => {
                                 tracing::debug!("Returning contract {} to {}", key, sender.peer);
                                 new_state = None;
+                                let value = match value {
+                                    Ok(res) => res,
+                                    Err(err) => {
+                                        tracing::error!("error: {err}");
+                                        return Err(OpError::ExecutorError(err));
+                                    }
+                                };
                                 return_msg = Some(GetMsg::ReturnGet {
                                     id,
                                     key,
-                                    value: value.unwrap(),
+                                    value,
                                     sender: target,
                                     target: sender,
                                 });
@@ -842,7 +849,16 @@ mod test {
         let get_specs = HashMap::from_iter([("node-0".into(), node_0), ("gateway-0".into(), gw_0)]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
+        let mut sim_nodes = SimNetwork::new(
+            "successful_get_op_between_nodes",
+            NUM_GW,
+            NUM_NODES,
+            3,
+            2,
+            4,
+            2,
+        )
+        .await;
         sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
@@ -881,7 +897,8 @@ mod test {
         let get_specs = HashMap::from_iter([("node-1".into(), node_1)]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
+        let mut sim_nodes =
+            SimNetwork::new("get_contract_not_found", NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
@@ -942,7 +959,16 @@ mod test {
         ]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(NUM_GW, NUM_NODES, 3, 2, 4, 3).await;
+        let mut sim_nodes = SimNetwork::new(
+            "get_contract_found_after_retry",
+            NUM_GW,
+            NUM_NODES,
+            3,
+            2,
+            4,
+            3,
+        )
+        .await;
         sim_nodes.build_with_specs(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
