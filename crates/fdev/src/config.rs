@@ -6,7 +6,7 @@ use freenet::dev_tool::OperationMode;
 use semver::Version;
 
 #[derive(clap::Parser, Clone)]
-#[clap(name = "Locutus Development Tool")]
+#[clap(name = "Freenet Development Tool")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(version = "0.0.3")]
 pub struct Config {
