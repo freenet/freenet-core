@@ -42,9 +42,9 @@ pub enum DeserializationFmt {
     MessagePack,
 }
 
-/// A CLI utility for testing out contracts against a Locutus local node.
+/// A CLI utility for testing out contracts against a Freenet local node.
 #[derive(clap::Parser, Clone)]
-#[clap(name = "Locutus Local Development Node Environment")]
+#[clap(name = "Freenet Local Development Node Environment")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(group(
     ArgGroup::new("output")
