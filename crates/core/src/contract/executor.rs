@@ -241,6 +241,7 @@ pub(crate) trait ContractExecutor: Send + Sync + 'static {
         &mut self,
         key: ContractKey,
         state: Either<WrappedState, StateDelta<'static>>,
+        params: Option<Parameters<'_>>,
     ) -> Result<WrappedState, crate::runtime::ContractError>;
 }
 
@@ -1193,8 +1194,8 @@ impl Executor<Runtime> {
 
 #[cfg(test)]
 impl Executor<crate::contract::MockRuntime> {
-    pub async fn new_mock(test: &str) -> Result<Self, DynError> {
-        let tmp_path = std::env::temp_dir().join(format!("freenet-executor-{test}"));
+    pub async fn new_mock(data_dir: &str) -> Result<Self, DynError> {
+        let tmp_path = std::env::temp_dir().join(format!("freenet-executor-{data_dir}"));
 
         let contracts_data_dir = tmp_path.join("contracts");
         let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
@@ -1253,6 +1254,7 @@ impl ContractExecutor for Executor<Runtime> {
         &mut self,
         _key: ContractKey,
         _state: Either<WrappedState, StateDelta<'static>>,
+        _params: Option<Parameters<'_>>,
     ) -> Result<WrappedState, crate::runtime::ContractError> {
         todo!()
     }
@@ -1298,14 +1300,20 @@ impl ContractExecutor for Executor<crate::contract::MockRuntime> {
 
     async fn upsert_contract_state(
         &mut self,
-        _key: ContractKey,
+        key: ContractKey,
         state: Either<WrappedState, StateDelta<'static>>,
+        params: Option<Parameters<'_>>,
     ) -> Result<WrappedState, crate::runtime::ContractError> {
         // todo: instead allow to perform mutations per contract based on incoming value so we can track
         // state values over the network
-        match state {
-            Either::Left(state) => Ok(state),
-            Either::Right(delta) => Ok(WrappedState::from(delta.as_ref())),
+        match (state, params) {
+            (Either::Left(state), Some(params)) => {
+                self.state_store
+                    .store(key, state.clone(), params.into_owned())
+                    .await?;
+                return Ok(state);
+            }
+            _ => todo!(),
         }
     }
 }

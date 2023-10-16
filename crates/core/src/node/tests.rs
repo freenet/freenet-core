@@ -17,7 +17,6 @@ use tracing::{info, instrument};
 use crate::{
     client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
-    contract::MemoryContractHandler,
     node::{event_log::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
 };
@@ -41,21 +40,6 @@ pub fn get_dynamic_port() -> u16 {
     const FIRST_DYNAMIC_PORT: u16 = 49152;
     const LAST_DYNAMIC_PORT: u16 = 65535;
     rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
-}
-
-/// A simulated in-memory network topology.
-pub(crate) struct SimNetwork {
-    name: String,
-    pub labels: HashMap<NodeLabel, PeerKey>,
-    pub event_listener: TestEventListener,
-    user_ev_controller: Sender<(EventId, PeerKey)>,
-    receiver_ch: Receiver<(EventId, PeerKey)>,
-    gateways: Vec<(NodeInMemory, GatewayConfig)>,
-    nodes: Vec<(NodeInMemory, NodeLabel)>,
-    ring_max_htl: usize,
-    rnd_if_htl_above: usize,
-    max_connections: usize,
-    min_connections: usize,
 }
 
 pub(crate) type EventId = usize;
@@ -93,6 +77,16 @@ impl std::ops::Deref for NodeLabel {
 
 impl<'a> From<&'a str> for NodeLabel {
     fn from(value: &'a str) -> Self {
+        assert!(value.starts_with("gateway-") || value.starts_with("node-"));
+        let mut parts = value.split('-');
+        assert!(parts.next().is_some());
+        assert!(parts
+            .next()
+            .map(|s| s.parse::<u16>())
+            .transpose()
+            .expect("should be an u16")
+            .is_some());
+        assert!(parts.next().is_none());
         Self(value.to_string().into())
     }
 }
@@ -114,6 +108,22 @@ struct GatewayConfig {
     location: Location,
 }
 
+/// A simulated in-memory network topology.
+pub(crate) struct SimNetwork {
+    name: String,
+    debug: bool,
+    pub labels: HashMap<NodeLabel, PeerKey>,
+    pub event_listener: TestEventListener,
+    user_ev_controller: Sender<(EventId, PeerKey)>,
+    receiver_ch: Receiver<(EventId, PeerKey)>,
+    gateways: Vec<(NodeInMemory, GatewayConfig)>,
+    nodes: Vec<(NodeInMemory, NodeLabel)>,
+    ring_max_htl: usize,
+    rnd_if_htl_above: usize,
+    max_connections: usize,
+    min_connections: usize,
+}
+
 impl SimNetwork {
     pub async fn new(
         name: &str,
@@ -128,6 +138,7 @@ impl SimNetwork {
         let (user_ev_controller, receiver_ch) = channel((0, PeerKey::random()));
         let mut net = Self {
             name: name.into(),
+            debug: false,
             event_listener: TestEventListener::new(),
             labels: HashMap::new(),
             user_ev_controller,
@@ -142,6 +153,11 @@ impl SimNetwork {
         net.build_gateways(gateways).await;
         net.build_nodes(nodes).await;
         net
+    }
+
+    #[allow(unused)]
+    pub fn debug(&mut self) {
+        self.debug = true;
     }
 
     #[instrument(skip(self))]
@@ -196,7 +212,7 @@ impl SimNetwork {
                         .listening_port(*port),
                 );
             }
-            let gateway = NodeInMemory::build::<MemoryContractHandler, _>(
+            let gateway = NodeInMemory::build(
                 this_node,
                 self.event_listener.clone(),
                 format!("{}-{label}", self.name, label = this_config.label),
@@ -209,6 +225,7 @@ impl SimNetwork {
 
     #[instrument(skip(self))]
     async fn build_nodes(&mut self, num: usize) {
+        info!("Building {} regular nodes", num);
         let gateways: Vec<_> = self
             .gateways
             .iter()
@@ -244,7 +261,7 @@ impl SimNetwork {
             self.event_listener
                 .add_node(label.clone(), PeerKey::from(id));
 
-            let node = NodeInMemory::build::<MemoryContractHandler, _>(
+            let node = NodeInMemory::build(
                 config,
                 self.event_listener.clone(),
                 format!("{}-{label}", self.name),
@@ -384,6 +401,18 @@ impl SimNetwork {
             tokio::time::sleep(sleep_time).await;
         }
         Ok(())
+    }
+}
+
+impl Drop for SimNetwork {
+    fn drop(&mut self) {
+        if !self.debug {
+            for label in self.labels.keys() {
+                let p = std::env::temp_dir()
+                    .join(format!("freenet-executor-{sim}-{label}", sim = self.name));
+                let _ = std::fs::remove_dir_all(p);
+            }
+        }
     }
 }
 

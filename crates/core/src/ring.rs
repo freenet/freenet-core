@@ -232,7 +232,6 @@ impl Ring {
 
     /// Returns this node location in the ring, if any (must have join the ring already).
     pub fn own_location(&self) -> PeerKeyLocation {
-        tracing::debug!("Getting loc for peer {}", self.peer_key);
         let location = f64::from_le_bytes(self.own_location.load(SeqCst).to_le_bytes());
         let location = if (location - -1f64).abs() < f64::EPSILON {
             None

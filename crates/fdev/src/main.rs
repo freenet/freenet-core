@@ -2,7 +2,6 @@ use std::borrow::Cow;
 
 use clap::Parser;
 use freenet_stdlib::client_api::ClientRequest;
-use tracing_subscriber::EnvFilter;
 
 mod build;
 mod commands;
@@ -35,9 +34,7 @@ enum Error {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    freenet::config::set_logger();
     let cwd = std::env::current_dir()?;
     let config = Config::parse();
     freenet::config::Config::set_op_mode(config.additional.mode);

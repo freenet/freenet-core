@@ -203,7 +203,7 @@ impl Operation for GetOp {
                         self.state,
                         Some(GetState::AwaitingResponse { .. })
                     ));
-                    tracing::debug!("Seek contract {} @ {} (tx: {})", key, target.peer, id);
+                    tracing::debug!(tx = %id, "Seek contract {} @ {}", key, target.peer);
                     new_state = self.state;
                     stats = Some(GetStats {
                         contract_location: Location::from(&key),
@@ -495,11 +495,13 @@ impl Operation for GetOp {
                         }
                     }
 
+                    let parameters = contract.as_ref().map(|c| c.params());
                     op_storage
                         .notify_contract_handler(
                             ContractHandlerEvent::PutQuery {
                                 key: key.clone(),
                                 state: value.clone(),
+                                parameters,
                             },
                             client_id,
                         )
@@ -683,9 +685,9 @@ pub(crate) async fn request_get(
         return Err(OpError::UnexpectedOpState);
     };
     tracing::debug!(
-        "Preparing get contract request to {} (tx: {})",
+        tx = %id,
+        "Preparing get contract request to {}",
         target.peer,
-        id
     );
 
     match get_op.state {
@@ -866,12 +868,11 @@ mod test {
         sim_nodes
             .trigger_event(&"node-0".into(), 1, Some(Duration::from_millis(100)))
             .await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(sim_nodes.has_got_contract(&"node-0".into(), &key));
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contract_not_found() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 2usize;
@@ -910,7 +911,6 @@ mod test {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contract_found_after_retry() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 2usize;

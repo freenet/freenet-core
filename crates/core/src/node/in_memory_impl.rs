@@ -15,7 +15,8 @@ use crate::{
     config::GlobalExecutor,
     contract::{
         self, executor_channel, ClientResponsesSender, ContractError, ContractHandler,
-        ContractHandlerEvent, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+        ContractHandlerEvent, ExecutorToEventLoopChannel, MemoryContractHandler,
+        NetworkEventListenerHalve,
     },
     message::{Message, NodeEvent, TransactionType},
     node::NodeBuilder,
@@ -37,14 +38,11 @@ pub(super) struct NodeInMemory {
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub async fn build<CH, EL: EventLogRegister>(
+    pub async fn build<EL: EventLogRegister>(
         builder: NodeBuilder<1>,
         event_listener: EL,
-        ch_builder: CH::Builder,
-    ) -> Result<NodeInMemory, anyhow::Error>
-    where
-        CH: ContractHandler + Send + Sync + 'static,
-    {
+        ch_builder: String,
+    ) -> Result<NodeInMemory, anyhow::Error> {
         let peer_key = PeerKey::from(builder.local_key.public());
         let conn_manager = MemoryConnManager::new(peer_key);
         let gateways = builder.get_gateways()?;
@@ -55,9 +53,10 @@ impl NodeInMemory {
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
-        let contract_handler = CH::build(ch_channel, executor_sender, ch_builder)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let contract_handler =
+            MemoryContractHandler::build(ch_channel, executor_sender, ch_builder)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
@@ -106,7 +105,8 @@ impl NodeInMemory {
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError> {
         for (contract, state) in contracts {
-            let key = contract.key();
+            let key: ContractKey = contract.key();
+            let parameters = contract.params();
             self.op_storage
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), None)
                 .await?;
@@ -115,6 +115,7 @@ impl NodeInMemory {
                     ContractHandlerEvent::PutQuery {
                         key: key.clone(),
                         state,
+                        parameters: Some(parameters),
                     },
                     None,
                 )

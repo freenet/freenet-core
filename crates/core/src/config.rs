@@ -323,6 +323,20 @@ impl libp2p::swarm::Executor for GlobalExecutor {
     }
 }
 
+pub fn set_logger() {
+    tracing_subscriber::fmt()
+        .with_level(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into())
+                .from_env_lossy()
+                .add_directive("stretto=off".parse().unwrap()),
+        )
+        .init();
+}
+
 pub(super) mod tracer {
     use super::*;
 

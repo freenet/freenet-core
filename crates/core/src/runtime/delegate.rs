@@ -417,7 +417,7 @@ mod test {
         name: &str,
     ) -> Result<(DelegateContainer, Runtime), Box<dyn std::error::Error>> {
         const TEST_PREFIX: &str = "delegate-api";
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let contracts_dir = super::super::tests::test_dir(TEST_PREFIX);
         let delegates_dir = super::super::tests::test_dir(TEST_PREFIX);
         let secrets_dir = super::super::tests::test_dir(TEST_PREFIX);

@@ -307,6 +307,7 @@ where
 }
 
 /// Process client events.
+#[tracing::instrument(skip_all)]
 async fn client_event_handling<ClientEv>(
     op_storage: Arc<OpManager>,
     mut client_events: ClientEv,
@@ -318,7 +319,10 @@ async fn client_event_handling<ClientEv>(
         tokio::select! {
             client_request = client_events.recv() => {
                 let req = match client_request {
-                    Ok(req) => req,
+                    Ok(req) => {
+                        tracing::debug!(%req, "got client request event");
+                        req
+                    }
                     Err(err) => {
                         tracing::debug!(error = %err, "client error");
                         continue;
@@ -332,6 +336,9 @@ async fn client_event_handling<ClientEv>(
             }
             res = client_responses.recv() => {
                 if let Some((cli_id, res)) = res {
+                    if let Ok(res) = &res {
+                        tracing::debug!(%res, "sending client response");
+                    }
                     if let Err(err) = client_events.send(cli_id, res).await {
                         tracing::error!("channel closed: {err}");
                         break;
@@ -438,9 +445,9 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
 macro_rules! log_handling_msg {
     ($op:expr, $id:expr, $op_storage:ident) => {
         tracing::debug!(
-            concat!("Handling ", $op, " get request @ {} (tx: {})"),
+            tx = %$id,
+            concat!("Handling ", $op, " get request @ {}"),
             $op_storage.ring.peer_key,
-            $id
         );
     };
 }
@@ -504,11 +511,12 @@ async fn report_result(
         }
         Ok(None) => {}
         Err(err) => {
-            tracing::debug!("Finished tx w/ error: {}", err)
+            tracing::debug!("Finished transaction with error: {}", err)
         }
     }
 }
 
+#[tracing::instrument(name = "process_network_message", skip_all)]
 async fn process_message<CB>(
     msg: Result<Message, ConnectionError>,
     op_storage: Arc<OpManager>,
@@ -628,7 +636,7 @@ async fn handle_cancelled_op<CM>(
 where
     CM: ConnectionBridge + Send + Sync,
 {
-    tracing::warn!("Failed tx `{}`, potentially attempting a retry", tx);
+    tracing::warn!(%tx, "Failed transaction, potentially attempting a retry");
     if let TransactionType::JoinRing = tx.tx_type() {
         const MSG: &str = "Fatal error: unable to connect to the network";
         // the attempt to join the network failed, this could be a fatal error since the node
