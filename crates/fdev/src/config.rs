@@ -18,13 +18,13 @@ pub struct Config {
 
 #[derive(clap::Parser, Clone)]
 pub struct BaseConfig {
-    /// Overrides the default data directory where Locutus contract files are stored.
+    /// Overrides the default data directory where Freenet contract files are stored.
     #[arg(long)]
     pub(crate) contract_data_dir: Option<PathBuf>,
-    /// Overrides the default data directory where Locutus delegate files are stored.
+    /// Overrides the default data directory where Freenet delegate files are stored.
     #[arg(long)]
     pub(crate) delegate_data_dir: Option<PathBuf>,
-    /// Overrides the default data directory where Locutus secret files are stored.
+    /// Overrides the default data directory where Freenet secret files are stored.
     #[arg(long)]
     pub(crate) secret_data_dir: Option<PathBuf>,
     /// Node operation mode.
@@ -154,7 +154,7 @@ fn parse_version(src: &str) -> Result<Version, String> {
     Version::parse(src).map_err(|e| e.to_string())
 }
 
-/// Create a new Locutus contract and/or app.
+/// Create a new Freenet contract and/or app.
 #[derive(clap::Parser, Clone)]
 pub struct NewPackageCliConfig {
     #[arg(id = "type", value_enum)]
