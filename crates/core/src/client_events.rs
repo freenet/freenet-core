@@ -99,6 +99,16 @@ pub struct OpenRequest<'a> {
     pub token: Option<AuthToken>,
 }
 
+impl Display for OpenRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "client request {{ client: {}, req: {} }}",
+            &self.client_id, &*self.request
+        )
+    }
+}
+
 impl<'a> OpenRequest<'a> {
     pub fn into_owned(self) -> OpenRequest<'static> {
         OpenRequest {
@@ -289,7 +299,6 @@ pub(crate) mod test {
                             return Ok(res.into_owned());
                         }
                     } else {
-                        tracing::debug!("sender half of user event gen dropped");
                         // probably the process finished, wait for a bit and then kill the thread
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         panic!("finished orphan background thread");

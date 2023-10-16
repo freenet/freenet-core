@@ -62,7 +62,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
 pub(crate) fn setup_test_contract(
     name: &str,
 ) -> Result<(ContractStore, ContractKey), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let mut store = ContractStore::new(test_dir("contract"), 10_000)?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),

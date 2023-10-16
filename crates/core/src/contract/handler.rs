@@ -147,13 +147,13 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
     fn build(
         channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
         _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
-        test: Self::Builder,
+        data_dir: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
         async move {
-            let executor = Executor::new_mock(&test).await?;
+            let executor = Executor::new_mock(&data_dir).await?;
             Ok(Self { executor, channel })
         }
         .boxed()
@@ -344,6 +344,7 @@ pub(crate) enum ContractHandlerEvent {
     PutQuery {
         key: ContractKey,
         state: WrappedState,
+        parameters: Option<Parameters<'static>>,
     },
     /// The response to a push query.
     PutResponse {
@@ -363,6 +364,52 @@ pub(crate) enum ContractHandlerEvent {
     Cache(ContractContainer),
     /// Result of a caching operation.
     CacheResult(Result<(), ContractError>),
+}
+
+impl std::fmt::Display for ContractHandlerEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContractHandlerEvent::PutQuery {
+                key,
+                state,
+                parameters,
+            } => {
+                if let Some(params) = parameters {
+                    write!(f, "put query {{ {key}, params: {:?} }}", params.as_ref())
+                } else {
+                    write!(f, "put query {{ {key} }}")
+                }
+            }
+            ContractHandlerEvent::PutResponse { new_value } => match new_value {
+                Ok(v) => {
+                    write!(f, "put query response {{ {v} }}",)
+                }
+                Err(e) => {
+                    write!(f, "put query failed {{ {e} }}",)
+                }
+            },
+            ContractHandlerEvent::GetQuery {
+                key,
+                fetch_contract,
+            } => {
+                write!(f, "get query {{ {key}, fetch contract: {fetch_contract} }}",)
+            }
+            ContractHandlerEvent::GetResponse { key, response } => match response {
+                Ok(v) => {
+                    write!(f, "get query response {{ {key} }}",)
+                }
+                Err(e) => {
+                    write!(f, "get query failed {{ {key} }}",)
+                }
+            },
+            ContractHandlerEvent::Cache(container) => {
+                write!(f, "caching {{ {} }}", container.key())
+            }
+            ContractHandlerEvent::CacheResult(r) => {
+                write!(f, "caching result {{ {} }}", r.is_ok())
+            }
+        }
+    }
 }
 
 impl ContractHandlerEvent {

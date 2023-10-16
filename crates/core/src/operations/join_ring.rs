@@ -119,6 +119,7 @@ impl Operation for JoinRingOp {
                 } => {
                     // likely a gateway which accepts connections
                     tracing::debug!(
+                        tx = %id,
                         "Initial join request received from {} with HTL {} @ {}",
                         req_peer,
                         hops_to_live,
@@ -128,10 +129,10 @@ impl Operation for JoinRingOp {
                     let new_location = Location::random();
                     // FIXME: don't try to forward to peers which have already been tried (add a rejected_by list)
                     let accepted_by = if op_storage.ring.should_accept(&new_location) {
-                        tracing::debug!("Accepting connection from {}", req_peer,);
+                        tracing::debug!(tx = %id, "Accepting connection from {}", req_peer,);
                         HashSet::from_iter([this_node_loc])
                     } else {
-                        tracing::debug!("Rejecting connection from peer {}", req_peer);
+                        tracing::debug!(tx = %id, "Rejecting connection from peer {}", req_peer);
                         HashSet::new()
                     };
 
@@ -151,9 +152,9 @@ impl Operation for JoinRingOp {
                     .await?
                     {
                         tracing::debug!(
-                            "Awaiting proxy response from @ {} (tx: {})",
+                            tx = %id,
+                            "Awaiting proxy response from @ {}",
                             this_node_loc.peer,
-                            id
                         );
                         updated_state.add_new_proxy(accepted_by)?;
                         // awaiting responses from proxies
@@ -162,6 +163,7 @@ impl Operation for JoinRingOp {
                     } else {
                         if !accepted_by.is_empty() {
                             tracing::debug!(
+                                tx = %id,
                                 "OC received at gateway {} from requesting peer {}",
                                 this_node_loc.peer,
                                 req_peer
@@ -196,6 +198,7 @@ impl Operation for JoinRingOp {
                 } => {
                     let own_loc = op_storage.ring.own_location();
                     tracing::debug!(
+                        tx = %id,
                         "Proxy join request received from {} to join new peer {} with HTL {} @ {}",
                         sender.peer,
                         joiner.peer,
@@ -206,10 +209,11 @@ impl Operation for JoinRingOp {
                         .ring
                         .should_accept(&joiner.location.ok_or(ConnectionError::LocationUnknown)?)
                     {
-                        tracing::debug!("Accepting proxy connection from {}", joiner.peer);
+                        tracing::debug!(tx = %id, "Accepting proxy connection from {}", joiner.peer);
                         HashSet::from_iter([own_loc])
                     } else {
                         tracing::debug!(
+                            tx = %id,
                             "Not accepting new proxy connection for sender {}",
                             joiner.peer
                         );
@@ -261,6 +265,7 @@ impl Operation for JoinRingOp {
                                 if match_target {
                                     new_state = Some(JRState::OCReceived);
                                     tracing::debug!(
+                                        tx = %id,
                                         "Sending response to join request with all the peers that accepted \
                                         connection from gateway {} to peer {}",
                                         sender.peer,
@@ -284,6 +289,7 @@ impl Operation for JoinRingOp {
                                     // connections alive and prune any dead connections
                                     new_state = Some(JRState::Connected);
                                     tracing::debug!(
+                                        tx = %id,
                                         "Sending response to join request with all the peers that accepted \
                                         connection from proxy peer {} to proxy peer {}",
                                         sender.peer,
@@ -319,7 +325,7 @@ impl Operation for JoinRingOp {
                         },
                     ..
                 } => {
-                    tracing::debug!("Join response received from {}", sender.peer);
+                    tracing::debug!(tx = %id, "Join response received from {}", sender.peer);
 
                     // Set the given location
                     let pk_loc = PeerKeyLocation {
@@ -331,6 +337,7 @@ impl Operation for JoinRingOp {
                         Some(JRState::Connecting(ConnectionInfo { gateway, .. })) => {
                             if !accepted_by.clone().is_empty() {
                                 tracing::debug!(
+                                    tx = %id,
                                     "OC received and acknowledged at requesting peer {} from gateway {}",
                                     your_peer_id,
                                     gateway.peer
@@ -372,17 +379,17 @@ impl Operation for JoinRingOp {
                     target,
                     msg: JoinResponse::Proxy { mut accepted_by },
                 } => {
-                    tracing::debug!("Received proxy join at @ {}", target.peer);
+                    tracing::debug!(tx = %id, "Received proxy join at @ {}", target.peer);
                     match self.state {
                         Some(JRState::Initializing) => {
                             // the sender of the response is the target of the request and
                             // is only a completed tx if it accepted the connection
                             if accepted_by.contains(&sender) {
                                 tracing::debug!(
-                                    "Return to {}, connected at proxy {} (tx: {})",
+                                    tx = %id,
+                                    "Return to {}, connected at proxy {}",
                                     target.peer,
                                     sender.peer,
-                                    id
                                 );
                                 new_state = Some(JRState::Connected);
                             } else {
@@ -423,6 +430,7 @@ impl Operation for JoinRingOp {
 
                             if is_target_peer {
                                 tracing::debug!(
+                                    tx = %id,
                                     "Sending response to join request with all the peers that accepted \
                                     connection from gateway {} to peer {}",
                                     target.peer,
@@ -440,6 +448,7 @@ impl Operation for JoinRingOp {
                                 });
                             } else {
                                 tracing::debug!(
+                                    tx = %id,
                                     "Sending response to join request with all the peers that accepted \
                                     connection from proxy peer {} to proxy peer {}",
                                     target.peer,
@@ -472,7 +481,7 @@ impl Operation for JoinRingOp {
                 } => {
                     match self.state {
                         Some(JRState::OCReceived) => {
-                            tracing::debug!("Acknowledge connected at gateway");
+                            tracing::debug!(tx = %id, "Acknowledge connected at gateway");
                             new_state = Some(JRState::Connected);
                             return_msg = Some(JoinRingMsg::Connected {
                                 id,
@@ -491,7 +500,7 @@ impl Operation for JoinRingOp {
                                 sender.location.ok_or(ConnectionError::LocationUnknown)?,
                                 sender.peer,
                             );
-                            tracing::debug!("Opened connection with peer {}", by_peer.peer);
+                            tracing::debug!(tx = %id, "Opened connection with peer {}", by_peer.peer);
                             new_state = None;
                         }
                     };
@@ -499,7 +508,7 @@ impl Operation for JoinRingOp {
                 JoinRingMsg::Connected { target, sender, id } => {
                     match self.state {
                         Some(JRState::OCReceived) => {
-                            tracing::debug!("Acknowledge connected at peer");
+                            tracing::debug!(tx = %id, "Acknowledge connected at peer {}", target.peer);
                             new_state = Some(JRState::Connected);
                             return_msg = None;
                         }
@@ -510,6 +519,7 @@ impl Operation for JoinRingOp {
                             return Err(OpError::InvalidStateTransition(id));
                         } else {
                             tracing::info!(
+                                tx = %id,
                                 "Successfully completed connection @ {}, new location = {:?}",
                                 target.peer,
                                 op_storage.ring.own_location().location
@@ -567,14 +577,14 @@ fn try_proxy_connection(
 ) -> (Option<JRState>, Option<JoinRingMsg>) {
     let new_state = if accepted_by.contains(own_loc) {
         tracing::debug!(
-            "Return to {}, connected at proxy {} (tx: {})",
+            tx = %id,
+            "Return to {}, connected at proxy {}",
             sender.peer,
             own_loc.peer,
-            id
         );
         Some(JRState::Connected)
     } else {
-        tracing::debug!("Failed to connect at proxy {}", sender.peer);
+        tracing::debug!(tx = %id, "Failed to connect at proxy {}", sender.peer);
         None
     };
     let return_msg = Some(JoinRingMsg::Response {
@@ -593,12 +603,13 @@ async fn propagate_oc_to_accepted_peers<CB: ConnectionBridge>(
     other_peer: &PeerKeyLocation,
     msg: JoinRingMsg,
 ) -> Result<(), OpError> {
+    let id = msg.id();
     if op_storage.ring.should_accept(
         &other_peer
             .location
             .ok_or(ConnectionError::LocationUnknown)?,
     ) {
-        tracing::info!("Established connection to {}", other_peer.peer);
+        tracing::info!(tx = %id, "Establishing connection to {}", other_peer.peer);
         conn_manager.add_connection(other_peer.peer).await?;
         op_storage.ring.add_connection(
             other_peer
@@ -612,7 +623,7 @@ async fn propagate_oc_to_accepted_peers<CB: ConnectionBridge>(
             let _ = conn_manager.send(&other_peer.peer, msg.into()).await;
         }
     } else {
-        tracing::debug!("Not accepting connection to {}", other_peer.peer);
+        tracing::debug!(tx = %id, "Not accepting connection to {}", other_peer.peer);
     }
 
     Ok(())
@@ -690,7 +701,7 @@ pub(crate) fn initial_request(
     max_hops_to_live: usize,
     id: Transaction,
 ) -> JoinRingOp {
-    tracing::debug!("Connecting to gw {} from {}", gateway.peer, this_peer);
+    tracing::debug!(tx = %id, "Connecting to gw {} from {}", gateway.peer, this_peer);
     let state = JRState::Connecting(ConnectionInfo {
         gateway,
         this_peer,
@@ -733,10 +744,10 @@ where
     } = state.expect("infallible").try_unwrap_connecting()?;
 
     tracing::info!(
-        "Joining ring via {} (at {}) (tx: {})",
+        tx = %id,
+        "Joining ring via {} (at {})",
         gateway.peer,
         gateway.location.ok_or(ConnectionError::LocationUnknown)?,
-        tx
     );
 
     conn_manager.add_connection(gateway.peer).await?;
@@ -786,12 +797,14 @@ where
 
     let forward_to = if left_htl >= ring.rnd_if_htl_above {
         tracing::debug!(
+            tx = %id,
             "Randomly selecting peer to forward JoinRequest (requester: {})",
             req_peer.peer
         );
         ring.random_peer(|p| p.peer != req_peer.peer)
     } else {
         tracing::debug!(
+            tx = %id,
             "Selecting close peer to forward request (requester: {})",
             req_peer.peer
         );
@@ -809,6 +822,7 @@ where
             },
         });
         tracing::debug!(
+            tx = %id,
             "Forwarding JoinRequest from sender {} to {}",
             req_peer.peer,
             forward_to.peer
@@ -825,11 +839,11 @@ where
     } else {
         if num_accepted != 0 {
             tracing::warn!(
-                "Unable to forward, will only be connected to one peer (tx: {})",
-                id
+                tx = %id,
+                "Unable to forward, will only be connected to one peer",
             );
         } else {
-            tracing::warn!("Unable to forward or accept any connections (tx: {})", id);
+            tracing::warn!(tx = %id, "Unable to forward or accept any connections");
         }
         Ok(None)
     }
@@ -946,15 +960,6 @@ mod messages {
         }
     }
 
-    /*
-
-    Peer A ---> Peer B (forward) ----> Peer C
-                |----- (forward) ---------> Peer D
-
-
-    Peer A ---> Peer B (forward) ----> Peer C ----> Peer D
-
-     */
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum JoinRequest {
         StartReq {
@@ -1000,7 +1005,6 @@ mod test {
     use crate::node::tests::{check_connectivity, SimNetwork};
 
     /// Given a network of one node and one gateway test that both are connected.
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new("join_one_node_connects_to_gw", 1, 1, 1, 1, 2, 2).await;
@@ -1013,6 +1017,7 @@ mod test {
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
+        // crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(
@@ -1030,8 +1035,8 @@ mod test {
     }
 
     /// Given a network of N peers all nodes should have connections.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;

@@ -23,6 +23,7 @@ pub use executor::{Executor, ExecutorError, OperationMode};
 
 use executor::ContractExecutor;
 
+#[tracing::instrument(skip_all)]
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 // todo: remove result
 where
@@ -30,6 +31,7 @@ where
 {
     loop {
         let (id, event) = contract_handler.channel().recv_from_event_loop().await?;
+        tracing::debug!(%event, "got contract handling event");
         match event {
             ContractHandlerEvent::GetQuery {
                 key,
@@ -87,10 +89,14 @@ where
                     }
                 }
             }
-            ContractHandlerEvent::PutQuery { key, state } => {
+            ContractHandlerEvent::PutQuery {
+                key,
+                state,
+                parameters,
+            } => {
                 let put_result = contract_handler
                     .executor()
-                    .upsert_contract_state(key, Either::Left(state))
+                    .upsert_contract_state(key, Either::Left(state), parameters)
                     .await
                     .map_err(Into::into);
                 contract_handler
