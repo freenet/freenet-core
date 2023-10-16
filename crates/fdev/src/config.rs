@@ -8,7 +8,7 @@ use semver::Version;
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Freenet Development Tool")]
 #[clap(author = "The Freenet Project Inc.")]
-#[clap(version = "0.0.3")]
+#[clap(version = "0.0.6")]
 pub struct Config {
     #[clap(subcommand)]
     pub sub_command: SubCommand,
