@@ -19,7 +19,7 @@ use crate::{util, CommandSender, DynError};
 
 use super::{state::AppState, DeserializationFmt, LocalNodeCliConfig};
 
-const HELP: &str = "Locutus Contract Development Environment
+const HELP: &str = "Freenet Contract Development Environment
 
 SUBCOMMANDS:
     help        Print this message
