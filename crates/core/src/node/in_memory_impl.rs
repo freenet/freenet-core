@@ -160,7 +160,7 @@ impl NodeInMemory {
                 }
             };
 
-            if let Ok(Either::Left(Message::Canceled(tx))) = msg {
+            if let Ok(Either::Left(Message::Aborted(tx))) = msg {
                 let tx_type = tx.tx_type();
                 let res = handle_cancelled_op(
                     tx,

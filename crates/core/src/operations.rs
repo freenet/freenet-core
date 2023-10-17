@@ -75,7 +75,7 @@ where
         }
         Err((err, tx_id)) => {
             if let Some(sender) = sender {
-                conn_manager.send(&sender, Message::Canceled(tx_id)).await?;
+                conn_manager.send(&sender, Message::Aborted(tx_id)).await?;
             }
             return Err(err);
         }
