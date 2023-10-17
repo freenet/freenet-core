@@ -25,7 +25,7 @@ pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), DynError> {
 fn create_view_package(cwd: &Path) -> Result<(), DynError> {
     create_rust_crate(cwd, ContractKind::WebApp)?;
     create_web_init_files(cwd)?;
-    let locutus_file_config = BuildToolConfig {
+    let freenet_file_config = BuildToolConfig {
         contract: Contract {
             c_type: Some(ContractType::WebApp),
             lang: Some(SupportedContractLangs::Rust),
@@ -43,7 +43,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
         }),
         state: None,
     };
-    let serialized = toml::to_string(&locutus_file_config)?.into_bytes();
+    let serialized = toml::to_string(&freenet_file_config)?.into_bytes();
     let path = cwd.join("freenet").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
@@ -52,7 +52,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
 
 fn create_regular_contract(cwd: &Path) -> Result<(), DynError> {
     create_rust_crate(cwd, ContractKind::Contract)?;
-    let locutus_file_config = BuildToolConfig {
+    let freenet_file_config = BuildToolConfig {
         contract: Contract {
             c_type: Some(ContractType::Standard),
             lang: Some(SupportedContractLangs::Rust),
@@ -61,7 +61,7 @@ fn create_regular_contract(cwd: &Path) -> Result<(), DynError> {
         webapp: None,
         state: None,
     };
-    let serialized = toml::to_string(&locutus_file_config)?.into_bytes();
+    let serialized = toml::to_string(&freenet_file_config)?.into_bytes();
     let path = cwd.join("freenet").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
