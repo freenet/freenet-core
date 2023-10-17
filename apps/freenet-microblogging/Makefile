@@ -41,7 +41,7 @@ posts:
 	hash=$$(bash -c "fdev inspect build/freenet/freenet_microblogging_posts key | grep 'code key:' | cut -d' ' -f3")
 	mkdir -p $(WEB_DIR)/build
 	echo $$hash
-	echo -n $$hash > $(WEB_DIR)/src/model_code_hash.txt
+	echo -n $$hash > $(WEB_DIR)/model_code_hash.txt
 
 publish-posts:
 	cd $(POSTS_DIR)
