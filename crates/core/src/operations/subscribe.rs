@@ -9,7 +9,7 @@ use crate::{
     client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::ContractError,
-    message::{Message, Transaction, TxType},
+    message::{Message, Transaction},
     node::{ConnectionBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{PeerKeyLocation, RingError},
@@ -245,7 +245,7 @@ impl Operation for SubscribeOp {
                                     retries: retries + 1,
                                 });
                             } else {
-                                return Err(OpError::MaxRetriesExceeded(id, "sub".to_owned()));
+                                return Err(OpError::MaxRetriesExceeded(id, id.tx_type()));
                             }
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
@@ -300,8 +300,8 @@ fn build_op_result(
     })
 }
 
-pub(crate) fn start_op(key: ContractKey, peer: &PeerKey) -> SubscribeOp {
-    let id = Transaction::new(<SubscribeMsg as TxType>::tx_type_id(), peer);
+pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
+    let id = Transaction::new::<SubscribeMsg>();
     let state = Some(SubscribeState::PrepareRequest { id, key });
     SubscribeOp {
         id,
@@ -519,7 +519,7 @@ mod test {
             2,
         )
         .await;
-        sim_nodes.build_with_specs(subscribe_specs).await;
+        sim_nodes.start_with_spec(subscribe_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         Ok(())

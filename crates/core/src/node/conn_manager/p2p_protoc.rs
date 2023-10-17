@@ -359,7 +359,6 @@ impl P2pConnManager {
                             let res = handle_cancelled_op(
                                 tx,
                                 op_manager.ring.peer_key,
-                                self.gateways.iter(),
                                 &op_manager,
                                 &mut self.bridge,
                             )

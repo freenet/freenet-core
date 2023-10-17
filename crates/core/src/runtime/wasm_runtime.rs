@@ -209,7 +209,6 @@ impl Runtime {
         let module = if let Some(module) = self.delegate_modules.get(key) {
             module
         } else {
-            // FIXME
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)

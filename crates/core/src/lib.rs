@@ -25,7 +25,6 @@ pub mod local_node {
 
 /// Exports to build a running network simulation.
 pub mod network_sim {
-    // todo: streamline this
     use super::*;
     pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
     pub use node::{InitPeerNode, NodeBuilder, NodeConfig};

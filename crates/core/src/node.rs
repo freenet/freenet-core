@@ -29,7 +29,7 @@ use crate::{
         ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
         NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
     },
-    message::{InnerMessage, Message, Transaction, TransactionType, TxType},
+    message::{InnerMessage, Message, Transaction, TransactionType},
     operations::{
         get,
         join_ring::{self, JoinRingMsg, JoinRingOp},
@@ -37,13 +37,11 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
-    util::{ExponentialBackoff, IterExt},
+    util::ExponentialBackoff,
 };
 
 use crate::operations::handle_op_request;
 pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
-#[cfg(test)]
-pub(crate) use event_log::test_utils::TestEventListener;
 pub(crate) use event_log::{EventLogRegister, EventRegister};
 pub(crate) use op_state::OpManager;
 
@@ -77,7 +75,6 @@ pub struct Node(NodeP2P);
 
 impl Node {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-        //TODO: Initialize tracer
         self.0.run_node().await?;
         Ok(())
     }
@@ -284,7 +281,7 @@ async fn join_ring_request<CM>(
 where
     CM: ConnectionBridge + Send + Sync,
 {
-    let tx_id = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_key);
+    let tx_id = Transaction::new::<JoinRingMsg>();
     let mut op =
         join_ring::initial_request(peer_key, *gateway, op_storage.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
@@ -295,10 +292,7 @@ where
         );
         if backoff.sleep_async().await.is_none() {
             tracing::error!("Max number of retries reached");
-            return Err(OpError::MaxRetriesExceeded(
-                tx_id,
-                format!("{:?}", tx_id.tx_type()),
-            ));
+            return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.tx_type()));
         }
         op.backoff = Some(backoff);
     }
@@ -367,12 +361,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                         "Received put from user event @ {}",
                         &op_storage_cp.ring.peer_key
                     );
-                    let op = put::start_op(
-                        contract,
-                        state,
-                        op_storage_cp.ring.max_hops_to_live,
-                        &op_storage_cp.ring.peer_key,
-                    );
+                    let op = put::start_op(contract, state, op_storage_cp.ring.max_hops_to_live);
                     if let Err(err) = put::request_put(&op_storage_cp, op, Some(client_id)).await {
                         tracing::error!("{}", err);
                     }
@@ -393,7 +382,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                         "Received get from user event @ {}",
                         &op_storage_cp.ring.peer_key
                     );
-                    let op = get::start_op(key, contract, &op_storage_cp.ring.peer_key);
+                    let op = get::start_op(key, contract);
                     if let Err(err) = get::request_get(&op_storage_cp, op, Some(client_id)).await {
                         tracing::error!("{}", err);
                     }
@@ -403,14 +392,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     loop {
                         // FIXME: this will block the event loop until the subscribe op succeeds
                         //        instead the op should be deferred for later execution
-                        let op = subscribe::start_op(key.clone(), &op_storage_cp.ring.peer_key);
+                        let op = subscribe::start_op(key.clone());
                         match subscribe::request_subscribe(&op_storage_cp, op, Some(client_id))
                             .await
                         {
                             Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
                                 tracing::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
-                                let get_op =
-                                    get::start_op(key.clone(), true, &op_storage_cp.ring.peer_key);
+                                let get_op = get::start_op(key.clone(), true);
                                 if let Err(err) =
                                     get::request_get(&op_storage_cp, get_op, Some(client_id)).await
                                 {
@@ -446,7 +434,7 @@ macro_rules! log_handling_msg {
     ($op:expr, $id:expr, $op_storage:ident) => {
         tracing::debug!(
             tx = %$id,
-            concat!("Handling ", $op, " get request @ {}"),
+            concat!("Handling ", $op, " request @ {}"),
             $op_storage.ring.peer_key,
         );
     };
@@ -629,53 +617,27 @@ async fn process_message<CB>(
 async fn handle_cancelled_op<CM>(
     tx: Transaction,
     peer_key: PeerKey,
-    gateways: impl Iterator<Item = &PeerKeyLocation>,
     op_storage: &OpManager,
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
     CM: ConnectionBridge + Send + Sync,
 {
-    tracing::warn!(%tx, "Failed transaction, potentially attempting a retry");
     if let TransactionType::JoinRing = tx.tx_type() {
-        const MSG: &str = "Fatal error: unable to connect to the network";
         // the attempt to join the network failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
         match op_storage.pop(&tx) {
             Some(OpEnum::JoinRing(op)) if op.has_backoff() => {
-                if let JoinRingOp {
-                    backoff: Some(backoff),
-                    gateway,
-                    ..
-                } = *op
-                {
-                    if cfg!(test) {
-                        join_ring_request(None, peer_key, &gateway, op_storage, conn_manager)
-                            .await?;
-                    } else {
-                        join_ring_request(
-                            Some(backoff),
-                            peer_key,
-                            &gateway,
-                            op_storage,
-                            conn_manager,
-                        )
-                        .await?;
-                    }
-                }
+                let JoinRingOp {
+                    gateway, backoff, ..
+                } = *op;
+                let backoff = backoff.expect("infallible");
+                tracing::warn!("Retry connecting to gateway {}", gateway.peer);
+                join_ring_request(Some(backoff), peer_key, &gateway, op_storage, conn_manager)
+                    .await?;
             }
-            None | Some(OpEnum::JoinRing(_)) => {
-                let rand_gw = gateways
-                    .shuffle()
-                    .take(1)
-                    .next()
-                    .expect("at least one gateway");
-                if !cfg!(test) {
-                    tracing::error!("{}", MSG);
-                } else {
-                    tracing::debug!("{}", MSG);
-                }
-                join_ring_request(None, peer_key, rand_gw, op_storage, conn_manager).await?;
+            Some(OpEnum::JoinRing(_)) => {
+                return Err(OpError::MaxRetriesExceeded(tx, tx.tx_type()));
             }
             _ => {}
         }
@@ -693,6 +655,7 @@ impl PeerKey {
         PeerKey::from(Keypair::generate_ed25519().public())
     }
 
+    #[cfg(test)]
     pub fn to_bytes(self) -> Vec<u8> {
         self.0.to_bytes()
     }

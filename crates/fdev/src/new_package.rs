@@ -152,7 +152,7 @@ fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
             Error::CommandFailed("npm")
         })?;
     pipe_std_streams(child)?;
-    // todo: change pacakge.json:
+    // todo: change package.json:
     // - include dependencies: freenet-stdlib
 
     let child = Command::new(TSC)

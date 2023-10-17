@@ -197,8 +197,8 @@ struct GetContract {
 
 #[async_trait::async_trait]
 impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
-    fn initiate_op(self, op_manager: &OpManager) -> operations::get::GetOp {
-        operations::get::start_op(self.key, self.fetch_contract, &op_manager.ring.peer_key)
+    fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
+        operations::get::start_op(self.key, self.fetch_contract)
     }
 
     async fn resume_op(

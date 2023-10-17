@@ -103,7 +103,7 @@ impl Operation for JoinRingOp {
         _client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut return_msg = None;
+            let return_msg;
             let mut new_state = None;
 
             match input {
@@ -333,45 +333,76 @@ impl Operation for JoinRingOp {
                         peer: your_peer_id,
                     };
 
-                    match self.state {
-                        Some(JRState::Connecting(ConnectionInfo { gateway, .. })) => {
-                            if !accepted_by.clone().is_empty() {
-                                tracing::debug!(
-                                    tx = %id,
-                                    "OC received and acknowledged at requesting peer {} from gateway {}",
-                                    your_peer_id,
-                                    gateway.peer
-                                );
-                                new_state = Some(JRState::OCReceived);
-                                return_msg = Some(JoinRingMsg::Response {
-                                    id,
-                                    msg: JoinResponse::ReceivedOC { by_peer: pk_loc },
-                                    sender: pk_loc,
-                                    target: sender,
-                                });
-                            }
-                        }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                    // fixme: remove
+                    tracing::debug!(
+                        "accepted by: \nstate: {:?} \nlist: {:?}",
+                        self.state,
+                        accepted_by
+                    );
+                    let Some(JRState::Connecting(ConnectionInfo { gateway, .. })) = self.state
+                    else {
+                        return Err(OpError::InvalidStateTransition(self.id));
                     };
+                    if !accepted_by.is_empty() {
+                        tracing::debug!(
+                            tx = %id,
+                            "OC received and acknowledged at requesting peer {} from gateway {}",
+                            your_peer_id,
+                            gateway.peer
+                        );
+                        new_state = Some(JRState::OCReceived);
+                        return_msg = Some(JoinRingMsg::Response {
+                            id,
+                            msg: JoinResponse::ReceivedOC { by_peer: pk_loc },
+                            sender: pk_loc,
+                            target: sender,
+                        });
+                        tracing::debug!(
+                            tx = %id,
+                            this_peer = %your_peer_id,
+                            location = %your_location,
+                            "Updating assigned location"
+                        );
+                        op_storage.ring.update_location(Some(your_location));
 
-                    op_storage.ring.update_location(Some(your_location));
-
-                    for other_peer in accepted_by {
-                        let _ = propagate_oc_to_accepted_peers(
-                            conn_manager,
-                            op_storage,
-                            sender,
-                            &other_peer,
-                            JoinRingMsg::Response {
-                                id,
-                                target: other_peer,
-                                sender: pk_loc,
-                                msg: JoinResponse::ReceivedOC { by_peer: pk_loc },
-                            },
-                        )
-                        .await;
+                        for other_peer in accepted_by {
+                            let _ = propagate_oc_to_accepted_peers(
+                                conn_manager,
+                                op_storage,
+                                sender,
+                                &other_peer,
+                                JoinRingMsg::Response {
+                                    id,
+                                    target: other_peer,
+                                    sender: pk_loc,
+                                    msg: JoinResponse::ReceivedOC { by_peer: pk_loc },
+                                },
+                            )
+                            .await;
+                        }
+                    } else {
+                        // no connections accepted, failed
+                        tracing::debug!(
+                            tx = %id,
+                            peer = %your_peer_id,
+                            "No accepted connections, failed"
+                        );
+                        let op = JoinRingOp {
+                            id,
+                            state: None,
+                            gateway: self.gateway,
+                            backoff: self.backoff,
+                            _ttl: self._ttl,
+                        };
+                        op_storage
+                            .notify_op_change(
+                                Message::Canceled(id),
+                                OpEnum::JoinRing(op.into()),
+                                None,
+                            )
+                            .await?;
+                        return Err(OpError::StatePushed);
                     }
-                    op_storage.ring.update_location(Some(your_location));
                 }
                 JoinRingMsg::Response {
                     id,
@@ -520,9 +551,9 @@ impl Operation for JoinRingOp {
                         } else {
                             tracing::info!(
                                 tx = %id,
-                                "Successfully completed connection @ {}, new location = {:?}",
+                                assigned_location = ?op_storage.ring.own_location().location,
+                                "Successfully completed connection @ {}",
                                 target.peer,
-                                op_storage.ring.own_location().location
                             );
                             conn_manager.add_connection(sender.peer).await?;
                             op_storage.ring.add_connection(
@@ -648,6 +679,7 @@ mod states {
     }
 }
 
+#[derive(Debug)]
 enum JRState {
     Initializing,
     Connecting(ConnectionInfo),
@@ -791,22 +823,36 @@ async fn forward_conn<CM>(
 where
     CM: ConnectionBridge,
 {
-    if left_htl == 0 || (ring.num_connections() == 0 && num_accepted == 0) {
+    if left_htl == 0 {
+        tracing::debug!(
+            tx = %id,
+            requester = %req_peer.peer,
+            "Couldn't forward join petition, no hops left or enough connections",
+        );
+        return Ok(None);
+    }
+
+    if ring.num_connections() == 0 {
+        tracing::warn!(
+            tx = %id,
+            requester = %req_peer.peer,
+            "Couldn't forward join petition, not enough connections",
+        );
         return Ok(None);
     }
 
     let forward_to = if left_htl >= ring.rnd_if_htl_above {
         tracing::debug!(
             tx = %id,
-            "Randomly selecting peer to forward JoinRequest (requester: {})",
-            req_peer.peer
+            requester = %req_peer.peer,
+            "Randomly selecting peer to forward JoinRequest",
         );
-        ring.random_peer(|p| p.peer != req_peer.peer)
+        ring.random_peer(|p| p != &req_peer.peer)
     } else {
         tracing::debug!(
             tx = %id,
-            "Selecting close peer to forward request (requester: {})",
-            req_peer.peer
+            requester = %req_peer.peer,
+            "Selecting close peer to forward request",
         );
         ring.routing(&new_peer_loc.location.unwrap(), Some(&req_peer.peer), &[])
             .and_then(|pkl| (pkl.peer != new_peer_loc.peer).then_some(pkl))
@@ -840,7 +886,7 @@ where
         if num_accepted != 0 {
             tracing::warn!(
                 tx = %id,
-                "Unable to forward, will only be connected to one peer",
+                "Unable to forward, will only be connecting to one peer",
             );
         } else {
             tracing::warn!(tx = %id, "Unable to forward or accept any connections");
@@ -1008,29 +1054,28 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_connects_to_gw() {
         let mut sim_nodes = SimNetwork::new("join_one_node_connects_to_gw", 1, 1, 1, 1, 2, 2).await;
-        sim_nodes.build().await;
+        sim_nodes.start().await;
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(sim_nodes.connected(&"node-0".into()));
     }
 
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
-        // crate::config::set_logger();
+        crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
         let mut sim_nodes = SimNetwork::new(
             "join_forward_connection_to_node",
             NUM_GW,
             NUM_NODES,
-            3,
+            4,
             2,
             4,
             2,
         )
         .await;
-        sim_nodes.build().await;
+        sim_nodes.start().await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await
     }
 
@@ -1050,7 +1095,7 @@ mod test {
             2,
         )
         .await;
-        sim_nodes.build().await;
+        sim_nodes.start().await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(10)).await
     }
 }
