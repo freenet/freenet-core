@@ -130,7 +130,7 @@ pub mod local_node {
                     if let Some(cause) = cause {
                         tracing::info!("disconnecting cause: {cause}");
                     }
-                    // todo: token must live for a bit to allow reconnections
+                    // fixme: token must live for a bit to allow reconnections
                     if let Some(rm_token) = gw
                         .attested_contracts
                         .iter()

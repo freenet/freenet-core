@@ -411,7 +411,7 @@ pub(super) mod test_utils {
     use parking_lot::RwLock;
 
     use super::*;
-    use crate::{message::TxType, node::tests::NodeLabel, ring::Distance};
+    use crate::{node::tests::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -570,12 +570,11 @@ pub(super) mod test_utils {
         }
     }
 
-    #[ignore]
     #[test]
     fn test_get_connections() -> Result<(), anyhow::Error> {
         let peer_id = PeerKey::random();
         let loc = Location::try_from(0.5)?;
-        let tx = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_id);
+        let tx = Transaction::new::<JoinRingMsg>();
         let locations = [
             (PeerKey::random(), Location::try_from(0.5)?),
             (PeerKey::random(), Location::try_from(0.75)?),

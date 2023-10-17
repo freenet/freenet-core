@@ -3,10 +3,7 @@
 use std::{fmt::Display, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use uuid::{
-    v1::{Context, Timestamp},
-    Uuid,
-};
+use ulid::Ulid;
 
 use crate::{
     node::{ConnectionError, PeerKey},
@@ -19,7 +16,7 @@ use crate::{
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 
 /// An transaction is a unique, universal and efficient identifier for any
-/// roundtrip transaction as it is broadcasted around the F2 network.
+/// roundtrip transaction as it is broadcasted around the Freenet network.
 ///
 /// The identifier conveys all necessary information to identify and classify the
 /// transaction:
@@ -31,27 +28,14 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) struct Transaction {
-    /// UUID V1, can retrieve timestamp information later to check for possible out of time
-    /// expired transactions which have been clean up already.
-    id: Uuid,
+    id: Ulid,
     ty: TransactionTypeId,
 }
 
-static UUID_CONTEXT: Context = Context::new(14);
-
 impl Transaction {
-    pub fn new(ty: TransactionTypeId, initial_peer: &PeerKey) -> Transaction {
-        // using v1 UUID to keep to keep track of the creation ts
-        let ts: Timestamp = uuid::timestamp::Timestamp::now(&UUID_CONTEXT);
-
-        // event in the net this UUID should be unique since peer keys are unique
-        // however some id collision may be theoretically possible if two transactions
-        // are created at the same exact time and the first 6 bytes of the key coincide;
-        // in practice the chance of this happening is astronomically low
-
-        let b = &mut [0; 6];
-        b.copy_from_slice(&initial_peer.to_bytes()[0..6]);
-        let id = Uuid::new_v1(ts, b);
+    pub fn new<T: TxType>() -> Transaction {
+        let ty = <T as TxType>::tx_type_id();
+        let id = Ulid::new();
 
         // 3 word size for 64-bits platforms
         Self { id, ty }
@@ -109,6 +93,19 @@ mod sealed_msg_type {
         Subscribe,
         Update,
         Canceled,
+    }
+
+    impl Display for TransactionType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                TransactionType::JoinRing => write!(f, "join ring"),
+                TransactionType::Put => write!(f, "put"),
+                TransactionType::Get => write!(f, "get"),
+                TransactionType::Subscribe => write!(f, "subscribe"),
+                TransactionType::Update => write!(f, "update"),
+                TransactionType::Canceled => write!(f, "canceled"),
+            }
+        }
     }
 
     macro_rules! transaction_type_enumeration {

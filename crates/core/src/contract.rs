@@ -25,7 +25,6 @@ use executor::ContractExecutor;
 
 #[tracing::instrument(skip_all)]
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
-// todo: remove result
 where
     CH: ContractHandler + Send + 'static,
 {

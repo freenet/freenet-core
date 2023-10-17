@@ -51,6 +51,7 @@ fn compile_options(cli_config: &BuildToolCliConfig) -> impl Iterator<Item = Stri
         .chain(release.iter().map(|s| s.to_string()))
 }
 
+#[cfg(test)]
 #[test]
 fn test_get_compile_options() {
     let config = BuildToolCliConfig {

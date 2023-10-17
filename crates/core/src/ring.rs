@@ -342,13 +342,32 @@ impl Ring {
     /// Get a random peer from the known ring connections.
     pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
     where
-        F: FnMut(&&PeerKeyLocation) -> bool,
+        F: Fn(&PeerKey) -> bool,
     {
-        self.connections_by_location
-            .read()
-            .values()
-            .find(filter_fn)
-            .copied()
+        use rand::Rng;
+        let peers = &*self.location_for_peer.read();
+        let amount = peers.len();
+        if amount == 0 {
+            return None;
+        }
+        let mut rng = rand::thread_rng();
+        let mut attempts = 0;
+        loop {
+            if attempts >= amount {
+                return None;
+            }
+            let selected = rng.gen_range(0..amount);
+            let (peer, loc) = peers.iter().nth(selected).expect("infallible");
+            if !filter_fn(peer) {
+                attempts += 1;
+                continue;
+            } else {
+                return Some(PeerKeyLocation {
+                    peer: *peer,
+                    location: Some(*loc),
+                });
+            }
+        }
     }
 
     /// Will return an error in case the max number of subscribers has been added.
@@ -456,8 +475,7 @@ impl From<&ContractKey> for Location {
 
 impl Display for Location {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.to_string().as_str())?;
-        Ok(())
+        write!(f, "{}", self.0)
     }
 }
 
@@ -558,10 +576,7 @@ pub(crate) enum RingError {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::client_events::test::MemoryEventsGen;
-    use tokio::sync::watch::channel;
 
-    #[ignore]
     #[test]
     fn location_dist() {
         let l0 = Location(0.);
@@ -571,59 +586,5 @@ mod test {
         let l0 = Location(0.75);
         let l1 = Location(0.50);
         assert!(l0.distance(l1) == Distance(0.25));
-    }
-
-    #[ignore]
-    #[test]
-    fn find_closest() {
-        let peer_key: PeerKey = PeerKey::random();
-
-        let (_, receiver) = channel((0, peer_key));
-        let user_events = MemoryEventsGen::new(receiver, peer_key);
-        let config = NodeBuilder::new([Box::new(user_events)]);
-        let ring = Ring::new::<1, node::TestEventListener>(&config, &[]).unwrap();
-
-        fn build_pk(loc: Location) -> PeerKeyLocation {
-            PeerKeyLocation {
-                peer: PeerKey::random(),
-                location: Some(loc),
-            }
-        }
-
-        {
-            let conns = &mut *ring.connections_by_location.write();
-            conns.insert(Location(0.3), build_pk(Location(0.3)));
-            conns.insert(Location(0.5), build_pk(Location(0.5)));
-            conns.insert(Location(0.0), build_pk(Location(0.0)));
-        }
-
-        assert_eq!(
-            Location(0.0),
-            ring.routing(&Location(0.9), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
-        assert_eq!(
-            Location(0.0),
-            ring.routing(&Location(0.1), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
-        assert_eq!(
-            Location(0.5),
-            ring.routing(&Location(0.41), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
-        assert_eq!(
-            Location(0.3),
-            ring.routing(&Location(0.39), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
     }
 }

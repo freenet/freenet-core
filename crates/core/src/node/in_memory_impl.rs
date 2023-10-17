@@ -145,6 +145,7 @@ impl NodeInMemory {
     }
 
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
+    #[tracing::instrument(name = "memory_event_listener", skip_all)]
     async fn run_event_listener(
         &mut self,
         _client_responses: ClientResponsesSender, // fixme: use this
@@ -164,7 +165,6 @@ impl NodeInMemory {
                 let res = handle_cancelled_op(
                     tx,
                     self.peer_key,
-                    self.gateways.iter(),
                     &self.op_storage,
                     &mut self.conn_manager,
                 )
@@ -174,15 +174,18 @@ impl NodeInMemory {
                         if tx_type == TransactionType::JoinRing && !self.is_gateway =>
                     {
                         tracing::warn!("Retrying joining the ring with an other peer");
-                        let gateway = self.gateways.iter().shuffle().next().unwrap();
-                        join_ring_request(
-                            None,
-                            self.peer_key,
-                            gateway,
-                            &self.op_storage,
-                            &mut self.conn_manager,
-                        )
-                        .await?
+                        if let Some(gateway) = self.gateways.iter().shuffle().next() {
+                            join_ring_request(
+                                None,
+                                self.peer_key,
+                                gateway,
+                                &self.op_storage,
+                                &mut self.conn_manager,
+                            )
+                            .await?
+                        } else {
+                            anyhow::bail!("requires at least one gateway");
+                        }
                     }
                     Err(err) => return Err(anyhow::anyhow!(err)),
                     Ok(_) => {}

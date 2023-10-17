@@ -8,7 +8,7 @@ use crate::{
     client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
-    message::{InnerMessage, Message, Transaction, TxType},
+    message::{InnerMessage, Message, Transaction},
     node::{ConnectionBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
@@ -409,7 +409,7 @@ impl Operation for GetOp {
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
-                                return Err(OpError::MaxRetriesExceeded(id, "get".to_owned()));
+                                return Err(OpError::MaxRetriesExceeded(id, id.tx_type()));
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
@@ -620,11 +620,11 @@ fn check_contract_found(
     }
 }
 
-pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, this_peer: &PeerKey) -> GetOp {
+pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
     let contract_location = Location::from(&key);
     tracing::debug!("Requesting get contract {} @ loc({contract_location})", key,);
 
-    let id = Transaction::new(<GetMsg as TxType>::tx_type_id(), this_peer);
+    let id = Transaction::new::<GetMsg>();
     let state = Some(GetState::PrepareRequest {
         key,
         id,
@@ -861,7 +861,7 @@ mod test {
             2,
         )
         .await;
-        sim_nodes.build_with_specs(get_specs).await;
+        sim_nodes.start_with_spec(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger get @ node-0, which does not own the contract
@@ -900,7 +900,7 @@ mod test {
         // establish network
         let mut sim_nodes =
             SimNetwork::new("get_contract_not_found", NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
-        sim_nodes.build_with_specs(get_specs).await;
+        sim_nodes.start_with_spec(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         // trigger get @ node-1, which does not own the contract
@@ -969,7 +969,7 @@ mod test {
             3,
         )
         .await;
-        sim_nodes.build_with_specs(get_specs).await;
+        sim_nodes.start_with_spec(get_specs).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
         sim_nodes

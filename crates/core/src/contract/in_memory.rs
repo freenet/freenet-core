@@ -88,7 +88,6 @@ impl ContractHandler for MemoryContractHandler {
     }
 }
 
-#[ignore]
 #[test]
 fn serialization() -> Result<(), anyhow::Error> {
     let bytes = crate::util::test::random_bytes_1024();

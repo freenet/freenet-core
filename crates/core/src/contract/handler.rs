@@ -289,7 +289,6 @@ impl ContractHandlerToEventLoopChannel<NetEventListener> {
         }
     }
 
-    // todo: use
     pub async fn recv_from_handler(&mut self) -> (EventId, ContractHandlerEvent) {
         todo!()
     }
@@ -424,55 +423,56 @@ pub mod test {
 
     use crate::runtime::ContractStore;
     use freenet_stdlib::{
-        client_api::{ClientRequest, HostResponse},
+        client_api::{ClientRequest, ContractRequest, HostResponse},
         prelude::*,
     };
 
     use super::*;
     use crate::{config::GlobalExecutor, contract::MockRuntime};
 
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_test() -> Result<(), anyhow::Error> {
         let (mut send_halve, mut rcv_halve) = contract_handler_channel();
 
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
+            Parameters::from(vec![4, 5]),
+        )));
+
+        let contract_cp = contract.clone();
         let h = GlobalExecutor::spawn(async move {
-            let contract =
-                ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-                    Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
-                    Parameters::from(vec![]),
-                )));
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(contract), None)
+                .send_to_handler(ContractHandlerEvent::Cache(contract_cp), None)
                 .await
         });
-
         let (id, ev) =
             tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_event_loop())
                 .await??;
 
-        if let ContractHandlerEvent::Cache(contract) = ev {
-            let data: Vec<u8> = contract.data();
-            assert_eq!(data, vec![0, 1, 2, 3]);
-            let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-                WrappedContract::new(Arc::new(ContractCode::from(data)), Parameters::from(vec![])),
-            ));
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                rcv_halve.send_to_event_loop(id, ContractHandlerEvent::Cache(contract)),
-            )
-            .await??;
-        } else {
+        let ContractHandlerEvent::Cache(contract) = ev else {
             anyhow::bail!("invalid event");
-        }
+        };
+        assert_eq!(contract.data(), vec![0, 1, 2, 3]);
 
-        if let ContractHandlerEvent::Cache(contract) = h.await?? {
-            let data: Vec<u8> = contract.data();
-            assert_eq!(data, vec![0, 1, 2, 3]);
-        } else {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            rcv_halve.send_to_event_loop(id, ContractHandlerEvent::Cache(contract)),
+        )
+        .await??;
+        let ContractHandlerEvent::Cache(contract) = h.await?? else {
             anyhow::bail!("invalid event!");
-        }
+        };
+        assert_eq!(contract.data(), vec![0, 1, 2, 3]);
 
         Ok(())
+    }
+
+    // Prepare and get handler for an in-memory sqlite db
+    async fn get_handler(test: &str) -> Result<NetworkContractHandler<MockRuntime>, DynError> {
+        let (_, ch_handler) = contract_handler_channel();
+        let (_, executor_sender) = super::super::executor::executor_channel_test();
+        let handler =
+            NetworkContractHandler::build(ch_handler, executor_sender, test.to_owned()).await?;
+        Ok(handler)
     }
 }

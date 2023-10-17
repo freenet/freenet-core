@@ -62,7 +62,6 @@ impl NodeP2P {
         }
 
         // start the p2p event loop
-        // todo: pass  `cli_response_sender`
         self.conn_manager
             .run_event_listener(
                 self.op_manager.clone(),

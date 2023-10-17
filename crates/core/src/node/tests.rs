@@ -122,6 +122,7 @@ pub(crate) struct SimNetwork {
     rnd_if_htl_above: usize,
     max_connections: usize,
     min_connections: usize,
+    init_backoff: Duration,
 }
 
 impl SimNetwork {
@@ -149,6 +150,7 @@ impl SimNetwork {
             rnd_if_htl_above,
             max_connections,
             min_connections,
+            init_backoff: Duration::from_millis(1),
         };
         net.build_gateways(gateways).await;
         net.build_nodes(nodes).await;
@@ -272,11 +274,11 @@ impl SimNetwork {
         }
     }
 
-    pub async fn build(&mut self) {
-        self.build_with_specs(HashMap::new()).await
+    pub async fn start(&mut self) {
+        self.start_with_spec(HashMap::new()).await
     }
 
-    pub async fn build_with_specs(&mut self, mut specs: HashMap<NodeLabel, NodeSpecification>) {
+    pub async fn start_with_spec(&mut self, mut specs: HashMap<NodeLabel, NodeSpecification>) {
         let mut gw_not_init = self.gateways.len();
         let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
         for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
@@ -284,8 +286,9 @@ impl SimNetwork {
             self.initialize_peer(node, label, node_spec);
             if gw_not_init != 0 {
                 gw_not_init -= 1;
+                tokio::time::sleep(self.init_backoff).await;
             } else {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(self.init_backoff).await;
             }
         }
     }
@@ -302,6 +305,7 @@ impl SimNetwork {
             user_events.request_contracts(specs.non_owned_contracts);
             user_events.generate_events(specs.events_to_generate);
         }
+        tracing::debug!(peer = %label, "initializing");
         self.labels.insert(label, peer.peer_key);
         GlobalExecutor::spawn(async move {
             if let Some(specs) = node_specs {
@@ -369,17 +373,16 @@ impl SimNetwork {
 
     /// Returns the connectivity in the network per peer (that is all the connections
     /// this peers has registered).
-    pub fn node_connectivity(&self) -> HashMap<NodeLabel, HashMap<NodeLabel, Distance>> {
+    pub fn node_connectivity(&self) -> HashMap<NodeLabel, (PeerKey, HashMap<NodeLabel, Distance>)> {
         let mut peers_connections = HashMap::with_capacity(self.labels.len());
         let key_to_label: HashMap<_, _> = self.labels.iter().map(|(k, v)| (v, k)).collect();
         for (label, key) in &self.labels {
-            peers_connections.insert(
-                label.clone(),
-                self.event_listener
-                    .connections(*key)
-                    .map(|(k, d)| (key_to_label[&k].clone(), d))
-                    .collect::<HashMap<_, _>>(),
-            );
+            let conns = self
+                .event_listener
+                .connections(*key)
+                .map(|(k, d)| (key_to_label[&k].clone(), d))
+                .collect::<HashMap<_, _>>();
+            peers_connections.insert(label.clone(), (*key, conns));
         }
         peers_connections
     }
@@ -478,7 +481,7 @@ pub(crate) async fn check_connectivity(
 
     let mut connections_per_peer: Vec<_> = node_connectivity
         .iter()
-        .map(|(k, v)| (k, v.len()))
+        .map(|(k, v)| (k, v.1.len()))
         .filter_map(|(k, v)| if !k.is_gateway() { Some(v) } else { None })
         .collect();
 
@@ -497,15 +500,17 @@ pub(crate) async fn check_connectivity(
     Ok(())
 }
 
-fn pretty_print_connections(conns: &HashMap<NodeLabel, HashMap<NodeLabel, Distance>>) -> String {
+fn pretty_print_connections(
+    conns: &HashMap<NodeLabel, (PeerKey, HashMap<NodeLabel, Distance>)>,
+) -> String {
     let mut connections = String::from("Node connections:\n");
     let mut conns = conns.iter().collect::<Vec<_>>();
     conns.sort_by(|(a, _), (b, _)| a.cmp(b));
-    for (peer, conns) in conns {
+    for (peer, (key, conns)) in conns {
         if peer.is_gateway() {
             continue;
         }
-        writeln!(&mut connections, "{peer}:").unwrap();
+        writeln!(&mut connections, "{peer} ({key}):").unwrap();
         for (conn, dist) in conns {
             let dist = dist.as_f64();
             writeln!(&mut connections, "    {conn} (dist: {dist:.3})").unwrap();
@@ -514,7 +519,6 @@ fn pretty_print_connections(conns: &HashMap<NodeLabel, HashMap<NodeLabel, Distan
     connections
 }
 
-#[ignore]
 #[test]
 fn group_locations_test() -> Result<(), anyhow::Error> {
     let locations = vec![0.5356, 0.5435, 0.5468, 0.5597, 0.6745, 0.7309, 0.7412];

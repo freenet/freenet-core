@@ -15,7 +15,7 @@ use crate::{
     client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::ContractHandlerEvent,
-    message::{InnerMessage, Message, Transaction, TxType},
+    message::{InnerMessage, Message, Transaction },
     node::{ConnectionBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
@@ -601,7 +601,6 @@ pub(crate) fn start_op(
     contract: ContractContainer,
     value: WrappedState,
     htl: usize,
-    peer: &PeerKey,
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
@@ -610,7 +609,7 @@ pub(crate) fn start_op(
         key,
     );
 
-    let id = Transaction::new(<PutMsg as TxType>::tx_type_id(), peer);
+    let id = Transaction::new::<PutMsg>();
     // let payload_size = contract.data().len();
     let state = Some(PutState::PrepareRequest {
         contract,
@@ -929,9 +928,9 @@ mod test {
     use super::*;
     use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
 
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
+        crate::config::set_logger();
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
@@ -1001,11 +1000,11 @@ mod test {
             ("gateway-0".into(), gw_0),
         ]);
 
-        sim_nodes.build_with_specs(put_specs).await;
+        sim_nodes.start_with_spec(put_specs).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
         check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
 
-        // trigger the put op @ gw-0, this
+        // trigger the put op @ gw-0
         sim_nodes
             .trigger_event(&"gateway-0".into(), 1, Some(Duration::from_secs(3)))
             .await?;

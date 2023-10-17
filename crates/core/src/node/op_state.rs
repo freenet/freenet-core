@@ -62,8 +62,7 @@ impl OpManager {
     }
 
     /// An early, fast path, return for communicating back changes of on-going operations
-    /// in the node to the main message handler receiving loop, without any transmission in
-    /// the network whatsoever.
+    /// in the node to the main message handler, without any transmission in the network whatsoever.
     ///
     /// Useful when transitioning between states that do not require any network communication
     /// with other nodes, like intermediate states before returning.

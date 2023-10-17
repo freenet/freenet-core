@@ -197,8 +197,8 @@ pub(crate) enum OpError {
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
     OpNotPresent(Transaction),
-    #[error("max number of retries for tx {0} of op type {1} reached")]
-    MaxRetriesExceeded(Transaction, String),
+    #[error("max number of retries for tx {0} of op type `{1}` reached")]
+    MaxRetriesExceeded(Transaction, TransactionType),
 
     // user for control flow
     /// This is used as an early interrumpt of an op update when an op
