@@ -354,7 +354,7 @@ impl P2pConnManager {
                 Ok(Left((msg, client_id))) => {
                     let cb = self.bridge.clone();
                     match msg {
-                        Message::Canceled(tx) => {
+                        Message::Aborted(tx) => {
                             let tx_type = tx.tx_type();
                             let res = handle_cancelled_op(
                                 tx,

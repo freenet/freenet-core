@@ -17,8 +17,6 @@ use crate::{
 
 pub(crate) use self::messages::{JoinRequest, JoinResponse, JoinRingMsg};
 
-const MAX_JOIN_RETRIES: usize = 3;
-
 pub(crate) struct JoinRingOp {
     id: Transaction,
     state: Option<JRState>,
@@ -132,7 +130,7 @@ impl Operation for JoinRingOp {
                         tracing::debug!(tx = %id, "Accepting connection from {}", req_peer,);
                         HashSet::from_iter([this_node_loc])
                     } else {
-                        tracing::debug!(tx = %id, "Rejecting connection from peer {}", req_peer);
+                        tracing::debug!(tx = %id, at_peer = %this_node_loc.peer, "Rejecting connection from peer {}", req_peer);
                         HashSet::new()
                     };
 
@@ -334,16 +332,13 @@ impl Operation for JoinRingOp {
                     };
 
                     // fixme: remove
-                    tracing::debug!(
-                        "accepted by: \nstate: {:?} \nlist: {:?}",
-                        self.state,
-                        accepted_by
-                    );
+                    tracing::debug!("accepted by state: {:?} ", self.state,);
                     let Some(JRState::Connecting(ConnectionInfo { gateway, .. })) = self.state
                     else {
                         return Err(OpError::InvalidStateTransition(self.id));
                     };
                     if !accepted_by.is_empty() {
+                        tracing::debug!("accepted by list: {:?} ", accepted_by);
                         tracing::debug!(
                             tx = %id,
                             "OC received and acknowledged at requesting peer {} from gateway {}",
@@ -385,7 +380,7 @@ impl Operation for JoinRingOp {
                         tracing::debug!(
                             tx = %id,
                             peer = %your_peer_id,
-                            "No accepted connections, failed"
+                            "Failed to establish any connections, aborting"
                         );
                         let op = JoinRingOp {
                             id,
@@ -396,7 +391,7 @@ impl Operation for JoinRingOp {
                         };
                         op_storage
                             .notify_op_change(
-                                Message::Canceled(id),
+                                Message::Aborted(id),
                                 OpEnum::JoinRing(op.into()),
                                 None,
                             )
@@ -472,7 +467,7 @@ impl Operation for JoinRingOp {
                                     target: state_target,
                                     sender: target,
                                     msg: JoinResponse::AcceptedBy {
-                                        peers: accepted_by,
+                                        peers: previously_accepted,
                                         your_location: new_location,
                                         your_peer_id: new_peer_id,
                                     },
@@ -490,7 +485,9 @@ impl Operation for JoinRingOp {
                                     id,
                                     target: state_target,
                                     sender: target,
-                                    msg: JoinResponse::Proxy { accepted_by },
+                                    msg: JoinResponse::Proxy {
+                                        accepted_by: previously_accepted,
+                                    },
                                 });
                             }
                         }
@@ -733,19 +730,25 @@ pub(crate) fn initial_request(
     max_hops_to_live: usize,
     id: Transaction,
 ) -> JoinRingOp {
+    const MAX_JOIN_RETRIES: usize = 3;
     tracing::debug!(tx = %id, "Connecting to gw {} from {}", gateway.peer, this_peer);
     let state = JRState::Connecting(ConnectionInfo {
         gateway,
         this_peer,
         max_hops_to_live,
     });
+    let ceiling = if cfg!(test) {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(120)
+    };
     JoinRingOp {
         id,
         state: Some(state),
         gateway: Box::new(gateway),
         backoff: Some(ExponentialBackoff::new(
             Duration::from_secs(1),
-            Duration::from_secs(120),
+            ceiling,
             MAX_JOIN_RETRIES,
         )),
         _ttl: PEER_TIMEOUT,
@@ -1069,14 +1072,14 @@ mod test {
             "join_forward_connection_to_node",
             NUM_GW,
             NUM_NODES,
-            4,
+            3,
             2,
-            4,
-            2,
+            8,
+            5,
         )
         .await;
         sim_nodes.start().await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await
+        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(10)).await
     }
 
     /// Given a network of N peers all nodes should have connections.

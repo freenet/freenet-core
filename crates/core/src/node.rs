@@ -286,10 +286,7 @@ where
         join_ring::initial_request(peer_key, *gateway, op_storage.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
-        tracing::warn!(
-            "Performing a new join attempt, attempt number: {}",
-            backoff.retries()
-        );
+        tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
         if backoff.sleep_async().await.is_none() {
             tracing::error!("Max number of retries reached");
             return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.tx_type()));

@@ -251,23 +251,27 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: &Location) -> bool {
+        let cbl = &*self.connections_by_location.read();
         let open_conn = self.open_connections.fetch_add(1, SeqCst) + 1;
         let my_location = &self
             .own_location()
             .location
             .expect("this node has no location assigned!");
-        let cbl = &*self.connections_by_location.read();
         let accepted = if location == my_location || cbl.contains_key(location) {
             false
         } else if open_conn < self.min_connections {
             true
         } else if open_conn >= self.max_connections {
+            tracing::debug!(peer = %self.peer_key, "max connections reached");
             false
         } else {
-            my_location.distance(location)
-                < self
-                    .median_distance_to(my_location)
-                    .unwrap_or(Distance(0.5))
+            let median_distance = self
+                .median_distance_to(my_location)
+                .unwrap_or(Distance(0.5));
+            let dist_to_loc = my_location.distance(location);
+            let is_lower_than_median = dist_to_loc < median_distance;
+            tracing::debug!("dist to connection loc: {dist_to_loc}, median dist: {median_distance}, accepting: {is_lower_than_median}");
+            is_lower_than_median
         };
         if !accepted {
             self.open_connections.fetch_sub(1, SeqCst);
@@ -571,6 +575,12 @@ impl Ord for Distance {
         self.0
             .partial_cmp(&other.0)
             .expect("always should return a cmp value")
+    }
+}
+
+impl Display for Distance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

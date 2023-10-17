@@ -142,8 +142,8 @@ pub(crate) enum Message {
     Get(GetMsg),
     Subscribe(SubscribeMsg),
     Update(UpdateMsg),
-    /// Failed a transaction, informing of cancellation.
-    Canceled(Transaction),
+    /// Failed a transaction, informing of abortion.
+    Aborted(Transaction),
 }
 
 pub(crate) trait InnerMessage: Into<Message> {
@@ -191,7 +191,7 @@ impl Message {
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
             Update(_op) => todo!(),
-            Canceled(tx) => tx,
+            Aborted(tx) => tx,
         }
     }
 
@@ -203,7 +203,7 @@ impl Message {
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
             Update(_op) => todo!(),
-            Canceled(_) => None,
+            Aborted(_) => None,
         }
     }
 
@@ -216,13 +216,13 @@ impl Message {
             Get(op) => op.terminal(),
             Subscribe(op) => op.terminal(),
             Update(_op) => todo!(),
-            Canceled(_) => true,
+            Aborted(_) => true,
         }
     }
 
     pub fn track_stats(&self) -> bool {
         use Message::*;
-        !matches!(self, JoinRing(_) | Subscribe(_) | Canceled(_))
+        !matches!(self, JoinRing(_) | Subscribe(_) | Aborted(_))
     }
 }
 
@@ -236,7 +236,7 @@ impl Display for Message {
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
             Update(_op) => todo!(),
-            Canceled(msg) => msg.fmt(f)?,
+            Aborted(msg) => msg.fmt(f)?,
         };
         write!(f, "}}")
     }
