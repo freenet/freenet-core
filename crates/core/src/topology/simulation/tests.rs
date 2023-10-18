@@ -1,4 +1,4 @@
-use super::*;
+
 
 fn setup() {
     // Initialize the tracer
@@ -7,6 +7,14 @@ fn setup() {
         .try_init()
         .unwrap_or(());
 }
+
+#[test]
+fn it_ticks_the_network() {
+    let mut network = SimulatedNetwork::new();
+    network.tick();
+    assert_eq!(network.current_time, 1);
+}
+
 #[test]
 fn test_add_node() {
     setup();
@@ -22,9 +30,9 @@ fn test_connect() {
     let mut net = SimulatedNetwork::new();
     let a = net.add_node();
     let b = net.add_node();
-    net.connect(a, b);
-    assert!(net.connections.get(&a).unwrap().contains(&b));
-    assert!(net.connections.get(&b).unwrap().contains(&a));
+    net.connections.connect(a, b);
+    assert!(net.connections.0.get(&a).unwrap().contains(&b));
+    assert!(net.connections.0.get(&b).unwrap().contains(&a));
 }
 
 #[test]
@@ -33,10 +41,10 @@ fn test_disconnect() {
     let mut net = SimulatedNetwork::new();
     let a = net.add_node();
     let b = net.add_node();
-    net.connect(a, b);
-    net.disconnect(a, b);
-    assert!(!net.connections.get(&a).unwrap().contains(&b));
-    assert!(!net.connections.get(&b).unwrap().contains(&a));
+    net.connections.connect(a, b);
+    net.connections.disconnect(a, b);
+    assert!(!net.connections.0.get(&a).unwrap().contains(&b));
+    assert!(!net.connections.0.get(&b).unwrap().contains(&a));
 }
 
 #[test]
@@ -45,7 +53,7 @@ fn test_route_success() {
     let mut net = SimulatedNetwork::new();
     let a = net.add_node();
     let b = net.add_node();
-    net.connect(a, b);
+    net.connections.connect(a, b);
 
     // Mock a destination location that's the same as node b's location
     let destination = net.nodes[b.index].location;
@@ -131,3 +139,4 @@ fn test_join_with_tolerance() {
     assert!(join_result.is_some());
     assert_eq!(join_result.unwrap(), vec![b]);
 }
+

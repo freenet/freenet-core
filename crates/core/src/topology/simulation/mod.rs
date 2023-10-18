@@ -1,15 +1,42 @@
 mod event_stat_tracker;
+mod tests;
 
 use crate::ring::Distance;
 use super::*;
 use event_stat_tracker::EventStatTracker;
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, info, warn};
 
+#[derive(Debug)]
+struct Connections(HashMap<NodeRef, HashSet<NodeRef>>);
+
+impl Connections {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    fn connect(&mut self, a: NodeRef, b: NodeRef) {
+        // throw an error if a == b
+        assert!(a != b, "Cannot connect a node to itself");
+
+        info!("Connecting {:?} and {:?}", a, b);
+        self.0.entry(a).or_default().insert(b);
+        self.0.entry(b).or_default().insert(a);
+    }
+
+    fn disconnect(&mut self, a: NodeRef, b: NodeRef) {
+        info!("Disconnecting {:?} and {:?}", a, b);
+        self.0.entry(a).or_default().remove(&b);
+        self.0.entry(b).or_default().remove(&a);
+    }
+
+}
 
 #[derive(Debug)]
 struct SimulatedNetwork {
     current_time: u64,
     nodes: Vec<SimulatedNode>,
-    connections: HashMap<NodeRef, HashSet<NodeRef>>,
+    connections: Connections,
     requests: HashMap<NodeRef, (EventStatTracker, HashMap<NodeRef, EventStatTracker>)>, // origin node -> destination node -> requests
 }
 
@@ -22,10 +49,12 @@ impl SimulatedNetwork {
         Self {
             current_time: 0,
             nodes: Vec::new(),
-            connections: HashMap::new(),
+            connections: Connections::new(),
             requests: HashMap::new(),
         }
     }
+
+    pub(crate) 
 
     fn add_node(&mut self) -> NodeRef {
         let index = self.nodes.len();
@@ -36,21 +65,6 @@ impl SimulatedNetwork {
         debug!("Adding node {:?}", node);
         self.nodes.push(node);
         NodeRef { index }
-    }
-
-    fn connect(&mut self, a: NodeRef, b: NodeRef) {
-        // throw an error if a == b
-        assert!(a != b, "Cannot connect a node to itself");
-
-        info!("Connecting {:?} and {:?}", a, b);
-        self.connections.entry(a).or_default().insert(b);
-        self.connections.entry(b).or_default().insert(a);
-    }
-
-    fn disconnect(&mut self, a: NodeRef, b: NodeRef) {
-        info!("Disconnecting {:?} and {:?}", a, b);
-        self.connections.entry(a).or_default().remove(&b);
-        self.connections.entry(b).or_default().remove(&a);
     }
 
     fn route(&self, source: &NodeRef, destination: Location) -> Result<Vec<NodeRef>, RouteError> {
@@ -76,7 +90,7 @@ impl SimulatedNetwork {
             debug!("Current distance to destination: {}", current_distance);
 
             // Find the closest connected node to the destination that hasn't been visited
-            let closest_connections = match self.connections.get(&current) {
+            let closest_connections = match self.connections.0.get(&current) {
                 Some(connections) => connections,
                 None => {
                     // Handle the None case here. For example, you might want to return agit n Err value or break the loop.
@@ -175,9 +189,22 @@ impl SimulatedNetwork {
         };
 
         for joiner in joiners.iter() {
-            self.connect(node, *joiner);
+            self.connections.connect(node, *joiner);
         }
     }
+
+    pub(crate) fn add_and_assimilate_node(&mut self, strategy: TopologyStrategy, peer_statistics: &PeerStatistics) -> NodeRef {
+        let new_node = self.add_node();
+        
+        let my_location = &self.nodes[new_node.index].location;
+        
+        let JoinTargetInfo { target, threshold, .. } = strategy.select_join_target_location(my_location, peer_statistics);
+        
+        self.join(new_node, target, threshold);
+        
+        new_node
+    }
+
 }
 
 #[derive(Debug)]
