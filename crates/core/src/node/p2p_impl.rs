@@ -72,18 +72,18 @@ impl NodeP2P {
             .await
     }
 
-    pub(crate) async fn build<CH, const CLIENTS: usize, EL: EventLogRegister>(
+    pub(crate) async fn build<CH, const CLIENTS: usize, EL>(
         builder: NodeBuilder<CLIENTS>,
         event_listener: EL,
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
+        EL: EventLogRegister + Clone,
     {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
 
-        let event_listener: Box<dyn EventLogRegister> = Box::new(event_listener);
         let ring = Ring::new::<CLIENTS, EL>(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
@@ -96,7 +96,7 @@ impl NodeP2P {
 
         let conn_manager = {
             let transport = Self::config_transport(&builder.local_key)?;
-            P2pConnManager::build(transport, &builder, op_storage.clone(), &*event_listener)?
+            P2pConnManager::build(transport, &builder, op_storage.clone(), event_listener)?
         };
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));

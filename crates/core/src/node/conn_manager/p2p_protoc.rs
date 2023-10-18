@@ -5,6 +5,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::Poll,
+    time::Duration,
 };
 
 use asynchronous_codec::{BytesMut, Framed};
@@ -31,7 +32,10 @@ use libp2p::{
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    Mutex,
+};
 use unsigned_varint::codec::UviBytes;
 
 use super::{ConnectionBridge, ConnectionError, EventLoopNotifications};
@@ -41,8 +45,8 @@ use crate::{
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
     message::{Message, NodeEvent, Transaction, TransactionType},
     node::{
-        handle_cancelled_op, join_ring_request, process_message, EventLogRegister, InitPeerNode,
-        NodeBuilder, OpManager, PeerKey,
+        event_log::EventLog, handle_cancelled_op, join_ring_request, process_message,
+        EventLogRegister, InitPeerNode, NodeBuilder, OpManager, PeerKey,
     },
     operations::OpError,
     ring::PeerKeyLocation,
@@ -117,19 +121,73 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 
 type P2pBridgeEvent = Either<(PeerKey, Box<Message>), NodeEvent>;
 
-#[derive(Clone)]
 pub(crate) struct P2pBridge {
     active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
     accepted_peers: Arc<DashSet<PeerKey>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
+    op_manager: Arc<OpManager>,
+    log_register: Arc<Mutex<Box<dyn EventLogRegister>>>,
 }
 
 impl P2pBridge {
-    fn new(sender: Sender<P2pBridgeEvent>) -> Self {
+    fn new<EL>(
+        sender: Sender<P2pBridgeEvent>,
+        op_manager: Arc<OpManager>,
+        event_register: EL,
+    ) -> Self
+    where
+        EL: EventLogRegister,
+    {
         Self {
             active_net_connections: Arc::new(DashMap::new()),
             accepted_peers: Arc::new(DashSet::new()),
             ev_listener_tx: sender,
+            op_manager,
+            log_register: Arc::new(Mutex::new(Box::new(event_register))),
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, test))]
+static CONTESTED_BRIDGE_CLONES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(debug_assertions, test))]
+static TOTAL_BRIDGE_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Clone for P2pBridge {
+    fn clone(&self) -> Self {
+        let log_register = loop {
+            if let Ok(lr) = self.log_register.try_lock() {
+                #[cfg(any(debug_assertions, test))]
+                {
+                    TOTAL_BRIDGE_CLONES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                break lr.trait_clone();
+            }
+            #[cfg(any(debug_assertions, test))]
+            {
+                let contested =
+                    CONTESTED_BRIDGE_CLONES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+                if contested % 100 == 0 {
+                    let total = TOTAL_BRIDGE_CLONES.load(std::sync::atomic::Ordering::Acquire);
+                    if total > 0 {
+                        let threshold = (total as f64 * 0.01) as usize;
+                        if contested / total > threshold {
+                            tracing::debug!("p2p bridge clone contested more than 1% of the time");
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_nanos(50));
+        };
+        Self {
+            active_net_connections: self.active_net_connections.clone(),
+            accepted_peers: self.accepted_peers.clone(),
+            ev_listener_tx: self.ev_listener_tx.clone(),
+            op_manager: self.op_manager.clone(),
+            log_register: Arc::new(Mutex::new(log_register)),
         }
     }
 }
@@ -157,6 +215,10 @@ impl ConnectionBridge for P2pBridge {
     }
 
     async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+        self.log_register
+            .lock()
+            .await
+            .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager));
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
             .await
@@ -180,7 +242,7 @@ impl P2pConnManager {
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeBuilder<CLIENTS>,
         op_manager: Arc<OpManager>,
-        event_listener: &dyn EventLogRegister,
+        event_listener: impl EventLogRegister + Clone,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
@@ -197,7 +259,7 @@ impl P2pConnManager {
             &config.local_key,
             &config.remote_nodes,
             &public_addr,
-            op_manager,
+            op_manager.clone(),
         );
         let mut swarm = Swarm::new(
             transport,
@@ -212,7 +274,7 @@ impl P2pConnManager {
         }
 
         let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
-        let bridge = P2pBridge::new(tx_bridge_cmd);
+        let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
 
         let gateways = config.get_gateways()?;
         Ok(P2pConnManager {
@@ -221,7 +283,7 @@ impl P2pConnManager {
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
             public_addr,
-            event_listener: event_listener.trait_clone(),
+            event_listener: Box::new(event_listener),
         })
     }
 

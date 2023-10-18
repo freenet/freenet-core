@@ -814,7 +814,7 @@ mod test {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
+    use crate::node::tests::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -851,7 +851,7 @@ mod test {
         let get_specs = HashMap::from_iter([("node-0".into(), node_0), ("gateway-0".into(), gw_0)]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(
+        let mut sim_nw = SimNetwork::new(
             "successful_get_op_between_nodes",
             NUM_GW,
             NUM_NODES,
@@ -861,15 +861,15 @@ mod test {
             2,
         )
         .await;
-        sim_nodes.start_with_spec(get_specs).await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+        sim_nw.start_with_spec(get_specs).await;
+        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
         // trigger get @ node-0, which does not own the contract
-        sim_nodes
+        sim_nw
             .trigger_event(&"node-0".into(), 1, Some(Duration::from_millis(100)))
             .await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(sim_nodes.has_got_contract(&"node-0".into(), &key));
+        assert!(sim_nw.has_got_contract(&"node-0".into(), &key));
         Ok(())
     }
 
@@ -898,16 +898,16 @@ mod test {
         let get_specs = HashMap::from_iter([("node-1".into(), node_1)]);
 
         // establish network
-        let mut sim_nodes =
+        let mut sim_nw =
             SimNetwork::new("get_contract_not_found", NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
-        sim_nodes.start_with_spec(get_specs).await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+        sim_nw.start_with_spec(get_specs).await;
+        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
         // trigger get @ node-1, which does not own the contract
-        sim_nodes
+        sim_nw
             .trigger_event(&"node-1".into(), 1, Some(Duration::from_millis(100)))
             .await?;
-        assert!(!sim_nodes.has_got_contract(&"node-1".into(), &key));
+        assert!(!sim_nw.has_got_contract(&"node-1".into(), &key));
         Ok(())
     }
 
@@ -959,7 +959,7 @@ mod test {
         ]);
 
         // establish network
-        let mut sim_nodes = SimNetwork::new(
+        let mut sim_nw = SimNetwork::new(
             "get_contract_found_after_retry",
             NUM_GW,
             NUM_NODES,
@@ -969,13 +969,13 @@ mod test {
             3,
         )
         .await;
-        sim_nodes.start_with_spec(get_specs).await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+        sim_nw.start_with_spec(get_specs).await;
+        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
-        sim_nodes
+        sim_nw
             .trigger_event(&"node-0".into(), 1, Some(Duration::from_millis(500)))
             .await?;
-        assert!(sim_nodes.has_got_contract(&"node-0".into(), &key));
+        assert!(sim_nw.has_got_contract(&"node-0".into(), &key));
         Ok(())
     }
 }
