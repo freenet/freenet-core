@@ -83,6 +83,6 @@ pub struct LocalNodeCliConfig {
     #[clap(long, requires = "fmt")]
     pub(crate) terminal_output: bool,
     /// Max contract size
-    #[clap(long, env = "LOCUTUS_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
+    #[clap(long, env = "FREENET_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
     pub(crate) max_contract_size: i64,
 }
