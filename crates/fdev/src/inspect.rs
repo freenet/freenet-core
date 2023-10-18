@@ -19,7 +19,7 @@ enum FileType {
     Contract,
 }
 
-/// Inspect the packaged WASM code for Locutus.
+/// Inspect the packaged WASM code for Freenet.
 #[derive(clap::Parser, Clone)]
 struct CodeInspection {}
 

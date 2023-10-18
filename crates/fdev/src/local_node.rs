@@ -42,9 +42,9 @@ pub enum DeserializationFmt {
     MessagePack,
 }
 
-/// A CLI utility for testing out contracts against a Locutus local node.
+/// A CLI utility for testing out contracts against a Freenet local node.
 #[derive(clap::Parser, Clone)]
-#[clap(name = "Locutus Local Development Node Environment")]
+#[clap(name = "Freenet Local Development Node Environment")]
 #[clap(author = "The Freenet Project Inc.")]
 #[clap(group(
     ArgGroup::new("output")
@@ -83,6 +83,6 @@ pub struct LocalNodeCliConfig {
     #[clap(long, requires = "fmt")]
     pub(crate) terminal_output: bool,
     /// Max contract size
-    #[clap(long, env = "LOCUTUS_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
+    #[clap(long, env = "FREENET_MAX_CONTRACT_SIZE", default_value_t = DEFAULT_MAX_CONTRACT_SIZE)]
     pub(crate) max_contract_size: i64,
 }

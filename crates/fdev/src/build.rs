@@ -28,38 +28,61 @@ pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), D
     }
 }
 
-fn compile_options(cli_config: &BuildToolCliConfig) -> impl Iterator<Item = &str> {
+fn compile_options(cli_config: &BuildToolCliConfig) -> impl Iterator<Item = String> {
     let release: &[&str] = if cli_config.debug {
         &[]
     } else {
         &["--release"]
     };
-    let feature_list = cli_config.features.iter().flat_map(|s| {
-        s.split(',')
-            .filter(|p| *p != cli_config.package_type.feature())
-    });
-    let features = ["--features", cli_config.package_type.feature()]
+    let feature_list = cli_config
+        .features
+        .iter()
+        .flat_map(|s| {
+            s.split(',')
+                .filter(|p| *p != cli_config.package_type.feature())
+        })
+        .chain([cli_config.package_type.feature()]);
+    let features = [
+        "--features".to_string(),
+        feature_list.collect::<Vec<_>>().join(","),
+    ];
+    features
         .into_iter()
-        .chain(feature_list);
-    features.chain(release.iter().copied())
+        .chain(release.iter().map(|s| s.to_string()))
+}
+
+#[test]
+fn test_get_compile_options() {
+    let config = BuildToolCliConfig {
+        features: Some("contract".into()),
+        version: semver::Version::new(0, 0, 1),
+        package_type: PackageType::Contract,
+        debug: false,
+    };
+    let opts: Vec<_> = compile_options(&config).collect();
+    assert_eq!(
+        opts,
+        vec!["--features", "contract,freenet-main-contract", "--release"]
+    );
 }
 
 fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
     const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
     use std::io::IsTerminal;
+    let comp_opts = compile_options(cli_config).collect::<Vec<_>>();
     let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
         RUST_TARGET_ARGS
             .iter()
             .copied()
             .chain([WASM_TARGET, "--color", "always"])
-            .chain(compile_options(cli_config))
+            .chain(comp_opts.iter().map(|s| s.as_str()))
             .collect::<Vec<_>>()
     } else {
         RUST_TARGET_ARGS
             .iter()
             .copied()
             .chain([WASM_TARGET])
-            .chain(compile_options(cli_config))
+            .chain(comp_opts.iter().map(|s| s.as_str()))
             .collect::<Vec<_>>()
     };
 
