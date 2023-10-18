@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use either::Either;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 
@@ -469,12 +470,13 @@ async fn report_result(
                             payload_transfer_time,
                         },
                     };
-                    if let Err(err) = event_listener
-                        .event_received(EventLog::route_event(op_res.id(), op_storage, &event))
-                        .await
-                    {
-                        tracing::warn!("failed logging event: {err}");
-                    }
+                    event_listener
+                        .register_events(Either::Left(EventLog::route_event(
+                            op_res.id(),
+                            op_storage,
+                            &event,
+                        )))
+                        .await;
                     op_storage.ring.routing_finished(event);
                 }
                 // todo: handle failures, need to track timeouts and other potential failures
@@ -516,12 +518,9 @@ async fn process_message<CB>(
     let cli_req = client_id.zip(client_req_handler_callback);
     match msg {
         Ok(msg) => {
-            if let Err(err) = event_listener
-                .event_received(EventLog::from_msg(&msg, &op_storage))
-                .await
-            {
-                tracing::warn!("failed logging event: {err}");
-            }
+            event_listener
+                .register_events(EventLog::from_inbound_msg(&msg, &op_storage))
+                .await;
             match msg {
                 Message::JoinRing(op) => {
                     log_handling_msg!("join", op.id(), op_storage);

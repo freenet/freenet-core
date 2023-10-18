@@ -469,7 +469,7 @@ mod test {
     use freenet_stdlib::client_api::ContractRequest;
 
     use super::*;
-    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
+    use crate::node::tests::{NodeSpecification, SimNetwork};
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -509,7 +509,7 @@ mod test {
             ("node-0".into(), first_node),
             ("node-1".into(), second_node),
         ]);
-        let mut sim_nodes = SimNetwork::new(
+        let mut sim_nw = SimNetwork::new(
             "successful_subscribe_op_between_nodes",
             NUM_GW,
             NUM_NODES,
@@ -519,8 +519,8 @@ mod test {
             2,
         )
         .await;
-        sim_nodes.start_with_spec(subscribe_specs).await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+        sim_nw.start_with_spec(subscribe_specs).await;
+        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
         Ok(())
     }

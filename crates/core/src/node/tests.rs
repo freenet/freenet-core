@@ -56,6 +56,7 @@ impl NodeLabel {
         Self(format!("node-{id}").into())
     }
 
+    #[allow(dead_code)]
     fn is_gateway(&self) -> bool {
         self.0.starts_with("gateway")
     }
@@ -360,15 +361,19 @@ impl SimNetwork {
     }
 
     /// Builds an histogram of the distribution in the ring of each node relative to each other.
-    pub fn ring_distribution(&self, scale: i32) -> impl Iterator<Item = (f64, usize)> {
+    pub fn ring_distribution(&self, scale: i32) -> Vec<(f64, usize)> {
         let mut all_dists = Vec::with_capacity(self.labels.len());
         for (.., key) in &self.labels {
             all_dists.push(self.event_listener.connections(*key));
         }
-        group_locations_in_buckets(
+        let mut dist_buckets = group_locations_in_buckets(
             all_dists.into_iter().flatten().map(|(_, l)| l.as_f64()),
             scale,
         )
+        .collect::<Vec<_>>();
+        dist_buckets
+            .sort_by(|(d0, _), (d1, _)| d0.partial_cmp(d1).unwrap_or(std::cmp::Ordering::Equal));
+        dist_buckets
     }
 
     /// Returns the connectivity in the network per peer (that is all the connections
@@ -402,6 +407,72 @@ impl SimNetwork {
             .expect("node listeners disconnected");
         if let Some(sleep_time) = await_for {
             tokio::time::sleep(sleep_time).await;
+        }
+        Ok(())
+    }
+
+    pub async fn check_connectivity(&self, time_out: Duration) -> Result<(), anyhow::Error> {
+        let num_nodes = self.nodes.capacity();
+        let mut connected = HashSet::new();
+        let elapsed = Instant::now();
+        while elapsed.elapsed() < time_out && connected.len() < num_nodes {
+            for node in 0..num_nodes {
+                if !connected.contains(&node) && self.connected(&NodeLabel::node(node)) {
+                    connected.insert(node);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let expected = HashSet::from_iter(0..num_nodes);
+        let mut missing: Vec<_> = expected
+            .difference(&connected)
+            .map(|n| format!("node-{}", n))
+            .collect();
+
+        let node_connectivity = self.node_connectivity();
+        let connections = pretty_print_connections(&node_connectivity);
+        tracing::info!("Number of simulated nodes: {num_nodes}");
+        tracing::info!("{connections}");
+
+        if !missing.is_empty() {
+            missing.sort();
+            tracing::error!("Nodes without connection: {:?}", missing);
+            tracing::error!("Total nodes without connection: {:?}", missing.len());
+            anyhow::bail!("found disconnected nodes");
+        }
+
+        tracing::info!(
+            "Required time for connecting all peers: {} secs",
+            elapsed.elapsed().as_secs()
+        );
+
+        let hist = self.ring_distribution(1);
+        tracing::info!("Ring distribution: {:?}", hist);
+
+        Ok(())
+    }
+
+    pub fn connections_per_peer(&self) -> Result<(), anyhow::Error> {
+        let num_nodes = self.nodes.capacity();
+        let node_connectivity = self.node_connectivity();
+
+        let mut connections_per_peer: Vec<_> = node_connectivity
+            .iter()
+            .map(|(k, v)| (k, v.1.len()))
+            .filter_map(|(k, v)| if !k.is_gateway() { Some(v) } else { None })
+            .collect();
+
+        // ensure at least normal nodes have more than one connection
+        connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
+        if *connections_per_peer.iter().last().unwrap() < 2 {
+            anyhow::bail!("low connectivy; some nodes didn't connect beyond the gateway");
+        }
+
+        // ensure the average number of connections per peer is above N
+        let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
+        tracing::info!("Average connections: {}", avg_connections);
+        if avg_connections < 1 {
+            anyhow::bail!("average number of connections is low");
         }
         Ok(())
     }
@@ -439,67 +510,6 @@ fn group_locations_in_buckets(
         .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)), v))
 }
 
-pub(crate) async fn check_connectivity(
-    sim_nodes: &SimNetwork,
-    num_nodes: usize,
-    time_out: Duration,
-) -> Result<(), anyhow::Error> {
-    let mut connected = HashSet::new();
-    let elapsed = Instant::now();
-    while elapsed.elapsed() < time_out && connected.len() < num_nodes {
-        for node in 0..num_nodes {
-            if !connected.contains(&node) && sim_nodes.connected(&NodeLabel::node(node)) {
-                connected.insert(node);
-            }
-        }
-    }
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
-    let expected = HashSet::from_iter(0..num_nodes);
-    let mut missing: Vec<_> = expected
-        .difference(&connected)
-        .map(|n| format!("node-{}", n))
-        .collect();
-
-    let node_connectivity = sim_nodes.node_connectivity();
-    let connections = pretty_print_connections(&node_connectivity);
-    tracing::info!("{connections}");
-
-    if !missing.is_empty() {
-        missing.sort();
-        tracing::error!("Nodes without connection: {:?}", missing);
-        tracing::error!("Total nodes without connection: {:?}", missing.len());
-        anyhow::bail!("found disconnected nodes");
-    }
-
-    tracing::info!(
-        "Required time for connecting all peers: {} secs",
-        elapsed.elapsed().as_secs()
-    );
-
-    let hist: Vec<_> = sim_nodes.ring_distribution(1).collect();
-    tracing::info!("Ring distribution: {:?}", hist);
-
-    let mut connections_per_peer: Vec<_> = node_connectivity
-        .iter()
-        .map(|(k, v)| (k, v.1.len()))
-        .filter_map(|(k, v)| if !k.is_gateway() { Some(v) } else { None })
-        .collect();
-
-    // ensure at least some normal nodes have more than one connection
-    connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
-    if *connections_per_peer.iter().last().unwrap() < 1 {
-        anyhow::bail!("low connectivy; nodes didn't connect beyond the gateway");
-    }
-
-    // ensure the average number of connections per peer is above N
-    let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
-    tracing::info!("Average connections: {}", avg_connections);
-    if avg_connections < 1 {
-        anyhow::bail!("average number of connections is low");
-    }
-    Ok(())
-}
-
 fn pretty_print_connections(
     conns: &HashMap<NodeLabel, (PeerKey, HashMap<NodeLabel, Distance>)>,
 ) -> String {
@@ -507,9 +517,6 @@ fn pretty_print_connections(
     let mut conns = conns.iter().collect::<Vec<_>>();
     conns.sort_by(|(a, _), (b, _)| a.cmp(b));
     for (peer, (key, conns)) in conns {
-        if peer.is_gateway() {
-            continue;
-        }
         writeln!(&mut connections, "{peer} ({key}):").unwrap();
         for (conn, dist) in conns {
             let dist = dist.as_f64();

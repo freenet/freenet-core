@@ -43,8 +43,8 @@ impl NodeInMemory {
         event_listener: EL,
         ch_builder: String,
     ) -> Result<NodeInMemory, anyhow::Error> {
+        let event_listener = Box::new(event_listener);
         let peer_key = PeerKey::from(builder.local_key.public());
-        let conn_manager = MemoryConnManager::new(peer_key);
         let gateways = builder.get_gateways()?;
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
 
@@ -58,6 +58,9 @@ impl NodeInMemory {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 
+        let conn_manager =
+            MemoryConnManager::new(peer_key, event_listener.trait_clone(), op_storage.clone());
+
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
         Ok(NodeInMemory {
@@ -66,7 +69,7 @@ impl NodeInMemory {
             op_storage,
             gateways,
             notification_channel,
-            event_listener: Box::new(event_listener),
+            event_listener,
             is_gateway,
             _executor_listener,
         })

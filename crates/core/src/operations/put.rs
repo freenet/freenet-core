@@ -15,7 +15,7 @@ use crate::{
     client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::ContractHandlerEvent,
-    message::{InnerMessage, Message, Transaction },
+    message::{InnerMessage, Message, Transaction},
     node::{ConnectionBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
@@ -597,11 +597,7 @@ async fn try_to_broadcast(
     Ok((new_state, return_msg))
 }
 
-pub(crate) fn start_op(
-    contract: ContractContainer,
-    value: WrappedState,
-    htl: usize,
-) -> PutOp {
+pub(crate) fn start_op(contract: ContractContainer, value: WrappedState, htl: usize) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
     tracing::debug!(
@@ -926,7 +922,7 @@ mod test {
     use freenet_stdlib::prelude::*;
 
     use super::*;
-    use crate::node::tests::{check_connectivity, NodeSpecification, SimNetwork};
+    use crate::node::tests::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -941,7 +937,7 @@ mod test {
         let contract_val: WrappedState = gen.arbitrary()?;
         let new_value = WrappedState::new(Vec::from_iter(gen.arbitrary::<[u8; 20]>().unwrap()));
 
-        let mut sim_nodes = SimNetwork::new(
+        let mut sim_nw = SimNetwork::new(
             "successful_put_op_between_nodes",
             NUM_GW,
             NUM_NODES,
@@ -951,7 +947,7 @@ mod test {
             2,
         )
         .await;
-        let mut locations = sim_nodes.get_locations_by_node();
+        let mut locations = sim_nw.get_locations_by_node();
         let node0_loc = locations.remove(&"node-0".into()).unwrap();
         let node1_loc = locations.remove(&"node-1".into()).unwrap();
 
@@ -1000,16 +996,16 @@ mod test {
             ("gateway-0".into(), gw_0),
         ]);
 
-        sim_nodes.start_with_spec(put_specs).await;
+        sim_nw.start_with_spec(put_specs).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
         // trigger the put op @ gw-0
-        sim_nodes
+        sim_nw
             .trigger_event(&"gateway-0".into(), 1, Some(Duration::from_secs(3)))
             .await?;
-        assert!(sim_nodes.has_put_contract(&"gateway-0".into(), &key, &new_value));
-        assert!(sim_nodes.event_listener.contract_broadcasted(&key));
+        assert!(sim_nw.has_put_contract(&"gateway-0".into(), &key, &new_value));
+        assert!(sim_nw.event_listener.contract_broadcasted(&key));
         Ok(())
     }
 }

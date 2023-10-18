@@ -432,13 +432,13 @@ impl Operation for JoinRingOp {
                         Some(JRState::AwaitingProxyResponse {
                             accepted_by: mut previously_accepted,
                             new_peer_id,
-                            target: state_target,
+                            target: original_target,
                             new_location,
                         }) => {
                             // Check if the response reached the target node and if the request
                             // has been accepted by any node
                             let is_accepted = !accepted_by.is_empty();
-                            let is_target_peer = new_peer_id == state_target.peer;
+                            let is_target_peer = new_peer_id == original_target.peer;
 
                             if is_accepted {
                                 previously_accepted.extend(accepted_by.drain());
@@ -460,11 +460,11 @@ impl Operation for JoinRingOp {
                                     "Sending response to join request with all the peers that accepted \
                                     connection from gateway {} to peer {}",
                                     target.peer,
-                                    state_target.peer
+                                    original_target.peer
                                 );
                                 return_msg = Some(JoinRingMsg::Response {
                                     id,
-                                    target: state_target,
+                                    target: original_target,
                                     sender: target,
                                     msg: JoinResponse::AcceptedBy {
                                         peers: previously_accepted,
@@ -478,12 +478,12 @@ impl Operation for JoinRingOp {
                                     "Sending response to join request with all the peers that accepted \
                                     connection from proxy peer {} to proxy peer {}",
                                     target.peer,
-                                    state_target.peer
+                                    original_target.peer
                                 );
 
                                 return_msg = Some(JoinRingMsg::Response {
                                     id,
-                                    target: state_target,
+                                    target: original_target,
                                     sender: target,
                                     msg: JoinResponse::Proxy {
                                         accepted_by: previously_accepted,
@@ -1051,7 +1051,7 @@ mod messages {
 mod test {
     use std::time::Duration;
 
-    use crate::node::tests::{check_connectivity, SimNetwork};
+    use crate::node::tests::SimNetwork;
 
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1068,18 +1068,18 @@ mod test {
         crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
-        let mut sim_nodes = SimNetwork::new(
+        let mut sim_nw = SimNetwork::new(
             "join_forward_connection_to_node",
             NUM_GW,
             NUM_NODES,
             3,
             2,
-            8,
             5,
+            3,
         )
         .await;
-        sim_nodes.start().await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(10)).await
+        sim_nw.start().await;
+        sim_nw.check_connectivity(Duration::from_secs(10)).await
     }
 
     /// Given a network of N peers all nodes should have connections.
@@ -1088,7 +1088,7 @@ mod test {
     async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 1usize;
-        let mut sim_nodes = SimNetwork::new(
+        let mut sim_nw = SimNetwork::new(
             "join_all_nodes_should_connect",
             NUM_GW,
             NUM_NODES,
@@ -1098,7 +1098,7 @@ mod test {
             2,
         )
         .await;
-        sim_nodes.start().await;
-        check_connectivity(&sim_nodes, NUM_NODES, Duration::from_secs(10)).await
+        sim_nw.start().await;
+        sim_nw.check_connectivity(Duration::from_secs(10)).await
     }
 }

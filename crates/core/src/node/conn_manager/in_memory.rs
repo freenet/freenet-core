@@ -8,23 +8,33 @@ use std::{
 
 use crossbeam::channel::{self, Receiver, Sender};
 use once_cell::sync::OnceCell;
-use parking_lot::Mutex;
 use rand::{prelude::StdRng, thread_rng, Rng, SeedableRng};
+use tokio::sync::Mutex;
 
 use super::{ConnectionBridge, ConnectionError, PeerKey};
-use crate::{config::GlobalExecutor, message::Message};
+use crate::{
+    config::GlobalExecutor,
+    message::Message,
+    node::{event_log::EventLog, EventLogRegister, OpManager},
+};
 
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
     OnceCell::new();
 
 pub(in crate::node) struct MemoryConnManager {
     pub transport: InMemoryTransport,
+    log_register: Arc<Mutex<Box<dyn EventLogRegister>>>,
+    op_manager: Arc<OpManager>,
     msg_queue: Arc<Mutex<Vec<Message>>>,
     peer: PeerKey,
 }
 
 impl MemoryConnManager {
-    pub fn new(peer: PeerKey) -> Self {
+    pub fn new(
+        peer: PeerKey,
+        log_register: Box<dyn EventLogRegister>,
+        op_manager: Arc<OpManager>,
+    ) -> Self {
         let transport = InMemoryTransport::new(peer);
         let msg_queue = Arc::new(Mutex::new(Vec::new()));
 
@@ -33,21 +43,21 @@ impl MemoryConnManager {
         GlobalExecutor::spawn(async move {
             // evaluate the messages as they arrive
             loop {
-                let msg = { tr_cp.msg_stack_queue.lock().pop() };
-                if let Some(msg) = msg {
-                    let msg_data: Message =
-                        bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
-                    if let Some(mut queue) = msg_queue_cp.try_lock() {
-                        queue.push(msg_data);
-                        std::mem::drop(queue);
-                    }
+                let Some(msg) = tr_cp.msg_stack_queue.lock().await.pop() else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                let msg_data: Message = bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
+                if let Ok(mut queue) = msg_queue_cp.try_lock() {
+                    queue.push(msg_data);
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
 
         Self {
             transport,
+            log_register: Arc::new(Mutex::new(log_register)),
+            op_manager,
             msg_queue,
             peer,
         }
@@ -55,22 +65,27 @@ impl MemoryConnManager {
 
     pub async fn recv(&self) -> Result<Message, ConnectionError> {
         loop {
-            if let Some(mut queue) = self.msg_queue.try_lock() {
-                let msg = queue.pop();
-                std::mem::drop(queue);
-                if let Some(msg) = msg {
-                    return Ok(msg);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let Some(msg) = self.msg_queue.try_lock().ok().and_then(|mut l| l.pop()) else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            return Ok(msg);
         }
     }
 }
 
 impl Clone for MemoryConnManager {
     fn clone(&self) -> Self {
+        let log_register = loop {
+            if let Ok(lr) = self.log_register.try_lock() {
+                break lr.trait_clone();
+            }
+            std::thread::sleep(Duration::from_nanos(50));
+        };
         Self {
             transport: self.transport.clone(),
+            log_register: Arc::new(Mutex::new(log_register)),
+            op_manager: self.op_manager.clone(),
             msg_queue: self.msg_queue.clone(),
             peer: self.peer,
         }
@@ -80,6 +95,11 @@ impl Clone for MemoryConnManager {
 #[async_trait::async_trait]
 impl ConnectionBridge for MemoryConnManager {
     async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+        self.log_register
+            .try_lock()
+            .expect("unique lock")
+            .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager))
+            .await;
         let msg = bincode::serialize(&msg)?;
         self.transport.send(*target, msg);
         Ok(())
@@ -139,7 +159,7 @@ impl InMemoryTransport {
                             delayed.entry(msg.target).or_default().push(msg);
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         } else {
-                            rcv_msg_c.lock().push(msg);
+                            rcv_msg_c.lock().await.push(msg);
                         }
                     }
                     Ok(msg) => {
@@ -156,7 +176,7 @@ impl InMemoryTransport {
                     && !delayed.is_empty())
                     || delayed.len() == MAX_DELAYED_MSG
                 {
-                    let mut queue = rcv_msg_c.lock();
+                    let mut queue = rcv_msg_c.lock().await;
                     for (_, msgs) in delayed.drain() {
                         queue.extend(msgs);
                     }
