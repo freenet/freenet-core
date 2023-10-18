@@ -8,7 +8,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest},
     prelude::*,
 };
-// use locutus_runtime::{
+// use freenet_runtime::{
 //     ContractContainer, ContractInstanceId, ContractStore, DelegateContainer, DelegateStore,
 //     Parameters, SecretsStore, StateStore,
 // };
