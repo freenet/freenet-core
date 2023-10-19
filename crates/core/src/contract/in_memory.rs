@@ -1,7 +1,4 @@
-use crate::{
-    client_events::ClientId,
-    runtime::{ContractStore, StateStorage, StateStore},
-};
+use crate::{client_events::ClientId, runtime::ContractStore};
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
     prelude::WrappedContract,
@@ -12,7 +9,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::{
     executor::{ExecutorHalve, ExecutorToEventLoopChannel},
     handler::{ContractHandler, ContractHandlerHalve, ContractHandlerToEventLoopChannel},
-    storages::in_memory::MemKVStore,
     Executor,
 };
 use crate::DynError;
@@ -21,34 +17,18 @@ pub(crate) struct MockRuntime {
     pub contract_store: ContractStore,
 }
 
-pub(crate) struct MemoryContractHandler<KVStore = MemKVStore>
-where
-    KVStore: StateStorage,
-{
+pub(crate) struct MemoryContractHandler {
     channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
-    _kv_store: StateStore<KVStore>,
     runtime: Executor<MockRuntime>,
 }
 
-impl<KVStore> MemoryContractHandler<KVStore>
-where
-    KVStore: StateStorage + Send + Sync + 'static,
-    <KVStore as StateStorage>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
+impl MemoryContractHandler {
     pub async fn new(
         channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
-        kv_store: KVStore,
         data_dir: &str,
     ) -> Self {
-        // let rt = MockRuntime {
-        //     contract_store: ContractStore::new(
-        //         Config::conf().contracts_dir(),
-        //         Self::MAX_MEM_CACHE,
-        //     )
-        //     .unwrap();
         MemoryContractHandler {
             channel,
-            _kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
             runtime: Executor::new_mock(data_dir).await.unwrap(),
         }
     }
@@ -66,8 +46,7 @@ impl ContractHandler for MemoryContractHandler {
     where
         Self: Sized + 'static,
     {
-        let store = MemKVStore::new();
-        async move { Ok(MemoryContractHandler::new(channel, store, &config).await) }.boxed()
+        async move { Ok(MemoryContractHandler::new(channel, &config).await) }.boxed()
     }
 
     fn channel(&mut self) -> &mut ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
@@ -80,7 +59,7 @@ impl ContractHandler for MemoryContractHandler {
         _client_id: ClientId,
         _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
-        todo!()
+        unreachable!()
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {

@@ -7,7 +7,8 @@ use tokio::sync::{mpsc::error::SendError, Mutex};
 
 use crate::{
     contract::{
-        ContractError, ContractHandlerEvent, ContractHandlerToEventLoopChannel, NetEventListener,
+        ContractError, ContractHandlerEvent, ContractHandlerToEventLoopChannel,
+        NetEventListenerHalve,
     },
     dev_tool::ClientId,
     message::{Message, Transaction, TransactionType},
@@ -28,7 +29,7 @@ pub(crate) struct OpManager {
     subscribe: DashMap<Transaction, SubscribeOp>,
     to_event_listener: EventLoopNotificationsSender,
     // todo: remove the need for a mutex here
-    ch_outbound: Mutex<ContractHandlerToEventLoopChannel<NetEventListener>>,
+    ch_outbound: Mutex<ContractHandlerToEventLoopChannel<NetEventListenerHalve>>,
     // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
     _ops_ttl: RwLock<BTreeMap<Instant, Vec<Transaction>>>,
     pub ring: Ring,
@@ -47,7 +48,7 @@ impl OpManager {
     pub(super) fn new(
         ring: Ring,
         notification_channel: EventLoopNotificationsSender,
-        contract_handler: ContractHandlerToEventLoopChannel<NetEventListener>,
+        contract_handler: ContractHandlerToEventLoopChannel<NetEventListenerHalve>,
     ) -> Self {
         Self {
             join_ring: DashMap::default(),
@@ -101,7 +102,7 @@ impl OpManager {
             .await
     }
 
-    pub async fn recv_from_handler(&self) -> (crate::contract::EventId, ContractHandlerEvent) {
+    pub async fn recv_from_handler(&self) -> crate::contract::EventId {
         todo!()
     }
 

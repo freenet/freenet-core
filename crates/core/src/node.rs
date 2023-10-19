@@ -44,13 +44,13 @@ use crate::{
 use crate::operations::handle_op_request;
 pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use event_log::{EventLogRegister, EventRegister};
-pub(crate) use op_state::OpManager;
+pub(crate) use op_state_manager::OpManager;
 
 mod conn_manager;
 mod event_log;
 #[cfg(test)]
 mod in_memory_impl;
-mod op_state;
+mod op_state_manager;
 mod p2p_impl;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -388,7 +388,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                 ContractRequest::Subscribe { key, .. } => {
                     // Initialize a subscribe op.
                     loop {
-                        // FIXME: this will block the event loop until the subscribe op succeeds
+                        // FIXME: this will block the loop until the subscribe op succeeds
                         //        instead the op should be deferred for later execution
                         let op = subscribe::start_op(key.clone());
                         match subscribe::request_subscribe(&op_storage_cp, op, Some(client_id))

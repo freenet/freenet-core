@@ -1,6 +1,5 @@
 #![allow(unused)] // FIXME: remove this
-
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -19,15 +18,7 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
-use crate::node::OpManager;
-use crate::{
-    client_events::ClientId,
-    node::NodeConfig,
-    runtime::{ContractStore, Runtime, StateStorage, StateStore},
-    DynError,
-};
-
-pub const MAX_MEM_CACHE: i64 = 10_000_000;
+use crate::{client_events::ClientId, node::NodeConfig, runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponses(UnboundedReceiver<(ClientId, HostResult)>);
 
@@ -188,11 +179,22 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
 pub(crate) struct EventId {
     id: u64,
     client_id: Option<ClientId>,
+    transaction: Option<Transaction>,
 }
 
 impl EventId {
     pub fn client_id(&self) -> Option<ClientId> {
         self.client_id
+    }
+
+    pub fn transaction(&self) -> Option<Transaction> {
+        self.transaction
+    }
+
+    // FIXME: this should be used somewhere to inform than an event is pending
+    // a transaction resolution
+    pub fn with_transaction(&mut self, transaction: Transaction) {
+        self.transaction = Some(transaction);
     }
 }
 
@@ -218,17 +220,17 @@ pub(crate) struct ContractHandlerToEventLoopChannel<End: sealed::ChannelHalve> {
 }
 
 pub(crate) struct ContractHandlerHalve;
-pub(crate) struct NetEventListener;
+pub(crate) struct NetEventListenerHalve;
 
 mod sealed {
-    use super::{ContractHandlerHalve, NetEventListener};
+    use super::{ContractHandlerHalve, NetEventListenerHalve};
     pub(crate) trait ChannelHalve {}
     impl ChannelHalve for ContractHandlerHalve {}
-    impl ChannelHalve for NetEventListener {}
+    impl ChannelHalve for NetEventListenerHalve {}
 }
 
 pub(crate) fn contract_handler_channel() -> (
-    ContractHandlerToEventLoopChannel<NetEventListener>,
+    ContractHandlerToEventLoopChannel<NetEventListenerHalve>,
     ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
 ) {
     let (notification_tx, notification_channel) = mpsc::unbounded_channel();
@@ -258,7 +260,7 @@ static EV_ID: AtomicU64 = AtomicU64::new(0);
 // kind of event and can be optimized on a case basis
 const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
 
-impl ContractHandlerToEventLoopChannel<NetEventListener> {
+impl ContractHandlerToEventLoopChannel<NetEventListenerHalve> {
     /// Send an event to the contract handler and receive a response event if successful.
     pub async fn send_to_handler(
         &mut self,
@@ -289,7 +291,7 @@ impl ContractHandlerToEventLoopChannel<NetEventListener> {
         }
     }
 
-    pub async fn recv_from_handler(&mut self) -> (EventId, ContractHandlerEvent) {
+    pub async fn recv_from_handler(&mut self) -> EventId {
         todo!()
     }
 }
@@ -317,6 +319,7 @@ impl ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
                 EventId {
                     id: msg.id,
                     client_id: msg.client_id,
+                    transaction: None,
                 },
                 msg.ev,
             ));
@@ -369,9 +372,7 @@ impl std::fmt::Display for ContractHandlerEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ContractHandlerEvent::PutQuery {
-                key,
-                state,
-                parameters,
+                key, parameters, ..
             } => {
                 if let Some(params) = parameters {
                     write!(f, "put query {{ {key}, params: {:?} }}", params.as_ref())
@@ -394,10 +395,10 @@ impl std::fmt::Display for ContractHandlerEvent {
                 write!(f, "get query {{ {key}, fetch contract: {fetch_contract} }}",)
             }
             ContractHandlerEvent::GetResponse { key, response } => match response {
-                Ok(v) => {
+                Ok(_) => {
                     write!(f, "get query response {{ {key} }}",)
                 }
-                Err(e) => {
+                Err(_) => {
                     write!(f, "get query failed {{ {key} }}",)
                 }
             },
@@ -411,24 +412,14 @@ impl std::fmt::Display for ContractHandlerEvent {
     }
 }
 
-impl ContractHandlerEvent {
-    pub async fn into_network_op(self, op_manager: &OpManager) -> Transaction {
-        todo!()
-    }
-}
-
 #[cfg(test)]
 pub mod test {
     use std::sync::Arc;
 
-    use crate::runtime::ContractStore;
-    use freenet_stdlib::{
-        client_api::{ClientRequest, ContractRequest, HostResponse},
-        prelude::*,
-    };
+    use freenet_stdlib::prelude::*;
 
     use super::*;
-    use crate::{config::GlobalExecutor, contract::MockRuntime};
+    use crate::config::GlobalExecutor;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_test() -> Result<(), anyhow::Error> {
@@ -465,14 +456,5 @@ pub mod test {
         assert_eq!(contract.data(), vec![0, 1, 2, 3]);
 
         Ok(())
-    }
-
-    // Prepare and get handler for an in-memory sqlite db
-    async fn get_handler(test: &str) -> Result<NetworkContractHandler<MockRuntime>, DynError> {
-        let (_, ch_handler) = contract_handler_channel();
-        let (_, executor_sender) = super::super::executor::executor_channel_test();
-        let handler =
-            NetworkContractHandler::build(ch_handler, executor_sender, test.to_owned()).await?;
-        Ok(handler)
     }
 }

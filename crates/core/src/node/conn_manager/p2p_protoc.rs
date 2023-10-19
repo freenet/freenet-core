@@ -399,9 +399,8 @@ impl P2pConnManager {
                 msg = network_msg => { msg }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
-                (event_id, contract_handler_event) = op_manager.recv_from_handler() => {
-                    if let Some(client_id) = event_id.client_id() {
-                        let transaction = contract_handler_event.into_network_op(&op_manager).await;
+                event_id = op_manager.recv_from_handler() => {
+                    if let Some((client_id, transaction)) = event_id.client_id().zip(event_id.transaction()) {
                         tx_to_client.insert(transaction, client_id);
                     }
                     continue;

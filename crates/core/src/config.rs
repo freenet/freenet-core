@@ -143,10 +143,6 @@ impl ConfigPaths {
 }
 
 impl Config {
-    pub fn set_from_cli() -> Result<(), DynError> {
-        todo!()
-    }
-
     pub fn set_op_mode(mode: OperationMode) {
         let local_mode = matches!(mode, OperationMode::Local);
         Self::conf()
@@ -324,6 +320,19 @@ impl libp2p::swarm::Executor for GlobalExecutor {
 }
 
 pub fn set_logger() {
+    static LOGGER_SET: AtomicBool = AtomicBool::new(false);
+    if LOGGER_SET
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+
     let sub = tracing_subscriber::fmt().with_level(true).with_env_filter(
         tracing_subscriber::EnvFilter::builder()
             .with_default_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into())

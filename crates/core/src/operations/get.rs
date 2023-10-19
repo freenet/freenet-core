@@ -132,7 +132,7 @@ impl TryFrom<GetOp> for GetResult {
     fn try_from(value: GetOp) -> Result<Self, Self::Error> {
         match value.result {
             Some(r) => Ok(r),
-            _ => todo!(),
+            _ => Err(OpError::UnexpectedOpState),
         }
     }
 }

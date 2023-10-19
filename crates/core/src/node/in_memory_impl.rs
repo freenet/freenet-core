@@ -7,7 +7,7 @@ use super::{
     client_event_handling,
     conn_manager::{in_memory::MemoryConnManager, EventLoopNotifications},
     handle_cancelled_op, join_ring_request,
-    op_state::OpManager,
+    op_state_manager::OpManager,
     process_message, EventLogRegister, PeerKey,
 };
 use crate::{

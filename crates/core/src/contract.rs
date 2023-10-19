@@ -13,7 +13,7 @@ pub(crate) use executor::{
 };
 pub(crate) use handler::{
     contract_handler_channel, ClientResponses, ClientResponsesSender, ContractHandler,
-    ContractHandlerEvent, ContractHandlerToEventLoopChannel, EventId, NetEventListener,
+    ContractHandlerEvent, ContractHandlerToEventLoopChannel, EventId, NetEventListenerHalve,
     NetworkContractHandler, StoreResponse,
 };
 #[cfg(test)]
