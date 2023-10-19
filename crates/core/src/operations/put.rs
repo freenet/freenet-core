@@ -869,6 +869,22 @@ mod messages {
                 Self::BroadcastTo { id, .. } => id,
             }
         }
+
+        fn target(&self) -> Option<&PeerKeyLocation> {
+            match self {
+                Self::SeekNode { target, .. } => Some(target),
+                Self::RequestPut { target, .. } => Some(target),
+                _ => None,
+            }
+        }
+
+        fn terminal(&self) -> bool {
+            use PutMsg::*;
+            matches!(
+                self,
+                SuccessfulUpdate { .. } | SeekNode { .. } | PutForward { .. }
+            )
+        }
     }
 
     impl PutMsg {
@@ -878,22 +894,6 @@ mod messages {
                 Self::BroadcastTo { sender, .. } => Some(sender),
                 _ => None,
             }
-        }
-
-        pub fn target(&self) -> Option<&PeerKeyLocation> {
-            match self {
-                Self::SeekNode { target, .. } => Some(target),
-                Self::RequestPut { target, .. } => Some(target),
-                _ => None,
-            }
-        }
-
-        pub fn terminal(&self) -> bool {
-            use PutMsg::*;
-            matches!(
-                self,
-                SuccessfulUpdate { .. } | SeekNode { .. } | PutForward { .. }
-            )
         }
     }
 

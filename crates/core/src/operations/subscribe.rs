@@ -9,7 +9,7 @@ use crate::{
     client_events::ClientId,
     config::PEER_TIMEOUT,
     contract::ContractError,
-    message::{Message, Transaction},
+    message::{InnerMessage, Message, Transaction},
     node::{ConnectionBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{PeerKeyLocation, RingError},
@@ -39,13 +39,16 @@ impl SubscribeOp {
     pub(super) fn record_transfer(&mut self) {}
 }
 
-pub(crate) enum SubscribeResult {}
+pub(crate) struct SubscribeResult {}
 
 impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
 
-    fn try_from(_value: SubscribeOp) -> Result<Self, Self::Error> {
-        todo!()
+    fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
+        value
+            .finalized()
+            .then_some(SubscribeResult {})
+            .ok_or(OpError::UnexpectedOpState)
     }
 }
 
@@ -416,26 +419,8 @@ mod messages {
                 Self::ReturnSub { id, .. } => id,
             }
         }
-    }
 
-    impl SubscribeMsg {
-        pub(crate) fn id(&self) -> &Transaction {
-            match self {
-                Self::SeekNode { id, .. } => id,
-                Self::FetchRouting { id, .. } => id,
-                Self::RequestSub { id, .. } => id,
-                Self::ReturnSub { id, .. } => id,
-            }
-        }
-
-        pub fn sender(&self) -> Option<&PeerKeyLocation> {
-            match self {
-                Self::ReturnSub { sender, .. } => Some(sender),
-                _ => None,
-            }
-        }
-
-        pub fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::ReturnSub { target, .. } => Some(target),
@@ -443,9 +428,18 @@ mod messages {
             }
         }
 
-        pub fn terminal(&self) -> bool {
+        fn terminal(&self) -> bool {
             use SubscribeMsg::*;
             matches!(self, ReturnSub { .. } | SeekNode { .. })
+        }
+    }
+
+    impl SubscribeMsg {
+        pub fn sender(&self) -> Option<&PeerKeyLocation> {
+            match self {
+                Self::ReturnSub { sender, .. } => Some(sender),
+                _ => None,
+            }
         }
     }
 

@@ -32,9 +32,8 @@ use crate::{
     },
     message::{InnerMessage, Message, Transaction, TransactionType},
     operations::{
-        get,
-        join_ring::{self, JoinRingMsg, JoinRingOp},
-        put, subscribe, OpEnum, OpError, OpOutcome,
+        connect::{self, ConnectMsg, ConnectOp},
+        get, put, subscribe, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
@@ -282,9 +281,9 @@ async fn join_ring_request<CM>(
 where
     CM: ConnectionBridge + Send + Sync,
 {
-    let tx_id = Transaction::new::<JoinRingMsg>();
+    let tx_id = Transaction::new::<ConnectMsg>();
     let mut op =
-        join_ring::initial_request(peer_key, *gateway, op_storage.ring.max_hops_to_live, tx_id);
+        connect::initial_request(peer_key, *gateway, op_storage.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
@@ -294,7 +293,7 @@ where
         }
         op.backoff = Some(backoff);
     }
-    join_ring::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
+    connect::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
     Ok(())
 }
 
@@ -524,7 +523,7 @@ async fn process_message<CB>(
             match msg {
                 Message::JoinRing(op) => {
                     log_handling_msg!("join", op.id(), op_storage);
-                    let op_result = handle_op_request::<join_ring::JoinRingOp, _>(
+                    let op_result = handle_op_request::<connect::ConnectOp, _>(
                         &op_storage,
                         &mut conn_manager,
                         op,
@@ -624,7 +623,7 @@ where
         // is useless without connecting to the network, we will retry with exponential backoff
         match op_storage.pop(&tx) {
             Some(OpEnum::JoinRing(op)) if op.has_backoff() => {
-                let JoinRingOp {
+                let ConnectOp {
                     gateway, backoff, ..
                 } = *op;
                 let backoff = backoff.expect("infallible");

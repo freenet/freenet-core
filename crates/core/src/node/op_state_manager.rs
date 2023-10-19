@@ -13,7 +13,8 @@ use crate::{
     dev_tool::ClientId,
     message::{Message, Transaction, TransactionType},
     operations::{
-        get::GetOp, join_ring::JoinRingOp, put::PutOp, subscribe::SubscribeOp, OpEnum, OpError,
+        connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
+        OpEnum, OpError,
     },
     ring::Ring,
 };
@@ -23,10 +24,11 @@ use super::{conn_manager::EventLoopNotificationsSender, PeerKey};
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 pub(crate) struct OpManager {
-    join_ring: DashMap<Transaction, JoinRingOp>,
+    join_ring: DashMap<Transaction, ConnectOp>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
+    update: DashMap<Transaction, UpdateOp>,
     to_event_listener: EventLoopNotificationsSender,
     // todo: remove the need for a mutex here
     ch_outbound: Mutex<ContractHandlerToEventLoopChannel<NetEventListenerHalve>>,
@@ -55,6 +57,7 @@ impl OpManager {
             put: DashMap::default(),
             get: DashMap::default(),
             subscribe: DashMap::default(),
+            update: DashMap::default(),
             ring,
             to_event_listener: notification_channel,
             ch_outbound: Mutex::new(contract_handler),
@@ -108,25 +111,30 @@ impl OpManager {
 
     pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
         match op {
-            OpEnum::JoinRing(tx) => {
+            OpEnum::JoinRing(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::JoinRing);
-                self.join_ring.insert(id, *tx);
+                self.join_ring.insert(id, *op);
             }
-            OpEnum::Put(tx) => {
+            OpEnum::Put(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::Put);
-                self.put.insert(id, tx);
+                self.put.insert(id, op);
             }
-            OpEnum::Get(tx) => {
+            OpEnum::Get(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::Get);
-                self.get.insert(id, tx);
+                self.get.insert(id, op);
             }
-            OpEnum::Subscribe(tx) => {
+            OpEnum::Subscribe(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::Subscribe);
-                self.subscribe.insert(id, tx);
+                self.subscribe.insert(id, op);
+            }
+            OpEnum::Update(op) => {
+                #[cfg(debug_assertions)]
+                check_id_op!(id.tx_type(), TransactionType::Update);
+                self.update.insert(id, op);
             }
         }
         Ok(())
@@ -146,7 +154,7 @@ impl OpManager {
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(OpEnum::Subscribe),
-            TransactionType::Update => todo!(),
+            TransactionType::Update => self.update.remove(id).map(|(_k, v)| v).map(OpEnum::Update),
             TransactionType::Canceled => unreachable!(),
         }
     }

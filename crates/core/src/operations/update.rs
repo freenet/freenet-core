@@ -3,9 +3,21 @@
 pub(crate) use self::messages::UpdateMsg;
 use crate::{client_events::ClientId, node::ConnectionBridge};
 
-use super::{op_trait::Operation, OpError};
+use super::{op_trait::Operation, OpError, OpOutcome};
 
 pub(crate) struct UpdateOp {}
+
+impl UpdateOp {
+    pub fn outcome(&self) -> OpOutcome {
+        OpOutcome::Irrelevant
+    }
+
+    pub fn finalized(&self) -> bool {
+        todo!()
+    }
+
+    pub fn record_transfer(&mut self) {}
+}
 
 pub(crate) struct UpdateResult {}
 
@@ -46,15 +58,34 @@ impl Operation for UpdateOp {
 }
 
 mod messages {
+    use std::fmt::Display;
+
     use serde::{Deserialize, Serialize};
 
-    use crate::message::{InnerMessage, Transaction};
+    use crate::{
+        message::{InnerMessage, Transaction},
+        ring::PeerKeyLocation,
+    };
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum UpdateMsg {}
 
     impl InnerMessage for UpdateMsg {
         fn id(&self) -> &Transaction {
+            todo!()
+        }
+
+        fn target(&self) -> Option<&PeerKeyLocation> {
+            todo!()
+        }
+
+        fn terminal(&self) -> bool {
+            todo!()
+        }
+    }
+
+    impl Display for UpdateMsg {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             todo!()
         }
     }
