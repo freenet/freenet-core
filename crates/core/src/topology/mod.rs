@@ -1,8 +1,8 @@
 #![allow(unused_variables, dead_code)]
 
 mod metric;
-mod simulation;
 mod small_world_rand;
+mod connection_evaluator;
 
 use rand::Rng;
 
@@ -10,11 +10,10 @@ use crate::ring::*;
 
 use self::small_world_rand::random_link_distance;
 
-const DEFAULT_MIN_DISTANCE: f64 = 0.01;
+const DEFAULT_MIN_DISTANCE: f64 = 1.0 / 1_000.0;
 
 pub(crate) enum TopologyStrategy {
     Random,
-    SmallWorld,
     LoadBalancing,
 }
 
@@ -32,9 +31,6 @@ impl TopologyStrategy {
     ) -> JoinTargetInfo {
         match self {
             TopologyStrategy::Random => random_strategy(my_location, peer_statistics),
-            TopologyStrategy::SmallWorld => {
-                small_world_metric_strategy(my_location, peer_statistics)
-            }
             TopologyStrategy::LoadBalancing => {
                 load_balancing_strategy(my_location, peer_statistics)
             }
