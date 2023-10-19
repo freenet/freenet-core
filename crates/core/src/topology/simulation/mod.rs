@@ -33,7 +33,7 @@ impl Connections {
 }
 
 #[derive(Debug)]
-struct SimulatedNetwork {
+pub(crate) struct SimulatedNetwork {
     current_time: u64,
     nodes: Vec<SimulatedNode>,
     connections: Connections,
@@ -54,9 +54,7 @@ impl SimulatedNetwork {
         }
     }
 
-    pub(crate) 
-
-    fn add_node(&mut self) -> NodeRef {
+    pub(crate) fn add_node(&mut self) -> NodeRef {
         let index = self.nodes.len();
         let node = SimulatedNode {
             location: Location::random(),
@@ -221,6 +219,6 @@ struct SimulatedNode {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-struct NodeRef {
+pub(crate) struct NodeRef {
     index: usize,
 }

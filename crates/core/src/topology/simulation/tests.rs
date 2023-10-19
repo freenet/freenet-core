@@ -1,4 +1,5 @@
-
+use super::*;
+use crate::ring::Location;
 
 fn setup() {
     // Initialize the tracer
@@ -71,9 +72,9 @@ fn test_route_loop_error() {
     let a = net.add_node();
     let b = net.add_node();
     let c = net.add_node();
-    net.connect(a, b);
-    net.connect(b, c);
-    net.connect(c, a);
+    net.connections.connect(a, b);
+    net.connections.connect(b, c);
+    net.connections.connect(c, a);
 
     // Mock a destination location that's not reachable
     let destination = Location::random(); // Assume random will not match any node
@@ -99,8 +100,8 @@ fn test_join_success() {
     let a = net.add_node();
     let b = net.add_node();
     let c = net.add_node();
-    net.connect(a, b);
-    net.connect(b, c);
+    net.connections.connect(a, b);
+    net.connections.connect(b, c);
 
     let destination = net.nodes[c.index].location;
     let tolerance = Distance::new(0.4); // Changed to a valid value
@@ -129,7 +130,7 @@ fn test_join_with_tolerance() {
     let mut net = SimulatedNetwork::new();
     let a = net.add_node();
     let b = net.add_node();
-    net.connect(a, b);
+    net.connections.connect(a, b);
 
     let destination = net.nodes[b.index].location;
     let tolerance = Distance::new(0.1); 
