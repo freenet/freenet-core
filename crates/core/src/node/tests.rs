@@ -56,9 +56,12 @@ impl NodeLabel {
         Self(format!("node-{id}").into())
     }
 
-    #[allow(dead_code)]
     fn is_gateway(&self) -> bool {
         self.0.starts_with("gateway")
+    }
+
+    pub fn is_node(&self) -> bool {
+        self.0.starts_with("node")
     }
 }
 
@@ -156,6 +159,10 @@ impl SimNetwork {
         net.build_gateways(gateways).await;
         net.build_nodes(nodes).await;
         net
+    }
+
+    pub fn with_start_backoff(&mut self, value: Duration) {
+        self.init_backoff = value;
     }
 
     #[allow(unused)]
@@ -285,12 +292,8 @@ impl SimNetwork {
         for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             let node_spec = specs.remove(&label);
             self.initialize_peer(node, label, node_spec);
-            if gw_not_init != 0 {
-                gw_not_init -= 1;
-                tokio::time::sleep(self.init_backoff).await;
-            } else {
-                tokio::time::sleep(self.init_backoff).await;
-            }
+            gw_not_init = gw_not_init.saturating_sub(1);
+            tokio::time::sleep(self.init_backoff).await;
         }
     }
 
@@ -411,6 +414,8 @@ impl SimNetwork {
         Ok(())
     }
 
+    /// Checks that all peers in the network have acquired at least one connection to any
+    /// other peers.
     pub async fn check_connectivity(&self, time_out: Duration) -> Result<(), anyhow::Error> {
         let num_nodes = self.nodes.capacity();
         let mut connected = HashSet::new();
@@ -452,27 +457,55 @@ impl SimNetwork {
         Ok(())
     }
 
-    pub fn connections_per_peer(&self) -> Result<(), anyhow::Error> {
+    /// Recommended to calling after `check_connectivity` to ensure enough time
+    /// elapsed for all peers to become connected.
+    ///
+    /// Checks that there is a good connectivity over the simulated network,
+    /// meaning that:
+    ///
+    /// - at least 50% of the peers have more than the minimum connections
+    /// -
+    pub fn network_connectivity_quality(&self) -> Result<(), anyhow::Error> {
+        const HIGHER_THAN_MIN_THRESHOLD: f64 = 0.5;
         let num_nodes = self.nodes.capacity();
+        let min_connections_threshold = (num_nodes as f64 * HIGHER_THAN_MIN_THRESHOLD) as usize;
         let node_connectivity = self.node_connectivity();
 
         let mut connections_per_peer: Vec<_> = node_connectivity
             .iter()
             .map(|(k, v)| (k, v.1.len()))
-            .filter_map(|(k, v)| if !k.is_gateway() { Some(v) } else { None })
+            .filter(|&(k, _)| !k.is_gateway())
+            .map(|(_, v)| v)
             .collect();
 
-        // ensure at least normal nodes have more than one connection
+        // ensure at least "most" normal nodes have more than one connection
         connections_per_peer.sort_unstable_by_key(|num_conn| *num_conn);
-        if *connections_per_peer.iter().last().unwrap() < 2 {
-            anyhow::bail!("low connectivy; some nodes didn't connect beyond the gateway");
+        if connections_per_peer[min_connections_threshold] < self.min_connections {
+            tracing::error!(
+                "Low connectivity; more than {:.0}% of the nodes don't have more than minimum connections",
+                HIGHER_THAN_MIN_THRESHOLD * 100.0
+            );
+            anyhow::bail!("low connectivity");
+        } else {
+            let idx = connections_per_peer[min_connections_threshold..]
+                .iter()
+                .position(|num_conn| *num_conn < self.min_connections)
+                .unwrap_or_else(|| connections_per_peer[min_connections_threshold..].len() - 1)
+                + (min_connections_threshold - 1);
+            let percentile = idx as f64 / connections_per_peer.len() as f64 * 100.0;
+            tracing::info!("{percentile:.0}% nodes have higher than required minimum connections");
         }
 
-        // ensure the average number of connections per peer is above N
+        // ensure the average number of connections per peer is above the mean between max and min connections
+        let expected_avg_connections =
+            ((self.max_connections - self.min_connections) / 2) + self.min_connections;
         let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
-        tracing::info!("Average connections: {}", avg_connections);
-        if avg_connections < 1 {
-            anyhow::bail!("average number of connections is low");
+        tracing::info!(
+            "Average connections: {avg_connections} (expected > {expected_avg_connections})"
+        );
+        if avg_connections < expected_avg_connections {
+            tracing::error!("Average number of connections ({avg_connections}) is low (< {expected_avg_connections})");
+            anyhow::bail!("low average number of connections");
         }
         Ok(())
     }

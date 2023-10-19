@@ -124,14 +124,6 @@ pub(crate) fn executor_channel(
     (listener_halve, sender_halve)
 }
 
-#[cfg(test)]
-pub(crate) fn executor_channel_test() -> (
-    ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    ExecutorToEventLoopChannel<ExecutorHalve>,
-) {
-    todo!()
-}
-
 impl ExecutorToEventLoopChannel<ExecutorHalve> {
     async fn send_to_event_loop<Op, T>(&mut self, message: T) -> Result<(), DynError>
     where
@@ -1200,6 +1192,7 @@ impl Executor<crate::contract::MockRuntime> {
         let contracts_data_dir = tmp_path.join("contracts");
         let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
 
+        // uses inmemory SQLite
         let state_store = StateStore::new(Storage::new().await?, u16::MAX as u32).unwrap();
 
         let executor = Executor::new(
@@ -1218,7 +1211,7 @@ impl Executor<crate::contract::MockRuntime> {
         _req: ClientRequest<'a>,
         _updates: Option<mpsc::UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> Response {
-        todo!()
+        unreachable!()
     }
 }
 
@@ -1313,7 +1306,7 @@ impl ContractExecutor for Executor<crate::contract::MockRuntime> {
                     .await?;
                 return Ok(state);
             }
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 }

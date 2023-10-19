@@ -265,6 +265,7 @@ impl Ring {
             tracing::debug!(peer = %self.peer_key, "max connections reached");
             false
         } else {
+            // todo: in the future maybe use the `small worldness` metric to decide
             let median_distance = self
                 .median_distance_to(my_location)
                 .unwrap_or(Distance(0.5));

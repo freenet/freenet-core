@@ -75,7 +75,6 @@ async fn execute_command(
                     })) => {
                         println!("current state for {key}:");
                         app.printout_deser(state.as_ref())?;
-                        todo!()
                     }
                     Err(err) => {
                         println!("error: {err}");
@@ -85,15 +84,6 @@ async fn execute_command(
             }
             _ => unreachable!(),
         },
-        ClientRequest::DelegateOp(op) => {
-            match node.handle_request(ClientId::FIRST, op.into(), None).await {
-                Ok(_res) => todo!(),
-                Err(err) => {
-                    println!("error: {err}");
-                }
-            }
-        }
-        ClientRequest::Disconnect { .. } => return Ok(true),
         _ => {
             tracing::error!("op not supported");
             return Err("op not support".into());

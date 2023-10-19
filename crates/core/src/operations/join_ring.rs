@@ -43,15 +43,36 @@ impl JoinRingOp {
     pub(super) fn record_transfer(&mut self) {}
 }
 
+/// Not really used since client requests will never interact with this directly.
 pub(crate) struct JoinRingResult {}
 
 impl TryFrom<JoinRingOp> for JoinRingResult {
     type Error = OpError;
 
     fn try_from(_value: JoinRingOp) -> Result<Self, Self::Error> {
-        todo!()
+        Ok(Self {})
     }
 }
+
+/*
+Will need to do some changes for when we perform parallel joins.
+
+t0: (#1 join attempt)
+joiner:
+    1. dont knows location
+    3. knows location
+    n. connected to the ring
+gateway:
+    2. assigned_location: None; assigned location to `joiner` based on IP and communicate to joiner
+    4. forward to N peers
+    ...
+
+(2 join subsequently to acquire more/better connections)
+join:
+    1. knows location
+gateway:
+    2. assigned_location: Some(loc)
+*/
 
 impl Operation for JoinRingOp {
     type Message = JoinRingMsg;
@@ -110,8 +131,9 @@ impl Operation for JoinRingOp {
                     msg:
                         JoinRequest::StartReq {
                             target: this_node_loc,
-                            req_peer,
+                            joiner,
                             hops_to_live,
+                            assigned_location,
                             ..
                         },
                 } => {
@@ -119,24 +141,25 @@ impl Operation for JoinRingOp {
                     tracing::debug!(
                         tx = %id,
                         "Initial join request received from {} with HTL {} @ {}",
-                        req_peer,
+                        joiner,
                         hops_to_live,
                         this_node_loc.peer
                     );
 
-                    let new_location = Location::random();
+                    // todo: location should be based on your public IP
+                    let new_location = assigned_location.unwrap_or_else(Location::random);
                     // FIXME: don't try to forward to peers which have already been tried (add a rejected_by list)
                     let accepted_by = if op_storage.ring.should_accept(&new_location) {
-                        tracing::debug!(tx = %id, "Accepting connection from {}", req_peer,);
+                        tracing::debug!(tx = %id, "Accepting connection from {}", joiner,);
                         HashSet::from_iter([this_node_loc])
                     } else {
-                        tracing::debug!(tx = %id, at_peer = %this_node_loc.peer, "Rejecting connection from peer {}", req_peer);
+                        tracing::debug!(tx = %id, at_peer = %this_node_loc.peer, "Rejecting connection from peer {}", joiner);
                         HashSet::new()
                     };
 
                     let new_peer_loc = PeerKeyLocation {
                         location: Some(new_location),
-                        peer: req_peer,
+                        peer: joiner,
                     };
                     if let Some(mut updated_state) = forward_conn(
                         id,
@@ -164,7 +187,7 @@ impl Operation for JoinRingOp {
                                 tx = %id,
                                 "OC received at gateway {} from requesting peer {}",
                                 this_node_loc.peer,
-                                req_peer
+                                joiner
                             );
                             new_state = Some(JRState::OCReceived);
                         } else {
@@ -176,10 +199,10 @@ impl Operation for JoinRingOp {
                             msg: JoinResponse::AcceptedBy {
                                 peers: accepted_by,
                                 your_location: new_location,
-                                your_peer_id: req_peer,
+                                your_peer_id: joiner,
                             },
                             target: PeerKeyLocation {
-                                peer: req_peer,
+                                peer: joiner,
                                 location: Some(new_location),
                             },
                         });
@@ -681,7 +704,7 @@ enum JRState {
     Initializing,
     Connecting(ConnectionInfo),
     AwaitingProxyResponse {
-        /// Could be either the requester or nodes which have been previously forwarded to
+        /// Could be either the joiner or nodes which have been previously forwarded to
         target: PeerKeyLocation,
         accepted_by: HashSet<PeerKeyLocation>,
         new_location: Location,
@@ -786,11 +809,13 @@ where
     );
 
     conn_manager.add_connection(gateway.peer).await?;
+    let assigned_location = op_storage.ring.own_location().location;
     let join_req = Message::from(messages::JoinRingMsg::Request {
         id: tx,
         msg: messages::JoinRequest::StartReq {
             target: gateway,
-            req_peer: this_peer,
+            joiner: this_peer,
+            assigned_location,
             hops_to_live: max_hops_to_live,
             max_hops_to_live,
         },
@@ -819,7 +844,7 @@ async fn forward_conn<CM>(
     ring: &Ring,
     conn_manager: &mut CM,
     req_peer: PeerKeyLocation,
-    new_peer_loc: PeerKeyLocation,
+    joiner: PeerKeyLocation,
     left_htl: usize,
     num_accepted: usize,
 ) -> Result<Option<JRState>, OpError>
@@ -829,7 +854,7 @@ where
     if left_htl == 0 {
         tracing::debug!(
             tx = %id,
-            requester = %req_peer.peer,
+            joiner = %joiner.peer,
             "Couldn't forward join petition, no hops left or enough connections",
         );
         return Ok(None);
@@ -838,7 +863,7 @@ where
     if ring.num_connections() == 0 {
         tracing::warn!(
             tx = %id,
-            requester = %req_peer.peer,
+            joiner = %joiner.peer,
             "Couldn't forward join petition, not enough connections",
         );
         return Ok(None);
@@ -847,25 +872,26 @@ where
     let forward_to = if left_htl >= ring.rnd_if_htl_above {
         tracing::debug!(
             tx = %id,
-            requester = %req_peer.peer,
+            joiner = %joiner.peer,
             "Randomly selecting peer to forward JoinRequest",
         );
         ring.random_peer(|p| p != &req_peer.peer)
     } else {
         tracing::debug!(
             tx = %id,
-            requester = %req_peer.peer,
+            joiner = %joiner.peer,
             "Selecting close peer to forward request",
         );
-        ring.routing(&new_peer_loc.location.unwrap(), Some(&req_peer.peer), &[])
-            .and_then(|pkl| (pkl.peer != new_peer_loc.peer).then_some(pkl))
+        // FIXME: target the `desired_location`
+        ring.routing(&joiner.location.unwrap(), Some(&req_peer.peer), &[])
+            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     };
 
     if let Some(forward_to) = forward_to {
         let forwarded = Message::from(JoinRingMsg::Request {
             id,
             msg: JoinRequest::Proxy {
-                joiner: new_peer_loc,
+                joiner,
                 hops_to_live: left_htl.min(ring.max_hops_to_live) - 1,
                 sender: ring.own_location(),
             },
@@ -881,8 +907,8 @@ where
         let new_state = JRState::AwaitingProxyResponse {
             target: req_peer,
             accepted_by: HashSet::new(),
-            new_location: new_peer_loc.location.unwrap(),
-            new_peer_id: new_peer_loc.peer,
+            new_location: joiner.location.unwrap(),
+            new_peer_id: joiner.peer,
         };
         Ok(Some(new_state))
     } else {
@@ -943,7 +969,10 @@ mod messages {
                 Response { sender, .. } => Some(&sender.peer),
                 Connected { sender, .. } => Some(&sender.peer),
                 Request {
-                    msg: JoinRequest::StartReq { req_peer, .. },
+                    msg:
+                        JoinRequest::StartReq {
+                            joiner: req_peer, ..
+                        },
                     ..
                 } => Some(req_peer),
                 _ => None,
@@ -1004,7 +1033,7 @@ mod messages {
                     ..
                 } => write!(f, "RouteValue(id: {id})"),
                 Self::Connected { .. } => write!(f, "Connected(id: {id})"),
-                _ => todo!(),
+                _ => unimplemented!(),
             }
         }
     }
@@ -1013,7 +1042,8 @@ mod messages {
     pub(crate) enum JoinRequest {
         StartReq {
             target: PeerKeyLocation,
-            req_peer: PeerKey,
+            joiner: PeerKey,
+            assigned_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
         },
@@ -1065,40 +1095,54 @@ mod test {
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
-        crate::config::set_logger();
-        const NUM_NODES: usize = 10usize;
+        // crate::config::set_logger();
+        const NUM_NODES: usize = 3usize;
         const NUM_GW: usize = 1usize;
         let mut sim_nw = SimNetwork::new(
             "join_forward_connection_to_node",
             NUM_GW,
             NUM_NODES,
-            3,
             2,
-            5,
-            3,
+            1,
+            2,
+            1,
         )
         .await;
+        // sim_nw.with_start_backoff(Duration::from_millis(100));
         sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(10)).await
+        sim_nw.check_connectivity(Duration::from_secs(5)).await?;
+        let some_forwarded = sim_nw
+            .node_connectivity()
+            .into_iter()
+            .flat_map(|(_this, (_, conns))| conns.into_keys())
+            .any(|c| c.is_node());
+        assert!(
+            some_forwarded,
+            "didn't find any connection succesfully forwarded"
+        );
+        Ok(())
     }
 
-    /// Given a network of N peers all nodes should have connections.
+    /// Given a network of N peers all good connectivity
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn all_nodes_should_connect() -> Result<(), anyhow::Error> {
+    async fn network_should_achieve_good_connectivity() -> Result<(), anyhow::Error> {
+        crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
-        const NUM_GW: usize = 1usize;
+        const NUM_GW: usize = 2usize;
         let mut sim_nw = SimNetwork::new(
             "join_all_nodes_should_connect",
             NUM_GW,
             NUM_NODES,
+            5,
             3,
-            2,
-            1000,
+            6,
             2,
         )
         .await;
+        sim_nw.with_start_backoff(Duration::from_millis(200));
         sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(10)).await
+        sim_nw.check_connectivity(Duration::from_secs(10)).await?;
+        sim_nw.network_connectivity_quality()
     }
 }
