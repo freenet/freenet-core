@@ -12,8 +12,8 @@ use crate::{
     DynError,
 };
 
+pub(crate) mod connect;
 pub(crate) mod get;
-pub(crate) mod join_ring;
 pub(crate) mod op_trait;
 pub(crate) mod put;
 pub(crate) mod subscribe;
@@ -126,10 +126,11 @@ where
 }
 
 pub(crate) enum OpEnum {
-    JoinRing(Box<join_ring::JoinRingOp>),
+    JoinRing(Box<connect::ConnectOp>),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
+    Update(update::UpdateOp),
 }
 
 impl OpEnum {
@@ -139,6 +140,7 @@ impl OpEnum {
             OpEnum::Put(op) => op,
             OpEnum::Get(op) => op,
             OpEnum::Subscribe(op) => op,
+            OpEnum::Update(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome;

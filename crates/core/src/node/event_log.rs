@@ -15,7 +15,7 @@ use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
     message::{Message, Transaction},
-    operations::{get::GetMsg, join_ring, put::PutMsg},
+    operations::{connect, get::GetMsg, put::PutMsg},
     ring::PeerKeyLocation,
     router::RouteEvent,
     DynError,
@@ -72,9 +72,9 @@ impl<'a> EventLog<'a> {
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::JoinRing(join_ring::JoinRingMsg::Response {
+            Message::JoinRing(connect::ConnectMsg::Response {
                 msg:
-                    join_ring::JoinResponse::AcceptedBy {
+                    connect::ConnectResponse::AcceptedBy {
                         peers,
                         your_location,
                         your_peer_id,
@@ -108,9 +108,9 @@ impl<'a> EventLog<'a> {
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::JoinRing(join_ring::JoinRingMsg::Response {
+            Message::JoinRing(connect::ConnectMsg::Response {
                 msg:
-                    join_ring::JoinResponse::AcceptedBy {
+                    connect::ConnectResponse::AcceptedBy {
                         peers,
                         your_location,
                         your_peer_id,
@@ -680,7 +680,7 @@ pub(super) mod test_utils {
         use crate::ring::Location;
         let peer_id = PeerKey::random();
         let loc = Location::try_from(0.5)?;
-        let tx = Transaction::new::<join_ring::JoinRingMsg>();
+        let tx = Transaction::new::<connect::ConnectMsg>();
         let locations = [
             (PeerKey::random(), Location::try_from(0.5)?),
             (PeerKey::random(), Location::try_from(0.75)?),

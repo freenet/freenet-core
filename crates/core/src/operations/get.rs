@@ -772,6 +772,19 @@ mod messages {
                 Self::ReturnGet { id, .. } => id,
             }
         }
+
+        fn target(&self) -> Option<&PeerKeyLocation> {
+            match self {
+                Self::SeekNode { target, .. } => Some(target),
+                Self::RequestGet { target, .. } => Some(target),
+                Self::ReturnGet { target, .. } => Some(target),
+            }
+        }
+
+        fn terminal(&self) -> bool {
+            use GetMsg::*;
+            matches!(self, ReturnGet { .. })
+        }
     }
 
     impl GetMsg {
@@ -780,19 +793,6 @@ mod messages {
                 Self::SeekNode { target, .. } => Some(target),
                 _ => None,
             }
-        }
-
-        pub fn target(&self) -> Option<&PeerKeyLocation> {
-            match self {
-                Self::SeekNode { target, .. } => Some(target),
-                Self::RequestGet { target, .. } => Some(target),
-                Self::ReturnGet { target, .. } => Some(target),
-            }
-        }
-
-        pub fn terminal(&self) -> bool {
-            use GetMsg::*;
-            matches!(self, ReturnGet { .. })
         }
     }
 

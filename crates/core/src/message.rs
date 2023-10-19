@@ -8,8 +8,7 @@ use ulid::Ulid;
 use crate::{
     node::{ConnectionError, PeerKey},
     operations::{
-        get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg,
-        update::UpdateMsg,
+        connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
     ring::{Location, PeerKeyLocation},
 };
@@ -127,7 +126,7 @@ mod sealed_msg_type {
     }
 
     transaction_type_enumeration!(decl struct {
-        JoinRing -> JoinRingMsg,
+        JoinRing -> ConnectMsg,
         Put -> PutMsg,
         Get -> GetMsg,
         Subscribe -> SubscribeMsg,
@@ -137,7 +136,7 @@ mod sealed_msg_type {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum Message {
-    JoinRing(JoinRingMsg),
+    JoinRing(ConnectMsg),
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
@@ -148,6 +147,10 @@ pub(crate) enum Message {
 
 pub(crate) trait InnerMessage: Into<Message> {
     fn id(&self) -> &Transaction;
+
+    fn target(&self) -> Option<&PeerKeyLocation>;
+
+    fn terminal(&self) -> bool;
 }
 
 /// Internal node events emitted to the event loop.
@@ -190,7 +193,7 @@ impl Message {
             Put(op) => op.id(),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
-            Update(_op) => todo!(),
+            Update(op) => op.id(),
             Aborted(tx) => tx,
         }
     }
@@ -202,7 +205,7 @@ impl Message {
             Put(op) => op.target(),
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
-            Update(_op) => todo!(),
+            Update(op) => op.target(),
             Aborted(_) => None,
         }
     }
@@ -215,7 +218,7 @@ impl Message {
             Put(op) => op.terminal(),
             Get(op) => op.terminal(),
             Subscribe(op) => op.terminal(),
-            Update(_op) => todo!(),
+            Update(op) => op.terminal(),
             Aborted(_) => true,
         }
     }
@@ -235,7 +238,7 @@ impl Display for Message {
             Put(msg) => msg.fmt(f)?,
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
-            Update(_op) => todo!(),
+            Update(msg) => msg.fmt(f)?,
             Aborted(msg) => msg.fmt(f)?,
         };
         write!(f, "}}")
