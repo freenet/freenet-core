@@ -1,7 +1,6 @@
 #![allow(unused_variables, dead_code)]
 
 mod metric;
-mod simulation;
 mod small_world_rand;
 mod connection_evaluator;
 
