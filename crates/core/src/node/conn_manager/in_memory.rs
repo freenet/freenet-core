@@ -8,7 +8,7 @@ use std::{
 
 use crossbeam::channel::{self, Receiver, Sender};
 use once_cell::sync::OnceCell;
-use rand::{prelude::StdRng, thread_rng, Rng, SeedableRng};
+use rand::{prelude::StdRng, seq::SliceRandom, thread_rng, Rng, SeedableRng};
 use tokio::sync::Mutex;
 
 use super::{ConnectionBridge, ConnectionError, PeerKey};
@@ -180,7 +180,8 @@ impl InMemoryTransport {
                     for (_, msgs) in delayed.drain() {
                         queue.extend(msgs);
                     }
-                    Self::shuffle(&mut queue);
+                    let queue = &mut queue;
+                    queue.shuffle(&mut thread_rng());
                 }
             }
             tracing::error!("Stopped receiving messages in {}", interface_peer);
@@ -202,14 +203,6 @@ impl InMemoryTransport {
         });
         if let Err(channel::SendError(_)) = send_res {
             tracing::error!("Network shutdown")
-        }
-    }
-
-    fn shuffle<T>(iter: &mut [T]) {
-        let mut rng = thread_rng();
-        for i in (1..(iter.len() - 1)).rev() {
-            let idx = rng.gen_range(0..=i);
-            iter.swap(idx, i);
         }
     }
 }

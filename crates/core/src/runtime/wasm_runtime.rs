@@ -127,8 +127,9 @@ impl Runtime {
         } else {
             (None, imports! {})
         };
-        native_api::time::prepare_export(&mut store, &mut top_level_imports);
         native_api::log::prepare_export(&mut store, &mut top_level_imports);
+        native_api::rand::prepare_export(&mut store, &mut top_level_imports);
+        native_api::time::prepare_export(&mut store, &mut top_level_imports);
 
         Ok(Self {
             wasm_store: store,
