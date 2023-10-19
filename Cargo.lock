@@ -945,15 +945,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9cace84e55f07e7301bae1c519df89cdad8cc3cd868413d3fdbdeca9ff3db484"
 
 [[package]]
-name = "crc32fast"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b540bd8bc810d3885c6ea91e2018302f68baba2129ab3e88f32389ee9370880d"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "crossbeam"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1535,16 +1526,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flate2"
-version = "1.0.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6c98ee8095e9d1dcbf2fcc6d95acccb90d1c81db1e44725c6a984b1dbdfb010"
-dependencies = [
- "crc32fast",
- "miniz_oxide",
-]
-
-[[package]]
 name = "flume"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1600,6 +1581,7 @@ dependencies = [
  "futures",
  "itertools",
  "libp2p",
+ "libp2p-identity",
  "notify",
  "once_cell",
  "opentelemetry",
@@ -2396,7 +2378,6 @@ dependencies = [
  "libp2p-autonat",
  "libp2p-connection-limits",
  "libp2p-core",
- "libp2p-deflate",
  "libp2p-dns",
  "libp2p-identify",
  "libp2p-identity",
@@ -2484,17 +2465,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libp2p-deflate"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc29d4b2f967505282d5a37a7bbdb98cef00662368fefc390bbd99063bd24b26"
-dependencies = [
- "flate2",
- "futures",
- "libp2p-core",
-]
-
-[[package]]
 name = "libp2p-dns"
 version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2533,9 +2503,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-identity"
-version = "0.2.5"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57bf6e730ec5e7022958da53ffb03b326e681b7316939012ae9b3c7449a812d4"
+checksum = "cdd6317441f361babc74c2989c6484eb0726045399b6648de039e1805ea96972"
 dependencies = [
  "bs58",
  "ed25519-dalek",

@@ -5,7 +5,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::Poll,
-    time::Instant,
 };
 
 use asynchronous_codec::{BytesMut, Framed};
@@ -26,9 +25,9 @@ use libp2p::{
         self,
         dial_opts::DialOpts,
         handler::{DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
-        ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm, KeepAlive,
-        NetworkBehaviour, NotifyHandler, Stream as NegotiatedSubstream, SubstreamProtocol,
-        SwarmBuilder, SwarmEvent, ToSwarm,
+        Config as SwarmConfig, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm,
+        KeepAlive, NetworkBehaviour, NotifyHandler, Stream as NegotiatedSubstream,
+        SubstreamProtocol, SwarmEvent, ToSwarm,
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
@@ -194,19 +193,20 @@ impl P2pConnManager {
             None
         };
 
-        let builder = SwarmBuilder::with_executor(
+        let behaviour = config_behaviour(
+            &config.local_key,
+            &config.remote_nodes,
+            &public_addr,
+            op_manager,
+        );
+        let mut swarm = Swarm::new(
             transport,
-            config_behaviour(
-                &config.local_key,
-                &config.remote_nodes,
-                &public_addr,
-                op_manager,
-            ),
+            behaviour,
             PeerId::from(config.local_key.public()),
-            global_executor,
+            SwarmConfig::with_executor(global_executor)
+                .with_idle_connection_timeout(config::PEER_TIMEOUT),
         );
 
-        let mut swarm = builder.build();
         for remote_addr in config.remote_nodes.iter().filter_map(|r| r.addr.clone()) {
             swarm.add_external_address(remote_addr);
         }
@@ -642,7 +642,6 @@ pub(in crate::node) enum HandlerEvent {
 /// Handles the connection with a given peer.
 pub(in crate::node) struct Handler {
     substreams: Vec<SubstreamState>,
-    keep_alive: KeepAlive,
     uniq_conn_id: UniqConnId,
     protocol_status: ProtocolStatus,
     pending: Vec<Message>,
@@ -692,17 +691,10 @@ enum SubstreamState {
     ReportError { error: ConnectionError },
 }
 
-impl SubstreamState {
-    fn is_free(&self) -> bool {
-        matches!(self, SubstreamState::FreeStream { .. })
-    }
-}
-
 impl Handler {
     fn new(op_manager: Arc<OpManager>) -> Self {
         Self {
             substreams: vec![],
-            keep_alive: KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT),
             uniq_conn_id: 0,
             protocol_status: ProtocolStatus::Unconfirmed,
             pending: Vec::new(),
@@ -782,7 +774,7 @@ impl ConnectionHandler for Handler {
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
-        self.keep_alive
+        KeepAlive::Yes
     }
 
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<HandlePollingEv> {
@@ -808,10 +800,6 @@ impl ConnectionHandler for Handler {
                         self.substreams
                             .push(SubstreamState::AwaitingFirst { conn_id });
                         self.pending.push(*msg);
-                        if self.substreams.is_empty() {
-                            self.keep_alive =
-                                KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
-                        }
                         return Poll::Ready(event);
                     }
                     SubstreamState::AwaitingFirst { conn_id } => {
@@ -965,13 +953,6 @@ impl ConnectionHandler for Handler {
                     }
                 }
             }
-        }
-
-        if self.substreams.is_empty() || self.substreams.iter().all(|s| s.is_free()) {
-            // We destroyed all substreams in this iteration or all substreams are free
-            self.keep_alive = KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
-        } else {
-            self.keep_alive = KeepAlive::Yes;
         }
 
         Poll::Pending

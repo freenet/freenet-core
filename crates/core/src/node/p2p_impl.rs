@@ -5,8 +5,7 @@ use libp2p::{
         muxing,
         transport::{self, upgrade},
     },
-    deflate,
-    dns::TokioDnsConfig,
+    dns,
     identity::Keypair,
     noise, tcp, yamux, PeerId, Transport,
 };
@@ -131,11 +130,10 @@ impl NodeP2P {
         local_key: &Keypair,
     ) -> std::io::Result<transport::Boxed<(PeerId, muxing::StreamMuxerBox)>> {
         let tcp = tcp::tokio::Transport::new(tcp::Config::new().nodelay(true).port_reuse(true));
-        let with_dns = TokioDnsConfig::system(tcp)?;
+        let with_dns = dns::tokio::Transport::system(tcp)?;
         Ok(with_dns
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::Config::new(local_key).unwrap())
-            .apply(deflate::DeflateConfig::default())
             .multiplex(yamux::Config::default())
             .timeout(config::PEER_TIMEOUT)
             .map(|(peer, muxer), _| (peer, muxing::StreamMuxerBox::new(muxer)))
