@@ -413,7 +413,8 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                                 }
                             }
                             Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
-                                tokio::time::sleep(Duration::from_secs(1)).await
+                                tracing::warn!("Still waiting for {key} contract");
+                                tokio::time::sleep(Duration::from_secs(2)).await
                             }
                             Err(err) => {
                                 tracing::error!("{}", err);
@@ -425,6 +426,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                                         "Got back the missing contract ({key}) while subscribing"
                                     );
                                 }
+                                tracing::debug!("Successfully subscribed to {key}");
                                 break;
                             }
                         }
