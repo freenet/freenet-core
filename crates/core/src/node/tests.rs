@@ -450,7 +450,7 @@ impl SimNetwork {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
+
         let expected = HashSet::from_iter(0..num_nodes);
         let mut missing: Vec<_> = expected
             .difference(&connected)

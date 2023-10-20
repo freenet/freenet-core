@@ -30,7 +30,7 @@ where
 {
     loop {
         let (id, event) = contract_handler.channel().recv_from_event_loop().await?;
-        tracing::debug!(%event, "got contract handling event");
+        tracing::debug!(%event, "Got contract handling event");
         match event {
             ContractHandlerEvent::GetQuery {
                 key,
@@ -42,6 +42,7 @@ where
                     .await
                 {
                     Ok((state, contract)) => {
+                        tracing::debug!("Fetched contract {key}");
                         contract_handler
                             .channel()
                             .send_to_event_loop(
@@ -57,7 +58,7 @@ where
                             .await?;
                     }
                     Err(err) => {
-                        tracing::warn!("error while executing get contract query: {err}");
+                        tracing::warn!("Error while executing get contract query: {err}");
                         contract_handler
                             .channel()
                             .send_to_event_loop(
@@ -126,4 +127,5 @@ pub(crate) enum ContractError {
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]
     NoEvHandlerResponse,
+    
 }

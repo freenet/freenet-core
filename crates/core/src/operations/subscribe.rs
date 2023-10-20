@@ -504,18 +504,17 @@ mod test {
             NUM_NODES,
             4,
             3,
-            4,
+            5,
             2,
         )
         .await;
-        sim_nw.with_start_backoff(Duration::from_millis(150));
         sim_nw.start_with_spec(subscribe_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
         sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_millis(50)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(2)))
             .await?;
         assert!(sim_nw.has_got_contract("node-1", &contract_key));
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(sim_nw.is_subscribed_to_contract("node-1", &contract_key));
         Ok(())
     }

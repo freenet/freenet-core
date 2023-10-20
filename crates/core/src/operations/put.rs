@@ -535,7 +535,7 @@ fn build_op_result(
     })
 }
 
-async fn try_to_cache_contract<'a>(
+pub(super) async fn try_to_cache_contract<'a>(
     op_storage: &'a OpManager,
     contract: &ContractContainer,
     key: &ContractKey,
