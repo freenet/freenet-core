@@ -255,7 +255,7 @@ pub(crate) mod test {
                         } else {
                             // let contract_no = rng.gen_range(0..self.non_owned_contracts.len());
                             // self.non_owned_contracts[contract_no]
-                            todo!("fixme")
+                            todo!()
                         };
                         break ContractRequest::Subscribe { key, summary: None }.into();
                     }

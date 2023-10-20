@@ -346,6 +346,7 @@ pub(crate) enum ContractHandlerEvent {
     PutQuery {
         key: ContractKey,
         state: WrappedState,
+        related_contracts: RelatedContracts<'static>,
         parameters: Option<Parameters<'static>>,
     },
     /// The response to a push query.

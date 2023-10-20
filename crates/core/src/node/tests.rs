@@ -127,6 +127,7 @@ pub(crate) struct SimNetwork {
     max_connections: usize,
     min_connections: usize,
     init_backoff: Duration,
+    add_noise: bool,
 }
 
 impl SimNetwork {
@@ -155,6 +156,7 @@ impl SimNetwork {
             max_connections,
             min_connections,
             init_backoff: Duration::from_millis(1),
+            add_noise: false,
         };
         net.build_gateways(gateways).await;
         net.build_nodes(nodes).await;
@@ -163,6 +165,12 @@ impl SimNetwork {
 
     pub fn with_start_backoff(&mut self, value: Duration) {
         self.init_backoff = value;
+    }
+
+    /// Simulates network random behaviour, like messages arriving delayed or out of order, throttling etc.
+    #[allow(unused)]
+    pub fn with_noise(&mut self) {
+        self.add_noise = true;
     }
 
     #[allow(unused)]
@@ -226,6 +234,7 @@ impl SimNetwork {
                 this_node,
                 self.event_listener.clone(),
                 format!("{}-{label}", self.name, label = this_config.label),
+                self.add_noise,
             )
             .await
             .unwrap();
@@ -275,6 +284,7 @@ impl SimNetwork {
                 config,
                 self.event_listener.clone(),
                 format!("{}-{label}", self.name),
+                self.add_noise,
             )
             .await
             .unwrap();
@@ -344,20 +354,28 @@ impl SimNetwork {
 
     pub fn has_put_contract(
         &self,
-        peer: &NodeLabel,
+        peer: impl Into<NodeLabel>,
         key: &ContractKey,
         value: &WrappedState,
     ) -> bool {
-        if let Some(pk) = self.labels.get(peer) {
+        if let Some(pk) = self.labels.get(&peer.into()) {
             self.event_listener.has_put_contract(pk, key, value)
         } else {
             panic!("peer not found");
         }
     }
 
-    pub fn has_got_contract(&self, peer: &NodeLabel, key: &ContractKey) -> bool {
-        if let Some(pk) = self.labels.get(peer) {
+    pub fn has_got_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
+        if let Some(pk) = self.labels.get(&peer.into()) {
             self.event_listener.has_got_contract(pk, key)
+        } else {
+            panic!("peer not found");
+        }
+    }
+
+    pub fn is_subscribed_to_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
+        if let Some(pk) = self.labels.get(&peer.into()) {
+            self.event_listener.is_subscribed_to_contract(pk, key)
         } else {
             panic!("peer not found");
         }
@@ -395,15 +413,20 @@ impl SimNetwork {
         peers_connections
     }
 
+    /// # Arguments
+    ///
+    /// - label: node for which to trigger the
+    /// - event_id: which event to trigger
+    /// - await_for: if set, wait for the duration before returning
     pub async fn trigger_event(
         &self,
-        label: &NodeLabel,
+        label: impl Into<NodeLabel>,
         event_id: EventId,
         await_for: Option<Duration>,
     ) -> Result<(), anyhow::Error> {
         let peer = self
             .labels
-            .get(label)
+            .get(&label.into())
             .ok_or_else(|| anyhow::anyhow!("node not found"))?;
         self.user_ev_controller
             .send((event_id, *peer))

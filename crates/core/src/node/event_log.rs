@@ -15,7 +15,7 @@ use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
     message::{Message, Transaction},
-    operations::{connect, get::GetMsg, put::PutMsg},
+    operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::PeerKeyLocation,
     router::RouteEvent,
     DynError,
@@ -177,6 +177,15 @@ impl<'a> EventLog<'a> {
                 value: StoreResponse { state: Some(_), .. },
                 ..
             }) => EventKind::Get { key: key.clone() },
+            Message::Subscribe(SubscribeMsg::ReturnSub {
+                subscribed: true,
+                key,
+                sender,
+                ..
+            }) => EventKind::Subscribed {
+                key: key.clone(),
+                at: *sender,
+            },
             _ => EventKind::Ignored,
         };
         Either::Left(EventLog {
@@ -451,6 +460,10 @@ enum EventKind {
         key: ContractKey,
     },
     Route(RouteEvent),
+    Subscribed {
+        key: ContractKey,
+        at: PeerKeyLocation,
+    },
     Ignored,
 }
 
@@ -607,6 +620,18 @@ pub(super) mod test_utils {
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Get { ref key } if key == expected_key  )
+            })
+        }
+
+        pub fn is_subscribed_to_contract(
+            &self,
+            peer: &PeerKey,
+            expected_key: &ContractKey,
+        ) -> bool {
+            let logs = self.logs.lock();
+            logs.iter().any(|log| {
+                &log.peer_id == peer
+                    && matches!(log.kind, EventKind::Subscribed { ref key, .. } if key == expected_key  )
             })
         }
 

@@ -178,6 +178,7 @@ impl Operation for PutOp {
                 PutMsg::RequestPut {
                     id,
                     contract,
+                    related_contracts,
                     value,
                     htl,
                     target,
@@ -198,6 +199,7 @@ impl Operation for PutOp {
                         target,
                         value,
                         contract,
+                        related_contracts,
                         htl,
                         skip_list: vec![sender.peer],
                     });
@@ -210,6 +212,7 @@ impl Operation for PutOp {
                     sender,
                     value,
                     contract,
+                    related_contracts,
                     htl,
                     target,
                     mut skip_list,
@@ -246,8 +249,15 @@ impl Operation for PutOp {
                     // after the contract has been cached, push the update query
                     tracing::debug!("Attempting contract value update");
                     let parameters = contract.params();
-                    let new_value =
-                        put_contract(op_storage, key.clone(), value, parameters, client_id).await?;
+                    let new_value = put_contract(
+                        op_storage,
+                        key.clone(),
+                        value,
+                        related_contracts,
+                        parameters,
+                        client_id,
+                    )
+                    .await?;
                     tracing::debug!("Contract successfully updated");
                     // if the change was successful, communicate this back to the requestor and broadcast the change
                     conn_manager
@@ -320,6 +330,7 @@ impl Operation for PutOp {
                         op_storage,
                         key.clone(),
                         new_value,
+                        RelatedContracts::default(),
                         parameters.clone(),
                         client_id,
                     )
@@ -468,9 +479,15 @@ impl Operation for PutOp {
                         });
                     }
                     // after the contract has been cached, push the update query
-                    let new_value =
-                        put_contract(op_storage, key, new_value, contract.params(), client_id)
-                            .await?;
+                    let new_value = put_contract(
+                        op_storage,
+                        key,
+                        new_value,
+                        RelatedContracts::default(),
+                        contract.params(),
+                        client_id,
+                    )
+                    .await?;
 
                     //update skip list
                     skip_list.push(peer_loc.peer);
@@ -597,7 +614,12 @@ async fn try_to_broadcast(
     Ok((new_state, return_msg))
 }
 
-pub(crate) fn start_op(contract: ContractContainer, value: WrappedState, htl: usize) -> PutOp {
+pub(crate) fn start_op(
+    contract: ContractContainer,
+    related_contracts: RelatedContracts<'static>,
+    value: WrappedState,
+    htl: usize,
+) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
     tracing::debug!(
@@ -609,6 +631,7 @@ pub(crate) fn start_op(contract: ContractContainer, value: WrappedState, htl: us
     // let payload_size = contract.data().len();
     let state = Some(PutState::PrepareRequest {
         contract,
+        related_contracts,
         value,
         htl,
     });
@@ -632,6 +655,7 @@ enum PutState {
     ReceivedRequest,
     PrepareRequest {
         contract: ContractContainer,
+        related_contracts: RelatedContracts<'static>,
         value: WrappedState,
         htl: usize,
     },
@@ -675,13 +699,14 @@ pub(crate) async fn request_put(
             contract,
             value,
             htl,
-            ..
+            related_contracts,
         }) => {
             let key = contract.key();
             let new_state = Some(PutState::AwaitingResponse { contract: key });
             let msg = PutMsg::RequestPut {
                 id,
                 contract,
+                related_contracts,
                 value,
                 htl,
                 target,
@@ -708,6 +733,7 @@ async fn put_contract(
     op_storage: &OpManager,
     key: ContractKey,
     state: WrappedState,
+    related_contracts: RelatedContracts<'static>,
     parameters: Parameters<'static>,
     client_id: Option<ClientId>,
 ) -> Result<WrappedState, OpError> {
@@ -717,6 +743,7 @@ async fn put_contract(
             ContractHandlerEvent::PutQuery {
                 key,
                 state,
+                related_contracts,
                 parameters: Some(parameters),
             },
             client_id,
@@ -800,6 +827,8 @@ mod messages {
         RequestPut {
             id: Transaction,
             contract: ContractContainer,
+            #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
+            related_contracts: RelatedContracts<'static>,
             value: WrappedState,
             /// max hops to live
             htl: usize,
@@ -828,6 +857,8 @@ mod messages {
             target: PeerKeyLocation,
             value: WrappedState,
             contract: ContractContainer,
+            #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
+            related_contracts: RelatedContracts<'static>,
             /// max hops to live
             htl: usize,
             // FIXME: remove skip list once we deduplicate at top msg handling level
@@ -926,7 +957,6 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
-        crate::config::set_logger();
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
@@ -941,9 +971,9 @@ mod test {
             "successful_put_op_between_nodes",
             NUM_GW,
             NUM_NODES,
-            3,
             2,
-            4,
+            1,
+            3,
             2,
         )
         .await;
@@ -997,14 +1027,13 @@ mod test {
         ]);
 
         sim_nw.start_with_spec(put_specs).await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
         // trigger the put op @ gw-0
         sim_nw
-            .trigger_event(&"gateway-0".into(), 1, Some(Duration::from_secs(3)))
+            .trigger_event("gateway-0", 1, Some(Duration::from_millis(100)))
             .await?;
-        assert!(sim_nw.has_put_contract(&"gateway-0".into(), &key, &new_value));
+        assert!(sim_nw.has_put_contract("gateway-0", &key, &new_value));
         assert!(sim_nw.event_listener.contract_broadcasted(&key));
         Ok(())
     }

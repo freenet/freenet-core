@@ -126,7 +126,7 @@ where
 }
 
 pub(crate) enum OpEnum {
-    JoinRing(Box<connect::ConnectOp>),
+    Connect(Box<connect::ConnectOp>),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
@@ -136,7 +136,7 @@ pub(crate) enum OpEnum {
 impl OpEnum {
     delegate::delegate! {
         to match self {
-            OpEnum::JoinRing(op) => op,
+            OpEnum::Connect(op) => op,
             OpEnum::Put(op) => op,
             OpEnum::Get(op) => op,
             OpEnum::Subscribe(op) => op,
