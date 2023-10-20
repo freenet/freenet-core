@@ -42,6 +42,7 @@ impl NodeInMemory {
         builder: NodeBuilder<1>,
         event_listener: EL,
         ch_builder: String,
+        add_noise: bool,
     ) -> Result<NodeInMemory, anyhow::Error> {
         let event_listener = Box::new(event_listener);
         let peer_key = PeerKey::from(builder.local_key.public());
@@ -58,8 +59,12 @@ impl NodeInMemory {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 
-        let conn_manager =
-            MemoryConnManager::new(peer_key, event_listener.trait_clone(), op_storage.clone());
+        let conn_manager = MemoryConnManager::new(
+            peer_key,
+            event_listener.trait_clone(),
+            op_storage.clone(),
+            add_noise,
+        );
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
@@ -118,6 +123,7 @@ impl NodeInMemory {
                     ContractHandlerEvent::PutQuery {
                         key: key.clone(),
                         state,
+                        related_contracts: RelatedContracts::default(),
                         parameters: Some(parameters),
                     },
                     None,

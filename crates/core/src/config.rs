@@ -333,11 +333,18 @@ pub fn set_logger() {
         return;
     }
 
+    let filter = if cfg!(any(test, debug_assertions)) {
+        tracing_subscriber::filter::LevelFilter::DEBUG.into()
+    } else {
+        tracing_subscriber::filter::LevelFilter::INFO.into()
+    };
+
     let sub = tracing_subscriber::fmt().with_level(true).with_env_filter(
         tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into())
+            .with_default_directive(filter)
             .from_env_lossy()
-            .add_directive("stretto=off".parse().unwrap()),
+            .add_directive("stretto=off".parse().unwrap())
+            .add_directive("sqlx=error".parse().unwrap()),
     );
 
     if cfg!(any(test, debug_assertions)) {

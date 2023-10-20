@@ -98,6 +98,10 @@ pub struct NodeBuilder<const CLIENTS: usize> {
     pub(crate) local_ip: Option<IpAddr>,
     /// socket port to bind to the listener
     pub(crate) local_port: Option<u16>,
+    /// IP dialers should connect to
+    pub(crate) public_ip: Option<IpAddr>,
+    /// socket port dialers should connect to
+    pub(crate) public_port: Option<u16>,
     /// At least an other running listener node is required for joining the network.
     /// Not necessary if this is an initial node.
     pub(crate) remote_nodes: Vec<InitPeerNode>,
@@ -122,6 +126,8 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
+            public_ip: None,
+            public_port: None,
             location: None,
             max_hops_to_live: None,
             rnd_if_htl_above: None,
@@ -293,7 +299,7 @@ where
         }
         op.backoff = Some(backoff);
     }
-    connect::join_ring_request(tx_id, op_storage, conn_manager, op).await?;
+    connect::connect_request(tx_id, op_storage, conn_manager, op).await?;
     Ok(())
 }
 
@@ -343,9 +349,9 @@ async fn client_event_handling<ClientEv>(
 #[inline]
 async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpManager>) {
     // this will indirectly start actions on the local contract executor
-    let op_storage_cp = op_storage.clone();
     let fut = async move {
         let client_id = request.client_id;
+        let mut missing_contract = false;
         match *request.request {
             ClientRequest::ContractOp(ops) => match ops {
                 ContractRequest::Put {
@@ -356,13 +362,17 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     // Initialize a put op.
                     tracing::debug!(
                         "Received put from user event @ {}",
-                        &op_storage_cp.ring.peer_key
+                        &op_storage.ring.peer_key
                     );
-                    let op = put::start_op(contract, state, op_storage_cp.ring.max_hops_to_live);
-                    if let Err(err) = put::request_put(&op_storage_cp, op, Some(client_id)).await {
+                    let op = put::start_op(
+                        contract,
+                        related_contracts,
+                        state,
+                        op_storage.ring.max_hops_to_live,
+                    );
+                    if let Err(err) = put::request_put(&op_storage, op, Some(client_id)).await {
                         tracing::error!("{}", err);
                     }
-                    todo!("use `related_contracts`: {related_contracts:?}")
                 }
                 ContractRequest::Update {
                     key: _key,
@@ -377,40 +387,48 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     // Initialize a get op.
                     tracing::debug!(
                         "Received get from user event @ {}",
-                        &op_storage_cp.ring.peer_key
+                        &op_storage.ring.peer_key
                     );
                     let op = get::start_op(key, contract);
-                    if let Err(err) = get::request_get(&op_storage_cp, op, Some(client_id)).await {
+                    if let Err(err) = get::request_get(&op_storage, op, Some(client_id)).await {
                         tracing::error!("{}", err);
                     }
                 }
                 ContractRequest::Subscribe { key, .. } => {
                     // Initialize a subscribe op.
                     loop {
-                        // FIXME: this will block the loop until the subscribe op succeeds
-                        //        instead the op should be deferred for later execution
                         let op = subscribe::start_op(key.clone());
-                        match subscribe::request_subscribe(&op_storage_cp, op, Some(client_id))
-                            .await
-                        {
-                            Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
-                                tracing::warn!("Trying to subscribe to a contract not present: {}, requesting it first", key);
+                        match subscribe::request_subscribe(&op_storage, op, Some(client_id)).await {
+                            Err(OpError::ContractError(ContractError::ContractNotFound(key)))
+                                if !missing_contract =>
+                            {
+                                tracing::info!("Trying to subscribe to a contract not present: {key}, requesting it first");
+                                missing_contract = true;
                                 let get_op = get::start_op(key.clone(), true);
                                 if let Err(err) =
-                                    get::request_get(&op_storage_cp, get_op, Some(client_id)).await
+                                    get::request_get(&op_storage, get_op, Some(client_id)).await
                                 {
-                                    tracing::error!("Failed getting the contract `{}` while previously trying to subscribe; bailing: {}", key, err);
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    tracing::error!("Failed getting the contract `{key}` while previously trying to subscribe; bailing: {err}");
+                                    break;
                                 }
+                            }
+                            Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
+                                tokio::time::sleep(Duration::from_secs(1)).await
                             }
                             Err(err) => {
                                 tracing::error!("{}", err);
                                 break;
                             }
-                            Ok(()) => break,
+                            Ok(()) => {
+                                if missing_contract {
+                                    tracing::debug!(
+                                        "Got back the missing contract ({key}) while subscribing"
+                                    );
+                                }
+                                break;
+                            }
                         }
                     }
-                    todo!()
                 }
                 _ => {
                     tracing::error!("op not supported");
@@ -423,7 +441,6 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
             }
         }
     };
-
     GlobalExecutor::spawn(fut);
 }
 
@@ -622,7 +639,7 @@ where
         // the attempt to join the network failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
         match op_storage.pop(&tx) {
-            Some(OpEnum::JoinRing(op)) if op.has_backoff() => {
+            Some(OpEnum::Connect(op)) if op.has_backoff() => {
                 let ConnectOp {
                     gateway, backoff, ..
                 } = *op;
@@ -631,7 +648,7 @@ where
                 join_ring_request(Some(backoff), peer_key, &gateway, op_storage, conn_manager)
                     .await?;
             }
-            Some(OpEnum::JoinRing(_)) => {
+            Some(OpEnum::Connect(_)) => {
                 return Err(OpError::MaxRetriesExceeded(tx, tx.tx_type()));
             }
             _ => {}

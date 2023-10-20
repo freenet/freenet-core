@@ -236,6 +236,7 @@ impl Operation for GetOp {
 
                     if !is_cached_contract {
                         tracing::warn!(
+                            tx = %id,
                             "Contract `{}` not found while processing a get request at node @ {}",
                             key,
                             target.peer
@@ -243,6 +244,7 @@ impl Operation for GetOp {
 
                         if htl == 0 {
                             tracing::warn!(
+                                tx = %id,
                                 "The maximum HOPS number has been exceeded, sending the error \
                                  back to the node @ {}",
                                 sender.peer
@@ -271,7 +273,7 @@ impl Operation for GetOp {
                         let Some(new_target) =
                             op_storage.ring.closest_caching(&key, &[sender.peer])
                         else {
-                            tracing::warn!("no peer found while trying getting contract {key}");
+                            tracing::warn!(tx = %id, "no peer found while trying getting contract {key}");
                             return Err(OpError::RingError(RingError::NoCachingPeers(key)));
                         };
 
@@ -316,24 +318,25 @@ impl Operation for GetOp {
                             Err(err) => return Err(err),
                         }
 
-                        tracing::debug!("Contract {returned_key} found @ peer {}", target.peer);
+                        tracing::debug!(tx = %id, "Contract {returned_key} found @ peer {}", target.peer);
 
                         match self.state {
                             Some(GetState::AwaitingResponse { .. }) => {
                                 tracing::debug!(
-                                    "Completed operation, Get response received for contract {key}"
+                                    tx = %id,
+                                    "Completed operation, get response received for contract {key}"
                                 );
                                 // Completed op
                                 new_state = None;
                                 return_msg = None;
                             }
                             Some(GetState::ReceivedRequest) => {
-                                tracing::debug!("Returning contract {} to {}", key, sender.peer);
+                                tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                                 new_state = None;
                                 let value = match value {
                                     Ok(res) => res,
                                     Err(err) => {
-                                        tracing::error!("error: {err}");
+                                        tracing::error!(tx = %id, "error: {err}");
                                         return Err(OpError::ExecutorError(err));
                                     }
                                 };
@@ -365,6 +368,7 @@ impl Operation for GetOp {
                 } => {
                     let this_loc = target;
                     tracing::warn!(
+                        tx = %id,
                         "Neither contract or contract value for contract `{}` found at peer {}, \
                         retrying with other peers",
                         key,
@@ -406,6 +410,7 @@ impl Operation for GetOp {
                                 });
                             } else {
                                 tracing::error!(
+                                    tx = %id,
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
@@ -413,7 +418,7 @@ impl Operation for GetOp {
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
-                            tracing::debug!("Returning contract {} to {}", key, sender.peer);
+                            tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
@@ -459,10 +464,11 @@ impl Operation for GetOp {
                                 )
                                 .await?;
                             let key = contract.key();
-                            tracing::debug!("Contract `{}` successfully cached", key);
+                            tracing::debug!(tx = %id, "Contract `{}` successfully cached", key);
                         } else {
                             // no contract, consider this like an error ignoring the incoming update value
                             tracing::warn!(
+                                tx = %id,
                                 "Contract not received from peer {} while requested",
                                 sender.peer
                             );
@@ -501,6 +507,7 @@ impl Operation for GetOp {
                             ContractHandlerEvent::PutQuery {
                                 key: key.clone(),
                                 state: value.clone(),
+                                related_contracts: RelatedContracts::default(),
                                 parameters,
                             },
                             client_id,
@@ -511,6 +518,7 @@ impl Operation for GetOp {
                         Some(GetState::AwaitingResponse { fetch_contract, .. }) => {
                             if fetch_contract && contract.is_none() {
                                 tracing::error!(
+                                    tx = %id,
                                     "Get response received for contract {key}, but the contract wasn't returned"
                                 );
                                 new_state = None;
@@ -520,7 +528,7 @@ impl Operation for GetOp {
                                     contract,
                                 });
                             } else {
-                                tracing::debug!("Get response received for contract {}", key);
+                                tracing::debug!(tx = %id, "Get response received for contract {}", key);
                                 new_state = None;
                                 return_msg = None;
                                 result = Some(GetResult {
@@ -530,7 +538,7 @@ impl Operation for GetOp {
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
-                            tracing::debug!("Returning contract {} to {}", key, sender.peer);
+                            tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
@@ -581,6 +589,7 @@ async fn continue_seeking<CB: ConnectionBridge>(
     retry_msg: Message,
 ) -> Result<(), OpError> {
     tracing::info!(
+        tx = %retry_msg.id(),
         "Retrying to get the contract from node @ {}",
         new_target.peer
     );
@@ -600,6 +609,7 @@ fn check_contract_found(
     if returned_key != key {
         // shouldn't be a reachable path
         tracing::error!(
+            tx = %id,
             "contract retrieved ({}) and asked ({}) are not the same",
             returned_key,
             key
@@ -622,9 +632,8 @@ fn check_contract_found(
 
 pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
     let contract_location = Location::from(&key);
-    tracing::debug!("Requesting get contract {} @ loc({contract_location})", key,);
-
     let id = Transaction::new::<GetMsg>();
+    tracing::debug!(tx = %id, "Requesting get contract {key} @ loc({contract_location})");
     let state = Some(GetState::PrepareRequest {
         key,
         id,
@@ -866,10 +875,9 @@ mod test {
 
         // trigger get @ node-0, which does not own the contract
         sim_nw
-            .trigger_event(&"node-0".into(), 1, Some(Duration::from_millis(100)))
+            .trigger_event("node-0", 1, Some(Duration::from_millis(50)))
             .await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(sim_nw.has_got_contract(&"node-0".into(), &key));
+        assert!(sim_nw.has_got_contract("node-0", &key));
         Ok(())
     }
 
@@ -905,9 +913,9 @@ mod test {
 
         // trigger get @ node-1, which does not own the contract
         sim_nw
-            .trigger_event(&"node-1".into(), 1, Some(Duration::from_millis(100)))
+            .trigger_event("node-1", 1, Some(Duration::from_millis(50)))
             .await?;
-        assert!(!sim_nw.has_got_contract(&"node-1".into(), &key));
+        assert!(!sim_nw.has_got_contract("node-1", &key));
         Ok(())
     }
 
@@ -973,9 +981,9 @@ mod test {
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
         sim_nw
-            .trigger_event(&"node-0".into(), 1, Some(Duration::from_millis(500)))
+            .trigger_event("node-0", 1, Some(Duration::from_millis(50)))
             .await?;
-        assert!(sim_nw.has_got_contract(&"node-0".into(), &key));
+        assert!(sim_nw.has_got_contract("node-0", &key));
         Ok(())
     }
 }

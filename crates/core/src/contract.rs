@@ -91,11 +91,12 @@ where
             ContractHandlerEvent::PutQuery {
                 key,
                 state,
+                related_contracts,
                 parameters,
             } => {
                 let put_result = contract_handler
                     .executor()
-                    .upsert_contract_state(key, Either::Left(state), parameters)
+                    .upsert_contract_state(key, Either::Left(state), related_contracts, parameters)
                     .await
                     .map_err(Into::into);
                 contract_handler

@@ -146,13 +146,13 @@ impl Operation for SubscribeOp {
                     };
 
                     if !op_storage.ring.is_contract_cached(&key) {
-                        tracing::info!("Contract {} not found while processing info", key);
-                        tracing::info!("Trying to found the contract from another node");
+                        tracing::info!(tx = %id, "Contract {} not found while processing info", key);
+                        tracing::info!(tx = %id, "Trying to found the contract from another node");
 
                         let Some(new_target) =
                             op_storage.ring.closest_caching(&key, &[sender.peer])
                         else {
-                            tracing::warn!("no peer found while trying getting contract {key}");
+                            tracing::warn!(tx = %id, "No peer found while trying getting contract {key}");
                             return Err(OpError::RingError(RingError::NoCachingPeers(key)));
                         };
                         let new_htl = htl + 1;
@@ -187,9 +187,9 @@ impl Operation for SubscribeOp {
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
                             tracing::info!(
-                                "Peer {} successfully subscribed to contract {}",
+                                tx = %id,
+                                "Peer {} successfully subscribed to contract {key}",
                                 subscriber.peer,
-                                key
                             );
                             new_state = Some(SubscribeState::Completed);
                             // TODO review behaviour, if the contract is not cached should return subscribed false?
@@ -212,8 +212,8 @@ impl Operation for SubscribeOp {
                     id,
                 } => {
                     tracing::warn!(
-                        "Contract `{}` not found at potential subscription provider {}",
-                        key,
+                        tx = %id,
+                        "Contract `{key}` not found at potential subscription provider {}",
                         sender.peer
                     );
                     // will error out in case it has reached max number of retries
@@ -261,14 +261,10 @@ impl Operation for SubscribeOp {
                     target: _,
                     id: _,
                 } => {
-                    tracing::warn!(
-                        "Subscribed to `{}` not found at potential subscription provider {}",
-                        key,
-                        sender.peer
-                    );
+                    tracing::warn!("Subscribed to `{key}` at provider {}", sender.peer);
                     op_storage.ring.add_subscription(key);
-                    let _ = client_id;
                     // todo: should inform back to the network event loop?
+                    let _ = client_id;
 
                     match self.state {
                         Some(SubscribeState::AwaitingResponse { .. }) => {
@@ -465,9 +461,9 @@ mod test {
     use super::*;
     use crate::node::tests::{NodeSpecification, SimNetwork};
 
-    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
+        crate::config::set_logger();
         const NUM_NODES: usize = 4usize;
         const NUM_GW: usize = 1usize;
 
@@ -483,19 +479,18 @@ mod test {
         }
         .into();
         let first_node = NodeSpecification {
-            owned_contracts: Vec::new(),
-            non_owned_contracts: vec![contract_key],
-            events_to_generate: HashMap::from_iter([(1, event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let second_node = NodeSpecification {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
             non_owned_contracts: Vec::new(),
             events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::new(),
+        };
+        let second_node = NodeSpecification {
+            owned_contracts: Vec::new(),
+            non_owned_contracts: vec![contract_key.clone()],
+            events_to_generate: HashMap::from_iter([(1, event)]),
             contract_subscribers: HashMap::new(),
         };
 
@@ -507,15 +502,21 @@ mod test {
             "successful_subscribe_op_between_nodes",
             NUM_GW,
             NUM_NODES,
+            4,
             3,
-            2,
             4,
             2,
         )
         .await;
+        sim_nw.with_start_backoff(Duration::from_millis(150));
         sim_nw.start_with_spec(subscribe_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
-
+        sim_nw
+            .trigger_event("node-1", 1, Some(Duration::from_millis(50)))
+            .await?;
+        assert!(sim_nw.has_got_contract("node-1", &contract_key));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(sim_nw.is_subscribed_to_contract("node-1", &contract_key));
         Ok(())
     }
 }

@@ -233,6 +233,7 @@ pub(crate) trait ContractExecutor: Send + Sync + 'static {
         &mut self,
         key: ContractKey,
         state: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
         params: Option<Parameters<'_>>,
     ) -> Result<WrappedState, crate::runtime::ContractError>;
 }
@@ -1247,6 +1248,7 @@ impl ContractExecutor for Executor<Runtime> {
         &mut self,
         _key: ContractKey,
         _state: Either<WrappedState, StateDelta<'static>>,
+        _related_contracts: RelatedContracts<'static>,
         _params: Option<Parameters<'_>>,
     ) -> Result<WrappedState, crate::runtime::ContractError> {
         todo!()
@@ -1295,6 +1297,7 @@ impl ContractExecutor for Executor<crate::contract::MockRuntime> {
         &mut self,
         key: ContractKey,
         state: Either<WrappedState, StateDelta<'static>>,
+        _related_contracts: RelatedContracts<'static>,
         params: Option<Parameters<'_>>,
     ) -> Result<WrappedState, crate::runtime::ContractError> {
         // todo: instead allow to perform mutations per contract based on incoming value so we can track

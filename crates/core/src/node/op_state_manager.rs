@@ -111,7 +111,7 @@ impl OpManager {
 
     pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
         match op {
-            OpEnum::JoinRing(op) => {
+            OpEnum::Connect(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.tx_type(), TransactionType::JoinRing);
                 self.join_ring.insert(id, *op);
@@ -146,7 +146,7 @@ impl OpManager {
                 .join_ring
                 .remove(id)
                 .map(|(_k, v)| v)
-                .map(|op| OpEnum::JoinRing(Box::new(op))),
+                .map(|op| OpEnum::Connect(Box::new(op))),
             TransactionType::Put => self.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
             TransactionType::Get => self.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
             TransactionType::Subscribe => self

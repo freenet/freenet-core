@@ -64,7 +64,7 @@ const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 fn config_behaviour(
     local_key: &Keypair,
     gateways: &[InitPeerNode],
-    _public_addr: &Option<Multiaddr>,
+    _private_addr: &Option<Multiaddr>,
     op_manager: Arc<OpManager>,
 ) -> NetBehaviour {
     let routing_table: HashMap<_, _> = gateways
@@ -234,6 +234,7 @@ pub(in crate::node) struct P2pConnManager {
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
     /// last valid observed public address
     public_addr: Option<Multiaddr>,
+    listening_addr: Option<Multiaddr>,
     event_listener: Box<dyn EventLogRegister>,
 }
 
@@ -248,7 +249,14 @@ impl P2pConnManager {
         // to reuse it's thread pool and scheduler in order to drive futures.
         let global_executor = GlobalExecutor;
 
-        let public_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
+        let private_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
+            let public_addr = multiaddr_from_connection(conn);
+            Some(public_addr)
+        } else {
+            None
+        };
+
+        let public_addr = if let Some(conn) = config.public_ip.zip(config.public_port) {
             let public_addr = multiaddr_from_connection(conn);
             Some(public_addr)
         } else {
@@ -258,7 +266,7 @@ impl P2pConnManager {
         let behaviour = config_behaviour(
             &config.local_key,
             &config.remote_nodes,
-            &public_addr,
+            &private_addr,
             op_manager.clone(),
         );
         let mut swarm = Swarm::new(
@@ -283,12 +291,13 @@ impl P2pConnManager {
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
             public_addr,
+            listening_addr: private_addr,
             event_listener: Box::new(event_listener),
         })
     }
 
     pub fn listen_on(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(listening_addr) = &self.public_addr {
+        if let Some(listening_addr) = &self.listening_addr {
             self.swarm.listen_on(listening_addr.clone())?;
         }
         Ok(())
@@ -510,7 +519,7 @@ impl P2pConnManager {
                     self.public_addr = Some(address);
                 }
                 Ok(Right(IsPrivatePeer(_peer))) => {
-                    todo!("attempt hole punching")
+                    todo!("this peer is private, attempt hole punching")
                 }
                 Ok(Right(ClosedChannel)) => {
                     tracing::info!("Notification channel closed");
@@ -561,7 +570,7 @@ enum ConnMngrActions {
     },
     /// Update self own public address, useful when communicating for first time
     UpdatePublicAddr(Multiaddr),
-    /// A peer which we attempted connection to is private, attempt hole-punching
+    /// This is private, so when establishing connections hole-punching should be performed
     IsPrivatePeer(PeerId),
     NodeAction(NodeEvent),
     ClosedChannel,
