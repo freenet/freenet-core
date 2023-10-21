@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    tags: [v*]
 
 jobs:
   deploy:
@@ -15,7 +14,6 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
-          ref: ${{ github.event.release.tag_name || 'main' }}
       - name: Setup Rust
         uses: ATiltedTree/setup-rust@v1
         with:
@@ -36,17 +34,8 @@ jobs:
           else
             echo "Docs folder not found."
           fi
-      - name: Prepare Deploy Folder
-        run: |
-          mkdir -p deploy
-          if [[ $GITHUB_REF == refs/heads/main ]]; then
-            mv docs/book deploy/
-          else
-            version=${GITHUB_REF#refs/tags/v}
-            mv docs/book deploy/$version
-          fi
       - name: Deploy
         uses: JamesIves/github-pages-deploy-action@v4
         with:
-          folder: deploy
+          folder: docs/book
           single-commit: true
