@@ -14,23 +14,19 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
-
       - name: Setup Rust
         uses: ATiltedTree/setup-rust@v1
         with:
           rust-version: stable
-
       - name: Cache Dependencies
         uses: actions/cache@v3
         with:
           path: ~/.cargo
           key: cargo-cache-${{ hashFiles('Cargo.lock') }}
-
       - name: Install dependencies
         run: |
           cargo install mdbook mdbook-mermaid mdbook-toc
-
-      - name: Build MDBook for HEAD
+      - name: Build MDBook
         run: |
           if [ -d "docs" ]; then
             cd docs
@@ -38,26 +34,6 @@ jobs:
           else
             echo "Docs folder not found."
           fi
-
-      - name: Checkout latest release
-        id: latest_release
-        run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0)
-          echo "::set-output name=tag::${LATEST_TAG}"
-          git checkout $LATEST_TAG
-
-      - name: Create release subdirectory
-        run: mkdir -p docs/release
-
-      - name: Build MDBook for release
-        run: |
-          if [ -d "docs" ]; then
-            cd docs
-            mdbook build -d release
-          else
-            echo "Docs folder not found."
-          fi
-
       - name: Deploy
         uses: JamesIves/github-pages-deploy-action@v4
         with:
