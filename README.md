@@ -18,7 +18,7 @@
 
 # Freenet
 
-The Internet has grown increasingly centralized over the past 25 years, such
+The Internet has grown increasingly centralized over the past two decades, such
 that a handful of companies now effectively control the Internet infrastructure.
 The public square is privately owned, threatening freedom of speech and
 democracy.
