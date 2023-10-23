@@ -19,7 +19,7 @@ jobs:
           toolchain: stable
 
       - name: Cache Dependencies
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: ~/.cargo
           key: cargo-cache-${{ hashFiles('**/Cargo.lock') }}
