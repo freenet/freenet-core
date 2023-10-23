@@ -81,6 +81,7 @@ where
                             .await?;
                     }
                     Err(err) => {
+                        tracing::error!("Error while caching: {err}");
                         let err = ContractError::ContractRuntimeError(err);
                         contract_handler
                             .channel()
@@ -121,11 +122,10 @@ pub(crate) enum ContractError {
     ChannelDropped(Box<ContractHandlerEvent>),
     #[error("contract {0} not found in storage")]
     ContractNotFound(ContractKey),
-    #[error("")]
-    ContractRuntimeError(ContractRtError),
     #[error(transparent)]
+    ContractRuntimeError(ContractRtError),
+    #[error("{0}")]
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]
     NoEvHandlerResponse,
-    
 }

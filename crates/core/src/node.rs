@@ -18,6 +18,7 @@ use std::{
 use either::Either;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
+use tracing::Instrument;
 
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;
@@ -30,7 +31,7 @@ use crate::{
         ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
         NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
     },
-    message::{InnerMessage, Message, Transaction, TransactionType},
+    message::{Message, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectMsg, ConnectOp},
         get, put, subscribe, OpEnum, OpError, OpOutcome,
@@ -426,7 +427,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                                         "Got back the missing contract ({key}) while subscribing"
                                     );
                                 }
-                                tracing::debug!("Successfully subscribed to {key}");
+                                tracing::debug!("Starting subscribe request to {key}");
                                 break;
                             }
                         }
@@ -443,9 +444,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
             }
         }
     };
-    GlobalExecutor::spawn(fut);
+    GlobalExecutor::spawn(fut.instrument(tracing::span!(
+        tracing::Level::INFO,
+        "process_client_request"
+    )));
 }
 
+#[allow(unused)]
 macro_rules! log_handling_msg {
     ($op:expr, $id:expr, $op_storage:ident) => {
         tracing::debug!(
@@ -515,8 +520,11 @@ async fn report_result(
             }
         }
         Ok(None) => {}
+        Err(OpError::OpNotPresent(tx)) => {
+            tracing::trace!(%tx, "Late message for finished transaction");
+        }
         Err(err) => {
-            tracing::debug!("Finished transaction with error: {}", err)
+            tracing::debug!("Finished transaction with error: {err}")
         }
     }
 }
@@ -541,7 +549,7 @@ async fn process_message<CB>(
                 .await;
             match msg {
                 Message::JoinRing(op) => {
-                    log_handling_msg!("join", op.id(), op_storage);
+                    // log_handling_msg!("join", op.id(), op_storage);
                     let op_result = handle_op_request::<connect::ConnectOp, _>(
                         &op_storage,
                         &mut conn_manager,
@@ -559,7 +567,7 @@ async fn process_message<CB>(
                     .await;
                 }
                 Message::Put(op) => {
-                    log_handling_msg!("put", *op.id(), op_storage);
+                    // log_handling_msg!("put", *op.id(), op_storage);
                     let op_result = handle_op_request::<put::PutOp, _>(
                         &op_storage,
                         &mut conn_manager,
@@ -577,7 +585,7 @@ async fn process_message<CB>(
                     .await;
                 }
                 Message::Get(op) => {
-                    log_handling_msg!("get", op.id(), op_storage);
+                    // log_handling_msg!("get", op.id(), op_storage);
                     let op_result = handle_op_request::<get::GetOp, _>(
                         &op_storage,
                         &mut conn_manager,
@@ -595,7 +603,7 @@ async fn process_message<CB>(
                     .await;
                 }
                 Message::Subscribe(op) => {
-                    log_handling_msg!("subscribe", op.id(), op_storage);
+                    // log_handling_msg!("subscribe", op.id(), op_storage);
                     let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                         &op_storage,
                         &mut conn_manager,

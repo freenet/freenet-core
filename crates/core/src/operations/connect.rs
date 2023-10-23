@@ -1111,7 +1111,7 @@ mod test {
         .await;
         // sim_nw.with_start_backoff(Duration::from_millis(100));
         sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(5)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
         let some_forwarded = sim_nw
             .node_connectivity()
             .into_iter()

@@ -8,7 +8,7 @@ use super::{delegate, secrets_store, wasm_runtime, DelegateExecError};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub struct ContractError(Box<RuntimeInnerError>);
 
 impl ContractError {
@@ -65,8 +65,6 @@ impl Display for ContractError {
     }
 }
 
-impl std::error::Error for ContractError {}
-
 impl From<RuntimeInnerError> for ContractError {
     fn from(err: RuntimeInnerError) -> Self {
         Self(Box::new(err))
@@ -104,7 +102,7 @@ pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
     BufferError(#[from] freenet_stdlib::memory::buf::Error),
 
-    #[error(transparent)]
+    #[error("{0}")]
     IOError(#[from] std::io::Error),
 
     #[error(transparent)]
