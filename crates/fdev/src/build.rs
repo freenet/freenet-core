@@ -21,6 +21,21 @@ pub(crate) use contract::*;
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
+#[cfg(windows)]
+pub const NPM_BUILD_COMMAND: &'static str = "npm.cmd";
+#[cfg(windows)]
+pub const TSC_BUILD_COMMAND: &'static str = "tsc.cmd";
+#[cfg(windows)]
+pub const WEBPACK_BUILD_COMMAND: &'static str = "tsc.cmd";
+
+
+#[cfg(not(windows))]
+pub const NPM_BUILD_COMMAND: &'static str = "npm";
+#[cfg(not(windows))]
+pub const TSC_BUILD_COMMAND: &'static str = "tsc";
+#[cfg(not(windows))]
+pub const WEBPACK_BUILD_COMMAND: &'static str = "tsc.cmd";
+
 pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), DynError> {
     match cli_config.package_type {
         PackageType::Contract => contract::package_contract(cli_config, cwd),
@@ -255,7 +270,7 @@ mod contract {
             println!("Bundling webapp contract state");
             match &web_config.lang {
                 Some(SupportedWebLangs::Typescript) => {
-                    let child = Command::new("npm")
+                    let child = Command::new(NPM_BUILD_COMMAND)
                         .args(["install"])
                         .current_dir(cwd)
                         .stdout(Stdio::piped())
@@ -263,7 +278,7 @@ mod contract {
                         .spawn()
                         .map_err(|e| {
                             eprintln!("Error while installing npm packages: {e}");
-                            Error::CommandFailed("npm")
+                            Error::CommandFailed(NPM_BUILD_COMMAND)
                         })?;
                     pipe_std_streams(child)?;
                     let webpack = web_config
@@ -274,12 +289,12 @@ mod contract {
                     use std::io::IsTerminal;
                     if webpack {
                         let cmd_args: &[&str] =
-                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() && cfg!(not(windows)) {
                                 &["--color"]
                             } else {
                                 &[]
                             };
-                        let child = Command::new("webpack")
+                        let child = Command::new(WEBPACK_BUILD_COMMAND)
                             .args(cmd_args)
                             .current_dir(cwd)
                             .stdout(Stdio::piped())
@@ -298,7 +313,7 @@ mod contract {
                             } else {
                                 &[]
                             };
-                        let child = Command::new("tsc")
+                        let child = Command::new(TSC_BUILD_COMMAND)
                             .args(cmd_args)
                             .current_dir(cwd)
                             .stdout(Stdio::piped())
@@ -306,7 +321,7 @@ mod contract {
                             .spawn()
                             .map_err(|e| {
                                 eprintln!("Error while executing command tsc: {e}");
-                                Error::CommandFailed("tsc")
+                                Error::CommandFailed(TSC_BUILD_COMMAND)
                             })?;
                         pipe_std_streams(child)?;
                         println!("Compiled input using tsc");
