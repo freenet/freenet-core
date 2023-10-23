@@ -21,7 +21,22 @@ pub(crate) use contract::*;
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
-pub fn build_package(cli_config: BuildToolConfig, cwd: &Path) -> Result<(), anyhow::Error> {
+#[cfg(windows)]
+pub const NPM_BUILD_COMMAND: &'static str = "npm.cmd";
+#[cfg(windows)]
+pub const TSC_BUILD_COMMAND: &'static str = "tsc.cmd";
+#[cfg(windows)]
+pub const WEBPACK_BUILD_COMMAND: &'static str = "webpack.cmd";
+
+
+#[cfg(not(windows))]
+pub const NPM_BUILD_COMMAND: &'static str = "npm";
+#[cfg(not(windows))]
+pub const TSC_BUILD_COMMAND: &'static str = "tsc";
+#[cfg(not(windows))]
+pub const WEBPACK_BUILD_COMMAND: &'static str = "webpack";
+
+pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), DynError> {
     match cli_config.package_type {
         PackageType::Contract => contract::package_contract(cli_config, cwd),
         PackageType::Delegate => delegate::package_delegate(cli_config, cwd),
@@ -259,65 +274,66 @@ mod contract {
         };
 
         let mut archive: Builder<Cursor<Vec<u8>>> = Builder::new(Cursor::new(Vec::new()));
-
-        println!("Bundling webapp contract state");
-        match &web_config.lang {
-            Some(SupportedWebLangs::Typescript) => {
-                let child = Command::new("npm")
-                    .args(["install"])
-                    .current_dir(cwd)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| {
-                        eprintln!("Error while installing npm packages: {e}");
-                        Error::CommandFailed("npm")
-                    })?;
-                pipe_std_streams(child)?;
-                let webpack = web_config
-                    .typescript
-                    .as_ref()
-                    .map(|c| c.webpack)
-                    .unwrap_or_default();
-                use std::io::IsTerminal;
-                if webpack {
-                    let cmd_args: &[&str] =
-                        if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
-                            &["--color"]
-                        } else {
-                            &[]
-                        };
-                    let child = Command::new("webpack")
-                        .args(cmd_args)
+        if let Some(web_config) = &config.webapp {
+            println!("Bundling webapp contract state");
+            match &web_config.lang {
+                Some(SupportedWebLangs::Typescript) => {
+                    let child = Command::new(NPM_BUILD_COMMAND)
+                        .args(["install"])
                         .current_dir(cwd)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()
                         .map_err(|e| {
-                            eprintln!("Error while executing webpack command: {e}");
-                            Error::CommandFailed("tsc")
+                            eprintln!("Error while installing npm packages: {e}");
+                            Error::CommandFailed(NPM_BUILD_COMMAND)
                         })?;
                     pipe_std_streams(child)?;
-                    println!("Compiled input using webpack");
-                } else {
-                    let cmd_args: &[&str] =
-                        if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
-                            &["--pretty"]
-                        } else {
-                            &[]
-                        };
-                    let child = Command::new("tsc")
-                        .args(cmd_args)
-                        .current_dir(cwd)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .map_err(|e| {
-                            eprintln!("Error while executing command tsc: {e}");
-                            Error::CommandFailed("tsc")
-                        })?;
-                    pipe_std_streams(child)?;
-                    println!("Compiled input using tsc");
+                    let webpack = web_config
+                        .typescript
+                        .as_ref()
+                        .map(|c| c.webpack)
+                        .unwrap_or_default();
+                    use std::io::IsTerminal;
+                    if webpack {
+                        let cmd_args: &[&str] =
+                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() && cfg!(not(windows)) {
+                                &["--color"]
+                            } else {
+                                &[]
+                            };
+                        let child = Command::new(WEBPACK_BUILD_COMMAND)
+                            .args(cmd_args)
+                            .current_dir(cwd)
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .map_err(|e| {
+                                eprintln!("Error while executing webpack command: {e}");
+                                Error::CommandFailed("tsc")
+                            })?;
+                        pipe_std_streams(child)?;
+                        println!("Compiled input using webpack");
+                    } else {
+                        let cmd_args: &[&str] =
+                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+                                &["--pretty"]
+                            } else {
+                                &[]
+                            };
+                        let child = Command::new(TSC_BUILD_COMMAND)
+                            .args(cmd_args)
+                            .current_dir(cwd)
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .map_err(|e| {
+                                eprintln!("Error while executing command tsc: {e}");
+                                Error::CommandFailed(TSC_BUILD_COMMAND)
+                            })?;
+                        pipe_std_streams(child)?;
+                        println!("Compiled input using tsc");
+                    }
                 }
             }
             None => {}
