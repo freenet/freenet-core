@@ -534,6 +534,7 @@ impl Operation for GetOp {
                         ContractHandlerEvent::PutResponse {
                             new_value: Err(err),
                         } => {
+                            tracing::debug!(tx = %id, error = %err, "Failed put at executor");
                             return Err(OpError::ExecutorError(err));
                         }
                         _ => unreachable!(),
@@ -614,14 +615,12 @@ async fn continue_seeking<CB: ConnectionBridge>(
     new_target: &PeerKeyLocation,
     retry_msg: Message,
 ) -> Result<(), OpError> {
-    tracing::info!(
+    tracing::debug!(
         tx = %retry_msg.id(),
-        "Retrying to get the contract from node @ {}",
+        "Forwarding get request to {}",
         new_target.peer
     );
-
     conn_manager.send(&new_target.peer, retry_msg).await?;
-
     Ok(())
 }
 
@@ -1003,7 +1002,7 @@ mod test {
             3,
             2,
             4,
-            3,
+            2,
         )
         .await;
         sim_nw.start_with_spec(get_specs).await;

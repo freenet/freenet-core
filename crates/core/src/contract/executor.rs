@@ -1191,6 +1191,7 @@ impl Executor<crate::contract::MockRuntime> {
         let tmp_path = std::env::temp_dir().join(format!("freenet-executor-{data_dir}"));
 
         let contracts_data_dir = tmp_path.join("contracts");
+        std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
         let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
 
         // uses inmemory SQLite

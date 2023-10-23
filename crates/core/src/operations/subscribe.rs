@@ -146,8 +146,7 @@ impl Operation for SubscribeOp {
                     };
 
                     if !op_storage.ring.is_contract_cached(&key) {
-                        tracing::info!(tx = %id, "Contract {} not found while processing info", key);
-                        tracing::info!(tx = %id, "Trying to found the contract from another node");
+                        tracing::debug!(tx = %id, "Contract {} not found at {}, trying other peer", key, target.peer);
 
                         let Some(new_target) =
                             op_storage.ring.closest_caching(&key, &[sender.peer])
@@ -164,6 +163,7 @@ impl Operation for SubscribeOp {
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.push(target.peer);
 
+                        tracing::debug!(tx = %id, "Forward request to peer: {}", new_target.peer);
                         // Retry seek node when the contract to subscribe has not been found in this node
                         conn_manager
                             .send(
@@ -186,7 +186,7 @@ impl Operation for SubscribeOp {
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %id,
                                 "Peer {} successfully subscribed to contract {key}",
                                 subscriber.peer,
@@ -258,20 +258,34 @@ impl Operation for SubscribeOp {
                     subscribed: true,
                     key,
                     sender,
-                    target: _,
-                    id: _,
+                    id,
+                    target,
+                    ..
                 } => {
-                    tracing::warn!("Subscribed to `{key}` at provider {}", sender.peer);
-                    op_storage.ring.add_subscription(key);
-                    // todo: should inform back to the network event loop?
-                    let _ = client_id;
-
                     match self.state {
                         Some(SubscribeState::AwaitingResponse { .. }) => {
+                            tracing::debug!(
+                                tx = %id,
+                                target = ?target.peer,
+                                this = ?op_storage.ring.own_location().peer,
+                                "Subscribed to `{key}` at provider {}", sender.peer
+                            );
+                            op_storage.ring.add_subscription(key);
+                            // todo: should inform back to the network event loop?
+                            let _ = client_id;
                             new_state = None;
                             return_msg = None;
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        state => {
+                            tracing::error!(
+                                tx = %id,
+                                ?state,
+                                target = ?target.peer,
+                                this = ?op_storage.ring.own_location().peer,
+                                "wrong state"
+                            );
+                            return Err(OpError::InvalidStateTransition(self.id));
+                        }
                     }
                 }
                 _ => return Err(OpError::UnexpectedOpState),
@@ -288,9 +302,9 @@ fn build_op_result(
     msg: Option<SubscribeMsg>,
     ttl: Duration,
 ) -> Result<OperationResult, OpError> {
-    let output_op = Some(SubscribeOp {
+    let output_op = state.map(|state| SubscribeOp {
         id,
-        state,
+        state: Some(state),
         _ttl: ttl,
     });
     Ok(OperationResult {
@@ -309,6 +323,7 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     }
 }
 
+#[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
     PrepareRequest {

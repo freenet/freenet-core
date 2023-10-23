@@ -129,7 +129,7 @@ pub enum SqlDbError {
     SqliteError(#[from] sqlx::Error),
     #[error(transparent)]
     RuntimeError(#[from] ContractError),
-    #[error(transparent)]
+    #[error("{0}")]
     IOError(#[from] std::io::Error),
     #[error(transparent)]
     StateStore(#[from] StateStoreError),
