@@ -51,6 +51,18 @@ impl Display for Transaction {
     }
 }
 
+impl PartialOrd for Transaction {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Transaction {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
 /// Get the transaction type associated to a given message type.
 pub(crate) trait TxType: sealed_msg_type::SealedTxType {
     fn tx_type_id() -> TransactionTypeId;
@@ -91,7 +103,6 @@ mod sealed_msg_type {
         Get,
         Subscribe,
         Update,
-        Canceled,
     }
 
     impl Display for TransactionType {
@@ -102,7 +113,6 @@ mod sealed_msg_type {
                 TransactionType::Get => write!(f, "get"),
                 TransactionType::Subscribe => write!(f, "subscribe"),
                 TransactionType::Update => write!(f, "update"),
-                TransactionType::Canceled => write!(f, "canceled"),
             }
         }
     }

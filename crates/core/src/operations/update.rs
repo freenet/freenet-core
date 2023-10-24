@@ -1,5 +1,7 @@
 // TODO: complete update logic in the network
 
+use futures::future::BoxFuture;
+
 pub(crate) use self::messages::UpdateMsg;
 use crate::{client_events::ClientId, node::ConnectionBridge};
 
@@ -33,10 +35,10 @@ impl Operation for UpdateOp {
     type Message = UpdateMsg;
     type Result = UpdateResult;
 
-    fn load_or_init(
-        _op_storage: &crate::node::OpManager,
-        _msg: &Self::Message,
-    ) -> Result<super::OpInitialization<Self>, OpError> {
+    fn load_or_init<'a>(
+        _op_storage: &'a crate::node::OpManager,
+        _msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<super::OpInitialization<Self>, OpError>> {
         todo!()
     }
 

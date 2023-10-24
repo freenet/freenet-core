@@ -63,7 +63,7 @@ impl From<PeerKey> for PeerKeyLocation {
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
@@ -71,25 +71,25 @@ pub(crate) struct Ring {
     max_connections: usize,
     min_connections: usize,
     router: Arc<RwLock<Router>>,
-    connections_by_location: Arc<RwLock<BTreeMap<Location, PeerKeyLocation>>>,
-    location_for_peer: Arc<RwLock<BTreeMap<PeerKey, Location>>>,
+    connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+    location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
-    own_location: Arc<AtomicU64>,
+    own_location: AtomicU64,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
-    subscribers: Arc<DashMap<ContractKey, Vec<PeerKeyLocation>>>,
-    subscriptions: Arc<RwLock<Vec<ContractKey>>>,
+    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
+    subscriptions: RwLock<Vec<ContractKey>>,
 
     // A peer which has been blacklisted to perform actions regarding a given contract.
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
     /// Interim connections ongoing haandshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
-    open_connections: Arc<AtomicUsize>,
+    open_connections: AtomicUsize,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -123,7 +123,7 @@ impl Ring {
         let peer_key = PeerKey::from(config.local_key.public());
 
         // for location here consider -1 == None
-        let own_location = Arc::new(AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes())));
+        let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
 
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
@@ -158,15 +158,15 @@ impl Ring {
             max_connections,
             min_connections,
             router,
-            connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
-            location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
+            connections_by_location: RwLock::new(BTreeMap::new()),
+            location_for_peer: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location,
             peer_key,
-            subscribers: Arc::new(DashMap::new()),
-            subscriptions: Arc::new(RwLock::new(Vec::new())),
+            subscribers: DashMap::new(),
+            subscriptions: RwLock::new(Vec::new()),
             // contract_blacklist: Arc::new(DashMap::new()),
-            open_connections: Arc::new(AtomicUsize::new(0)),
+            open_connections: AtomicUsize::new(0),
         };
 
         if let Some(loc) = config.location {
