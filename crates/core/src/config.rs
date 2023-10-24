@@ -52,6 +52,7 @@ pub(crate) struct WebSocketApiConfig {
     port: u16,
 }
 
+#[cfg(feature = "websocket")]
 impl From<WebSocketApiConfig> for SocketAddr {
     fn from(val: WebSocketApiConfig) -> Self {
         (val.ip, val.port).into()
@@ -143,10 +144,6 @@ impl ConfigPaths {
 }
 
 impl Config {
-    pub fn set_from_cli() -> Result<(), DynError> {
-        todo!()
-    }
-
     pub fn set_op_mode(mode: OperationMode) {
         let local_mode = matches!(mode, OperationMode::Local);
         Self::conf()
@@ -323,10 +320,48 @@ impl libp2p::swarm::Executor for GlobalExecutor {
     }
 }
 
+pub fn set_logger() {
+    #[cfg(feature = "trace")]
+    {
+        static LOGGER_SET: AtomicBool = AtomicBool::new(false);
+        if LOGGER_SET
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let filter = if cfg!(any(test, debug_assertions)) {
+            tracing_subscriber::filter::LevelFilter::DEBUG.into()
+        } else {
+            tracing_subscriber::filter::LevelFilter::INFO.into()
+        };
+
+        let sub = tracing_subscriber::fmt().with_level(true).with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(filter)
+                .from_env_lossy()
+                .add_directive("stretto=off".parse().unwrap())
+                .add_directive("sqlx=error".parse().unwrap()),
+        );
+
+        if cfg!(any(test, debug_assertions)) {
+            sub.with_file(true).with_line_number(true).init();
+        } else {
+            sub.init();
+        }
+    }
+}
+
+#[cfg(feature = "trace")]
 pub(super) mod tracer {
     use super::*;
 
-    #[cfg(feature = "trace")]
     pub fn init_tracer() -> Result<(), opentelemetry::trace::TraceError> {
         use opentelemetry::{global, sdk::propagation::TraceContextPropagator};
         use tracing_subscriber::layer::SubscriberExt;

@@ -1,6 +1,7 @@
 use std::{io, path::Path, time::SystemTime};
 
 use chrono::{DateTime, Utc};
+use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
@@ -14,8 +15,8 @@ use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
     message::{Message, Transaction},
-    operations::{get::GetMsg, join_ring::JoinRingMsg, put::PutMsg},
-    ring::{Location, PeerKeyLocation},
+    operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
+    ring::PeerKeyLocation,
     router::RouteEvent,
     DynError,
 };
@@ -34,7 +35,10 @@ struct ListenerLogId(usize);
 /// This type then can emit it's own information to adjacent systems
 /// or is a no-op.
 pub(crate) trait EventLogRegister: std::any::Any + Send + Sync + 'static {
-    fn event_received<'a>(&'a mut self, ev: EventLog) -> BoxFuture<'a, Result<(), DynError>>;
+    fn register_events<'a>(
+        &'a mut self,
+        events: Either<EventLog<'a>, Vec<EventLog<'a>>>,
+    ) -> BoxFuture<'a, ()>;
     fn trait_clone(&self) -> Box<dyn EventLogRegister>;
     fn as_any(&self) -> &dyn std::any::Any
     where
@@ -44,7 +48,6 @@ pub(crate) trait EventLogRegister: std::any::Any + Send + Sync + 'static {
     }
 }
 
-#[allow(dead_code)] // fixme: remove this
 pub(crate) struct EventLog<'a> {
     tx: &'a Transaction,
     peer_id: &'a PeerKey,
@@ -64,14 +67,75 @@ impl<'a> EventLog<'a> {
         }
     }
 
-    pub fn from_msg(msg: &'a Message, op_storage: &'a OpManager) -> Self {
+    pub fn from_outbound_msg(
+        msg: &'a Message,
+        op_storage: &'a OpManager,
+    ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::JoinRing(JoinRingMsg::Connected { sender, target, .. }) => {
-                EventKind::Connected {
-                    loc: target.location.unwrap(),
-                    from: target.peer,
-                    to: *sender,
+            Message::Connect(connect::ConnectMsg::Response {
+                msg:
+                    connect::ConnectResponse::AcceptedBy {
+                        peers,
+                        your_location,
+                        your_peer_id,
+                    },
+                ..
+            }) => {
+                let this_peer = op_storage.ring.own_location();
+                if peers.contains(&this_peer) {
+                    EventKind::Connected {
+                        this: this_peer,
+                        connected: PeerKeyLocation {
+                            peer: *your_peer_id,
+                            location: Some(*your_location),
+                        },
+                    }
+                } else {
+                    EventKind::Ignored
                 }
+            }
+            _ => EventKind::Ignored,
+        };
+        Either::Left(EventLog {
+            tx: msg.id(),
+            peer_id: &op_storage.ring.peer_key,
+            kind,
+        })
+    }
+
+    pub fn from_inbound_msg(
+        msg: &'a Message,
+        op_storage: &'a OpManager,
+    ) -> Either<Self, Vec<Self>> {
+        let kind = match msg {
+            Message::Connect(connect::ConnectMsg::Response {
+                msg:
+                    connect::ConnectResponse::AcceptedBy {
+                        peers,
+                        your_location,
+                        your_peer_id,
+                    },
+                ..
+            }) => {
+                return Either::Right(
+                    peers
+                        .iter()
+                        .map(|peer| {
+                            let kind: EventKind = EventKind::Connected {
+                                this: PeerKeyLocation {
+                                    peer: *your_peer_id,
+                                    location: Some(*your_location),
+                                },
+                                connected: *peer,
+                            };
+                            EventLog {
+                                tx: msg.id(),
+                                peer_id: &op_storage.ring.peer_key,
+                                kind,
+                            }
+                        })
+                        .collect(),
+                );
             }
             Message::Put(PutMsg::RequestPut {
                 contract, target, ..
@@ -113,13 +177,22 @@ impl<'a> EventLog<'a> {
                 value: StoreResponse { state: Some(_), .. },
                 ..
             }) => EventKind::Get { key: key.clone() },
-            _ => EventKind::Unknown,
+            Message::Subscribe(SubscribeMsg::ReturnSub {
+                subscribed: true,
+                key,
+                sender,
+                ..
+            }) => EventKind::Subscribed {
+                key: key.clone(),
+                at: *sender,
+            },
+            _ => EventKind::Ignored,
         };
-        EventLog {
+        Either::Left(EventLog {
             tx: msg.id(),
             peer_id: &op_storage.ring.peer_key,
             kind,
-        }
+        })
     }
 }
 
@@ -339,14 +412,35 @@ impl EventRegister {
 }
 
 impl EventLogRegister for EventRegister {
-    fn event_received<'a>(&'a mut self, log: EventLog) -> BoxFuture<'a, Result<(), DynError>> {
-        let log_msg = LogMessage {
-            datetime: Utc::now(),
-            tx: *log.tx,
-            kind: log.kind,
-            peer_id: *log.peer_id,
-        };
-        async { Ok(self.log_sender.send(log_msg).await?) }.boxed()
+    fn register_events<'a>(
+        &'a mut self,
+        logs: Either<EventLog<'a>, Vec<EventLog<'a>>>,
+    ) -> BoxFuture<'a, ()> {
+        async {
+            match logs {
+                Either::Left(log) => {
+                    let log_msg = LogMessage {
+                        datetime: Utc::now(),
+                        tx: *log.tx,
+                        kind: log.kind,
+                        peer_id: *log.peer_id,
+                    };
+                    let _ = self.log_sender.send(log_msg).await;
+                }
+                Either::Right(logs) => {
+                    for log in logs {
+                        let log_msg = LogMessage {
+                            datetime: Utc::now(),
+                            tx: *log.tx,
+                            kind: log.kind,
+                            peer_id: *log.peer_id,
+                        };
+                        let _ = self.log_sender.send(log_msg).await;
+                    }
+                }
+            }
+        }
+        .boxed()
     }
 
     fn trait_clone(&self) -> Box<dyn EventLogRegister> {
@@ -355,18 +449,22 @@ impl EventLogRegister for EventRegister {
 }
 
 #[derive(Serialize, Deserialize)]
+// todo: make this take by ref instead
 enum EventKind {
     Connected {
-        loc: Location,
-        from: PeerKey,
-        to: PeerKeyLocation,
+        this: PeerKeyLocation,
+        connected: PeerKeyLocation,
     },
     Put(PutEvent),
     Get {
         key: ContractKey,
     },
     Route(RouteEvent),
-    Unknown,
+    Subscribed {
+        key: ContractKey,
+        at: PeerKeyLocation,
+    },
+    Ignored,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -408,18 +506,18 @@ pub(super) mod test_utils {
     };
 
     use dashmap::DashMap;
-    use parking_lot::RwLock;
+    use parking_lot::Mutex;
 
     use super::*;
-    use crate::{message::TxType, ring::Distance};
+    use crate::{node::tests::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
-        node_labels: Arc<DashMap<String, PeerKey>>,
+        node_labels: Arc<DashMap<NodeLabel, PeerKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<RwLock<Vec<LogMessage>>>,
+        logs: Arc<Mutex<Vec<LogMessage>>>,
     }
 
     impl TestEventListener {
@@ -427,16 +525,16 @@ pub(super) mod test_utils {
             TestEventListener {
                 node_labels: Arc::new(DashMap::new()),
                 tx_log: Arc::new(DashMap::new()),
-                logs: Arc::new(RwLock::new(Vec::new())),
+                logs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        pub fn add_node(&mut self, label: String, peer: PeerKey) {
+        pub fn add_node(&mut self, label: NodeLabel, peer: PeerKey) {
             self.node_labels.insert(label, peer);
         }
 
         pub fn is_connected(&self, peer: &PeerKey) -> bool {
-            let logs = self.logs.read();
+            let logs = self.logs.lock();
             logs.iter()
                 .any(|log| &log.peer_id == peer && matches!(log.kind, EventKind::Connected { .. }))
         }
@@ -447,7 +545,7 @@ pub(super) mod test_utils {
             for_key: &ContractKey,
             expected_value: &WrappedState,
         ) -> bool {
-            let logs = self.logs.read();
+            let logs = self.logs.lock();
             let put_ops = logs.iter().filter_map(|l| match &l.kind {
                 EventKind::Put(ev) => Some((&l.tx, ev)),
                 _ => None,
@@ -485,7 +583,7 @@ pub(super) mod test_utils {
 
         /// The contract was broadcasted from one peer to an other successfully.
         pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
-            let logs = self.logs.read();
+            let logs = self.logs.lock();
             let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
                 EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. })
                 | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }) => Some((&l.tx, ev)),
@@ -518,21 +616,39 @@ pub(super) mod test_utils {
         }
 
         pub fn has_got_contract(&self, peer: &PeerKey, expected_key: &ContractKey) -> bool {
-            let logs = self.logs.read();
+            let logs = self.logs.lock();
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Get { ref key } if key == expected_key  )
             })
         }
 
+        pub fn is_subscribed_to_contract(
+            &self,
+            peer: &PeerKey,
+            expected_key: &ContractKey,
+        ) -> bool {
+            let logs = self.logs.lock();
+            logs.iter().any(|log| {
+                &log.peer_id == peer
+                    && matches!(log.kind, EventKind::Subscribed { ref key, .. } if key == expected_key  )
+            })
+        }
+
         /// Unique connections for a given peer and their relative distance to other peers.
         pub fn connections(&self, peer: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
-            let logs = self.logs.read();
+            let logs = self.logs.lock();
             logs.iter()
                 .filter_map(|l| {
-                    if let EventKind::Connected { loc, from, to } = l.kind {
-                        if from == peer {
-                            return Some((to.peer, loc.distance(to.location.unwrap())));
+                    if let EventKind::Connected { this, connected } = l.kind {
+                        if this.peer == peer {
+                            return Some((
+                                connected.peer,
+                                connected
+                                    .location
+                                    .expect("set location")
+                                    .distance(this.location.unwrap()),
+                            ));
                         }
                     }
                     None
@@ -555,14 +671,28 @@ pub(super) mod test_utils {
     }
 
     impl super::EventLogRegister for TestEventListener {
-        fn event_received<'a>(&'a mut self, log: EventLog) -> BoxFuture<'a, Result<(), DynError>> {
-            let tx = log.tx;
-            let mut logs = self.logs.write();
-            let (msg_log, log_id) = Self::create_log(log);
-            logs.push(msg_log);
-            std::mem::drop(logs);
-            self.tx_log.entry(*tx).or_default().push(log_id);
-            async { Ok(()) }.boxed()
+        fn register_events<'a>(
+            &'a mut self,
+            logs: Either<EventLog<'a>, Vec<EventLog<'a>>>,
+        ) -> BoxFuture<'a, ()> {
+            match logs {
+                Either::Left(log) => {
+                    let tx = log.tx;
+                    let (msg_log, log_id) = Self::create_log(log);
+                    self.logs.lock().push(msg_log);
+                    self.tx_log.entry(*tx).or_default().push(log_id);
+                }
+                Either::Right(logs) => {
+                    let logs_list = &mut *self.logs.lock();
+                    for log in logs {
+                        let tx = log.tx;
+                        let (msg_log, log_id) = Self::create_log(log);
+                        logs_list.push(msg_log);
+                        self.tx_log.entry(*tx).or_default().push(log_id);
+                    }
+                }
+            }
+            async {}.boxed()
         }
 
         fn trait_clone(&self) -> Box<dyn EventLogRegister> {
@@ -570,12 +700,12 @@ pub(super) mod test_utils {
         }
     }
 
-    #[ignore]
     #[test]
     fn test_get_connections() -> Result<(), anyhow::Error> {
+        use crate::ring::Location;
         let peer_id = PeerKey::random();
         let loc = Location::try_from(0.5)?;
-        let tx = Transaction::new(<JoinRingMsg as TxType>::tx_type_id(), &peer_id);
+        let tx = Transaction::new::<connect::ConnectMsg>();
         let locations = [
             (PeerKey::random(), Location::try_from(0.5)?),
             (PeerKey::random(), Location::try_from(0.75)?),
@@ -584,18 +714,20 @@ pub(super) mod test_utils {
 
         let mut listener = TestEventListener::new();
         locations.iter().for_each(|(other, location)| {
-            listener.event_received(EventLog {
+            listener.register_events(Either::Left(EventLog {
                 tx: &tx,
                 peer_id: &peer_id,
                 kind: EventKind::Connected {
-                    loc,
-                    from: peer_id,
-                    to: PeerKeyLocation {
+                    this: PeerKeyLocation {
+                        peer: peer_id,
+                        location: Some(loc),
+                    },
+                    connected: PeerKeyLocation {
                         peer: *other,
                         location: Some(*location),
                     },
                 },
-            });
+            }));
         });
 
         let distances: Vec<_> = listener.connections(peer_id).collect();

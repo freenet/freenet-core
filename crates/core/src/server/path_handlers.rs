@@ -45,7 +45,9 @@ pub(super) async fn contract_home(
     let client_id = if let Some(HostCallbackResult::NewId { id }) = response_recv.recv().await {
         id
     } else {
-        todo!("this is an error");
+        return Err(WebSocketApiError::NodeError {
+            error_cause: "Couldn't register new client in the node".into(),
+        });
     };
     request_sender
         .send(ClientConnection::Request {
@@ -120,7 +122,7 @@ pub(super) async fn contract_home(
                 web_body
             }
             None => {
-                todo!("error indicating the contract is not present");
+                return Err(WebSocketApiError::MissingContract { key });
             }
         },
         Some(HostCallbackResult::Result {

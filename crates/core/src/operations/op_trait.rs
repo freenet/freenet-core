@@ -31,7 +31,7 @@ where
         self,
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,
-        input: Self::Message,
+        input: &'a Self::Message,
         client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }

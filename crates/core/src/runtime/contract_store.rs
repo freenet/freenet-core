@@ -51,7 +51,7 @@ pub struct ContractStore {
     key_to_code_part: Arc<DashMap<ContractKey, CodeHash>>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
-//       to keep the total speed used under a configured threshold
+//       to keep the total space used under a configured threshold
 
 static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();

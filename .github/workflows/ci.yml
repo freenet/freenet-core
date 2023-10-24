@@ -10,14 +10,14 @@ on:
 
 jobs:
   test_all:
-    name: Test features
+    name: Test
 
     runs-on: ubuntu-latest
 
     strategy:
       max-parallel: 1
       matrix:
-        args: ["--no-default-features", "--features default"]
+        args: ["--no-default-features --features trace,websocket,sqlite"]
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target

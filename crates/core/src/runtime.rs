@@ -21,4 +21,4 @@ pub(crate) use error::RuntimeResult;
 pub use secrets_store::SecretsStore;
 pub use state_store::StateStore;
 pub(crate) use state_store::{StateStorage, StateStoreError};
-pub(crate) use wasm_runtime::{ContractExecError, Runtime};
+pub use wasm_runtime::{ContractExecError, Runtime};

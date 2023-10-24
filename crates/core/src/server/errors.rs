@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use freenet_stdlib::client_api::ErrorKind;
+use freenet_stdlib::prelude::ContractKey;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
@@ -15,14 +16,18 @@ pub(super) enum WebSocketApiError {
     AxumError {
         error: ErrorKind,
     },
+    MissingContract {
+        key: ContractKey,
+    },
 }
 
 impl WebSocketApiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             WebSocketApiError::InvalidParam { .. } => StatusCode::BAD_REQUEST,
-            WebSocketApiError::NodeError { .. } => StatusCode::BAD_GATEWAY,
+            WebSocketApiError::NodeError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             WebSocketApiError::AxumError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            WebSocketApiError::MissingContract { .. } => StatusCode::NOT_FOUND,
         }
     }
 
@@ -32,7 +37,8 @@ impl WebSocketApiError {
                 format!("Invalid request params: {}", error_cause)
             }
             WebSocketApiError::NodeError { error_cause } => format!("Node error: {}", error_cause),
-            WebSocketApiError::AxumError { error } => format!("Axum error: {}", error),
+            WebSocketApiError::AxumError { error } => format!("Server error: {}", error),
+            WebSocketApiError::MissingContract { key } => format!("Missing contract {key}"),
         }
     }
 }
@@ -61,7 +67,12 @@ impl IntoResponse for WebSocketApiError {
             {
                 (StatusCode::NOT_FOUND, error_cause)
             }
-            WebSocketApiError::NodeError { error_cause } => (StatusCode::BAD_GATEWAY, error_cause),
+            WebSocketApiError::NodeError { error_cause } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, error_cause)
+            }
+            err @ WebSocketApiError::MissingContract { .. } => {
+                (StatusCode::NOT_FOUND, err.error_message())
+            }
             WebSocketApiError::AxumError { error } => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}"))
             }

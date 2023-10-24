@@ -1,8 +1,6 @@
 use clap::Parser;
 use freenet::local_node::{Executor, NodeConfig, OperationMode};
 use std::net::SocketAddr;
-use tracing::metadata::LevelFilter;
-use tracing_subscriber::EnvFilter;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -23,16 +21,7 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
 }
 
 fn main() -> Result<(), DynError> {
-    tracing_subscriber::fmt()
-        .with_level(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
+    freenet::config::set_logger();
     let config = NodeConfig::parse();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
