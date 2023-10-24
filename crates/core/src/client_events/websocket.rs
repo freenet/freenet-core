@@ -474,7 +474,7 @@ impl ClientEventsProxy for WebSocketProxy {
                         break Ok(reply.into_owned());
                     }
                 } else {
-                    todo!()
+                    break Err(ClientError::from(ErrorKind::ChannelClosed));
                 }
             }
         }

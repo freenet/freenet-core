@@ -5,8 +5,7 @@ use libp2p::{
         muxing,
         transport::{self, upgrade},
     },
-    deflate,
-    dns::TokioDnsConfig,
+    dns,
     identity::Keypair,
     noise, tcp, yamux, PeerId, Transport,
 };
@@ -63,7 +62,6 @@ impl NodeP2P {
         }
 
         // start the p2p event loop
-        // todo: pass  `cli_response_sender`
         self.conn_manager
             .run_event_listener(
                 self.op_manager.clone(),
@@ -74,18 +72,18 @@ impl NodeP2P {
             .await
     }
 
-    pub(crate) async fn build<CH, const CLIENTS: usize, EL: EventLogRegister>(
+    pub(crate) async fn build<CH, const CLIENTS: usize, EL>(
         builder: NodeBuilder<CLIENTS>,
         event_listener: EL,
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
         CH: ContractHandler + Send + Sync + 'static,
+        EL: EventLogRegister + Clone,
     {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
 
-        let event_listener: Box<dyn EventLogRegister> = Box::new(event_listener);
         let ring = Ring::new::<CLIENTS, EL>(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
@@ -98,7 +96,7 @@ impl NodeP2P {
 
         let conn_manager = {
             let transport = Self::config_transport(&builder.local_key)?;
-            P2pConnManager::build(transport, &builder, op_storage.clone(), &*event_listener)?
+            P2pConnManager::build(transport, &builder, op_storage.clone(), event_listener)?
         };
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
@@ -131,11 +129,10 @@ impl NodeP2P {
         local_key: &Keypair,
     ) -> std::io::Result<transport::Boxed<(PeerId, muxing::StreamMuxerBox)>> {
         let tcp = tcp::tokio::Transport::new(tcp::Config::new().nodelay(true).port_reuse(true));
-        let with_dns = TokioDnsConfig::system(tcp)?;
+        let with_dns = dns::tokio::Transport::system(tcp)?;
         Ok(with_dns
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::Config::new(local_key).unwrap())
-            .apply(deflate::DeflateConfig::default())
             .multiplex(yamux::Config::default())
             .timeout(config::PEER_TIMEOUT)
             .map(|(peer, muxer), _| (peer, muxing::StreamMuxerBox::new(muxer)))
@@ -213,7 +210,7 @@ mod test {
                 NodeP2P::build::<MemoryContractHandler, 1, _>(
                     config,
                     event_log::TestEventListener::new(),
-                    (),
+                    "ping-listener".into(),
                 )
                 .await?,
             );
@@ -230,7 +227,7 @@ mod test {
             let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1, _>(
                 config,
                 event_log::TestEventListener::new(),
-                (),
+                "ping-dialer".into(),
             )
             .await
             .unwrap();

@@ -1,7 +1,4 @@
-use crate::{
-    client_events::ClientId,
-    runtime::{ContractStore, StateStorage, StateStore},
-};
+use crate::{client_events::ClientId, runtime::ContractStore};
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
     prelude::WrappedContract,
@@ -12,63 +9,44 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::{
     executor::{ExecutorHalve, ExecutorToEventLoopChannel},
     handler::{ContractHandler, ContractHandlerHalve, ContractHandlerToEventLoopChannel},
-    storages::in_memory::MemKVStore,
     Executor,
 };
-use crate::{config::Config, DynError};
+use crate::DynError;
 
 pub(crate) struct MockRuntime {
     pub contract_store: ContractStore,
 }
 
-pub(crate) struct MemoryContractHandler<KVStore = MemKVStore>
-where
-    KVStore: StateStorage,
-{
+pub(crate) struct MemoryContractHandler {
     channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
-    _kv_store: StateStore<KVStore>,
-    _runtime: MockRuntime,
+    runtime: Executor<MockRuntime>,
 }
 
-impl<KVStore> MemoryContractHandler<KVStore>
-where
-    KVStore: StateStorage + Send + Sync + 'static,
-    <KVStore as StateStorage>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    const MAX_MEM_CACHE: i64 = 10_000_000;
-
-    pub fn new(
+impl MemoryContractHandler {
+    pub async fn new(
         channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
-        kv_store: KVStore,
+        data_dir: &str,
     ) -> Self {
         MemoryContractHandler {
             channel,
-            _kv_store: StateStore::new(kv_store, 10_000_000).unwrap(),
-            _runtime: MockRuntime {
-                contract_store: ContractStore::new(
-                    Config::conf().contracts_dir(),
-                    Self::MAX_MEM_CACHE,
-                )
-                .unwrap(),
-            },
+            runtime: Executor::new_mock(data_dir).await.unwrap(),
         }
     }
 }
 
 impl ContractHandler for MemoryContractHandler {
-    type Builder = ();
+    type Builder = String;
     type ContractExecutor = Executor<MockRuntime>;
 
     fn build(
         channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
         _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
-        _config: Self::Builder,
+        config: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
-        let store = MemKVStore::new();
-        async move { Ok(MemoryContractHandler::new(channel, store)) }.boxed()
+        async move { Ok(MemoryContractHandler::new(channel, &config).await) }.boxed()
     }
 
     fn channel(&mut self) -> &mut ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
@@ -81,15 +59,14 @@ impl ContractHandler for MemoryContractHandler {
         _client_id: ClientId,
         _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
     ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
-        todo!()
+        unreachable!()
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
-        todo!()
+        &mut self.runtime
     }
 }
 
-#[ignore]
 #[test]
 fn serialization() -> Result<(), anyhow::Error> {
     let bytes = crate::util::test::random_bytes_1024();

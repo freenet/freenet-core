@@ -3,23 +3,19 @@
 use std::{fmt::Display, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use uuid::{
-    v1::{Context, Timestamp},
-    Uuid,
-};
+use ulid::Ulid;
 
 use crate::{
     node::{ConnectionError, PeerKey},
     operations::{
-        get::GetMsg, join_ring::JoinRingMsg, put::PutMsg, subscribe::SubscribeMsg,
-        update::UpdateMsg,
+        connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
     ring::{Location, PeerKeyLocation},
 };
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 
 /// An transaction is a unique, universal and efficient identifier for any
-/// roundtrip transaction as it is broadcasted around the F2 network.
+/// roundtrip transaction as it is broadcasted around the Freenet network.
 ///
 /// The identifier conveys all necessary information to identify and classify the
 /// transaction:
@@ -31,27 +27,14 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) struct Transaction {
-    /// UUID V1, can retrieve timestamp information later to check for possible out of time
-    /// expired transactions which have been clean up already.
-    id: Uuid,
+    id: Ulid,
     ty: TransactionTypeId,
 }
 
-static UUID_CONTEXT: Context = Context::new(14);
-
 impl Transaction {
-    pub fn new(ty: TransactionTypeId, initial_peer: &PeerKey) -> Transaction {
-        // using v1 UUID to keep to keep track of the creation ts
-        let ts: Timestamp = uuid::timestamp::Timestamp::now(&UUID_CONTEXT);
-
-        // event in the net this UUID should be unique since peer keys are unique
-        // however some id collision may be theoretically possible if two transactions
-        // are created at the same exact time and the first 6 bytes of the key coincide;
-        // in practice the chance of this happening is astronomically low
-
-        let b = &mut [0; 6];
-        b.copy_from_slice(&initial_peer.to_bytes()[0..6]);
-        let id = Uuid::new_v1(ts, b);
+    pub fn new<T: TxType>() -> Transaction {
+        let ty = <T as TxType>::tx_type_id();
+        let id = Ulid::new();
 
         // 3 word size for 64-bits platforms
         Self { id, ty }
@@ -65,6 +48,18 @@ impl Transaction {
 impl Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)
+    }
+}
+
+impl PartialOrd for Transaction {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Transaction {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.cmp(&other.id)
     }
 }
 
@@ -103,12 +98,23 @@ mod sealed_msg_type {
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     pub(crate) enum TransactionType {
-        JoinRing,
+        Connect,
         Put,
         Get,
         Subscribe,
         Update,
-        Canceled,
+    }
+
+    impl Display for TransactionType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                TransactionType::Connect => write!(f, "join ring"),
+                TransactionType::Put => write!(f, "put"),
+                TransactionType::Get => write!(f, "get"),
+                TransactionType::Subscribe => write!(f, "subscribe"),
+                TransactionType::Update => write!(f, "update"),
+            }
+        }
     }
 
     macro_rules! transaction_type_enumeration {
@@ -130,7 +136,7 @@ mod sealed_msg_type {
     }
 
     transaction_type_enumeration!(decl struct {
-        JoinRing -> JoinRingMsg,
+        Connect -> ConnectMsg,
         Put -> PutMsg,
         Get -> GetMsg,
         Subscribe -> SubscribeMsg,
@@ -138,19 +144,23 @@ mod sealed_msg_type {
     });
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Message {
-    JoinRing(JoinRingMsg),
+    Connect(ConnectMsg),
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
     Update(UpdateMsg),
-    /// Failed a transaction, informing of cancellation.
-    Canceled(Transaction),
+    /// Failed a transaction, informing of abortion.
+    Aborted(Transaction),
 }
 
 pub(crate) trait InnerMessage: Into<Message> {
     fn id(&self) -> &Transaction;
+
+    fn target(&self) -> Option<&PeerKeyLocation>;
+
+    fn terminal(&self) -> bool;
 }
 
 /// Internal node events emitted to the event loop.
@@ -189,24 +199,24 @@ impl Message {
     pub fn id(&self) -> &Transaction {
         use Message::*;
         match self {
-            JoinRing(op) => op.id(),
+            Connect(op) => op.id(),
             Put(op) => op.id(),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
-            Update(_op) => todo!(),
-            Canceled(tx) => tx,
+            Update(op) => op.id(),
+            Aborted(tx) => tx,
         }
     }
 
     pub fn target(&self) -> Option<&PeerKeyLocation> {
         use Message::*;
         match self {
-            JoinRing(op) => op.target(),
+            Connect(op) => op.target(),
             Put(op) => op.target(),
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
-            Update(_op) => todo!(),
-            Canceled(_) => None,
+            Update(op) => op.target(),
+            Aborted(_) => None,
         }
     }
 
@@ -214,18 +224,18 @@ impl Message {
     pub fn terminal(&self) -> bool {
         use Message::*;
         match self {
-            JoinRing(op) => op.terminal(),
+            Connect(op) => op.terminal(),
             Put(op) => op.terminal(),
             Get(op) => op.terminal(),
             Subscribe(op) => op.terminal(),
-            Update(_op) => todo!(),
-            Canceled(_) => true,
+            Update(op) => op.terminal(),
+            Aborted(_) => true,
         }
     }
 
     pub fn track_stats(&self) -> bool {
         use Message::*;
-        !matches!(self, JoinRing(_) | Subscribe(_) | Canceled(_))
+        !matches!(self, Connect(_) | Subscribe(_) | Aborted(_))
     }
 }
 
@@ -234,12 +244,12 @@ impl Display for Message {
         use Message::*;
         write!(f, "Message {{")?;
         match self {
-            JoinRing(msg) => msg.fmt(f)?,
+            Connect(msg) => msg.fmt(f)?,
             Put(msg) => msg.fmt(f)?,
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
-            Update(_op) => todo!(),
-            Canceled(msg) => msg.fmt(f)?,
+            Update(msg) => msg.fmt(f)?,
+            Aborted(msg) => msg.fmt(f)?,
         };
         write!(f, "}}")
     }

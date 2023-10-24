@@ -1,0 +1,79 @@
+name: Retroactive Documentation Deployment
+
+on:
+  workflow_dispatch:  # Allows manual triggering of the workflow
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Get the entire history so all tags are available
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - name: Cache Dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo
+          key: cargo-cache-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install dependencies
+        run: |
+          cargo install mdbook mdbook-mermaid mdbook-toc
+
+      - name: Generate and Deploy Documentation
+        run: |
+          mkdir -p deploy
+          tags=$(git tag -l 'v*')  # Assumes tag format is v<version>
+          latest_version=""
+          for tag in $tags; do
+            git checkout $tag
+            version=${tag#v}
+            if [[ "$version" > "$latest_version" ]]; then
+              latest_version=$version
+            fi
+            deploy_dir="deploy/$version"
+            if [[ ! -d $deploy_dir ]]; then
+              if [[ -d "docs" ]]; then
+                cd docs
+                mdbook build
+                mv book ../$deploy_dir
+                cd ..
+              else
+                echo "Docs folder not found for tag $tag."
+              fi
+            else
+              echo "Documentation already exists for tag $tag."
+            fi
+          done
+          git checkout main  # Return to main branch before deployment
+          # Build and move the latest version documentation to root directory
+          git checkout "v$latest_version"
+          if [[ -d "docs" ]]; then
+            cd docs
+            mdbook build
+            mv book ../deploy_latest
+            cd ..
+          else
+            echo "Docs folder not found for the latest tag v$latest_version."
+          fi
+
+      - name: Deploy
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: deploy
+          single-commit: true
+
+      - name: Deploy Latest Documentation
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: deploy_latest
+          target-folder: .
+          single-commit: true

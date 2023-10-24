@@ -16,7 +16,6 @@ pub struct InspectCliConfig {
 enum FileType {
     Code(CodeInspection),
     Delegate,
-    Contract,
 }
 
 /// Inspect the packaged WASM code for Freenet.
@@ -47,7 +46,6 @@ delegate API version: {version}
 "#
             );
         }
-        FileType::Contract => todo!(),
     }
 
     Ok(())

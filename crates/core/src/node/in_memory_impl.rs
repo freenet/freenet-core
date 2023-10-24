@@ -7,7 +7,7 @@ use super::{
     client_event_handling,
     conn_manager::{in_memory::MemoryConnManager, EventLoopNotifications},
     handle_cancelled_op, join_ring_request,
-    op_state::OpManager,
+    op_state_manager::OpManager,
     process_message, EventLogRegister, PeerKey,
 };
 use crate::{
@@ -15,7 +15,8 @@ use crate::{
     config::GlobalExecutor,
     contract::{
         self, executor_channel, ClientResponsesSender, ContractError, ContractHandler,
-        ContractHandlerEvent, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+        ContractHandlerEvent, ExecutorToEventLoopChannel, MemoryContractHandler,
+        NetworkEventListenerHalve,
     },
     message::{Message, NodeEvent, TransactionType},
     node::NodeBuilder,
@@ -37,16 +38,14 @@ pub(super) struct NodeInMemory {
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub async fn build<CH, EL: EventLogRegister>(
+    pub async fn build<EL: EventLogRegister>(
         builder: NodeBuilder<1>,
         event_listener: EL,
-        ch_builder: CH::Builder,
-    ) -> Result<NodeInMemory, anyhow::Error>
-    where
-        CH: ContractHandler + Send + Sync + 'static,
-    {
+        ch_builder: String,
+        add_noise: bool,
+    ) -> Result<NodeInMemory, anyhow::Error> {
+        let event_listener = Box::new(event_listener);
         let peer_key = PeerKey::from(builder.local_key.public());
-        let conn_manager = MemoryConnManager::new(peer_key);
         let gateways = builder.get_gateways()?;
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
 
@@ -55,9 +54,17 @@ impl NodeInMemory {
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
-        let contract_handler = CH::build(ch_channel, executor_sender, ch_builder)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let contract_handler =
+            MemoryContractHandler::build(ch_channel, executor_sender, ch_builder)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+        let conn_manager = MemoryConnManager::new(
+            peer_key,
+            event_listener.trait_clone(),
+            op_storage.clone(),
+            add_noise,
+        );
 
         GlobalExecutor::spawn(contract::contract_handling(contract_handler));
 
@@ -67,7 +74,7 @@ impl NodeInMemory {
             op_storage,
             gateways,
             notification_channel,
-            event_listener: Box::new(event_listener),
+            event_listener,
             is_gateway,
             _executor_listener,
         })
@@ -106,7 +113,8 @@ impl NodeInMemory {
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), ContractError> {
         for (contract, state) in contracts {
-            let key = contract.key();
+            let key: ContractKey = contract.key();
+            let parameters = contract.params();
             self.op_storage
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), None)
                 .await?;
@@ -115,6 +123,8 @@ impl NodeInMemory {
                     ContractHandlerEvent::PutQuery {
                         key: key.clone(),
                         state,
+                        related_contracts: RelatedContracts::default(),
+                        parameters: Some(parameters),
                     },
                     None,
                 )
@@ -144,6 +154,7 @@ impl NodeInMemory {
     }
 
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
+    #[tracing::instrument(name = "memory_event_listener", skip_all)]
     async fn run_event_listener(
         &mut self,
         _client_responses: ClientResponsesSender, // fixme: use this
@@ -158,30 +169,32 @@ impl NodeInMemory {
                 }
             };
 
-            if let Ok(Either::Left(Message::Canceled(tx))) = msg {
+            if let Ok(Either::Left(Message::Aborted(tx))) = msg {
                 let tx_type = tx.tx_type();
                 let res = handle_cancelled_op(
                     tx,
                     self.peer_key,
-                    self.gateways.iter(),
                     &self.op_storage,
                     &mut self.conn_manager,
                 )
                 .await;
                 match res {
                     Err(OpError::MaxRetriesExceeded(_, _))
-                        if tx_type == TransactionType::JoinRing && !self.is_gateway =>
+                        if tx_type == TransactionType::Connect && !self.is_gateway =>
                     {
                         tracing::warn!("Retrying joining the ring with an other peer");
-                        let gateway = self.gateways.iter().shuffle().next().unwrap();
-                        join_ring_request(
-                            None,
-                            self.peer_key,
-                            gateway,
-                            &self.op_storage,
-                            &mut self.conn_manager,
-                        )
-                        .await?
+                        if let Some(gateway) = self.gateways.iter().shuffle().next() {
+                            join_ring_request(
+                                None,
+                                self.peer_key,
+                                gateway,
+                                &self.op_storage,
+                                &mut self.conn_manager,
+                            )
+                            .await?
+                        } else {
+                            anyhow::bail!("requires at least one gateway");
+                        }
                     }
                     Err(err) => return Err(anyhow::anyhow!(err)),
                     Ok(_) => {}

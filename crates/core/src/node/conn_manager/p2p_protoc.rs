@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::Poll,
-    time::Instant,
+    time::Duration,
 };
 
 use asynchronous_codec::{BytesMut, Framed};
@@ -26,13 +26,16 @@ use libp2p::{
         self,
         dial_opts::DialOpts,
         handler::{DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
-        ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm, KeepAlive,
-        NetworkBehaviour, NotifyHandler, Stream as NegotiatedSubstream, SubstreamProtocol,
-        SwarmBuilder, SwarmEvent, ToSwarm,
+        Config as SwarmConfig, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm,
+        KeepAlive, NetworkBehaviour, NotifyHandler, Stream as NegotiatedSubstream,
+        SubstreamProtocol, SwarmEvent, ToSwarm,
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
 };
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    Mutex,
+};
 use unsigned_varint::codec::UviBytes;
 
 use super::{ConnectionBridge, ConnectionError, EventLoopNotifications};
@@ -42,8 +45,8 @@ use crate::{
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
     message::{Message, NodeEvent, Transaction, TransactionType},
     node::{
-        handle_cancelled_op, join_ring_request, process_message, EventLogRegister, InitPeerNode,
-        NodeBuilder, OpManager, PeerKey,
+        event_log::EventLog, handle_cancelled_op, join_ring_request, process_message,
+        EventLogRegister, InitPeerNode, NodeBuilder, OpManager, PeerKey,
     },
     operations::OpError,
     ring::PeerKeyLocation,
@@ -61,7 +64,7 @@ const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 fn config_behaviour(
     local_key: &Keypair,
     gateways: &[InitPeerNode],
-    _public_addr: &Option<Multiaddr>,
+    _private_addr: &Option<Multiaddr>,
     op_manager: Arc<OpManager>,
 ) -> NetBehaviour {
     let routing_table: HashMap<_, _> = gateways
@@ -118,19 +121,73 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 
 type P2pBridgeEvent = Either<(PeerKey, Box<Message>), NodeEvent>;
 
-#[derive(Clone)]
 pub(crate) struct P2pBridge {
     active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
     accepted_peers: Arc<DashSet<PeerKey>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
+    op_manager: Arc<OpManager>,
+    log_register: Arc<Mutex<Box<dyn EventLogRegister>>>,
 }
 
 impl P2pBridge {
-    fn new(sender: Sender<P2pBridgeEvent>) -> Self {
+    fn new<EL>(
+        sender: Sender<P2pBridgeEvent>,
+        op_manager: Arc<OpManager>,
+        event_register: EL,
+    ) -> Self
+    where
+        EL: EventLogRegister,
+    {
         Self {
             active_net_connections: Arc::new(DashMap::new()),
             accepted_peers: Arc::new(DashSet::new()),
             ev_listener_tx: sender,
+            op_manager,
+            log_register: Arc::new(Mutex::new(Box::new(event_register))),
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, test))]
+static CONTESTED_BRIDGE_CLONES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(debug_assertions, test))]
+static TOTAL_BRIDGE_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Clone for P2pBridge {
+    fn clone(&self) -> Self {
+        let log_register = loop {
+            if let Ok(lr) = self.log_register.try_lock() {
+                #[cfg(any(debug_assertions, test))]
+                {
+                    TOTAL_BRIDGE_CLONES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                break lr.trait_clone();
+            }
+            #[cfg(any(debug_assertions, test))]
+            {
+                let contested =
+                    CONTESTED_BRIDGE_CLONES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+                if contested % 100 == 0 {
+                    let total = TOTAL_BRIDGE_CLONES.load(std::sync::atomic::Ordering::Acquire);
+                    if total > 0 {
+                        let threshold = (total as f64 * 0.01) as usize;
+                        if contested / total > threshold {
+                            tracing::debug!("p2p bridge clone contested more than 1% of the time");
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_nanos(50));
+        };
+        Self {
+            active_net_connections: self.active_net_connections.clone(),
+            accepted_peers: self.accepted_peers.clone(),
+            ev_listener_tx: self.ev_listener_tx.clone(),
+            op_manager: self.op_manager.clone(),
+            log_register: Arc::new(Mutex::new(log_register)),
         }
     }
 }
@@ -158,6 +215,10 @@ impl ConnectionBridge for P2pBridge {
     }
 
     async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+        self.log_register
+            .lock()
+            .await
+            .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager));
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
             .await
@@ -173,6 +234,7 @@ pub(in crate::node) struct P2pConnManager {
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
     /// last valid observed public address
     public_addr: Option<Multiaddr>,
+    listening_addr: Option<Multiaddr>,
     event_listener: Box<dyn EventLogRegister>,
 }
 
@@ -181,38 +243,46 @@ impl P2pConnManager {
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeBuilder<CLIENTS>,
         op_manager: Arc<OpManager>,
-        event_listener: &dyn EventLogRegister,
+        event_listener: impl EventLogRegister + Clone,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
         let global_executor = GlobalExecutor;
 
-        let public_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
+        let private_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
             let public_addr = multiaddr_from_connection(conn);
             Some(public_addr)
         } else {
             None
         };
 
-        let builder = SwarmBuilder::with_executor(
+        let public_addr = if let Some(conn) = config.public_ip.zip(config.public_port) {
+            let public_addr = multiaddr_from_connection(conn);
+            Some(public_addr)
+        } else {
+            None
+        };
+
+        let behaviour = config_behaviour(
+            &config.local_key,
+            &config.remote_nodes,
+            &private_addr,
+            op_manager.clone(),
+        );
+        let mut swarm = Swarm::new(
             transport,
-            config_behaviour(
-                &config.local_key,
-                &config.remote_nodes,
-                &public_addr,
-                op_manager,
-            ),
+            behaviour,
             PeerId::from(config.local_key.public()),
-            global_executor,
+            SwarmConfig::with_executor(global_executor)
+                .with_idle_connection_timeout(config::PEER_TIMEOUT),
         );
 
-        let mut swarm = builder.build();
         for remote_addr in config.remote_nodes.iter().filter_map(|r| r.addr.clone()) {
             swarm.add_external_address(remote_addr);
         }
 
         let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
-        let bridge = P2pBridge::new(tx_bridge_cmd);
+        let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
 
         let gateways = config.get_gateways()?;
         Ok(P2pConnManager {
@@ -221,17 +291,19 @@ impl P2pConnManager {
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
             public_addr,
-            event_listener: event_listener.trait_clone(),
+            listening_addr: private_addr,
+            event_listener: Box::new(event_listener),
         })
     }
 
     pub fn listen_on(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(listening_addr) = &self.public_addr {
+        if let Some(listening_addr) = &self.listening_addr {
             self.swarm.listen_on(listening_addr.clone())?;
         }
         Ok(())
     }
 
+    #[tracing::instrument(name = "network_event_listener", skip_all)]
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
@@ -336,9 +408,8 @@ impl P2pConnManager {
                 msg = network_msg => { msg }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
-                (event_id, contract_handler_event) = op_manager.recv_from_handler() => {
-                    if let Some(client_id) = event_id.client_id() {
-                        let transaction = contract_handler_event.into_network_op(&op_manager).await;
+                event_id = op_manager.recv_from_handler() => {
+                    if let Some((client_id, transaction)) = event_id.client_id().zip(event_id.transaction()) {
                         tx_to_client.insert(transaction, client_id);
                     }
                     continue;
@@ -353,19 +424,18 @@ impl P2pConnManager {
                 Ok(Left((msg, client_id))) => {
                     let cb = self.bridge.clone();
                     match msg {
-                        Message::Canceled(tx) => {
+                        Message::Aborted(tx) => {
                             let tx_type = tx.tx_type();
                             let res = handle_cancelled_op(
                                 tx,
                                 op_manager.ring.peer_key,
-                                self.gateways.iter(),
                                 &op_manager,
                                 &mut self.bridge,
                             )
                             .await;
                             match res {
                                 Err(OpError::MaxRetriesExceeded(_, _))
-                                    if tx_type == TransactionType::JoinRing
+                                    if tx_type == TransactionType::Connect
                                         && self.public_addr.is_none() /* FIXME: this should be not a gateway instead */ =>
                                 {
                                     tracing::warn!("Retrying joining the ring with an other peer");
@@ -449,7 +519,7 @@ impl P2pConnManager {
                     self.public_addr = Some(address);
                 }
                 Ok(Right(IsPrivatePeer(_peer))) => {
-                    todo!("attempt hole punching")
+                    todo!("this peer is private, attempt hole punching")
                 }
                 Ok(Right(ClosedChannel)) => {
                     tracing::info!("Notification channel closed");
@@ -500,7 +570,7 @@ enum ConnMngrActions {
     },
     /// Update self own public address, useful when communicating for first time
     UpdatePublicAddr(Multiaddr),
-    /// A peer which we attempted connection to is private, attempt hole-punching
+    /// This is private, so when establishing connections hole-punching should be performed
     IsPrivatePeer(PeerId),
     NodeAction(NodeEvent),
     ClosedChannel,
@@ -642,7 +712,6 @@ pub(in crate::node) enum HandlerEvent {
 /// Handles the connection with a given peer.
 pub(in crate::node) struct Handler {
     substreams: Vec<SubstreamState>,
-    keep_alive: KeepAlive,
     uniq_conn_id: UniqConnId,
     protocol_status: ProtocolStatus,
     pending: Vec<Message>,
@@ -692,17 +761,10 @@ enum SubstreamState {
     ReportError { error: ConnectionError },
 }
 
-impl SubstreamState {
-    fn is_free(&self) -> bool {
-        matches!(self, SubstreamState::FreeStream { .. })
-    }
-}
-
 impl Handler {
     fn new(op_manager: Arc<OpManager>) -> Self {
         Self {
             substreams: vec![],
-            keep_alive: KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT),
             uniq_conn_id: 0,
             protocol_status: ProtocolStatus::Unconfirmed,
             pending: Vec::new(),
@@ -782,7 +844,7 @@ impl ConnectionHandler for Handler {
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
-        self.keep_alive
+        KeepAlive::Yes
     }
 
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<HandlePollingEv> {
@@ -808,10 +870,6 @@ impl ConnectionHandler for Handler {
                         self.substreams
                             .push(SubstreamState::AwaitingFirst { conn_id });
                         self.pending.push(*msg);
-                        if self.substreams.is_empty() {
-                            self.keep_alive =
-                                KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
-                        }
                         return Poll::Ready(event);
                     }
                     SubstreamState::AwaitingFirst { conn_id } => {
@@ -849,9 +907,14 @@ impl ConnectionHandler for Handler {
                             Left(msg) => {
                                 let op_id = msg.id();
                                 if msg.track_stats() {
-                                    if let Some(mut op) = self.op_manager.pop(op_id) {
+                                    if let Ok(Some(mut op)) = self.op_manager.pop(op_id) {
                                         op.record_transfer();
-                                        let _ = self.op_manager.push(*op_id, op);
+                                        let fut = self.op_manager.push(*op_id, op);
+                                        futures::pin_mut!(fut);
+                                        match fut.poll_unpin(cx) {
+                                            Poll::Ready(_) => {}
+                                            Poll::Pending => return Poll::Pending,
+                                        }
                                     }
                                 }
                                 let op_id = *op_id;
@@ -894,9 +957,14 @@ impl ConnectionHandler for Handler {
                     } => match Sink::poll_flush(Pin::new(&mut substream), cx) {
                         Poll::Ready(Ok(())) => {
                             if let Some(op_id) = op_id {
-                                if let Some(mut op) = self.op_manager.pop(&op_id) {
+                                if let Ok(Some(mut op)) = self.op_manager.pop(&op_id) {
                                     op.record_transfer();
-                                    let _ = self.op_manager.push(op_id, op);
+                                    let fut = self.op_manager.push(op_id, op);
+                                    futures::pin_mut!(fut);
+                                    match fut.poll_unpin(cx) {
+                                        Poll::Ready(_) => {}
+                                        Poll::Pending => return Poll::Pending,
+                                    }
                                 }
                             }
                             stream = SubstreamState::WaitingMsg { substream, conn_id };
@@ -923,9 +991,14 @@ impl ConnectionHandler for Handler {
                     } => match Stream::poll_next(Pin::new(&mut substream), cx) {
                         Poll::Ready(Some(Ok(msg))) => {
                             let op_id = msg.id();
-                            if let Some(mut op) = self.op_manager.pop(op_id) {
+                            if let Ok(Some(mut op)) = self.op_manager.pop(op_id) {
                                 op.record_transfer();
-                                let _ = self.op_manager.push(*op_id, op);
+                                let fut = self.op_manager.push(*op_id, op);
+                                futures::pin_mut!(fut);
+                                match fut.poll_unpin(cx) {
+                                    Poll::Ready(_) => {}
+                                    Poll::Pending => return Poll::Pending,
+                                }
                             }
                             if !msg.terminal() {
                                 // received a message, the other peer is waiting for an answer
@@ -965,13 +1038,6 @@ impl ConnectionHandler for Handler {
                     }
                 }
             }
-        }
-
-        if self.substreams.is_empty() || self.substreams.iter().all(|s| s.is_free()) {
-            // We destroyed all substreams in this iteration or all substreams are free
-            self.keep_alive = KeepAlive::Until(Instant::now() + config::PEER_TIMEOUT);
-        } else {
-            self.keep_alive = KeepAlive::Yes;
         }
 
         Poll::Pending

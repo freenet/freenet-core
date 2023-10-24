@@ -54,7 +54,7 @@ impl StoreEntriesContainer for KeyToEncryptionMap {
 pub enum SecretStoreError {
     #[error("encryption error: {0}")]
     Encryption(EncryptionError),
-    #[error(transparent)]
+    #[error("{0}")]
     IO(#[from] std::io::Error),
     #[error("missing cipher")]
     MissingCipher,

@@ -7,12 +7,13 @@ use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
-    node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
+    node::{ConnectionBridge, ConnectionError, OpManager, OpNotAvailable, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
+    DynError,
 };
 
+pub(crate) mod connect;
 pub(crate) mod get;
-pub(crate) mod join_ring;
 pub(crate) mod op_trait;
 pub(crate) mod put;
 pub(crate) mod subscribe;
@@ -33,7 +34,7 @@ pub(crate) struct OpInitialization<Op> {
 pub(crate) async fn handle_op_request<Op, CB>(
     op_storage: &OpManager,
     conn_manager: &mut CB,
-    msg: Op::Message,
+    msg: &Op::Message,
     client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
@@ -43,7 +44,7 @@ where
     let sender;
     let tx = *msg.id();
     let result = {
-        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, &msg)?;
+        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, msg).await?;
         sender = s;
         op.process_message(conn_manager, op_storage, msg, client_id)
             .await
@@ -74,7 +75,7 @@ where
         }
         Err((err, tx_id)) => {
             if let Some(sender) = sender {
-                conn_manager.send(&sender, Message::Canceled(tx_id)).await?;
+                conn_manager.send(&sender, Message::Aborted(tx_id)).await?;
             }
             return Err(err);
         }
@@ -87,7 +88,7 @@ where
             if let Some(target) = msg.target().cloned() {
                 conn_manager.send(&target.peer, msg).await?;
             }
-            op_storage.push(id, updated_state)?;
+            op_storage.push(id, updated_state).await?;
         }
 
         Ok(OperationResult {
@@ -103,7 +104,7 @@ where
         }) => {
             // interim state
             let id = *updated_state.id();
-            op_storage.push(id, updated_state)?;
+            op_storage.push(id, updated_state).await?;
         }
         Ok(OperationResult {
             return_msg: Some(msg),
@@ -125,19 +126,21 @@ where
 }
 
 pub(crate) enum OpEnum {
-    JoinRing(Box<join_ring::JoinRingOp>),
+    Connect(Box<connect::ConnectOp>),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
+    Update(update::UpdateOp),
 }
 
 impl OpEnum {
     delegate::delegate! {
         to match self {
-            OpEnum::JoinRing(op) => op,
+            OpEnum::Connect(op) => op,
             OpEnum::Put(op) => op,
             OpEnum::Get(op) => op,
             OpEnum::Subscribe(op) => op,
+            OpEnum::Update(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome;
@@ -183,19 +186,23 @@ pub(crate) enum OpError {
     RingError(#[from] RingError),
     #[error(transparent)]
     ContractError(#[from] ContractError),
+    #[error(transparent)]
+    ExecutorError(DynError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
     #[error("cannot perform a state transition from the current state with the provided input (tx: {0})")]
     InvalidStateTransition(Transaction),
-    #[error("failed notifying back to the node message loop, channel closed")]
-    NotificationError(#[from] Box<SendError<(Message, Option<ClientId>)>>),
+    #[error("failed notifying, channel closed")]
+    NotificationError,
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
     OpNotPresent(Transaction),
-    #[error("max number of retries for tx {0} of op type {1} reached")]
-    MaxRetriesExceeded(Transaction, String),
+    #[error("max number of retries for tx {0} of op type `{1}` reached")]
+    MaxRetriesExceeded(Transaction, TransactionType),
+    #[error("op not available")]
+    OpNotAvailable(#[from] OpNotAvailable),
 
     // user for control flow
     /// This is used as an early interrumpt of an op update when an op
@@ -204,8 +211,8 @@ pub(crate) enum OpError {
     StatePushed,
 }
 
-impl From<SendError<(Message, Option<ClientId>)>> for OpError {
-    fn from(err: SendError<(Message, Option<ClientId>)>) -> OpError {
-        OpError::NotificationError(Box::new(err))
+impl<T> From<SendError<T>> for OpError {
+    fn from(_: SendError<T>) -> OpError {
+        OpError::NotificationError
     }
 }

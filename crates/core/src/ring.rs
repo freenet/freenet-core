@@ -63,7 +63,7 @@ impl From<PeerKey> for PeerKeyLocation {
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
@@ -71,25 +71,25 @@ pub(crate) struct Ring {
     max_connections: usize,
     min_connections: usize,
     router: Arc<RwLock<Router>>,
-    connections_by_location: Arc<RwLock<BTreeMap<Location, PeerKeyLocation>>>,
-    location_for_peer: Arc<RwLock<BTreeMap<PeerKey, Location>>>,
+    connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+    location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
-    own_location: Arc<AtomicU64>,
+    own_location: AtomicU64,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
-    subscribers: Arc<DashMap<ContractKey, Vec<PeerKeyLocation>>>,
-    subscriptions: Arc<RwLock<Vec<ContractKey>>>,
+    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
+    subscriptions: RwLock<Vec<ContractKey>>,
 
     // A peer which has been blacklisted to perform actions regarding a given contract.
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
     /// Interim connections ongoing haandshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
-    open_connections: Arc<AtomicUsize>,
+    open_connections: AtomicUsize,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -123,7 +123,7 @@ impl Ring {
         let peer_key = PeerKey::from(config.local_key.public());
 
         // for location here consider -1 == None
-        let own_location = Arc::new(AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes())));
+        let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
 
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
@@ -158,15 +158,15 @@ impl Ring {
             max_connections,
             min_connections,
             router,
-            connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
-            location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
+            connections_by_location: RwLock::new(BTreeMap::new()),
+            location_for_peer: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location,
             peer_key,
-            subscribers: Arc::new(DashMap::new()),
-            subscriptions: Arc::new(RwLock::new(Vec::new())),
+            subscribers: DashMap::new(),
+            subscriptions: RwLock::new(Vec::new()),
             // contract_blacklist: Arc::new(DashMap::new()),
-            open_connections: Arc::new(AtomicUsize::new(0)),
+            open_connections: AtomicUsize::new(0),
         };
 
         if let Some(loc) = config.location {
@@ -232,7 +232,6 @@ impl Ring {
 
     /// Returns this node location in the ring, if any (must have join the ring already).
     pub fn own_location(&self) -> PeerKeyLocation {
-        tracing::debug!("Getting loc for peer {}", self.peer_key);
         let location = f64::from_le_bytes(self.own_location.load(SeqCst).to_le_bytes());
         let location = if (location - -1f64).abs() < f64::EPSILON {
             None
@@ -251,23 +250,28 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: &Location) -> bool {
+        let cbl = &*self.connections_by_location.read();
         let open_conn = self.open_connections.fetch_add(1, SeqCst) + 1;
         let my_location = &self
             .own_location()
             .location
             .expect("this node has no location assigned!");
-        let cbl = &*self.connections_by_location.read();
         let accepted = if location == my_location || cbl.contains_key(location) {
             false
         } else if open_conn < self.min_connections {
             true
         } else if open_conn >= self.max_connections {
+            tracing::debug!(peer = %self.peer_key, "max connections reached");
             false
         } else {
-            my_location.distance(location)
-                < self
-                    .median_distance_to(my_location)
-                    .unwrap_or(Distance(0.5))
+            // todo: in the future maybe use the `small worldness` metric to decide
+            let median_distance = self
+                .median_distance_to(my_location)
+                .unwrap_or(Distance(0.5));
+            let dist_to_loc = my_location.distance(location);
+            let is_lower_than_median = dist_to_loc < median_distance;
+            tracing::debug!("dist to connection loc: {dist_to_loc}, median dist: {median_distance}, accepting: {is_lower_than_median}");
+            is_lower_than_median
         };
         if !accepted {
             self.open_connections.fetch_sub(1, SeqCst);
@@ -343,13 +347,32 @@ impl Ring {
     /// Get a random peer from the known ring connections.
     pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
     where
-        F: FnMut(&&PeerKeyLocation) -> bool,
+        F: Fn(&PeerKey) -> bool,
     {
-        self.connections_by_location
-            .read()
-            .values()
-            .find(filter_fn)
-            .copied()
+        use rand::Rng;
+        let peers = &*self.location_for_peer.read();
+        let amount = peers.len();
+        if amount == 0 {
+            return None;
+        }
+        let mut rng = rand::thread_rng();
+        let mut attempts = 0;
+        loop {
+            if attempts >= amount {
+                return None;
+            }
+            let selected = rng.gen_range(0..amount);
+            let (peer, loc) = peers.iter().nth(selected).expect("infallible");
+            if !filter_fn(peer) {
+                attempts += 1;
+                continue;
+            } else {
+                return Some(PeerKeyLocation {
+                    peer: *peer,
+                    location: Some(*loc),
+                });
+            }
+        }
     }
 
     /// Will return an error in case the max number of subscribers has been added.
@@ -466,8 +489,7 @@ impl From<&ContractKey> for Location {
 
 impl Display for Location {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.to_string().as_str())?;
-        Ok(())
+        write!(f, "{}", self.0)
     }
 }
 
@@ -483,7 +505,8 @@ impl Eq for Location {}
 
 impl Ord for Location {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other)
+        self.0
+            .partial_cmp(&other.0)
             .expect("always should return a cmp value")
     }
 }
@@ -556,6 +579,12 @@ impl Ord for Distance {
     }
 }
 
+impl Display for Distance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]
@@ -569,10 +598,7 @@ pub(crate) enum RingError {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::client_events::test::MemoryEventsGen;
-    use tokio::sync::watch::channel;
 
-    #[ignore]
     #[test]
     fn location_dist() {
         let l0 = Location(0.);
@@ -582,59 +608,5 @@ mod test {
         let l0 = Location(0.75);
         let l1 = Location(0.50);
         assert!(l0.distance(l1) == Distance(0.25));
-    }
-
-    #[ignore]
-    #[test]
-    fn find_closest() {
-        let peer_key: PeerKey = PeerKey::random();
-
-        let (_, receiver) = channel((0, peer_key));
-        let user_events = MemoryEventsGen::new(receiver, peer_key);
-        let config = NodeBuilder::new([Box::new(user_events)]);
-        let ring = Ring::new::<1, node::TestEventListener>(&config, &[]).unwrap();
-
-        fn build_pk(loc: Location) -> PeerKeyLocation {
-            PeerKeyLocation {
-                peer: PeerKey::random(),
-                location: Some(loc),
-            }
-        }
-
-        {
-            let conns = &mut *ring.connections_by_location.write();
-            conns.insert(Location(0.3), build_pk(Location(0.3)));
-            conns.insert(Location(0.5), build_pk(Location(0.5)));
-            conns.insert(Location(0.0), build_pk(Location(0.0)));
-        }
-
-        assert_eq!(
-            Location(0.0),
-            ring.routing(&Location(0.9), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
-        assert_eq!(
-            Location(0.0),
-            ring.routing(&Location(0.1), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
-        assert_eq!(
-            Location(0.5),
-            ring.routing(&Location(0.41), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
-        assert_eq!(
-            Location(0.3),
-            ring.routing(&Location(0.39), None, &[])
-                .unwrap()
-                .location
-                .unwrap()
-        );
     }
 }

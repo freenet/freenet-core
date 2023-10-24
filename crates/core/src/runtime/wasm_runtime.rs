@@ -127,8 +127,9 @@ impl Runtime {
         } else {
             (None, imports! {})
         };
-        native_api::time::prepare_export(&mut store, &mut top_level_imports);
         native_api::log::prepare_export(&mut store, &mut top_level_imports);
+        native_api::rand::prepare_export(&mut store, &mut top_level_imports);
+        native_api::time::prepare_export(&mut store, &mut top_level_imports);
 
         Ok(Self {
             wasm_store: store,
@@ -209,7 +210,6 @@ impl Runtime {
         let module = if let Some(module) = self.delegate_modules.get(key) {
             module
         } else {
-            // FIXME
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)

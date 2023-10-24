@@ -34,10 +34,10 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
         webapp: Some(WebAppContract {
             lang: Some(SupportedWebLangs::Typescript),
             typescript: Some(TypescriptConfig { webpack: true }),
-            state_sources: Some(Sources {
+            state_sources: Sources {
                 source_dirs: Some(vec![PathBuf::from("dist")]),
                 files: None,
-            }),
+            },
             metadata: None,
             dependencies: None,
         }),
@@ -152,7 +152,7 @@ fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
             Error::CommandFailed("npm")
         })?;
     pipe_std_streams(child)?;
-    // todo: change pacakge.json:
+    // todo: change package.json:
     // - include dependencies: freenet-stdlib
 
     let child = Command::new(TSC)

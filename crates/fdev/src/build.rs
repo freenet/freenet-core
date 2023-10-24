@@ -51,6 +51,7 @@ fn compile_options(cli_config: &BuildToolCliConfig) -> impl Iterator<Item = Stri
         .chain(release.iter().map(|s| s.to_string()))
 }
 
+#[cfg(test)]
 #[test]
 fn test_get_compile_options() {
     let config = BuildToolCliConfig {
@@ -219,7 +220,7 @@ mod contract {
         pub lang: Option<SupportedWebLangs>,
         pub typescript: Option<TypescriptConfig>,
         #[serde(rename = "state-sources")]
-        pub state_sources: Option<Sources>,
+        pub state_sources: Sources,
         pub metadata: Option<PathBuf>,
         pub dependencies: Option<toml::value::Table>,
     }
@@ -227,7 +228,6 @@ mod contract {
     #[derive(Serialize, Deserialize, PartialEq)]
     #[serde(rename_all = "lowercase")]
     pub(crate) enum SupportedWebLangs {
-        Javascript,
         Typescript,
     }
 
@@ -242,6 +242,11 @@ mod contract {
         embedded_deps: EmbeddedDeps,
         cwd: &Path,
     ) -> Result<(), DynError> {
+        let Some(web_config) = &config.webapp else {
+            println!("No webapp config found.");
+            return Ok(());
+        };
+
         let metadata = if let Some(md) = config.webapp.as_ref().and_then(|a| a.metadata.as_ref()) {
             let mut buf = vec![];
             File::open(md)?.read_to_end(&mut buf)?;
@@ -251,73 +256,68 @@ mod contract {
         };
 
         let mut archive: Builder<Cursor<Vec<u8>>> = Builder::new(Cursor::new(Vec::new()));
-        if let Some(web_config) = &config.webapp {
-            println!("Bundling webapp contract state");
-            match &web_config.lang {
-                Some(SupportedWebLangs::Typescript) => {
-                    let child = Command::new("npm")
-                        .args(["install"])
+
+        println!("Bundling webapp contract state");
+        match &web_config.lang {
+            Some(SupportedWebLangs::Typescript) => {
+                let child = Command::new("npm")
+                    .args(["install"])
+                    .current_dir(cwd)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| {
+                        eprintln!("Error while installing npm packages: {e}");
+                        Error::CommandFailed("npm")
+                    })?;
+                pipe_std_streams(child)?;
+                let webpack = web_config
+                    .typescript
+                    .as_ref()
+                    .map(|c| c.webpack)
+                    .unwrap_or_default();
+                use std::io::IsTerminal;
+                if webpack {
+                    let cmd_args: &[&str] =
+                        if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+                            &["--color"]
+                        } else {
+                            &[]
+                        };
+                    let child = Command::new("webpack")
+                        .args(cmd_args)
                         .current_dir(cwd)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()
                         .map_err(|e| {
-                            eprintln!("Error while installing npm packages: {e}");
-                            Error::CommandFailed("npm")
+                            eprintln!("Error while executing webpack command: {e}");
+                            Error::CommandFailed("tsc")
                         })?;
                     pipe_std_streams(child)?;
-                    let webpack = web_config
-                        .typescript
-                        .as_ref()
-                        .map(|c| c.webpack)
-                        .unwrap_or_default();
-                    use std::io::IsTerminal;
-                    if webpack {
-                        let cmd_args: &[&str] =
-                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
-                                &["--color"]
-                            } else {
-                                &[]
-                            };
-                        let child = Command::new("webpack")
-                            .args(cmd_args)
-                            .current_dir(cwd)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .map_err(|e| {
-                                eprintln!("Error while executing webpack command: {e}");
-                                Error::CommandFailed("tsc")
-                            })?;
-                        pipe_std_streams(child)?;
-                        println!("Compiled input using webpack");
-                    } else {
-                        let cmd_args: &[&str] =
-                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
-                                &["--pretty"]
-                            } else {
-                                &[]
-                            };
-                        let child = Command::new("tsc")
-                            .args(cmd_args)
-                            .current_dir(cwd)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .map_err(|e| {
-                                eprintln!("Error while executing command tsc: {e}");
-                                Error::CommandFailed("tsc")
-                            })?;
-                        pipe_std_streams(child)?;
-                        println!("Compiled input using tsc");
-                    }
+                    println!("Compiled input using webpack");
+                } else {
+                    let cmd_args: &[&str] =
+                        if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+                            &["--pretty"]
+                        } else {
+                            &[]
+                        };
+                    let child = Command::new("tsc")
+                        .args(cmd_args)
+                        .current_dir(cwd)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| {
+                            eprintln!("Error while executing command tsc: {e}");
+                            Error::CommandFailed("tsc")
+                        })?;
+                    pipe_std_streams(child)?;
+                    println!("Compiled input using tsc");
                 }
-                Some(SupportedWebLangs::Javascript) => todo!(),
-                None => {}
             }
-        } else {
-            println!("No webapp config found.");
-            return Ok(());
+            None => {}
         }
 
         let build_state = |sources: &Sources| -> Result<(), DynError> {
@@ -392,15 +392,8 @@ mod contract {
             Ok(())
         };
 
-        if let Some(sources) = config
-            .webapp
-            .as_ref()
-            .and_then(|a| a.state_sources.as_ref())
-        {
-            build_state(sources)
-        } else {
-            todo!()
-        }
+        let sources = &web_config.state_sources;
+        build_state(sources)
     }
 
     fn build_generic_state(config: &mut BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
@@ -602,10 +595,10 @@ mod contract {
                     webapp: Some(WebAppContract {
                         lang: Some(SupportedWebLangs::Typescript),
                         typescript: Some(TypescriptConfig { webpack: true }),
-                        state_sources: Some(Sources {
+                        state_sources: Sources {
                             source_dirs: Some(vec!["dist".into()]),
                             files: None,
-                        }),
+                        },
                         metadata: None,
                         dependencies: Some(
                             toml::toml! {

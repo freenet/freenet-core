@@ -12,7 +12,7 @@ use xz2::read::{XzDecoder, XzEncoder};
 pub enum WebContractError {
     #[error("unpacking error: {0}")]
     UnpackingError(Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error(transparent)]
+    #[error("{0}")]
     StoringError(std::io::Error),
     #[error("file not found: {0}")]
     FileNotFound(String),

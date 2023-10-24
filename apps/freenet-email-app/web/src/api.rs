@@ -39,7 +39,7 @@ impl WebApi {
 
     #[cfg(all(not(target_family = "wasm"), feature = "use-node"))]
     fn new() -> Result<Self, String> {
-        todo!()
+        unimplemented!()
     }
 
     #[cfg(all(target_family = "wasm", feature = "use-node"))]

@@ -1,4 +1,5 @@
 use crate::runtime::ContractError as ContractRtError;
+use either::Either;
 use freenet_stdlib::prelude::*;
 
 mod executor;
@@ -12,7 +13,7 @@ pub(crate) use executor::{
 };
 pub(crate) use handler::{
     contract_handler_channel, ClientResponses, ClientResponsesSender, ContractHandler,
-    ContractHandlerEvent, ContractHandlerToEventLoopChannel, EventId, NetEventListener,
+    ContractHandlerEvent, ContractHandlerToEventLoopChannel, EventId, NetEventListenerHalve,
     NetworkContractHandler, StoreResponse,
 };
 #[cfg(test)]
@@ -22,12 +23,14 @@ pub use executor::{Executor, ExecutorError, OperationMode};
 
 use executor::ContractExecutor;
 
+#[tracing::instrument(skip_all)]
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
 {
     loop {
         let (id, event) = contract_handler.channel().recv_from_event_loop().await?;
+        tracing::debug!(%event, "Got contract handling event");
         match event {
             ContractHandlerEvent::GetQuery {
                 key,
@@ -39,6 +42,7 @@ where
                     .await
                 {
                     Ok((state, contract)) => {
+                        tracing::debug!("Fetched contract {key}");
                         contract_handler
                             .channel()
                             .send_to_event_loop(
@@ -54,7 +58,7 @@ where
                             .await?;
                     }
                     Err(err) => {
-                        tracing::warn!("error while executing get contract query: {err}");
+                        tracing::warn!("Error while executing get contract query: {err}");
                         contract_handler
                             .channel()
                             .send_to_event_loop(
@@ -77,6 +81,7 @@ where
                             .await?;
                     }
                     Err(err) => {
+                        tracing::error!("Error while caching: {err}");
                         let err = ContractError::ContractRuntimeError(err);
                         contract_handler
                             .channel()
@@ -86,29 +91,25 @@ where
                 }
             }
             ContractHandlerEvent::PutQuery {
-                key: _key,
-                state: _state,
+                key,
+                state,
+                related_contracts,
+                parameters,
             } => {
-                // let _put_result = contract_handler
-                //     .handle_request(ClientRequest::Put {
-                //         contract: todo!(),
-                //         state: _state,
-                //     }.into())
-                //     .await
-                //     .map(|r| {
-                //         let _r = r.unwrap_put();
-                //         unimplemented!();
-                //     });
-                // contract_handler
-                //     .channel()
-                //     .send_to_listener(
-                //         _id,
-                //         ContractHandlerEvent::PushResponse {
-                //             new_value: put_result,
-                //         },
-                //     )
-                //     .await?;
-                todo!("perform put request");
+                let put_result = contract_handler
+                    .executor()
+                    .upsert_contract_state(key, Either::Left(state), related_contracts, parameters)
+                    .await
+                    .map_err(Into::into);
+                contract_handler
+                    .channel()
+                    .send_to_event_loop(
+                        id,
+                        ContractHandlerEvent::PutResponse {
+                            new_value: put_result,
+                        },
+                    )
+                    .await?;
             }
             _ => unreachable!(),
         }
@@ -121,9 +122,9 @@ pub(crate) enum ContractError {
     ChannelDropped(Box<ContractHandlerEvent>),
     #[error("contract {0} not found in storage")]
     ContractNotFound(ContractKey),
-    #[error("")]
-    ContractRuntimeError(ContractRtError),
     #[error(transparent)]
+    ContractRuntimeError(ContractRtError),
+    #[error("{0}")]
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]
     NoEvHandlerResponse,

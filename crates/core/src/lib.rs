@@ -25,7 +25,6 @@ pub mod local_node {
 
 /// Exports to build a running network simulation.
 pub mod network_sim {
-    // todo: streamline this
     use super::*;
     pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
     pub use node::{InitPeerNode, NodeBuilder, NodeConfig};
@@ -38,5 +37,5 @@ pub mod dev_tool {
     pub use crate::config::Config;
     pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
-    pub use runtime::{ContractStore, DelegateStore, SecretsStore, StateStore};
+    pub use runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }
