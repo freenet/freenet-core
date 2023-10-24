@@ -1104,7 +1104,6 @@ mod test {
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
-        // crate::config::set_logger();
         const NUM_NODES: usize = 3usize;
         const NUM_GW: usize = 1usize;
         let mut sim_nw = SimNetwork::new(

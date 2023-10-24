@@ -74,7 +74,7 @@ tar = { version = "0.4.38" }
 xz2 = { version = "0.1" }
 
 # Tracing deps
-tracing = { version = "0.1", optional = true }
+tracing = { version = "0.1" }
 opentelemetry = { version = "0.20.0", default-features = false, features = ["rt-tokio", "trace"], optional = true }
 opentelemetry-jaeger = { version = "0.19.0", features = ["rt-tokio","collector_client", "isahc"], optional = true }
 tracing-opentelemetry = { version = "0.21.0", optional = true }
@@ -91,11 +91,11 @@ pico-args = "0.5"
 freenet-stdlib = { workspace = true, features = ["testing", "net"] }
 
 [features]
-default = ["websocket", "rocks_db", "trace"]
+default = ["trace", "websocket", "sqlite"]
 testing = ["arbitrary"]
 rocks_db = ["rocksdb"]
 sqlite = ["sqlx"]
 websocket = ["axum/ws"]
-trace = ["tracing", "opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]
+trace = ["opentelemetry", "opentelemetry-jaeger", "tracing-opentelemetry", "tracing-subscriber"]
 local-mode = []
 network-mode = []
