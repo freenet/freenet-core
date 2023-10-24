@@ -3,6 +3,8 @@ use std::time::Duration;
 use std::{future::Future, time::Instant};
 
 use freenet_stdlib::prelude::*;
+use futures::future::BoxFuture;
+use futures::FutureExt;
 
 use crate::{
     client_events::ClientId,
@@ -138,39 +140,42 @@ impl Operation for GetOp {
     type Message = GetMsg;
     type Result = GetResult;
 
-    fn load_or_init(
-        op_storage: &OpManager,
-        msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerKey> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer);
-        };
-        let tx = *msg.id();
-        match op_storage.pop(msg.id()) {
-            Ok(Some(OpEnum::Get(get_op))) => {
-                Ok(OpInitialization { op: get_op, sender })
-                // was an existing operation, other peer messaged back
+    fn load_or_init<'a>(
+        op_storage: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
+        async move {
+            let mut sender: Option<PeerKey> = None;
+            if let Some(peer_key_loc) = msg.sender().cloned() {
+                sender = Some(peer_key_loc.peer);
+            };
+            let tx = *msg.id();
+            match op_storage.pop(msg.id()) {
+                Ok(Some(OpEnum::Get(get_op))) => {
+                    Ok(OpInitialization { op: get_op, sender })
+                    // was an existing operation, other peer messaged back
+                }
+                Ok(Some(op)) => {
+                    let _ = op_storage.push(tx, op).await;
+                    Err(OpError::OpNotPresent(tx))
+                }
+                Ok(None) => {
+                    // new request to get a value for a contract, initialize the machine
+                    Ok(OpInitialization {
+                        op: Self {
+                            state: Some(GetState::ReceivedRequest),
+                            id: tx,
+                            result: None,
+                            stats: None, // don't care about stats in target peers
+                            _ttl: PEER_TIMEOUT,
+                        },
+                        sender,
+                    })
+                }
+                Err(err) => Err(err.into()),
             }
-            Ok(Some(op)) => {
-                let _ = op_storage.push(tx, op);
-                Err(OpError::OpNotPresent(tx))
-            }
-            Ok(None) => {
-                // new request to get a value for a contract, initialize the machine
-                Ok(OpInitialization {
-                    op: Self {
-                        state: Some(GetState::ReceivedRequest),
-                        id: tx,
-                        result: None,
-                        stats: None, // don't care about stats in target peers
-                        _ttl: PEER_TIMEOUT,
-                    },
-                    sender,
-                })
-            }
-            Err(err) => Err(err.into()),
         }
+        .boxed()
     }
 
     fn id(&self) -> &Transaction {

@@ -1,5 +1,6 @@
 //! Operation which seeks new connections in the ring.
-use futures::Future;
+use futures::future::BoxFuture;
+use futures::{Future, FutureExt};
 use std::pin::Pin;
 use std::{collections::HashSet, time::Duration};
 
@@ -79,40 +80,43 @@ impl Operation for ConnectOp {
     type Message = ConnectMsg;
     type Result = ConnectResult;
 
-    fn load_or_init(
-        op_storage: &OpManager,
-        msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError> {
-        let sender;
-        let tx = *msg.id();
-        match op_storage.pop(msg.id()) {
-            Ok(Some(OpEnum::Connect(connect_op))) => {
-                sender = msg.sender().cloned();
-                // was an existing operation, the other peer messaged back
-                Ok(OpInitialization {
-                    op: *connect_op,
-                    sender,
-                })
+    fn load_or_init<'a>(
+        op_storage: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
+        async move {
+            let sender;
+            let tx = *msg.id();
+            match op_storage.pop(msg.id()) {
+                Ok(Some(OpEnum::Connect(connect_op))) => {
+                    sender = msg.sender().cloned();
+                    // was an existing operation, the other peer messaged back
+                    Ok(OpInitialization {
+                        op: *connect_op,
+                        sender,
+                    })
+                }
+                Ok(Some(op)) => {
+                    let _ = op_storage.push(tx, op).await;
+                    Err(OpError::OpNotPresent(tx))
+                }
+                Ok(None) => {
+                    // new request to join this node, initialize the machine
+                    Ok(OpInitialization {
+                        op: Self {
+                            id: tx,
+                            state: Some(ConnectState::Initializing),
+                            backoff: None,
+                            gateway: Box::new(op_storage.ring.own_location()),
+                            _ttl: PEER_TIMEOUT,
+                        },
+                        sender: None,
+                    })
+                }
+                Err(err) => Err(err.into()),
             }
-            Ok(Some(op)) => {
-                let _ = op_storage.push(tx, op);
-                Err(OpError::OpNotPresent(tx))
-            }
-            Ok(None) => {
-                // new request to join this node, initialize the machine
-                Ok(OpInitialization {
-                    op: Self {
-                        id: tx,
-                        state: Some(ConnectState::Initializing),
-                        backoff: None,
-                        gateway: Box::new(op_storage.ring.own_location()),
-                        _ttl: PEER_TIMEOUT,
-                    },
-                    sender: None,
-                })
-            }
-            Err(err) => Err(err.into()),
         }
+        .boxed()
     }
 
     fn id(&self) -> &Transaction {
@@ -830,20 +834,22 @@ where
         },
     });
     conn_manager.send(&gateway.peer, join_req).await?;
-    op_storage.push(
-        tx,
-        OpEnum::Connect(Box::new(ConnectOp {
-            id,
-            state: Some(ConnectState::Connecting(ConnectionInfo {
-                gateway,
-                this_peer,
-                max_hops_to_live,
+    op_storage
+        .push(
+            tx,
+            OpEnum::Connect(Box::new(ConnectOp {
+                id,
+                state: Some(ConnectState::Connecting(ConnectionInfo {
+                    gateway,
+                    this_peer,
+                    max_hops_to_live,
+                })),
+                gateway: Box::new(gateway),
+                backoff,
+                _ttl,
             })),
-            gateway: Box::new(gateway),
-            backoff,
-            _ttl,
-        })),
-    )?;
+        )
+        .await?;
     Ok(())
 }
 

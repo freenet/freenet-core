@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use freenet_stdlib::prelude::*;
+use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -56,41 +57,44 @@ impl Operation for SubscribeOp {
     type Message = SubscribeMsg;
     type Result = SubscribeResult;
 
-    fn load_or_init(
-        op_storage: &OpManager,
-        msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerKey> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer);
-        };
-        let id = *msg.id();
+    fn load_or_init<'a>(
+        op_storage: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
+        async move {
+            let mut sender: Option<PeerKey> = None;
+            if let Some(peer_key_loc) = msg.sender().cloned() {
+                sender = Some(peer_key_loc.peer);
+            };
+            let id = *msg.id();
 
-        match op_storage.pop(msg.id()) {
-            Ok(Some(OpEnum::Subscribe(subscribe_op))) => {
-                // was an existing operation, the other peer messaged back
-                Ok(OpInitialization {
-                    op: subscribe_op,
-                    sender,
-                })
+            match op_storage.pop(msg.id()) {
+                Ok(Some(OpEnum::Subscribe(subscribe_op))) => {
+                    // was an existing operation, the other peer messaged back
+                    Ok(OpInitialization {
+                        op: subscribe_op,
+                        sender,
+                    })
+                }
+                Ok(Some(op)) => {
+                    let _ = op_storage.push(id, op).await;
+                    Err(OpError::OpNotPresent(id))
+                }
+                Ok(None) => {
+                    // new request to subcribe to a contract, initialize the machine
+                    Ok(OpInitialization {
+                        op: Self {
+                            state: Some(SubscribeState::ReceivedRequest),
+                            id,
+                            _ttl: PEER_TIMEOUT,
+                        },
+                        sender,
+                    })
+                }
+                Err(err) => Err(err.into()),
             }
-            Ok(Some(op)) => {
-                let _ = op_storage.push(id, op);
-                Err(OpError::OpNotPresent(id))
-            }
-            Ok(None) => {
-                // new request to subcribe to a contract, initialize the machine
-                Ok(OpInitialization {
-                    op: Self {
-                        state: Some(SubscribeState::ReceivedRequest),
-                        id,
-                        _ttl: PEER_TIMEOUT,
-                    },
-                    sender,
-                })
-            }
-            Err(err) => Err(err.into()),
         }
+        .boxed()
     }
 
     fn id(&self) -> &Transaction {

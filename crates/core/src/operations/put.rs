@@ -9,6 +9,8 @@ use std::{collections::HashSet, time::Instant};
 
 pub(crate) use self::messages::PutMsg;
 use freenet_stdlib::prelude::*;
+use futures::future::BoxFuture;
+use futures::FutureExt;
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 use crate::{
@@ -126,39 +128,42 @@ impl Operation for PutOp {
     type Message = PutMsg;
     type Result = PutResult;
 
-    fn load_or_init(
-        op_storage: &OpManager,
-        msg: &Self::Message,
-    ) -> Result<OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerKey> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer);
-        };
+    fn load_or_init<'a>(
+        op_storage: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
+        async move {
+            let mut sender: Option<PeerKey> = None;
+            if let Some(peer_key_loc) = msg.sender().cloned() {
+                sender = Some(peer_key_loc.peer);
+            };
 
-        let tx = *msg.id();
-        match op_storage.pop(msg.id()) {
-            Ok(Some(OpEnum::Put(put_op))) => {
-                // was an existing operation, the other peer messaged back
-                Ok(OpInitialization { op: put_op, sender })
+            let tx = *msg.id();
+            match op_storage.pop(msg.id()) {
+                Ok(Some(OpEnum::Put(put_op))) => {
+                    // was an existing operation, the other peer messaged back
+                    Ok(OpInitialization { op: put_op, sender })
+                }
+                Ok(Some(op)) => {
+                    let _ = op_storage.push(tx, op).await;
+                    Err(OpError::OpNotPresent(tx))
+                }
+                Ok(None) => {
+                    // new request to put a new value for a contract, initialize the machine
+                    Ok(OpInitialization {
+                        op: Self {
+                            state: Some(PutState::ReceivedRequest),
+                            stats: None, // don't care for stats in the target peers
+                            id: tx,
+                            _ttl: PEER_TIMEOUT,
+                        },
+                        sender,
+                    })
+                }
+                Err(err) => Err(err.into()),
             }
-            Ok(Some(op)) => {
-                let _ = op_storage.push(tx, op);
-                Err(OpError::OpNotPresent(tx))
-            }
-            Ok(None) => {
-                // new request to put a new value for a contract, initialize the machine
-                Ok(OpInitialization {
-                    op: Self {
-                        state: Some(PutState::ReceivedRequest),
-                        stats: None, // don't care for stats in the target peers
-                        id: tx,
-                        _ttl: PEER_TIMEOUT,
-                    },
-                    sender,
-                })
-            }
-            Err(err) => Err(err.into()),
         }
+        .boxed()
     }
 
     fn id(&self) -> &Transaction {

@@ -909,7 +909,12 @@ impl ConnectionHandler for Handler {
                                 if msg.track_stats() {
                                     if let Ok(Some(mut op)) = self.op_manager.pop(op_id) {
                                         op.record_transfer();
-                                        let _ = self.op_manager.push(*op_id, op);
+                                        let fut = self.op_manager.push(*op_id, op);
+                                        futures::pin_mut!(fut);
+                                        match fut.poll_unpin(cx) {
+                                            Poll::Ready(_) => {}
+                                            Poll::Pending => return Poll::Pending,
+                                        }
                                     }
                                 }
                                 let op_id = *op_id;
@@ -954,7 +959,12 @@ impl ConnectionHandler for Handler {
                             if let Some(op_id) = op_id {
                                 if let Ok(Some(mut op)) = self.op_manager.pop(&op_id) {
                                     op.record_transfer();
-                                    let _ = self.op_manager.push(op_id, op);
+                                    let fut = self.op_manager.push(op_id, op);
+                                    futures::pin_mut!(fut);
+                                    match fut.poll_unpin(cx) {
+                                        Poll::Ready(_) => {}
+                                        Poll::Pending => return Poll::Pending,
+                                    }
                                 }
                             }
                             stream = SubstreamState::WaitingMsg { substream, conn_id };
@@ -983,7 +993,12 @@ impl ConnectionHandler for Handler {
                             let op_id = msg.id();
                             if let Ok(Some(mut op)) = self.op_manager.pop(op_id) {
                                 op.record_transfer();
-                                let _ = self.op_manager.push(*op_id, op);
+                                let fut = self.op_manager.push(*op_id, op);
+                                futures::pin_mut!(fut);
+                                match fut.poll_unpin(cx) {
+                                    Poll::Ready(_) => {}
+                                    Poll::Pending => return Poll::Pending,
+                                }
                             }
                             if !msg.terminal() {
                                 // received a message, the other peer is waiting for an answer
