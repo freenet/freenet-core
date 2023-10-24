@@ -48,7 +48,7 @@ impl Operation for UpdateOp {
         self,
         _conn_manager: &'a mut CB,
         _op_storage: &'a crate::node::OpManager,
-        _input: Self::Message,
+        _input: &Self::Message,
         _client_id: Option<ClientId>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
@@ -67,7 +67,7 @@ mod messages {
         ring::PeerKeyLocation,
     };
 
-    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+    #[derive(Debug, Serialize, Deserialize)]
     pub(crate) enum UpdateMsg {}
 
     impl InnerMessage for UpdateMsg {

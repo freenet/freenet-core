@@ -180,7 +180,7 @@ impl NodeInMemory {
                 .await;
                 match res {
                     Err(OpError::MaxRetriesExceeded(_, _))
-                        if tx_type == TransactionType::JoinRing && !self.is_gateway =>
+                        if tx_type == TransactionType::Connect && !self.is_gateway =>
                     {
                         tracing::warn!("Retrying joining the ring with an other peer");
                         if let Some(gateway) = self.gateways.iter().shuffle().next() {

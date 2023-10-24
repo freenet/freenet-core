@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use either::Either;
 use parking_lot::RwLock;
 use tokio::sync::{mpsc::error::SendError, Mutex};
@@ -21,6 +21,14 @@ use crate::{
 
 use super::{conn_manager::EventLoopNotificationsSender, PeerKey};
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OpNotAvailable {
+    #[error("operation running")]
+    Running,
+    #[error("operation completed")]
+    Completed,
+}
+
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 pub(crate) struct OpManager {
@@ -34,6 +42,9 @@ pub(crate) struct OpManager {
     ch_outbound: Mutex<ContractHandlerToEventLoopChannel<NetEventListenerHalve>>,
     // FIXME: think of an optimal strategy to check for timeouts and clean up garbage
     _ops_ttl: RwLock<BTreeMap<Instant, Vec<Transaction>>>,
+    // todo: improve this when the anti-write amplification functionality is added
+    completed: DashSet<Transaction>,
+    in_progress: DashSet<Transaction>,
     pub ring: Ring,
 }
 
@@ -61,6 +72,8 @@ impl OpManager {
             ring,
             to_event_listener: notification_channel,
             ch_outbound: Mutex::new(contract_handler),
+            completed: DashSet::new(),
+            in_progress: DashSet::new(),
             _ops_ttl: RwLock::new(BTreeMap::new()),
         }
     }
@@ -84,14 +97,6 @@ impl OpManager {
             .map_err(|err| SendError(err.0.unwrap_left()))
     }
 
-    // /// Send an internal message to this node event loop.
-    // pub async fn notify_internal_op(&self, msg: NodeEvent) -> Result<(), SendError<NodeEvent>> {
-    //     self.to_event_listener
-    //         .send(Either::Right(msg))
-    //         .await
-    //         .map_err(|err| SendError(err.0.unwrap_right()))
-    // }
-
     /// Send an event to the contract handler and await a response event from it if successful.
     pub async fn notify_contract_handler(
         &self,
@@ -110,10 +115,11 @@ impl OpManager {
     }
 
     pub fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
+        self.in_progress.remove(&id);
         match op {
             OpEnum::Connect(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::JoinRing);
+                check_id_op!(id.tx_type(), TransactionType::Connect);
                 self.join_ring.insert(id, *op);
             }
             OpEnum::Put(op) => {
@@ -140,9 +146,15 @@ impl OpManager {
         Ok(())
     }
 
-    pub fn pop(&self, id: &Transaction) -> Option<OpEnum> {
-        match id.tx_type() {
-            TransactionType::JoinRing => self
+    pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
+        if self.completed.contains(id) {
+            return Err(OpNotAvailable::Completed);
+        }
+        if self.in_progress.contains(id) {
+            return Err(OpNotAvailable::Running);
+        }
+        let op = match id.tx_type() {
+            TransactionType::Connect => self
                 .join_ring
                 .remove(id)
                 .map(|(_k, v)| v)
@@ -156,7 +168,13 @@ impl OpManager {
                 .map(OpEnum::Subscribe),
             TransactionType::Update => self.update.remove(id).map(|(_k, v)| v).map(OpEnum::Update),
             TransactionType::Canceled => unreachable!(),
-        }
+        };
+        self.in_progress.insert(*id);
+        Ok(op)
+    }
+
+    pub fn completed(&self, id: Transaction) {
+        self.completed.insert(id);
     }
 
     pub fn prune_connection(&self, peer: PeerKey) {

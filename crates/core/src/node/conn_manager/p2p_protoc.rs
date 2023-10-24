@@ -435,7 +435,7 @@ impl P2pConnManager {
                             .await;
                             match res {
                                 Err(OpError::MaxRetriesExceeded(_, _))
-                                    if tx_type == TransactionType::JoinRing
+                                    if tx_type == TransactionType::Connect
                                         && self.public_addr.is_none() /* FIXME: this should be not a gateway instead */ =>
                                 {
                                     tracing::warn!("Retrying joining the ring with an other peer");
@@ -907,7 +907,7 @@ impl ConnectionHandler for Handler {
                             Left(msg) => {
                                 let op_id = msg.id();
                                 if msg.track_stats() {
-                                    if let Some(mut op) = self.op_manager.pop(op_id) {
+                                    if let Ok(Some(mut op)) = self.op_manager.pop(op_id) {
                                         op.record_transfer();
                                         let _ = self.op_manager.push(*op_id, op);
                                     }
@@ -952,7 +952,7 @@ impl ConnectionHandler for Handler {
                     } => match Sink::poll_flush(Pin::new(&mut substream), cx) {
                         Poll::Ready(Ok(())) => {
                             if let Some(op_id) = op_id {
-                                if let Some(mut op) = self.op_manager.pop(&op_id) {
+                                if let Ok(Some(mut op)) = self.op_manager.pop(&op_id) {
                                     op.record_transfer();
                                     let _ = self.op_manager.push(op_id, op);
                                 }
@@ -981,7 +981,7 @@ impl ConnectionHandler for Handler {
                     } => match Stream::poll_next(Pin::new(&mut substream), cx) {
                         Poll::Ready(Some(Ok(msg))) => {
                             let op_id = msg.id();
-                            if let Some(mut op) = self.op_manager.pop(op_id) {
+                            if let Ok(Some(mut op)) = self.op_manager.pop(op_id) {
                                 op.record_transfer();
                                 let _ = self.op_manager.push(*op_id, op);
                             }
