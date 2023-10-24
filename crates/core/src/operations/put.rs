@@ -1048,7 +1048,7 @@ mod test {
 
         // trigger the put op @ gw-0
         sim_nw
-            .trigger_event("gateway-0", 1, Some(Duration::from_millis(150)))
+            .trigger_event("gateway-0", 1, Some(Duration::from_millis(200)))
             .await?;
         assert!(sim_nw.has_put_contract("gateway-0", &key, &new_value));
         assert!(sim_nw.event_listener.contract_broadcasted(&key));

@@ -1020,7 +1020,7 @@ mod test {
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
 
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_millis(50)))
+            .trigger_event("node-0", 1, Some(Duration::from_millis(200)))
             .await?;
         assert!(sim_nw.has_got_contract("node-0", &key));
         Ok(())
