@@ -44,7 +44,7 @@ where
     let sender;
     let tx = *msg.id();
     let result = {
-        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, msg)?;
+        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, msg).await?;
         sender = s;
         op.process_message(conn_manager, op_storage, msg, client_id)
             .await
@@ -88,7 +88,7 @@ where
             if let Some(target) = msg.target().cloned() {
                 conn_manager.send(&target.peer, msg).await?;
             }
-            op_storage.push(id, updated_state)?;
+            op_storage.push(id, updated_state).await?;
         }
 
         Ok(OperationResult {
@@ -104,7 +104,7 @@ where
         }) => {
             // interim state
             let id = *updated_state.id();
-            op_storage.push(id, updated_state)?;
+            op_storage.push(id, updated_state).await?;
         }
         Ok(OperationResult {
             return_msg: Some(msg),
@@ -193,8 +193,8 @@ pub(crate) enum OpError {
     UnexpectedOpState,
     #[error("cannot perform a state transition from the current state with the provided input (tx: {0})")]
     InvalidStateTransition(Transaction),
-    #[error("failed notifying back to the node message loop, channel closed")]
-    NotificationError(#[from] Box<SendError<(Message, Option<ClientId>)>>),
+    #[error("failed notifying, channel closed")]
+    NotificationError,
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
@@ -211,8 +211,8 @@ pub(crate) enum OpError {
     StatePushed,
 }
 
-impl From<SendError<(Message, Option<ClientId>)>> for OpError {
-    fn from(err: SendError<(Message, Option<ClientId>)>) -> OpError {
-        OpError::NotificationError(Box::new(err))
+impl<T> From<SendError<T>> for OpError {
+    fn from(_: SendError<T>) -> OpError {
+        OpError::NotificationError
     }
 }
