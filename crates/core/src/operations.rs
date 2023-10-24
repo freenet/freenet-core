@@ -7,7 +7,7 @@ use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
-    node::{ConnectionBridge, ConnectionError, OpManager, PeerKey},
+    node::{ConnectionBridge, ConnectionError, OpManager, OpNotAvailable, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
 };
@@ -34,7 +34,7 @@ pub(crate) struct OpInitialization<Op> {
 pub(crate) async fn handle_op_request<Op, CB>(
     op_storage: &OpManager,
     conn_manager: &mut CB,
-    msg: Op::Message,
+    msg: &Op::Message,
     client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
@@ -44,7 +44,7 @@ where
     let sender;
     let tx = *msg.id();
     let result = {
-        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, &msg)?;
+        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, msg)?;
         sender = s;
         op.process_message(conn_manager, op_storage, msg, client_id)
             .await
@@ -201,6 +201,8 @@ pub(crate) enum OpError {
     OpNotPresent(Transaction),
     #[error("max number of retries for tx {0} of op type `{1}` reached")]
     MaxRetriesExceeded(Transaction, TransactionType),
+    #[error("op not available")]
+    OpNotAvailable(#[from] OpNotAvailable),
 
     // user for control flow
     /// This is used as an early interrumpt of an op update when an op

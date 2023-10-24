@@ -72,7 +72,7 @@ impl<'a> EventLog<'a> {
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::JoinRing(connect::ConnectMsg::Response {
+            Message::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,
@@ -108,7 +108,7 @@ impl<'a> EventLog<'a> {
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::JoinRing(connect::ConnectMsg::Response {
+            Message::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,

@@ -86,7 +86,7 @@ mod sealed_msg_type {
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     pub(crate) enum TransactionType {
-        JoinRing,
+        Connect,
         Put,
         Get,
         Subscribe,
@@ -97,7 +97,7 @@ mod sealed_msg_type {
     impl Display for TransactionType {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                TransactionType::JoinRing => write!(f, "join ring"),
+                TransactionType::Connect => write!(f, "join ring"),
                 TransactionType::Put => write!(f, "put"),
                 TransactionType::Get => write!(f, "get"),
                 TransactionType::Subscribe => write!(f, "subscribe"),
@@ -126,7 +126,7 @@ mod sealed_msg_type {
     }
 
     transaction_type_enumeration!(decl struct {
-        JoinRing -> ConnectMsg,
+        Connect -> ConnectMsg,
         Put -> PutMsg,
         Get -> GetMsg,
         Subscribe -> SubscribeMsg,
@@ -134,9 +134,9 @@ mod sealed_msg_type {
     });
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Message {
-    JoinRing(ConnectMsg),
+    Connect(ConnectMsg),
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
@@ -189,7 +189,7 @@ impl Message {
     pub fn id(&self) -> &Transaction {
         use Message::*;
         match self {
-            JoinRing(op) => op.id(),
+            Connect(op) => op.id(),
             Put(op) => op.id(),
             Get(op) => op.id(),
             Subscribe(op) => op.id(),
@@ -201,7 +201,7 @@ impl Message {
     pub fn target(&self) -> Option<&PeerKeyLocation> {
         use Message::*;
         match self {
-            JoinRing(op) => op.target(),
+            Connect(op) => op.target(),
             Put(op) => op.target(),
             Get(op) => op.target(),
             Subscribe(op) => op.target(),
@@ -214,7 +214,7 @@ impl Message {
     pub fn terminal(&self) -> bool {
         use Message::*;
         match self {
-            JoinRing(op) => op.terminal(),
+            Connect(op) => op.terminal(),
             Put(op) => op.terminal(),
             Get(op) => op.terminal(),
             Subscribe(op) => op.terminal(),
@@ -225,7 +225,7 @@ impl Message {
 
     pub fn track_stats(&self) -> bool {
         use Message::*;
-        !matches!(self, JoinRing(_) | Subscribe(_) | Aborted(_))
+        !matches!(self, Connect(_) | Subscribe(_) | Aborted(_))
     }
 }
 
@@ -234,7 +234,7 @@ impl Display for Message {
         use Message::*;
         write!(f, "Message {{")?;
         match self {
-            JoinRing(msg) => msg.fmt(f)?,
+            Connect(msg) => msg.fmt(f)?,
             Put(msg) => msg.fmt(f)?,
             Get(msg) => msg.fmt(f)?,
             Subscribe(msg) => msg.fmt(f)?,
