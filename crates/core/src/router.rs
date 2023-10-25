@@ -260,6 +260,7 @@ struct RoutingPrediction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) struct RouteEvent {
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
@@ -267,6 +268,7 @@ pub(crate) struct RouteEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum RouteOutcome {
     Success {
         time_to_response_start: Duration,

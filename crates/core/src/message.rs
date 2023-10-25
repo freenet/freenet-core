@@ -45,6 +45,18 @@ impl Transaction {
     }
 }
 
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for Transaction {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let ty: TransactionTypeId = u.arbitrary()?;
+        let bytes: u128 = u.arbitrary()?;
+        Ok(Self {
+            id: Ulid(bytes),
+            ty,
+        })
+    }
+}
+
 impl Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)
@@ -87,6 +99,7 @@ mod sealed_msg_type {
     }
 
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+    #[cfg_attr(test, derive(arbitrary::Arbitrary))]
     pub(crate) struct TransactionTypeId(TransactionType);
 
     impl TransactionTypeId {
@@ -97,6 +110,7 @@ mod sealed_msg_type {
 
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+    #[cfg_attr(test, derive(arbitrary::Arbitrary))]
     pub(crate) enum TransactionType {
         Connect,
         Put,

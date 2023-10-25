@@ -182,13 +182,14 @@ pub(crate) mod test {
             pub(crate) fn $name() -> [u8; $size] {
                 let mut rng = rand::thread_rng();
                 let mut rnd_bytes = [0u8; $size];
-                rng.fill(&mut rnd_bytes);
+                rng.fill(rnd_bytes.as_mut_slice());
                 rnd_bytes
             }
         };
     }
 
     rnd_bytes!(1024 -> random_bytes_1024);
+    rnd_bytes!(102400 -> random_bytes_100k);
 }
 
 #[derive(Clone, Copy, serde::Deserialize, Debug)]

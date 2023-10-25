@@ -698,6 +698,17 @@ where
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct PeerKey(PeerId);
 
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for PeerKey {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let data: [u8; 32] = u.arbitrary()?;
+        let id =
+            PeerId::from_multihash(libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap())
+                .unwrap();
+        Ok(Self(id))
+    }
+}
+
 impl PeerKey {
     #[cfg(test)]
     pub fn random() -> Self {

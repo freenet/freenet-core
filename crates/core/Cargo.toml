@@ -14,7 +14,6 @@ path = "src/bin/freenet.rs"
 
 [dependencies]
 anyhow = "1"
-arbitrary = { version = "1", features = ["derive"], optional = true}
 asynchronous-codec = "0.6"
 async-trait = "0.1"
 arrayvec = { workspace = true }
@@ -90,10 +89,11 @@ itertools = "0.11"
 pico-args = "0.5"
 statrs = "0.16.0"
 freenet-stdlib = { workspace = true, features = ["testing", "net"] }
+chrono = { workspace = true, features = ["arbitrary"] }
+statrs = "0.16.0"
 
 [features]
 default = ["trace", "websocket", "sqlite"]
-testing = ["arbitrary"]
 rocks_db = ["rocksdb"]
 sqlite = ["sqlx"]
 websocket = ["axum/ws"]

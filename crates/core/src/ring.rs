@@ -37,6 +37,7 @@ use crate::{
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 /// The location of a peer in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
     pub peer: PeerKey,
@@ -437,6 +438,7 @@ impl Ring {
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct Location(f64);
 
 impl Location {
