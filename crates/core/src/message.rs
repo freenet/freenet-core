@@ -28,21 +28,45 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) struct Transaction {
     id: Ulid,
-    ty: TransactionTypeId,
 }
 
 impl Transaction {
     pub fn new<T: TxType>() -> Transaction {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
-
-        // 3 word size for 64-bits platforms
-        Self { id, ty }
+        Self::update(ty.0, id)
     }
 
     pub fn tx_type(&self) -> TransactionType {
-        self.ty.desc()
+        let id_byte = (self.id.0 >> 120) as u8;
+        match id_byte {
+            0 => TransactionType::Connect,
+            1 => TransactionType::Put,
+            2 => TransactionType::Get,
+            3 => TransactionType::Subscribe,
+            4 => TransactionType::Update,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
     }
+
+    fn update(ty: TransactionType, id: Ulid) -> Self {
+        // Clear the last byte
+        let cleared = id.0 & !(0xFFu128 << 120);
+        // Set the last byte with the transaction type
+        let ty = ty as u8;
+        let updated = cleared | (u128::from(ty) << 120);
+
+        // 2 words size for 64-bits platforms
+        Self { id: Ulid(updated) }
+    }
+}
+
+#[test]
+fn pack_transaction() {
+    let tx = Transaction::update(TransactionType::Connect, Ulid::new());
+    assert_eq!(tx.tx_type(), TransactionType::Connect);
+    let tx = Transaction::update(TransactionType::Subscribe, Ulid::new());
+    assert_eq!(tx.tx_type(), TransactionType::Subscribe);
 }
 
 #[cfg(test)]
@@ -50,10 +74,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
         let bytes: u128 = u.arbitrary()?;
-        Ok(Self {
-            id: Ulid(bytes),
-            ty,
-        })
+        Ok(Self::update(ty.0, Ulid(bytes)))
     }
 }
 
@@ -100,23 +121,17 @@ mod sealed_msg_type {
 
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-    pub(crate) struct TransactionTypeId(TransactionType);
-
-    impl TransactionTypeId {
-        pub fn desc(&self) -> TransactionType {
-            self.0
-        }
-    }
+    pub(crate) struct TransactionTypeId(pub(super) TransactionType);
 
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     #[cfg_attr(test, derive(arbitrary::Arbitrary))]
     pub(crate) enum TransactionType {
-        Connect,
-        Put,
-        Get,
-        Subscribe,
-        Update,
+        Connect = 0,
+        Put = 1,
+        Get = 2,
+        Subscribe = 3,
+        Update = 4,
     }
 
     impl Display for TransactionType {
