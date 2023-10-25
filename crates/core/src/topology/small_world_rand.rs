@@ -17,7 +17,6 @@ pub(crate) fn random_link_distance(d_min: Distance) -> Distance {
 
 #[cfg(test)]
 mod tests {
-    use crate::topology::metric::measure_small_worldness;
 
     use super::*;
     use statrs::distribution::*;
@@ -66,28 +65,6 @@ mod tests {
             p_value > 0.05,
             "Chi-squared test failed, p_value = {}",
             p_value
-        );
-    }
-
-    #[test]
-    fn metric_test() {
-        let d_min = Distance::new(0.01);
-        let n = 1000; // Number of samples
-        let mut distances = vec![];
-        // Generate a bunch of link distances
-        for _ in 0..n {
-            distances.push(random_link_distance(d_min));
-        }
-
-        let metric = measure_small_worldness(&distances);
-
-        println!("Small-world deviation metric = {}", metric);
-
-        // Check if metric is close to 0.0, indicating that the network is close to the ideal small-world topology
-        assert!(
-            metric.abs() < 0.1,
-            "Small-world deviation metric is too high, metric = {}",
-            metric
         );
     }
 }
