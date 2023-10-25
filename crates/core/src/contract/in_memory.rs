@@ -69,7 +69,7 @@ impl ContractHandler for MemoryContractHandler {
 
 #[test]
 fn serialization() -> Result<(), anyhow::Error> {
-    let bytes = crate::util::test::random_bytes_1024();
+    let bytes = crate::util::test::random_bytes_1kb();
     let mut gen = arbitrary::Unstructured::new(&bytes);
     let contract: WrappedContract = gen.arbitrary()?;
 

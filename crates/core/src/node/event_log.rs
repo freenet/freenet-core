@@ -219,6 +219,9 @@ static NEW_RECORDS_TS: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::ne
 static FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
 impl EventRegister {
+    #[cfg(not(test))]
+    const MAX_LOG_RECORDS: usize = 100_000;
+    #[cfg(test)]
     const MAX_LOG_RECORDS: usize = 10_000;
 
     pub fn new() -> Self {
@@ -262,10 +265,9 @@ impl EventRegister {
         ) -> Result<(), Box<dyn std::error::Error>> {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            tracing::debug!(%remove_records, "truncating log file");
             let _guard = FILE_LOCK.lock().await;
-
             file.rewind().await?;
+            // tracing::debug!(position = file.stream_position().await.unwrap());
             let mut records_count = 0;
             while records_count < remove_records {
                 let mut length_bytes = [0u8; 4];
@@ -286,7 +288,6 @@ impl EventRegister {
                     tracing::error!(%error, ?pos, "error while trying to read file");
                     return Err(error.into());
                 }
-                // tracing::debug!(position = file.stream_position().await.unwrap());
                 records_count += 1;
             }
 
@@ -300,8 +301,28 @@ impl EventRegister {
                 }
             }
 
+            #[cfg(test)]
+            {
+                assert!(!buffer.is_empty());
+                let mut unique = std::collections::HashSet::new();
+                let mut read_buf = &*buffer;
+                let mut length_bytes: [u8; 4] = [0u8; 4];
+                let mut cursor = 0;
+                while read_buf.read_exact(&mut length_bytes).await.is_ok() {
+                    let length = u32::from_be_bytes(length_bytes) as usize;
+                    cursor += 4;
+                    let log: LogMessage =
+                        bincode::deserialize(&buffer[cursor..cursor + length]).unwrap();
+                    cursor += length;
+                    read_buf = &buffer[cursor..];
+                    unique.insert(log.peer_id);
+                    // tracing::debug!(?log, %cursor);
+                }
+                assert!(unique.len() > 1);
+            }
+
             // Seek back to the beginning and write the remaining content
-            file.seek(io::SeekFrom::Start(0)).await?;
+            file.rewind().await?;
             file.write_all(&buffer).await?;
 
             // Truncate the file to the new size
@@ -331,7 +352,6 @@ impl EventRegister {
         let mut num_recs = num_lines(event_log_path.as_path())
             .await
             .expect("non IO error");
-        tracing::info!(%num_recs);
 
         while let Some(log) = log_recv.recv().await {
             log_batch.push(log);
@@ -383,13 +403,11 @@ impl EventRegister {
                     }
                 }
                 num_recs += num_written;
-                tracing::debug!(%num_recs);
                 num_written = 0;
             }
 
             // Check the number of lines and truncate if needed
             if num_recs > Self::MAX_LOG_RECORDS {
-                tracing::debug!(%num_recs, "removing");
                 const REMOVE_RECS: usize = 1000 + BATCH_SIZE; // making space for 1000 new records
                 if let Err(err) = truncate_records(&mut event_log, REMOVE_RECS).await {
                     tracing::error!("Failed truncating log file: {:?}", err);
@@ -441,8 +459,6 @@ impl EventRegister {
             }
         }
 
-        tracing::debug!(new_records_ts = %DateTime::from_timestamp(new_records_ts, 0).unwrap());
-        tracing::info!(recs = records.len());
         let deserialized_records = tokio::task::spawn_blocking(move || {
             let mut filtered = vec![];
             for buf in records {
@@ -578,10 +594,10 @@ pub(super) mod test {
         // truncate the log if it exists
         std::fs::File::create(event_log_path).unwrap();
 
+        // force a truncation
         const TEST_LOGS: usize = EventRegister::MAX_LOG_RECORDS + 100;
-        // const TEST_LOGS: usize = 100;
         let mut register = EventRegister::new();
-        let bytes = crate::util::test::random_bytes_100k();
+        let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
         let mut peers = vec![];
