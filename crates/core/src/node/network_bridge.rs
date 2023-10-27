@@ -23,17 +23,11 @@ pub(crate) mod p2p_protoc;
 
 pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
+/// Allows handling of connections to the network as well as sending messages
+/// to other peers in the network with whom connection has been established.
 #[async_trait::async_trait]
-pub(crate) trait ConnectionBridge: Send + Sync {
+pub(crate) trait NetworkBridge: Send + Sync {
     async fn add_connection(&mut self, peer: PeerKey) -> ConnResult<()>;
-
-    // todo: LRU connection drop IF we can connect to other peer
-    // at least have a minimum of connection time alive to consider dropping it
-
-    // If we get a join request and are at MAX_CONNECTIONS:
-    // 1. Ensure it's been N minutes since the last peer removal.
-    // 2. Drop the peer with the fewest outbound requests/minute that's at least M minutes old.
-    // This promotes peer turnover to prevent network stagnation.
 
     async fn drop_connection(&mut self, peer: &PeerKey) -> ConnResult<()>;
 
@@ -118,7 +112,8 @@ impl DerefMut for EventLoopNotifications {
     }
 }
 
-pub(super) struct EventLoopNotificationsSender(
+#[derive(Clone)]
+pub(crate) struct EventLoopNotificationsSender(
     Sender<Either<(Message, Option<ClientId>), NodeEvent>>,
 );
 

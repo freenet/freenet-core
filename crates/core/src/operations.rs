@@ -7,7 +7,7 @@ use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
-    node::{ConnectionBridge, ConnectionError, OpManager, OpNotAvailable, PeerKey},
+    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
 };
@@ -31,27 +31,27 @@ pub(crate) struct OpInitialization<Op> {
     op: Op,
 }
 
-pub(crate) async fn handle_op_request<Op, CB>(
+pub(crate) async fn handle_op_request<Op, NB>(
     op_storage: &OpManager,
-    conn_manager: &mut CB,
+    network_bridge: &mut NB,
     msg: &Op::Message,
     client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
-    CB: ConnectionBridge,
+    NB: NetworkBridge,
 {
     let sender;
     let tx = *msg.id();
     let result = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, msg).await?;
         sender = s;
-        op.process_message(conn_manager, op_storage, msg, client_id)
+        op.process_message(network_bridge, op_storage, msg, client_id)
             .await
     };
     handle_op_result(
         op_storage,
-        conn_manager,
+        network_bridge,
         result.map_err(|err| (err, tx)),
         sender,
     )
@@ -60,12 +60,12 @@ where
 
 async fn handle_op_result<CB>(
     op_storage: &OpManager,
-    conn_manager: &mut CB,
+    network_bridge: &mut CB,
     result: Result<OperationResult, (OpError, Transaction)>,
     sender: Option<PeerKey>,
 ) -> Result<Option<OpEnum>, OpError>
 where
-    CB: ConnectionBridge,
+    CB: NetworkBridge,
 {
     // FIXME: register changes in the future op commit log
     match result {
@@ -75,7 +75,9 @@ where
         }
         Err((err, tx_id)) => {
             if let Some(sender) = sender {
-                conn_manager.send(&sender, Message::Aborted(tx_id)).await?;
+                network_bridge
+                    .send(&sender, Message::Aborted(tx_id))
+                    .await?;
             }
             return Err(err);
         }
@@ -86,7 +88,7 @@ where
             // updated op
             let id = *msg.id();
             if let Some(target) = msg.target().cloned() {
-                conn_manager.send(&target.peer, msg).await?;
+                network_bridge.send(&target.peer, msg).await?;
             }
             op_storage.push(id, updated_state).await?;
         }
@@ -112,7 +114,7 @@ where
         }) => {
             // finished the operation at this node, informing back
             if let Some(target) = msg.target().cloned() {
-                conn_manager.send(&target.peer, msg).await?;
+                network_bridge.send(&target.peer, msg).await?;
             }
         }
         Ok(OperationResult {

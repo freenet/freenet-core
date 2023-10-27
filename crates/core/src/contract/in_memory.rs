@@ -8,7 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
     executor::{ExecutorHalve, ExecutorToEventLoopChannel},
-    handler::{ContractHandler, ContractHandlerHalve, ContractHandlerToEventLoopChannel},
+    handler::{ContractHandler, ContractHandlerChannel, ContractHandlerHalve},
     Executor,
 };
 use crate::DynError;
@@ -18,13 +18,13 @@ pub(crate) struct MockRuntime {
 }
 
 pub(crate) struct MemoryContractHandler {
-    channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+    channel: ContractHandlerChannel<ContractHandlerHalve>,
     runtime: Executor<MockRuntime>,
 }
 
 impl MemoryContractHandler {
     pub async fn new(
-        channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+        channel: ContractHandlerChannel<ContractHandlerHalve>,
         data_dir: &str,
     ) -> Self {
         MemoryContractHandler {
@@ -39,7 +39,7 @@ impl ContractHandler for MemoryContractHandler {
     type ContractExecutor = Executor<MockRuntime>;
 
     fn build(
-        channel: ContractHandlerToEventLoopChannel<ContractHandlerHalve>,
+        channel: ContractHandlerChannel<ContractHandlerHalve>,
         _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         config: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
@@ -49,7 +49,7 @@ impl ContractHandler for MemoryContractHandler {
         async move { Ok(MemoryContractHandler::new(channel, &config).await) }.boxed()
     }
 
-    fn channel(&mut self) -> &mut ContractHandlerToEventLoopChannel<ContractHandlerHalve> {
+    fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
         &mut self.channel
     }
 

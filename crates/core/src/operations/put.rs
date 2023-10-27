@@ -18,7 +18,7 @@ use crate::{
     config::PEER_TIMEOUT,
     contract::ContractHandlerEvent,
     message::{InnerMessage, Message, Transaction},
-    node::{ConnectionBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -170,9 +170,9 @@ impl Operation for PutOp {
         &self.id
     }
 
-    fn process_message<'a, CB: ConnectionBridge>(
+    fn process_message<'a, NB: NetworkBridge>(
         self,
-        conn_manager: &'a mut CB,
+        conn_manager: &'a mut NB,
         op_storage: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
@@ -799,7 +799,7 @@ async fn forward_changes<CB>(
     htl: usize,
     skip_list: &[PeerKey],
 ) where
-    CB: ConnectionBridge,
+    CB: NetworkBridge,
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);

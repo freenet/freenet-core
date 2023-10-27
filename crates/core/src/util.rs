@@ -51,7 +51,7 @@ impl ExponentialBackoff {
 
     /// Record that we made an attempt and sleep for the appropriate amount
     /// of time. If the max number of attempts was reached returns none.
-    pub async fn sleep_async(&mut self) -> Option<()> {
+    pub async fn sleep(&mut self) -> Option<()> {
         if self.attempt == self.max_attempts {
             None
         } else {

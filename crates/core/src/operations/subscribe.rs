@@ -11,7 +11,7 @@ use crate::{
     config::PEER_TIMEOUT,
     contract::ContractError,
     message::{InnerMessage, Message, Transaction},
-    node::{ConnectionBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{PeerKeyLocation, RingError},
 };
@@ -101,9 +101,9 @@ impl Operation for SubscribeOp {
         &self.id
     }
 
-    fn process_message<'a, CB: ConnectionBridge>(
+    fn process_message<'a, NB: NetworkBridge>(
         self,
-        conn_manager: &'a mut CB,
+        conn_manager: &'a mut NB,
         op_storage: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
@@ -360,7 +360,7 @@ pub(crate) async fn request_subscribe(
                 .closest_caching(key, &[])
                 .into_iter()
                 .next()
-                .ok_or(RingError::EmptyRing)?,
+                .ok_or_else(|| RingError::NoCachingPeers(key.clone()))?,
             *id,
         )
     } else {

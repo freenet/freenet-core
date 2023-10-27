@@ -42,14 +42,14 @@ use crate::{
 };
 
 use crate::operations::handle_op_request;
-pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use event_log::{EventLogRegister, EventRegister};
+pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-mod conn_manager;
 mod event_log;
 #[cfg(test)]
 mod in_memory_impl;
+mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
 #[cfg(test)]
@@ -286,7 +286,7 @@ async fn join_ring_request<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: ConnectionBridge + Send + Sync,
+    CM: NetworkBridge + Send + Sync,
 {
     let tx_id = Transaction::new::<ConnectMsg>();
     let mut op =
@@ -294,7 +294,7 @@ where
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
-        if backoff.sleep_async().await.is_none() {
+        if backoff.sleep().await.is_none() {
             tracing::error!("Max number of retries reached");
             return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.tx_type()));
         }
@@ -526,7 +526,11 @@ async fn report_result(
             if let Some(tx) = tx {
                 op_storage.completed(tx);
             }
-            tracing::debug!("Finished transaction with error: {err}")
+            if cfg!(debug_assertions) {
+                tracing::error!("Finished transaction with error: {err}")
+            } else {
+                tracing::debug!("Finished transaction with error: {err}")
+            }
         }
     }
 }
@@ -555,7 +559,7 @@ async fn process_message<CB>(
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<ClientId>,
 ) where
-    CB: ConnectionBridge,
+    CB: NetworkBridge,
 {
     let cli_req = client_id.zip(client_req_handler_callback);
     match msg {
@@ -671,7 +675,7 @@ async fn handle_cancelled_op<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: ConnectionBridge + Send + Sync,
+    CM: NetworkBridge + Send + Sync,
 {
     if let TransactionType::Connect = tx.tx_type() {
         // the attempt to join the network failed, this could be a fatal error since the node
@@ -681,10 +685,12 @@ where
                 let ConnectOp {
                     gateway, backoff, ..
                 } = *op;
-                let backoff = backoff.expect("infallible");
-                tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                join_ring_request(Some(backoff), peer_key, &gateway, op_storage, conn_manager)
-                    .await?;
+                if let Some(gateway) = gateway {
+                    let backoff = backoff.expect("infallible");
+                    tracing::warn!("Retry connecting to gateway {}", gateway.peer);
+                    join_ring_request(Some(backoff), peer_key, &gateway, op_storage, conn_manager)
+                        .await?;
+                }
             }
             Ok(Some(OpEnum::Connect(_))) => {
                 return Err(OpError::MaxRetriesExceeded(tx, tx.tx_type()));

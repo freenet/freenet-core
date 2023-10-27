@@ -5,7 +5,7 @@ use freenet_stdlib::prelude::*;
 
 use super::{
     client_event_handling,
-    conn_manager::{in_memory::MemoryConnManager, EventLoopNotifications},
+    network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
     handle_cancelled_op, join_ring_request,
     op_state_manager::OpManager,
     process_message, EventLogRegister, PeerKey,
@@ -49,9 +49,10 @@ impl NodeInMemory {
         let gateways = builder.get_gateways()?;
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
 
-        let ring = Ring::new::<1, EL>(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
+
+        let ring = Ring::new::<1, EL>(&builder, &gateways, notification_tx.clone())?;
         let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =

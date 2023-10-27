@@ -7,7 +7,7 @@ use futures::{future::BoxFuture, Future};
 use crate::{
     client_events::ClientId,
     message::{InnerMessage, Transaction},
-    node::{ConnectionBridge, OpManager},
+    node::{NetworkBridge, OpManager},
     operations::{OpError, OpInitialization, OperationResult},
 };
 
@@ -27,7 +27,7 @@ where
     fn id(&self) -> &Transaction;
 
     #[allow(clippy::type_complexity)]
-    fn process_message<'a, CB: ConnectionBridge>(
+    fn process_message<'a, CB: NetworkBridge>(
         self,
         conn_manager: &'a mut CB,
         op_storage: &'a OpManager,

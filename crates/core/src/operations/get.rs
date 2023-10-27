@@ -11,7 +11,7 @@ use crate::{
     config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, Message, Transaction},
-    node::{ConnectionBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
@@ -182,9 +182,9 @@ impl Operation for GetOp {
         &self.id
     }
 
-    fn process_message<'a, CB: ConnectionBridge>(
+    fn process_message<'a, NB: NetworkBridge>(
         self,
-        conn_manager: &'a mut CB,
+        conn_manager: &'a mut NB,
         op_storage: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
@@ -626,8 +626,8 @@ fn build_op_result(
     })
 }
 
-async fn continue_seeking<CB: ConnectionBridge>(
-    conn_manager: &mut CB,
+async fn continue_seeking<NB: NetworkBridge>(
+    conn_manager: &mut NB,
     new_target: &PeerKeyLocation,
     retry_msg: Message,
 ) -> Result<(), OpError> {

@@ -38,7 +38,7 @@ use tokio::sync::{
 };
 use unsigned_varint::codec::UviBytes;
 
-use super::{ConnectionBridge, ConnectionError, EventLoopNotifications};
+use super::{ConnectionError, EventLoopNotifications, NetworkBridge};
 use crate::{
     client_events::ClientId,
     config::{self, GlobalExecutor},
@@ -193,7 +193,7 @@ impl Clone for P2pBridge {
 }
 
 #[async_trait::async_trait]
-impl ConnectionBridge for P2pBridge {
+impl NetworkBridge for P2pBridge {
     async fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
             self.accepted_peers.insert(peer);

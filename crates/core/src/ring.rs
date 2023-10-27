@@ -25,15 +25,23 @@ use std::{
 };
 
 use anyhow::bail;
+use arrayvec::ArrayVec;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
+use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     config::GlobalExecutor,
-    node::{self, EventLogRegister, EventRegister, NodeBuilder, PeerKey},
+    message::Transaction,
+    node::{
+        self, EventLogRegister, EventLoopNotificationsSender, EventRegister, NodeBuilder, PeerKey,
+    },
+    operations::connect,
     router::Router,
+    DynError,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -122,7 +130,8 @@ impl Ring {
     pub fn new<const CLIENTS: usize, EL: EventLogRegister>(
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
-    ) -> Result<Self, anyhow::Error> {
+        event_loop_notifier: EventLoopNotificationsSender,
+    ) -> Result<Arc<Self>, anyhow::Error> {
         let peer_key = PeerKey::from(config.local_key.public());
 
         // for location here consider -1 == None
@@ -183,6 +192,8 @@ impl Ring {
             }
         }
 
+        let ring = Arc::new(ring);
+        GlobalExecutor::spawn(ring.clone().connection_maintenace(event_loop_notifier));
         Ok(ring)
     }
 
@@ -264,7 +275,7 @@ impl Ring {
         } else if open_conn < self.min_connections {
             true
         } else if open_conn >= self.max_connections {
-            tracing::debug!(peer = %self.peer_key, "max connections reached");
+            tracing::debug!(peer = %self.peer_key, "max open connections reached");
             false
         } else {
             // todo: in the future maybe use the `small worldness` metric to decide
@@ -352,7 +363,6 @@ impl Ring {
     where
         F: Fn(&PeerKey) -> bool,
     {
-        use rand::Rng;
         let peers = &*self.location_for_peer.read();
         let amount = peers.len();
         if amount == 0 {
@@ -434,6 +444,104 @@ impl Ring {
         }
         self.open_connections.fetch_sub(1, SeqCst);
     }
+
+    pub fn closest_to_location(&self, location: Location) -> Option<&PeerKeyLocation> {
+        todo!()
+    }
+
+    // TODO: LRU connection drop IF we can connect to other peer
+    // at least have a minimum of connection time alive to consider dropping it
+    //
+    // If we get a join request and are at MAX_CONNECTIONS:
+    // 1. Ensure it's been N minutes since the last peer removal.
+    // 2. Drop the peer with the fewest outbound requests/minute that's at least M minutes old.
+    // This promotes peer turnover to prevent network stagnation.
+    async fn connection_maintenace(
+        self: Arc<Self>,
+        notifier: EventLoopNotificationsSender,
+    ) -> Result<(), DynError> {
+        const OPTIMAL_DISTANCE: Distance = Distance(0.2);
+        /// Drop a connection and acquire a new one.
+        fn should_swap<'a>(_connections: impl Iterator<Item = &'a PeerKeyLocation>) -> bool {
+            // todo: instead we should be using ConnectionEvaluator here
+            false
+        }
+
+        let mut tick = tokio::time::interval(Duration::from_secs(5 * 60));
+        loop {
+            let (current_connections, should_swap) = {
+                let peers = self.connections_by_location.read();
+                (peers.len(), should_swap(peers.values()))
+            };
+
+            if current_connections < self.max_connections {
+                // requires more connections
+                let ideal_target_dist =
+                    crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
+                self.acquire_new(ideal_target_dist, &[], &notifier).await?;
+            } else if should_swap {
+                let ideal_target_dist =
+                    crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
+                self.acquire_new(ideal_target_dist, &[], &notifier).await?;
+            }
+            tick.tick().await;
+        }
+    }
+
+    async fn acquire_new(
+        &self,
+        ideal_target_dist: Distance,
+        skip_list: &[PeerKey],
+        notifier: &EventLoopNotificationsSender,
+    ) -> Result<(), DynError> {
+        let Some(msg) = Self::find_optimal_query_target(
+            (self.own_location(), ideal_target_dist),
+            self.connections_by_location.read().iter(),
+            skip_list,
+        ) else {
+            return Ok(());
+        };
+        notifier.send(Either::Left((msg.into(), None))).await?;
+        Ok(())
+    }
+
+    fn find_optimal_query_target<'a>(
+        (joiner, ideal_target_dist): (PeerKeyLocation, Distance),
+        connections_by_location: impl Iterator<Item = (&'a Location, &'a PeerKeyLocation)>,
+        skip_list: &[PeerKey],
+    ) -> Option<connect::ConnectMsg> {
+        let own_location = joiner.location?;
+        let acceptable_range = ideal_target_dist.0 * 0.05;
+        let (negative_ideal_location, positive_ideal_location) = own_location + ideal_target_dist;
+        let ideal_location = if rand::thread_rng().gen_bool(0.5) {
+            negative_ideal_location
+        } else {
+            positive_ideal_location
+        };
+
+        let mut request_to = connections_by_location
+            .filter_map(|(loc, peer)| {
+                let dist: Distance = own_location.distance(loc);
+                let is_valid = ((dist - ideal_target_dist).abs() < acceptable_range)
+                    && !skip_list.contains(&peer.peer);
+                is_valid.then_some((dist, peer))
+            })
+            .collect::<ArrayVec<_, { Ring::MAX_CONNECTIONS }>>();
+        request_to.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        // target the peer which is the closest to the ideal location since
+        // it should have the most connections potentially to the ideal target location
+        let (_, request_to) = request_to.first()?;
+
+        Some(connect::ConnectMsg::Request {
+            id: Transaction::new::<connect::ConnectMsg>(),
+            msg: connect::ConnectRequest::FindPeer {
+                query_target: **request_to,
+                ideal_location,
+                joiner,
+            },
+        })
+    }
 }
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
@@ -474,6 +582,17 @@ impl Location {
 
     pub fn as_f64(&self) -> f64 {
         self.0
+    }
+}
+
+impl std::ops::Add<Distance> for Location {
+    type Output = (Location, Location);
+
+    /// Returns the positive and directive locations on the ring  at the given distance.
+    fn add(self, distance: Distance) -> Self::Output {
+        let neg_loc = self.0 - distance.0;
+        let pos_loc = self.0 + distance.0;
+        (Location(neg_loc), Location(pos_loc))
     }
 }
 
@@ -605,6 +724,14 @@ impl Display for Distance {
     }
 }
 
+impl std::ops::Sub<Distance> for Distance {
+    type Output = f64;
+
+    fn sub(self, rhs: Distance) -> Self::Output {
+        self.0 - rhs.0
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]
@@ -613,11 +740,61 @@ pub(crate) enum RingError {
     EmptyRing,
     #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
     NoCachingPeers(ContractKey),
+    #[error("No location assigned to this peer")]
+    NoLocation,
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn find_optimal_query_target() {
+        let joiner = PeerKeyLocation {
+            location: Some(Location::new(0.2)),
+            peer: PeerKey::random(),
+        };
+        let ideal_target_dist = Distance(0.3);
+
+        let connections_data = vec![
+            (
+                Location::new(0.1),
+                PeerKeyLocation {
+                    location: Some(Location::new(0.1)),
+                    peer: PeerKey::random(),
+                },
+            ),
+            (
+                Location::new(0.3),
+                PeerKeyLocation {
+                    location: Some(Location::new(0.2)),
+                    peer: PeerKey::random(),
+                },
+            ),
+            (
+                Location::new(0.5),
+                PeerKeyLocation {
+                    location: Some(Location::new(0.5)),
+                    peer: PeerKey::random(),
+                },
+            ),
+        ];
+
+        let result = Ring::find_optimal_query_target(
+            (joiner, ideal_target_dist),
+            connections_data.iter().map(|x| (&x.0, &x.1)),
+            &[],
+        )
+        .expect("find query target");
+        let connect::ConnectMsg::Request {
+            msg: connect::ConnectRequest::FindPeer { ideal_location, .. },
+            ..
+        } = result
+        else {
+            panic!()
+        };
+        assert_eq!(ideal_location, Location::new(0.5));
+    }
 
     #[test]
     fn location_dist() {

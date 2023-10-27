@@ -6,10 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     config::GlobalExecutor,
-    contract::{
-        ContractError, ContractHandlerEvent, ContractHandlerToEventLoopChannel,
-        NetEventListenerHalve,
-    },
+    contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     dev_tool::ClientId,
     message::{Message, Transaction, TransactionType},
     operations::{
@@ -23,7 +20,7 @@ use crate::{
     ring::Ring,
 };
 
-use super::{conn_manager::EventLoopNotificationsSender, PeerKey};
+use super::{network_bridge::EventLoopNotificationsSender, PeerKey};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -54,16 +51,16 @@ pub(crate) struct OpManager {
     under_progress: Arc<DashSet<Transaction>>,
     to_event_listener: EventLoopNotificationsSender,
     // todo: remove the need for a mutex here if possible
-    ch_outbound: Mutex<ContractHandlerToEventLoopChannel<NetEventListenerHalve>>,
+    ch_outbound: Mutex<ContractHandlerChannel<SenderHalve>>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
-    pub ring: Ring,
+    pub ring: Arc<Ring>,
 }
 
 impl OpManager {
     pub(super) fn new(
-        ring: Ring,
+        ring: Arc<Ring>,
         notification_channel: EventLoopNotificationsSender,
-        contract_handler: ContractHandlerToEventLoopChannel<NetEventListenerHalve>,
+        contract_handler: ContractHandlerChannel<SenderHalve>,
     ) -> Self {
         let connect = Arc::new(DashMap::new());
         let put = Arc::new(DashMap::new());
