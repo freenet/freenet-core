@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
-    time::Duration,
+    time::{ops::Add, Duration, Instant},
 };
 
 use anyhow::bail;
@@ -37,7 +37,8 @@ use crate::{
     config::GlobalExecutor,
     message::Transaction,
     node::{
-        self, EventLogRegister, EventLoopNotificationsSender, EventRegister, NodeBuilder, PeerKey,
+        self, EventLogRegister, EventLoopNotificationsSender, EventRegister, LiveTxPeerTracker,
+        NodeBuilder, PeerKey,
     },
     operations::connect,
     router::Router,
@@ -72,9 +73,13 @@ impl From<PeerKey> for PeerKeyLocation {
     }
 }
 
+struct Connection {
+    location: PeerKeyLocation,
+    open_at: Instant,
+}
+
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
-#[derive(Debug)]
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
@@ -82,7 +87,7 @@ pub(crate) struct Ring {
     max_connections: usize,
     min_connections: usize,
     router: Arc<RwLock<Router>>,
-    connections_by_location: RwLock<BTreeMap<Location, PeerKeyLocation>>,
+    connections_by_location: RwLock<BTreeMap<Location, Connection>>,
     location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
@@ -131,6 +136,7 @@ impl Ring {
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
+        live_transactions_peers: LiveTxPeerTracker,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let peer_key = PeerKey::from(config.local_key.public());
 
@@ -193,7 +199,10 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
-        GlobalExecutor::spawn(ring.clone().connection_maintenace(event_loop_notifier));
+        GlobalExecutor::spawn(
+            ring.clone()
+                .connection_maintenace(event_loop_notifier, live_transactions_peers),
+        );
         Ok(ring)
     }
 
@@ -298,9 +307,12 @@ impl Ring {
         self.location_for_peer.write().insert(peer, loc);
         cbl.insert(
             loc,
-            PeerKeyLocation {
-                peer,
-                location: Some(loc),
+            Connection {
+                location: PeerKeyLocation {
+                    peer,
+                    location: Some(loc),
+                },
+                open_at: Instant::now(),
             },
         );
     }
@@ -340,16 +352,16 @@ impl Ring {
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let peers = connections
-            .iter()
-            .filter(|(_, pkloc)| {
+            .values()
+            .filter(|conn| {
                 if let Some(requester) = requesting {
-                    if requester == &pkloc.peer {
+                    if requester == &conn.location.peer {
                         return false;
                     }
                 }
-                !skip_list.contains(&pkloc.peer)
+                !skip_list.contains(&conn.location.peer)
             })
-            .map(|(_, peer)| peer);
+            .map(|conn| &conn.location);
         let router = &*self.router.read();
         router.select_peer(peers, target).cloned()
     }
@@ -445,33 +457,54 @@ impl Ring {
         self.open_connections.fetch_sub(1, SeqCst);
     }
 
-    pub fn closest_to_location(&self, location: Location) -> Option<&PeerKeyLocation> {
-        todo!()
+    pub fn closest_to_location(&self, location: Location) -> Option<PeerKeyLocation> {
+        self.connections_by_location
+            .read()
+            .range(..location)
+            .next_back()
+            .map(|(_, ploc)| ploc.location)
     }
 
-    // TODO: LRU connection drop IF we can connect to other peer
-    // at least have a minimum of connection time alive to consider dropping it
-    //
-    // If we get a join request and are at MAX_CONNECTIONS:
-    // 1. Ensure it's been N minutes since the last peer removal.
-    // 2. Drop the peer with the fewest outbound requests/minute that's at least M minutes old.
-    // This promotes peer turnover to prevent network stagnation.
     async fn connection_maintenace(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
+        under_progress: LiveTxPeerTracker,
     ) -> Result<(), DynError> {
         const OPTIMAL_DISTANCE: Distance = Distance(0.2);
         /// Drop a connection and acquire a new one.
-        fn should_swap<'a>(_connections: impl Iterator<Item = &'a PeerKeyLocation>) -> bool {
+        fn should_swap<'a>(
+            _connections: impl Iterator<Item = &'a PeerKeyLocation>,
+        ) -> Vec<PeerKey> {
             // todo: instead we should be using ConnectionEvaluator here
-            false
+            vec![]
         }
 
-        let mut tick = tokio::time::interval(Duration::from_secs(5 * 60));
+        #[cfg(not(test))]
+        const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
+        #[cfg(test)]
+        const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(5);
+        #[cfg(not(test))]
+        const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(60 * 5);
+        #[cfg(test)]
+        const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(1);
+
+        let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
+        check_interval.tick().await;
         loop {
             let (current_connections, should_swap) = {
                 let peers = self.connections_by_location.read();
-                (peers.len(), should_swap(peers.values()))
+                (
+                    peers.len(),
+                    should_swap(
+                        peers
+                            .values()
+                            .filter(|conn| {
+                                conn.open_at.elapsed() > CONNECTION_AGE_THRESOLD
+                                    && !under_progress.contains_key(&conn.location.peer)
+                            })
+                            .map(|conn| &conn.location),
+                    ),
+                )
             };
 
             if current_connections < self.max_connections {
@@ -479,12 +512,13 @@ impl Ring {
                 let ideal_target_dist =
                     crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
                 self.acquire_new(ideal_target_dist, &[], &notifier).await?;
-            } else if should_swap {
+            } else if !should_swap.is_empty() {
                 let ideal_target_dist =
                     crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
+                // todo: drop connections in should_swap
                 self.acquire_new(ideal_target_dist, &[], &notifier).await?;
+                check_interval.tick().await;
             }
-            tick.tick().await;
         }
     }
 
@@ -496,7 +530,10 @@ impl Ring {
     ) -> Result<(), DynError> {
         let Some(msg) = Self::find_optimal_query_target(
             (self.own_location(), ideal_target_dist),
-            self.connections_by_location.read().iter(),
+            self.connections_by_location
+                .read()
+                .iter()
+                .map(|(loc, conn)| (loc, &conn.location)),
             skip_list,
         ) else {
             return Ok(());

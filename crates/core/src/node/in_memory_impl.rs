@@ -4,9 +4,8 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 
 use super::{
-    client_event_handling,
+    client_event_handling, handle_cancelled_op, join_ring_request,
     network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
-    handle_cancelled_op, join_ring_request,
     op_state_manager::OpManager,
     process_message, EventLogRegister, PeerKey,
 };
@@ -21,7 +20,7 @@ use crate::{
     message::{Message, NodeEvent, TransactionType},
     node::NodeBuilder,
     operations::OpError,
-    ring::{PeerKeyLocation, Ring},
+    ring::PeerKeyLocation,
     util::IterExt,
 };
 
@@ -52,8 +51,12 @@ impl NodeInMemory {
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
 
-        let ring = Ring::new::<1, EL>(&builder, &gateways, notification_tx.clone())?;
-        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
+        let op_storage = Arc::new(OpManager::new::<1, EL>(
+            notification_tx,
+            ops_ch_channel,
+            &builder,
+            &gateways,
+        )?);
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =
             MemoryContractHandler::build(ch_channel, executor_sender, ch_builder)

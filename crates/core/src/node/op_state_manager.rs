@@ -1,5 +1,6 @@
 use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 
+use arrayvec::ArrayVec;
 use dashmap::{DashMap, DashSet};
 use either::Either;
 use tokio::sync::Mutex;
@@ -17,10 +18,10 @@ use crate::{
         update::UpdateOp,
         OpEnum, OpError,
     },
-    ring::Ring,
+    ring::{PeerKeyLocation, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, PeerKey};
+use super::{network_bridge::EventLoopNotificationsSender, EventLogRegister, NodeBuilder, PeerKey};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -39,6 +40,8 @@ pub(crate) enum OpNotAvailable {
     Completed,
 }
 
+pub(crate) type LiveTxPeerTracker = Arc<DashMap<PeerKey, Vec<Transaction>>>;
+
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 pub(crate) struct OpManager {
@@ -49,6 +52,7 @@ pub(crate) struct OpManager {
     update: Arc<DashMap<Transaction, UpdateOp>>,
     completed: Arc<DashSet<Transaction>>,
     under_progress: Arc<DashSet<Transaction>>,
+    pub live_transactions_peers: LiveTxPeerTracker,
     to_event_listener: EventLoopNotificationsSender,
     // todo: remove the need for a mutex here if possible
     ch_outbound: Mutex<ContractHandlerChannel<SenderHalve>>,
@@ -57,11 +61,20 @@ pub(crate) struct OpManager {
 }
 
 impl OpManager {
-    pub(super) fn new(
-        ring: Arc<Ring>,
+    pub(super) fn new<const CLIENTS: usize, EL: EventLogRegister>(
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
-    ) -> Self {
+        builder: &NodeBuilder<CLIENTS>,
+        gateways: &[PeerKeyLocation],
+    ) -> Result<Self, anyhow::Error> {
+        let live_transactions_peers = Arc::new(DashMap::new());
+
+        let ring = Ring::new::<CLIENTS, EL>(
+            builder,
+            gateways,
+            notification_channel.clone(),
+            live_transactions_peers.clone(),
+        )?;
         let connect = Arc::new(DashMap::new());
         let put = Arc::new(DashMap::new());
         let get = Arc::new(DashMap::new());
@@ -80,9 +93,10 @@ impl OpManager {
             update.clone(),
             completed.clone(),
             under_progress.clone(),
+            live_transactions_peers.clone(),
         ));
 
-        Self {
+        Ok(Self {
             connect,
             put,
             get,
@@ -90,11 +104,12 @@ impl OpManager {
             update,
             completed,
             under_progress,
+            live_transactions_peers,
             to_event_listener: notification_channel,
             ch_outbound: Mutex::new(contract_handler),
             new_transactions,
             ring,
-        }
+        })
     }
 
     /// An early, fast path, return for communicating back changes of on-going operations
@@ -193,12 +208,28 @@ impl OpManager {
     }
 
     pub fn completed(&self, id: Transaction) {
+        remove_finished_tx(&self.live_transactions_peers, id);
         self.completed.insert(id);
     }
 
     pub fn prune_connection(&self, peer: PeerKey) {
-        // pending ops will be cleaned up by the garbage collector on time out
+        self.live_transactions_peers.remove(&peer);
         self.ring.prune_connection(peer);
+    }
+}
+
+fn remove_finished_tx(live_transactions_peers: &LiveTxPeerTracker, tx: Transaction) {
+    let keys_to_remove: Vec<PeerKey> = live_transactions_peers
+        .iter()
+        .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
+        .map(|entry| *entry.key())
+        .collect();
+
+    for k in keys_to_remove {
+        live_transactions_peers.remove_if_mut(&k, |k, v| {
+            v.retain(|otx| otx != &tx);
+            v.is_empty()
+        });
     }
 }
 
@@ -212,6 +243,7 @@ async fn garbage_cleanup_task(
     update: Arc<DashMap<Transaction, UpdateOp>>,
     completed: Arc<DashSet<Transaction>>,
     under_progress: Arc<DashSet<Transaction>>,
+    live_transactions_peers: LiveTxPeerTracker,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -239,6 +271,8 @@ async fn garbage_cleanup_task(
             };
             if still_waiting {
                 delayed.push(tx);
+            } else {
+                remove_finished_tx(&live_transactions_peers, tx);
             }
         }
         for Reverse(tx) in ttl_set.split_off(&older_than).into_iter() {
@@ -249,22 +283,15 @@ async fn garbage_cleanup_task(
             if completed.remove(&tx).is_some() {
                 continue;
             }
-            match tx.tx_type() {
-                TransactionType::Connect => {
-                    connect.remove(&tx);
-                }
-                TransactionType::Put => {
-                    put.remove(&tx);
-                }
-                TransactionType::Get => {
-                    get.remove(&tx);
-                }
-                TransactionType::Subscribe => {
-                    subscribe.remove(&tx);
-                }
-                TransactionType::Update => {
-                    update.remove(&tx);
-                }
+            let removed = match tx.tx_type() {
+                TransactionType::Connect => connect.remove(&tx).is_some(),
+                TransactionType::Put => put.remove(&tx).is_some(),
+                TransactionType::Get => get.remove(&tx).is_some(),
+                TransactionType::Subscribe => subscribe.remove(&tx).is_some(),
+                TransactionType::Update => update.remove(&tx).is_some(),
+            };
+            if removed {
+                remove_finished_tx(&live_transactions_peers, tx);
             }
         }
     };

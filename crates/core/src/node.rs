@@ -44,7 +44,7 @@ use crate::{
 use crate::operations::handle_op_request;
 pub(crate) use event_log::{EventLogRegister, EventRegister};
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
-pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
+pub(crate) use op_state_manager::{LiveTxPeerTracker, OpManager, OpNotAvailable};
 
 mod event_log;
 #[cfg(test)]
