@@ -153,7 +153,60 @@ impl Operation for ConnectOp {
             let mut new_state;
 
             match input {
-                
+                ConnectMsg::Request {
+                    msg:
+                        ConnectRequest::FindPeer {
+                            query_target,
+                            ideal_location,
+                            joiner,
+                        },
+                    id,
+                } => {
+                    let own_loc = op_storage.ring.own_location();
+                    let PeerKeyLocation {
+                        peer: this_peer,
+                        location: Some(_),
+                    } = &own_loc
+                    else {
+                        return Err(OpError::RingError(crate::ring::RingError::NoLocation));
+                    };
+                    if this_peer == &query_target.peer {
+                        // this peer should be the original target queries
+                        if let Some(peer) = op_storage.ring.closest_to_location(*ideal_location) {
+                            let msg = ConnectMsg::Request {
+                                id: *id,
+                                msg: ConnectRequest::Proxy {
+                                    sender: own_loc,
+                                    joiner: *joiner,
+                                    hops_to_live: 0,
+                                    skip_list: vec![*this_peer],
+                                    accepted_by: HashSet::new(),
+                                },
+                            };
+                            network_bridge.send(&peer.peer, msg.into()).await?;
+                            return_msg = None;
+                            new_state = Some(ConnectState::AwaitingConnectionAcquisition {
+                                joiner: *joiner,
+                            });
+                        } else {
+                            todo!("reply back that we didn't found any");
+                        }
+                    } else {
+                        // this peer is the one establishing connections
+                        debug_assert_eq!(this_peer, &joiner.peer);
+                        new_state = Some(ConnectState::AwaitingNewConnection);
+                        let msg = ConnectMsg::Request {
+                            id: *id,
+                            msg: ConnectRequest::FindPeer {
+                                query_target: *query_target,
+                                ideal_location: *ideal_location,
+                                joiner: *joiner,
+                            },
+                        };
+                        network_bridge.send(&query_target.peer, msg.into()).await?;
+                        return_msg = None;
+                    }
+                }
                 ConnectMsg::Request {
                     id,
                     msg:
@@ -333,7 +386,7 @@ impl Operation for ConnectOp {
                             your_peer_id,
                             gateway.peer
                         );
-                        new_state = Some(ConnectState::OCReceived); // FIXME
+                        new_state = Some(ConnectState::OCReceived);
                         return_msg = Some(ConnectMsg::Response {
                             id: *id,
                             msg: ConnectResponse::ReceivedOC {
@@ -396,8 +449,8 @@ impl Operation for ConnectOp {
                 ConnectMsg::Response {
                     id,
                     target,
+                    sender,
                     msg: ConnectResponse::Proxy { accepted_by },
-                    ..
                 } => {
                     tracing::debug!(tx = %id, "Received proxy connect response at @ {}", target.peer);
                     match self.state {
@@ -456,8 +509,41 @@ impl Operation for ConnectOp {
                                 });
                             }
                         }
-                        other_state => {
-                            tracing::error!(?other_state);
+                        Some(ConnectState::AwaitingConnectionAcquisition { joiner }) => {
+                            return_msg = Some(ConnectMsg::Response {
+                                id: *id,
+                                target: joiner,
+                                sender: *target,
+                                msg: ConnectResponse::Proxy {
+                                    accepted_by: HashSet::from([*sender]),
+                                },
+                            });
+                            new_state = None;
+                        }
+                        Some(ConnectState::AwaitingNewConnection) => {
+                            let joiner = *target;
+                            for peer in accepted_by {
+                                propagate_oc_to_accepted_peers(
+                                    network_bridge,
+                                    op_storage,
+                                    *sender,
+                                    peer,
+                                    ConnectMsg::Response {
+                                        id: *id,
+                                        sender: joiner,
+                                        target: *peer,
+                                        msg: ConnectResponse::ReceivedOC {
+                                            by_peer: joiner,
+                                            gateway: *sender, // irrelevant in this case
+                                        },
+                                    },
+                                )
+                                .await?;
+                            }
+                            return_msg = None;
+                            new_state = None;
+                        }
+                        _other_state => {
                             return Err(OpError::InvalidStateTransition(self.id));
                         }
                     }
@@ -630,7 +716,10 @@ mod states {
                 ConnectState::AwaitingProxyResponse { .. } => write!(f, "AwaitingProxyResponse"),
                 ConnectState::OCReceived => write!(f, "OCReceived"),
                 ConnectState::Connected => write!(f, "Connected"),
-                ConnectState::AwaitingNewConnection { query_target } => todo!(),
+                ConnectState::AwaitingNewConnection => write!(f, "AwaitingNewConnection"),
+                ConnectState::AwaitingConnectionAcquisition { .. } => {
+                    write!(f, "AwaitingConnectionAcquisition")
+                }
             }
         }
     }
@@ -647,9 +736,10 @@ enum ConnectState {
         new_location: Location,
         new_peer_id: PeerKey,
     },
-    AwaitingNewConnection {
-        query_target: PeerKeyLocation,
+    AwaitingConnectionAcquisition {
+        joiner: PeerKeyLocation,
     },
+    AwaitingNewConnection,
     OCReceived,
     Connected,
 }
