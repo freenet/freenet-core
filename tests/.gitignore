@@ -1,1 +1,6 @@
 **/build/*
+**/target/*
+
+**/test-app-1/node_modules/*
+**/test-app-1/**/*.js
+**/test-app-1/src/**/*.js

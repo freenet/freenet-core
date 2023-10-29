@@ -1,0 +1,26 @@
+[package]
+name = "test-dep-contract"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.71.1"
+resolver = "2"
+publish = false
+
+[dependencies]
+byteorder = "1"
+freenet-stdlib = { workspace = true, features = ["contract"] }
+rsa = { version = "0.9.2", default-features = false, features = ["serde", "pem", "sha2"] }
+serde = "1"
+serde_json = "1"
+serde_with = { version = "3", default-features = false, features = ["macros"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+serde = "1"
+serde_json = "1"
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
