@@ -2,9 +2,6 @@ use freenet_stdlib::prelude::*;
 
 struct Contract;
 
-// TODO: verify that the state is signed by a pub/key pair
-// ~/.freenet/secrets/keys/keypair1.json
-
 #[contract]
 impl ContractInterface for Contract {
     fn validate_state(
