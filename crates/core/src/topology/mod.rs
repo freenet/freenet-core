@@ -1,5 +1,16 @@
 #![allow(unused_variables, dead_code)]
 
+/*
+ NOTES
+
+Distribution of connections should mirror the distribution of inbound and locally generated requests.
+
+For outbound join requests this means random selection of outbound requests in proportion to outbound request density.
+
+For inbound requests this means selecting the inbound request in the highest density region of the keyspace.
+
+*/
+
 mod metric;
 mod small_world_rand;
 mod connection_evaluator;
