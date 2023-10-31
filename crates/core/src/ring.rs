@@ -37,8 +37,8 @@ use crate::{
     config::GlobalExecutor,
     message::Transaction,
     node::{
-        self, EventLogRegister, EventLoopNotificationsSender, EventRegister, LiveTxPeerTracker,
-        NodeBuilder, PeerKey,
+        self, EventLogRegister, EventLoopNotificationsSender, EventRegister,
+        LiveTransactionPeerTracker, NodeBuilder, PeerKey,
     },
     operations::connect,
     router::Router,
@@ -103,7 +103,7 @@ pub(crate) struct Ring {
     // A peer which has been blacklisted to perform actions regarding a given contract.
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
-    /// Interim connections ongoing haandshake or successfully open connections
+    /// Interim connections ongoing handshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
     open_connections: AtomicUsize,
 }
@@ -136,7 +136,7 @@ impl Ring {
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
-        live_transactions_peers: LiveTxPeerTracker,
+        live_transactions_peers: LiveTransactionPeerTracker,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let peer_key = PeerKey::from(config.local_key.public());
 
@@ -212,7 +212,13 @@ impl Ring {
         loop {
             interval.tick().await;
             let history = if std::any::type_name::<EL>() == std::any::type_name::<EventRegister>() {
-                EventRegister::get_router_events(10_000).await.unwrap()
+                EventRegister::get_router_events(10_000)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!("shutting down refresh router task");
+                        error
+                    })
+                    .expect("todo: propagate this to main thread")
             } else {
                 vec![]
             };
@@ -468,7 +474,7 @@ impl Ring {
     async fn connection_maintenace(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
-        under_progress: LiveTxPeerTracker,
+        under_progress: LiveTransactionPeerTracker,
     ) -> Result<(), DynError> {
         const OPTIMAL_DISTANCE: Distance = Distance(0.2);
         /// Drop a connection and acquire a new one.
@@ -490,8 +496,14 @@ impl Ring {
 
         let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
         check_interval.tick().await;
+        let mut acquire_max_connections = tokio::time::interval(Duration::from_secs(1));
+        acquire_max_connections.tick().await;
+
+        // todo: this skip list should be updated with peers we recently tried to acquire connections through
+        // but failed to do so
+        let skip_list = &[];
         loop {
-            let (current_connections, should_swap) = {
+            let (mut current_connections, should_swap) = {
                 let peers = self.connections_by_location.read();
                 (
                     peers.len(),
@@ -500,7 +512,7 @@ impl Ring {
                             .values()
                             .filter(|conn| {
                                 conn.open_at.elapsed() > CONNECTION_AGE_THRESOLD
-                                    && !under_progress.contains_key(&conn.location.peer)
+                                    && !under_progress.has_live_connection(&conn.location.peer)
                             })
                             .map(|conn| &conn.location),
                     ),
@@ -511,12 +523,30 @@ impl Ring {
                 // requires more connections
                 let ideal_target_dist =
                     crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
-                self.acquire_new(ideal_target_dist, &[], &notifier).await?;
+                self.acquire_new(ideal_target_dist, skip_list, &notifier)
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(?error, "shutting down connection maintenance task");
+                        error
+                    })?;
+                current_connections = self.connections_by_location.read().len();
+                if current_connections < self.max_connections {
+                    acquire_max_connections.tick().await;
+                } else {
+                    check_interval.tick().await;
+                }
             } else if !should_swap.is_empty() {
                 let ideal_target_dist =
                     crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
                 // todo: drop connections in should_swap
-                self.acquire_new(ideal_target_dist, &[], &notifier).await?;
+                self.acquire_new(ideal_target_dist, skip_list, &notifier)
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(?error, "shutting down connection maintenance task");
+                        error
+                    })?;
+                check_interval.tick().await;
+            } else {
                 check_interval.tick().await;
             }
         }
@@ -572,7 +602,7 @@ impl Ring {
 
         Some(connect::ConnectMsg::Request {
             id: Transaction::new::<connect::ConnectMsg>(),
-            msg: connect::ConnectRequest::FindPeer {
+            msg: connect::ConnectRequest::FindOptimalPeer {
                 query_target: **request_to,
                 ideal_location,
                 joiner,
@@ -824,7 +854,7 @@ mod test {
         )
         .expect("find query target");
         let connect::ConnectMsg::Request {
-            msg: connect::ConnectRequest::FindPeer { ideal_location, .. },
+            msg: connect::ConnectRequest::FindOptimalPeer { ideal_location, .. },
             ..
         } = result
         else {
