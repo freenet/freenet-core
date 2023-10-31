@@ -1,4 +1,4 @@
-//! Main message type which encapsulated all the messaging between nodes.
+//! Network messaging between peers.
 
 use std::{
     fmt::Display,
@@ -13,7 +13,7 @@ use crate::{
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
-    ring::{Location, PeerKeyLocation},
+    ring::PeerKeyLocation,
 };
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 
@@ -312,24 +312,6 @@ impl Display for Message {
         };
         write!(f, "}}")
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct ProbeRequest {
-    pub hops_to_live: u8,
-    pub target: Location,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct ProbeResponse {
-    pub visits: Vec<Visit>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct Visit {
-    pub hop: u8,
-    pub latency: Duration,
-    pub location: Location,
 }
 
 #[cfg(test)]

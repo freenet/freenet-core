@@ -253,14 +253,14 @@ pub(crate) fn contract_handler_channel() -> (
 
 static EV_ID: AtomicU64 = AtomicU64::new(0);
 
-// TODO: the timeout should be derived from whatever is the worst
-// case we are willing to accept for waiting out for an event;
-// have to double check all events to see if any depend on external
-// responses and go from there, also this may very well depend on the
-// kind of event and can be optimized on a case basis
-const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
-
 impl ContractHandlerChannel<SenderHalve> {
+    // TODO: the timeout should be derived from whatever is the worst
+    // case we are willing to accept for waiting out for an event;
+    // have to double check all events to see if any depend on external
+    // responses and go from there, also this may very well depend on the
+    // kind of event and can be optimized on a case basis
+    const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
+
     /// Send an event to the contract handler and receive a response event if successful.
     pub async fn send_to_handler(
         &mut self,
@@ -276,7 +276,7 @@ impl ContractHandlerChannel<SenderHalve> {
         } else {
             let started_op = Instant::now();
             loop {
-                if started_op.elapsed() > CH_EV_RESPONSE_TIME_OUT {
+                if started_op.elapsed() > Self::CH_EV_RESPONSE_TIME_OUT {
                     break Err(ContractError::NoEvHandlerResponse);
                 }
                 while let Some(msg) = self.rx.recv().await {

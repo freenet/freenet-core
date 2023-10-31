@@ -5,7 +5,7 @@ use std::{
     future::Future,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     str::FromStr,
     sync::atomic::AtomicBool,
@@ -17,7 +17,7 @@ use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
-use crate::{local_node::OperationMode, DynError};
+use crate::local_node::OperationMode;
 
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;

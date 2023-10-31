@@ -13,7 +13,7 @@ use crate::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
     },
-    ring::{PeerKeyLocation, Ring},
+    ring::{LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
 use super::{network_bridge::EventLoopNotificationsSender, EventLogRegister, NodeBuilder, PeerKey};
@@ -35,19 +35,6 @@ pub(crate) enum OpNotAvailable {
     Completed,
 }
 
-#[derive(Clone)]
-pub(crate) struct LiveTransactionPeerTracker(Arc<DashMap<PeerKey, Vec<Transaction>>>);
-
-impl LiveTransactionPeerTracker {
-    pub fn has_live_connection(&self, peer: &PeerKey) -> bool {
-        self.0.contains_key(peer)
-    }
-
-    fn add_transaction(&self, peer: PeerKey, tx: Transaction) {
-        self.0.entry(peer).or_default().push(tx);
-    }
-}
-
 #[derive(Default)]
 struct Ops {
     connect: DashMap<Transaction, ConnectOp>,
@@ -63,7 +50,6 @@ struct Ops {
 /// and enable their execution.
 pub(crate) struct OpManager {
     pub ring: Arc<Ring>,
-    live_transactions_peers: LiveTransactionPeerTracker,
     ops: Arc<Ops>,
     to_event_listener: EventLoopNotificationsSender,
     // todo: remove the need for a mutex here if possible
@@ -78,27 +64,19 @@ impl OpManager {
         builder: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
     ) -> Result<Self, anyhow::Error> {
-        let live_transactions_peers = LiveTransactionPeerTracker(Arc::new(DashMap::new()));
-
-        let ring = Ring::new::<CLIENTS, EL>(
-            builder,
-            gateways,
-            notification_channel.clone(),
-            live_transactions_peers.clone(),
-        )?;
+        let ring = Ring::new::<CLIENTS, EL>(builder, gateways, notification_channel.clone())?;
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
         GlobalExecutor::spawn(garbage_cleanup_task(
             rx,
             ops.clone(),
-            live_transactions_peers.clone(),
+            ring.live_tx_tracker.clone(),
         ));
 
         Ok(Self {
             ring,
             ops,
-            live_transactions_peers,
             to_event_listener: notification_channel,
             ch_outbound: Mutex::new(contract_handler),
             new_transactions,
@@ -138,6 +116,7 @@ impl OpManager {
     }
 
     pub async fn recv_from_handler(&self) -> crate::contract::EventId {
+        // self.ch_outbound.lock().await.recv_from_handler();
         todo!()
     }
 
@@ -217,42 +196,29 @@ impl OpManager {
     }
 
     pub fn completed(&self, id: Transaction) {
-        remove_finished_tx(&self.live_transactions_peers, id);
+        self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.completed.insert(id);
     }
 
     pub fn prune_connection(&self, peer: PeerKey) {
-        self.live_transactions_peers.0.remove(&peer);
+        self.ring
+            .live_tx_tracker
+            .prune_transactions_from_peer(&peer);
         self.ring.prune_connection(peer);
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
     pub fn sending_transaction(&self, peer: &PeerKey, transaction: &Transaction) {
-        self.live_transactions_peers
+        self.ring
+            .live_tx_tracker
             .add_transaction(*peer, *transaction);
-    }
-}
-
-fn remove_finished_tx(live_transactions_peers: &LiveTransactionPeerTracker, tx: Transaction) {
-    let keys_to_remove: Vec<PeerKey> = live_transactions_peers
-        .0
-        .iter()
-        .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
-        .map(|entry| *entry.key())
-        .collect();
-
-    for k in keys_to_remove {
-        live_transactions_peers.0.remove_if_mut(&k, |_, v| {
-            v.retain(|otx| otx != &tx);
-            v.is_empty()
-        });
     }
 }
 
 async fn garbage_cleanup_task(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
     ops: Arc<Ops>,
-    live_transactions_peers: LiveTransactionPeerTracker,
+    live_tx_tracker: LiveTransactionTracker,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -282,7 +248,7 @@ async fn garbage_cleanup_task(
                     ops.under_progress.remove(&tx);
                     ops.completed.remove(&tx);
                 }
-                remove_finished_tx(&live_transactions_peers, tx);
+                live_tx_tracker.remove_finished_transaction(tx);
             }
         }
 
@@ -304,7 +270,7 @@ async fn garbage_cleanup_task(
                 TransactionType::Update => ops.update.remove(&tx).is_some(),
             };
             if removed {
-                remove_finished_tx(&live_transactions_peers, tx);
+                live_tx_tracker.remove_finished_transaction(tx);
             }
         }
     };

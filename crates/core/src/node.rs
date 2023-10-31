@@ -44,7 +44,7 @@ use crate::{
 use crate::operations::handle_op_request;
 pub(crate) use event_log::{EventLogRegister, EventRegister};
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
-pub(crate) use op_state_manager::{LiveTransactionPeerTracker, OpManager, OpNotAvailable};
+pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod event_log;
 #[cfg(test)]
@@ -338,7 +338,7 @@ async fn client_event_handling<ClientEv>(
                         tracing::debug!(%res, "sending client response");
                     }
                     if let Err(err) = client_events.send(cli_id, res).await {
-                        tracing::error!("channel closed: {err}");
+                        tracing::debug!("channel closed: {err}");
                         break;
                     }
                 }
@@ -434,13 +434,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     }
                 }
                 _ => {
-                    tracing::error!("op not supported");
+                    tracing::error!("Op not supported");
                 }
             },
             ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
             ClientRequest::Disconnect { .. } => unreachable!(),
             _ => {
-                tracing::error!("op not supported");
+                tracing::error!("Op not supported");
             }
         }
     };

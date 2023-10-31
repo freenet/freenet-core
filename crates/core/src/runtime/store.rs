@@ -46,7 +46,7 @@ where
                         }
                     }
                 }
-                Err(e) => tracing::error!("{e}"),
+                Err(err) => tracing::error!("{err}"),
             },
         )?;
         watcher.watch(key_file_path, notify::RecursiveMode::NonRecursive)?;

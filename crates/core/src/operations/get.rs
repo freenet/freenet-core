@@ -217,7 +217,6 @@ impl Operation for GetOp {
                         key: key.clone(),
                         id: *id,
                         target: *target,
-                        skip_list: vec![own_loc.peer],
                         sender: own_loc,
                         fetch_contract: *fetch_contract,
                         htl: MAX_GET_RETRY_HOPS,
@@ -229,7 +228,6 @@ impl Operation for GetOp {
                     fetch_contract,
                     sender,
                     target,
-                    skip_list,
                     htl,
                 } => {
                     let htl = *htl;
@@ -241,8 +239,6 @@ impl Operation for GetOp {
                     if let Some(s) = stats.as_mut() {
                         s.caching_peer = Some(*target);
                     }
-                    let mut skip_list = skip_list.clone();
-                    skip_list.push(target.peer);
 
                     if !is_cached_contract {
                         tracing::warn!(
@@ -271,7 +267,6 @@ impl Operation for GetOp {
                                         contract: None,
                                     },
                                     sender: op_storage.ring.own_location(),
-                                    updated_skip_list: skip_list,
                                     target: *sender, // return to requester
                                 }),
                                 None,
@@ -280,8 +275,7 @@ impl Operation for GetOp {
                         }
 
                         let new_htl = htl - 1;
-                        let Some(new_target) = op_storage.ring.closest_caching(&key, &skip_list)
-                        else {
+                        let Some(new_target) = op_storage.ring.closest_caching(&key, &[]) else {
                             tracing::warn!(tx = %id, "No other peers found while trying getting contract {key} @ {}", target.peer);
                             return Err(OpError::RingError(RingError::NoCachingPeers(key)));
                         };
@@ -294,7 +288,6 @@ impl Operation for GetOp {
                                 fetch_contract,
                                 sender: *sender,
                                 target: new_target,
-                                skip_list,
                                 htl: new_htl,
                             })
                             .into(),
@@ -353,7 +346,6 @@ impl Operation for GetOp {
                                     id,
                                     key,
                                     value,
-                                    updated_skip_list: vec![],
                                     sender: *target,
                                     target: *sender,
                                 });
@@ -374,7 +366,6 @@ impl Operation for GetOp {
                         },
                     sender,
                     target,
-                    updated_skip_list,
                 } => {
                     let this_loc = target;
                     tracing::warn!(
@@ -409,7 +400,6 @@ impl Operation for GetOp {
                                         sender: *this_loc,
                                         fetch_contract,
                                         htl: MAX_GET_RETRY_HOPS,
-                                        skip_list: updated_skip_list.clone(),
                                     });
                                 } else {
                                     return Err(RingError::NoCachingPeers(key.clone()).into());
@@ -438,7 +428,6 @@ impl Operation for GetOp {
                                     state: None,
                                     contract: None,
                                 },
-                                updated_skip_list: updated_skip_list.clone(),
                                 sender: *sender,
                                 target: *target,
                             });
@@ -456,12 +445,9 @@ impl Operation for GetOp {
                         },
                     sender,
                     target,
-                    updated_skip_list,
                 } => {
                     let id = *id;
                     let key = key.clone();
-                    let mut updated_skip_list = updated_skip_list.clone();
-                    updated_skip_list.push(sender.peer);
                     let require_contract = matches!(
                         self.state,
                         Some(GetState::AwaitingResponse {
@@ -517,7 +503,6 @@ impl Operation for GetOp {
                                         },
                                         sender: *sender,
                                         target: *target,
-                                        updated_skip_list,
                                     }),
                                     OpEnum::Get(op),
                                     None,
@@ -585,7 +570,6 @@ impl Operation for GetOp {
                                 },
                                 sender: *sender,
                                 target: *target,
-                                updated_skip_list,
                             });
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
@@ -794,8 +778,6 @@ mod messages {
             target: PeerKeyLocation,
             sender: PeerKeyLocation,
             htl: usize,
-            // FIXME: remove skip list once we deduplicate at top msg handling level
-            skip_list: Vec<PeerKey>,
         },
         ReturnGet {
             id: Transaction,
@@ -803,7 +785,6 @@ mod messages {
             value: StoreResponse,
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
-            updated_skip_list: Vec<PeerKey>,
         },
     }
 

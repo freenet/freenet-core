@@ -9,7 +9,6 @@ mod state_store;
 mod store;
 #[cfg(test)]
 mod tests;
-mod util;
 mod wasm_runtime;
 
 pub(crate) use contract::ContractRuntimeInterface;

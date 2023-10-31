@@ -175,9 +175,9 @@ async fn execute_command(
     executor
         .handle_request(ClientId::FIRST, request, None)
         .await
-        .map_err(|e| {
-            tracing::error!("{e}");
-            e
+        .map_err(|err| {
+            tracing::error!("{err}");
+            err
         })?;
 
     Ok(())

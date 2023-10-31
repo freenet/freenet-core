@@ -49,19 +49,14 @@ where
         op.process_message(network_bridge, op_storage, msg, client_id)
             .await
     };
-    handle_op_result(
-        op_storage,
-        network_bridge,
-        result.map_err(|err| (err, tx)),
-        sender,
-    )
-    .await
+    handle_op_result(op_storage, network_bridge, result, tx, sender).await
 }
 
 async fn handle_op_result<CB>(
     op_storage: &OpManager,
     network_bridge: &mut CB,
-    result: Result<OperationResult, (OpError, Transaction)>,
+    result: Result<OperationResult, OpError>,
+    tx_id: Transaction,
     sender: Option<PeerKey>,
 ) -> Result<Option<OpEnum>, OpError>
 where
@@ -69,11 +64,11 @@ where
 {
     // FIXME: register changes in the future op commit log
     match result {
-        Err((OpError::StatePushed, _)) => {
+        Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
             return Ok(None);
         }
-        Err((err, tx_id)) => {
+        Err(err) => {
             if let Some(sender) = sender {
                 network_bridge
                     .send(&sender, Message::Aborted(tx_id))
@@ -98,6 +93,7 @@ where
             state: Some(final_state),
         }) if final_state.finalized() => {
             // operation finished_completely with result
+            op_storage.completed(tx_id);
             return Ok(Some(final_state));
         }
         Ok(OperationResult {
@@ -112,6 +108,7 @@ where
             return_msg: Some(msg),
             state: None,
         }) => {
+            op_storage.completed(tx_id);
             // finished the operation at this node, informing back
             if let Some(target) = msg.target().cloned() {
                 network_bridge.send(&target.peer, msg).await?;
@@ -122,6 +119,7 @@ where
             state: None,
         }) => {
             // operation finished_completely
+            op_storage.completed(tx_id);
         }
     }
     Ok(None)

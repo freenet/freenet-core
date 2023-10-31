@@ -26,7 +26,6 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
             std::process::exit(0);
         } else {
             tracing::error!("Failed to remove content at {path:?}");
-
             std::process::exit(-1);
         }
     })

@@ -64,7 +64,7 @@ pub mod local_node {
             axum::Server::bind(&socket)
                 .serve(router.into_make_service())
                 .map_err(|e| {
-                    tracing::error!("error while running HTTP gateway server: {e}");
+                    tracing::error!("Error while running HTTP gateway server: {e}");
                 }),
         );
     }

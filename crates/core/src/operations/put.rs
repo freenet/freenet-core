@@ -196,6 +196,7 @@ impl Operation for PutOp {
                         target.peer
                     );
 
+                    // fixme: this node should filter out incoming redundant puts since is the one initiating the request
                     return_msg = Some(PutMsg::SeekNode {
                         id: *id,
                         sender,
@@ -204,7 +205,6 @@ impl Operation for PutOp {
                         contract: contract.clone(),
                         related_contracts: related_contracts.clone(),
                         htl: *htl,
-                        skip_list: vec![sender.peer],
                     });
 
                     // no changes to state yet, still in AwaitResponse state
@@ -218,7 +218,6 @@ impl Operation for PutOp {
                     related_contracts,
                     htl,
                     target,
-                    skip_list,
                 } => {
                     let key = contract.key();
                     let is_cached_contract = op_storage.ring.is_contract_cached(&key);
@@ -276,9 +275,6 @@ impl Operation for PutOp {
                         )
                         .await?;
 
-                    let mut skip_list = skip_list.clone();
-                    skip_list.push(target.peer);
-
                     if let Some(new_htl) = htl.checked_sub(1) {
                         // forward changes in the contract to nodes closer to the contract location, if possible
                         forward_changes(
@@ -288,7 +284,6 @@ impl Operation for PutOp {
                             new_value.clone(),
                             *id,
                             new_htl,
-                            skip_list.as_slice(),
                         )
                         .await;
                     }
@@ -440,15 +435,13 @@ impl Operation for PutOp {
                     );
 
                     // Subscriber nodes have been notified of the change, the operation is completed
-                    op_storage.completed(*id);
                     return_msg = None;
                     new_state = None;
                 }
-                PutMsg::SuccessfulUpdate { id, .. } => {
+                PutMsg::SuccessfulUpdate { .. } => {
                     match self.state {
                         Some(PutState::AwaitingResponse { contract, .. }) => {
                             tracing::debug!("Successfully updated value for {}", contract,);
-                            op_storage.completed(*id);
                             new_state = None;
                             return_msg = None;
                         }
@@ -464,7 +457,6 @@ impl Operation for PutOp {
                     contract,
                     new_value,
                     htl,
-                    skip_list,
                 } => {
                     let key = contract.key();
                     let peer_loc = op_storage.ring.own_location();
@@ -502,10 +494,6 @@ impl Operation for PutOp {
                     )
                     .await?;
 
-                    // update skip list
-                    let mut skip_list = skip_list.clone();
-                    skip_list.push(peer_loc.peer);
-
                     // if successful, forward to the next closest peers (if any)
                     if let Some(new_htl) = htl.checked_sub(1) {
                         forward_changes(
@@ -515,11 +503,9 @@ impl Operation for PutOp {
                             new_value,
                             *id,
                             new_htl,
-                            skip_list.as_slice(),
                         )
                         .await;
                     }
-                    op_storage.completed(*id);
                     return_msg = None;
                     new_state = None;
                 }
@@ -780,13 +766,12 @@ async fn forward_changes<CB>(
     new_value: WrappedState,
     id: Transaction,
     htl: usize,
-    skip_list: &[PeerKey],
 ) where
     CB: NetworkBridge,
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    let forward_to = op_storage.ring.closest_caching(&key, skip_list);
+    let forward_to = op_storage.ring.closest_caching(&key, &[]);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     if let Some(peer) = forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
@@ -803,7 +788,6 @@ async fn forward_changes<CB>(
                         contract: contract.clone(),
                         new_value: new_value.clone(),
                         htl,
-                        skip_list: skip_list.to_vec(),
                     })
                     .into(),
                 )
@@ -848,7 +832,6 @@ mod messages {
             new_value: WrappedState,
             /// current htl, reduced by one at each hop
             htl: usize,
-            skip_list: Vec<PeerKey>,
         },
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
@@ -866,9 +849,6 @@ mod messages {
             related_contracts: RelatedContracts<'static>,
             /// max hops to live
             htl: usize,
-            // FIXME: remove skip list once we deduplicate at top msg handling level
-            // using this is a tmp workaround until (https://github.com/freenet/freenet-core/issues/13) is done
-            skip_list: Vec<PeerKey>,
         },
         /// Internal node instruction that  a change (either a first time insert or an update).
         Broadcasting {

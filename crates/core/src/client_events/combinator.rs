@@ -180,7 +180,7 @@ async fn client_fn(
             }
         }
     }
-    tracing::error!("client shut down");
+    tracing::error!("Client shut down");
 }
 
 /// An optimized for the use case version of `futures::select_all` which keeps ordering.

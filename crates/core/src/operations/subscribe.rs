@@ -202,7 +202,6 @@ impl Operation for SubscribeOp {
                                 key: key.clone(),
                                 subscribed: true,
                             });
-                            op_storage.completed(*id);
                         }
                         _ => return Err(OpError::InvalidStateTransition(self.id)),
                     }
@@ -279,7 +278,6 @@ impl Operation for SubscribeOp {
                             let _ = client_id;
                             new_state = Some(SubscribeState::Completed);
                             return_msg = None;
-                            op_storage.completed(*id);
                         }
                         _other => {
                             return Err(OpError::InvalidStateTransition(self.id));
