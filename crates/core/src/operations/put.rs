@@ -4,7 +4,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 use std::{collections::HashSet, time::Instant};
 
 pub(crate) use self::messages::PutMsg;
@@ -15,7 +14,6 @@ use futures::FutureExt;
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 use crate::{
     client_events::ClientId,
-    config::PEER_TIMEOUT,
     contract::ContractHandlerEvent,
     message::{InnerMessage, Message, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
@@ -27,8 +25,6 @@ pub(crate) struct PutOp {
     id: Transaction,
     state: Option<PutState>,
     stats: Option<PutStats>,
-    /// time left until time out, when this reaches zero it will be removed from the state
-    _ttl: Duration,
 }
 
 impl PutOp {
@@ -155,7 +151,6 @@ impl Operation for PutOp {
                             state: Some(PutState::ReceivedRequest),
                             stats: None, // don't care for stats in the target peers
                             id: tx,
-                            _ttl: PEER_TIMEOUT,
                         },
                         sender,
                     })
@@ -317,7 +312,6 @@ impl Operation for PutOp {
                         broadcast_to,
                         key.clone(),
                         (contract.params(), new_value),
-                        self._ttl,
                     )
                     .await
                     {
@@ -376,7 +370,6 @@ impl Operation for PutOp {
                         broadcast_to,
                         key.clone(),
                         (parameters.clone(), new_value),
-                        self._ttl,
                     )
                     .await
                     {
@@ -533,7 +526,7 @@ impl Operation for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, self._ttl, stats)
+            build_op_result(self.id, new_state, return_msg, stats)
         })
     }
 }
@@ -542,15 +535,9 @@ fn build_op_result(
     id: Transaction,
     state: Option<PutState>,
     msg: Option<PutMsg>,
-    ttl: Duration,
     stats: Option<PutStats>,
 ) -> Result<OperationResult, OpError> {
-    let output_op = Some(PutOp {
-        id,
-        state,
-        stats,
-        _ttl: ttl,
-    });
+    let output_op = Some(PutOp { id, state, stats });
     Ok(OperationResult {
         return_msg: msg.map(Message::from),
         state: output_op.map(OpEnum::Put),
@@ -586,7 +573,6 @@ async fn try_to_broadcast(
     broadcast_to: Vec<PeerKeyLocation>,
     key: ContractKey,
     (parameters, new_value): (Parameters<'static>, WrappedState),
-    ttl: Duration,
 ) -> Result<(Option<PutState>, Option<PutMsg>), OpError> {
     let new_state;
     let return_msg;
@@ -618,7 +604,6 @@ async fn try_to_broadcast(
                     id,
                     state: new_state,
                     stats: None,
-                    _ttl: ttl,
                 };
                 op_storage
                     .notify_op_change(
@@ -669,7 +654,6 @@ pub(crate) fn start_op(
             transfer_time: None,
             step: Default::default(),
         }),
-        _ttl: PEER_TIMEOUT,
     }
 }
 
@@ -738,7 +722,6 @@ pub(crate) async fn request_put(
                 state: new_state,
                 id,
                 stats: put_op.stats,
-                _ttl: put_op._ttl,
             };
 
             op_storage
@@ -969,12 +952,11 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use freenet_stdlib::client_api::ContractRequest;
     use freenet_stdlib::prelude::*;
 
-    use super::*;
     use crate::node::tests::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

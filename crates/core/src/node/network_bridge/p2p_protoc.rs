@@ -219,11 +219,7 @@ impl NetworkBridge for P2pBridge {
             .lock()
             .await
             .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager));
-        self.op_manager
-            .live_transactions_peers
-            .entry(*target)
-            .or_default()
-            .push(*msg.id());
+        self.op_manager.sending_transaction(target, msg.id());
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
             .await

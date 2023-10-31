@@ -55,7 +55,11 @@ where
                                     }),
                                 },
                             )
-                            .await?;
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                     Err(err) => {
                         tracing::warn!("Error while executing get contract query: {err}");
@@ -68,7 +72,11 @@ where
                                     response: Err(err.into()),
                                 },
                             )
-                            .await?;
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                 }
             }
@@ -78,7 +86,11 @@ where
                         contract_handler
                             .channel()
                             .send_to_sender(id, ContractHandlerEvent::CacheResult(Ok(())))
-                            .await?;
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                     Err(err) => {
                         tracing::error!("Error while caching: {err}");
@@ -86,7 +98,11 @@ where
                         contract_handler
                             .channel()
                             .send_to_sender(id, ContractHandlerEvent::CacheResult(Err(err)))
-                            .await?;
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                 }
             }
@@ -109,7 +125,11 @@ where
                             new_value: put_result,
                         },
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
             }
             _ => unreachable!(),
         }

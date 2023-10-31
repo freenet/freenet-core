@@ -24,6 +24,7 @@ const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
 
 static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
 // Initialize the executor once.
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_async_rt);

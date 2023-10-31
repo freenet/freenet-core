@@ -1,5 +1,4 @@
 use std::pin::Pin;
-use std::time::Duration;
 use std::{future::Future, time::Instant};
 
 use freenet_stdlib::prelude::*;
@@ -8,7 +7,6 @@ use futures::FutureExt;
 
 use crate::{
     client_events::ClientId,
-    config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, Message, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
@@ -33,7 +31,6 @@ pub(crate) struct GetOp {
     state: Option<GetState>,
     pub(super) result: Option<GetResult>,
     stats: Option<GetStats>,
-    _ttl: Duration,
 }
 
 struct GetStats {
@@ -167,7 +164,6 @@ impl Operation for GetOp {
                             id: tx,
                             result: None,
                             stats: None, // don't care about stats in target peers
-                            _ttl: PEER_TIMEOUT,
                         },
                         sender,
                     })
@@ -280,7 +276,6 @@ impl Operation for GetOp {
                                 }),
                                 None,
                                 stats,
-                                self._ttl,
                             );
                         }
 
@@ -508,7 +503,6 @@ impl Operation for GetOp {
                                 id,
                                 state: self.state,
                                 result: None,
-                                _ttl: self._ttl,
                                 stats,
                             };
 
@@ -600,7 +594,7 @@ impl Operation for GetOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, result, stats, self._ttl)
+            build_op_result(self.id, new_state, return_msg, result, stats)
         })
     }
 }
@@ -611,14 +605,12 @@ fn build_op_result(
     msg: Option<GetMsg>,
     result: Option<GetResult>,
     stats: Option<GetStats>,
-    ttl: Duration,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(GetOp {
         id,
         state,
         result,
         stats,
-        _ttl: ttl,
     });
     Ok(OperationResult {
         return_msg: msg.map(Message::from),
@@ -691,7 +683,6 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
             first_response_time: None,
             step: Default::default(),
         }),
-        _ttl: PEER_TIMEOUT,
     }
 }
 
@@ -768,7 +759,6 @@ pub(crate) async fn request_get(
                     s.caching_peer = Some(target);
                     s
                 }),
-                _ttl: get_op._ttl,
             };
 
             op_storage
@@ -864,7 +854,7 @@ mod messages {
 #[cfg(test)]
 mod test {
     use freenet_stdlib::client_api::ContractRequest;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use super::*;
     use crate::node::tests::{NodeSpecification, SimNetwork};

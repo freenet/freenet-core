@@ -9,7 +9,6 @@ use crate::operations::op_trait::Operation;
 use crate::operations::OpInitialization;
 use crate::{
     client_events::ClientId,
-    config::PEER_TIMEOUT,
     message::{InnerMessage, Message, Transaction},
     node::{ConnectionError, NetworkBridge, OpManager, PeerKey},
     operations::OpEnum,
@@ -25,8 +24,6 @@ pub(crate) struct ConnectOp {
     pub gateway: Option<Box<PeerKeyLocation>>,
     /// keeps track of the number of retries and applies an exponential backoff cooldown period
     pub backoff: Option<ExponentialBackoff>,
-    /// time left until time out, when this reaches zero it will be removed from the state
-    _ttl: Duration,
 }
 
 impl ConnectOp {
@@ -56,26 +53,6 @@ impl TryFrom<ConnectOp> for ConnectResult {
     }
 }
 
-/*
-Will need to do some changes for when we perform parallel joins.
-
-t0: (#1 join attempt)
-joiner:
-    1. dont knows location
-    3. knows location
-    n. connected to the ring
-gateway:
-    2. assigned_location: None; assigned location to `joiner` based on IP and communicate to joiner
-    4. forward to N peers
-    ...
-
-(2 join subsequently to acquire more/better connections)
-join:
-    1. knows location
-gateway:
-    2. assigned_location: Some(loc)
-*/
-
 impl Operation for ConnectOp {
     type Message = ConnectMsg;
     type Result = ConnectResult;
@@ -104,7 +81,7 @@ impl Operation for ConnectOp {
                     let gateway = if !matches!(
                         msg,
                         ConnectMsg::Request {
-                            msg: ConnectRequest::FindPeer { .. },
+                            msg: ConnectRequest::FindOptimalPeer { .. },
                             ..
                         }
                     ) {
@@ -119,7 +96,6 @@ impl Operation for ConnectOp {
                             state: Some(ConnectState::Initializing),
                             backoff: None,
                             gateway,
-                            _ttl: PEER_TIMEOUT,
                         },
                         sender: None,
                     })
@@ -155,7 +131,7 @@ impl Operation for ConnectOp {
             match input {
                 ConnectMsg::Request {
                     msg:
-                        ConnectRequest::FindPeer {
+                        ConnectRequest::FindOptimalPeer {
                             query_target,
                             ideal_location,
                             joiner,
@@ -189,7 +165,8 @@ impl Operation for ConnectOp {
                                 joiner: *joiner,
                             });
                         } else {
-                            todo!("reply back that we didn't found any");
+                            return_msg = None;
+                            new_state = None;
                         }
                     } else {
                         // this peer is the one establishing connections
@@ -197,7 +174,7 @@ impl Operation for ConnectOp {
                         new_state = Some(ConnectState::AwaitingNewConnection);
                         let msg = ConnectMsg::Request {
                             id: *id,
-                            msg: ConnectRequest::FindPeer {
+                            msg: ConnectRequest::FindOptimalPeer {
                                 query_target: *query_target,
                                 ideal_location: *ideal_location,
                                 joiner: *joiner,
@@ -434,7 +411,6 @@ impl Operation for ConnectOp {
                             state: None,
                             gateway: self.gateway,
                             backoff: self.backoff,
-                            _ttl: self._ttl,
                         };
                         op_storage
                             .notify_op_change(
@@ -609,14 +585,7 @@ impl Operation for ConnectOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(
-                self.id,
-                new_state,
-                return_msg,
-                self.gateway,
-                self.backoff,
-                self._ttl,
-            )
+            build_op_result(self.id, new_state, return_msg, self.gateway, self.backoff)
         })
     }
 }
@@ -627,14 +596,12 @@ fn build_op_result(
     msg: Option<ConnectMsg>,
     gateway: Option<Box<PeerKeyLocation>>,
     backoff: Option<ExponentialBackoff>,
-    ttl: Duration,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(ConnectOp {
         id,
         state,
         gateway,
         backoff,
-        _ttl: ttl,
     });
     Ok(OperationResult {
         return_msg: msg.map(Message::from),
@@ -800,7 +767,6 @@ pub(crate) fn initial_request(
             ceiling,
             MAX_JOIN_RETRIES,
         )),
-        _ttl: PEER_TIMEOUT,
     }
 }
 
@@ -815,11 +781,7 @@ where
     NB: NetworkBridge,
 {
     let ConnectOp {
-        id,
-        state,
-        backoff,
-        _ttl,
-        ..
+        id, state, backoff, ..
     } = join_op;
     let ConnectionInfo {
         gateway,
@@ -859,7 +821,6 @@ where
                 })),
                 gateway: Some(Box::new(gateway)),
                 backoff,
-                _ttl,
             })),
         )
         .await?;
@@ -1072,8 +1033,9 @@ mod messages {
             hops_to_live: usize,
             max_hops_to_live: usize,
         },
-        FindPeer {
-            /// Peer to which you are querying new connection about.
+        /// Query target should find a good candidate for joiner to join.
+        FindOptimalPeer {
+            /// Peer whom you are querying new connection about.
             query_target: PeerKeyLocation,
             /// The ideal location of the peer to which you would connect.
             ideal_location: Location,
@@ -1152,7 +1114,6 @@ mod test {
     }
 
     /// Given a network of N peers all good connectivity
-    // #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn network_should_achieve_good_connectivity() -> Result<(), anyhow::Error> {
         crate::config::set_logger();
@@ -1169,7 +1130,9 @@ mod test {
         )
         .await;
         sim_nw.with_start_backoff(Duration::from_millis(200));
+        println!("starting");
         sim_nw.start().await;
+        println!("started");
         sim_nw.check_connectivity(Duration::from_secs(10)).await?;
         sim_nw.network_connectivity_quality()
     }

@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
@@ -8,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     client_events::ClientId,
-    config::PEER_TIMEOUT,
     contract::ContractError,
     message::{InnerMessage, Message, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
@@ -25,7 +23,6 @@ const MAX_RETRIES: usize = 10;
 pub(crate) struct SubscribeOp {
     id: Transaction,
     state: Option<SubscribeState>,
-    _ttl: Duration,
 }
 
 impl SubscribeOp {
@@ -86,7 +83,6 @@ impl Operation for SubscribeOp {
                         op: Self {
                             state: Some(SubscribeState::ReceivedRequest),
                             id,
-                            _ttl: PEER_TIMEOUT,
                         },
                         sender,
                     })
@@ -293,7 +289,7 @@ impl Operation for SubscribeOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, self._ttl)
+            build_op_result(self.id, new_state, return_msg)
         })
     }
 }
@@ -302,12 +298,10 @@ fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
-    ttl: Duration,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|state| SubscribeOp {
         id,
         state: Some(state),
-        _ttl: ttl,
     });
     Ok(OperationResult {
         return_msg: msg.map(Message::from),
@@ -318,11 +312,7 @@ fn build_op_result(
 pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp {
-        id,
-        state,
-        _ttl: PEER_TIMEOUT,
-    }
+    SubscribeOp { id, state }
 }
 
 #[derive(Debug)]
@@ -377,7 +367,6 @@ pub(crate) async fn request_subscribe(
             let op = SubscribeOp {
                 id,
                 state: new_state,
-                _ttl: sub_op._ttl,
             };
             op_storage
                 .notify_op_change(Message::from(msg), OpEnum::Subscribe(op), client_id)
@@ -471,7 +460,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use freenet_stdlib::client_api::ContractRequest;
 

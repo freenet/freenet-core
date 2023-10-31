@@ -1,6 +1,9 @@
 //! Main message type which encapsulated all the messaging between nodes.
 
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    time::{Duration, SystemTime},
+};
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -31,14 +34,15 @@ pub(crate) struct Transaction {
 }
 
 impl Transaction {
-    pub fn new<T: TxType>() -> Transaction {
+    pub fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
         Self::update(ty.0, id)
+        // Self { id }
     }
 
     pub fn tx_type(&self) -> TransactionType {
-        let id_byte = (self.id.0 >> 120) as u8;
+        let id_byte = (self.id.0 & 0xFFu128) as u8;
         match id_byte {
             0 => TransactionType::Connect,
             1 => TransactionType::Put,
@@ -49,24 +53,50 @@ impl Transaction {
         }
     }
 
+    pub fn timed_out(&self) -> bool {
+        self.elapsed() >= crate::config::OPERATION_TTL
+    }
+
+    fn elapsed(&self) -> Duration {
+        let current_unix_epoch_ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("now should be always be later than unix epoch")
+            .as_millis() as u64;
+        let this_tx_creation = self.id.timestamp_ms();
+        if current_unix_epoch_ts < this_tx_creation {
+            Duration::new(0, 0)
+        } else {
+            let ms_elapsed = current_unix_epoch_ts - this_tx_creation;
+            Duration::from_millis(ms_elapsed)
+        }
+    }
+
+    /// Generate a random transaction which has the implicit TTL cutoff.
+    ///
+    /// This will allow, for example, to compare against any older transactions,
+    /// in order to remove them.
+    pub fn ttl_transaction() -> Self {
+        let id = Ulid::new();
+        let ts = id.timestamp_ms();
+        const TTL_MS: u64 = crate::config::OPERATION_TTL.as_millis() as u64;
+        let ttl_epoch: u64 = ts - TTL_MS;
+
+        // Clear the ts significant bits of the ULID and replace them with the new cutoff ts.
+        const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
+        let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
+        Self { id: Ulid(new_ulid) }
+    }
+
     fn update(ty: TransactionType, id: Ulid) -> Self {
+        const TYPE_MASK: u128 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00u128;
         // Clear the last byte
-        let cleared = id.0 & !(0xFFu128 << 120);
+        let cleared = id.0 & TYPE_MASK;
         // Set the last byte with the transaction type
-        let ty = ty as u8;
-        let updated = cleared | (u128::from(ty) << 120);
+        let updated = cleared | (ty as u8) as u128;
 
         // 2 words size for 64-bits platforms
         Self { id: Ulid(updated) }
     }
-}
-
-#[test]
-fn pack_transaction() {
-    let tx = Transaction::update(TransactionType::Connect, Ulid::new());
-    assert_eq!(tx.tx_type(), TransactionType::Connect);
-    let tx = Transaction::update(TransactionType::Subscribe, Ulid::new());
-    assert_eq!(tx.tx_type(), TransactionType::Subscribe);
 }
 
 #[cfg(test)]
@@ -300,4 +330,50 @@ pub(crate) struct Visit {
     pub hop: u8,
     pub latency: Duration,
     pub location: Location,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_transaction_type() {
+        let ts_0 = Ulid::new();
+        std::thread::sleep(Duration::from_millis(1));
+        let tx = Transaction::update(TransactionType::Connect, Ulid::new());
+        assert_eq!(tx.tx_type(), TransactionType::Connect);
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new());
+        assert_eq!(tx.tx_type(), TransactionType::Subscribe);
+        std::thread::sleep(Duration::from_millis(1));
+        let ts_1 = Ulid::new();
+        assert!(
+            tx.id.timestamp_ms() > ts_0.timestamp_ms(),
+            "{} <= {}",
+            tx.id.datetime(),
+            ts_0.datetime()
+        );
+        assert!(
+            tx.id.timestamp_ms() < ts_1.timestamp_ms(),
+            "{} >= {}",
+            tx.id.datetime(),
+            ts_1.datetime()
+        );
+    }
+
+    #[test]
+    fn get_ttl_cutoff_transaction() {
+        let ttl_tx = Transaction::ttl_transaction();
+        let original_tx = Transaction::new::<crate::operations::get::GetMsg>();
+
+        assert!(original_tx > ttl_tx);
+        assert!(ttl_tx.timed_out());
+        assert!(
+            original_tx.id.timestamp_ms() - ttl_tx.id.timestamp_ms()
+                >= crate::config::OPERATION_TTL.as_millis() as u64
+        );
+        assert!(
+            original_tx.id.timestamp_ms() - ttl_tx.id.timestamp_ms()
+                < crate::config::OPERATION_TTL.as_millis() as u64 + 1
+        );
+    }
 }

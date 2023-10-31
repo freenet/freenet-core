@@ -100,11 +100,7 @@ impl NetworkBridge for MemoryConnManager {
             .expect("unique lock")
             .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager))
             .await;
-        self.op_manager
-            .live_transactions_peers
-            .entry(*target)
-            .or_default()
-            .push(*msg.id());
+        self.op_manager.sending_transaction(target, msg.id());
         let msg = bincode::serialize(&msg)?;
         self.transport.send(*target, msg);
         Ok(())
