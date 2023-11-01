@@ -20,5 +20,5 @@ distance(a, b) cancel out
 
 */
 
-mod sliding_window;
+mod request_density_tracker;
 mod small_world_rand;

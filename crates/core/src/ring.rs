@@ -20,7 +20,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
-    time::Duration,
+    time::Duration, ops::Add,
 };
 
 use anyhow::bail;
@@ -545,14 +545,31 @@ impl Distance {
     pub fn new(value: f64) -> Self {
         debug_assert!(!value.is_nan(), "Distance cannot be NaN");
         debug_assert!(
-            (0.0..=0.5).contains(&value),
-            "Distance must be in the range [0, 0.5]"
+            (0.0..=1.0).contains(&value),
+            "Distance must be in the range [0, 1.0]"
         );
-        Distance(value)
+        if value <= 0.5 {
+            Distance(value)
+        } else {
+            Distance(1.0 - value)
+        }
     }
 
     pub fn as_f64(&self) -> f64 {
         self.0
+    }
+}
+
+impl Add for Distance {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let d = self.0 + rhs.0;
+        if d > 0.5 {
+            Distance::new(1.0 - d)
+        } else {
+            Distance::new(d)
+        }
     }
 }
 
