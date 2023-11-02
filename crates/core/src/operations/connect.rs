@@ -320,7 +320,7 @@ impl Operation for ConnectOp {
                     } else {
                         tracing::debug!(
                             tx = %id,
-                            "Not accepting new proxy connection for sender {}",
+                            "Not accepting new proxy connection from {}",
                             joiner.peer
                         );
                     }
@@ -366,7 +366,7 @@ impl Operation for ConnectOp {
                 }
                 ConnectMsg::Response {
                     id,
-                    sender,
+                    sender: gateway,
                     target,
                     msg:
                         ConnectResponse::AcceptedBy {
@@ -378,7 +378,7 @@ impl Operation for ConnectOp {
                     tracing::debug!(
                         tx = %id,
                         this_peer = %target.peer,
-                        "Connect response received from {}", sender.peer
+                        "Connect response received from {}", gateway.peer
                     );
 
                     // Set the given location
@@ -394,20 +394,26 @@ impl Operation for ConnectOp {
                     if !accepted_by.is_empty() {
                         tracing::debug!(
                             tx = %id,
-                            "OC received and acknowledged at requesting peer {} from gateway {}",
+                            "OC acknowledged at requesting peer {} from gateway {}",
                             your_peer_id,
                             gateway.peer
                         );
                         new_state = Some(ConnectState::OCReceived);
-                        return_msg = Some(ConnectMsg::Response {
-                            id: *id,
-                            msg: ConnectResponse::ReceivedOC {
-                                by_peer: pk_loc,
-                                gateway,
-                            },
-                            sender: pk_loc,
-                            target: *sender,
-                        });
+                        if accepted_by.contains(&gateway) {
+                            // just send back a message in case the gw accepteds the connection
+                            // otherwise skip sending anything back
+                            return_msg = Some(ConnectMsg::Response {
+                                id: *id,
+                                msg: ConnectResponse::ReceivedOC {
+                                    by_peer: pk_loc,
+                                    gateway,
+                                },
+                                sender: pk_loc,
+                                target: gateway,
+                            });
+                        } else {
+                            return_msg = None;
+                        }
                         tracing::debug!(
                             tx = %id,
                             this_peer = %your_peer_id,
@@ -420,7 +426,7 @@ impl Operation for ConnectOp {
                             let _ = propagate_oc_to_accepted_peers(
                                 network_bridge,
                                 op_storage,
-                                *sender,
+                                gateway,
                                 other_peer,
                                 ConnectMsg::Response {
                                     id: *id,
@@ -472,10 +478,10 @@ impl Operation for ConnectOp {
                             new_location,
                         }) => {
                             let own_loc = op_storage.ring.own_location();
-                            let is_accepted: bool = accepted_by.contains(&own_loc);
                             let target_is_joiner = new_peer_id == original_target.peer;
 
                             previously_accepted.extend(accepted_by.iter().copied());
+                            let is_accepted: bool = previously_accepted.contains(&own_loc);
                             if is_accepted {
                                 new_state = Some(ConnectState::OCReceived);
                             } else {
@@ -600,7 +606,10 @@ impl Operation for ConnectOp {
                                 Box::new(other_state),
                             ))
                         }
-                        None => return Err(OpError::invalid_transition(self.id)),
+                        None => {
+                            tracing::error!(tx = %self.id, this_peer =  %target.peer, "completed");
+                            return Err(OpError::invalid_transition(self.id));
+                        }
                     }
 
                     network_bridge.add_connection(sender.peer).await?;
@@ -784,7 +793,6 @@ pub(crate) fn initial_request(
     id: Transaction,
 ) -> ConnectOp {
     const MAX_JOIN_RETRIES: usize = usize::MAX;
-    tracing::debug!(tx = %id, "Connecting to gateway {} from {}", gateway.peer, this_peer);
     let state = ConnectState::Connecting(ConnectionInfo {
         gateway,
         this_peer,
@@ -828,7 +836,8 @@ where
 
     tracing::info!(
         tx = %id,
-        "Connecting to peer {} (at {})",
+        %this_peer,
+        "Connecting to gateway {} (at {})",
         gateway.peer,
         gateway.location.ok_or(ConnectionError::LocationUnknown)?,
     );
@@ -900,7 +909,7 @@ where
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        ring.random_peer(|p| p != &req_peer.peer)
+        ring.random_peer(|p| !skip_list.contains(p))
     } else {
         tracing::debug!(
             tx = %id,
@@ -1151,9 +1160,9 @@ mod test {
     }
 
     /// Given a network of N peers all good connectivity
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn network_should_achieve_good_connectivity() -> Result<(), anyhow::Error> {
-        crate::config::set_logger();
+        // crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 2usize;
         let mut sim_nw = SimNetwork::new(
@@ -1166,10 +1175,14 @@ mod test {
             2,
         )
         .await;
-        sim_nw.with_start_backoff(Duration::from_millis(200));
+        sim_nw.with_start_backoff(Duration::from_millis(100));
         sim_nw.start().await;
         sim_nw.check_connectivity(Duration::from_secs(10)).await?;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        sim_nw.network_connectivity_quality()
+        // wait for a bit so peers can acquire more connections
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        sim_nw.network_connectivity_quality()?;
+        sim_nw.print_network_connections();
+        sim_nw.print_ring_distribution();
+        Ok(())
     }
 }

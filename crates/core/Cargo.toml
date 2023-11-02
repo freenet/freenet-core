@@ -90,7 +90,6 @@ pico-args = "0.5"
 statrs = "0.16.0"
 freenet-stdlib = { workspace = true, features = ["testing", "net"] }
 chrono = { workspace = true, features = ["arbitrary"] }
-statrs = "0.16.0"
 
 [features]
 default = ["trace", "websocket", "sqlite"]

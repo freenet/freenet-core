@@ -208,6 +208,7 @@ impl OpManager {
     }
 }
 
+#[tracing::instrument(skip_all)]
 async fn garbage_cleanup_task(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
     ops: Arc<Ops>,

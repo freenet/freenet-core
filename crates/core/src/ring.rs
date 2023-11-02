@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
-    time::{ops::Add, Duration, Instant},
+    time::{Duration, Instant},
 };
 
 use anyhow::bail;
@@ -46,7 +46,7 @@ use crate::{
     DynError,
 };
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 /// The location of a peer in the ring. This location allows routing towards the peer.
 pub(crate) struct PeerKeyLocation {
@@ -70,6 +70,21 @@ impl From<PeerKey> for PeerKeyLocation {
         PeerKeyLocation {
             peer,
             location: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for PeerKeyLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Display>::fmt(self, f)
+    }
+}
+
+impl Display for PeerKeyLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.location {
+            Some(loc) => write!(f, "{} (@ {loc})", self.peer),
+            None => write!(f, "{}", self.peer),
         }
     }
 }
@@ -451,7 +466,7 @@ impl Ring {
         let mut rng = rand::thread_rng();
         let mut attempts = 0;
         loop {
-            if attempts >= amount {
+            if attempts >= amount * 2 {
                 return None;
             }
             let selected = rng.gen_range(0..amount);
@@ -543,6 +558,7 @@ impl Ring {
             .map(|(_, ploc)| ploc.location)
     }
 
+    #[tracing::instrument(skip_all)]
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
@@ -566,15 +582,23 @@ impl Ring {
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(1);
+        #[cfg(test)]
+        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_millis(100);
+        #[cfg(not(test))]
+        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(1);
 
         let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
         check_interval.tick().await;
-        let mut acquire_max_connections = tokio::time::interval(Duration::from_secs(1));
+        let mut acquire_max_connections = tokio::time::interval(ACQUIRE_CONNS_TICK_DURATION);
         acquire_max_connections.tick().await;
 
-        // todo: this skip list should be updated with peers we recently tried to acquire connections through
-        // but failed to do so
         let mut missing = BTreeMap::new();
+
+        #[cfg(not(test))]
+        let retry_interval = REMOVAL_TICK_DURATION * 2;
+        #[cfg(test)]
+        let retry_interval = Duration::from_secs(5);
+
         'outer: loop {
             loop {
                 match missing_candidates.try_recv() {
@@ -588,33 +612,21 @@ impl Ring {
                     }
                 }
             }
-            missing.split_off(&Reverse(Instant::now() - REMOVAL_TICK_DURATION * 2));
-            let (mut current_connections, mut should_swap) = {
-                let peers = self.connections_by_location.read();
-                (
-                    peers.len(),
-                    should_swap(
-                        peers
-                            .values()
-                            .filter(|conn| {
-                                conn.open_at.elapsed() > CONNECTION_AGE_THRESOLD
-                                    && !live_tx_tracker.has_live_connection(&conn.location.peer)
-                            })
-                            .map(|conn| &conn.location),
-                    ),
-                )
-            };
+            // eventually peers which failed to return candidates should be retried when enough time has passed
+            let retry_missing_candidates_until = Instant::now() - retry_interval;
+            missing.split_off(&Reverse(retry_missing_candidates_until));
 
-            if current_connections < self.max_connections {
+            if self
+                .open_connections
+                .load(std::sync::atomic::Ordering::Acquire)
+                < self.max_connections
+            {
                 // requires more connections
                 let ideal_target_dist =
                     crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
                 self.acquire_new(
                     ideal_target_dist,
-                    &missing
-                        .values()
-                        .copied()
-                        .collect::<ArrayVec<PeerKey, { 5120 / 80 }>>(),
+                    &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
                     &notifier,
                 )
                 .await
@@ -622,21 +634,37 @@ impl Ring {
                     tracing::debug!(?error, "shutting down connection maintenance task");
                     error
                 })?;
-                current_connections = self.connections_by_location.read().len();
-                if current_connections < self.max_connections {
+                if self
+                    .open_connections
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    < self.max_connections
+                {
                     acquire_max_connections.tick().await;
+                    continue;
                 } else {
                     check_interval.tick().await;
+                    continue;
                 }
-            } else if !should_swap.is_empty() {
+            }
+
+            let mut should_swap = {
+                let peers = self.connections_by_location.read();
+                should_swap(
+                    peers
+                        .values()
+                        .filter(|conn| {
+                            conn.open_at.elapsed() > CONNECTION_AGE_THRESOLD
+                                && !live_tx_tracker.has_live_connection(&conn.location.peer)
+                        })
+                        .map(|conn| &conn.location),
+                )
+            };
+            if !should_swap.is_empty() {
                 let ideal_target_dist =
                     crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
                 self.acquire_new(
                     ideal_target_dist,
-                    &missing
-                        .values()
-                        .copied()
-                        .collect::<ArrayVec<PeerKey, { 5120 / 80 }>>(),
+                    &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
                     &notifier,
                 )
                 .await
@@ -655,17 +683,16 @@ impl Ring {
                             error
                         })?;
                 }
-                check_interval.tick().await;
-            } else {
-                check_interval.tick().await;
             }
+            check_interval.tick().await;
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self, notifier))]
     async fn acquire_new(
         &self,
         ideal_target_dist: Distance,
-        skip_list: &[PeerKey],
+        skip_list: &[&PeerKey],
         notifier: &EventLoopNotificationsSender,
     ) -> Result<(), DynError> {
         let Some(msg) = Self::find_optimal_query_target(
@@ -685,7 +712,7 @@ impl Ring {
     fn find_optimal_query_target<'a>(
         (joiner, ideal_target_dist): (PeerKeyLocation, Distance),
         connections_by_location: impl Iterator<Item = (&'a Location, &'a PeerKeyLocation)>,
-        skip_list: &[PeerKey],
+        skip_list: &[&PeerKey],
     ) -> Option<connect::ConnectMsg> {
         let own_location = joiner.location?;
         let acceptable_range = ideal_target_dist.0 * 0.05;
@@ -700,7 +727,7 @@ impl Ring {
             .filter_map(|(loc, peer)| {
                 let dist: Distance = own_location.distance(loc);
                 let is_valid = ((dist - ideal_target_dist).abs() < acceptable_range)
-                    && !skip_list.contains(&peer.peer);
+                    && !skip_list.contains(&&peer.peer);
                 is_valid.then_some((dist, peer))
             })
             .collect::<ArrayVec<_, { Ring::MAX_CONNECTIONS }>>();
@@ -710,6 +737,12 @@ impl Ring {
         // it should have the most connections potentially to the ideal target location
         let (_, request_to) = request_to.first()?;
 
+        tracing::debug!(
+            this_peer = %joiner,
+            query_target = %request_to,
+            %ideal_target_dist,
+            "Adding new connections"
+        );
         Some(connect::ConnectMsg::Request {
             id: Transaction::new::<connect::ConnectMsg>(),
             msg: connect::ConnectRequest::FindOptimalPeer {
@@ -878,7 +911,6 @@ impl PartialEq for Distance {
     }
 }
 
-#[allow(clippy::incorrect_partial_ord_impl_on_ord_type)]
 impl PartialOrd for Distance {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))

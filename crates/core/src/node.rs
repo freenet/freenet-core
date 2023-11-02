@@ -532,14 +532,19 @@ async fn report_result(
                     tracing::error!("Finished transaction with error: {err}");
                     return;
                 };
-                tracing::error!(%tx, ?state, "Wrong state");
                 // todo: this can be improved once std::backtrace::Backtrace::frames is stabilized
                 let trace = format!("{trace}");
                 let mut tr_lines = trace.lines();
-                if let Some(second_trace) = tr_lines.nth(2) {
-                    let second_trace_lines = [second_trace, tr_lines.next().unwrap_or_default()];
-                    eprintln!("{}", second_trace_lines.join("\n"));
-                }
+                let trace = tr_lines
+                    .nth(2)
+                    .map(|second_trace| {
+                        let second_trace_lines =
+                            [second_trace, tr_lines.next().unwrap_or_default()];
+                        second_trace_lines.join("\n")
+                    })
+                    .unwrap_or_default();
+                tracing::error!(%tx, ?state, "Wrong state");
+                eprintln!("{trace}");
             }
             #[cfg(not(debug_assertions))]
             {
@@ -715,7 +720,7 @@ where
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct PeerKey(PeerId);
 
 #[cfg(test)]
@@ -739,6 +744,12 @@ impl PeerKey {
     #[cfg(test)]
     pub fn to_bytes(self) -> Vec<u8> {
         self.0.to_bytes()
+    }
+}
+
+impl std::fmt::Debug for PeerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Display>::fmt(self, f)
     }
 }
 

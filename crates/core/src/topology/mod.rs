@@ -11,9 +11,9 @@ use tracing::{debug, error, info};
 
 use self::{request_density_tracker::DensityMapError, small_world_rand::random_link_distance};
 
-mod connection_evaluator;
+pub mod connection_evaluator;
 mod request_density_tracker;
-mod small_world_rand;
+pub mod small_world_rand;
 
 const SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(5 * 60);
 const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(60);
