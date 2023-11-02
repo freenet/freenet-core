@@ -4,7 +4,9 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 
 use super::{
-    client_event_handling, handle_cancelled_op, join_ring_request,
+    client_event_handling,
+    event_log::EventLog,
+    handle_cancelled_op, join_ring_request,
     network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
     op_state_manager::OpManager,
     process_message, EventLogRegister, PeerKey,
@@ -210,12 +212,15 @@ impl NodeInMemory {
                 Ok(Either::Left(msg)) => Ok(msg),
                 Ok(Either::Right(action)) => match action {
                     NodeEvent::ShutdownNode => break Ok(()),
-                    NodeEvent::ConfirmedInbound => continue,
-                    NodeEvent::DropConnection(_) => continue,
-                    NodeEvent::AcceptConnection(_) => continue,
-                    NodeEvent::Error(err) => {
-                        tracing::error!("Connection error within ops: {err}");
+                    NodeEvent::DropConnection(peer) => {
+                        tracing::info!("Dropping connection to {peer}");
+                        self.event_listener
+                            .register_events(Either::Left(EventLog::disconnected(&peer)));
+                        self.op_storage.ring.prune_connection(peer);
                         continue;
+                    }
+                    other => {
+                        unreachable!("event {other:?}, shouldn't happen in the in-memory impl")
                     }
                 },
                 Err(err) => Err(err),

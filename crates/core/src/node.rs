@@ -526,14 +526,24 @@ async fn report_result(
             if let Some(tx) = tx {
                 op_storage.completed(tx);
             }
-            if cfg!(debug_assertions) {
-                let OpError::InvalidStateTransition { tx, state } = err else {
+            #[cfg(debug_assertions)]
+            {
+                let OpError::InvalidStateTransition { tx, state, trace } = err else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;
                 };
-                tracing::error!(%tx, "Wrong state: {state:?}");
-            } else {
-                tracing::debug!("Finished transaction with error: {err}")
+                tracing::error!(%tx, ?state, "Wrong state");
+                // todo: this can be improved once std::backtrace::Backtrace::frames is stabilized
+                let trace = format!("{trace}");
+                let mut tr_lines = trace.lines();
+                if let Some(second_trace) = tr_lines.nth(2) {
+                    let second_trace_lines = [second_trace, tr_lines.next().unwrap_or_default()];
+                    eprintln!("{}", second_trace_lines.join("\n"));
+                }
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                tracing::debug!("Finished transaction with error: {err}");
             }
         }
     }

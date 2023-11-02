@@ -71,6 +71,14 @@ impl<'a> EventLog<'a> {
         }
     }
 
+    pub fn disconnected(from: &'a PeerKey) -> Self {
+        EventLog {
+            tx: Transaction::NULL,
+            peer_id: from,
+            kind: EventKind::Disconnected,
+        }
+    }
+
     pub fn from_outbound_msg(
         msg: &'a Message,
         op_storage: &'a OpManager,
@@ -537,6 +545,7 @@ enum EventKind {
         at: PeerKeyLocation,
     },
     Ignored,
+    Disconnected,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -751,10 +760,23 @@ pub(super) mod test {
         /// Unique connections for a given peer and their relative distance to other peers.
         pub fn connections(&self, peer: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
             let logs = self.logs.lock();
+            let disconnects = logs
+                .iter()
+                .filter(|l| matches!(l.kind, EventKind::Disconnected))
+                .fold(HashMap::<_, Vec<_>>::new(), |mut map, log| {
+                    map.entry(log.peer_id).or_default().push(log.datetime);
+                    map
+                });
+
             logs.iter()
                 .filter_map(|l| {
                     if let EventKind::Connected { this, connected } = l.kind {
-                        if this.peer == peer {
+                        let disconnected = disconnects
+                            .get(&connected.peer)
+                            .iter()
+                            .flat_map(|dcs| dcs.iter())
+                            .any(|dc| dc > &l.datetime);
+                        if this.peer == peer && !disconnected {
                             return Some((
                                 connected.peer,
                                 connected

@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+use std::backtrace::Backtrace as StdTrace;
 use std::time::Duration;
 
 use tokio::sync::mpsc::error::SendError;
@@ -194,7 +196,10 @@ pub(crate) enum OpError {
     #[error("cannot perform a state transition from the current state with the provided input (tx: {tx})")]
     InvalidStateTransition {
         tx: Transaction,
+        #[cfg(debug_assertions)]
         state: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
+        #[cfg(debug_assertions)]
+        trace: StdTrace,
     },
     #[error("failed notifying, channel closed")]
     NotificationError,
@@ -215,8 +220,27 @@ pub(crate) enum OpError {
 }
 
 impl OpError {
-    pub fn invalid_state(tx: Transaction) -> Self {
-        Self::InvalidStateTransition { tx, state: None }
+    pub fn invalid_transition(tx: Transaction) -> Self {
+        Self::InvalidStateTransition {
+            tx,
+            #[cfg(debug_assertions)]
+            state: None,
+            #[cfg(debug_assertions)]
+            trace: StdTrace::force_capture(),
+        }
+    }
+
+    pub fn invalid_transition_with_state(
+        tx: Transaction,
+        state: Box<dyn std::fmt::Debug + Send + Sync>,
+    ) -> Self {
+        Self::InvalidStateTransition {
+            tx,
+            #[cfg(debug_assertions)]
+            state: Some(state),
+            #[cfg(debug_assertions)]
+            trace: StdTrace::force_capture(),
+        }
     }
 }
 

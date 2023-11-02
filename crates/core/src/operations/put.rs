@@ -445,7 +445,7 @@ impl Operation for PutOp {
                             new_state = None;
                             return_msg = None;
                         }
-                        _ => return Err(OpError::invalid_state(self.id)),
+                        _ => return Err(OpError::invalid_transition(self.id)),
                     };
                     tracing::debug!(
                         "Peer {} completed contract value put",
@@ -601,7 +601,7 @@ async fn try_to_broadcast(
                 return Err(OpError::StatePushed);
             }
         }
-        _ => return Err(OpError::invalid_state(id)),
+        _ => return Err(OpError::invalid_transition(id)),
     };
 
     Ok((new_state, return_msg))
@@ -714,7 +714,7 @@ pub(crate) async fn request_put(
                 .notify_op_change(Message::from(msg), OpEnum::Put(op), client_id)
                 .await?;
         }
-        _ => return Err(OpError::invalid_state(put_op.id)),
+        _ => return Err(OpError::invalid_transition(put_op.id)),
     };
 
     Ok(())

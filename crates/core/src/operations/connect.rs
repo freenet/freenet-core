@@ -251,7 +251,7 @@ impl Operation for ConnectOp {
                         (new_peer_loc, new_peer_loc),
                         *hops_to_live,
                         accepted_by.clone(),
-                        vec![this_node_loc.peer],
+                        vec![this_node_loc.peer, *joiner],
                     )
                     .await?
                     {
@@ -354,12 +354,13 @@ impl Operation for ConnectOp {
                                 new_state = state;
                                 return_msg = msg;
                             }
-                            other_state => {
-                                return Err(OpError::InvalidStateTransition {
-                                    tx: self.id,
-                                    state: other_state.map(|s| Box::new(s) as _),
-                                })
+                            Some(other_state) => {
+                                return Err(OpError::invalid_transition_with_state(
+                                    self.id,
+                                    Box::new(other_state),
+                                ))
                             }
+                            None => return Err(OpError::invalid_transition(self.id)),
                         };
                     }
                 }
@@ -388,7 +389,7 @@ impl Operation for ConnectOp {
 
                     let Some(ConnectState::Connecting(ConnectionInfo { gateway, .. })) = self.state
                     else {
-                        return Err(OpError::invalid_state(self.id));
+                        return Err(OpError::invalid_transition(self.id));
                     };
                     if !accepted_by.is_empty() {
                         tracing::debug!(
@@ -562,12 +563,13 @@ impl Operation for ConnectOp {
                                 new_state = None;
                             }
                         }
-                        other_state => {
-                            return Err(OpError::InvalidStateTransition {
-                                tx: self.id,
-                                state: other_state.map(|s| Box::new(s) as _),
-                            });
+                        Some(other_state) => {
+                            return Err(OpError::invalid_transition_with_state(
+                                self.id,
+                                Box::new(other_state),
+                            ))
                         }
+                        None => return Err(OpError::invalid_transition(self.id)),
                     }
                 }
                 ConnectMsg::Response {
@@ -592,12 +594,13 @@ impl Operation for ConnectOp {
                                 new_state = None;
                             }
                         }
-                        other_state => {
-                            return Err(OpError::InvalidStateTransition {
-                                tx: self.id,
-                                state: other_state.map(|s| Box::new(s) as _),
-                            })
+                        Some(other_state) => {
+                            return Err(OpError::invalid_transition_with_state(
+                                self.id,
+                                Box::new(other_state),
+                            ))
                         }
+                        None => return Err(OpError::invalid_transition(self.id)),
                     }
 
                     network_bridge.add_connection(sender.peer).await?;
@@ -616,12 +619,13 @@ impl Operation for ConnectOp {
                             tracing::debug!(tx = %id, "Acknowledge connected at peer {}", target.peer);
                             return_msg = None;
                         }
-                        other_state => {
-                            return Err(OpError::InvalidStateTransition {
-                                tx: self.id,
-                                state: other_state.map(|s| Box::new(s) as _),
-                            })
+                        Some(other_state) => {
+                            return Err(OpError::invalid_transition_with_state(
+                                self.id,
+                                Box::new(other_state),
+                            ))
                         }
+                        None => return Err(OpError::invalid_transition(self.id)),
                     };
                     tracing::info!(
                         tx = %id,

@@ -203,7 +203,7 @@ impl Operation for SubscribeOp {
                                 subscribed: true,
                             });
                         }
-                        _ => return Err(OpError::invalid_state(self.id)),
+                        _ => return Err(OpError::invalid_transition(self.id)),
                     }
                 }
                 SubscribeMsg::ReturnSub {
@@ -253,7 +253,7 @@ impl Operation for SubscribeOp {
                                 return Err(OpError::MaxRetriesExceeded(*id, id.tx_type()));
                             }
                         }
-                        _ => return Err(OpError::invalid_state(self.id)),
+                        _ => return Err(OpError::invalid_transition(self.id)),
                     }
                 }
                 SubscribeMsg::ReturnSub {
@@ -280,7 +280,7 @@ impl Operation for SubscribeOp {
                             return_msg = None;
                         }
                         _other => {
-                            return Err(OpError::invalid_state(self.id));
+                            return Err(OpError::invalid_transition(self.id));
                         }
                     }
                 }
@@ -370,7 +370,7 @@ pub(crate) async fn request_subscribe(
                 .notify_op_change(Message::from(msg), OpEnum::Subscribe(op), client_id)
                 .await?;
         }
-        _ => return Err(OpError::invalid_state(sub_op.id)),
+        _ => return Err(OpError::invalid_transition(sub_op.id)),
     }
 
     Ok(())

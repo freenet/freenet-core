@@ -200,13 +200,6 @@ impl OpManager {
         self.ops.completed.insert(id);
     }
 
-    pub fn prune_connection(&self, peer: PeerKey) {
-        self.ring
-            .live_tx_tracker
-            .prune_transactions_from_peer(&peer);
-        self.ring.prune_connection(peer);
-    }
-
     /// Notify the operation manager that a transaction is being transacted over the network.
     pub fn sending_transaction(&self, peer: &PeerKey, transaction: &Transaction) {
         self.ring

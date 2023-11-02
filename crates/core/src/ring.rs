@@ -118,7 +118,7 @@ impl LiveTransactionTracker {
         }
     }
 
-    pub fn prune_transactions_from_peer(&self, peer: &PeerKey) {
+    fn prune_transactions_from_peer(&self, peer: &PeerKey) {
         self.tx_per_peer.remove(peer);
     }
 
@@ -509,6 +509,11 @@ impl Ring {
     }
 
     pub fn prune_connection(&self, peer: PeerKey) {
+        #[cfg(debug_assertions)]
+        {
+            tracing::info!(%peer, "Removing connection");
+        }
+        self.live_tx_tracker.prune_transactions_from_peer(&peer);
         let loc = self.location_for_peer.write().remove(&peer).unwrap();
         {
             let conns = &mut *self.connections_by_location.write();
@@ -584,7 +589,7 @@ impl Ring {
                 }
             }
             missing.split_off(&Reverse(Instant::now() - REMOVAL_TICK_DURATION * 2));
-            let (mut current_connections, should_swap) = {
+            let (mut current_connections, mut should_swap) = {
                 let peers = self.connections_by_location.read();
                 (
                     peers.len(),
@@ -626,7 +631,6 @@ impl Ring {
             } else if !should_swap.is_empty() {
                 let ideal_target_dist =
                     crate::topology::small_world_rand::random_link_distance(OPTIMAL_DISTANCE);
-                // todo: drop connections in should_swap
                 self.acquire_new(
                     ideal_target_dist,
                     &missing
@@ -640,6 +644,17 @@ impl Ring {
                     tracing::warn!(?error, "shutting down connection maintenance task");
                     error
                 })?;
+                for peer in should_swap.drain(..) {
+                    notifier
+                        .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                            peer,
+                        )))
+                        .await
+                        .map_err(|error| {
+                            tracing::debug!(?error, "shutting down connection maintenance task");
+                            error
+                        })?;
+                }
                 check_interval.tick().await;
             } else {
                 check_interval.tick().await;

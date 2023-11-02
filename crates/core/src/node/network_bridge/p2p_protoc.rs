@@ -211,13 +211,18 @@ impl NetworkBridge for P2pBridge {
             .send(Right(NodeEvent::DropConnection(*peer)))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
+        self.log_register
+            .try_lock()
+            .expect("single reference")
+            .register_events(Either::Left(EventLog::disconnected(peer)))
+            .await;
         Ok(())
     }
 
     async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
         self.log_register
-            .lock()
-            .await
+            .try_lock()
+            .expect("single reference")
             .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager));
         self.op_manager.sending_transaction(target, msg.id());
         self.ev_listener_tx
@@ -511,10 +516,10 @@ impl P2pConnManager {
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
-                    op_manager.prune_connection(peer_id);
+                    op_manager.ring.prune_connection(peer_id);
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     let _ = self.swarm.disconnect_peer_id(peer_id.0);
-                    tracing::debug!("Dropped connection with peer {}", peer_id);
+                    tracing::info!("Dropped connection with peer {}", peer_id);
                 }
                 Ok(Right(UpdatePublicAddr(address))) => {
                     self.public_addr = Some(address);

@@ -34,6 +34,8 @@ pub(crate) struct Transaction {
 }
 
 impl Transaction {
+    pub const NULL: &'static Transaction = &Transaction { id: Ulid(0) };
+
     pub fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
