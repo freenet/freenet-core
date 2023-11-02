@@ -1,7 +1,7 @@
 #![allow(unused_variables, dead_code)]
 
 use std::{time::Duration, collections::BTreeMap, rc::Rc};
-use tracing::{info, debug, error, instrument};
+use tracing::{info, debug, error};
 use crate::ring::{Location, Distance};
 
 use self::{request_density_tracker::DensityMapError, cached_density_map::CachedDensityMap, small_world_rand::random_link_distance};
@@ -16,6 +16,24 @@ const REQUEST_DENSITY_TRACKER_WINDOW_SIZE: usize = 10_000;
 const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 const RANDOM_CLOSEST_DISTANCE: f64 = 1.0 / 1000.0;
 
+/// The goal of `TopologyManager` is to select new connections such that the
+/// distribution of connections in the network is as close as possible to the
+/// distribution of requests in the network. 
+/// 
+/// This is done by maintaining a `RequestDensityTracker` which tracks the
+/// distribution of requests in the network. The `TopologyManager` uses this
+/// tracker to create a `DensityMap` which is used to evaluate the density of
+/// requests at a given location.
+/// 
+/// The `TopologyManager` uses the density map to select the best candidate
+/// location, which is assumed to be close to peer connections that are
+/// currently receiving a lot of requests. This should have the effect of
+/// "balancing" out requests over time.
+/// 
+/// The `TopologyManager` also uses a `ConnectionEvaluator` to evaluate whether
+/// a given connection is better than all other connections within a predefined
+/// time window. The goal of this is to select the best connections over time
+/// from incoming join requests.
 pub(crate) struct TopologyManager {
     connection_evaluator: connection_evaluator::ConnectionEvaluator,
     request_density_tracker: request_density_tracker::RequestDensityTracker,

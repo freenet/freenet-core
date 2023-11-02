@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 /// `ConnectionEvaluator` is used to evaluate connection scores within a specified time window.
 ///
-/// The evaluator records scores and determines whether a given score is better (i.e., lower) than
-/// any other scores within a predefined time window. A score is considered better if it's lower
+/// The evaluator records scores and determines whether a given score is better (higher) than
+/// any other scores within a predefined time window. A score is considered better if it's higher
 /// than all other scores in the time window, or if no scores were recorded within the window's
 /// duration.
 /// 
@@ -31,7 +31,9 @@ impl ConnectionEvaluator {
     fn record_with_current_time(&mut self, score: f64, current_time: Instant) -> bool {
         self.remove_outdated_scores(current_time);
 
-        let is_better = self.scores.is_empty() || self.scores.iter().all(|&(_, s)| score < s);
+        let is_better = self.scores.is_empty() || self.scores.iter().all(|&(_, s)| score > s);
+
+        // Important to add new score *after* checking if it's better than all other scores
         self.scores.push_back((current_time, score));
 
         is_better
