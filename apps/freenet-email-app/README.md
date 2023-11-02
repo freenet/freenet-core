@@ -58,9 +58,9 @@ This delegate is located inside the modules folder of freenet-core:
       - `Makefile` <-- this file contains the build instructions for the delegate
       - ...
 
-Before building the delegate, cargo needs to know where to generate binaries:
+Add the target directory for the project. This should be an absolute file path to freenet-core/target.
 ```bash
-export CARGO_TARGET_DIR="./target"
+export CARGO_TARGET_DIR="... freenet-core/target"
 ```
 
 To build the delegate, go to the `identity-management` folder and run the following command:
