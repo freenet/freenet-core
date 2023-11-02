@@ -1,6 +1,6 @@
 # Getting Started
 
-This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-microblogging` app (located in under the `apps/freenet-microblogging` directory in the `freenet-core` repository).
+This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-email` app (located in under the `apps/freenet-email-app` directory in the `freenet-core` repository).
 
 <!-- toc -->
 
