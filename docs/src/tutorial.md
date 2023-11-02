@@ -30,6 +30,11 @@ cargo install freenet fdev
 This command will install `fdev` (Freenet development tool) and a working Freenet kernel that can
 be used for local development.
 
+### Add WebAssembly target
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
 ### Node.js and TypeScript
 
 To build user interfaces in JavaScript or TypeScript, you need to have Node.js
