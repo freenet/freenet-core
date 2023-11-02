@@ -191,8 +191,11 @@ pub(crate) enum OpError {
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
-    #[error("cannot perform a state transition from the current state with the provided input (tx: {0})")]
-    InvalidStateTransition(Transaction),
+    #[error("cannot perform a state transition from the current state with the provided input (tx: {tx})")]
+    InvalidStateTransition {
+        tx: Transaction,
+        state: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
+    },
     #[error("failed notifying, channel closed")]
     NotificationError,
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
@@ -209,6 +212,12 @@ pub(crate) enum OpError {
     /// was sent throught the fast path back to the storage.
     #[error("early push of state into the op stack")]
     StatePushed,
+}
+
+impl OpError {
+    pub fn invalid_state(tx: Transaction) -> Self {
+        Self::InvalidStateTransition { tx, state: None }
+    }
 }
 
 impl<T> From<SendError<T>> for OpError {

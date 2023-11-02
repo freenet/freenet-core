@@ -527,7 +527,11 @@ async fn report_result(
                 op_storage.completed(tx);
             }
             if cfg!(debug_assertions) {
-                tracing::error!("Finished transaction with error: {err}")
+                let OpError::InvalidStateTransition { tx, state } = err else {
+                    tracing::error!("Finished transaction with error: {err}");
+                    return;
+                };
+                tracing::error!(%tx, "Wrong state: {state:?}");
             } else {
                 tracing::debug!("Finished transaction with error: {err}")
             }

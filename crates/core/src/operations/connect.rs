@@ -148,8 +148,15 @@ impl Operation for ConnectOp {
                     };
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
-                        if let Some(desirable_peer) =
-                            op_storage.ring.closest_to_location(*ideal_location)
+                        tracing::debug!(
+                            tx = %id,
+                            query_target = %query_target.peer,
+                            joiner = %joiner.peer,
+                            "Got queried for new connections from joiner",
+                        );
+                        if let Some(desirable_peer) = op_storage
+                            .ring
+                            .closest_to_location(*ideal_location, &[joiner.peer])
                         {
                             let msg = ConnectMsg::Request {
                                 id: *id,
@@ -157,7 +164,7 @@ impl Operation for ConnectOp {
                                     sender: own_loc,
                                     joiner: *joiner,
                                     hops_to_live: 0,
-                                    skip_list: vec![*this_peer],
+                                    skip_list: vec![*this_peer, joiner.peer],
                                     accepted_by: HashSet::new(),
                                 },
                             };
@@ -181,6 +188,12 @@ impl Operation for ConnectOp {
                         }
                     } else {
                         // this peer is the one establishing connections
+                        tracing::debug!(
+                            tx = %id,
+                            query_target = %query_target.peer,
+                            this_peer = %joiner.peer,
+                            "Querying the query target for new connections",
+                        );
                         debug_assert_eq!(this_peer, &joiner.peer);
                         new_state = Some(ConnectState::AwaitingNewConnection {
                             query_target: query_target.peer,
@@ -341,7 +354,12 @@ impl Operation for ConnectOp {
                                 new_state = state;
                                 return_msg = msg;
                             }
-                            _ => return Err(OpError::InvalidStateTransition(self.id)),
+                            other_state => {
+                                return Err(OpError::InvalidStateTransition {
+                                    tx: self.id,
+                                    state: other_state.map(|s| Box::new(s) as _),
+                                })
+                            }
                         };
                     }
                 }
@@ -356,7 +374,11 @@ impl Operation for ConnectOp {
                             your_peer_id,
                         },
                 } => {
-                    tracing::debug!(tx = %id, "Connect response received from {}", sender.peer);
+                    tracing::debug!(
+                        tx = %id,
+                        this_peer = %target.peer,
+                        "Connect response received from {}", sender.peer
+                    );
 
                     // Set the given location
                     let pk_loc = PeerKeyLocation {
@@ -366,7 +388,7 @@ impl Operation for ConnectOp {
 
                     let Some(ConnectState::Connecting(ConnectionInfo { gateway, .. })) = self.state
                     else {
-                        return Err(OpError::InvalidStateTransition(self.id));
+                        return Err(OpError::invalid_state(self.id));
                     };
                     if !accepted_by.is_empty() {
                         tracing::debug!(
@@ -502,7 +524,7 @@ impl Operation for ConnectOp {
                                 target: joiner,
                                 sender: *target,
                                 msg: ConnectResponse::Proxy {
-                                    accepted_by: HashSet::from([*sender]),
+                                    accepted_by: accepted_by.clone(),
                                 },
                             });
                             new_state = None;
@@ -540,8 +562,11 @@ impl Operation for ConnectOp {
                                 new_state = None;
                             }
                         }
-                        _other_state => {
-                            return Err(OpError::InvalidStateTransition(self.id));
+                        other_state => {
+                            return Err(OpError::InvalidStateTransition {
+                                tx: self.id,
+                                state: other_state.map(|s| Box::new(s) as _),
+                            });
                         }
                     }
                 }
@@ -567,7 +592,12 @@ impl Operation for ConnectOp {
                                 new_state = None;
                             }
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        other_state => {
+                            return Err(OpError::InvalidStateTransition {
+                                tx: self.id,
+                                state: other_state.map(|s| Box::new(s) as _),
+                            })
+                        }
                     }
 
                     network_bridge.add_connection(sender.peer).await?;
@@ -586,7 +616,12 @@ impl Operation for ConnectOp {
                             tracing::debug!(tx = %id, "Acknowledge connected at peer {}", target.peer);
                             return_msg = None;
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        other_state => {
+                            return Err(OpError::InvalidStateTransition {
+                                tx: self.id,
+                                state: other_state.map(|s| Box::new(s) as _),
+                            })
+                        }
                     };
                     tracing::info!(
                         tx = %id,
@@ -744,7 +779,7 @@ pub(crate) fn initial_request(
     max_hops_to_live: usize,
     id: Transaction,
 ) -> ConnectOp {
-    const MAX_JOIN_RETRIES: usize = 3;
+    const MAX_JOIN_RETRIES: usize = usize::MAX;
     tracing::debug!(tx = %id, "Connecting to gateway {} from {}", gateway.peer, this_peer);
     let state = ConnectState::Connecting(ConnectionInfo {
         gateway,
@@ -1128,10 +1163,9 @@ mod test {
         )
         .await;
         sim_nw.with_start_backoff(Duration::from_millis(200));
-        println!("starting");
         sim_nw.start().await;
-        println!("started");
         sim_nw.check_connectivity(Duration::from_secs(10)).await?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
         sim_nw.network_connectivity_quality()
     }
 }

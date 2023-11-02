@@ -525,10 +525,15 @@ impl Ring {
         self.open_connections.fetch_sub(1, SeqCst);
     }
 
-    pub fn closest_to_location(&self, location: Location) -> Option<PeerKeyLocation> {
+    pub fn closest_to_location(
+        &self,
+        location: Location,
+        skip_list: &[PeerKey],
+    ) -> Option<PeerKeyLocation> {
         self.connections_by_location
             .read()
             .range(..location)
+            .filter(|(_, conn)| !skip_list.contains(&conn.location.peer))
             .next_back()
             .map(|(_, ploc)| ploc.location)
     }

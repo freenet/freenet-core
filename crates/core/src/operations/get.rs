@@ -350,10 +350,10 @@ impl Operation for GetOp {
                                     target: *sender,
                                 });
                             }
-                            _ => return Err(OpError::InvalidStateTransition(self.id)),
+                            _ => return Err(OpError::invalid_state(self.id)),
                         };
                     } else {
-                        return Err(OpError::InvalidStateTransition(id));
+                        return Err(OpError::invalid_state(id));
                     }
                 }
                 GetMsg::ReturnGet {
@@ -432,7 +432,7 @@ impl Operation for GetOp {
                                 target: *target,
                             });
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        _ => return Err(OpError::invalid_state(self.id)),
                     };
                 }
                 GetMsg::ReturnGet {
@@ -572,7 +572,7 @@ impl Operation for GetOp {
                                 target: *target,
                             });
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        _ => return Err(OpError::invalid_state(self.id)),
                     };
                 }
                 _ => return Err(OpError::UnexpectedOpState),
@@ -631,7 +631,7 @@ fn check_contract_found(
             returned_key,
             key
         );
-        return Err(OpError::InvalidStateTransition(id));
+        return Err(OpError::invalid_state(id));
     }
 
     match &value {
@@ -749,7 +749,7 @@ pub(crate) async fn request_get(
                 .notify_op_change(Message::from(msg), OpEnum::Get(op), client_id)
                 .await?;
         }
-        _ => return Err(OpError::InvalidStateTransition(get_op.id)),
+        _ => return Err(OpError::invalid_state(get_op.id)),
     }
     Ok(())
 }
