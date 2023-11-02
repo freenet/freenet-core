@@ -1,6 +1,6 @@
 # Getting Started
 
-This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-microblogging` app (located in under the `apps/freenet-microblogging` directory in the `freenet-core` repository).
+This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-email` app (located in under the `apps/freenet-email-app` directory in the `freenet-core` repository).
 
 <!-- toc -->
 
@@ -15,17 +15,25 @@ Mac (for Windows see [here](https://rustup.rs)):
 curl https://sh.rustup.rs -sSf | sh
 ```
 
+#### Note for MacOS install
+Do not have the `brew` version of rust installed as it will cause compications with `fdev`.
+
 ### Freenet development tool (fdev)
 
 Once you have a working installation of Cargo you can install the Freenet dev
 tools:
 
 ```bash
-cargo install freenet
+cargo install freenet fdev
 ```
 
 This command will install `fdev` (Freenet development tool) and a working Freenet kernel that can
 be used for local development.
+
+### Add WebAssembly target
+```bash
+rustup target add wasm32-unknown-unknown
+```
 
 ### Node.js and TypeScript
 
