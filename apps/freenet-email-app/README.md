@@ -15,11 +15,30 @@ local node, which simulates a node on the network.
   ```bash
   curl https://sh.rustup.rs -sSf | sh
   ```
+- (Ubuntu)
+  ```bash
+  sudo apt-get update
+  sudo apt-get install libssl-dev libclang-dev pkg-config
+  ```
 - Install the Freeenet development tool (fdev) and a working Freenet kernel that can be used for local development. Use cargo to install it:
   ```bash
   cargo install freenet
   cargo install fdev
   ```
+- Install Dioxus-CLI, a GUI library for rust
+  ```bash
+  cargo install dioxus-cli
+  ```
+- Add WebAssembly target
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
+- Initializing & Fetching Submodules
+  ```bash
+  git submodule update --init --recursive
+  ```
+### Note about MacOS
+Email account creation currently does not work on MacOS
 
 ## Prepare the Freenet email contracts and delegates
 
@@ -38,6 +57,11 @@ This delegate is located inside the modules folder of freenet-core:
       - `src/` <-- this folder contains the source code of the delegate
       - `Makefile` <-- this file contains the build instructions for the delegate
       - ...
+
+Before building the delegate, cargo needs to know where to generate binaries:
+```bash
+export CARGO_TARGET_DIR="./target"
+```
 
 To build the delegate, go to the `identity-management` folder and run the following command:
 

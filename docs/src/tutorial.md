@@ -15,13 +15,16 @@ Mac (for Windows see [here](https://rustup.rs)):
 curl https://sh.rustup.rs -sSf | sh
 ```
 
+#### Note for MacOS install
+Do not have the `brew` version of rust installed as it will cause compications with `fdev`.
+
 ### Freenet development tool (fdev)
 
 Once you have a working installation of Cargo you can install the Freenet dev
 tools:
 
 ```bash
-cargo install freenet
+cargo install freenet fdev
 ```
 
 This command will install `fdev` (Freenet development tool) and a working Freenet kernel that can
