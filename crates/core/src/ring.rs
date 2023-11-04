@@ -694,7 +694,7 @@ impl Ring {
                 live_tx = self
                     .acquire_new(
                         ideal_location,
-                        &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
+                        &missing.values().collect::<Vec<_>>(),
                         &notifier,
                         self.max_connections - open_connections,
                     )
@@ -738,7 +738,7 @@ impl Ring {
                 live_tx = self
                     .acquire_new(
                         ideal_location,
-                        &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
+                        &missing.values().collect::<Vec<_>>(),
                         &notifier,
                         should_swap.len(),
                     )

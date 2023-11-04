@@ -98,7 +98,7 @@ impl ContractStore {
             return result;
         }
 
-        self.key_to_code_part.get(&key.id()).and_then(|key| {
+        self.key_to_code_part.get(key.id()).and_then(|key| {
             let code_hash = key.value().1;
             let path = code_hash.encode();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
@@ -161,7 +161,7 @@ impl ContractStore {
         Self::insert(
             &mut self.index_file,
             &mut self.key_to_code_part,
-            key.id(),
+            *key.id(),
             *code_hash,
         )?;
 
@@ -188,7 +188,7 @@ impl ContractStore {
                 RuntimeInnerError::UnwrapContract
             })?,
         };
-        if let Some((_, (offset, _))) = self.key_to_code_part.remove(&key.id()) {
+        if let Some((_, (offset, _))) = self.key_to_code_part.remove(key.id()) {
             Self::remove(KEY_FILE_PATH.get().expect("infallible"), offset)?;
         }
         let key_path = self
@@ -200,7 +200,7 @@ impl ContractStore {
     }
 
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {
-        self.key_to_code_part.get(&key.id()).map(|r| r.value().1)
+        self.key_to_code_part.get(key.id()).map(|r| r.value().1)
     }
 }
 
