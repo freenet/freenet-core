@@ -1624,6 +1624,7 @@ dependencies = [
  "statrs",
  "stretto",
  "tar",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower-http",
@@ -1650,7 +1651,6 @@ name = "freenet-stdlib"
 version = "0.0.8"
 dependencies = [
  "arbitrary",
- "arrayvec",
  "bincode",
  "blake3",
  "bs58",

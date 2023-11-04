@@ -8,7 +8,7 @@ use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
 };
 
-use super::ContractStore;
+use super::{ContractStore, DelegateStore};
 
 mod contract;
 mod time;
@@ -61,15 +61,16 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
 
 pub(crate) fn setup_test_contract(
     name: &str,
-) -> Result<(ContractStore, ContractKey), Box<dyn std::error::Error>> {
+) -> Result<(ContractStore, DelegateStore, ContractKey), Box<dyn std::error::Error>> {
     // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let mut store = ContractStore::new(test_dir("contract"), 10_000)?;
+    let mut contract_store = ContractStore::new(test_dir("contract"), 10_000)?;
+    let delegate_store = DelegateStore::new(test_dir("delegate"), 10_000)?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),
     );
     let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
     let key = contract.key();
-    store.store_contract(contract)?;
-    Ok((store, key))
+    contract_store.store_contract(contract)?;
+    Ok((contract_store, delegate_store, key))
 }

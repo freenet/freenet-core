@@ -27,7 +27,6 @@ use std::{
 };
 
 use anyhow::bail;
-use arrayvec::ArrayVec;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};

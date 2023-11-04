@@ -2,18 +2,12 @@
 
 use wasmer::TypedFunction;
 
-use super::super::{DelegateStore, Runtime, SecretsStore};
+use super::super::{Runtime, SecretsStore};
 
 #[test]
 fn now() -> Result<(), Box<dyn std::error::Error>> {
-    let (store, key) = super::setup_test_contract("test_contract_2")?;
-    let mut runtime = Runtime::build(
-        store,
-        DelegateStore::default(),
-        SecretsStore::default(),
-        false,
-    )
-    .unwrap();
+    let (contracts, delegates, key) = super::setup_test_contract("test_contract_2")?;
+    let mut runtime = Runtime::build(contracts, delegates, SecretsStore::default(), false).unwrap();
 
     let module = runtime.prepare_contract_call(&key, &vec![].into(), 1_000)?;
     let f: TypedFunction<(), ()> = module
