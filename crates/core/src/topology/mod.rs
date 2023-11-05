@@ -44,6 +44,7 @@ pub(crate) struct TopologyManager {
 }
 
 impl TopologyManager {
+    /// Create a new TopologyManager specifying the peer's own Location
     pub(crate) fn new(this_peer_location : Location) -> Self {
         info!("Creating a new TopologyManager instance");
         TopologyManager {
@@ -55,11 +56,15 @@ impl TopologyManager {
         }
     }
 
+    /// Record a request and the location it's targeting
     pub(crate) fn record_request(&mut self, requested_location: Location, request_type : RequestType) {
         debug!("Recording request for location: {:?}", requested_location);
         self.request_density_tracker.sample(requested_location);
     }
 
+    /// Decide whether to accept a connection from a new candidate peer based on its location
+    /// and current neighbors and request density, along with how it compares to other
+    /// recent candidates.
     pub(crate) fn evaluate_new_connection(&mut self, current_neighbors: &BTreeMap<Location, usize>, candidate_location: Location, acquisition_strategy : AcquisitionStrategy) -> Result<bool, DensityMapError> {
         self.evaluate_new_connection_with_current_time(current_neighbors, candidate_location, acquisition_strategy, Instant::now())
     }
@@ -83,6 +88,7 @@ impl TopologyManager {
         Ok(accept)
     }
 
+    /// Get the ideal location for a new connection based on current neighbors and request density
     pub(crate) fn get_best_candidate_location(&mut self, current_neighbors: &BTreeMap<Location, usize>) -> Result<Location, DensityMapError> {
         debug!("Retrieving best candidate location");
         let density_map = self.get_or_create_density_map(current_neighbors)?;
