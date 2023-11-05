@@ -183,16 +183,3 @@ mod tests {
         assert_eq!(best_location, Location::new(0.4));
     }
 }
-
-/*
-        // Dump histogram of requests with 0.01 intervals
-        let mut histogram = vec![0; 100];
-        for request in requests {
-            let index = (request.as_f64() * 100.0).floor() as usize;
-            histogram[index] += 1;
-        }
-        println!("Histogram of requests:");
-        for i in 0..100 {
-            println!("{}\t{}", i as f64 / 100.0, histogram[i]);
-        }
- */
