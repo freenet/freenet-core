@@ -18,8 +18,8 @@ const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 const RANDOM_CLOSEST_DISTANCE: f64 = 1.0 / 1000.0;
 
 /// The goal of `TopologyManager` is to select new connections such that the
-/// distribution of connections in the network is as close as possible to the
-/// distribution of requests in the network. 
+/// distribution of connections is as close as possible to the
+/// distribution of outbound requests.
 /// 
 /// This is done by maintaining a `RequestDensityTracker` which tracks the
 /// distribution of requests in the network. The `TopologyManager` uses this
