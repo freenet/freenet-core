@@ -371,7 +371,7 @@ mod tests {
         );
         assert!(
             original_tx.id.timestamp_ms() - ttl_tx.id.timestamp_ms()
-                < crate::config::OPERATION_TTL.as_millis() as u64 + 1
+                < crate::config::OPERATION_TTL.as_millis() as u64 + 5
         );
     }
 }

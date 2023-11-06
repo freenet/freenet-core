@@ -766,14 +766,11 @@ impl Ring {
         connections_by_location: impl Iterator<Item = (Location, &'a PeerKeyLocation)>,
         skip_list: &[&PeerKey],
     ) -> Option<connect::ConnectMsg> {
-        const MAX_DEVIATION_FROM_IDEAL: f64 = 0.05;
-
-        // filter possible peers by proximity to the ideal location
-        let acceptable_range = ideal_location.0 * MAX_DEVIATION_FROM_IDEAL;
+        // sort possible peers by proximity to the ideal location
         let mut request_to = connections_by_location
             .filter_map(|(loc, peer)| {
                 let dist: Distance = loc.distance(ideal_location);
-                let is_valid = (dist.0 < acceptable_range) && !skip_list.contains(&&peer.peer);
+                let is_valid = !skip_list.contains(&&peer.peer);
                 is_valid.then_some((dist, peer))
             })
             .collect::<ArrayVec<_, { Ring::MAX_CONNECTIONS }>>();
@@ -1037,7 +1034,7 @@ mod test {
                 },
             ),
             (
-                Location::new(0.5),
+                Location::new(0.6),
                 PeerKeyLocation {
                     location: Some(Location::new(0.6)),
                     peer: PeerKey::random(),
@@ -1052,13 +1049,17 @@ mod test {
         )
         .expect("find query target");
         let connect::ConnectMsg::Request {
-            msg: connect::ConnectRequest::FindOptimalPeer { ideal_location, .. },
+            msg:
+                connect::ConnectRequest::FindOptimalPeer {
+                    query_target: PeerKeyLocation { location, .. },
+                    ..
+                },
             ..
         } = result
         else {
             panic!()
         };
-        assert_eq!(ideal_location, Location::new(0.6));
+        assert_eq!(location, Some(Location::new(0.6)));
     }
 
     #[test]

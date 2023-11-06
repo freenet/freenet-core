@@ -115,11 +115,14 @@ fn test_drop() {
 }
 
 #[test]
+#[should_panic(expected = "assertion failed: !neighbors.is_empty()")]
 fn test_empty_neighbors_error() {
     let sw = RequestDensityTracker::new(10);
     let empty_neighbors = BTreeMap::new();
-    let result = sw.create_density_map(&empty_neighbors);
-    assert!(matches!(result, Err(DensityMapError::EmptyNeighbors)));
+    matches!(
+        sw.create_density_map(&empty_neighbors),
+        Err(DensityMapError::EmptyNeighbors)
+    );
 }
 
 #[test]

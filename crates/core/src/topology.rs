@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 mod connection_evaluator;
 mod request_density_tracker;
@@ -19,7 +19,6 @@ use small_world_rand::random_link_distance;
 const SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(5 * 60);
 const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(60);
 const REQUEST_DENSITY_TRACKER_WINDOW_SIZE: usize = 10_000;
-const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 const RANDOM_CLOSEST_DISTANCE: f64 = 1.0 / 1000.0;
 
 /// The goal of `TopologyManager` is to select new connections such that the
@@ -52,7 +51,6 @@ pub(crate) struct TopologyManager {
 impl TopologyManager {
     /// Create a new TopologyManager specifying the peer's own Location
     pub(crate) fn new(this_peer_location: Location) -> Self {
-        info!("Creating a new TopologyManager instance");
         TopologyManager {
             slow_connection_evaluator: connection_evaluator::ConnectionEvaluator::new(
                 SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION,
@@ -63,7 +61,7 @@ impl TopologyManager {
             request_density_tracker: request_density_tracker::RequestDensityTracker::new(
                 REQUEST_DENSITY_TRACKER_WINDOW_SIZE,
             ),
-            cached_density_map: CachedDensityMap::new(REGENERATE_DENSITY_MAP_INTERVAL),
+            cached_density_map: CachedDensityMap::new(),
             this_peer_location,
         }
     }
@@ -73,7 +71,7 @@ impl TopologyManager {
         current_neighbors: &BTreeMap<Location, usize>,
     ) -> Result<(), DensityMapError> {
         self.cached_density_map
-            .create(&self.request_density_tracker, current_neighbors)?;
+            .set(&self.request_density_tracker, current_neighbors)?;
         Ok(())
     }
 
@@ -175,7 +173,6 @@ impl TopologyManager {
     }
 }
 
-// FIXME
 pub(crate) enum AcquisitionStrategy {
     /// Acquire new connections slowly, be picky
     Slow,
@@ -199,6 +196,13 @@ mod tests {
             current_neighbors.insert(Location::new(i as f64 / 10.0), 0);
         }
 
+        topology_manager
+            .cached_density_map
+            .set(
+                &topology_manager.request_density_tracker,
+                &current_neighbors,
+            )
+            .unwrap();
         let mut requests = vec![];
         // Simulate a bunch of random requests clustered around 0.35
         for _ in 0..1000 {

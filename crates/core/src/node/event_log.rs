@@ -598,7 +598,6 @@ pub(super) mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
-        crate::config::set_logger();
         let event_log_path = crate::config::Config::conf().event_log();
         // truncate the log if it exists
         std::fs::File::create(event_log_path).unwrap();

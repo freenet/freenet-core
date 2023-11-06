@@ -91,6 +91,8 @@ impl RequestDensityTracker {
             }
         }
 
+        debug_assert!(!density_map.neighbor_request_counts.is_empty());
+
         Ok(density_map)
     }
 }
