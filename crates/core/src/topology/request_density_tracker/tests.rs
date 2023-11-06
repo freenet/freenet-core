@@ -16,8 +16,14 @@ fn test_create_density_map() {
     let result = sw.create_density_map(&neighbors);
     assert!(result.is_ok());
     let result = result.unwrap();
-    assert_eq!(result.neighbor_request_counts.get(&Location::new(0.2)), Some(&3));
-    assert_eq!(result.neighbor_request_counts.get(&Location::new(0.6)), Some(&2));
+    assert_eq!(
+        result.neighbor_request_counts.get(&Location::new(0.2)),
+        Some(&3)
+    );
+    assert_eq!(
+        result.neighbor_request_counts.get(&Location::new(0.6)),
+        Some(&2)
+    );
 }
 
 #[test]
@@ -36,8 +42,14 @@ fn test_wrap_around() {
     let result = sw.create_density_map(&neighbors);
     assert!(result.is_ok());
     let result = result.unwrap();
-    assert_eq!(result.neighbor_request_counts.get(&Location::new(0.9)), Some(&3));
-    assert_eq!(result.neighbor_request_counts.get(&Location::new(0.6)), Some(&2));
+    assert_eq!(
+        result.neighbor_request_counts.get(&Location::new(0.9)),
+        Some(&3)
+    );
+    assert_eq!(
+        result.neighbor_request_counts.get(&Location::new(0.6)),
+        Some(&2)
+    );
 }
 
 #[test]
@@ -63,7 +75,11 @@ fn test_interpolate() {
         let location = Location::new(i as f64 / 100.0);
         let density = result.get_density_at(location).unwrap();
         // Print and round density to 2 decimals
-        println!("{}\t{}", location.as_f64(), (density * 100.0).round() / 100.0);
+        println!(
+            "{}\t{}",
+            location.as_f64(),
+            (density * 100.0).round() / 100.0
+        );
     }
 
     assert_eq!(result.get_density_at(Location::new(0.2)).unwrap(), 3.0);
@@ -88,9 +104,14 @@ fn test_drop() {
     let result = sw.create_density_map(&neighbors);
     assert!(result.is_ok());
     let result = result.unwrap();
-    assert_eq!(result.neighbor_request_counts.get(&Location::new(0.2)), Some(&2));
-    assert_eq!(result.neighbor_request_counts.get(&Location::new(0.6)), Some(&2));
-
+    assert_eq!(
+        result.neighbor_request_counts.get(&Location::new(0.2)),
+        Some(&2)
+    );
+    assert_eq!(
+        result.neighbor_request_counts.get(&Location::new(0.6)),
+        Some(&2)
+    );
 }
 
 #[test]
@@ -107,9 +128,15 @@ fn test_get_max_density() {
         neighbor_request_counts: BTreeMap::new(),
     };
 
-    density_map.neighbor_request_counts.insert(Location::new(0.2), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.6), 2);
-    density_map.neighbor_request_counts.insert(Location::new(0.8), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.2), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.6), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.8), 2);
 
     let result = density_map.get_max_density();
     assert!(result.is_ok());
@@ -123,10 +150,18 @@ fn test_get_max_density_2() {
         neighbor_request_counts: BTreeMap::new(),
     };
 
-    density_map.neighbor_request_counts.insert(Location::new(0.2), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.6), 2);
-    density_map.neighbor_request_counts.insert(Location::new(0.8), 2);
-    density_map.neighbor_request_counts.insert(Location::new(0.9), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.2), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.6), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.8), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.9), 1);
 
     let result = density_map.get_max_density();
     assert!(result.is_ok());
@@ -140,11 +175,21 @@ fn test_get_max_density_first_last() {
         neighbor_request_counts: BTreeMap::new(),
     };
 
-    density_map.neighbor_request_counts.insert(Location::new(0.0), 2);
-    density_map.neighbor_request_counts.insert(Location::new(0.2), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.6), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.8), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.9), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.0), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.2), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.6), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.8), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.9), 2);
 
     let result = density_map.get_max_density();
     assert!(result.is_ok());
@@ -159,11 +204,21 @@ fn test_get_max_density_first_last_2() {
         neighbor_request_counts: BTreeMap::new(),
     };
 
-    density_map.neighbor_request_counts.insert(Location::new(0.3), 2);
-    density_map.neighbor_request_counts.insert(Location::new(0.4), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.6), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.8), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.9), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.3), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.4), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.6), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.8), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.9), 2);
 
     let result = density_map.get_max_density();
     assert!(result.is_ok());
@@ -178,11 +233,21 @@ fn test_get_max_density_first_last_3() {
         neighbor_request_counts: BTreeMap::new(),
     };
 
-    density_map.neighbor_request_counts.insert(Location::new(0.1), 2);
-    density_map.neighbor_request_counts.insert(Location::new(0.2), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.3), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.4), 1);
-    density_map.neighbor_request_counts.insert(Location::new(0.7), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.1), 2);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.2), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.3), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.4), 1);
+    density_map
+        .neighbor_request_counts
+        .insert(Location::new(0.7), 2);
 
     let result = density_map.get_max_density();
     assert!(result.is_ok());

@@ -12,7 +12,7 @@ mod small_world_rand;
 mod connection_evaluator;
 
 const SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(5 * 60);
-const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(1 * 60);
+const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(60);
 const REQUEST_DENSITY_TRACKER_WINDOW_SIZE: usize = 10_000;
 const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 const RANDOM_CLOSEST_DISTANCE: f64 = 1.0 / 1000.0;

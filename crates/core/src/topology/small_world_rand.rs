@@ -39,14 +39,14 @@ mod tests {
         }
 
         // Perform chi-squared test
-        let mut expected_counts = vec![0.0; num_bins];
-        for i in 0..num_bins {
-            let lower = d_min + (d_max - d_min) * (i as f64 / num_bins as f64);
-            let upper = d_min + (d_max - d_min) * ((i as f64 + 1.0) / num_bins as f64);
-            expected_counts[i] = ((upper - lower) / (upper.powf(-1.0) - lower.powf(-1.0))).floor()
-                * n as f64
-                / num_bins as f64;
-        }
+        let expected_counts: Vec<_> = (0..num_bins)
+            .map(|i| {
+                let lower = d_min + (d_max - d_min) * (i as f64 / num_bins as f64);
+                let upper = d_min + (d_max - d_min) * ((i as f64 + 1.0) / num_bins as f64);
+                ((upper - lower) / (upper.powf(-1.0) - lower.powf(-1.0))).floor() * n as f64
+                    / num_bins as f64
+            })
+            .collect();
 
         let chi_squared = expected_counts
             .iter()

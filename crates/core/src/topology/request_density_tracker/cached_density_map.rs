@@ -1,6 +1,10 @@
-use std::{time::{Duration, Instant}, collections::BTreeMap, rc::Rc};
 use crate::ring::Location;
 use crate::topology::request_density_tracker::{self, DensityMapError};
+use std::{
+    collections::BTreeMap,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 /// Struct to handle caching of DensityMap
 pub(in crate::topology) struct CachedDensityMap {
@@ -16,7 +20,11 @@ impl CachedDensityMap {
         }
     }
 
-    pub(in crate::topology) fn get_or_create(&mut self, tracker: &request_density_tracker::RequestDensityTracker, current_neighbors: &BTreeMap<Location, usize>) -> Result<Rc<request_density_tracker::DensityMap>, DensityMapError> {
+    pub(in crate::topology) fn get_or_create(
+        &mut self,
+        tracker: &request_density_tracker::RequestDensityTracker,
+        current_neighbors: &BTreeMap<Location, usize>,
+    ) -> Result<Rc<request_density_tracker::DensityMap>, DensityMapError> {
         let now = Instant::now();
         if let Some((density_map, last_update)) = &self.density_map {
             if now.duration_since(*last_update) < self.regenerate_interval {

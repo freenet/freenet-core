@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 /// any other scores within a predefined time window. A score is considered better if it's higher
 /// than all other scores in the time window, or if no scores were recorded within the window's
 /// duration.
-/// 
+///
 /// In the Freenet context, this will be used to titrate the rate of new connection requests accepted
 /// by a node. The node will only accept a new connection if the score of the connection is better
-/// than all other scores within the time window. 
+/// than all other scores within the time window.
 pub(crate) struct ConnectionEvaluator {
     scores: VecDeque<(Instant, f64)>,
     window_duration: Duration,
