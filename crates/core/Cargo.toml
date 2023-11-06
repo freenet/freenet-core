@@ -88,6 +88,7 @@ tracing = "0.1"
 arbitrary = { version = "1", features = ["derive"] }
 itertools = "0.11"
 pico-args = "0.5"
+statrs = "0.16.0"
 freenet-stdlib = { workspace = true, features = ["testing", "net"] }
 
 [features]

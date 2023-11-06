@@ -10,11 +10,13 @@
 //! - next node
 //! - final location
 
+use std::hash::Hash;
 use std::{
     collections::BTreeMap,
     convert::TryFrom,
     fmt::Display,
     hash::Hasher,
+    ops::Add,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
@@ -446,6 +448,11 @@ impl Location {
         Location(location)
     }
 
+    /// Returns a new location rounded to ensure it is between 0.0 and 1.0
+    pub fn new_rounded(location: f64) -> Self {
+        Self::new(location.rem_euclid(1.0))
+    }
+
     /// Returns a new random location.
     pub fn random() -> Self {
         use rand::prelude::*;
@@ -461,6 +468,10 @@ impl Location {
         } else {
             Distance::new(1.0f64 - d)
         }
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        self.0
     }
 }
 
@@ -535,14 +546,31 @@ impl Distance {
     pub fn new(value: f64) -> Self {
         debug_assert!(!value.is_nan(), "Distance cannot be NaN");
         debug_assert!(
-            (0.0..=0.5).contains(&value),
-            "Distance must be in the range [0, 0.5]"
+            (0.0..=1.0).contains(&value),
+            "Distance must be in the range [0, 1.0]"
         );
-        Distance(value)
+        if value <= 0.5 {
+            Distance(value)
+        } else {
+            Distance(1.0 - value)
+        }
     }
 
     pub fn as_f64(&self) -> f64 {
         self.0
+    }
+}
+
+impl Add for Distance {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let d = self.0 + rhs.0;
+        if d > 0.5 {
+            Distance::new(1.0 - d)
+        } else {
+            Distance::new(d)
+        }
     }
 }
 
@@ -552,6 +580,7 @@ impl PartialEq for Distance {
     }
 }
 
+#[allow(clippy::incorrect_partial_ord_impl_on_ord_type)]
 impl PartialOrd for Distance {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
