@@ -224,7 +224,7 @@ impl NetworkBridge for P2pBridge {
             .try_lock()
             .expect("single reference")
             .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager));
-        self.op_manager.sending_transaction(target, msg.id());
+        self.op_manager.sending_transaction(target, &msg);
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
             .await
@@ -431,7 +431,7 @@ impl P2pConnManager {
                     let cb = self.bridge.clone();
                     match msg {
                         Message::Aborted(tx) => {
-                            let tx_type = tx.tx_type();
+                            let tx_type = tx.transaction_type();
                             let res = handle_cancelled_op(
                                 tx,
                                 op_manager.ring.peer_key,

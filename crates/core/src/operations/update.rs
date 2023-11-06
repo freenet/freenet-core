@@ -84,6 +84,10 @@ mod messages {
         fn terminal(&self) -> bool {
             todo!()
         }
+
+        fn requested_location(&self) -> Option<crate::network_sim::Location> {
+            todo!()
+        }
     }
 
     impl Display for UpdateMsg {

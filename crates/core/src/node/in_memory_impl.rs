@@ -176,7 +176,7 @@ impl NodeInMemory {
             };
 
             if let Ok(Either::Left(Message::Aborted(tx))) = msg {
-                let tx_type = tx.tx_type();
+                let tx_type = tx.transaction_type();
                 let res = handle_cancelled_op(
                     tx,
                     self.peer_key,

@@ -13,7 +13,7 @@ use crate::{
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
-    ring::PeerKeyLocation,
+    ring::{Location, PeerKeyLocation},
 };
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 
@@ -43,7 +43,7 @@ impl Transaction {
         // Self { id }
     }
 
-    pub fn tx_type(&self) -> TransactionType {
+    pub fn transaction_type(&self) -> TransactionType {
         let id_byte = (self.id.0 & 0xFFu128) as u8;
         match id_byte {
             0 => TransactionType::Connect,
@@ -222,6 +222,8 @@ pub(crate) trait InnerMessage: Into<Message> {
     fn target(&self) -> Option<&PeerKeyLocation>;
 
     fn terminal(&self) -> bool;
+
+    fn requested_location(&self) -> Option<Location>;
 }
 
 /// Internal node events emitted to the event loop.
@@ -294,6 +296,18 @@ impl Message {
         }
     }
 
+    pub fn requested_location(&self) -> Option<Location> {
+        use Message::*;
+        match self {
+            Connect(op) => op.requested_location(),
+            Put(op) => op.requested_location(),
+            Get(op) => op.requested_location(),
+            Subscribe(op) => op.requested_location(),
+            Update(op) => op.requested_location(),
+            Aborted(_) => None,
+        }
+    }
+
     pub fn track_stats(&self) -> bool {
         use Message::*;
         !matches!(self, Connect(_) | Subscribe(_) | Aborted(_))
@@ -325,9 +339,9 @@ mod tests {
         let ts_0 = Ulid::new();
         std::thread::sleep(Duration::from_millis(1));
         let tx = Transaction::update(TransactionType::Connect, Ulid::new());
-        assert_eq!(tx.tx_type(), TransactionType::Connect);
+        assert_eq!(tx.transaction_type(), TransactionType::Connect);
         let tx = Transaction::update(TransactionType::Subscribe, Ulid::new());
-        assert_eq!(tx.tx_type(), TransactionType::Subscribe);
+        assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
         std::thread::sleep(Duration::from_millis(1));
         let ts_1 = Ulid::new();
         assert!(

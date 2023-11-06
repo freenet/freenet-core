@@ -11,6 +11,7 @@
 //! - final location
 
 use std::hash::Hash;
+use std::sync::atomic::AtomicBool;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
@@ -29,14 +30,15 @@ use anyhow::bail;
 use arrayvec::ArrayVec;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
 use either::Either;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync;
 
-use crate::topology::TopologyManager;
+use crate::message::TransactionType;
+use crate::topology::{AcquisitionStrategy, TopologyManager};
 use crate::{
     config::GlobalExecutor,
     message::Transaction,
@@ -169,6 +171,9 @@ pub(crate) struct Ring {
     min_connections: usize,
     router: Arc<RwLock<Router>>,
     topology_manager: RwLock<TopologyManager>,
+    /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
+    /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
+    fast_acquisition: AtomicBool,
     connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
     location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
     /// contracts in the ring cached by this node
@@ -263,6 +268,7 @@ impl Ring {
             min_connections,
             router,
             topology_manager,
+            fast_acquisition: AtomicBool::new(true),
             connections_by_location: RwLock::new(BTreeMap::new()),
             location_for_peer: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
@@ -393,12 +399,17 @@ impl Ring {
             tracing::debug!(peer = %self.peer_key, "max open connections reached");
             false
         } else {
+            let strategy = if self
+                .fast_acquisition
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                AcquisitionStrategy::Fast
+            } else {
+                AcquisitionStrategy::Slow
+            };
             self.topology_manager
                 .write()
-                .evaluate_new_connection(
-                    location,
-                    crate::topology::AcquisitionStrategy::Slow, // todo: conditionally change this
-                )
+                .evaluate_new_connection(location, strategy)
                 .expect("already have > min connections, so neighbors shouldn't be empty")
         };
         if !accepted {
@@ -406,6 +417,12 @@ impl Ring {
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
         accepted
+    }
+
+    pub fn record_request(&self, requested_location: Location, request_type: TransactionType) {
+        self.topology_manager
+            .write()
+            .record_request(requested_location, request_type);
     }
 
     pub fn add_connection(&self, loc: Location, peer: PeerKey) {
@@ -640,6 +657,8 @@ impl Ring {
                 .open_connections
                 .load(std::sync::atomic::Ordering::Acquire);
             if open_connections < self.max_connections && open_connections > self.min_connections {
+                self.fast_acquisition
+                    .store(true, std::sync::atomic::Ordering::Release);
                 // requires more connections
                 let ideal_location = {
                     self.topology_manager
@@ -684,6 +703,8 @@ impl Ring {
                 )
             };
             if !should_swap.is_empty() {
+                self.fast_acquisition
+                    .store(false, std::sync::atomic::Ordering::Release);
                 let ideal_location = {
                     self.topology_manager
                         .write()
@@ -818,6 +839,16 @@ impl Location {
     pub fn as_f64(&self) -> f64 {
         self.0
     }
+
+    fn from_contract_key(bytes: &[u8]) -> Self {
+        let mut value = 0.0;
+        let mut divisor = 256.0;
+        for byte in bytes {
+            value += *byte as f64 / divisor;
+            divisor *= 256.0;
+        }
+        Location::try_from(value).expect("value should be between 0 and 1")
+    }
 }
 
 impl std::ops::Add<Distance> for Location {
@@ -835,13 +866,13 @@ impl std::ops::Add<Distance> for Location {
 /// (which have been hashed with a strong, cryptographically safe, hash function first).
 impl From<&ContractKey> for Location {
     fn from(key: &ContractKey) -> Self {
-        let mut value = 0.0;
-        let mut divisor = 256.0;
-        for byte in key.bytes().iter().take(7) {
-            value += *byte as f64 / divisor;
-            divisor *= 256.0;
-        }
-        Location::try_from(value).expect("value should be between 0 and 1")
+        Self::from_contract_key(key.id().as_bytes())
+    }
+}
+
+impl From<&ContractInstanceId> for Location {
+    fn from(key: &ContractInstanceId) -> Self {
+        Self::from_contract_key(key.as_bytes())
     }
 }
 

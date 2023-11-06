@@ -193,16 +193,6 @@ impl DensityMap {
     }
 }
 
-// Define the custom error type using thiserror
-#[derive(Error, Debug)]
-pub(super) enum DensityError {
-    #[error("Not enough samples to determine lower and upper bounds")]
-    CantFindBounds,
-
-    #[error("Window radius too big. Window radius should be <= 50% of the number of samples ({samples}) and window size ({window_size}).")]
-    WindowTooBig { samples: usize, window_size: usize },
-}
-
 #[derive(Error, Debug)]
 pub(crate) enum DensityMapError {
     #[error("The neighbors BTreeMap is empty.")]

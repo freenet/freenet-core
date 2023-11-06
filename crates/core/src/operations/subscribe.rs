@@ -11,7 +11,7 @@ use crate::{
     message::{InnerMessage, Message, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
-    ring::{PeerKeyLocation, RingError},
+    ring::{Location, PeerKeyLocation, RingError},
 };
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
@@ -250,7 +250,10 @@ impl Operation for SubscribeOp {
                                     retries: retries + 1,
                                 });
                             } else {
-                                return Err(OpError::MaxRetriesExceeded(*id, id.tx_type()));
+                                return Err(OpError::MaxRetriesExceeded(
+                                    *id,
+                                    id.transaction_type(),
+                                ));
                             }
                         }
                         _ => return Err(OpError::invalid_transition(self.id)),
@@ -431,6 +434,15 @@ mod messages {
         fn terminal(&self) -> bool {
             use SubscribeMsg::*;
             matches!(self, ReturnSub { .. } | SeekNode { .. })
+        }
+
+        fn requested_location(&self) -> Option<Location> {
+            match self {
+                Self::SeekNode { key, .. } => Some(Location::from(key.id())),
+                Self::RequestSub { key, .. } => Some(Location::from(key.id())),
+                Self::ReturnSub { key, .. } => Some(Location::from(key.id())),
+                _ => None,
+            }
         }
     }
 

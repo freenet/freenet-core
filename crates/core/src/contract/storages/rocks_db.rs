@@ -33,13 +33,13 @@ impl StateStorage for RocksDb {
 
     async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
         self.0
-            .put([key.bytes(), RocksDb::STATE_SUFFIX].concat(), state)?;
+            .put([key.as_bytes(), RocksDb::STATE_SUFFIX].concat(), state)?;
 
         Ok(())
     }
 
     async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
-        match self.0.get([key.bytes(), RocksDb::STATE_SUFFIX].concat()) {
+        match self.0.get([key.as_bytes(), RocksDb::STATE_SUFFIX].concat()) {
             Ok(result) => {
                 if let Some(r) = result.map(|r| Some(WrappedState::new(r))) {
                     Ok(r)
@@ -69,7 +69,7 @@ impl StateStorage for RocksDb {
         params: Parameters<'static>,
     ) -> Result<(), Self::Error> {
         self.0
-            .put([key.bytes(), RocksDb::PARAMS_SUFFIX].concat(), params)?;
+            .put([key.as_bytes(), RocksDb::PARAMS_SUFFIX].concat(), params)?;
 
         Ok(())
     }
@@ -78,7 +78,10 @@ impl StateStorage for RocksDb {
         &'a self,
         key: &'a ContractKey,
     ) -> Result<Option<Parameters<'static>>, Self::Error> {
-        match self.0.get([key.bytes(), RocksDb::PARAMS_SUFFIX].concat()) {
+        match self
+            .0
+            .get([key.as_bytes(), RocksDb::PARAMS_SUFFIX].concat())
+        {
             Ok(result) => Ok(result
                 .map(|r| Some(Parameters::from(r)))
                 .expect("vec bytes")),

@@ -1,4 +1,7 @@
-use crate::ring::{Distance, Location};
+use crate::{
+    message::TransactionType,
+    ring::{Distance, Location},
+};
 use request_density_tracker::cached_density_map::CachedDensityMap;
 use std::{
     collections::BTreeMap,
@@ -6,12 +9,12 @@ use std::{
 };
 use tracing::{debug, error, info};
 
-use self::request_density_tracker::DensityMapError;
-pub(crate) use small_world_rand::random_link_distance;
-
 mod connection_evaluator;
 mod request_density_tracker;
 mod small_world_rand;
+
+use request_density_tracker::DensityMapError;
+use small_world_rand::random_link_distance;
 
 const SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(5 * 60);
 const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(60);
@@ -78,7 +81,7 @@ impl TopologyManager {
     pub(crate) fn record_request(
         &mut self,
         requested_location: Location,
-        _request_type: RequestType,
+        _request_type: TransactionType,
     ) {
         debug!("Recording request for location: {:?}", requested_location);
         self.request_density_tracker.sample(requested_location);
@@ -172,13 +175,7 @@ impl TopologyManager {
     }
 }
 
-pub(crate) enum RequestType {
-    Get,
-    Put,
-    Join,
-    Subscribe,
-}
-
+// FIXME
 pub(crate) enum AcquisitionStrategy {
     /// Acquire new connections slowly, be picky
     Slow,
@@ -190,7 +187,7 @@ pub(crate) enum AcquisitionStrategy {
 #[cfg(test)]
 mod tests {
     use super::TopologyManager;
-    use crate::ring::Location;
+    use crate::{message::TransactionType, ring::Location};
 
     #[test]
     fn test_topology_manager() {
@@ -206,7 +203,7 @@ mod tests {
         // Simulate a bunch of random requests clustered around 0.35
         for _ in 0..1000 {
             let requested_location = topology_manager.random_location();
-            topology_manager.record_request(requested_location, super::RequestType::Get);
+            topology_manager.record_request(requested_location, TransactionType::Get);
             requests.push(requested_location);
         }
 

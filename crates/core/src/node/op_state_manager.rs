@@ -131,27 +131,27 @@ impl OpManager {
         match op {
             OpEnum::Connect(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Connect);
+                check_id_op!(id.transaction_type(), TransactionType::Connect);
                 self.ops.connect.insert(id, *op);
             }
             OpEnum::Put(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Put);
+                check_id_op!(id.transaction_type(), TransactionType::Put);
                 self.ops.put.insert(id, op);
             }
             OpEnum::Get(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Get);
+                check_id_op!(id.transaction_type(), TransactionType::Get);
                 self.ops.get.insert(id, op);
             }
             OpEnum::Subscribe(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Subscribe);
+                check_id_op!(id.transaction_type(), TransactionType::Subscribe);
                 self.ops.subscribe.insert(id, op);
             }
             OpEnum::Update(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Update);
+                check_id_op!(id.transaction_type(), TransactionType::Update);
                 self.ops.update.insert(id, op);
             }
         }
@@ -169,7 +169,7 @@ impl OpManager {
             }
             return Err(OpNotAvailable::Running);
         }
-        let op = match id.tx_type() {
+        let op = match id.transaction_type() {
             TransactionType::Connect => self
                 .ops
                 .connect
@@ -201,7 +201,12 @@ impl OpManager {
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
-    pub fn sending_transaction(&self, peer: &PeerKey, transaction: &Transaction) {
+    pub fn sending_transaction(&self, peer: &PeerKey, msg: &Message) {
+        let transaction = msg.id();
+        if let Some(loc) = msg.requested_location() {
+            self.ring
+                .record_request(loc, transaction.transaction_type());
+        }
         self.ring
             .live_tx_tracker
             .add_transaction(*peer, *transaction);
@@ -227,7 +232,7 @@ async fn garbage_cleanup_task(
             if ops.completed.remove(&tx).is_some() {
                 continue;
             }
-            let still_waiting = match tx.tx_type() {
+            let still_waiting = match tx.transaction_type() {
                 TransactionType::Connect => ops.connect.remove(&tx).is_none(),
                 TransactionType::Put => ops.put.remove(&tx).is_none(),
                 TransactionType::Get => ops.get.remove(&tx).is_none(),
@@ -256,7 +261,7 @@ async fn garbage_cleanup_task(
             if ops.completed.remove(&tx).is_some() {
                 continue;
             }
-            let removed = match tx.tx_type() {
+            let removed = match tx.transaction_type() {
                 TransactionType::Connect => ops.connect.remove(&tx).is_some(),
                 TransactionType::Put => ops.put.remove(&tx).is_some(),
                 TransactionType::Get => ops.get.remove(&tx).is_some(),

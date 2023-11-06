@@ -415,7 +415,10 @@ impl Operation for GetOp {
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
-                                return Err(OpError::MaxRetriesExceeded(*id, id.tx_type()));
+                                return Err(OpError::MaxRetriesExceeded(
+                                    *id,
+                                    id.transaction_type(),
+                                ));
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
@@ -808,6 +811,14 @@ mod messages {
         fn terminal(&self) -> bool {
             use GetMsg::*;
             matches!(self, ReturnGet { .. })
+        }
+
+        fn requested_location(&self) -> Option<Location> {
+            match self {
+                GetMsg::RequestGet { key, .. } => Some(Location::from(key.id())),
+                GetMsg::SeekNode { key, .. } => Some(Location::from(key.id())),
+                GetMsg::ReturnGet { key, .. } => Some(Location::from(key.id())),
+            }
         }
     }
 

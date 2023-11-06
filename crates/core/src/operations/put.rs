@@ -806,12 +806,6 @@ mod messages {
 
     #[derive(Debug, Serialize, Deserialize)]
     pub(crate) enum PutMsg {
-        /// Initialize the put operation by routing the value
-        RouteValue {
-            id: Transaction,
-            htl: usize,
-            target: PeerKeyLocation,
-        },
         /// Internal node instruction to find a route to the target node.
         RequestPut {
             id: Transaction,
@@ -876,7 +870,6 @@ mod messages {
         fn id(&self) -> &Transaction {
             match self {
                 Self::SeekNode { id, .. } => id,
-                Self::RouteValue { id, .. } => id,
                 Self::RequestPut { id, .. } => id,
                 Self::Broadcasting { id, .. } => id,
                 Self::SuccessfulUpdate { id, .. } => id,
@@ -901,6 +894,17 @@ mod messages {
                 SuccessfulUpdate { .. } | SeekNode { .. } | PutForward { .. }
             )
         }
+
+        fn requested_location(&self) -> Option<Location> {
+            match self {
+                Self::SeekNode { contract, .. } => Some(Location::from(contract.id())),
+                Self::RequestPut { contract, .. } => Some(Location::from(contract.id())),
+                Self::Broadcasting { key, .. } => Some(Location::from(key.id())),
+                Self::PutForward { contract, .. } => Some(Location::from(contract.id())),
+                Self::BroadcastTo { key, .. } => Some(Location::from(key.id())),
+                _ => None,
+            }
+        }
     }
 
     impl PutMsg {
@@ -918,7 +922,6 @@ mod messages {
             let id = self.id();
             match self {
                 Self::SeekNode { .. } => write!(f, "SeekNode(id: {id})"),
-                Self::RouteValue { .. } => write!(f, "RouteValue(id: {id})"),
                 Self::RequestPut { .. } => write!(f, "RequestPut(id: {id})"),
                 Self::Broadcasting { .. } => write!(f, "Broadcasting(id: {id})"),
                 Self::SuccessfulUpdate { .. } => write!(f, "SusscessfulUpdate(id: {id})"),

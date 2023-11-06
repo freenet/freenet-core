@@ -1020,6 +1020,10 @@ mod messages {
                 } | Connected { .. }
             )
         }
+
+        fn requested_location(&self) -> Option<Location> {
+            self.target().and_then(|pkloc| pkloc.location)
+        }
     }
 
     impl ConnectMsg {

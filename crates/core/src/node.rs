@@ -296,7 +296,7 @@ where
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
         if backoff.sleep().await.is_none() {
             tracing::error!("Max number of retries reached");
-            return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.tx_type()));
+            return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.transaction_type()));
         }
         op.backoff = Some(backoff);
     }
@@ -696,7 +696,7 @@ async fn handle_cancelled_op<CM>(
 where
     CM: NetworkBridge + Send + Sync,
 {
-    if let TransactionType::Connect = tx.tx_type() {
+    if let TransactionType::Connect = tx.transaction_type() {
         // the attempt to join the network failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
         match op_storage.pop(&tx) {
@@ -712,7 +712,7 @@ where
                 }
             }
             Ok(Some(OpEnum::Connect(_))) => {
-                return Err(OpError::MaxRetriesExceeded(tx, tx.tx_type()));
+                return Err(OpError::MaxRetriesExceeded(tx, tx.transaction_type()));
             }
             _ => {}
         }

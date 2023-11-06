@@ -673,7 +673,7 @@ impl Executor<Runtime> {
         let key = contract.key();
         let params = contract.params();
 
-        if self.get_local_contract(&key.id()).await.is_ok() {
+        if self.get_local_contract(key.id()).await.is_ok() {
             // already existing contract, just try to merge states
             return self
                 .perform_contract_update(key, UpdateData::State(state.into()))
@@ -963,7 +963,7 @@ impl Executor<Runtime> {
                 {
                     if self.mode == OperationMode::Local {
                         return Err(ExecutorError::request(RequestError::ContractError(
-                            CoreContractError::MissingRelated { key: key.id() },
+                            CoreContractError::MissingRelated { key: *key.id() },
                         )));
                     }
                 }
@@ -1109,7 +1109,7 @@ impl Executor<Runtime> {
         }
         if iterations == DEPENDENCY_CYCLE_LIMIT_GUARD {
             return Err(ExecutorError::request(CoreContractError::MissingRelated {
-                key: original_key.id(),
+                key: *original_key.id(),
             }));
         }
         Ok(())
