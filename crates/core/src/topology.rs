@@ -1,5 +1,3 @@
-#![allow(unused_variables, dead_code)]
-
 use crate::ring::{Distance, Location};
 use request_density_tracker::cached_density_map::CachedDensityMap;
 use std::{
@@ -8,11 +6,12 @@ use std::{
 };
 use tracing::{debug, error, info};
 
-use self::{request_density_tracker::DensityMapError, small_world_rand::random_link_distance};
+use self::request_density_tracker::DensityMapError;
+pub(crate) use small_world_rand::random_link_distance;
 
-pub mod connection_evaluator;
+mod connection_evaluator;
 mod request_density_tracker;
-pub mod small_world_rand;
+mod small_world_rand;
 
 const SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(5 * 60);
 const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(60);
@@ -42,8 +41,9 @@ pub(crate) struct TopologyManager {
     slow_connection_evaluator: connection_evaluator::ConnectionEvaluator,
     fast_connection_evaluator: connection_evaluator::ConnectionEvaluator,
     request_density_tracker: request_density_tracker::RequestDensityTracker,
+    /// Must be updated when new neightbors are discovered.
     cached_density_map: CachedDensityMap,
-    this_peer_location: Location,
+    pub this_peer_location: Location,
 }
 
 impl TopologyManager {
@@ -65,11 +65,20 @@ impl TopologyManager {
         }
     }
 
+    pub(crate) fn refresh_cache(
+        &mut self,
+        current_neighbors: &BTreeMap<Location, usize>,
+    ) -> Result<(), DensityMapError> {
+        self.cached_density_map
+            .create(&self.request_density_tracker, current_neighbors)?;
+        Ok(())
+    }
+
     /// Record a request and the location it's targeting
     pub(crate) fn record_request(
         &mut self,
         requested_location: Location,
-        request_type: RequestType,
+        _request_type: RequestType,
     ) {
         debug!("Recording request for location: {:?}", requested_location);
         self.request_density_tracker.sample(requested_location);
@@ -80,12 +89,10 @@ impl TopologyManager {
     /// recent candidates.
     pub(crate) fn evaluate_new_connection(
         &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
         candidate_location: Location,
         acquisition_strategy: AcquisitionStrategy,
     ) -> Result<bool, DensityMapError> {
         self.evaluate_new_connection_with_current_time(
-            current_neighbors,
             candidate_location,
             acquisition_strategy,
             Instant::now(),
@@ -94,7 +101,6 @@ impl TopologyManager {
 
     fn evaluate_new_connection_with_current_time(
         &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
         candidate_location: Location,
         acquisition_strategy: AcquisitionStrategy,
         current_time: Instant,
@@ -103,7 +109,10 @@ impl TopologyManager {
             "Evaluating new connection for candidate location: {:?}",
             candidate_location
         );
-        let density_map = self.get_or_create_density_map(current_neighbors)?;
+        let density_map = self
+            .cached_density_map
+            .get()
+            .ok_or(DensityMapError::EmptyNeighbors)?;
         let score = density_map.get_density_at(candidate_location)?;
 
         let accept = match acquisition_strategy {
@@ -125,12 +134,12 @@ impl TopologyManager {
     }
 
     /// Get the ideal location for a new connection based on current neighbors and request density
-    pub(crate) fn get_best_candidate_location(
-        &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
-    ) -> Result<Location, DensityMapError> {
+    pub(crate) fn get_best_candidate_location(&self) -> Result<Location, DensityMapError> {
         debug!("Retrieving best candidate location");
-        let density_map = self.get_or_create_density_map(current_neighbors)?;
+        let density_map = self
+            .cached_density_map
+            .get()
+            .ok_or(DensityMapError::EmptyNeighbors)?;
 
         let best_location = match density_map.get_max_density() {
             Ok(location) => {
@@ -160,18 +169,6 @@ impl TopologyManager {
         };
         let location_f64 = location_f64.rem_euclid(1.0); // Ensure result is in [0.0, 1.0)
         Location::new(location_f64)
-    }
-
-    fn get_or_create_density_map<'a>(
-        &'a mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
-    ) -> Result<&'a request_density_tracker::DensityMap, DensityMapError> {
-        debug!("Getting or creating density map");
-        if self.cached_density_map.density_map.is_none() {
-            self.cached_density_map
-                .create(&self.request_density_tracker, current_neighbors)?;
-        }
-        Ok(self.cached_density_map.get().unwrap())
     }
 }
 
@@ -213,9 +210,7 @@ mod tests {
             requests.push(requested_location);
         }
 
-        let best_candidate_location = topology_manager
-            .get_best_candidate_location(&current_neighbors)
-            .unwrap();
+        let best_candidate_location = topology_manager.get_best_candidate_location().unwrap();
         // Should be half way between 0.3 and 0.4 as that is where the most requests were
         assert_eq!(best_candidate_location, Location::new(0.35));
 
@@ -226,7 +221,8 @@ mod tests {
         for i in 0..100 {
             let candidate_location = Location::new(i as f64 / 100.0);
             let score = topology_manager
-                .get_or_create_density_map(&current_neighbors)
+                .cached_density_map
+                .get()
                 .unwrap()
                 .get_density_at(candidate_location)
                 .unwrap();

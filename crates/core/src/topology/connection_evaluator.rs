@@ -24,17 +24,9 @@ impl ConnectionEvaluator {
         }
     }
 
-    pub fn record_only(&mut self, score: f64) {
-        self.record_only_with_current_time(score, Instant::now());
-    }
-
     pub fn record_only_with_current_time(&mut self, score: f64, current_time: Instant) {
         self.remove_outdated_scores(current_time);
         self.scores.push_back((current_time, score));
-    }
-
-    pub fn record_and_eval(&mut self, score: f64) -> bool {
-        self.record_and_eval_with_current_time(score, Instant::now())
     }
 
     pub fn record_and_eval_with_current_time(&mut self, score: f64, current_time: Instant) -> bool {

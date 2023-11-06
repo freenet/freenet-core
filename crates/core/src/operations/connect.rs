@@ -232,7 +232,7 @@ impl Operation for ConnectOp {
 
                     // todo: location should be based on your public IP
                     let new_location = assigned_location.unwrap_or_else(Location::random);
-                    let accepted_by = if op_storage.ring.should_accept(&new_location) {
+                    let accepted_by = if op_storage.ring.should_accept(new_location) {
                         tracing::debug!(tx = %id, "Accepting connection from {}", joiner,);
                         HashSet::from_iter([*this_node_loc])
                     } else {
@@ -313,7 +313,7 @@ impl Operation for ConnectOp {
                     );
                     if op_storage
                         .ring
-                        .should_accept(&joiner.location.ok_or(ConnectionError::LocationUnknown)?)
+                        .should_accept(joiner.location.ok_or(ConnectionError::LocationUnknown)?)
                     {
                         tracing::debug!(tx = %id, "Accepting proxy connection from {}", joiner.peer);
                         accepted_by.insert(own_loc);
@@ -712,7 +712,7 @@ async fn propagate_oc_to_accepted_peers<NB: NetworkBridge>(
 ) -> Result<(), OpError> {
     let id = msg.id();
     if op_storage.ring.should_accept(
-        &other_peer
+        other_peer
             .location
             .ok_or(ConnectionError::LocationUnknown)?,
     ) {

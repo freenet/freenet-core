@@ -49,11 +49,11 @@ impl RequestDensityTracker {
         &self,
         neighbors: &BTreeMap<Location, usize>,
     ) -> Result<DensityMap, DensityMapError> {
+        debug_assert!(!neighbors.is_empty());
         if neighbors.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
         }
 
-        let smoothing_radius = 2;
         let mut density_map = DensityMap {
             neighbor_request_counts: BTreeMap::new(),
         };
