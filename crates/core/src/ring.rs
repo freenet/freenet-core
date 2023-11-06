@@ -16,11 +16,12 @@ use std::{
     convert::TryFrom,
     fmt::Display,
     hash::Hasher,
+    ops::Add,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
-    time::Duration, ops::Add,
+    time::Duration,
 };
 
 use anyhow::bail;
