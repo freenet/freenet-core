@@ -10,7 +10,7 @@ use thiserror::Error;
 /// Tracks requests sent by a node to its neighbors and creates a density map, which
 /// is useful for determining which new neighbors to connect to based on their
 /// location.
-pub(crate) struct RequestDensityTracker {
+pub(super) struct RequestDensityTracker {
     ordered_map: BTreeMap<Location, usize>,
     list: LinkedList<Location>,
     window_size: usize,
@@ -18,7 +18,7 @@ pub(crate) struct RequestDensityTracker {
 }
 
 impl RequestDensityTracker {
-    pub(crate) fn new(window_size: usize) -> Self {
+    pub fn new(window_size: usize) -> Self {
         Self {
             ordered_map: BTreeMap::new(),
             list: LinkedList::new(),
@@ -27,7 +27,7 @@ impl RequestDensityTracker {
         }
     }
 
-    pub(crate) fn sample(&mut self, value: Location) {
+    pub fn sample(&mut self, value: Location) {
         self.samples += 1;
 
         self.list.push_back(value);
@@ -45,7 +45,7 @@ impl RequestDensityTracker {
         }
     }
 
-    pub(crate) fn create_density_map(
+    pub fn create_density_map(
         &self,
         neighbors: &BTreeMap<Location, usize>,
     ) -> Result<DensityMap, DensityMapError> {
@@ -95,12 +95,12 @@ impl RequestDensityTracker {
     }
 }
 
-pub(crate) struct DensityMap {
+pub(super) struct DensityMap {
     neighbor_request_counts: BTreeMap<Location, usize>,
 }
 
 impl DensityMap {
-    pub(crate) fn get_density_at(&self, location: Location) -> Result<f64, DensityMapError> {
+    pub fn get_density_at(&self, location: Location) -> Result<f64, DensityMapError> {
         if self.neighbor_request_counts.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
         }
@@ -142,7 +142,7 @@ impl DensityMap {
         Ok(count_estimate)
     }
 
-    pub(crate) fn get_max_density(&self) -> Result<Location, DensityMapError> {
+    pub fn get_max_density(&self) -> Result<Location, DensityMapError> {
         if self.neighbor_request_counts.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
         }
@@ -195,7 +195,7 @@ impl DensityMap {
 
 // Define the custom error type using thiserror
 #[derive(Error, Debug)]
-pub enum DensityError {
+pub(super) enum DensityError {
     #[error("Not enough samples to determine lower and upper bounds")]
     CantFindBounds,
 
@@ -204,7 +204,7 @@ pub enum DensityError {
 }
 
 #[derive(Error, Debug)]
-pub enum DensityMapError {
+pub(crate) enum DensityMapError {
     #[error("The neighbors BTreeMap is empty.")]
     EmptyNeighbors,
 }

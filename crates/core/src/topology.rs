@@ -4,7 +4,6 @@ use crate::ring::{Distance, Location};
 use request_density_tracker::cached_density_map::CachedDensityMap;
 use std::{
     collections::BTreeMap,
-    rc::Rc,
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info};
@@ -163,13 +162,16 @@ impl TopologyManager {
         Location::new(location_f64)
     }
 
-    fn get_or_create_density_map(
-        &mut self,
+    fn get_or_create_density_map<'a>(
+        &'a mut self,
         current_neighbors: &BTreeMap<Location, usize>,
-    ) -> Result<Rc<request_density_tracker::DensityMap>, DensityMapError> {
+    ) -> Result<&'a request_density_tracker::DensityMap, DensityMapError> {
         debug!("Getting or creating density map");
-        self.cached_density_map
-            .get_or_create(&self.request_density_tracker, current_neighbors)
+        if self.cached_density_map.density_map.is_none() {
+            self.cached_density_map
+                .create(&self.request_density_tracker, current_neighbors)?;
+        }
+        Ok(self.cached_density_map.get().unwrap())
     }
 }
 
