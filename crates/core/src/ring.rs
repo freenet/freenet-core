@@ -439,11 +439,15 @@ impl Ring {
             open_at: Instant::now(),
         });
         self.location_for_peer.write().insert(peer, loc);
+        std::mem::drop(cbl);
+        self.refresh_density_request_cache()
+    }
+
+    fn refresh_density_request_cache(&self) {
+        let cbl = self.connections_by_location.read();
         let current_neighbors = &Self::current_neighbors(&cbl);
         let topology_manager = &mut *self.topology_manager.write();
-        topology_manager
-            .refresh_cache(current_neighbors)
-            .expect("current neightbors shouldn't be empty here ever, just added at least one")
+        let _ = topology_manager.refresh_cache(current_neighbors);
     }
 
     /// Return the most optimal peer caching a given contract.
@@ -624,11 +628,14 @@ impl Ring {
         #[cfg(test)]
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(1);
         const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(1);
+        const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
         let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut acquire_max_connections = tokio::time::interval(ACQUIRE_CONNS_TICK_DURATION);
         acquire_max_connections.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut refresh_density_map = tokio::time::interval(REGENERATE_DENSITY_MAP_INTERVAL);
+        refresh_density_map.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut missing = BTreeMap::new();
 
@@ -651,6 +658,7 @@ impl Ring {
                     }
                 }
             }
+
             // eventually peers which failed to return candidates should be retried when enough time has passed
             let retry_missing_candidates_until = Instant::now() - retry_interval;
             missing.split_off(&Reverse(retry_missing_candidates_until));
@@ -752,7 +760,13 @@ impl Ring {
                         })?;
                 }
             }
-            check_interval.tick().await;
+
+            tokio::select! {
+              _ = refresh_density_map.tick() => {
+                self.refresh_density_request_cache();
+              }
+              _ = check_interval.tick() => {}
+            }
         }
     }
 
