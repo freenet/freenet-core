@@ -203,6 +203,7 @@ pub(crate) enum OpError {
     },
     #[error("failed notifying, channel closed")]
     NotificationError,
+    #[cfg(debug_assertions)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
@@ -234,6 +235,10 @@ impl OpError {
         tx: Transaction,
         state: Box<dyn std::fmt::Debug + Send + Sync>,
     ) -> Self {
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = state;
+        }
         Self::InvalidStateTransition {
             tx,
             #[cfg(debug_assertions)]

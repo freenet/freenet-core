@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 /// In the Freenet context, this will be used to titrate the rate of new connection requests accepted
 /// by a node. The node will only accept a new connection if the score of the connection is better
 /// than all other scores within the time window.
-pub(crate) struct ConnectionEvaluator {
+pub(super) struct ConnectionEvaluator {
     scores: VecDeque<(Instant, f64)>,
     window_duration: Duration,
 }

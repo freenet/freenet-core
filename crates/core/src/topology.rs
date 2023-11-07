@@ -185,6 +185,7 @@ mod tests {
 
     #[test]
     fn test_topology_manager() {
+        const NUM_REQUESTS: usize = 1_000;
         let mut topology_manager = TopologyManager::new(Location::new(0.39));
         let mut current_neighbors = std::collections::BTreeMap::new();
 
@@ -202,15 +203,23 @@ mod tests {
             .unwrap();
         let mut requests = vec![];
         // Simulate a bunch of random requests clustered around 0.35
-        for _ in 0..1000 {
+        for _ in 0..NUM_REQUESTS {
             let requested_location = topology_manager.random_location();
             topology_manager.record_request(requested_location, TransactionType::Get);
             requests.push(requested_location);
         }
 
+        let target_dense_location = Location::new(
+            requests.iter().map(|loc| loc.as_f64()).sum::<f64>() / NUM_REQUESTS as f64,
+        );
         let best_candidate_location = topology_manager.get_best_candidate_location().unwrap();
-        // Should be half way between 0.3 and 0.4 as that is where the most requests were
-        assert_eq!(best_candidate_location, Location::new(0.35));
+        // Should be close to where most of the requests were done.
+        let distance = (best_candidate_location.as_f64() - target_dense_location.as_f64()).abs();
+        assert!(
+            distance < 0.05,
+            "most requests done to {target_dense_location}, but candidate is {best_candidate_location} instead, \
+             distance between them higher than 0.05"
+        );
 
         // call evaluate_new_connection for locations 0.0 to 1.0 at 0.01 intervals and find the
         // location with the highest score

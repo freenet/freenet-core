@@ -607,7 +607,7 @@ impl Ring {
         live_tx_tracker: LiveTransactionTracker,
         mut missing_candidates: sync::mpsc::Receiver<PeerKey>,
     ) -> Result<(), DynError> {
-        /// Drop a connection and acquire a new one.
+        /// Peers whose connection should be acquired.
         fn should_swap<'a>(
             _connections: impl Iterator<Item = &'a PeerKeyLocation>,
         ) -> Vec<PeerKey> {
@@ -689,6 +689,7 @@ impl Ring {
                         ideal_location,
                         &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
                         &notifier,
+                        self.max_connections - open_connections,
                     )
                     .await
                     .map_err(|error| {
@@ -732,6 +733,7 @@ impl Ring {
                         ideal_location,
                         &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
                         &notifier,
+                        should_swap.len(),
                     )
                     .await
                     .map_err(|error| {
@@ -760,6 +762,7 @@ impl Ring {
         ideal_location: Location,
         skip_list: &[&PeerKey],
         notifier: &EventLoopNotificationsSender,
+        missing_connections: usize,
     ) -> Result<Option<Transaction>, DynError> {
         use crate::message::InnerMessage;
         let Some(query_target) = self.routing(ideal_location, None, skip_list) else {
@@ -778,6 +781,7 @@ impl Ring {
                 query_target,
                 ideal_location,
                 joiner,
+                max_hops_to_live: missing_connections,
             },
         };
         let id = *msg.id();

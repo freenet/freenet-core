@@ -135,6 +135,7 @@ impl Operation for ConnectOp {
                             query_target,
                             ideal_location,
                             joiner,
+                            max_hops_to_live,
                         },
                     id,
                 } => {
@@ -163,7 +164,7 @@ impl Operation for ConnectOp {
                                 msg: ConnectRequest::Proxy {
                                     sender: own_loc,
                                     joiner: *joiner,
-                                    hops_to_live: 0,
+                                    hops_to_live: *max_hops_to_live,
                                     skip_list: vec![*this_peer, joiner.peer],
                                     accepted_by: HashSet::new(),
                                 },
@@ -204,6 +205,7 @@ impl Operation for ConnectOp {
                                 query_target: *query_target,
                                 ideal_location: *ideal_location,
                                 joiner: *joiner,
+                                max_hops_to_live: *max_hops_to_live,
                             },
                         };
                         network_bridge.send(&query_target.peer, msg.into()).await?;
@@ -1094,6 +1096,7 @@ mod messages {
             /// The ideal location of the peer to which you would connect.
             ideal_location: Location,
             joiner: PeerKeyLocation,
+            max_hops_to_live: usize,
         },
         Proxy {
             sender: PeerKeyLocation,

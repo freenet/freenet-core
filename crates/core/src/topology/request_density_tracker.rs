@@ -18,7 +18,7 @@ impl RequestDensityTracker {
     pub fn new(window_size: usize) -> Self {
         Self {
             request_locations: BTreeMap::new(),
-            request_list: VecDeque::new(),
+            request_list: VecDeque::with_capacity(window_size),
             window_size,
             samples: 0,
         }
