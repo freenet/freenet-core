@@ -2,12 +2,11 @@ use crate::{
     message::TransactionType,
     ring::{Distance, Location},
 };
-use request_density_tracker::cached_density_map::CachedDensityMap;
+use request_density_tracker::CachedDensityMap;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
 };
-use tracing::{debug, error};
 
 mod connection_evaluator;
 mod request_density_tracker;
@@ -79,9 +78,9 @@ impl TopologyManager {
     pub(crate) fn record_request(
         &mut self,
         requested_location: Location,
-        _request_type: TransactionType,
+        request_type: TransactionType,
     ) {
-        debug!("Recording request for location: {:?}", requested_location);
+        tracing::debug!(%request_type, %requested_location, "Recording request for location");
         self.request_density_tracker.sample(requested_location);
     }
 
@@ -106,7 +105,7 @@ impl TopologyManager {
         acquisition_strategy: AcquisitionStrategy,
         current_time: Instant,
     ) -> Result<bool, DensityMapError> {
-        debug!(
+        tracing::debug!(
             "Evaluating new connection for candidate location: {:?}",
             candidate_location
         );
@@ -136,7 +135,6 @@ impl TopologyManager {
 
     /// Get the ideal location for a new connection based on current neighbors and request density
     pub(crate) fn get_best_candidate_location(&self) -> Result<Location, DensityMapError> {
-        debug!("Retrieving best candidate location");
         let density_map = self
             .cached_density_map
             .get()
@@ -144,24 +142,23 @@ impl TopologyManager {
 
         let best_location = match density_map.get_max_density() {
             Ok(location) => {
-                debug!("Max density found at location: {:?}", location);
+                tracing::debug!("Max density found at location: {:?}", location);
                 location
             }
             Err(_) => {
-                error!(
+                tracing::error!(
                     "An error occurred while getting max density, falling back to random location"
                 );
                 self.random_location()
             }
         };
-
         Ok(best_location)
     }
 
     /// Generates a random location that is close to the current peer location with a small
     /// world distribution.
     fn random_location(&self) -> Location {
-        debug!("Generating random location");
+        tracing::debug!("Generating random location");
         let distance = random_link_distance(Distance::new(RANDOM_CLOSEST_DISTANCE));
         let location_f64 = if rand::random() {
             self.this_peer_location.as_f64() - distance.as_f64()

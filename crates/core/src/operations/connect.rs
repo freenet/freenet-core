@@ -917,8 +917,12 @@ where
             "Selecting close peer to forward request",
         );
         // FIXME: target the `desired_location`
-        ring.routing(&joiner.location.unwrap(), Some(&req_peer.peer), &skip_list)
-            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
+        ring.routing(
+            joiner.location.unwrap(),
+            Some(&req_peer.peer),
+            skip_list.as_slice(),
+        )
+        .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     };
 
     if let Some(forward_to) = forward_to {

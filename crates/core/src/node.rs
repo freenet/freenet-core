@@ -544,7 +544,7 @@ async fn report_result(
                     })
                     .unwrap_or_default();
                 tracing::error!(%tx, ?state, "Wrong state");
-                eprintln!("{trace}");
+                eprintln!("Operation error trace:\n{trace}");
             }
             #[cfg(not(debug_assertions))]
             {

@@ -676,7 +676,7 @@ pub(crate) async fn request_put(
     // - and the value to put
     let target = op_storage
         .ring
-        .closest_caching(&key, &[sender.peer])
+        .closest_caching(&key, [&sender.peer].as_slice())
         .into_iter()
         .next()
         .ok_or(RingError::EmptyRing)?;
@@ -771,7 +771,8 @@ async fn forward_changes<CB>(
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    let forward_to = op_storage.ring.closest_caching(&key, &[]);
+    const EMPTY: &[PeerKey] = &[];
+    let forward_to = op_storage.ring.closest_caching(&key, EMPTY);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     if let Some(peer) = forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
@@ -1018,7 +1019,7 @@ mod test {
 
         // trigger the put op @ gw-0
         sim_nw
-            .trigger_event("gateway-0", 1, Some(Duration::from_millis(200)))
+            .trigger_event("gateway-0", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nw.has_put_contract("gateway-0", &key, &new_value));
         assert!(sim_nw.event_listener.contract_broadcasted(&key));

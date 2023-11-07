@@ -1,18 +1,15 @@
-pub mod cached_density_map;
-
-#[cfg(test)]
-mod tests;
-
 use crate::ring::Location;
-use std::collections::{BTreeMap, LinkedList};
+use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
 /// Tracks requests sent by a node to its neighbors and creates a density map, which
 /// is useful for determining which new neighbors to connect to based on their
 /// location.
 pub(super) struct RequestDensityTracker {
-    ordered_map: BTreeMap<Location, usize>,
-    list: LinkedList<Location>,
+    /// Amount of requests done to an specific location.
+    request_locations: BTreeMap<Location, usize>,
+    /// Request locations sorted by order of execution.
+    request_list: VecDeque<Location>,
     window_size: usize,
     samples: usize,
 }
@@ -20,8 +17,8 @@ pub(super) struct RequestDensityTracker {
 impl RequestDensityTracker {
     pub fn new(window_size: usize) -> Self {
         Self {
-            ordered_map: BTreeMap::new(),
-            list: LinkedList::new(),
+            request_locations: BTreeMap::new(),
+            request_list: VecDeque::new(),
             window_size,
             samples: 0,
         }
@@ -30,15 +27,15 @@ impl RequestDensityTracker {
     pub fn sample(&mut self, value: Location) {
         self.samples += 1;
 
-        self.list.push_back(value);
-        *self.ordered_map.entry(value).or_insert(0) += 1;
+        self.request_list.push_back(value);
+        *self.request_locations.entry(value).or_insert(0) += 1;
 
-        if self.list.len() > self.window_size {
-            if let Some(oldest) = self.list.pop_front() {
-                if let Some(count) = self.ordered_map.get_mut(&oldest) {
+        if self.request_list.len() > self.window_size {
+            if let Some(oldest) = self.request_list.pop_front() {
+                if let Some(count) = self.request_locations.get_mut(&oldest) {
                     *count -= 1;
                     if *count == 0 {
-                        self.ordered_map.remove(&oldest);
+                        self.request_locations.remove(&oldest);
                     }
                 }
             }
@@ -54,11 +51,9 @@ impl RequestDensityTracker {
             return Err(DensityMapError::EmptyNeighbors);
         }
 
-        let mut density_map = DensityMap {
-            neighbor_request_counts: BTreeMap::new(),
-        };
+        let mut neighbor_request_counts = BTreeMap::new();
 
-        for (sample_location, sample_count) in self.ordered_map.iter() {
+        for (sample_location, sample_count) in self.request_locations.iter() {
             let previous_neighbor = neighbors
                 .range(..*sample_location)
                 .next_back()
@@ -73,13 +68,11 @@ impl RequestDensityTracker {
                     if sample_location.distance(*previous_neighbor_location)
                         < sample_location.distance(*next_neighbor_location)
                     {
-                        *density_map
-                            .neighbor_request_counts
+                        *neighbor_request_counts
                             .entry(*previous_neighbor_location)
                             .or_insert(0) += sample_count;
                     } else {
-                        *density_map
-                            .neighbor_request_counts
+                        *neighbor_request_counts
                             .entry(*next_neighbor_location)
                             .or_insert(0) += sample_count;
                     }
@@ -91,9 +84,9 @@ impl RequestDensityTracker {
             }
         }
 
-        debug_assert!(!density_map.neighbor_request_counts.is_empty());
-
-        Ok(density_map)
+        Ok(DensityMap {
+            neighbor_request_counts,
+        })
     }
 }
 
@@ -195,8 +188,306 @@ impl DensityMap {
     }
 }
 
+/// Struct to handle caching of DensityMap
+pub(in crate::topology) struct CachedDensityMap {
+    density_map: Option<DensityMap>,
+}
+
+impl CachedDensityMap {
+    pub fn new() -> Self {
+        CachedDensityMap { density_map: None }
+    }
+
+    pub fn set(
+        &mut self,
+        tracker: &RequestDensityTracker,
+        current_neighbors: &BTreeMap<Location, usize>,
+    ) -> Result<(), DensityMapError> {
+        let density_map = tracker.create_density_map(current_neighbors)?;
+        self.density_map = Some(density_map);
+        Ok(())
+    }
+
+    pub fn get(&self) -> Option<&DensityMap> {
+        self.density_map.as_ref()
+    }
+}
+
 #[derive(Error, Debug)]
 pub(crate) enum DensityMapError {
     #[error("The neighbors BTreeMap is empty.")]
     EmptyNeighbors,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_density_map() {
+        let mut sw = RequestDensityTracker::new(5);
+        sw.sample(Location::new(0.21));
+        sw.sample(Location::new(0.22));
+        sw.sample(Location::new(0.23));
+        sw.sample(Location::new(0.61));
+        sw.sample(Location::new(0.62));
+
+        let mut neighbors = BTreeMap::new();
+        neighbors.insert(Location::new(0.2), 1);
+        neighbors.insert(Location::new(0.6), 1);
+
+        let result = sw.create_density_map(&neighbors);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(
+            result.neighbor_request_counts.get(&Location::new(0.2)),
+            Some(&3)
+        );
+        assert_eq!(
+            result.neighbor_request_counts.get(&Location::new(0.6)),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn test_wrap_around() {
+        let mut sw = RequestDensityTracker::new(5);
+        sw.sample(Location::new(0.21));
+        sw.sample(Location::new(0.22));
+        sw.sample(Location::new(0.23));
+        sw.sample(Location::new(0.61));
+        sw.sample(Location::new(0.62));
+
+        let mut neighbors = BTreeMap::new();
+        neighbors.insert(Location::new(0.6), 1);
+        neighbors.insert(Location::new(0.9), 1);
+
+        let result = sw.create_density_map(&neighbors);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(
+            result.neighbor_request_counts.get(&Location::new(0.9)),
+            Some(&3)
+        );
+        assert_eq!(
+            result.neighbor_request_counts.get(&Location::new(0.6)),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn test_interpolate() {
+        let mut sw = RequestDensityTracker::new(10);
+        sw.sample(Location::new(0.19));
+        sw.sample(Location::new(0.20));
+        sw.sample(Location::new(0.21));
+        sw.sample(Location::new(0.59));
+        sw.sample(Location::new(0.60));
+
+        let mut neighbors = BTreeMap::new();
+        neighbors.insert(Location::new(0.2), 1);
+        neighbors.insert(Location::new(0.6), 1);
+
+        let result = sw.create_density_map(&neighbors);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+
+        // Scan and dumb densities 0.0 to 1.0 at 0.01 intervals
+        println!("Location\tDensity");
+        for i in 0..100 {
+            let location = Location::new(i as f64 / 100.0);
+            let density = result.get_density_at(location).unwrap();
+            // Print and round density to 2 decimals
+            println!(
+                "{}\t{}",
+                location.as_f64(),
+                (density * 100.0).round() / 100.0
+            );
+        }
+
+        assert_eq!(result.get_density_at(Location::new(0.2)).unwrap(), 3.0);
+        assert_eq!(result.get_density_at(Location::new(0.6)).unwrap(), 2.0);
+        assert_eq!(result.get_density_at(Location::new(0.4)).unwrap(), 2.5);
+        assert_eq!(result.get_density_at(Location::new(0.5)).unwrap(), 2.25);
+    }
+
+    #[test]
+    fn test_drop() {
+        let mut sw = RequestDensityTracker::new(4);
+        sw.sample(Location::new(0.21));
+        sw.sample(Location::new(0.22));
+        sw.sample(Location::new(0.23));
+        sw.sample(Location::new(0.61));
+        sw.sample(Location::new(0.62));
+
+        let mut neighbors = BTreeMap::new();
+        neighbors.insert(Location::new(0.2), 1);
+        neighbors.insert(Location::new(0.6), 1);
+
+        let result = sw.create_density_map(&neighbors);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(
+            result.neighbor_request_counts.get(&Location::new(0.2)),
+            Some(&2)
+        );
+        assert_eq!(
+            result.neighbor_request_counts.get(&Location::new(0.6)),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed: !neighbors.is_empty()")]
+    fn test_empty_neighbors_error() {
+        let sw = RequestDensityTracker::new(10);
+        let empty_neighbors = BTreeMap::new();
+        matches!(
+            sw.create_density_map(&empty_neighbors),
+            Err(DensityMapError::EmptyNeighbors)
+        );
+    }
+
+    #[test]
+    fn test_get_max_density() {
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.2), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.6), 2);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.8), 2);
+
+        let result = density_map.get_max_density();
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, Location::new(0.7));
+    }
+
+    #[test]
+    fn test_get_max_density_2() {
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.2), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.6), 2);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.8), 2);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.9), 1);
+
+        let result = density_map.get_max_density();
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, Location::new(0.7));
+    }
+
+    #[test]
+    fn test_get_max_density_first_last() {
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.0), 2);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.2), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.6), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.8), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.9), 2);
+
+        let result = density_map.get_max_density();
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, Location::new(0.95));
+    }
+
+    #[test]
+    fn test_get_max_density_first_last_2() {
+        // Verify the other case in max_density_location calculation
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.3), 2);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.4), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.6), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.8), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.9), 2);
+
+        let result = density_map.get_max_density();
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, Location::new(0.1));
+    }
+
+    #[test]
+    fn test_get_max_density_first_last_3() {
+        // Verify the other case in max_density_location calculation
+        let mut density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.1), 2);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.2), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.3), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.4), 1);
+        density_map
+            .neighbor_request_counts
+            .insert(Location::new(0.7), 2);
+
+        let result = density_map.get_max_density();
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result, Location::new(0.9));
+    }
+
+    #[test]
+    fn test_get_max_density_empty_neighbors_error() {
+        let density_map = DensityMap {
+            neighbor_request_counts: BTreeMap::new(),
+        };
+
+        let result = density_map.get_max_density();
+        assert!(matches!(result, Err(DensityMapError::EmptyNeighbors)));
+    }
 }

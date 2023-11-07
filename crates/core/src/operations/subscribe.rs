@@ -151,7 +151,9 @@ impl Operation for SubscribeOp {
                     if !op_storage.ring.is_contract_cached(key) {
                         tracing::debug!(tx = %id, "Contract {} not found at {}, trying other peer", key, target.peer);
 
-                        let Some(new_target) = op_storage.ring.closest_caching(key, &[sender.peer])
+                        let Some(new_target) = op_storage
+                            .ring
+                            .closest_caching(key, [&sender.peer].as_slice())
                         else {
                             tracing::warn!(tx = %id, "No peer found while trying getting contract {key}");
                             return Err(OpError::RingError(RingError::NoCachingPeers(key.clone())));
@@ -345,10 +347,11 @@ pub(crate) async fn request_subscribe(
                 key.clone(),
             )));
         }
+        const EMPTY: &[PeerKey] = &[];
         (
             op_storage
                 .ring
-                .closest_caching(key, &[])
+                .closest_caching(key, EMPTY)
                 .into_iter()
                 .next()
                 .ok_or_else(|| RingError::NoCachingPeers(key.clone()))?,
@@ -526,7 +529,7 @@ mod test {
         sim_nw.start_with_spec(subscribe_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
         sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(2)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nw.has_got_contract("node-1", &contract_key));
         tokio::time::sleep(Duration::from_secs(3)).await;

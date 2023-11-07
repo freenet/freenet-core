@@ -397,7 +397,6 @@ impl Ring {
         } else if open_conn < self.min_connections {
             true
         } else if open_conn >= self.max_connections {
-            tracing::debug!(peer = %self.peer_key, "max open connections reached");
             false
         } else {
             let strategy = if self
@@ -411,7 +410,7 @@ impl Ring {
             self.topology_manager
                 .write()
                 .evaluate_new_connection(location, strategy)
-                .expect("already have > min connections, so neighbors shouldn't be empty")
+                .unwrap_or(false)
         };
         if !accepted {
             self.open_connections
@@ -436,8 +435,8 @@ impl Ring {
             open_at: Instant::now(),
         });
         self.location_for_peer.write().insert(peer, loc);
-        let topology_manager = &mut *self.topology_manager.write();
         let current_neighbors = &Self::current_neighbors(&cbl);
+        let topology_manager = &mut *self.topology_manager.write();
         topology_manager
             .refresh_cache(current_neighbors)
             .expect("current neightbors shouldn't be empty here ever, just added at least one")
@@ -448,7 +447,7 @@ impl Ring {
     pub fn closest_caching(
         &self,
         contract_key: &ContractKey,
-        skip_list: &[PeerKey],
+        skip_list: impl Contains<PeerKey>,
     ) -> Option<PeerKeyLocation> {
         self.routing(Location::from(contract_key), None, skip_list)
     }
@@ -620,15 +619,12 @@ impl Ring {
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(1);
-        #[cfg(test)]
-        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_millis(100);
-        #[cfg(not(test))]
         const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(1);
 
         let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
-        check_interval.tick().await;
+        check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut acquire_max_connections = tokio::time::interval(ACQUIRE_CONNS_TICK_DURATION);
-        acquire_max_connections.tick().await;
+        acquire_max_connections.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut missing = BTreeMap::new();
 
@@ -645,7 +641,7 @@ impl Ring {
                     }
                     Err(sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(sync::mpsc::error::TryRecvError::Disconnected) => {
-                        tracing::debug!("shutting down connection maintenance");
+                        tracing::debug!("Shutting down connection maintenance");
                         break 'outer Err("finished".into());
                     }
                 }
@@ -656,16 +652,22 @@ impl Ring {
 
             let open_connections = self
                 .open_connections
-                .load(std::sync::atomic::Ordering::Acquire);
-            if open_connections < self.max_connections && open_connections > self.min_connections {
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            if open_connections < self.max_connections {
                 self.fast_acquisition
                     .store(true, std::sync::atomic::Ordering::Release);
                 // requires more connections
                 let ideal_location = {
-                    self.topology_manager
-                        .write()
-                        .get_best_candidate_location()
-                        .expect("we only acquire connections when we have at least the minimum established neighbors already")
+                    let loc = { self.topology_manager.read().get_best_candidate_location() };
+                    match loc {
+                        Ok(loc) => loc,
+                        Err(_) => {
+                            tracing::debug!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                            acquire_max_connections.tick().await;
+                            continue;
+                        }
+                    }
                 };
                 self.acquire_new(
                     ideal_location,
@@ -674,20 +676,11 @@ impl Ring {
                 )
                 .await
                 .map_err(|error| {
-                    tracing::debug!(?error, "shutting down connection maintenance task");
+                    tracing::debug!(?error, "Shutting down connection maintenance task");
                     error
                 })?;
-                if self
-                    .open_connections
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    < self.max_connections
-                {
-                    acquire_max_connections.tick().await;
-                    continue;
-                } else {
-                    check_interval.tick().await;
-                    continue;
-                }
+                acquire_max_connections.tick().await;
+                continue;
             }
 
             let mut should_swap = {
@@ -707,10 +700,15 @@ impl Ring {
                 self.fast_acquisition
                     .store(false, std::sync::atomic::Ordering::Release);
                 let ideal_location = {
-                    self.topology_manager
-                        .write()
-                        .get_best_candidate_location()
-                        .expect("we only swap when we have some established neighbors already")
+                    let loc = { self.topology_manager.read().get_best_candidate_location() };
+                    match loc {
+                        Ok(loc) => loc,
+                        Err(_) => {
+                            tracing::debug!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                            check_interval.tick().await;
+                            continue;
+                        }
+                    }
                 };
                 self.acquire_new(
                     ideal_location,
@@ -719,7 +717,7 @@ impl Ring {
                 )
                 .await
                 .map_err(|error| {
-                    tracing::warn!(?error, "shutting down connection maintenance task");
+                    tracing::warn!(?error, "Shutting down connection maintenance task");
                     error
                 })?;
                 for peer in should_swap.drain(..) {
@@ -729,7 +727,7 @@ impl Ring {
                         )))
                         .await
                         .map_err(|error| {
-                            tracing::debug!(?error, "shutting down connection maintenance task");
+                            tracing::debug!(?error, "Shutting down connection maintenance task");
                             error
                         })?;
                 }

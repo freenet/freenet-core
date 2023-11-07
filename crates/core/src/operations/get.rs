@@ -251,7 +251,7 @@ impl Operation for GetOp {
                         if htl == 0 {
                             tracing::warn!(
                                 tx = %id,
-                                "The maximum HOPS number has been exceeded, sending the error \
+                                "The maximum hops has been exceeded, sending the error \
                                  back to the node @ {}",
                                 sender.peer
                             );
@@ -275,7 +275,10 @@ impl Operation for GetOp {
                         }
 
                         let new_htl = htl - 1;
-                        let Some(new_target) = op_storage.ring.closest_caching(&key, &[]) else {
+                        let Some(new_target) = op_storage
+                            .ring
+                            .closest_caching(&key, [&sender.peer].as_slice())
+                        else {
                             tracing::warn!(tx = %id, "No other peers found while trying getting contract {key} @ {}", target.peer);
                             return Err(OpError::RingError(RingError::NoCachingPeers(key)));
                         };
@@ -367,9 +370,10 @@ impl Operation for GetOp {
                     sender,
                     target,
                 } => {
-                    let this_loc = target;
+                    let this_peer = target;
                     tracing::warn!(
                         tx = %id,
+                        %this_peer,
                         "Neither contract or contract value for contract `{}` found at peer {}, \
                         retrying with other peers",
                         key,
@@ -397,7 +401,7 @@ impl Operation for GetOp {
                                         id: *id,
                                         key: key.clone(),
                                         target,
-                                        sender: *this_loc,
+                                        sender: *this_peer,
                                         fetch_contract,
                                         htl: MAX_GET_RETRY_HOPS,
                                     });
@@ -697,13 +701,14 @@ pub(crate) async fn request_get(
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
+        const EMPTY: &[PeerKey] = &[];
         // the initial request must provide:
         // - a location in the network where the contract resides
         // - and the key of the contract value to get
         (
             op_storage
                 .ring
-                .closest_caching(key, &[])
+                .closest_caching(key, EMPTY)
                 .into_iter()
                 .next()
                 .ok_or(RingError::EmptyRing)?,
@@ -901,7 +906,7 @@ mod test {
 
         // trigger get @ node-0, which does not own the contract
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_millis(50)))
+            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nw.has_got_contract("node-0", &key));
         Ok(())
@@ -939,7 +944,7 @@ mod test {
 
         // trigger get @ node-1, which does not own the contract
         sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_millis(50)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(!sim_nw.has_got_contract("node-1", &key));
         Ok(())
@@ -947,6 +952,7 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contract_found_after_retry() -> Result<(), anyhow::Error> {
+        // crate::config::set_logger();
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
@@ -1005,9 +1011,8 @@ mod test {
         .await;
         sim_nw.start_with_spec(get_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
-
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_millis(200)))
+            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nw.has_got_contract("node-0", &key));
         Ok(())
