@@ -39,6 +39,7 @@ use tokio::sync;
 
 use crate::message::TransactionType;
 use crate::topology::{AcquisitionStrategy, TopologyManager};
+use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
     message::Transaction,
@@ -449,15 +450,15 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: &[PeerKey],
     ) -> Option<PeerKeyLocation> {
-        self.routing(&Location::from(contract_key), None, skip_list)
+        self.routing(Location::from(contract_key), None, skip_list)
     }
 
     /// Route an op to the most optimal target.
     pub fn routing(
         &self,
-        target: &Location,
+        target: Location,
         requesting: Option<&PeerKey>,
-        skip_list: &[PeerKey],
+        skip_list: impl Contains<PeerKey>,
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let peers = connections.values().filter_map(|conns| {
@@ -467,7 +468,7 @@ impl Ring {
                     return None;
                 }
             }
-            (!skip_list.contains(&conn.location.peer)).then_some(&conn.location)
+            (!skip_list.has_element(&conn.location.peer)).then_some(&conn.location)
         });
         let router = &*self.router.read();
         router.select_peer(peers, target).cloned()
@@ -744,56 +745,26 @@ impl Ring {
         skip_list: &[&PeerKey],
         notifier: &EventLoopNotificationsSender,
     ) -> Result<(), DynError> {
-        let msg = {
-            let conns = &*self.connections_by_location.read();
-            let Some(msg) = Self::find_optimal_query_target(
-                (self.own_location(), ideal_location),
-                conns
-                    .iter()
-                    .flat_map(|(loc, conns)| conns.iter().map(|conn| (*loc, &conn.location))),
-                skip_list,
-            ) else {
-                return Ok(());
-            };
-            msg
+        let Some(query_target) = self.routing(ideal_location, None, skip_list) else {
+            return Ok(());
         };
-        notifier.send(Either::Left((msg.into(), None))).await?;
-        Ok(())
-    }
-
-    fn find_optimal_query_target<'a>(
-        (joiner, ideal_location): (PeerKeyLocation, Location),
-        connections_by_location: impl Iterator<Item = (Location, &'a PeerKeyLocation)>,
-        skip_list: &[&PeerKey],
-    ) -> Option<connect::ConnectMsg> {
-        // sort possible peers by proximity to the ideal location
-        let mut request_to = connections_by_location
-            .filter_map(|(loc, peer)| {
-                let dist: Distance = loc.distance(ideal_location);
-                let is_valid = !skip_list.contains(&&peer.peer);
-                is_valid.then_some((dist, peer))
-            })
-            .collect::<ArrayVec<_, { Ring::MAX_CONNECTIONS }>>();
-        request_to.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        // target the peer which is the closest to the ideal location since
-        // it should have the most connections potentially to the ideal target location
-        let (_, request_to) = request_to.first()?;
-
+        let joiner = self.own_location();
         tracing::debug!(
             this_peer = %joiner,
-            query_target = %request_to,
+            %query_target,
             %ideal_location,
             "Adding new connections"
         );
-        Some(connect::ConnectMsg::Request {
+        let msg = connect::ConnectMsg::Request {
             id: Transaction::new::<connect::ConnectMsg>(),
             msg: connect::ConnectRequest::FindOptimalPeer {
-                query_target: **request_to,
+                query_target,
                 ideal_location,
                 joiner,
             },
-        })
+        };
+        notifier.send(Either::Left((msg.into(), None))).await?;
+        Ok(())
     }
 }
 
@@ -986,14 +957,6 @@ impl Display for Distance {
     }
 }
 
-impl std::ops::Sub<Distance> for Distance {
-    type Output = f64;
-
-    fn sub(self, rhs: Distance) -> Self::Output {
-        self.0 - rhs.0
-    }
-}
-
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]
@@ -1009,58 +972,6 @@ pub(crate) enum RingError {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn find_optimal_query_target() {
-        let joiner = PeerKeyLocation {
-            location: Some(Location::new(0.2)),
-            peer: PeerKey::random(),
-        };
-        let ideal_location = Location(0.7);
-
-        let connections_data = vec![
-            (
-                Location::new(0.1),
-                PeerKeyLocation {
-                    location: Some(Location::new(0.2)),
-                    peer: PeerKey::random(),
-                },
-            ),
-            (
-                Location::new(0.3),
-                PeerKeyLocation {
-                    location: Some(Location::new(0.3)),
-                    peer: PeerKey::random(),
-                },
-            ),
-            (
-                Location::new(0.6),
-                PeerKeyLocation {
-                    location: Some(Location::new(0.6)),
-                    peer: PeerKey::random(),
-                },
-            ),
-        ];
-
-        let result = Ring::find_optimal_query_target(
-            (joiner, ideal_location),
-            connections_data.iter().map(|x| (x.0, &x.1)),
-            &[],
-        )
-        .expect("find query target");
-        let connect::ConnectMsg::Request {
-            msg:
-                connect::ConnectRequest::FindOptimalPeer {
-                    query_target: PeerKeyLocation { location, .. },
-                    ..
-                },
-            ..
-        } = result
-        else {
-            panic!()
-        };
-        assert_eq!(location, Some(Location::new(0.6)));
-    }
 
     #[test]
     fn location_dist() {

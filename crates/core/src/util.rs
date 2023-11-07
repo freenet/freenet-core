@@ -8,6 +8,8 @@ use rand::{
     SeedableRng,
 };
 
+use crate::node::PeerKey;
+
 pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
@@ -214,5 +216,21 @@ impl std::fmt::Display for EncodingProtocol {
             EncodingProtocol::Flatbuffers => write!(f, "flatbuffers"),
             EncodingProtocol::Native => write!(f, "native"),
         }
+    }
+}
+
+pub(crate) trait Contains<T> {
+    fn has_element(&self, target: &T) -> bool;
+}
+
+impl<'x> Contains<PeerKey> for &'x [PeerKey] {
+    fn has_element(&self, target: &PeerKey) -> bool {
+        self.contains(target)
+    }
+}
+
+impl<'x> Contains<PeerKey> for &'x [&PeerKey] {
+    fn has_element(&self, target: &PeerKey) -> bool {
+        self.contains(&target)
     }
 }
