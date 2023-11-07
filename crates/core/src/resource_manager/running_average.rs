@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, time::Instant};
 
 #[derive(Clone, Debug)]
-pub struct RunningAverage {
+pub(super) struct RunningAverage {
     max_samples: usize,
     samples: VecDeque<(Instant, f64)>,
     sum_samples: f64,

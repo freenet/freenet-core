@@ -198,7 +198,7 @@ impl Runtime {
         .clone();
         let instance = self.prepare_instance(&module)?;
         self.set_instance_mem(req_bytes, &instance)?;
-        RunningInstance::new(self, instance, Key::Contract(key.id()))
+        RunningInstance::new(self, instance, Key::Contract(*key.id()))
     }
 
     pub(super) fn prepare_delegate_call(

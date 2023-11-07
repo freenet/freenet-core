@@ -66,7 +66,7 @@ impl StateStorage for Pool {
                      ON CONFLICT(contract) DO UPDATE SET state = excluded.state
                      ",
         )
-        .bind(key.bytes())
+        .bind(key.as_bytes())
         .bind(state.as_ref())
         .execute(&self.0)
         .await?;
@@ -75,7 +75,7 @@ impl StateStorage for Pool {
 
     async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
         match sqlx::query("SELECT state FROM states WHERE contract = ?")
-            .bind(key.bytes())
+            .bind(key.as_bytes())
             .map(|row: SqliteRow| Some(WrappedState::new(row.get("state"))))
             .fetch_one(&self.0)
             .await
@@ -97,7 +97,7 @@ impl StateStorage for Pool {
                      ON CONFLICT(contract) DO UPDATE SET params = excluded.params
                      ",
         )
-        .bind(key.bytes())
+        .bind(key.as_bytes())
         .bind(params.as_ref())
         .execute(&self.0)
         .await?;
@@ -109,7 +109,7 @@ impl StateStorage for Pool {
         key: &'a ContractKey,
     ) -> Result<Option<Parameters<'static>>, Self::Error> {
         match sqlx::query("SELECT params FROM states WHERE contract = ?")
-            .bind(key.bytes())
+            .bind(key.as_bytes())
             .map(|row: SqliteRow| Some(Parameters::from(row.get::<Vec<u8>, _>("params"))))
             .fetch_one(&self.0)
             .await

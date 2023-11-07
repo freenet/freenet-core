@@ -1,5 +1,4 @@
 use std::pin::Pin;
-use std::time::Duration;
 use std::{future::Future, time::Instant};
 
 use freenet_stdlib::prelude::*;
@@ -8,10 +7,9 @@ use futures::FutureExt;
 
 use crate::{
     client_events::ClientId,
-    config::PEER_TIMEOUT,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, Message, Transaction},
-    node::{ConnectionBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
@@ -33,7 +31,6 @@ pub(crate) struct GetOp {
     state: Option<GetState>,
     pub(super) result: Option<GetResult>,
     stats: Option<GetStats>,
-    _ttl: Duration,
 }
 
 struct GetStats {
@@ -167,7 +164,6 @@ impl Operation for GetOp {
                             id: tx,
                             result: None,
                             stats: None, // don't care about stats in target peers
-                            _ttl: PEER_TIMEOUT,
                         },
                         sender,
                     })
@@ -182,9 +178,9 @@ impl Operation for GetOp {
         &self.id
     }
 
-    fn process_message<'a, CB: ConnectionBridge>(
+    fn process_message<'a, NB: NetworkBridge>(
         self,
-        conn_manager: &'a mut CB,
+        conn_manager: &'a mut NB,
         op_storage: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
@@ -221,7 +217,6 @@ impl Operation for GetOp {
                         key: key.clone(),
                         id: *id,
                         target: *target,
-                        skip_list: vec![own_loc.peer],
                         sender: own_loc,
                         fetch_contract: *fetch_contract,
                         htl: MAX_GET_RETRY_HOPS,
@@ -233,7 +228,6 @@ impl Operation for GetOp {
                     fetch_contract,
                     sender,
                     target,
-                    skip_list,
                     htl,
                 } => {
                     let htl = *htl;
@@ -245,8 +239,6 @@ impl Operation for GetOp {
                     if let Some(s) = stats.as_mut() {
                         s.caching_peer = Some(*target);
                     }
-                    let mut skip_list = skip_list.clone();
-                    skip_list.push(target.peer);
 
                     if !is_cached_contract {
                         tracing::warn!(
@@ -259,7 +251,7 @@ impl Operation for GetOp {
                         if htl == 0 {
                             tracing::warn!(
                                 tx = %id,
-                                "The maximum HOPS number has been exceeded, sending the error \
+                                "The maximum hops has been exceeded, sending the error \
                                  back to the node @ {}",
                                 sender.peer
                             );
@@ -275,17 +267,17 @@ impl Operation for GetOp {
                                         contract: None,
                                     },
                                     sender: op_storage.ring.own_location(),
-                                    updated_skip_list: skip_list,
                                     target: *sender, // return to requester
                                 }),
                                 None,
                                 stats,
-                                self._ttl,
                             );
                         }
 
                         let new_htl = htl - 1;
-                        let Some(new_target) = op_storage.ring.closest_caching(&key, &skip_list)
+                        let Some(new_target) = op_storage
+                            .ring
+                            .closest_caching(&key, [&sender.peer].as_slice())
                         else {
                             tracing::warn!(tx = %id, "No other peers found while trying getting contract {key} @ {}", target.peer);
                             return Err(OpError::RingError(RingError::NoCachingPeers(key)));
@@ -299,7 +291,6 @@ impl Operation for GetOp {
                                 fetch_contract,
                                 sender: *sender,
                                 target: new_target,
-                                skip_list,
                                 htl: new_htl,
                             })
                             .into(),
@@ -358,15 +349,14 @@ impl Operation for GetOp {
                                     id,
                                     key,
                                     value,
-                                    updated_skip_list: vec![],
                                     sender: *target,
                                     target: *sender,
                                 });
                             }
-                            _ => return Err(OpError::InvalidStateTransition(self.id)),
+                            _ => return Err(OpError::invalid_transition(self.id)),
                         };
                     } else {
-                        return Err(OpError::InvalidStateTransition(id));
+                        return Err(OpError::invalid_transition(id));
                     }
                 }
                 GetMsg::ReturnGet {
@@ -379,11 +369,11 @@ impl Operation for GetOp {
                         },
                     sender,
                     target,
-                    updated_skip_list,
                 } => {
-                    let this_loc = target;
+                    let this_peer = target;
                     tracing::warn!(
                         tx = %id,
+                        %this_peer,
                         "Neither contract or contract value for contract `{}` found at peer {}, \
                         retrying with other peers",
                         key,
@@ -411,10 +401,9 @@ impl Operation for GetOp {
                                         id: *id,
                                         key: key.clone(),
                                         target,
-                                        sender: *this_loc,
+                                        sender: *this_peer,
                                         fetch_contract,
                                         htl: MAX_GET_RETRY_HOPS,
-                                        skip_list: updated_skip_list.clone(),
                                     });
                                 } else {
                                     return Err(RingError::NoCachingPeers(key.clone()).into());
@@ -430,7 +419,10 @@ impl Operation for GetOp {
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
-                                return Err(OpError::MaxRetriesExceeded(*id, id.tx_type()));
+                                return Err(OpError::MaxRetriesExceeded(
+                                    *id,
+                                    id.transaction_type(),
+                                ));
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
@@ -443,12 +435,11 @@ impl Operation for GetOp {
                                     state: None,
                                     contract: None,
                                 },
-                                updated_skip_list: updated_skip_list.clone(),
                                 sender: *sender,
                                 target: *target,
                             });
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        _ => return Err(OpError::invalid_transition(self.id)),
                     };
                 }
                 GetMsg::ReturnGet {
@@ -461,12 +452,9 @@ impl Operation for GetOp {
                         },
                     sender,
                     target,
-                    updated_skip_list,
                 } => {
                     let id = *id;
                     let key = key.clone();
-                    let mut updated_skip_list = updated_skip_list.clone();
-                    updated_skip_list.push(sender.peer);
                     let require_contract = matches!(
                         self.state,
                         Some(GetState::AwaitingResponse {
@@ -508,7 +496,6 @@ impl Operation for GetOp {
                                 id,
                                 state: self.state,
                                 result: None,
-                                _ttl: self._ttl,
                                 stats,
                             };
 
@@ -523,7 +510,6 @@ impl Operation for GetOp {
                                         },
                                         sender: *sender,
                                         target: *target,
-                                        updated_skip_list,
                                     }),
                                     OpEnum::Get(op),
                                     None,
@@ -591,16 +577,15 @@ impl Operation for GetOp {
                                 },
                                 sender: *sender,
                                 target: *target,
-                                updated_skip_list,
                             });
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        _ => return Err(OpError::invalid_transition(self.id)),
                     };
                 }
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, result, stats, self._ttl)
+            build_op_result(self.id, new_state, return_msg, result, stats)
         })
     }
 }
@@ -611,14 +596,12 @@ fn build_op_result(
     msg: Option<GetMsg>,
     result: Option<GetResult>,
     stats: Option<GetStats>,
-    ttl: Duration,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(GetOp {
         id,
         state,
         result,
         stats,
-        _ttl: ttl,
     });
     Ok(OperationResult {
         return_msg: msg.map(Message::from),
@@ -626,8 +609,8 @@ fn build_op_result(
     })
 }
 
-async fn continue_seeking<CB: ConnectionBridge>(
-    conn_manager: &mut CB,
+async fn continue_seeking<NB: NetworkBridge>(
+    conn_manager: &mut NB,
     new_target: &PeerKeyLocation,
     retry_msg: Message,
 ) -> Result<(), OpError> {
@@ -655,7 +638,7 @@ fn check_contract_found(
             returned_key,
             key
         );
-        return Err(OpError::InvalidStateTransition(id));
+        return Err(OpError::invalid_transition(id));
     }
 
     match &value {
@@ -691,7 +674,6 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
             first_response_time: None,
             step: Default::default(),
         }),
-        _ttl: PEER_TIMEOUT,
     }
 }
 
@@ -719,13 +701,14 @@ pub(crate) async fn request_get(
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
+        const EMPTY: &[PeerKey] = &[];
         // the initial request must provide:
         // - a location in the network where the contract resides
         // - and the key of the contract value to get
         (
             op_storage
                 .ring
-                .closest_caching(key, &[])
+                .closest_caching(key, EMPTY)
                 .into_iter()
                 .next()
                 .ok_or(RingError::EmptyRing)?,
@@ -768,14 +751,13 @@ pub(crate) async fn request_get(
                     s.caching_peer = Some(target);
                     s
                 }),
-                _ttl: get_op._ttl,
             };
 
             op_storage
                 .notify_op_change(Message::from(msg), OpEnum::Get(op), client_id)
                 .await?;
         }
-        _ => return Err(OpError::InvalidStateTransition(get_op.id)),
+        _ => return Err(OpError::invalid_transition(get_op.id)),
     }
     Ok(())
 }
@@ -804,8 +786,6 @@ mod messages {
             target: PeerKeyLocation,
             sender: PeerKeyLocation,
             htl: usize,
-            // FIXME: remove skip list once we deduplicate at top msg handling level
-            skip_list: Vec<PeerKey>,
         },
         ReturnGet {
             id: Transaction,
@@ -813,7 +793,6 @@ mod messages {
             value: StoreResponse,
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
-            updated_skip_list: Vec<PeerKey>,
         },
     }
 
@@ -837,6 +816,14 @@ mod messages {
         fn terminal(&self) -> bool {
             use GetMsg::*;
             matches!(self, ReturnGet { .. })
+        }
+
+        fn requested_location(&self) -> Option<Location> {
+            match self {
+                GetMsg::RequestGet { key, .. } => Some(Location::from(key.id())),
+                GetMsg::SeekNode { key, .. } => Some(Location::from(key.id())),
+                GetMsg::ReturnGet { key, .. } => Some(Location::from(key.id())),
+            }
         }
     }
 
@@ -864,7 +851,7 @@ mod messages {
 #[cfg(test)]
 mod test {
     use freenet_stdlib::client_api::ContractRequest;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use super::*;
     use crate::node::tests::{NodeSpecification, SimNetwork};
@@ -874,7 +861,7 @@ mod test {
         const NUM_NODES: usize = 1usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::util::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1kb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
@@ -919,7 +906,7 @@ mod test {
 
         // trigger get @ node-0, which does not own the contract
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_millis(50)))
+            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nw.has_got_contract("node-0", &key));
         Ok(())
@@ -930,7 +917,7 @@ mod test {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::util::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1kb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let key = contract.key().clone();
@@ -957,7 +944,7 @@ mod test {
 
         // trigger get @ node-1, which does not own the contract
         sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_millis(50)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(!sim_nw.has_got_contract("node-1", &key));
         Ok(())
@@ -965,10 +952,11 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contract_found_after_retry() -> Result<(), anyhow::Error> {
+        // crate::config::set_logger();
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::util::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1kb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
@@ -1023,9 +1011,8 @@ mod test {
         .await;
         sim_nw.start_with_spec(get_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
-
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_millis(200)))
+            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nw.has_got_contract("node-0", &key));
         Ok(())

@@ -11,7 +11,7 @@ const RUNNING_AVERAGE_WINDOW_SIZE: usize = 20;
 
 /// A structure that keeps track of the usage of dynamic resources which are consumed over time.
 /// It provides methods to report and query resource usage, both total and attributed to specific sources.
-pub struct Meter {
+pub(super) struct Meter {
     totals_by_resource: ResourceTotals,
     attribution_meters: AttributionMeters,
 }
@@ -211,7 +211,7 @@ mod tests {
             50.0
         );
 
-        let bytes = crate::util::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1kb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         // Report usage for a different attribution and test that the total and attributed usage are updated
         let other_attribution =

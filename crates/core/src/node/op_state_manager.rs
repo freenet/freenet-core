@@ -6,24 +6,17 @@ use tokio::sync::Mutex;
 
 use crate::{
     config::GlobalExecutor,
-    contract::{
-        ContractError, ContractHandlerEvent, ContractHandlerToEventLoopChannel,
-        NetEventListenerHalve,
-    },
+    contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     dev_tool::ClientId,
     message::{Message, Transaction, TransactionType},
     operations::{
-        connect::ConnectOp,
-        get::{self, GetOp},
-        put::PutOp,
-        subscribe::SubscribeOp,
-        update::UpdateOp,
+        connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
     },
-    ring::Ring,
+    ring::{LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
-use super::{conn_manager::EventLoopNotificationsSender, PeerKey};
+use super::{network_bridge::EventLoopNotificationsSender, EventLogRegister, NodeBuilder, PeerKey};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -42,62 +35,52 @@ pub(crate) enum OpNotAvailable {
     Completed,
 }
 
+#[derive(Default)]
+struct Ops {
+    connect: DashMap<Transaction, ConnectOp>,
+    put: DashMap<Transaction, PutOp>,
+    get: DashMap<Transaction, GetOp>,
+    subscribe: DashMap<Transaction, SubscribeOp>,
+    update: DashMap<Transaction, UpdateOp>,
+    completed: DashSet<Transaction>,
+    under_progress: DashSet<Transaction>,
+}
+
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 pub(crate) struct OpManager {
-    connect: Arc<DashMap<Transaction, ConnectOp>>,
-    put: Arc<DashMap<Transaction, PutOp>>,
-    get: Arc<DashMap<Transaction, GetOp>>,
-    subscribe: Arc<DashMap<Transaction, SubscribeOp>>,
-    update: Arc<DashMap<Transaction, UpdateOp>>,
-    completed: Arc<DashSet<Transaction>>,
-    under_progress: Arc<DashSet<Transaction>>,
+    pub ring: Arc<Ring>,
+    ops: Arc<Ops>,
     to_event_listener: EventLoopNotificationsSender,
     // todo: remove the need for a mutex here if possible
-    ch_outbound: Mutex<ContractHandlerToEventLoopChannel<NetEventListenerHalve>>,
+    ch_outbound: Mutex<ContractHandlerChannel<SenderHalve>>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
-    pub ring: Ring,
 }
 
 impl OpManager {
-    pub(super) fn new(
-        ring: Ring,
+    pub(super) fn new<const CLIENTS: usize, EL: EventLogRegister>(
         notification_channel: EventLoopNotificationsSender,
-        contract_handler: ContractHandlerToEventLoopChannel<NetEventListenerHalve>,
-    ) -> Self {
-        let connect = Arc::new(DashMap::new());
-        let put = Arc::new(DashMap::new());
-        let get = Arc::new(DashMap::new());
-        let subscribe = Arc::new(DashMap::new());
-        let update = Arc::new(DashMap::new());
-        let completed = Arc::new(DashSet::new());
-        let under_progress = Arc::new(DashSet::new());
+        contract_handler: ContractHandlerChannel<SenderHalve>,
+        builder: &NodeBuilder<CLIENTS>,
+        gateways: &[PeerKeyLocation],
+    ) -> Result<Self, anyhow::Error> {
+        let ring = Ring::new::<CLIENTS, EL>(builder, gateways, notification_channel.clone())?;
+        let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
         GlobalExecutor::spawn(garbage_cleanup_task(
             rx,
-            connect.clone(),
-            put.clone(),
-            get.clone(),
-            subscribe.clone(),
-            update.clone(),
-            completed.clone(),
-            under_progress.clone(),
+            ops.clone(),
+            ring.live_tx_tracker.clone(),
         ));
 
-        Self {
-            connect,
-            put,
-            get,
-            subscribe,
-            update,
-            completed,
-            under_progress,
+        Ok(Self {
+            ring,
+            ops,
             to_event_listener: notification_channel,
             ch_outbound: Mutex::new(contract_handler),
             new_transactions,
-            ring,
-        }
+        })
     }
 
     /// An early, fast path, return for communicating back changes of on-going operations
@@ -133,88 +116,108 @@ impl OpManager {
     }
 
     pub async fn recv_from_handler(&self) -> crate::contract::EventId {
+        // self.ch_outbound.lock().await.recv_from_handler();
         todo!()
     }
 
     pub async fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
-        self.under_progress.remove(&id);
+        if let Some(tx) = self.ops.under_progress.remove(&id) {
+            if tx.timed_out() {
+                self.ops.completed.insert(tx);
+                return Ok(());
+            }
+        }
         self.new_transactions.send(id).await?;
         match op {
             OpEnum::Connect(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Connect);
-                self.connect.insert(id, *op);
+                check_id_op!(id.transaction_type(), TransactionType::Connect);
+                self.ops.connect.insert(id, *op);
             }
             OpEnum::Put(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Put);
-                self.put.insert(id, op);
+                check_id_op!(id.transaction_type(), TransactionType::Put);
+                self.ops.put.insert(id, op);
             }
             OpEnum::Get(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Get);
-                self.get.insert(id, op);
+                check_id_op!(id.transaction_type(), TransactionType::Get);
+                self.ops.get.insert(id, op);
             }
             OpEnum::Subscribe(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Subscribe);
-                self.subscribe.insert(id, op);
+                check_id_op!(id.transaction_type(), TransactionType::Subscribe);
+                self.ops.subscribe.insert(id, op);
             }
             OpEnum::Update(op) => {
                 #[cfg(debug_assertions)]
-                check_id_op!(id.tx_type(), TransactionType::Update);
-                self.update.insert(id, op);
+                check_id_op!(id.transaction_type(), TransactionType::Update);
+                self.ops.update.insert(id, op);
             }
         }
         Ok(())
     }
 
     pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
-        if self.completed.contains(id) {
+        if self.ops.completed.contains(id) {
             return Err(OpNotAvailable::Completed);
         }
-        if self.under_progress.contains(id) {
+        if self.ops.under_progress.contains(id) {
+            if id.timed_out() {
+                self.ops.completed.insert(*id);
+                return Err(OpNotAvailable::Completed);
+            }
             return Err(OpNotAvailable::Running);
         }
-        let op = match id.tx_type() {
+        let op = match id.transaction_type() {
             TransactionType::Connect => self
+                .ops
                 .connect
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(|op| OpEnum::Connect(Box::new(op))),
-            TransactionType::Put => self.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
-            TransactionType::Get => self.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
+            TransactionType::Put => self.ops.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
+            TransactionType::Get => self.ops.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
             TransactionType::Subscribe => self
+                .ops
                 .subscribe
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(OpEnum::Subscribe),
-            TransactionType::Update => self.update.remove(id).map(|(_k, v)| v).map(OpEnum::Update),
+            TransactionType::Update => self
+                .ops
+                .update
+                .remove(id)
+                .map(|(_k, v)| v)
+                .map(OpEnum::Update),
         };
-        self.under_progress.insert(*id);
+        self.ops.under_progress.insert(*id);
         Ok(op)
     }
 
     pub fn completed(&self, id: Transaction) {
-        self.completed.insert(id);
+        self.ring.live_tx_tracker.remove_finished_transaction(id);
+        self.ops.completed.insert(id);
     }
 
-    pub fn prune_connection(&self, peer: PeerKey) {
-        // pending ops will be cleaned up by the garbage collector on time out
-        self.ring.prune_connection(peer);
+    /// Notify the operation manager that a transaction is being transacted over the network.
+    pub fn sending_transaction(&self, peer: &PeerKey, msg: &Message) {
+        let transaction = msg.id();
+        if let Some(loc) = msg.requested_location() {
+            self.ring
+                .record_request(loc, transaction.transaction_type());
+        }
+        self.ring
+            .live_tx_tracker
+            .add_transaction(*peer, *transaction);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all)]
 async fn garbage_cleanup_task(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
-    connect: Arc<DashMap<Transaction, ConnectOp>>,
-    put: Arc<DashMap<Transaction, PutOp>>,
-    get: Arc<DashMap<Transaction, GetOp>>,
-    subscribe: Arc<DashMap<Transaction, SubscribeOp>>,
-    update: Arc<DashMap<Transaction, UpdateOp>>,
-    completed: Arc<DashSet<Transaction>>,
-    under_progress: Arc<DashSet<Transaction>>,
+    ops: Arc<Ops>,
+    live_tx_tracker: LiveTransactionTracker,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -224,50 +227,49 @@ async fn garbage_cleanup_task(
 
     let remove_old = move |ttl_set: &mut BTreeSet<Reverse<Transaction>>,
                            delayed: &mut Vec<Transaction>| {
-        // generate a random id, since those are sortable by time
-        // it will allow to get any older transactions, notice the use of reverse
-        // so the older transactions are removed instead of the newer ones
-        let older_than: Reverse<Transaction> = Reverse(Transaction::new::<get::GetMsg>());
         let mut old_missing = std::mem::replace(delayed, Vec::with_capacity(200));
         for tx in old_missing.drain(..) {
-            if completed.remove(&tx).is_some() {
+            if ops.completed.remove(&tx).is_some() {
                 continue;
             }
-            let still_waiting = match tx.tx_type() {
-                TransactionType::Connect => connect.remove(&tx).is_none(),
-                TransactionType::Put => put.remove(&tx).is_none(),
-                TransactionType::Get => get.remove(&tx).is_none(),
-                TransactionType::Subscribe => subscribe.remove(&tx).is_none(),
-                TransactionType::Update => update.remove(&tx).is_none(),
+            let still_waiting = match tx.transaction_type() {
+                TransactionType::Connect => ops.connect.remove(&tx).is_none(),
+                TransactionType::Put => ops.put.remove(&tx).is_none(),
+                TransactionType::Get => ops.get.remove(&tx).is_none(),
+                TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
+                TransactionType::Update => ops.update.remove(&tx).is_none(),
             };
-            if still_waiting {
+            let timed_out = tx.timed_out();
+            if still_waiting && !timed_out {
                 delayed.push(tx);
+            } else {
+                if still_waiting && timed_out {
+                    ops.under_progress.remove(&tx);
+                    ops.completed.remove(&tx);
+                }
+                live_tx_tracker.remove_finished_transaction(tx);
             }
         }
+
+        // notice the use of reverse so the older transactions are removed instead of the newer ones
+        let older_than: Reverse<Transaction> = Reverse(Transaction::ttl_transaction());
         for Reverse(tx) in ttl_set.split_off(&older_than).into_iter() {
-            if under_progress.contains(&tx) {
+            if ops.under_progress.contains(&tx) {
                 delayed.push(tx);
                 continue;
             }
-            if completed.remove(&tx).is_some() {
+            if ops.completed.remove(&tx).is_some() {
                 continue;
             }
-            match tx.tx_type() {
-                TransactionType::Connect => {
-                    connect.remove(&tx);
-                }
-                TransactionType::Put => {
-                    put.remove(&tx);
-                }
-                TransactionType::Get => {
-                    get.remove(&tx);
-                }
-                TransactionType::Subscribe => {
-                    subscribe.remove(&tx);
-                }
-                TransactionType::Update => {
-                    update.remove(&tx);
-                }
+            let removed = match tx.transaction_type() {
+                TransactionType::Connect => ops.connect.remove(&tx).is_some(),
+                TransactionType::Put => ops.put.remove(&tx).is_some(),
+                TransactionType::Get => ops.get.remove(&tx).is_some(),
+                TransactionType::Subscribe => ops.subscribe.remove(&tx).is_some(),
+                TransactionType::Update => ops.update.remove(&tx).is_some(),
+            };
+            if removed {
+                live_tx_tracker.remove_finished_transaction(tx);
             }
         }
     };

@@ -11,7 +11,7 @@ use crate::ring::PeerKeyLocation;
 
 use self::meter::{AttributionSource, Meter, ResourceType};
 
-pub struct ResourceManager {
+pub(crate) struct ResourceManager {
     limits: Limits,
     meter: Meter,
 }
@@ -22,10 +22,6 @@ impl ResourceManager {
             meter: Meter::new(),
             limits,
         }
-    }
-
-    pub fn meter(&self) -> &Meter {
-        &self.meter
     }
 
     pub fn update_limits(&mut self, limits: Limits) {
@@ -222,13 +218,13 @@ mod tests {
         );
         assert_eq!(
             resource_manager
-                .meter()
+                .meter
                 .total_usage(ResourceType::InboundBandwidthBytes),
             100.0
         );
         assert_eq!(
             resource_manager
-                .meter()
+                .meter
                 .attributed_usage(&attribution, ResourceType::InboundBandwidthBytes),
             100.0
         );

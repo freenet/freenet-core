@@ -8,6 +8,8 @@ use rand::{
     SeedableRng,
 };
 
+use crate::node::PeerKey;
+
 pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
@@ -26,7 +28,6 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
             std::process::exit(0);
         } else {
             tracing::error!("Failed to remove content at {path:?}");
-
             std::process::exit(-1);
         }
     })
@@ -51,7 +52,7 @@ impl ExponentialBackoff {
 
     /// Record that we made an attempt and sleep for the appropriate amount
     /// of time. If the max number of attempts was reached returns none.
-    pub async fn sleep_async(&mut self) -> Option<()> {
+    pub async fn sleep(&mut self) -> Option<()> {
         if self.attempt == self.max_attempts {
             None
         } else {
@@ -173,22 +174,31 @@ pub(crate) mod test {
         assert!(times_equal < 3);
     }
 
-    // Would be nice to use const generics for this but there is a bound for the allowed
-    // array size parameter which cannot be expressed with current version of const generics.
-    // So using this macro hack.
     macro_rules! rnd_bytes {
         ($size:tt -> $name:tt) => {
             #[inline]
+            #[allow(unused_braces)]
             pub(crate) fn $name() -> [u8; $size] {
                 let mut rng = rand::thread_rng();
                 let mut rnd_bytes = [0u8; $size];
-                rng.fill(&mut rnd_bytes);
+                rng.fill(rnd_bytes.as_mut_slice());
+                rnd_bytes
+            }
+        };
+        (large: $size:tt -> $name:tt) => {
+            #[inline]
+            #[allow(unused_braces)]
+            pub(crate) fn $name() -> Vec<u8> {
+                let mut rng = rand::thread_rng();
+                let mut rnd_bytes = vec![0u8; $size];
+                rng.fill(rnd_bytes.as_mut_slice());
                 rnd_bytes
             }
         };
     }
 
-    rnd_bytes!(1024 -> random_bytes_1024);
+    rnd_bytes!(1024 -> random_bytes_1kb);
+    rnd_bytes!(large: { 1024 * 1024 * 2 } -> random_bytes_2mb);
 }
 
 #[derive(Clone, Copy, serde::Deserialize, Debug)]
@@ -206,5 +216,21 @@ impl std::fmt::Display for EncodingProtocol {
             EncodingProtocol::Flatbuffers => write!(f, "flatbuffers"),
             EncodingProtocol::Native => write!(f, "native"),
         }
+    }
+}
+
+pub(crate) trait Contains<T> {
+    fn has_element(&self, target: &T) -> bool;
+}
+
+impl<'x> Contains<PeerKey> for &'x [PeerKey] {
+    fn has_element(&self, target: &PeerKey) -> bool {
+        self.contains(target)
+    }
+}
+
+impl<'x> Contains<PeerKey> for &'x [&PeerKey] {
+    fn has_element(&self, target: &PeerKey) -> bool {
+        self.contains(&target)
     }
 }

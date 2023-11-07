@@ -42,14 +42,14 @@ use crate::{
 };
 
 use crate::operations::handle_op_request;
-pub(crate) use conn_manager::{ConnectionBridge, ConnectionError};
 pub(crate) use event_log::{EventLogRegister, EventRegister};
+pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-mod conn_manager;
 mod event_log;
 #[cfg(test)]
 mod in_memory_impl;
+mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
 #[cfg(test)]
@@ -286,7 +286,7 @@ async fn join_ring_request<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: ConnectionBridge + Send + Sync,
+    CM: NetworkBridge + Send + Sync,
 {
     let tx_id = Transaction::new::<ConnectMsg>();
     let mut op =
@@ -294,9 +294,9 @@ where
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
-        if backoff.sleep_async().await.is_none() {
+        if backoff.sleep().await.is_none() {
             tracing::error!("Max number of retries reached");
-            return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.tx_type()));
+            return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.transaction_type()));
         }
         op.backoff = Some(backoff);
     }
@@ -338,7 +338,7 @@ async fn client_event_handling<ClientEv>(
                         tracing::debug!(%res, "sending client response");
                     }
                     if let Err(err) = client_events.send(cli_id, res).await {
-                        tracing::error!("channel closed: {err}");
+                        tracing::debug!("channel closed: {err}");
                         break;
                     }
                 }
@@ -434,13 +434,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     }
                 }
                 _ => {
-                    tracing::error!("op not supported");
+                    tracing::error!("Op not supported");
                 }
             },
             ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
             ClientRequest::Disconnect { .. } => unreachable!(),
             _ => {
-                tracing::error!("op not supported");
+                tracing::error!("Op not supported");
             }
         }
     };
@@ -526,7 +526,30 @@ async fn report_result(
             if let Some(tx) = tx {
                 op_storage.completed(tx);
             }
-            tracing::debug!("Finished transaction with error: {err}")
+            #[cfg(debug_assertions)]
+            {
+                let OpError::InvalidStateTransition { tx, state, trace } = err else {
+                    tracing::error!("Finished transaction with error: {err}");
+                    return;
+                };
+                // todo: this can be improved once std::backtrace::Backtrace::frames is stabilized
+                let trace = format!("{trace}");
+                let mut tr_lines = trace.lines();
+                let trace = tr_lines
+                    .nth(2)
+                    .map(|second_trace| {
+                        let second_trace_lines =
+                            [second_trace, tr_lines.next().unwrap_or_default()];
+                        second_trace_lines.join("\n")
+                    })
+                    .unwrap_or_default();
+                tracing::error!(%tx, ?state, "Wrong state");
+                eprintln!("Operation error trace:\n{trace}");
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                tracing::debug!("Finished transaction with error: {err}");
+            }
         }
     }
 }
@@ -555,7 +578,7 @@ async fn process_message<CB>(
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<ClientId>,
 ) where
-    CB: ConnectionBridge,
+    CB: NetworkBridge,
 {
     let cli_req = client_id.zip(client_req_handler_callback);
     match msg {
@@ -671,9 +694,9 @@ async fn handle_cancelled_op<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: ConnectionBridge + Send + Sync,
+    CM: NetworkBridge + Send + Sync,
 {
-    if let TransactionType::Connect = tx.tx_type() {
+    if let TransactionType::Connect = tx.transaction_type() {
         // the attempt to join the network failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
         match op_storage.pop(&tx) {
@@ -681,13 +704,15 @@ where
                 let ConnectOp {
                     gateway, backoff, ..
                 } = *op;
-                let backoff = backoff.expect("infallible");
-                tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                join_ring_request(Some(backoff), peer_key, &gateway, op_storage, conn_manager)
-                    .await?;
+                if let Some(gateway) = gateway {
+                    let backoff = backoff.expect("infallible");
+                    tracing::warn!("Retry connecting to gateway {}", gateway.peer);
+                    join_ring_request(Some(backoff), peer_key, &gateway, op_storage, conn_manager)
+                        .await?;
+                }
             }
             Ok(Some(OpEnum::Connect(_))) => {
-                return Err(OpError::MaxRetriesExceeded(tx, tx.tx_type()));
+                return Err(OpError::MaxRetriesExceeded(tx, tx.transaction_type()));
             }
             _ => {}
         }
@@ -695,8 +720,19 @@ where
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct PeerKey(PeerId);
+
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for PeerKey {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let data: [u8; 32] = u.arbitrary()?;
+        let id =
+            PeerId::from_multihash(libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap())
+                .unwrap();
+        Ok(Self(id))
+    }
+}
 
 impl PeerKey {
     #[cfg(test)]
@@ -708,6 +744,12 @@ impl PeerKey {
     #[cfg(test)]
     pub fn to_bytes(self) -> Vec<u8> {
         self.0.to_bytes()
+    }
+}
+
+impl std::fmt::Debug for PeerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Display>::fmt(self, f)
     }
 }
 

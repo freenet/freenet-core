@@ -154,7 +154,7 @@ impl ClientEventsProxy for HttpGateway {
                     } => return Ok(OpenRequest::new(client_id, req).with_token(auth_token)),
                 }
             }
-            tracing::warn!("shutting down http gateway receiver");
+            tracing::warn!("Shutting down http gateway receiver");
             Err(ErrorKind::Disconnect.into())
         }
         .boxed()

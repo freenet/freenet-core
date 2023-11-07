@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
@@ -8,12 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     client_events::ClientId,
-    config::PEER_TIMEOUT,
     contract::ContractError,
     message::{InnerMessage, Message, Transaction},
-    node::{ConnectionBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerKey},
     operations::{op_trait::Operation, OpInitialization},
-    ring::{PeerKeyLocation, RingError},
+    ring::{Location, PeerKeyLocation, RingError},
 };
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
@@ -25,7 +23,6 @@ const MAX_RETRIES: usize = 10;
 pub(crate) struct SubscribeOp {
     id: Transaction,
     state: Option<SubscribeState>,
-    _ttl: Duration,
 }
 
 impl SubscribeOp {
@@ -86,7 +83,6 @@ impl Operation for SubscribeOp {
                         op: Self {
                             state: Some(SubscribeState::ReceivedRequest),
                             id,
-                            _ttl: PEER_TIMEOUT,
                         },
                         sender,
                     })
@@ -101,9 +97,9 @@ impl Operation for SubscribeOp {
         &self.id
     }
 
-    fn process_message<'a, CB: ConnectionBridge>(
+    fn process_message<'a, NB: NetworkBridge>(
         self,
-        conn_manager: &'a mut CB,
+        conn_manager: &'a mut NB,
         op_storage: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
@@ -155,7 +151,9 @@ impl Operation for SubscribeOp {
                     if !op_storage.ring.is_contract_cached(key) {
                         tracing::debug!(tx = %id, "Contract {} not found at {}, trying other peer", key, target.peer);
 
-                        let Some(new_target) = op_storage.ring.closest_caching(key, &[sender.peer])
+                        let Some(new_target) = op_storage
+                            .ring
+                            .closest_caching(key, [&sender.peer].as_slice())
                         else {
                             tracing::warn!(tx = %id, "No peer found while trying getting contract {key}");
                             return Err(OpError::RingError(RingError::NoCachingPeers(key.clone())));
@@ -206,9 +204,8 @@ impl Operation for SubscribeOp {
                                 key: key.clone(),
                                 subscribed: true,
                             });
-                            op_storage.completed(*id);
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        _ => return Err(OpError::invalid_transition(self.id)),
                     }
                 }
                 SubscribeMsg::ReturnSub {
@@ -255,10 +252,13 @@ impl Operation for SubscribeOp {
                                     retries: retries + 1,
                                 });
                             } else {
-                                return Err(OpError::MaxRetriesExceeded(*id, id.tx_type()));
+                                return Err(OpError::MaxRetriesExceeded(
+                                    *id,
+                                    id.transaction_type(),
+                                ));
                             }
                         }
-                        _ => return Err(OpError::InvalidStateTransition(self.id)),
+                        _ => return Err(OpError::invalid_transition(self.id)),
                     }
                 }
                 SubscribeMsg::ReturnSub {
@@ -283,17 +283,16 @@ impl Operation for SubscribeOp {
                             let _ = client_id;
                             new_state = Some(SubscribeState::Completed);
                             return_msg = None;
-                            op_storage.completed(*id);
                         }
                         _other => {
-                            return Err(OpError::InvalidStateTransition(self.id));
+                            return Err(OpError::invalid_transition(self.id));
                         }
                     }
                 }
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, self._ttl)
+            build_op_result(self.id, new_state, return_msg)
         })
     }
 }
@@ -302,12 +301,10 @@ fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
-    ttl: Duration,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|state| SubscribeOp {
         id,
         state: Some(state),
-        _ttl: ttl,
     });
     Ok(OperationResult {
         return_msg: msg.map(Message::from),
@@ -318,11 +315,7 @@ fn build_op_result(
 pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp {
-        id,
-        state,
-        _ttl: PEER_TIMEOUT,
-    }
+    SubscribeOp { id, state }
 }
 
 #[derive(Debug)]
@@ -354,13 +347,14 @@ pub(crate) async fn request_subscribe(
                 key.clone(),
             )));
         }
+        const EMPTY: &[PeerKey] = &[];
         (
             op_storage
                 .ring
-                .closest_caching(key, &[])
+                .closest_caching(key, EMPTY)
                 .into_iter()
                 .next()
-                .ok_or(RingError::EmptyRing)?,
+                .ok_or_else(|| RingError::NoCachingPeers(key.clone()))?,
             *id,
         )
     } else {
@@ -377,13 +371,12 @@ pub(crate) async fn request_subscribe(
             let op = SubscribeOp {
                 id,
                 state: new_state,
-                _ttl: sub_op._ttl,
             };
             op_storage
                 .notify_op_change(Message::from(msg), OpEnum::Subscribe(op), client_id)
                 .await?;
         }
-        _ => return Err(OpError::InvalidStateTransition(sub_op.id)),
+        _ => return Err(OpError::invalid_transition(sub_op.id)),
     }
 
     Ok(())
@@ -445,6 +438,15 @@ mod messages {
             use SubscribeMsg::*;
             matches!(self, ReturnSub { .. } | SeekNode { .. })
         }
+
+        fn requested_location(&self) -> Option<Location> {
+            match self {
+                Self::SeekNode { key, .. } => Some(Location::from(key.id())),
+                Self::RequestSub { key, .. } => Some(Location::from(key.id())),
+                Self::ReturnSub { key, .. } => Some(Location::from(key.id())),
+                _ => None,
+            }
+        }
     }
 
     impl SubscribeMsg {
@@ -471,7 +473,7 @@ mod messages {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use freenet_stdlib::client_api::ContractRequest;
 
@@ -483,7 +485,7 @@ mod test {
         const NUM_NODES: usize = 4usize;
         const NUM_GW: usize = 1usize;
 
-        let bytes = crate::util::test::random_bytes_1024();
+        let bytes = crate::util::test::random_bytes_1kb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
@@ -527,7 +529,7 @@ mod test {
         sim_nw.start_with_spec(subscribe_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3)).await?;
         sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(2)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
         assert!(sim_nw.has_got_contract("node-1", &contract_key));
         tokio::time::sleep(Duration::from_secs(3)).await;

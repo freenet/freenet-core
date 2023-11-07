@@ -1,6 +1,9 @@
-//! Main message type which encapsulated all the messaging between nodes.
+//! Network messaging between peers.
 
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    time::{Duration, SystemTime},
+};
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -28,20 +31,82 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) struct Transaction {
     id: Ulid,
-    ty: TransactionTypeId,
 }
 
 impl Transaction {
-    pub fn new<T: TxType>() -> Transaction {
+    pub const NULL: &'static Transaction = &Transaction { id: Ulid(0) };
+
+    pub fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
-
-        // 3 word size for 64-bits platforms
-        Self { id, ty }
+        Self::update(ty.0, id)
+        // Self { id }
     }
 
-    pub fn tx_type(&self) -> TransactionType {
-        self.ty.desc()
+    pub fn transaction_type(&self) -> TransactionType {
+        let id_byte = (self.id.0 & 0xFFu128) as u8;
+        match id_byte {
+            0 => TransactionType::Connect,
+            1 => TransactionType::Put,
+            2 => TransactionType::Get,
+            3 => TransactionType::Subscribe,
+            4 => TransactionType::Update,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.elapsed() >= crate::config::OPERATION_TTL
+    }
+
+    fn elapsed(&self) -> Duration {
+        let current_unix_epoch_ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("now should be always be later than unix epoch")
+            .as_millis() as u64;
+        let this_tx_creation = self.id.timestamp_ms();
+        if current_unix_epoch_ts < this_tx_creation {
+            Duration::new(0, 0)
+        } else {
+            let ms_elapsed = current_unix_epoch_ts - this_tx_creation;
+            Duration::from_millis(ms_elapsed)
+        }
+    }
+
+    /// Generate a random transaction which has the implicit TTL cutoff.
+    ///
+    /// This will allow, for example, to compare against any older transactions,
+    /// in order to remove them.
+    pub fn ttl_transaction() -> Self {
+        let id = Ulid::new();
+        let ts = id.timestamp_ms();
+        const TTL_MS: u64 = crate::config::OPERATION_TTL.as_millis() as u64;
+        let ttl_epoch: u64 = ts - TTL_MS;
+
+        // Clear the ts significant bits of the ULID and replace them with the new cutoff ts.
+        const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
+        let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
+        Self { id: Ulid(new_ulid) }
+    }
+
+    fn update(ty: TransactionType, id: Ulid) -> Self {
+        const TYPE_MASK: u128 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00u128;
+        // Clear the last byte
+        let cleared = id.0 & TYPE_MASK;
+        // Set the last byte with the transaction type
+        let updated = cleared | (ty as u8) as u128;
+
+        // 2 words size for 64-bits platforms
+        Self { id: Ulid(updated) }
+    }
+}
+
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for Transaction {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let ty: TransactionTypeId = u.arbitrary()?;
+        let bytes: u128 = u.arbitrary()?;
+        Ok(Self::update(ty.0, Ulid(bytes)))
     }
 }
 
@@ -87,22 +152,18 @@ mod sealed_msg_type {
     }
 
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
-    pub(crate) struct TransactionTypeId(TransactionType);
-
-    impl TransactionTypeId {
-        pub fn desc(&self) -> TransactionType {
-            self.0
-        }
-    }
+    #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+    pub(crate) struct TransactionTypeId(pub(super) TransactionType);
 
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+    #[cfg_attr(test, derive(arbitrary::Arbitrary))]
     pub(crate) enum TransactionType {
-        Connect,
-        Put,
-        Get,
-        Subscribe,
-        Update,
+        Connect = 0,
+        Put = 1,
+        Get = 2,
+        Subscribe = 3,
+        Update = 4,
     }
 
     impl Display for TransactionType {
@@ -161,6 +222,8 @@ pub(crate) trait InnerMessage: Into<Message> {
     fn target(&self) -> Option<&PeerKeyLocation>;
 
     fn terminal(&self) -> bool;
+
+    fn requested_location(&self) -> Option<Location>;
 }
 
 /// Internal node events emitted to the event loop.
@@ -233,6 +296,18 @@ impl Message {
         }
     }
 
+    pub fn requested_location(&self) -> Option<Location> {
+        use Message::*;
+        match self {
+            Connect(op) => op.requested_location(),
+            Put(op) => op.requested_location(),
+            Get(op) => op.requested_location(),
+            Subscribe(op) => op.requested_location(),
+            Update(op) => op.requested_location(),
+            Aborted(_) => None,
+        }
+    }
+
     pub fn track_stats(&self) -> bool {
         use Message::*;
         !matches!(self, Connect(_) | Subscribe(_) | Aborted(_))
@@ -255,20 +330,48 @@ impl Display for Message {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct ProbeRequest {
-    pub hops_to_live: u8,
-    pub target: Location,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct ProbeResponse {
-    pub visits: Vec<Visit>,
-}
+    #[test]
+    fn pack_transaction_type() {
+        let ts_0 = Ulid::new();
+        std::thread::sleep(Duration::from_millis(1));
+        let tx = Transaction::update(TransactionType::Connect, Ulid::new());
+        assert_eq!(tx.transaction_type(), TransactionType::Connect);
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new());
+        assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
+        std::thread::sleep(Duration::from_millis(1));
+        let ts_1 = Ulid::new();
+        assert!(
+            tx.id.timestamp_ms() > ts_0.timestamp_ms(),
+            "{} <= {}",
+            tx.id.datetime(),
+            ts_0.datetime()
+        );
+        assert!(
+            tx.id.timestamp_ms() < ts_1.timestamp_ms(),
+            "{} >= {}",
+            tx.id.datetime(),
+            ts_1.datetime()
+        );
+    }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct Visit {
-    pub hop: u8,
-    pub latency: Duration,
-    pub location: Location,
+    #[test]
+    fn get_ttl_cutoff_transaction() {
+        let ttl_tx = Transaction::ttl_transaction();
+        let original_tx = Transaction::new::<crate::operations::get::GetMsg>();
+
+        assert!(original_tx > ttl_tx);
+        assert!(ttl_tx.timed_out());
+        assert!(
+            original_tx.id.timestamp_ms() - ttl_tx.id.timestamp_ms()
+                >= crate::config::OPERATION_TTL.as_millis() as u64
+        );
+        assert!(
+            original_tx.id.timestamp_ms() - ttl_tx.id.timestamp_ms()
+                < crate::config::OPERATION_TTL.as_millis() as u64 + 5
+        );
+    }
 }

@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+use std::backtrace::Backtrace as StdTrace;
 use std::time::Duration;
 
 use tokio::sync::mpsc::error::SendError;
@@ -7,7 +9,7 @@ use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
     message::{InnerMessage, Message, Transaction, TransactionType},
-    node::{ConnectionBridge, ConnectionError, OpManager, OpNotAvailable, PeerKey},
+    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
 };
@@ -31,51 +33,48 @@ pub(crate) struct OpInitialization<Op> {
     op: Op,
 }
 
-pub(crate) async fn handle_op_request<Op, CB>(
+pub(crate) async fn handle_op_request<Op, NB>(
     op_storage: &OpManager,
-    conn_manager: &mut CB,
+    network_bridge: &mut NB,
     msg: &Op::Message,
     client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
-    CB: ConnectionBridge,
+    NB: NetworkBridge,
 {
     let sender;
     let tx = *msg.id();
     let result = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, msg).await?;
         sender = s;
-        op.process_message(conn_manager, op_storage, msg, client_id)
+        op.process_message(network_bridge, op_storage, msg, client_id)
             .await
     };
-    handle_op_result(
-        op_storage,
-        conn_manager,
-        result.map_err(|err| (err, tx)),
-        sender,
-    )
-    .await
+    handle_op_result(op_storage, network_bridge, result, tx, sender).await
 }
 
 async fn handle_op_result<CB>(
     op_storage: &OpManager,
-    conn_manager: &mut CB,
-    result: Result<OperationResult, (OpError, Transaction)>,
+    network_bridge: &mut CB,
+    result: Result<OperationResult, OpError>,
+    tx_id: Transaction,
     sender: Option<PeerKey>,
 ) -> Result<Option<OpEnum>, OpError>
 where
-    CB: ConnectionBridge,
+    CB: NetworkBridge,
 {
     // FIXME: register changes in the future op commit log
     match result {
-        Err((OpError::StatePushed, _)) => {
+        Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
             return Ok(None);
         }
-        Err((err, tx_id)) => {
+        Err(err) => {
             if let Some(sender) = sender {
-                conn_manager.send(&sender, Message::Aborted(tx_id)).await?;
+                network_bridge
+                    .send(&sender, Message::Aborted(tx_id))
+                    .await?;
             }
             return Err(err);
         }
@@ -86,7 +85,7 @@ where
             // updated op
             let id = *msg.id();
             if let Some(target) = msg.target().cloned() {
-                conn_manager.send(&target.peer, msg).await?;
+                network_bridge.send(&target.peer, msg).await?;
             }
             op_storage.push(id, updated_state).await?;
         }
@@ -96,6 +95,7 @@ where
             state: Some(final_state),
         }) if final_state.finalized() => {
             // operation finished_completely with result
+            op_storage.completed(tx_id);
             return Ok(Some(final_state));
         }
         Ok(OperationResult {
@@ -110,9 +110,10 @@ where
             return_msg: Some(msg),
             state: None,
         }) => {
+            op_storage.completed(tx_id);
             // finished the operation at this node, informing back
             if let Some(target) = msg.target().cloned() {
-                conn_manager.send(&target.peer, msg).await?;
+                network_bridge.send(&target.peer, msg).await?;
             }
         }
         Ok(OperationResult {
@@ -120,6 +121,7 @@ where
             state: None,
         }) => {
             // operation finished_completely
+            op_storage.completed(tx_id);
         }
     }
     Ok(None)
@@ -191,10 +193,17 @@ pub(crate) enum OpError {
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
-    #[error("cannot perform a state transition from the current state with the provided input (tx: {0})")]
-    InvalidStateTransition(Transaction),
+    #[error("cannot perform a state transition from the current state with the provided input (tx: {tx})")]
+    InvalidStateTransition {
+        tx: Transaction,
+        #[cfg(debug_assertions)]
+        state: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
+        #[cfg(debug_assertions)]
+        trace: StdTrace,
+    },
     #[error("failed notifying, channel closed")]
     NotificationError,
+    #[cfg(debug_assertions)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
@@ -209,6 +218,35 @@ pub(crate) enum OpError {
     /// was sent throught the fast path back to the storage.
     #[error("early push of state into the op stack")]
     StatePushed,
+}
+
+impl OpError {
+    pub fn invalid_transition(tx: Transaction) -> Self {
+        Self::InvalidStateTransition {
+            tx,
+            #[cfg(debug_assertions)]
+            state: None,
+            #[cfg(debug_assertions)]
+            trace: StdTrace::force_capture(),
+        }
+    }
+
+    pub fn invalid_transition_with_state(
+        tx: Transaction,
+        state: Box<dyn std::fmt::Debug + Send + Sync>,
+    ) -> Self {
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = state;
+        }
+        Self::InvalidStateTransition {
+            tx,
+            #[cfg(debug_assertions)]
+            state: Some(state),
+            #[cfg(debug_assertions)]
+            trace: StdTrace::force_capture(),
+        }
+    }
 }
 
 impl<T> From<SendError<T>> for OpError {

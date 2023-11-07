@@ -38,7 +38,7 @@ use tokio::sync::{
 };
 use unsigned_varint::codec::UviBytes;
 
-use super::{ConnectionBridge, ConnectionError, EventLoopNotifications};
+use super::{ConnectionError, EventLoopNotifications, NetworkBridge};
 use crate::{
     client_events::ClientId,
     config::{self, GlobalExecutor},
@@ -193,7 +193,7 @@ impl Clone for P2pBridge {
 }
 
 #[async_trait::async_trait]
-impl ConnectionBridge for P2pBridge {
+impl NetworkBridge for P2pBridge {
     async fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
             self.accepted_peers.insert(peer);
@@ -211,14 +211,20 @@ impl ConnectionBridge for P2pBridge {
             .send(Right(NodeEvent::DropConnection(*peer)))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
+        self.log_register
+            .try_lock()
+            .expect("single reference")
+            .register_events(Either::Left(EventLog::disconnected(peer)))
+            .await;
         Ok(())
     }
 
     async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
         self.log_register
-            .lock()
-            .await
+            .try_lock()
+            .expect("single reference")
             .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager));
+        self.op_manager.sending_transaction(target, &msg);
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
             .await
@@ -425,7 +431,7 @@ impl P2pConnManager {
                     let cb = self.bridge.clone();
                     match msg {
                         Message::Aborted(tx) => {
-                            let tx_type = tx.tx_type();
+                            let tx_type = tx.transaction_type();
                             let res = handle_cancelled_op(
                                 tx,
                                 op_manager.ring.peer_key,
@@ -510,10 +516,10 @@ impl P2pConnManager {
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
-                    op_manager.prune_connection(peer_id);
+                    op_manager.ring.prune_connection(peer_id);
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     let _ = self.swarm.disconnect_peer_id(peer_id.0);
-                    tracing::debug!("Dropped connection with peer {}", peer_id);
+                    tracing::info!("Dropped connection with peer {}", peer_id);
                 }
                 Ok(Right(UpdatePublicAddr(address))) => {
                     self.public_addr = Some(address);

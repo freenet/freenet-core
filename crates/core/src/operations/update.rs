@@ -3,7 +3,7 @@
 use futures::future::BoxFuture;
 
 pub(crate) use self::messages::UpdateMsg;
-use crate::{client_events::ClientId, node::ConnectionBridge};
+use crate::{client_events::ClientId, node::NetworkBridge};
 
 use super::{op_trait::Operation, OpError, OpOutcome};
 
@@ -46,9 +46,9 @@ impl Operation for UpdateOp {
         todo!()
     }
 
-    fn process_message<'a, CB: ConnectionBridge>(
+    fn process_message<'a, NB: NetworkBridge>(
         self,
-        _conn_manager: &'a mut CB,
+        _conn_manager: &'a mut NB,
         _op_storage: &'a crate::node::OpManager,
         _input: &Self::Message,
         _client_id: Option<ClientId>,
@@ -82,6 +82,10 @@ mod messages {
         }
 
         fn terminal(&self) -> bool {
+            todo!()
+        }
+
+        fn requested_location(&self) -> Option<crate::network_sim::Location> {
             todo!()
         }
     }

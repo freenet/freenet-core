@@ -13,8 +13,8 @@ pub(crate) use executor::{
 };
 pub(crate) use handler::{
     contract_handler_channel, ClientResponses, ClientResponsesSender, ContractHandler,
-    ContractHandlerEvent, ContractHandlerToEventLoopChannel, EventId, NetEventListenerHalve,
-    NetworkContractHandler, StoreResponse,
+    ContractHandlerChannel, ContractHandlerEvent, EventId, NetworkContractHandler, SenderHalve,
+    StoreResponse,
 };
 #[cfg(test)]
 pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
@@ -29,7 +29,7 @@ where
     CH: ContractHandler + Send + 'static,
 {
     loop {
-        let (id, event) = contract_handler.channel().recv_from_event_loop().await?;
+        let (id, event) = contract_handler.channel().recv_from_sender().await?;
         tracing::debug!(%event, "Got contract handling event");
         match event {
             ContractHandlerEvent::GetQuery {
@@ -45,7 +45,7 @@ where
                         tracing::debug!("Fetched contract {key}");
                         contract_handler
                             .channel()
-                            .send_to_event_loop(
+                            .send_to_sender(
                                 id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
@@ -55,20 +55,28 @@ where
                                     }),
                                 },
                             )
-                            .await?;
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                     Err(err) => {
                         tracing::warn!("Error while executing get contract query: {err}");
                         contract_handler
                             .channel()
-                            .send_to_event_loop(
+                            .send_to_sender(
                                 id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
                                     response: Err(err.into()),
                                 },
                             )
-                            .await?;
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                 }
             }
@@ -77,16 +85,24 @@ where
                     Ok(_) => {
                         contract_handler
                             .channel()
-                            .send_to_event_loop(id, ContractHandlerEvent::CacheResult(Ok(())))
-                            .await?;
+                            .send_to_sender(id, ContractHandlerEvent::CacheResult(Ok(())))
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                     Err(err) => {
                         tracing::error!("Error while caching: {err}");
                         let err = ContractError::ContractRuntimeError(err);
                         contract_handler
                             .channel()
-                            .send_to_event_loop(id, ContractHandlerEvent::CacheResult(Err(err)))
-                            .await?;
+                            .send_to_sender(id, ContractHandlerEvent::CacheResult(Err(err)))
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(%error, "shutting down contract handler");
+                                error
+                            })?;
                     }
                 }
             }
@@ -103,13 +119,17 @@ where
                     .map_err(Into::into);
                 contract_handler
                     .channel()
-                    .send_to_event_loop(
+                    .send_to_sender(
                         id,
                         ContractHandlerEvent::PutResponse {
                             new_value: put_result,
                         },
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
             }
             _ => unreachable!(),
         }

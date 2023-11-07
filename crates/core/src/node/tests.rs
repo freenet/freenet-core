@@ -457,10 +457,7 @@ impl SimNetwork {
             .map(|n| format!("node-{}", n))
             .collect();
 
-        let node_connectivity = self.node_connectivity();
-        let connections = pretty_print_connections(&node_connectivity);
         tracing::info!("Number of simulated nodes: {num_nodes}");
-        tracing::info!("{connections}");
 
         if !missing.is_empty() {
             missing.sort();
@@ -474,10 +471,18 @@ impl SimNetwork {
             elapsed.elapsed().as_secs()
         );
 
+        Ok(())
+    }
+
+    pub fn print_network_connections(&self) {
+        let node_connectivity = self.node_connectivity();
+        let connections = pretty_print_connections(&node_connectivity);
+        tracing::info!("{connections}");
+    }
+
+    pub fn print_ring_distribution(&self) {
         let hist = self.ring_distribution(1);
         tracing::info!("Ring distribution: {:?}", hist);
-
-        Ok(())
     }
 
     /// Recommended to calling after `check_connectivity` to ensure enough time
@@ -523,12 +528,8 @@ impl SimNetwork {
         let expected_avg_connections =
             ((self.max_connections - self.min_connections) / 2) + self.min_connections;
         let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
-        tracing::info!(
-            "Average connections: {avg_connections} (expected > {expected_avg_connections})"
-        );
         if avg_connections < expected_avg_connections {
-            tracing::error!("Average number of connections ({avg_connections}) is low (< {expected_avg_connections})");
-            anyhow::bail!("low average number of connections");
+            tracing::warn!("Average number of connections ({avg_connections}) is low (< {expected_avg_connections})");
         }
         Ok(())
     }

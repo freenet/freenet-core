@@ -11,9 +11,9 @@ use libp2p::{
 };
 
 use super::{
-    client_event_handling,
-    conn_manager::{p2p_protoc::P2pConnManager, EventLoopNotifications},
-    join_ring_request, EventLogRegister, PeerKey,
+    client_event_handling, join_ring_request,
+    network_bridge::{p2p_protoc::P2pConnManager, EventLoopNotifications},
+    EventLogRegister, PeerKey,
 };
 use crate::{
     client_events::combinator::ClientEventsCombinator,
@@ -23,7 +23,6 @@ use crate::{
         NetworkEventListenerHalve,
     },
     node::NodeBuilder,
-    ring::Ring,
     util::IterExt,
 };
 
@@ -84,11 +83,16 @@ impl NodeP2P {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
 
-        let ring = Ring::new::<CLIENTS, EL>(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
-        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ch_outbound));
+
+        let op_storage = Arc::new(OpManager::new::<CLIENTS, EL>(
+            notification_tx,
+            ch_outbound,
+            &builder,
+            &gateways,
+        )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_storage.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
             .await
@@ -144,7 +148,7 @@ impl NodeP2P {
 mod test {
     use std::{net::Ipv4Addr, time::Duration};
 
-    use super::super::conn_manager::p2p_protoc::NetEvent;
+    use super::super::network_bridge::p2p_protoc::NetEvent;
     use super::*;
     use crate::{
         client_events::test::MemoryEventsGen,

@@ -1,24 +1,23 @@
-#![allow(unused_variables, dead_code)]
-
-use crate::ring::{Distance, Location};
-use request_density_tracker::cached_density_map::CachedDensityMap;
+use crate::{
+    message::TransactionType,
+    ring::{Distance, Location},
+};
+use request_density_tracker::CachedDensityMap;
 use std::{
     collections::BTreeMap,
-    rc::Rc,
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info};
-
-use self::{request_density_tracker::DensityMapError, small_world_rand::random_link_distance};
 
 mod connection_evaluator;
 mod request_density_tracker;
 mod small_world_rand;
 
+use request_density_tracker::DensityMapError;
+use small_world_rand::random_link_distance;
+
 const SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(5 * 60);
 const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(60);
 const REQUEST_DENSITY_TRACKER_WINDOW_SIZE: usize = 10_000;
-const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 const RANDOM_CLOSEST_DISTANCE: f64 = 1.0 / 1000.0;
 
 /// The goal of `TopologyManager` is to select new connections such that the
@@ -43,14 +42,14 @@ pub(crate) struct TopologyManager {
     slow_connection_evaluator: connection_evaluator::ConnectionEvaluator,
     fast_connection_evaluator: connection_evaluator::ConnectionEvaluator,
     request_density_tracker: request_density_tracker::RequestDensityTracker,
+    /// Must be updated when new neightbors are discovered.
     cached_density_map: CachedDensityMap,
-    this_peer_location: Location,
+    pub this_peer_location: Location,
 }
 
 impl TopologyManager {
     /// Create a new TopologyManager specifying the peer's own Location
     pub(crate) fn new(this_peer_location: Location) -> Self {
-        info!("Creating a new TopologyManager instance");
         TopologyManager {
             slow_connection_evaluator: connection_evaluator::ConnectionEvaluator::new(
                 SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION,
@@ -61,18 +60,27 @@ impl TopologyManager {
             request_density_tracker: request_density_tracker::RequestDensityTracker::new(
                 REQUEST_DENSITY_TRACKER_WINDOW_SIZE,
             ),
-            cached_density_map: CachedDensityMap::new(REGENERATE_DENSITY_MAP_INTERVAL),
+            cached_density_map: CachedDensityMap::new(),
             this_peer_location,
         }
+    }
+
+    pub(crate) fn refresh_cache(
+        &mut self,
+        current_neighbors: &BTreeMap<Location, usize>,
+    ) -> Result<(), DensityMapError> {
+        self.cached_density_map
+            .set(&self.request_density_tracker, current_neighbors)?;
+        Ok(())
     }
 
     /// Record a request and the location it's targeting
     pub(crate) fn record_request(
         &mut self,
         requested_location: Location,
-        request_type: RequestType,
+        request_type: TransactionType,
     ) {
-        debug!("Recording request for location: {:?}", requested_location);
+        tracing::debug!(%request_type, %requested_location, "Recording request for location");
         self.request_density_tracker.sample(requested_location);
     }
 
@@ -81,12 +89,10 @@ impl TopologyManager {
     /// recent candidates.
     pub(crate) fn evaluate_new_connection(
         &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
         candidate_location: Location,
         acquisition_strategy: AcquisitionStrategy,
     ) -> Result<bool, DensityMapError> {
         self.evaluate_new_connection_with_current_time(
-            current_neighbors,
             candidate_location,
             acquisition_strategy,
             Instant::now(),
@@ -95,16 +101,18 @@ impl TopologyManager {
 
     fn evaluate_new_connection_with_current_time(
         &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
         candidate_location: Location,
         acquisition_strategy: AcquisitionStrategy,
         current_time: Instant,
     ) -> Result<bool, DensityMapError> {
-        debug!(
+        tracing::debug!(
             "Evaluating new connection for candidate location: {:?}",
             candidate_location
         );
-        let density_map = self.get_or_create_density_map(current_neighbors)?;
+        let density_map = self
+            .cached_density_map
+            .get()
+            .ok_or(DensityMapError::EmptyNeighbors)?;
         let score = density_map.get_density_at(candidate_location)?;
 
         let accept = match acquisition_strategy {
@@ -126,33 +134,31 @@ impl TopologyManager {
     }
 
     /// Get the ideal location for a new connection based on current neighbors and request density
-    pub(crate) fn get_best_candidate_location(
-        &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
-    ) -> Result<Location, DensityMapError> {
-        debug!("Retrieving best candidate location");
-        let density_map = self.get_or_create_density_map(current_neighbors)?;
+    pub(crate) fn get_best_candidate_location(&self) -> Result<Location, DensityMapError> {
+        let density_map = self
+            .cached_density_map
+            .get()
+            .ok_or(DensityMapError::EmptyNeighbors)?;
 
         let best_location = match density_map.get_max_density() {
             Ok(location) => {
-                debug!("Max density found at location: {:?}", location);
+                tracing::debug!("Max density found at location: {:?}", location);
                 location
             }
             Err(_) => {
-                error!(
+                tracing::error!(
                     "An error occurred while getting max density, falling back to random location"
                 );
                 self.random_location()
             }
         };
-
         Ok(best_location)
     }
 
     /// Generates a random location that is close to the current peer location with a small
     /// world distribution.
     fn random_location(&self) -> Location {
-        debug!("Generating random location");
+        tracing::debug!("Generating random location");
         let distance = random_link_distance(Distance::new(RANDOM_CLOSEST_DISTANCE));
         let location_f64 = if rand::random() {
             self.this_peer_location.as_f64() - distance.as_f64()
@@ -162,22 +168,6 @@ impl TopologyManager {
         let location_f64 = location_f64.rem_euclid(1.0); // Ensure result is in [0.0, 1.0)
         Location::new(location_f64)
     }
-
-    fn get_or_create_density_map(
-        &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
-    ) -> Result<Rc<request_density_tracker::DensityMap>, DensityMapError> {
-        debug!("Getting or creating density map");
-        self.cached_density_map
-            .get_or_create(&self.request_density_tracker, current_neighbors)
-    }
-}
-
-pub(crate) enum RequestType {
-    Get,
-    Put,
-    Join,
-    Subscribe,
 }
 
 pub(crate) enum AcquisitionStrategy {
@@ -191,10 +181,11 @@ pub(crate) enum AcquisitionStrategy {
 #[cfg(test)]
 mod tests {
     use super::TopologyManager;
-    use crate::ring::Location;
+    use crate::{message::TransactionType, ring::Location};
 
     #[test]
     fn test_topology_manager() {
+        const NUM_REQUESTS: usize = 1_000;
         let mut topology_manager = TopologyManager::new(Location::new(0.39));
         let mut current_neighbors = std::collections::BTreeMap::new();
 
@@ -203,19 +194,32 @@ mod tests {
             current_neighbors.insert(Location::new(i as f64 / 10.0), 0);
         }
 
+        topology_manager
+            .cached_density_map
+            .set(
+                &topology_manager.request_density_tracker,
+                &current_neighbors,
+            )
+            .unwrap();
         let mut requests = vec![];
         // Simulate a bunch of random requests clustered around 0.35
-        for _ in 0..1000 {
+        for _ in 0..NUM_REQUESTS {
             let requested_location = topology_manager.random_location();
-            topology_manager.record_request(requested_location, super::RequestType::Get);
+            topology_manager.record_request(requested_location, TransactionType::Get);
             requests.push(requested_location);
         }
 
-        let best_candidate_location = topology_manager
-            .get_best_candidate_location(&current_neighbors)
-            .unwrap();
-        // Should be half way between 0.3 and 0.4 as that is where the most requests were
-        assert_eq!(best_candidate_location, Location::new(0.35));
+        let target_dense_location = Location::new(
+            requests.iter().map(|loc| loc.as_f64()).sum::<f64>() / NUM_REQUESTS as f64,
+        );
+        let best_candidate_location = topology_manager.get_best_candidate_location().unwrap();
+        // Should be close to where most of the requests were done.
+        let distance = (best_candidate_location.as_f64() - target_dense_location.as_f64()).abs();
+        assert!(
+            distance < 0.05,
+            "most requests done to {target_dense_location}, but candidate is {best_candidate_location} instead, \
+             distance between them higher than 0.05"
+        );
 
         // call evaluate_new_connection for locations 0.0 to 1.0 at 0.01 intervals and find the
         // location with the highest score
@@ -224,7 +228,8 @@ mod tests {
         for i in 0..100 {
             let candidate_location = Location::new(i as f64 / 100.0);
             let score = topology_manager
-                .get_or_create_density_map(&current_neighbors)
+                .cached_density_map
+                .get()
                 .unwrap()
                 .get_density_at(candidate_location)
                 .unwrap();

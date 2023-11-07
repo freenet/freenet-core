@@ -11,7 +11,7 @@ use once_cell::sync::OnceCell;
 use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use tokio::sync::Mutex;
 
-use super::{ConnectionBridge, ConnectionError, PeerKey};
+use super::{ConnectionError, NetworkBridge, PeerKey};
 use crate::{
     config::GlobalExecutor,
     message::Message,
@@ -93,13 +93,14 @@ impl Clone for MemoryConnManager {
 }
 
 #[async_trait::async_trait]
-impl ConnectionBridge for MemoryConnManager {
+impl NetworkBridge for MemoryConnManager {
     async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
         self.log_register
             .try_lock()
             .expect("unique lock")
             .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager))
             .await;
+        self.op_manager.sending_transaction(target, &msg);
         let msg = bincode::serialize(&msg)?;
         self.transport.send(*target, msg);
         Ok(())

@@ -5,8 +5,9 @@ use freenet_stdlib::prelude::*;
 
 use super::{
     client_event_handling,
-    conn_manager::{in_memory::MemoryConnManager, EventLoopNotifications},
+    event_log::EventLog,
     handle_cancelled_op, join_ring_request,
+    network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
     op_state_manager::OpManager,
     process_message, EventLogRegister, PeerKey,
 };
@@ -21,7 +22,7 @@ use crate::{
     message::{Message, NodeEvent, TransactionType},
     node::NodeBuilder,
     operations::OpError,
-    ring::{PeerKeyLocation, Ring},
+    ring::PeerKeyLocation,
     util::IterExt,
 };
 
@@ -49,10 +50,15 @@ impl NodeInMemory {
         let gateways = builder.get_gateways()?;
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
 
-        let ring = Ring::new::<1, EL>(&builder, &gateways)?;
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
-        let op_storage = Arc::new(OpManager::new(ring, notification_tx, ops_ch_channel));
+
+        let op_storage = Arc::new(OpManager::new::<1, EL>(
+            notification_tx,
+            ops_ch_channel,
+            &builder,
+            &gateways,
+        )?);
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =
             MemoryContractHandler::build(ch_channel, executor_sender, ch_builder)
@@ -170,7 +176,7 @@ impl NodeInMemory {
             };
 
             if let Ok(Either::Left(Message::Aborted(tx))) = msg {
-                let tx_type = tx.tx_type();
+                let tx_type = tx.transaction_type();
                 let res = handle_cancelled_op(
                     tx,
                     self.peer_key,
@@ -206,12 +212,15 @@ impl NodeInMemory {
                 Ok(Either::Left(msg)) => Ok(msg),
                 Ok(Either::Right(action)) => match action {
                     NodeEvent::ShutdownNode => break Ok(()),
-                    NodeEvent::ConfirmedInbound => continue,
-                    NodeEvent::DropConnection(_) => continue,
-                    NodeEvent::AcceptConnection(_) => continue,
-                    NodeEvent::Error(err) => {
-                        tracing::error!("Connection error within ops: {err}");
+                    NodeEvent::DropConnection(peer) => {
+                        tracing::info!("Dropping connection to {peer}");
+                        self.event_listener
+                            .register_events(Either::Left(EventLog::disconnected(&peer)));
+                        self.op_storage.ring.prune_connection(peer);
                         continue;
+                    }
+                    other => {
+                        unreachable!("event {other:?}, shouldn't happen in the in-memory impl")
                     }
                 },
                 Err(err) => Err(err),

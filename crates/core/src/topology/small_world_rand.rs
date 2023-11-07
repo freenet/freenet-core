@@ -3,7 +3,7 @@ use rand::Rng;
 use crate::ring::Distance;
 
 // Function to generate a random link distance based on Kleinberg's d^{-1} distribution
-pub(crate) fn random_link_distance(d_min: Distance) -> Distance {
+pub(super) fn random_link_distance(d_min: Distance) -> Distance {
     let d_max = 0.5;
 
     // Generate a uniform random number between 0 and 1

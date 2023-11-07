@@ -149,7 +149,7 @@ impl Router {
     pub fn select_peer<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
-        contract_location: &Location,
+        target_location: Location,
     ) -> Option<&'a PeerKeyLocation> {
         if !self.has_sufficient_historical_data() {
             // Find the peer with the minimum distance to the contract location,
@@ -158,7 +158,7 @@ impl Router {
                 .into_iter()
                 .filter_map(|peer| {
                     peer.location
-                        .map(|loc| (peer, contract_location.distance(loc)))
+                        .map(|loc| (peer, target_location.distance(loc)))
                 })
                 .min_by_key(|&(_, distance)| distance)
                 .map(|(peer, _)| peer)
@@ -167,11 +167,9 @@ impl Router {
             peers
                 .into_iter()
                 .map(|peer: &PeerKeyLocation| {
-                    let t = self
-                        .predict_routing_outcome(peer, contract_location)
-                        .expect(
-                            "Should always be Ok when has_sufficient_historical_data() is true",
-                        );
+                    let t = self.predict_routing_outcome(peer, target_location).expect(
+                        "Should always be Ok when has_sufficient_historical_data() is true",
+                    );
                     (peer, t.time_to_response_start)
                 })
                 // Required because f64 doesn't implement Ord
@@ -187,7 +185,7 @@ impl Router {
     fn predict_routing_outcome(
         &self,
         peer: &PeerKeyLocation,
-        contract_location: &Location,
+        target_location: Location,
     ) -> Result<RoutingPrediction, RoutingError> {
         if !self.has_sufficient_historical_data() {
             return Err(RoutingError::InsufficientDataError);
@@ -195,21 +193,21 @@ impl Router {
 
         let time_to_response_start_estimate = self
             .response_start_time_estimator
-            .estimate_retrieval_time(peer, contract_location)
+            .estimate_retrieval_time(peer, target_location)
             .map_err(|source| RoutingError::EstimationError {
                 estimation: "start time",
                 source,
             })?;
         let failure_estimate = self
             .failure_estimator
-            .estimate_retrieval_time(peer, contract_location)
+            .estimate_retrieval_time(peer, target_location)
             .map_err(|source| RoutingError::EstimationError {
                 estimation: "failure",
                 source,
             })?;
         let transfer_rate_estimate = self
             .transfer_rate_estimator
-            .estimate_retrieval_time(peer, contract_location)
+            .estimate_retrieval_time(peer, target_location)
             .map_err(|source| RoutingError::EstimationError {
                 estimation: "transfer rate",
                 source,
@@ -260,6 +258,7 @@ struct RoutingPrediction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) struct RouteEvent {
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
@@ -267,6 +266,7 @@ pub(crate) struct RouteEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum RouteOutcome {
     Success {
         time_to_response_start: Duration,
@@ -297,7 +297,7 @@ mod tests {
         for _ in 0..10 {
             let contract_location = Location::random();
             // Pass a reference to the `peers` vector
-            let best = router.select_peer(&peers, &contract_location).unwrap();
+            let best = router.select_peer(&peers, contract_location).unwrap();
             let best_distance = best.location.unwrap().distance(contract_location);
             for peer in &peers {
                 // Dereference `best` when making the comparison
@@ -357,7 +357,7 @@ mod tests {
             let truth = simulate_prediction(&mut rng, event.peer, event.contract_location);
 
             let prediction = router
-                .predict_routing_outcome(&event.peer, &event.contract_location)
+                .predict_routing_outcome(&event.peer, event.contract_location)
                 .unwrap();
 
             // Verify that the prediction is within 0.01 of the truth
@@ -397,9 +397,9 @@ mod tests {
     fn simulate_prediction(
         random: &mut rand::rngs::ThreadRng,
         peer: PeerKeyLocation,
-        contract_location: Location,
+        target_location: Location,
     ) -> RoutingPrediction {
-        let distance = peer.location.unwrap().distance(contract_location);
+        let distance = peer.location.unwrap().distance(target_location);
         let time_to_response_start = 2.0 * distance.as_f64();
         let failure_prob = distance.as_f64();
         let transfer_speed = 100.0 - (100.0 * distance.as_f64());

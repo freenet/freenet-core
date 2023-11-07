@@ -219,8 +219,8 @@ async fn websocket_commands(
     Extension(rs): Extension<WebSocketRequest>,
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
-        if let Err(e) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
-            tracing::error!("{e}");
+        if let Err(error) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
+            tracing::error!("{error}");
         }
     };
     ws.on_upgrade(on_upgrade)

@@ -111,7 +111,7 @@ impl IsotonicEstimator {
     pub fn estimate_retrieval_time(
         &self,
         peer: &PeerKeyLocation,
-        contract_location: &Location,
+        contract_location: Location,
     ) -> Result<f64, EstimationError> {
         // Check if there are enough data points that the model won't produce
         // garbage output, but users of this class must implement their own checks
@@ -251,7 +251,7 @@ mod tests {
         let mut errors = Vec::new();
         for event in testing_events {
             let estimated_time = estimator
-                .estimate_retrieval_time(&event.peer, &event.contract_location)
+                .estimate_retrieval_time(&event.peer, event.contract_location)
                 .unwrap();
             let actual_time = event.result;
             let error = (estimated_time - actual_time).abs();
@@ -288,7 +288,7 @@ mod tests {
         let mut errors = Vec::new();
         for event in testing_events {
             let estimated_time = estimator
-                .estimate_retrieval_time(&event.peer, &event.contract_location)
+                .estimate_retrieval_time(&event.peer, event.contract_location)
                 .unwrap();
             let actual_time = event.result;
             let error = (estimated_time - actual_time).abs();
