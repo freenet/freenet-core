@@ -156,6 +156,10 @@ impl LiveTransactionTracker {
     fn has_live_connection(&self, peer: &PeerKey) -> bool {
         self.tx_per_peer.contains_key(peer)
     }
+
+    fn still_alive(&self, tx: &Transaction) -> bool {
+        self.tx_per_peer.iter().any(|e| e.value().contains(tx))
+    }
 }
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
@@ -633,6 +637,7 @@ impl Ring {
         #[cfg(test)]
         let retry_interval = Duration::from_secs(5);
 
+        let mut live_tx = None;
         'outer: loop {
             loop {
                 match missing_candidates.try_recv() {
@@ -654,6 +659,16 @@ impl Ring {
                 .open_connections
                 .load(std::sync::atomic::Ordering::SeqCst);
 
+            if let Some(tx) = &live_tx {
+                if !live_tx_tracker.still_alive(tx) {
+                    let _ = live_tx.take();
+                } else if open_connections < self.max_connections {
+                    acquire_max_connections.tick().await;
+                } else {
+                    check_interval.tick().await;
+                }
+            }
+
             if open_connections < self.max_connections {
                 self.fast_acquisition
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -669,16 +684,18 @@ impl Ring {
                         }
                     }
                 };
-                self.acquire_new(
-                    ideal_location,
-                    &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
-                    &notifier,
-                )
-                .await
-                .map_err(|error| {
-                    tracing::debug!(?error, "Shutting down connection maintenance task");
-                    error
-                })?;
+                live_tx = self
+                    .acquire_new(
+                        ideal_location,
+                        &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
+                        &notifier,
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(?error, "Shutting down connection maintenance task");
+                        error
+                    })?;
+
                 acquire_max_connections.tick().await;
                 continue;
             }
@@ -710,16 +727,17 @@ impl Ring {
                         }
                     }
                 };
-                self.acquire_new(
-                    ideal_location,
-                    &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
-                    &notifier,
-                )
-                .await
-                .map_err(|error| {
-                    tracing::warn!(?error, "Shutting down connection maintenance task");
-                    error
-                })?;
+                live_tx = self
+                    .acquire_new(
+                        ideal_location,
+                        &missing.values().collect::<ArrayVec<_, { 5120 / 80 }>>(),
+                        &notifier,
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(?error, "Shutting down connection maintenance task");
+                        error
+                    })?;
                 for peer in should_swap.drain(..) {
                     notifier
                         .send(Either::Right(crate::message::NodeEvent::DropConnection(
@@ -742,9 +760,10 @@ impl Ring {
         ideal_location: Location,
         skip_list: &[&PeerKey],
         notifier: &EventLoopNotificationsSender,
-    ) -> Result<(), DynError> {
+    ) -> Result<Option<Transaction>, DynError> {
+        use crate::message::InnerMessage;
         let Some(query_target) = self.routing(ideal_location, None, skip_list) else {
-            return Ok(());
+            return Ok(None);
         };
         let joiner = self.own_location();
         tracing::debug!(
@@ -761,8 +780,9 @@ impl Ring {
                 joiner,
             },
         };
+        let id = *msg.id();
         notifier.send(Either::Left((msg.into(), None))).await?;
-        Ok(())
+        Ok(Some(id))
     }
 }
 
