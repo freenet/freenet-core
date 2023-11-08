@@ -1,72 +1,48 @@
-use std::{fs::File, io::Write, iter::FromIterator, path::PathBuf, sync::Arc};
+use std::{
+    fs::{File, OpenOptions},
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
-use serde::{Deserialize, Serialize};
 use stretto::Cache;
 
-use super::{
-    error::RuntimeInnerError,
-    store::{StoreEntriesContainer, StoreFsManagement},
-    RuntimeResult,
-};
-
-#[derive(Serialize, Deserialize, Default)]
-struct KeyToCodeMap(Vec<(ContractKey, CodeHash)>);
-
-impl StoreEntriesContainer for KeyToCodeMap {
-    type MemContainer = Arc<DashMap<ContractKey, CodeHash>>;
-    type Key = ContractKey;
-    type Value = CodeHash;
-
-    fn update(self, container: &mut Self::MemContainer) {
-        for (k, v) in self.0 {
-            container.insert(k, v);
-        }
-    }
-
-    fn replace(container: &Self::MemContainer) -> Self {
-        KeyToCodeMap::from(&**container)
-    }
-
-    fn insert(container: &mut Self::MemContainer, key: Self::Key, value: Self::Value) {
-        container.insert(key, value);
-    }
-}
-
-impl From<&DashMap<ContractKey, CodeHash>> for KeyToCodeMap {
-    fn from(vals: &DashMap<ContractKey, CodeHash>) -> Self {
-        let mut map = vec![];
-        for r in vals.iter() {
-            map.push((r.key().clone(), *r.value()));
-        }
-        Self(map)
-    }
-}
+use super::{error::RuntimeInnerError, store::StoreFsManagement, RuntimeResult};
 
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
     contracts_dir: PathBuf,
     contract_cache: Cache<CodeHash, Arc<ContractCode<'static>>>,
-    key_to_code_part: Arc<DashMap<ContractKey, CodeHash>>,
+    key_to_code_part: Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>,
+    index_file: BufWriter<File>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total space used under a configured threshold
 
-static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
-impl StoreFsManagement<KeyToCodeMap> for ContractStore {}
+impl StoreFsManagement for ContractStore {
+    type MemContainer = Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>;
+    type Key = ContractInstanceId;
+    type Value = CodeHash;
+
+    fn insert_in_container(
+        container: &mut Self::MemContainer,
+        (key, offset): (Self::Key, u64),
+        value: Self::Value,
+    ) {
+        container.insert(key, (offset, value));
+    }
+}
 
 impl ContractStore {
     /// # Arguments
     /// - max_size: max size in bytes of the contracts being cached
     pub fn new(contracts_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
         const ERR: &str = "failed to build mem cache";
-        let key_to_code_part;
-        let _ = LOCK_FILE_PATH.try_insert(contracts_dir.join("__LOCK"));
-        // if the lock file exists is from a previous execution so is safe to delete it
-        let _ = std::fs::remove_file(LOCK_FILE_PATH.get().unwrap().as_path());
+        let mut key_to_code_part = Arc::new(DashMap::new());
         let key_file = match KEY_FILE_PATH
             .try_insert(contracts_dir.join("KEY_DATA"))
             .map_err(|(e, _)| e)
@@ -79,24 +55,25 @@ impl ContractStore {
                 tracing::error!("error creating contract dir: {err}");
                 err
             })?;
-            key_to_code_part = Arc::new(DashMap::new());
             File::create(contracts_dir.join("KEY_DATA"))?;
         } else {
-            let map = Self::load_from_file(
-                KEY_FILE_PATH.get().unwrap().as_path(),
-                LOCK_FILE_PATH.get().unwrap().as_path(),
+            Self::load_from_file(
+                KEY_FILE_PATH.get().expect("infallible").as_path(),
+                &mut key_to_code_part,
             )?;
-            key_to_code_part = Arc::new(DashMap::from_iter(map.0));
         }
         Self::watch_changes(
             key_to_code_part.clone(),
-            KEY_FILE_PATH.get().unwrap().as_path(),
-            LOCK_FILE_PATH.get().unwrap().as_path(),
+            KEY_FILE_PATH.get().expect("infallible").as_path(),
         )?;
+
+        let index_file =
+            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(key_file)?);
         Ok(Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
             key_to_code_part,
+            index_file,
         })
     }
 
@@ -121,8 +98,8 @@ impl ContractStore {
             return result;
         }
 
-        self.key_to_code_part.get(key).and_then(|key| {
-            let code_hash = key.value();
+        self.key_to_code_part.get(key.id()).and_then(|key| {
+            let code_hash = key.value().1;
             let path = code_hash.encode();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
             let ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract {
@@ -140,7 +117,7 @@ impl ContractStore {
             };
             // add back the contract part to the mem store
             let size = data.data().len() as i64;
-            self.contract_cache.insert(*code_hash, data.clone(), size);
+            self.contract_cache.insert(code_hash, data.clone(), size);
             Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                 WrappedContract::new(data, params),
             )))
@@ -162,15 +139,6 @@ impl ContractStore {
         if self.contract_cache.get(code_hash).is_some() {
             return Ok(());
         }
-
-        Self::update(
-            &mut self.key_to_code_part,
-            key.clone(),
-            *code_hash,
-            KEY_FILE_PATH.get().unwrap(),
-            LOCK_FILE_PATH.get().unwrap().as_path(),
-        )?;
-
         let key_path = code_hash.encode();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
@@ -185,10 +153,17 @@ impl ContractStore {
         self.contract_cache
             .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
 
+        // save on disc
         let version = APIVersion::from(contract);
         let output: Vec<u8> = code.to_bytes_versioned(version)?;
         let mut file = File::create(key_path)?;
         file.write_all(output.as_slice())?;
+        Self::insert(
+            &mut self.index_file,
+            &mut self.key_to_code_part,
+            *key.id(),
+            *code_hash,
+        )?;
 
         Ok(())
     }
@@ -213,6 +188,9 @@ impl ContractStore {
                 RuntimeInnerError::UnwrapContract
             })?,
         };
+        if let Some((_, (offset, _))) = self.key_to_code_part.remove(key.id()) {
+            Self::remove(KEY_FILE_PATH.get().expect("infallible"), offset)?;
+        }
         let key_path = self
             .contracts_dir
             .join(contract_hash.encode())
@@ -222,7 +200,7 @@ impl ContractStore {
     }
 
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {
-        self.key_to_code_part.get(key).map(|r| *r.value())
+        self.key_to_code_part.get(key.id()).map(|r| r.value().1)
     }
 }
 

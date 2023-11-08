@@ -1125,7 +1125,7 @@ impl Executor<Runtime> {
         if let Some(notifiers) = self.update_notifications.get_mut(key) {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             // in general there should be less than 32 failures
-            let mut failures = arrayvec::ArrayVec::<_, 32>::new();
+            let mut failures = Vec::with_capacity(32);
             for (peer_key, notifier) in notifiers.iter() {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
                 let update = match peer_summary {
@@ -1153,7 +1153,7 @@ impl Executor<Runtime> {
                 }
                 .into()))
                 {
-                    let _ = failures.try_push(*peer_key);
+                    failures.push(*peer_key);
                     tracing::error!(cli_id = %peer_key, "{err}");
                 } else {
                     tracing::debug!(cli_id = %peer_key, contract = %key, "notified of update");

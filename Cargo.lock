@@ -199,9 +199,6 @@ name = "arrayvec"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96d30a06541fbafbc7f82ed10c06164cfbd2c401138f6addd8404629c4b16711"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "asn1-rs"
@@ -1582,7 +1579,6 @@ version = "0.0.6"
 dependencies = [
  "anyhow",
  "arbitrary",
- "arrayvec",
  "async-trait",
  "asynchronous-codec",
  "axum",
@@ -1603,6 +1599,7 @@ dependencies = [
  "directories",
  "either",
  "freenet-stdlib",
+ "fs4",
  "futures",
  "itertools",
  "libp2p",
@@ -1624,6 +1621,7 @@ dependencies = [
  "statrs",
  "stretto",
  "tar",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower-http",
@@ -1650,7 +1648,6 @@ name = "freenet-stdlib"
 version = "0.0.8"
 dependencies = [
  "arbitrary",
- "arrayvec",
  "bincode",
  "blake3",
  "bs58",
@@ -1676,6 +1673,16 @@ dependencies = [
  "wasm-bindgen",
  "wasmer",
  "web-sys",
+]
+
+[[package]]
+name = "fs4"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29f9df8a11882c4e3335eb2d18a0137c505d9ca927470b0cac9c6f0ae07d28f7"
+dependencies = [
+ "rustix 0.38.21",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

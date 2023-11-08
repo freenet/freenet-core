@@ -1,8 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::Write,
-    iter::FromIterator,
     path::PathBuf,
     sync::Arc,
 };
@@ -12,43 +11,10 @@ use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20P
 use dashmap::DashMap;
 use freenet_stdlib::{client_api::DelegateRequest, prelude::*};
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 
-use super::{
-    store::{StoreEntriesContainer, StoreFsManagement},
-    RuntimeResult,
-};
+use super::{store::StoreFsManagement, RuntimeResult};
 
 type SecretKey = [u8; 32];
-
-#[derive(Serialize, Deserialize, Default)]
-struct KeyToEncryptionMap(Vec<(DelegateKey, Vec<SecretKey>)>);
-
-impl StoreEntriesContainer for KeyToEncryptionMap {
-    type MemContainer = Arc<DashMap<DelegateKey, Vec<SecretKey>>>;
-    type Key = DelegateKey;
-    type Value = Vec<SecretKey>;
-
-    fn update(self, container: &mut Self::MemContainer) {
-        for (k, v) in self.0 {
-            container.insert(k, v);
-        }
-    }
-
-    fn replace(container: &Self::MemContainer) -> Self {
-        KeyToEncryptionMap::from(&**container)
-    }
-
-    fn insert(container: &mut Self::MemContainer, key: Self::Key, value: Self::Value) {
-        if let Some(element) = container.get(&key.clone()) {
-            let mut secrets = element.value().clone();
-            secrets.extend(value);
-            container.insert(key, secrets);
-        } else {
-            container.insert(key, value);
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretStoreError {
@@ -62,16 +28,6 @@ pub enum SecretStoreError {
     MissingSecret(SecretsId),
 }
 
-impl From<&DashMap<DelegateKey, Vec<SecretKey>>> for KeyToEncryptionMap {
-    fn from(vals: &DashMap<DelegateKey, Vec<SecretKey>>) -> Self {
-        let mut map = vec![];
-        for r in vals.iter() {
-            map.push((r.key().clone(), r.value().clone()));
-        }
-        Self(map)
-    }
-}
-
 #[derive(Clone)]
 struct Encryption {
     cipher: XChaCha20Poly1305,
@@ -82,13 +38,56 @@ struct Encryption {
 pub struct SecretsStore {
     base_path: PathBuf,
     ciphers: HashMap<DelegateKey, Encryption>,
-    key_to_secret_part: Arc<DashMap<DelegateKey, Vec<SecretKey>>>,
+    key_to_secret_part: Arc<DashMap<DelegateKey, HashSet<SecretKey>>>,
 }
 
-static LOCK_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
-impl StoreFsManagement<KeyToEncryptionMap> for SecretsStore {}
+pub(super) struct ConcatenatedSecretKeys(Vec<u8>);
+
+impl AsRef<[u8]> for ConcatenatedSecretKeys {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<'x> TryFrom<&'x [u8]> for ConcatenatedSecretKeys {
+    type Error = std::io::Error;
+
+    fn try_from(value: &'x [u8]) -> Result<Self, Self::Error> {
+        Ok(Self(value.to_vec()))
+    }
+}
+
+impl StoreFsManagement for SecretsStore {
+    type MemContainer = Arc<DashMap<DelegateKey, HashSet<SecretKey>>>;
+    type Key = DelegateKey;
+    type Value = ConcatenatedSecretKeys;
+
+    fn insert_in_container(
+        container: &mut Self::MemContainer,
+        (key, _offset): (Self::Key, u64),
+        value: Self::Value,
+    ) {
+        let split_secrets = value
+            .0
+            .chunks(32)
+            .map(|chunk| {
+                let mut fixed = [0u8; 32];
+                fixed.copy_from_slice(chunk);
+                fixed
+            })
+            .collect::<HashSet<_>>();
+        match container.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut delegate) => {
+                delegate.get_mut().extend(split_secrets);
+            }
+            dashmap::mapref::entry::Entry::Vacant(delegate) => {
+                delegate.insert(split_secrets);
+            }
+        }
+    }
+}
 
 static DEFAULT_CIPHER: Lazy<XChaCha20Poly1305> = Lazy::new(|| {
     let arr = GenericArray::from_slice(&DelegateRequest::DEFAULT_CIPHER);
@@ -105,8 +104,7 @@ static DEFAULT_ENCRYPTION: Lazy<Encryption> = Lazy::new(|| Encryption {
 
 impl SecretsStore {
     pub fn new(secrets_dir: PathBuf) -> RuntimeResult<Self> {
-        let key_to_secret_part;
-        let _ = LOCK_FILE_PATH.try_insert(secrets_dir.join("__LOCK"));
+        let mut key_to_secret_part = Arc::new(DashMap::new());
         let key_file = match KEY_FILE_PATH
             .try_insert(secrets_dir.join("KEY_DATA"))
             .map_err(|(e, _)| e)
@@ -119,19 +117,16 @@ impl SecretsStore {
                 tracing::error!("error creating delegate dir: {err}");
                 err
             })?;
-            key_to_secret_part = Arc::new(DashMap::new());
             File::create(secrets_dir.join("KEY_DATA"))?;
         } else {
-            let map = Self::load_from_file(
+            Self::load_from_file(
                 KEY_FILE_PATH.get().unwrap().as_path(),
-                LOCK_FILE_PATH.get().unwrap().as_path(),
+                &mut key_to_secret_part,
             )?;
-            key_to_secret_part = Arc::new(DashMap::from_iter(map.0));
         }
         Self::watch_changes(
             key_to_secret_part.clone(),
             KEY_FILE_PATH.get().unwrap().as_path(),
-            LOCK_FILE_PATH.get().unwrap().as_path(),
         )?;
         Ok(Self {
             base_path: secrets_dir,
@@ -176,8 +171,12 @@ impl SecretsStore {
                 }
             })?;
 
+        // FIXME: update on disc
         self.key_to_secret_part
-            .insert(delegate.clone(), vec![secret_key]);
+            .entry(delegate.clone())
+            .or_default()
+            .value_mut()
+            .insert(secret_key);
 
         fs::create_dir_all(&delegate_path)?;
         tracing::debug!("storing secret `{key}` at {secret_file_path:?}");

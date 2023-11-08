@@ -19,14 +19,19 @@ pub(super) struct AppState {
 
 impl AppState {
     const MAX_MEM_CACHE: u32 = 10_000_000;
+    const DEFAULT_MAX_DELEGATE_SIZE: i64 = 10 * 1024 * 1024;
 
     pub async fn new(config: &LocalNodeCliConfig) -> Result<Self, DynError> {
-        let contract_dir = Config::conf().contracts_dir();
-        let contract_store = ContractStore::new(contract_dir, config.max_contract_size)?;
+        let contract_store =
+            ContractStore::new(Config::conf().contracts_dir(), config.max_contract_size)?;
+        let delegate_store = DelegateStore::new(
+            Config::conf().delegates_dir(),
+            Self::DEFAULT_MAX_DELEGATE_SIZE,
+        )?;
         let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE).unwrap();
         let rt = freenet::dev_tool::Runtime::build(
             contract_store,
-            DelegateStore::default(),
+            delegate_store,
             SecretsStore::default(),
             false,
         )

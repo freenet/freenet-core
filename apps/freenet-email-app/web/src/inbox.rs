@@ -557,7 +557,7 @@ mod tests {
                     minimum_tier: Tier::Hour1,
                     private_key,
                 },
-                key: ContractKey::from((&params.try_into()?, ContractCode::from([].as_slice()))),
+                key: ContractKey::from_params_and_code(&params.try_into()?, ContractCode::from([].as_slice())),
             })
         }
     }

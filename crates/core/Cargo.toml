@@ -16,7 +16,6 @@ path = "src/bin/freenet.rs"
 anyhow = "1"
 asynchronous-codec = "0.6"
 async-trait = "0.1"
-arrayvec = { workspace = true }
 axum = { version = "0.6", default-features = false, features = ["ws", "tower-log", "matched-path", "headers", "query", "http1"] }
 bincode = "1"
 blake3 = { workspace = true }
@@ -33,6 +32,7 @@ dashmap = "^5.5"
 delegate = "0.10"
 directories = "5"
 either = { workspace = true , features = ["serde"] }
+fs4 = "0.7"
 futures = "0.3.21"
 libp2p = { version = "0.52.3", features = [
     "autonat",
@@ -90,6 +90,7 @@ pico-args = "0.5"
 statrs = "0.16.0"
 freenet-stdlib = { workspace = true, features = ["testing", "net"] }
 chrono = { workspace = true, features = ["arbitrary"] }
+tempfile = "3.8"
 
 [features]
 default = ["trace", "websocket", "sqlite"]
