@@ -340,11 +340,11 @@ impl Executor<Runtime> {
 impl<R> Executor<R> {
     pub async fn new(
         state_store: StateStore<Storage>,
-        ctrl_handler: impl FnOnce(),
+        ctrl_handler: impl FnOnce() -> Result<(), DynError>,
         mode: OperationMode,
         runtime: R,
     ) -> Result<Self, DynError> {
-        ctrl_handler();
+        ctrl_handler()?;
 
         Ok(Self {
             #[cfg(any(
@@ -416,7 +416,8 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             || {
-                crate::util::set_cleanup_on_exit().unwrap();
+                crate::util::set_cleanup_on_exit()?;
+                Ok(())
             },
             OperationMode::Local,
             rt,
@@ -1199,7 +1200,7 @@ impl Executor<crate::contract::MockRuntime> {
 
         let executor = Executor::new(
             state_store,
-            || {},
+            || Ok(()),
             OperationMode::Local,
             super::MockRuntime { contract_store },
         )
@@ -1335,6 +1336,7 @@ mod test {
             state_store,
             || {
                 counter += 1;
+                Ok(())
             },
             OperationMode::Local,
             MockRuntime { contract_store },

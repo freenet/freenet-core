@@ -28,20 +28,21 @@ impl AppState {
             Config::conf().delegates_dir(),
             Self::DEFAULT_MAX_DELEGATE_SIZE,
         )?;
-        let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE).unwrap();
+        let secrets_store = SecretsStore::new(Config::conf().secrets_dir())?;
+        let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE)?;
         let rt = freenet::dev_tool::Runtime::build(
             contract_store,
             delegate_store,
-            SecretsStore::default(),
+            secrets_store,
             false,
-        )
-        .unwrap();
+        )?;
         Ok(AppState {
             local_node: Arc::new(RwLock::new(
                 Executor::new(
                     state_store,
                     || {
-                        freenet::util::set_cleanup_on_exit().unwrap();
+                        freenet::util::set_cleanup_on_exit()?;
+                        Ok(())
                     },
                     OperationMode::Local,
                     rt,

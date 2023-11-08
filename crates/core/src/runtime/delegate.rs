@@ -390,6 +390,7 @@ mod test {
     use freenet_stdlib::prelude::*;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     use super::super::{delegate_store::DelegateStore, ContractStore, SecretsStore};
     use super::*;
@@ -416,11 +417,11 @@ mod test {
     fn setup_runtime(
         name: &str,
     ) -> Result<(DelegateContainer, Runtime), Box<dyn std::error::Error>> {
-        const TEST_PREFIX: &str = "delegate-api";
         // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-        let contracts_dir = super::super::tests::test_dir(TEST_PREFIX);
-        let delegates_dir = super::super::tests::test_dir(TEST_PREFIX);
-        let secrets_dir = super::super::tests::test_dir(TEST_PREFIX);
+        let temp_dir = TempDir::new().expect("Failed to create a temporary directory");
+        let contracts_dir = temp_dir.path().join("contracts");
+        let delegates_dir = temp_dir.path().join("delegates");
+        let secrets_dir = temp_dir.path().join("secrets");
 
         let contract_store = ContractStore::new(contracts_dir, 10_000)?;
         let delegate_store = DelegateStore::new(delegates_dir, 10_000)?;

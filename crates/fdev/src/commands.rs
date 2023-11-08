@@ -170,7 +170,7 @@ async fn execute_command(
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE)?;
     let rt =
         freenet::dev_tool::Runtime::build(contract_store, delegate_store, secret_store, false)?;
-    let mut executor = Executor::new(state_store, || {}, OperationMode::Local, rt).await?;
+    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt).await?;
 
     executor
         .handle_request(ClientId::FIRST, request, None)

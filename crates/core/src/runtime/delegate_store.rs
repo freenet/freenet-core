@@ -54,15 +54,9 @@ impl DelegateStore {
             })?;
             File::create(delegates_dir.join("KEY_DATA"))?;
         } else {
-            Self::load_from_file(
-                KEY_FILE_PATH.get().unwrap().as_path(),
-                &mut key_to_code_part,
-            )?;
+            Self::load_from_file(key_file, &mut key_to_code_part)?;
         }
-        Self::watch_changes(
-            key_to_code_part.clone(),
-            KEY_FILE_PATH.get().unwrap().as_path(),
-        )?;
+        Self::watch_changes(key_to_code_part.clone(), key_file)?;
 
         let index_file =
             std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(key_file)?);
@@ -136,12 +130,27 @@ impl DelegateStore {
         let output: Vec<u8> = delegate.code().to_bytes_versioned(version)?;
         let mut file = File::create(delegate_path)?;
         file.write_all(output.as_slice())?;
-        Self::insert(
-            &mut self.index_file,
-            &mut self.key_to_code_part,
-            key.clone(),
-            *code_hash,
-        )?;
+
+        // Update index
+        let keys = self.key_to_code_part.entry(key.clone());
+        match keys {
+            dashmap::mapref::entry::Entry::Occupied(mut v) => {
+                let current_version_offset = v.get().0;
+                let prev_val = &mut v.get_mut().1;
+                // first mark the old entry (if it exists) as removed
+                Self::remove(
+                    KEY_FILE_PATH.get().expect("should be set"),
+                    current_version_offset,
+                )?;
+                let new_offset = Self::insert(&mut self.index_file, key.clone(), code_hash)?;
+                *prev_val = *code_hash;
+                v.get_mut().0 = new_offset;
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let offset = Self::insert(&mut self.index_file, key.clone(), code_hash)?;
+                v.insert((offset, *code_hash));
+            }
+        }
 
         Ok(())
     }

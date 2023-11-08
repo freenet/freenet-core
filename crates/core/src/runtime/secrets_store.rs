@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
     path::PathBuf,
     sync::Arc,
 };
@@ -34,11 +34,11 @@ struct Encryption {
     nonce: XNonce,
 }
 
-#[derive(Default)]
 pub struct SecretsStore {
     base_path: PathBuf,
     ciphers: HashMap<DelegateKey, Encryption>,
-    key_to_secret_part: Arc<DashMap<DelegateKey, HashSet<SecretKey>>>,
+    key_to_secret_part: Arc<DashMap<DelegateKey, (u64, HashSet<SecretKey>)>>,
+    index_file: BufWriter<File>,
 }
 
 static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
@@ -60,13 +60,13 @@ impl<'x> TryFrom<&'x [u8]> for ConcatenatedSecretKeys {
 }
 
 impl StoreFsManagement for SecretsStore {
-    type MemContainer = Arc<DashMap<DelegateKey, HashSet<SecretKey>>>;
+    type MemContainer = Arc<DashMap<DelegateKey, (u64, HashSet<SecretKey>)>>;
     type Key = DelegateKey;
     type Value = ConcatenatedSecretKeys;
 
     fn insert_in_container(
         container: &mut Self::MemContainer,
-        (key, _offset): (Self::Key, u64),
+        (key, new_offset): (Self::Key, u64),
         value: Self::Value,
     ) {
         let split_secrets = value
@@ -80,10 +80,13 @@ impl StoreFsManagement for SecretsStore {
             .collect::<HashSet<_>>();
         match container.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut delegate) => {
-                delegate.get_mut().extend(split_secrets);
+                // if an update was to happen from an other process new value would be loaded here
+                let (offset, secret_hashes) = delegate.get_mut();
+                *offset = new_offset;
+                secret_hashes.extend(split_secrets);
             }
             dashmap::mapref::entry::Entry::Vacant(delegate) => {
-                delegate.insert(split_secrets);
+                delegate.insert((new_offset, split_secrets));
             }
         }
     }
@@ -119,19 +122,17 @@ impl SecretsStore {
             })?;
             File::create(secrets_dir.join("KEY_DATA"))?;
         } else {
-            Self::load_from_file(
-                KEY_FILE_PATH.get().unwrap().as_path(),
-                &mut key_to_secret_part,
-            )?;
+            Self::load_from_file(key_file, &mut key_to_secret_part)?;
         }
-        Self::watch_changes(
-            key_to_secret_part.clone(),
-            KEY_FILE_PATH.get().unwrap().as_path(),
-        )?;
+        Self::watch_changes(key_to_secret_part.clone(), key_file)?;
+
+        let index_file =
+            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(key_file)?);
         Ok(Self {
             base_path: secrets_dir,
             ciphers: HashMap::new(),
             key_to_secret_part,
+            index_file,
         })
     }
 
@@ -171,12 +172,38 @@ impl SecretsStore {
                 }
             })?;
 
-        // FIXME: update on disc
-        self.key_to_secret_part
-            .entry(delegate.clone())
-            .or_default()
-            .value_mut()
-            .insert(secret_key);
+        // Update index 
+        let hashes = self.key_to_secret_part.entry(delegate.clone());
+        match hashes {
+            dashmap::mapref::entry::Entry::Occupied(mut v) => {
+                let current_version_offset = v.get().0;
+                let secret_hashes = &mut v.get_mut().1;
+                let mut value = vec![];
+                for hash in &*secret_hashes {
+                    value.extend_from_slice(hash);
+                }
+                // first mark the old entry (if it exists) as removed
+                Self::remove(
+                    KEY_FILE_PATH.get().expect("should be set"),
+                    current_version_offset,
+                )?;
+                let new_offset = Self::insert(
+                    &mut self.index_file,
+                    delegate.clone(),
+                    &ConcatenatedSecretKeys(value),
+                )?;
+                secret_hashes.insert(secret_key);
+                v.get_mut().0 = new_offset;
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let offset = Self::insert(
+                    &mut self.index_file,
+                    delegate.clone(),
+                    &ConcatenatedSecretKeys(secret_key.to_vec()),
+                )?;
+                v.insert((offset, HashSet::from([secret_key])));
+            }
+        }
 
         fs::create_dir_all(&delegate_path)?;
         tracing::debug!("storing secret `{key}` at {secret_file_path:?}");

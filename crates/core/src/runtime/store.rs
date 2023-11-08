@@ -102,20 +102,19 @@ pub(super) trait StoreFsManagement {
         Ok(())
     }
 
+    /// Insert in index file and returns the offset at which this record resides.
     fn insert(
         file: &mut BufWriter<File>,
-        mem_container: &mut Self::MemContainer,
         key: Self::Key,
-        value: Self::Value,
-    ) -> std::io::Result<()>
+        value: &Self::Value,
+    ) -> std::io::Result<u64>
     where
         StoreKey: From<Self::Key>,
     {
         // The full key is the tombstone marker byte + kind + [internal key content]  + size of value
-        let internal_key: StoreKey = key.clone().into();
+        let internal_key: StoreKey = key.into();
         let offset = insert_record(file, internal_key, value.as_ref())?;
-        Self::insert_in_container(mem_container, (key, offset), value);
-        Ok(())
+        Ok(offset)
     }
 
     fn remove(key_file_path: &Path, key_offset: u64) -> std::io::Result<()> {
@@ -403,19 +402,16 @@ mod tests {
                     .open(&delegate_keys_file_path)
                     .expect("Failed to open key file"),
             );
-            let mut container_1 = <TestStore1 as StoreFsManagement>::MemContainer::default();
-            let mut container_2 = <TestStore2 as StoreFsManagement>::MemContainer::default();
+            let container_1 = <TestStore1 as StoreFsManagement>::MemContainer::default();
+            let container_2 = <TestStore2 as StoreFsManagement>::MemContainer::default();
 
-            TestStore1::insert(&mut file_1, &mut container_1, key_1, expected_value_1)
+            let offset = TestStore1::insert(&mut file_1, key_1, &expected_value_1)
                 .expect("Failed to update");
+            container_1.insert(key_1, (offset, expected_value_1));
 
-            TestStore2::insert(
-                &mut file_2,
-                &mut container_2,
-                key_2.clone(),
-                expected_value_2,
-            )
-            .expect("Failed to update");
+            let offset = TestStore2::insert(&mut file_2, key_2.clone(), &expected_value_2)
+                .expect("Failed to update");
+            container_2.insert(key_2.clone(), (offset, expected_value_2));
         }
 
         // Test the load_from_file function
@@ -599,13 +595,14 @@ mod tests {
     fn create_test_data(
         file: &mut BufWriter<File>,
         test_path: &Path,
-        mut shared_data: <TestStore1 as StoreFsManagement>::MemContainer,
+        shared_data: <TestStore1 as StoreFsManagement>::MemContainer,
         thread: u8,
     ) {
         for j in 0..10 {
             let key = ContractInstanceId::new([thread + j as u8; 32]);
             let value = CodeHash::new([thread + j as u8; 32]);
-            TestStore1::insert(file, &mut shared_data, key, value).expect("Failed to update");
+            let offset = TestStore1::insert(file, key, &value).expect("Failed to update");
+            shared_data.insert(key, (offset, value));
         }
         for j in [3, 6, 9] {
             let key = ContractInstanceId::new([thread + j as u8; 32]);

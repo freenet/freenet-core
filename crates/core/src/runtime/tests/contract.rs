@@ -1,14 +1,14 @@
 use freenet_stdlib::prelude::*;
 
 use super::super::contract::*;
-use super::super::{secrets_store::SecretsStore, tests::setup_test_contract, Runtime};
+use super::super::{tests::setup_test_contract, Runtime};
 
 const TEST_CONTRACT_1: &str = "test_contract_1";
 
 #[test]
 fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
-    let (contracts, delegates, key) = setup_test_contract(TEST_CONTRACT_1)?;
-    let mut runtime = Runtime::build(contracts, delegates, SecretsStore::default(), false).unwrap();
+    let (contracts, delegates, secrets, key) = setup_test_contract(TEST_CONTRACT_1)?;
+    let mut runtime = Runtime::build(contracts, delegates, secrets, false).unwrap();
 
     let is_valid = runtime.validate_state(
         &key,
@@ -31,8 +31,8 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
-    let (contracts, delegates, key) = setup_test_contract(TEST_CONTRACT_1)?;
-    let mut runtime = Runtime::build(contracts, delegates, SecretsStore::default(), false).unwrap();
+    let (contracts, delegates, secrets, key) = setup_test_contract(TEST_CONTRACT_1)?;
+    let mut runtime = Runtime::build(contracts, delegates, secrets, false).unwrap();
 
     let is_valid = runtime.validate_delta(
         &key,
@@ -53,8 +53,8 @@ fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn update_state() -> Result<(), Box<dyn std::error::Error>> {
-    let (contracts, delegates, key) = setup_test_contract(TEST_CONTRACT_1)?;
-    let mut runtime = Runtime::build(contracts, delegates, SecretsStore::default(), false).unwrap();
+    let (contracts, delegates, secrets, key) = setup_test_contract(TEST_CONTRACT_1)?;
+    let mut runtime = Runtime::build(contracts, delegates, secrets, false).unwrap();
 
     let new_state = runtime
         .update_state(
@@ -71,8 +71,8 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
-    let (contracts, delegates, key) = setup_test_contract(TEST_CONTRACT_1)?;
-    let mut runtime = Runtime::build(contracts, delegates, SecretsStore::default(), false).unwrap();
+    let (contracts, delegates, secrets, key) = setup_test_contract(TEST_CONTRACT_1)?;
+    let mut runtime = Runtime::build(contracts, delegates, secrets, false).unwrap();
 
     let summary = runtime.summarize_state(
         &key,
@@ -85,8 +85,8 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
-    let (contracts, delegates, key) = setup_test_contract(TEST_CONTRACT_1)?;
-    let mut runtime = Runtime::build(contracts, delegates, SecretsStore::default(), false).unwrap();
+    let (contracts, delegates, secrets, key) = setup_test_contract(TEST_CONTRACT_1)?;
+    let mut runtime = Runtime::build(contracts, delegates, secrets, false).unwrap();
 
     let delta = runtime.get_state_delta(
         &key,
