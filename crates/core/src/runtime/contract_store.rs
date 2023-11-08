@@ -153,7 +153,7 @@ impl ContractStore {
         let mut file = File::create(key_path)?;
         file.write_all(output.as_slice())?;
 
-        // Update index 
+        // Update index
         let keys = self.key_to_code_part.entry(*key.id());
         match keys {
             dashmap::mapref::entry::Entry::Occupied(mut v) => {
@@ -215,15 +215,15 @@ impl ContractStore {
 
 #[cfg(test)]
 mod test {
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let contract_dir = std::env::temp_dir()
-            .join("freenet-test")
-            .join("contract-store-test");
-        std::fs::create_dir_all(&contract_dir)?;
-        let mut store = ContractStore::new(contract_dir, 10_000)?;
+        let contract_dir = TempDir::new()?;
+        std::fs::create_dir_all(contract_dir.path())?;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
         let contract = WrappedContract::new(
             Arc::new(ContractCode::from(vec![0, 1, 2])),
             [0, 1].as_ref().into(),

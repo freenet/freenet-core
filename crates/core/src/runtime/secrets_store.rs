@@ -172,7 +172,7 @@ impl SecretsStore {
                 }
             })?;
 
-        // Update index 
+        // Update index
         let hashes = self.key_to_secret_part.entry(delegate.clone());
         match hashes {
             dashmap::mapref::entry::Entry::Occupied(mut v) => {

@@ -92,7 +92,7 @@ pub struct ConfigPaths {
 }
 
 impl ConfigPaths {
-    fn new() -> std::io::Result<ConfigPaths> {
+    pub fn app_data_dir() -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
         let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
@@ -100,6 +100,11 @@ impl ConfigPaths {
         } else {
             project_dir.data_dir().into()
         };
+        Ok(app_data_dir)
+    }
+
+    fn new() -> std::io::Result<ConfigPaths> {
+        let app_data_dir = Self::app_data_dir()?;
         let contracts_dir = app_data_dir.join("contracts");
         let delegates_dir = app_data_dir.join("delegates");
         let secrets_dir = app_data_dir.join("secrets");

@@ -14,22 +14,24 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 
-        let path = std::env::temp_dir().join("freenet");
+        let Ok(path) = crate::config::ConfigPaths::app_data_dir() else {
+            std::process::exit(0);
+        };
         tracing::info!("Removing content stored at {path:?}");
 
-        let rm = std::process::Command::new("rm")
-            .arg("-rf")
-            .arg(path.to_str().expect("correct path to freenet tmp"))
-            .spawn();
-
-        if rm.is_ok() {
-            tracing::info!("Successful cleanup");
-
-            std::process::exit(0);
-        } else {
-            tracing::error!("Failed to remove content at {path:?}");
-            std::process::exit(-1);
+        if path.exists() {
+            let rm = std::fs::remove_dir_all(&path).map_err(|err| {
+                tracing::warn!("Failed cleaning up directory: {err}");
+                err
+            });
+            if rm.is_err() {
+                tracing::error!("Failed to remove content at {path:?}");
+                std::process::exit(-1);
+            }
         }
+        tracing::info!("Successful cleanup");
+
+        std::process::exit(0);
     })
 }
 
