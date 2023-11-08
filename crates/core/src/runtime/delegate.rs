@@ -416,7 +416,7 @@ mod test {
 
     fn setup_runtime(
         name: &str,
-    ) -> Result<(DelegateContainer, Runtime), Box<dyn std::error::Error>> {
+    ) -> Result<(DelegateContainer, Runtime, TempDir), Box<dyn std::error::Error>> {
         // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let temp_dir = TempDir::new().expect("Failed to create a temporary directory");
         let contracts_dir = temp_dir.path().join("contracts");
@@ -446,7 +446,7 @@ mod test {
             .secret_store
             .register_delegate(delegate.key().clone(), cipher, nonce);
 
-        Ok((delegate, runtime))
+        Ok((delegate, runtime, temp_dir))
     }
 
     #[test]
@@ -455,7 +455,7 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let (delegate, mut runtime) = setup_runtime(TEST_DELEGATE_1)?;
+        let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_1)?;
         let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // CreateInboxRequest message parts
