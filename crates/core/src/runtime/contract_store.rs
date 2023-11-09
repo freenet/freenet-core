@@ -219,7 +219,7 @@ mod test {
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let contract_dir = crate::util::tests_util::get_temp_dir();
+        let contract_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(contract_dir.path())?;
         let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
         let contract = WrappedContract::new(

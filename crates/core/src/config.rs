@@ -366,17 +366,25 @@ pub fn set_logger() {
 
 #[cfg(feature = "trace")]
 pub(super) mod tracer {
+    use crate::DynError;
+
     use super::*;
 
-    pub fn init_tracer() -> Result<(), opentelemetry::trace::TraceError> {
-        use opentelemetry::{global, sdk::propagation::TraceContextPropagator};
+    pub fn init_tracer() -> Result<(), DynError> {
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Registry;
 
-        let tracer = opentelemetry_jaeger::new_agent_pipeline().install_simple()?;
-        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-        let subscriber = Registry::default().with(telemetry);
-        global::set_text_map_propagator(TraceContextPropagator::new());
+        // Get a tracer which will route OT spans to a Jaeger agent
+        let ot_jaeger_tracer = opentelemetry_jaeger::new_agent_pipeline().install_simple()?;
+        // Connect the Jaeger OT tracer with the tracing middleware
+        let tracing_ot_layer = tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer);
+        // Create a subscriber which includes the tracing Jaeger OT layer
+        let subscriber = Registry::default().with(tracing_ot_layer);
+
+        // opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+        // Set the global subscriber
         tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
         Ok(())
     }

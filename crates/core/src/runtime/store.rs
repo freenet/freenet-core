@@ -337,7 +337,7 @@ mod tests {
         sync::{Arc, Barrier},
     };
 
-    use crate::util::tests_util::get_temp_dir;
+    use crate::util::tests::get_temp_dir;
 
     use super::*;
     use dashmap::DashMap;
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_store() {
-        let temp_dir = crate::util::tests_util::get_temp_dir();
+        let temp_dir = get_temp_dir();
         let contract_keys_file_path = temp_dir.path().join("contract_keys");
         let delegate_keys_file_path = temp_dir.path().join("delegate_keys");
 
