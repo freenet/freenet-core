@@ -4,7 +4,7 @@ mod contract;
 mod message;
 mod node;
 mod operations;
-mod resource_manager;
+mod resources;
 mod ring;
 mod router;
 mod runtime;
