@@ -10,7 +10,8 @@ use super::running_average::RunningAverage;
 const RUNNING_AVERAGE_WINDOW_SIZE: usize = 20;
 
 /// A structure that keeps track of the usage of dynamic resources which are consumed over time.
-/// It provides methods to report and query resource usage, both total and attributed to specific sources.
+/// It provides methods to report and query resource usage, both total and attributed to specific
+/// sources.
 pub(super) struct Meter {
     totals_by_resource: ResourceTotals,
     attribution_meters: AttributionMeters,
