@@ -8,7 +8,7 @@ use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
 };
 
-use crate::util::tests_util::get_temp_dir;
+use crate::util::tests::get_temp_dir;
 
 use super::{ContractStore, DelegateStore, SecretsStore};
 
