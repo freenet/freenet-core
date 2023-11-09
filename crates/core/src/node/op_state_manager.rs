@@ -3,6 +3,7 @@ use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 use dashmap::{DashMap, DashSet};
 use either::Either;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::{
     config::GlobalExecutor,
@@ -68,11 +69,11 @@ impl OpManager {
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
-        GlobalExecutor::spawn(garbage_cleanup_task(
-            rx,
-            ops.clone(),
-            ring.live_tx_tracker.clone(),
-        ));
+        let parent_span = tracing::Span::current();
+        GlobalExecutor::spawn(
+            garbage_cleanup_task(rx, ops.clone(), ring.live_tx_tracker.clone())
+                .instrument(tracing::info_span!(parent: parent_span, "garbage_cleanup_task")),
+        );
 
         Ok(Self {
             ring,
@@ -213,7 +214,6 @@ impl OpManager {
     }
 }
 
-#[tracing::instrument(skip_all)]
 async fn garbage_cleanup_task(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
     ops: Arc<Ops>,

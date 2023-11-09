@@ -35,6 +35,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync;
+use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::{AcquisitionStrategy, TopologyManager};
@@ -296,11 +297,12 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
-        GlobalExecutor::spawn(ring.clone().connection_maintenance(
-            event_loop_notifier,
-            live_tx_tracker,
-            missing_candidate_rx,
-        ));
+        let parent_span = tracing::Span::current();
+        GlobalExecutor::spawn(
+            ring.clone()
+                .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
+                .instrument(tracing::info_span!(parent: parent_span, "connection_maintenance")),
+        );
         Ok(ring)
     }
 
@@ -603,7 +605,6 @@ impl Ring {
             })
     }
 
-    #[tracing::instrument(skip_all)]
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,

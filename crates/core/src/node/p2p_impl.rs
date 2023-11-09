@@ -9,6 +9,7 @@ use libp2p::{
     identity::Keypair,
     noise, tcp, yamux, PeerId, Transport,
 };
+use tracing::Instrument;
 
 use super::{
     client_event_handling, join_ring_request,
@@ -103,13 +104,16 @@ impl NodeP2P {
             P2pConnManager::build(transport, &builder, op_storage.clone(), event_listener)?
         };
 
-        GlobalExecutor::spawn(contract::contract_handling(contract_handler));
+        let parent_span = tracing::Span::current();
+        GlobalExecutor::spawn(
+            contract::contract_handling(contract_handler)
+                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+        );
         let clients = ClientEventsCombinator::new(builder.clients);
-        GlobalExecutor::spawn(client_event_handling(
-            op_storage.clone(),
-            clients,
-            client_responses,
-        ));
+        GlobalExecutor::spawn(
+            client_event_handling(op_storage.clone(), clients, client_responses)
+                .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
+        );
 
         Ok(NodeP2P {
             peer_key,

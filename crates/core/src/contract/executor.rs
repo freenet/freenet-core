@@ -229,6 +229,7 @@ pub(crate) trait ContractExecutor: Send + Sync + 'static {
         &mut self,
         contract: ContractContainer,
     ) -> Result<(), crate::runtime::ContractError>;
+
     async fn upsert_contract_state(
         &mut self,
         key: ContractKey,

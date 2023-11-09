@@ -37,7 +37,7 @@ pub struct Config {
     pub bootstrap_ip: IpAddr,
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
-    pub local_peer_keypair: Option<identity::Keypair>,
+    pub local_peer_keypair: identity::Keypair,
     pub log_level: tracing::log::LevelFilter,
     config_paths: ConfigPaths,
     local_mode: AtomicBool,
@@ -157,6 +157,17 @@ impl Config {
             .store(local_mode, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn node_mode() -> OperationMode {
+        if Self::conf()
+            .local_mode
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            OperationMode::Local
+        } else {
+            OperationMode::Network
+        }
+    }
+
     pub fn db_dir(&self) -> PathBuf {
         if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
             self.config_paths.db_dir.join("local")
@@ -242,13 +253,14 @@ impl Config {
         let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
         let config_paths = ConfigPaths::new()?;
 
-        let local_mode = settings.get_string("local_mode").is_ok();
+        let local_mode = settings.get_string("network_mode").is_err();
 
         Ok(Config {
             bootstrap_ip,
             bootstrap_port,
             bootstrap_id,
-            local_peer_keypair,
+            local_peer_keypair: local_peer_keypair
+                .unwrap_or_else(identity::Keypair::generate_ed25519),
             log_level,
             config_paths,
             local_mode: AtomicBool::new(local_mode),
@@ -342,47 +354,79 @@ pub fn set_logger() {
             return;
         }
 
-        let filter = if cfg!(any(test, debug_assertions)) {
-            tracing_subscriber::filter::LevelFilter::DEBUG.into()
-        } else {
-            tracing_subscriber::filter::LevelFilter::INFO.into()
-        };
-
-        let sub = tracing_subscriber::fmt().with_level(true).with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(filter)
-                .from_env_lossy()
-                .add_directive("stretto=off".parse().unwrap())
-                .add_directive("sqlx=error".parse().unwrap()),
-        );
-
-        if cfg!(any(test, debug_assertions)) {
-            sub.with_file(true).with_line_number(true).init();
-        } else {
-            sub.init();
-        }
+        tracer::init_tracer().expect("failed tracing initialization")
     }
 }
 
 #[cfg(feature = "trace")]
 pub(super) mod tracer {
+    use tracing::Subscriber;
+    use tracing_subscriber::{fmt, layer::Layered, Layer, Registry};
+
     use crate::DynError;
 
     use super::*;
 
     pub fn init_tracer() -> Result<(), DynError> {
-        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        let filter = if cfg!(any(test, debug_assertions)) {
+            tracing_subscriber::filter::LevelFilter::DEBUG
+        } else {
+            tracing_subscriber::filter::LevelFilter::INFO
+        };
+        let filter_layer = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(filter.into())
+            .from_env_lossy()
+            .add_directive("stretto=off".parse().unwrap())
+            .add_directive("sqlx=error".parse().unwrap());
+
+        // use opentelemetry_sdk::propagation::TraceContextPropagator;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Registry;
 
-        // Get a tracer which will route OT spans to a Jaeger agent
-        let ot_jaeger_tracer = opentelemetry_jaeger::new_agent_pipeline().install_simple()?;
-        // Connect the Jaeger OT tracer with the tracing middleware
-        let tracing_ot_layer = tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer);
-        // Create a subscriber which includes the tracing Jaeger OT layer
-        let subscriber = Registry::default().with(tracing_ot_layer);
-
-        // opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
+        let layers = {
+            let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
+            let fmt_layer = if cfg!(any(test, debug_assertions)) {
+                fmt_layer.with_file(true).with_line_number(true)
+            } else {
+                fmt_layer
+            };
+            #[cfg(feature = "trace-ot")]
+            {
+                let identifier = if matches!(Config::node_mode(), OperationMode::Local) {
+                    "freenet-core".to_string()
+                } else {
+                    format!(
+                        "freenet-core-{peer}",
+                        peer = Config::conf().local_peer_keypair.public().to_peer_id()
+                    )
+                };
+                let tracing_ot_layer = {
+                    // Connect the Jaeger OT tracer with the tracing middleware
+                    let ot_jaeger_tracer =
+                        opentelemetry_jaeger::config::agent::AgentPipeline::default()
+                            .with_service_name(identifier)
+                            .install_simple()?;
+                    // Get a tracer which will route OT spans to a Jaeger agent
+                    tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer)
+                };
+                if !disabled_logs {
+                    fmt_layer.and_then(tracing_ot_layer).boxed()
+                } else {
+                    tracing_ot_layer.boxed()
+                }
+            }
+            #[cfg(not(feature = "trace-ot"))]
+            {
+                if disabled_logs {
+                    return Ok(());
+                }
+                fmt_layer.boxed()
+            }
+        };
+        let filtered = layers.with_filter(filter_layer);
+        // Create a subscriber which includes the tracing Jaeger OT layer and a fmt layer
+        let subscriber = Registry::default().with(filtered);
 
         // Set the global subscriber
         tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");

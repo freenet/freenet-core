@@ -15,7 +15,7 @@ pub(crate) trait Operation
 where
     Self: Sized + TryInto<Self::Result>,
 {
-    type Message: InnerMessage;
+    type Message: InnerMessage + std::fmt::Display;
 
     type Result;
 

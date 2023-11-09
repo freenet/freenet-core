@@ -117,11 +117,7 @@ pub struct NodeBuilder<const CLIENTS: usize> {
 
 impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeBuilder<CLIENTS> {
-        let local_key = if let Some(key) = &Config::conf().local_peer_keypair {
-            key.clone()
-        } else {
-            identity::Keypair::generate_ed25519()
-        };
+        let local_key = Config::conf().local_peer_keypair.clone();
         NodeBuilder {
             local_key,
             remote_nodes: Vec::with_capacity(1),
@@ -305,7 +301,6 @@ where
 }
 
 /// Process client events.
-#[tracing::instrument(skip_all)]
 async fn client_event_handling<ClientEv>(
     op_storage: Arc<OpManager>,
     mut client_events: ClientEv,
@@ -467,7 +462,7 @@ async fn report_result(
     op_storage: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
-    event_listener: &mut Box<dyn EventLogRegister>,
+    event_listener: &mut dyn EventLogRegister,
 ) {
     match op_result {
         Ok(Some(op_res)) => {
@@ -568,9 +563,8 @@ macro_rules! handle_op_not_available {
     };
 }
 
-#[tracing::instrument(name = "process_network_message", skip_all)]
 async fn process_message<CB>(
-    msg: Result<Message, ConnectionError>,
+    msg: Message,
     op_storage: Arc<OpManager>,
     mut conn_manager: CB,
     mut event_listener: Box<dyn EventLogRegister>,
@@ -581,108 +575,94 @@ async fn process_message<CB>(
     CB: NetworkBridge,
 {
     let cli_req = client_id.zip(client_req_handler_callback);
-    match msg {
-        Ok(msg) => {
-            let tx = Some(*msg.id());
-            event_listener
-                .register_events(EventLog::from_inbound_msg(&msg, &op_storage))
+
+    let tx = Some(*msg.id());
+    event_listener
+        .register_events(EventLog::from_inbound_msg(&msg, &op_storage))
+        .await;
+    loop {
+        match &msg {
+            Message::Connect(op) => {
+                // log_handling_msg!("join", op.id(), op_storage);
+                let op_result = handle_op_request::<connect::ConnectOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
                 .await;
-            loop {
-                match &msg {
-                    Message::Connect(op) => {
-                        // log_handling_msg!("join", op.id(), op_storage);
-                        let op_result = handle_op_request::<connect::ConnectOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    Message::Put(op) => {
-                        // log_handling_msg!("put", *op.id(), op_storage);
-                        let op_result = handle_op_request::<put::PutOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    Message::Get(op) => {
-                        // log_handling_msg!("get", op.id(), op_storage);
-                        let op_result = handle_op_request::<get::GetOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    Message::Subscribe(op) => {
-                        // log_handling_msg!("subscribe", op.id(), op_storage);
-                        let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    _ => break,
-                }
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
             }
-        }
-        Err(err) => {
-            report_result(
-                None,
-                Err(err.into()),
-                &op_storage,
-                executor_callback,
-                cli_req,
-                &mut event_listener,
-            )
-            .await;
+            Message::Put(op) => {
+                // log_handling_msg!("put", *op.id(), op_storage);
+                let op_result = handle_op_request::<put::PutOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
+                .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            Message::Get(op) => {
+                // log_handling_msg!("get", op.id(), op_storage);
+                let op_result = handle_op_request::<get::GetOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
+                .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            Message::Subscribe(op) => {
+                // log_handling_msg!("subscribe", op.id(), op_storage);
+                let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
+                .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            _ => break,
         }
     }
 }

@@ -36,6 +36,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     Mutex,
 };
+use tracing::Instrument;
 use unsigned_varint::codec::UviBytes;
 
 use super::{ConnectionError, EventLoopNotifications, NetworkBridge};
@@ -322,6 +323,13 @@ impl P2pConnManager {
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
+        let this_peer = super::PeerKey(
+            crate::config::Config::conf()
+                .local_peer_keypair
+                .public()
+                .to_peer_id(),
+        );
+
         loop {
             let network_msg = self.swarm.select_next_some().map(|event| match event {
                 SwarmEvent::Behaviour(NetEvent::Freenet(msg)) => {
@@ -471,15 +479,25 @@ impl P2pConnManager {
                             } else {
                                 None
                             };
-                            GlobalExecutor::spawn(process_message(
-                                Ok(msg),
-                                op_manager.clone(),
-                                cb,
-                                self.event_listener.trait_clone(),
-                                executor_callback,
-                                client_req_handler_callback,
-                                client_id,
-                            ));
+                            let parent_span = tracing::Span::current();
+                            let span = tracing::info_span!(
+                                parent: parent_span,
+                                "process_network_message",
+                                peer = %this_peer, transaction = %msg.id(),
+                                tx_type = %msg.id().transaction_type()
+                            );
+                            GlobalExecutor::spawn(
+                                process_message(
+                                    msg,
+                                    op_manager.clone(),
+                                    cb,
+                                    self.event_listener.trait_clone(),
+                                    executor_callback,
+                                    client_req_handler_callback,
+                                    client_id,
+                                )
+                                .instrument(span),
+                            );
                         }
                     }
                 }
@@ -532,16 +550,15 @@ impl P2pConnManager {
                     break;
                 }
                 Err(err) => {
-                    let cb = self.bridge.clone();
-                    GlobalExecutor::spawn(process_message(
-                        Err(err),
-                        op_manager.clone(),
-                        cb,
-                        self.event_listener.trait_clone(),
+                    super::super::report_result(
+                        None,
+                        Err(err.into()),
+                        &op_manager,
                         None,
                         None,
-                        None,
-                    ));
+                        &mut *self.event_listener as &mut _,
+                    )
+                    .await;
                 }
                 Ok(Right(NoAction)) | Ok(Right(NodeAction(NodeEvent::ConfirmedInbound))) => {}
             }

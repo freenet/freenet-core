@@ -169,7 +169,7 @@ mod sealed_msg_type {
     impl Display for TransactionType {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                TransactionType::Connect => write!(f, "join ring"),
+                TransactionType::Connect => write!(f, "connect"),
                 TransactionType::Put => write!(f, "put"),
                 TransactionType::Get => write!(f, "get"),
                 TransactionType::Subscribe => write!(f, "subscribe"),

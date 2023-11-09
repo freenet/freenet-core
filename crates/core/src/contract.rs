@@ -22,8 +22,8 @@ pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
 pub use executor::{Executor, ExecutorError, OperationMode};
 
 use executor::ContractExecutor;
+use tracing::Instrument;
 
-#[tracing::instrument(skip_all)]
 pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
@@ -39,6 +39,7 @@ where
                 match contract_handler
                     .executor()
                     .fetch_contract(key.clone(), fetch_contract)
+                    .instrument(tracing::info_span!("fetch_contract", %key))
                     .await
                 {
                     Ok((state, contract)) => {
@@ -81,7 +82,13 @@ where
                 }
             }
             ContractHandlerEvent::Cache(contract) => {
-                match contract_handler.executor().store_contract(contract).await {
+                let key = contract.key();
+                match contract_handler
+                    .executor()
+                    .store_contract(contract)
+                    .instrument(tracing::info_span!("store_contract", %key))
+                    .await
+                {
                     Ok(_) => {
                         contract_handler
                             .channel()
@@ -114,7 +121,13 @@ where
             } => {
                 let put_result = contract_handler
                     .executor()
-                    .upsert_contract_state(key, Either::Left(state), related_contracts, parameters)
+                    .upsert_contract_state(
+                        key.clone(),
+                        Either::Left(state),
+                        related_contracts,
+                        parameters,
+                    )
+                    .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await
                     .map_err(Into::into);
                 contract_handler
