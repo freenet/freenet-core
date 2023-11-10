@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, time::Instant};
 use std::time::Duration;
-use crate::resource_manager::rate::Rate;
+use crate::resources::rate::Rate;
 
 #[derive(Clone, Debug)]
 pub(super) struct RunningAverage {

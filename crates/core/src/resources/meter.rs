@@ -2,7 +2,7 @@ use std::hash::Hash;
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
-use crate::resource_manager::rate::Rate;
+use crate::resources::rate::Rate;
 
 use crate::ring::PeerKeyLocation;
 
@@ -63,7 +63,8 @@ impl Meter {
     /// Report the use of a resource with multiple attribution sources, splitting the usage
     /// evenly between the sources.
     /// This should be done in the lowest-level functions that consume the resource, taking
-    /// an AttributionMeter as a parameter.
+    /// an AttributionMeter as a parameter. This will be useful for contracts with multiple
+    /// subscribers - where the responsibility should be split evenly among the subscribers.
     pub(crate) fn report_split(
         &self,
         attributions: &[AttributionSource],
@@ -109,7 +110,6 @@ impl Meter {
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub(crate) enum AttributionSource {
     Peer(PeerKeyLocation),
-    RelayedContract(ContractInstanceId),
     Delegate(DelegateKey),
 }
 
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_meter() {
-        let meter = Meter::new();
+        let meter = Meter::new_with_window_size(10);
 
         // Test that the new Meter has empty totals_by_resource and attribution_meters
         assert!(meter.totals_by_resource.map.is_empty());
@@ -234,7 +234,7 @@ mod tests {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         // Report usage for a different attribution and test that the total and attributed usage are updated
         let other_attribution =
-            AttributionSource::RelayedContract(gen.arbitrary::<ContractInstanceId>()?);
+            AttributionSource::Peer(PeerKeyLocation::random());
         meter.report(
             &other_attribution,
             ResourceType::InboundBandwidthBytes,
