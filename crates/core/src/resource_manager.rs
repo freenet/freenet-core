@@ -4,6 +4,7 @@
 
 mod meter;
 mod running_average;
+pub mod rate;
 
 use std::time::Instant;
 
@@ -77,14 +78,14 @@ impl ResourceManager {
     where
         P: IntoIterator<Item = PeerValue>,
     {
-        let total_usage: f64 = self.meter.total_usage(resource_type);
+        let total_usage: f64 = self.meter.resource_usage_rate(resource_type);
         let total_limit: f64 = self.limits.get(resource_type);
         if total_usage > total_limit {
             let mut candidate_costs = vec![];
             for PeerValue { peer, value } in candidates {
                 let cost = self
                     .meter
-                    .attributed_usage(&AttributionSource::Peer(peer), resource_type);
+                    .attributed_usage_rate(&AttributionSource::Peer(peer), resource_type);
                 const MIN_VALUE: f64 = 0.0001;
                 let cost_per_value = cost / value.max(MIN_VALUE);
                 candidate_costs.push(CandidateCost {
@@ -219,13 +220,13 @@ mod tests {
         assert_eq!(
             resource_manager
                 .meter
-                .total_usage(ResourceType::InboundBandwidthBytes),
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes),
             100.0
         );
         assert_eq!(
             resource_manager
                 .meter
-                .attributed_usage(&attribution, ResourceType::InboundBandwidthBytes),
+                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes),
             100.0
         );
     }
