@@ -78,7 +78,7 @@ impl NodeP2P {
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
-        CH: ContractHandler + Send + Sync + 'static,
+        CH: ContractHandler + Send + 'static,
         EL: EventLogRegister + Clone,
     {
         let peer_key = PeerKey::from(builder.local_key.public());

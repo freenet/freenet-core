@@ -13,10 +13,7 @@ use freenet_stdlib::{
 //     Parameters, SecretsStore, StateStore,
 // };
 
-use crate::{
-    config::{BaseConfig, PutConfig, UpdateConfig},
-    DynError,
-};
+use crate::config::{BaseConfig, PutConfig, UpdateConfig};
 
 const MAX_MEM_CACHE: u32 = 10_000_000;
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
@@ -50,10 +47,9 @@ pub(crate) struct PutDelegate {
     pub(crate) cipher: String,
 }
 
-// #[track_caller]
-pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), DynError> {
+pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
     if config.release {
-        return Err("Cannot publish contracts in the network yet".into());
+        anyhow::bail!("Cannot publish contracts in the network yet");
     }
     let params = if let Some(params) = &config.parameters {
         let mut buf = vec![];
@@ -73,7 +69,7 @@ async fn put_contract(
     contract_config: &PutContract,
     other: BaseConfig,
     params: Parameters<'static>,
-) -> Result<(), DynError> {
+) -> Result<(), anyhow::Error> {
     let contract = ContractContainer::try_from((config.code.as_path(), params))?;
     let state = {
         let mut buf = vec![];
@@ -101,7 +97,7 @@ async fn put_delegate(
     delegate_config: &PutDelegate,
     other: BaseConfig,
     params: Parameters<'static>,
-) -> Result<(), DynError> {
+) -> Result<(), anyhow::Error> {
     let delegate = DelegateContainer::try_from((config.code.as_path(), params))?;
 
     let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
@@ -135,9 +131,9 @@ For additional hardening is recommended to use a different cipher and nonce to e
     execute_command(request, other).await
 }
 
-pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), DynError> {
+pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
     if config.release {
-        return Err("Cannot publish contracts in the network yet".into());
+        anyhow::bail!("Cannot publish contracts in the network yet");
     }
     let key = ContractInstanceId::try_from(config.key)?.into();
     println!("Updating contract {key}");
@@ -153,7 +149,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), DynEr
 async fn execute_command(
     request: ClientRequest<'static>,
     other: BaseConfig,
-) -> Result<(), DynError> {
+) -> Result<(), anyhow::Error> {
     let contracts_data_path = other
         .contract_data_dir
         .unwrap_or_else(|| Config::conf().contracts_dir());
@@ -170,7 +166,9 @@ async fn execute_command(
     let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE)?;
     let rt =
         freenet::dev_tool::Runtime::build(contract_store, delegate_store, secret_store, false)?;
-    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt).await?;
+    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
 
     executor
         .handle_request(ClientId::FIRST, request, None)

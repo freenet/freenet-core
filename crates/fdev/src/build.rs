@@ -14,14 +14,14 @@ use tar::Builder;
 use crate::{
     config::{BuildToolCliConfig, PackageType},
     util::pipe_std_streams,
-    DynError, Error,
+    Error,
 };
 pub(crate) use contract::*;
 
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
-pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), DynError> {
+pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), anyhow::Error> {
     match cli_config.package_type {
         PackageType::Contract => contract::package_contract(cli_config, cwd),
         PackageType::Delegate => delegate::package_delegate(cli_config, cwd),
@@ -67,7 +67,10 @@ fn test_get_compile_options() {
     );
 }
 
-fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Result<(), DynError> {
+fn compile_rust_wasm_lib(
+    cli_config: &BuildToolCliConfig,
+    work_dir: &Path,
+) -> Result<(), anyhow::Error> {
     const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
     use std::io::IsTerminal;
     let comp_opts = compile_options(cli_config).collect::<Vec<_>>();
@@ -106,7 +109,7 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolCliConfig, work_dir: &Path) -> Re
 fn get_out_lib(
     work_dir: &Path,
     cli_config: &BuildToolCliConfig,
-) -> Result<(String, PathBuf), DynError> {
+) -> Result<(String, PathBuf), anyhow::Error> {
     const ERR: &str = "Cargo.toml definition incorrect";
 
     let target = WASM_TARGET;
@@ -158,7 +161,7 @@ mod contract {
     pub(super) fn package_contract(
         cli_config: BuildToolCliConfig,
         cwd: &Path,
-    ) -> Result<(), DynError> {
+    ) -> Result<(), anyhow::Error> {
         let mut config = get_config(cwd)?;
         compile_contract(&config, &cli_config, cwd)?;
         match config.contract.c_type.unwrap_or(ContractType::Standard) {
@@ -241,7 +244,7 @@ mod contract {
         config: &BuildToolConfig,
         embedded_deps: EmbeddedDeps,
         cwd: &Path,
-    ) -> Result<(), DynError> {
+    ) -> Result<(), anyhow::Error> {
         let Some(web_config) = &config.webapp else {
             println!("No webapp config found.");
             return Ok(());
@@ -320,7 +323,7 @@ mod contract {
             None => {}
         }
 
-        let build_state = |sources: &Sources| -> Result<(), DynError> {
+        let build_state = |sources: &Sources| -> Result<(), anyhow::Error> {
             let mut found_entry = false;
             if let Some(sources) = &sources.files {
                 for src in sources {
@@ -343,14 +346,13 @@ mod contract {
                         if !found_entry && present_entry {
                             found_entry = true;
                         } else if present_entry {
-                            return Err(format!(
+                            anyhow::bail!(
                                 "duplicate entry point (index.html) found at directory: {dir:?}"
-                            )
-                            .into());
+                            );
                         }
                         archive.append_dir_all(".", &ori_dir)?;
                     } else {
-                        return Err(format!("unknown directory: {dir:?}").into());
+                        anyhow::bail!("unknown directory: {dir:?}");
                     }
                 }
             }
@@ -378,10 +380,10 @@ mod contract {
             }
 
             if sources.source_dirs.is_none() && sources.files.is_none() {
-                return Err("need to specify source dirs and/or files".into());
+                anyhow::bail!("need to specify source dirs and/or files");
             }
             if !found_entry {
-                return Err("didn't find entry point `index.html` in package".into());
+                anyhow::bail!("didn't find entry point `index.html` in package");
             } else {
                 let state = WebApp::from_data(metadata, archive)?;
                 let packed = state.pack()?;
@@ -396,7 +398,7 @@ mod contract {
         build_state(sources)
     }
 
-    fn build_generic_state(config: &mut BuildToolConfig, cwd: &Path) -> Result<(), DynError> {
+    fn build_generic_state(config: &mut BuildToolConfig, cwd: &Path) -> Result<(), anyhow::Error> {
         const REQ_ONE_FILE_ERR: &str = "Requires exactly one source file specified for the state.";
 
         let sources = config.state.as_mut().and_then(|s| s.files.as_mut());
@@ -427,7 +429,7 @@ mod contract {
         output: &Option<PathBuf>,
         packed: &[u8],
         cwd: &Path,
-    ) -> Result<(), DynError> {
+    ) -> Result<(), anyhow::Error> {
         if let Some(path) = output {
             File::create(path)?.write_all(packed)?;
         } else {
@@ -439,14 +441,14 @@ mod contract {
         Ok(())
     }
 
-    fn get_config(cwd: &Path) -> Result<BuildToolConfig, DynError> {
+    fn get_config(cwd: &Path) -> Result<BuildToolConfig, anyhow::Error> {
         let config_file = cwd.join("freenet.toml");
         if config_file.exists() {
             let mut f_content = vec![];
             File::open(config_file)?.read_to_end(&mut f_content)?;
             Ok(toml::from_str(std::str::from_utf8(&f_content)?)?)
         } else {
-            Err("could not locate `freenet.toml` config file in current dir".into())
+            anyhow::bail!("could not locate `freenet.toml` config file in current dir")
         }
     }
 
@@ -454,7 +456,7 @@ mod contract {
         config: &BuildToolConfig,
         cli_config: &BuildToolCliConfig,
         cwd: &Path,
-    ) -> Result<(), DynError> {
+    ) -> Result<(), anyhow::Error> {
         let work_dir = match config.contract.c_type.unwrap_or(ContractType::Standard) {
             ContractType::WebApp => cwd.join("container"),
             ContractType::Standard => cwd.to_path_buf(),
@@ -487,10 +489,16 @@ mod contract {
     fn get_versioned_contract(
         contract_code_path: &Path,
         cli_config: &BuildToolCliConfig,
-    ) -> Result<Vec<u8>, DynError> {
+    ) -> Result<Vec<u8>, anyhow::Error> {
         let code: ContractCode = ContractCode::load_raw(contract_code_path)?;
         tracing::info!("compiled contract code hash: {}", code.hash_str());
-        let output = code.to_bytes_versioned((&cli_config.version).try_into()?)?;
+        let output = code
+            .to_bytes_versioned(
+                (&cli_config.version)
+                    .try_into()
+                    .map_err(anyhow::Error::msg)?,
+            )
+            .map_err(anyhow::Error::msg)?;
         Ok(output)
     }
 
@@ -503,7 +511,7 @@ mod contract {
 
     fn include_deps(
         contracts: &toml::value::Table,
-    ) -> Result<HashMap<&String, DependencyDefinition>, DynError> {
+    ) -> Result<HashMap<&String, DependencyDefinition>, anyhow::Error> {
         let mut deps = HashMap::with_capacity(contracts.len());
         for (alias, definition) in contracts {
             let mut dep = DependencyDefinition::default();
@@ -548,7 +556,7 @@ mod contract {
         cwd: &Path,
         deps: HashMap<impl Into<String>, DependencyDefinition>,
         cli_config: &BuildToolCliConfig,
-    ) -> Result<EmbeddedDeps, DynError> {
+    ) -> Result<EmbeddedDeps, anyhow::Error> {
         let cwd = fs::canonicalize(cwd)?;
         let mut deps_json = HashMap::new();
         let mut to_embed = EmbeddedDeps::default();
@@ -581,7 +589,7 @@ mod contract {
     mod test {
         use super::*;
 
-        fn setup_webapp_contract() -> Result<(BuildToolConfig, PathBuf), DynError> {
+        fn setup_webapp_contract() -> Result<(BuildToolConfig, PathBuf), anyhow::Error> {
             const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
             let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/web");
             Ok((
@@ -613,7 +621,7 @@ mod contract {
         }
 
         #[test]
-        fn package_webapp_state() -> Result<(), DynError> {
+        fn package_webapp_state() -> Result<(), anyhow::Error> {
             let (config, cwd) = setup_webapp_contract()?;
             // env::set_current_dir(&cwd)?;
             build_web_state(&config, EmbeddedDeps::default(), &cwd)?;
@@ -636,7 +644,7 @@ mod contract {
         }
 
         #[test]
-        fn compile_webapp_contract() -> Result<(), DynError> {
+        fn compile_webapp_contract() -> Result<(), anyhow::Error> {
             //
             let (config, cwd) = setup_webapp_contract()?;
             compile_contract(&config, &BuildToolCliConfig::default(), &cwd)?;
@@ -644,7 +652,7 @@ mod contract {
         }
 
         #[test]
-        fn package_generic_state() -> Result<(), DynError> {
+        fn package_generic_state() -> Result<(), anyhow::Error> {
             const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
             let cwd =
                 PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/contracts/posts");
@@ -673,7 +681,7 @@ mod contract {
         }
 
         #[test]
-        fn deps_parsing() -> Result<(), DynError> {
+        fn deps_parsing() -> Result<(), anyhow::Error> {
             let deps = toml::toml! {
                 posts = { path = "../contracts/posts" }
             };
@@ -683,7 +691,7 @@ mod contract {
         }
 
         #[test]
-        fn embedded_deps() -> Result<(), DynError> {
+        fn embedded_deps() -> Result<(), anyhow::Error> {
             const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
             let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/web");
             let deps = toml::toml! {
@@ -704,7 +712,7 @@ mod delegate {
     pub(super) fn package_delegate(
         cli_config: BuildToolCliConfig,
         cwd: &Path,
-    ) -> Result<(), DynError> {
+    ) -> Result<(), anyhow::Error> {
         compile_rust_wasm_lib(&cli_config, cwd)?;
         let (package_name, output_lib) = get_out_lib(cwd, &cli_config)?;
         if !output_lib.exists() {
@@ -723,10 +731,16 @@ mod delegate {
     fn get_versioned_contract(
         contract_code_path: &Path,
         cli_config: &BuildToolCliConfig,
-    ) -> Result<Vec<u8>, DynError> {
+    ) -> Result<Vec<u8>, anyhow::Error> {
         let code: DelegateCode = DelegateCode::load_raw(contract_code_path)?;
         tracing::info!("compiled contract code hash: {}", code.hash_str());
-        let output = code.to_bytes_versioned((&cli_config.version).try_into()?)?;
+        let output = code
+            .to_bytes_versioned(
+                (&cli_config.version)
+                    .try_into()
+                    .map_err(anyhow::Error::msg)?,
+            )
+            .map_err(anyhow::Error::msg)?;
         Ok(output)
     }
 }

@@ -1,7 +1,7 @@
 use freenet::dev_tool::ClientId;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 
-use crate::{CommandReceiver, DynError};
+use crate::CommandReceiver;
 
 use super::{state::AppState, LocalNodeCliConfig};
 
@@ -9,10 +9,14 @@ pub(super) async fn wasm_runtime(
     _config: LocalNodeCliConfig,
     mut command_receiver: CommandReceiver,
     mut app: AppState,
-) -> Result<(), DynError> {
+) -> Result<(), anyhow::Error> {
     loop {
         let req = command_receiver.recv().await;
-        let dc = execute_command(req.ok_or("channel closed")?, &mut app).await?;
+        let dc = execute_command(
+            req.ok_or_else(|| anyhow::anyhow!("channel closed"))?,
+            &mut app,
+        )
+        .await?;
         if dc {
             break;
         }
@@ -23,7 +27,7 @@ pub(super) async fn wasm_runtime(
 async fn execute_command(
     req: ClientRequest<'static>,
     app: &mut AppState,
-) -> Result<bool, DynError> {
+) -> Result<bool, anyhow::Error> {
     let node = &mut *app.local_node.write().await;
     match req {
         ClientRequest::ContractOp(op) => match op {
@@ -86,7 +90,7 @@ async fn execute_command(
         },
         _ => {
             tracing::error!("op not supported");
-            return Err("op not support".into());
+            anyhow::bail!("op not support");
         }
     }
     Ok(false)

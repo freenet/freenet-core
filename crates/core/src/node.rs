@@ -39,6 +39,7 @@ use crate::{
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
     util::ExponentialBackoff,
+    DynError,
 };
 
 use crate::operations::handle_op_request;
@@ -75,7 +76,7 @@ pub struct NodeConfig {
 pub struct Node(NodeP2P);
 
 impl Node {
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    pub async fn run(self) -> Result<(), DynError> {
         self.0.run_node().await?;
         Ok(())
     }
@@ -282,7 +283,7 @@ async fn join_ring_request<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: NetworkBridge + Send + Sync,
+    CM: NetworkBridge + Send,
 {
     let tx_id = Transaction::new::<ConnectMsg>();
     let mut op =
@@ -306,7 +307,7 @@ async fn client_event_handling<ClientEv>(
     mut client_events: ClientEv,
     mut client_responses: ClientResponses,
 ) where
-    ClientEv: ClientEventsProxy + Send + Sync + 'static,
+    ClientEv: ClientEventsProxy + Send + 'static,
 {
     loop {
         tokio::select! {
@@ -674,7 +675,7 @@ async fn handle_cancelled_op<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: NetworkBridge + Send + Sync,
+    CM: NetworkBridge + Send,
 {
     if let TransactionType::Connect = tx.transaction_type() {
         // the attempt to join the network failed, this could be a fatal error since the node

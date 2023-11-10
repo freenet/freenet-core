@@ -22,7 +22,6 @@ use crate::{
 
 type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest<'static>>;
 type CommandSender = tokio::sync::mpsc::Sender<ClientRequest<'static>>;
-type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, thiserror::Error)]
 enum Error {

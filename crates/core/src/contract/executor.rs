@@ -91,6 +91,15 @@ impl From<ExecutorError> for DynError {
     }
 }
 
+impl From<ExecutorError> for anyhow::Error {
+    fn from(value: ExecutorError) -> Self {
+        match value.0 {
+            Either::Left(l) => anyhow::Error::new(*l),
+            Either::Right(r) => anyhow::Error::msg(r),
+        }
+    }
+}
+
 type Response = Result<HostResponse, ExecutorError>;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,7 +228,7 @@ struct UpdateContract {
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {}
 
 #[async_trait::async_trait]
-pub(crate) trait ContractExecutor: Send + Sync + 'static {
+pub(crate) trait ContractExecutor: Send + 'static {
     async fn fetch_contract(
         &mut self,
         key: ContractKey,

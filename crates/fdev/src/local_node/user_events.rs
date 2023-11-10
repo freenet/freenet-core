@@ -15,7 +15,7 @@ use freenet_stdlib::{
 use futures::future::BoxFuture;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{util, CommandSender, DynError};
+use crate::{util, CommandSender};
 
 use super::{state::AppState, DeserializationFmt, LocalNodeCliConfig};
 
@@ -34,14 +34,17 @@ pub(super) async fn user_fn_handler(
     config: LocalNodeCliConfig,
     command_sender: CommandSender,
     app_state: AppState,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+) -> Result<(), anyhow::Error> {
     let mut input = StdInput::new(config, app_state)?;
     tracing::debug!("running... send a command or write \"help\" for help");
     loop {
-        let command = input.recv().await;
+        let command = input.recv().await.map_err(|err| anyhow::anyhow!(err));
         let command = command?;
         let dc = command.request.is_disconnect();
-        command_sender.send(*command.request).await?;
+        command_sender
+            .send(*command.request)
+            .await
+            .map_err(anyhow::Error::new)?;
         if dc {
             break;
         }
@@ -58,7 +61,7 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: LocalNodeCliConfig, app_state: AppState) -> Result<Self, DynError> {
+    fn new(config: LocalNodeCliConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
         let params = config
             .params
             .as_ref()
@@ -66,7 +69,7 @@ impl StdInput {
                 let mut f = File::open(p)?;
                 let mut buf = vec![];
                 f.read_to_end(&mut buf)?;
-                Ok::<_, DynError>(buf)
+                Ok::<_, anyhow::Error>(buf)
             })
             .transpose()?
             .unwrap_or_default();
@@ -84,7 +87,7 @@ impl StdInput {
         })
     }
 
-    fn read_input<T>(&mut self) -> Result<T, DynError>
+    fn read_input<T>(&mut self) -> Result<T, anyhow::Error>
     where
         T: DeserializeOwned,
     {

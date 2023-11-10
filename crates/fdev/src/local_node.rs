@@ -8,11 +8,9 @@ mod user_events;
 
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
-pub async fn run_local_node_client(
-    config: LocalNodeCliConfig,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+pub async fn run_local_node_client(config: LocalNodeCliConfig) -> Result<(), anyhow::Error> {
     if config.disable_tui_mode {
-        return Err("TUI mode not yet implemented".into());
+        anyhow::bail!("TUI mode not yet implemented");
     }
 
     if config.clean_exit {
@@ -38,8 +36,6 @@ pub async fn run_local_node_client(
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 pub enum DeserializationFmt {
     Json,
-    #[cfg(feature = "messagepack")]
-    MessagePack,
 }
 
 /// A CLI utility for testing out contracts against a Freenet local node.

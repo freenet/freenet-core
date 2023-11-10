@@ -33,7 +33,7 @@ pub(super) struct NodeInMemory {
     gateways: Vec<PeerKeyLocation>,
     notification_channel: EventLoopNotifications,
     conn_manager: MemoryConnManager,
-    event_listener: Box<dyn EventLogRegister + Send + Sync + 'static>,
+    event_listener: Box<dyn EventLogRegister + Send + 'static>,
     is_gateway: bool,
     _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     /// Span to use for this node for tracing purposes
@@ -96,7 +96,7 @@ impl NodeInMemory {
 
     pub async fn run_node<UsrEv>(&mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
     where
-        UsrEv: ClientEventsProxy + Send + Sync + 'static,
+        UsrEv: ClientEventsProxy + Send + 'static,
     {
         if !self.is_gateway {
             if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {

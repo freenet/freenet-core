@@ -5,9 +5,10 @@ use freenet::dev_tool::{
     Storage,
 };
 use freenet_stdlib::prelude::*;
+use futures::TryFutureExt;
 use tokio::sync::RwLock;
 
-use crate::{local_node::DeserializationFmt, DynError};
+use crate::local_node::DeserializationFmt;
 
 use super::LocalNodeCliConfig;
 
@@ -21,7 +22,7 @@ impl AppState {
     const MAX_MEM_CACHE: u32 = 10_000_000;
     const DEFAULT_MAX_DELEGATE_SIZE: i64 = 10 * 1024 * 1024;
 
-    pub async fn new(config: &LocalNodeCliConfig) -> Result<Self, DynError> {
+    pub async fn new(config: &LocalNodeCliConfig) -> Result<Self, anyhow::Error> {
         let contract_store =
             ContractStore::new(Config::conf().contracts_dir(), config.max_contract_size)?;
         let delegate_store = DelegateStore::new(
@@ -47,6 +48,7 @@ impl AppState {
                     OperationMode::Local,
                     rt,
                 )
+                .map_err(|err| anyhow::anyhow!(err))
                 .await?,
             )),
             config: config.clone(),
@@ -63,20 +65,10 @@ impl AppState {
             }
             Ok(())
         }
-        match self.config.ser_format {
-            Some(DeserializationFmt::Json) => {
-                let deser: serde_json::Value = serde_json::from_slice(data.as_ref())?;
-                let pp = serde_json::to_string_pretty(&deser)?;
-                write_res(&self.config, &pp)?;
-            }
-            #[cfg(feature = "messagepack")]
-            Some(DeserializationFmt::MessagePack) => {
-                let deser = rmpv::decode::read_value(&mut data.as_ref())
-                    .map_err(|_err| std::io::ErrorKind::InvalidData)?;
-                let pp = format!("{deser}");
-                write_res(&self.config, &pp)?;
-            }
-            _ => {}
+        if let Some(DeserializationFmt::Json) = self.config.ser_format {
+            let deser: serde_json::Value = serde_json::from_slice(data.as_ref())?;
+            let pp = serde_json::to_string_pretty(&deser)?;
+            write_res(&self.config, &pp)?;
         }
         Ok(())
     }

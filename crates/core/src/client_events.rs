@@ -13,7 +13,7 @@ pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
 
-pub(crate) type BoxedClient = Box<dyn ClientEventsProxy + Send + Sync + 'static>;
+pub(crate) type BoxedClient = Box<dyn ClientEventsProxy + Send + 'static>;
 pub type HostResult = Result<HostResponse, ClientError>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
