@@ -152,7 +152,7 @@ impl Limits {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bandwidth(f64);
 impl Bandwidth {
     pub fn new(bytes_per_second: f64) -> Self {
@@ -166,7 +166,7 @@ impl From<Bandwidth> for f64 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InstructionsPerSecond(f64);
 impl InstructionsPerSecond {
     pub fn new(cpu_usage: f64) -> Self {
@@ -302,5 +302,41 @@ mod tests {
 
         // Test that the peer with the highest usage is deleted
         assert_eq!(to_delete[0], peer1);
+    }
+
+    #[test]
+    fn test_update_limits() {
+        let limits = Limits {
+            max_upstream_bandwidth: Bandwidth::new(1000.0),
+            max_downstream_bandwidth: Bandwidth::new(1000.0),
+            max_cpu_usage: InstructionsPerSecond::new(1000.0),
+            max_memory_usage: 1000.0,
+            max_storage_usage: 1000.0,
+        };
+        let mut resource_manager = ResourceManager::new(limits);
+
+        let new_limits = Limits {
+            max_upstream_bandwidth: Bandwidth::new(2000.0),
+            max_downstream_bandwidth: Bandwidth::new(2000.0),
+            max_cpu_usage: InstructionsPerSecond::new(2000.0),
+            max_memory_usage: 2000.0,
+            max_storage_usage: 2000.0,
+        };
+        resource_manager.update_limits(new_limits);
+
+        assert_eq!(
+            resource_manager.limits.max_upstream_bandwidth,
+            Bandwidth::new(2000.0)
+        );
+        assert_eq!(
+            resource_manager.limits.max_downstream_bandwidth,
+            Bandwidth::new(2000.0)
+        );
+        assert_eq!(
+            resource_manager.limits.max_cpu_usage,
+            InstructionsPerSecond::new(2000.0)
+        );
+        assert_eq!(resource_manager.limits.max_memory_usage, 2000.0);
+        assert_eq!(resource_manager.limits.max_storage_usage, 2000.0);
     }
 }

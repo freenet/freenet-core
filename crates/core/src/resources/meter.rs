@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::resources::rate::Rate;
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
+use crate::resources::Bandwidth;
 
 use crate::ring::PeerKeyLocation;
 
@@ -75,6 +76,14 @@ impl Meter {
         for attribution in attributions {
             self.report(attribution, resource, split_value);
         }
+    }
+
+    pub(crate) fn report_inbound_bandwidth(&mut self, attribution : &AttributionSource, bandwidth: Bandwidth) {
+        self.report(attribution, ResourceType::InboundBandwidthBytes, bandwidth.into());
+    }
+
+    pub(crate) fn report_outbound_bandwidth(&mut self, attribution : &AttributionSource, bandwidth: Bandwidth) {
+        self.report(attribution, ResourceType::OutboundBandwidthBytes, bandwidth.into());
     }
 
     /// Report the use of a resource. This should be done in the lowest-level
@@ -282,8 +291,6 @@ mod tests {
             50.0
         );
 
-        let bytes = crate::util::test::random_bytes_1kb();
-        let gen = arbitrary::Unstructured::new(&bytes);
         // Report usage for a different attribution and test that the total and attributed usage are updated
         let other_attribution = AttributionSource::Peer(PeerKeyLocation::random());
         meter.report(
