@@ -134,8 +134,8 @@ struct CandidateCost {
 }
 
 pub struct Limits {
-    pub max_upstream_bandwidth: Bandwidth,
-    pub max_downstream_bandwidth: Bandwidth,
+    pub max_upstream_bandwidth: BytesPerSecond,
+    pub max_downstream_bandwidth: BytesPerSecond,
     pub max_cpu_usage: InstructionsPerSecond,
     pub max_memory_usage: f64,
     pub max_storage_usage: f64,
@@ -153,15 +153,15 @@ impl Limits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bandwidth(f64);
-impl Bandwidth {
+pub struct BytesPerSecond(f64);
+impl BytesPerSecond {
     pub fn new(bytes_per_second: f64) -> Self {
-        Bandwidth(bytes_per_second)
+        BytesPerSecond(bytes_per_second)
     }
 }
 
-impl From<Bandwidth> for f64 {
-    fn from(val: Bandwidth) -> Self {
+impl From<BytesPerSecond> for f64 {
+    fn from(val: BytesPerSecond) -> Self {
         val.0
     }
 }
@@ -196,7 +196,7 @@ impl From<ByteCount> for f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::resources::{Bandwidth, InstructionsPerSecond, Limits, ResourceManager};
+    use crate::resources::{BytesPerSecond, InstructionsPerSecond, Limits, ResourceManager};
 
     use super::*;
     use std::time::Instant;
@@ -205,8 +205,8 @@ mod tests {
     fn test_resource_manager_report() {
         // Create a ResourceManager with arbitrary limits
         let limits = Limits {
-            max_upstream_bandwidth: Bandwidth::new(1000.0),
-            max_downstream_bandwidth: Bandwidth::new(1000.0),
+            max_upstream_bandwidth: BytesPerSecond::new(1000.0),
+            max_downstream_bandwidth: BytesPerSecond::new(1000.0),
             max_cpu_usage: InstructionsPerSecond::new(1000.0),
             max_memory_usage: 1000.0,
             max_storage_usage: 1000.0,
@@ -244,8 +244,8 @@ mod tests {
     fn test_resource_manager_should_delete_peers() {
         // Create a ResourceManager with arbitrary limits
         let limits = Limits {
-            max_upstream_bandwidth: Bandwidth::new(1000.0),
-            max_downstream_bandwidth: Bandwidth::new(1000.0),
+            max_upstream_bandwidth: BytesPerSecond::new(1000.0),
+            max_downstream_bandwidth: BytesPerSecond::new(1000.0),
             max_cpu_usage: InstructionsPerSecond::new(1000.0),
             max_memory_usage: 1000.0,
             max_storage_usage: 1000.0,
@@ -298,7 +298,7 @@ mod tests {
 
         let to_delete =
             resource_manager.should_delete_peers(ResourceType::InboundBandwidthBytes, candidates);
-        assert!(to_delete.len() == 1);
+        assert_eq!(to_delete.len(), 1);
 
         // Test that the peer with the highest usage is deleted
         assert_eq!(to_delete[0], peer1);
@@ -307,8 +307,8 @@ mod tests {
     #[test]
     fn test_update_limits() {
         let limits = Limits {
-            max_upstream_bandwidth: Bandwidth::new(1000.0),
-            max_downstream_bandwidth: Bandwidth::new(1000.0),
+            max_upstream_bandwidth: BytesPerSecond::new(1000.0),
+            max_downstream_bandwidth: BytesPerSecond::new(1000.0),
             max_cpu_usage: InstructionsPerSecond::new(1000.0),
             max_memory_usage: 1000.0,
             max_storage_usage: 1000.0,
@@ -316,8 +316,8 @@ mod tests {
         let mut resource_manager = ResourceManager::new(limits);
 
         let new_limits = Limits {
-            max_upstream_bandwidth: Bandwidth::new(2000.0),
-            max_downstream_bandwidth: Bandwidth::new(2000.0),
+            max_upstream_bandwidth: BytesPerSecond::new(2000.0),
+            max_downstream_bandwidth: BytesPerSecond::new(2000.0),
             max_cpu_usage: InstructionsPerSecond::new(2000.0),
             max_memory_usage: 2000.0,
             max_storage_usage: 2000.0,
@@ -326,11 +326,11 @@ mod tests {
 
         assert_eq!(
             resource_manager.limits.max_upstream_bandwidth,
-            Bandwidth::new(2000.0)
+            BytesPerSecond::new(2000.0)
         );
         assert_eq!(
             resource_manager.limits.max_downstream_bandwidth,
-            Bandwidth::new(2000.0)
+            BytesPerSecond::new(2000.0)
         );
         assert_eq!(
             resource_manager.limits.max_cpu_usage,

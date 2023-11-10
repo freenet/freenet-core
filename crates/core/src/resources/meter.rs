@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::resources::rate::Rate;
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
-use crate::resources::Bandwidth;
+use crate::resources::{BytesPerSecond, InstructionsPerSecond};
 
 use crate::ring::PeerKeyLocation;
 
@@ -78,12 +78,16 @@ impl Meter {
         }
     }
 
-    pub(crate) fn report_inbound_bandwidth(&mut self, attribution : &AttributionSource, bandwidth: Bandwidth) {
+    pub(crate) fn report_inbound_bandwidth(&mut self, attribution : &AttributionSource, bandwidth: BytesPerSecond) {
         self.report(attribution, ResourceType::InboundBandwidthBytes, bandwidth.into());
     }
 
-    pub(crate) fn report_outbound_bandwidth(&mut self, attribution : &AttributionSource, bandwidth: Bandwidth) {
+    pub(crate) fn report_outbound_bandwidth(&mut self, attribution : &AttributionSource, bandwidth: BytesPerSecond) {
         self.report(attribution, ResourceType::OutboundBandwidthBytes, bandwidth.into());
+    }
+
+    pub(crate) fn report_cpu_usage(&mut self, attribution : &AttributionSource, cpu_usage: InstructionsPerSecond) {
+        self.report(attribution, ResourceType::CpuInstructions, cpu_usage.into());
     }
 
     /// Report the use of a resource. This should be done in the lowest-level
