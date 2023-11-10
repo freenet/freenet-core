@@ -25,7 +25,7 @@ impl ResourceManager {
 
     /// Report the use of a resource.
     pub(crate) fn report(
-        &self,
+        &mut self,
         _time: Instant,
         attribution: &AttributionSource,
         resource: ResourceType,
@@ -211,7 +211,7 @@ mod tests {
             max_memory_usage: 1000.0,
             max_storage_usage: 1000.0,
         };
-        let resource_manager = ResourceManager::new(limits);
+        let mut resource_manager = ResourceManager::new(limits);
 
         // Report some usage and test that the total and attributed usage are updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
@@ -250,7 +250,7 @@ mod tests {
             max_memory_usage: 1000.0,
             max_storage_usage: 1000.0,
         };
-        let resource_manager = ResourceManager::new(limits);
+        let mut resource_manager = ResourceManager::new(limits);
 
         // Report some usage
         let peer1 = PeerKeyLocation::random();

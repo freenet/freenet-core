@@ -66,7 +66,7 @@ impl Meter {
     /// an AttributionMeter as a parameter. This will be useful for contracts with multiple
     /// subscribers - where the responsibility should be split evenly among the subscribers.
     pub(crate) fn report_split(
-        &self,
+        &mut self,
         attributions: &[AttributionSource],
         resource: ResourceType,
         value: f64,
@@ -81,7 +81,7 @@ impl Meter {
     /// functions that consume the resource, taking an AttributionMeter
     /// as a parameter.
     pub(crate) fn report(
-        &self,
+        &mut self,
         attribution: &AttributionSource,
         resource: ResourceType,
         value: f64,
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_meter_total_usage() {
-        let meter = Meter::new_with_window_size(100);
+        let mut meter = Meter::new_with_window_size(100);
 
         // Test that the total usage is 0.0 for all resources
         assert_eq!(
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_meter_attributed_usage() {
-        let meter = Meter::new_with_window_size(100);
+        let mut meter = Meter::new_with_window_size(100);
 
         // Test that the attributed usage is 0.0 for all resources
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_meter_report() -> Result<(), DynError> {
-        let meter = Meter::new_with_window_size(100);
+        let mut meter = Meter::new_with_window_size(100);
 
         // Report some usage and test that the total and attributed usage are updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
@@ -283,7 +283,7 @@ mod tests {
         );
 
         let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let gen = arbitrary::Unstructured::new(&bytes);
         // Report usage for a different attribution and test that the total and attributed usage are updated
         let other_attribution = AttributionSource::Peer(PeerKeyLocation::random());
         meter.report(
