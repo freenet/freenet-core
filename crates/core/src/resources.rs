@@ -191,7 +191,7 @@ impl From<ByteCount> for f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::resource_manager::{Bandwidth, InstructionsPerSecond, Limits, ResourceManager};
+    use crate::resources::{Bandwidth, InstructionsPerSecond, Limits, ResourceManager};
 
     use super::*;
     use std::time::Instant;
