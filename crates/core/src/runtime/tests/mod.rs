@@ -47,9 +47,16 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
     Ok(std::fs::read(output_file)?)
 }
 
-pub(crate) fn setup_test_contract(
-    name: &str,
-) -> Result<(ContractStore, DelegateStore, SecretsStore, ContractKey), Box<dyn std::error::Error>> {
+pub(crate) struct TestSetup {
+    #[allow(unused)]
+    temp_dir: TempDir,
+    contract_store: ContractStore,
+    delegate_store: DelegateStore,
+    secrets_store: SecretsStore,
+    contract_key: ContractKey,
+}
+
+pub(crate) fn setup_test_contract(name: &str) -> Result<TestSetup, Box<dyn std::error::Error>> {
     // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let temp_dir = TempDir::new().expect("Failed to create a temporary directory");
 
@@ -61,7 +68,13 @@ pub(crate) fn setup_test_contract(
         vec![].into(),
     );
     let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
-    let key = contract.key();
+    let contract_key = contract.key();
     contract_store.store_contract(contract)?;
-    Ok((contract_store, delegate_store, secrets_store, key))
+    Ok(TestSetup {
+        temp_dir,
+        contract_store,
+        delegate_store,
+        secrets_store,
+        contract_key,
+    })
 }
