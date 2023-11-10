@@ -13,7 +13,7 @@ mod wasm_runtime;
 
 pub(crate) use contract::ContractRuntimeInterface;
 pub use contract_store::ContractStore;
-pub(crate) use ::delegate::{DelegateExecError, DelegateRuntimeInterface};
+pub(crate) use delegate::{DelegateExecError, DelegateRuntimeInterface};
 pub use delegate_store::DelegateStore;
 pub(crate) use error::ContractError;
 pub(crate) use error::RuntimeResult;
