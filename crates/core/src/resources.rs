@@ -1,16 +1,10 @@
-// FIXME: remove this
-#![allow(dead_code)]
-#![allow(unused)]
-
 mod meter;
-mod running_average;
 pub mod rate;
-
-use std::time::Instant;
-
-use crate::ring::PeerKeyLocation;
+mod running_average;
 
 use self::meter::{AttributionSource, Meter, ResourceType};
+use crate::ring::PeerKeyLocation;
+use std::time::Instant;
 
 pub(crate) struct ResourceManager {
     limits: Limits,
@@ -20,7 +14,7 @@ pub(crate) struct ResourceManager {
 impl ResourceManager {
     pub fn new(limits: Limits) -> Self {
         ResourceManager {
-            meter: Meter::new(),
+            meter: Meter::new_with_window_size(100),
             limits,
         }
     }
@@ -78,25 +72,36 @@ impl ResourceManager {
     where
         P: IntoIterator<Item = PeerValue>,
     {
-        let total_usage: f64 = self.meter.resource_usage_rate(resource_type);
+        let total_usage = match self.meter.resource_usage_rate(resource_type) {
+            Some(rate) => rate.per_second(),
+            None => return vec![], // Or handle the error as appropriate
+        };
+
         let total_limit: f64 = self.limits.get(resource_type);
         if total_usage > total_limit {
             let mut candidate_costs = vec![];
             for PeerValue { peer, value } in candidates {
-                let cost = self
+                if let Some(cost) = self
                     .meter
-                    .attributed_usage_rate(&AttributionSource::Peer(peer), resource_type);
-                const MIN_VALUE: f64 = 0.0001;
-                let cost_per_value = cost / value.max(MIN_VALUE);
-                candidate_costs.push(CandidateCost {
-                    peer,
-                    total_cost: cost,
-                    cost_per_value,
-                });
+                    .attributed_usage_rate(&AttributionSource::Peer(peer), resource_type)
+                {
+                    const MIN_VALUE: f64 = 0.0001;
+                    let cost_per_second = cost.per_second();
+                    let cost_per_value = cost_per_second / value.max(MIN_VALUE);
+                    candidate_costs.push(CandidateCost {
+                        peer,
+                        total_cost: cost_per_second,
+                        cost_per_value,
+                    });
+                } // Else, you might want to handle the case where cost is None
             }
-            // sort candidate_costs by cost_per_value descending
-            candidate_costs
-                .sort_by(|a, b| b.cost_per_value.partial_cmp(&a.cost_per_value).unwrap());
+
+            // Sort candidate_costs by cost_per_value descending
+            candidate_costs.sort_by(|a, b| {
+                b.cost_per_value
+                    .partial_cmp(&a.cost_per_value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             let mut to_delete = vec![];
             let excess_usage = total_usage - total_limit;
@@ -220,13 +225,17 @@ mod tests {
         assert_eq!(
             resource_manager
                 .meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes),
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             100.0
         );
         assert_eq!(
             resource_manager
                 .meter
-                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes),
+                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             100.0
         );
     }

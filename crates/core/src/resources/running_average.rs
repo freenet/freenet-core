@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, time::Instant};
-use std::time::Duration;
 use crate::resources::rate::Rate;
+use std::time::Duration;
+use std::{collections::VecDeque, time::Instant};
 
 #[derive(Clone, Debug)]
 pub(super) struct RunningAverage {
@@ -11,7 +11,6 @@ pub(super) struct RunningAverage {
 }
 
 impl RunningAverage {
-
     pub fn new(max_samples: usize) -> Self {
         RunningAverage {
             max_samples,
@@ -69,7 +68,7 @@ mod tests {
     #[test]
     fn test_insert() {
         let max_samples = 3;
-        let mut running_avg = RunningAverage::new_with_max_samples(max_samples);
+        let mut running_avg = RunningAverage::new(max_samples);
         let now = Instant::now();
 
         running_avg.insert_with_time(now, 2.0);
@@ -93,16 +92,19 @@ mod tests {
     #[test]
     fn test_per_second_measurement() {
         let max_samples = 3;
-        let mut running_avg = RunningAverage::new_with_max_samples(max_samples);
+        let mut running_avg = RunningAverage::new(max_samples);
         let now = Instant::now();
 
         // Test with no samples
-        assert_eq!(running_avg.get_rate_at_time(now), 0.0);
+        assert!(running_avg.get_rate_at_time(now).is_none());
 
         // Test with one sample
         running_avg.insert_with_time(now, 2.0);
         assert_eq!(
-            running_avg.get_rate_at_time(now + Duration::from_secs(1)),
+            running_avg
+                .get_rate_at_time(now + Duration::from_secs(1))
+                .unwrap()
+                .per_second(),
             2.0
         );
 
@@ -110,14 +112,20 @@ mod tests {
         running_avg.insert_with_time(now + Duration::from_secs(1), 4.0);
         running_avg.insert_with_time(now + Duration::from_secs(2), 6.0);
         assert_eq!(
-            running_avg.get_rate_at_time(now + Duration::from_secs(3)),
+            running_avg
+                .get_rate_at_time(now + Duration::from_secs(3))
+                .unwrap()
+                .per_second(),
             4.0
         );
 
         // Test with max_samples exceeded
         running_avg.insert_with_time(now + Duration::from_secs(3), 8.0);
         assert_eq!(
-            running_avg.get_rate_at_time(now + Duration::from_secs(4)),
+            running_avg
+                .get_rate_at_time(now + Duration::from_secs(4))
+                .unwrap()
+                .per_second(),
             6.0
         );
     }

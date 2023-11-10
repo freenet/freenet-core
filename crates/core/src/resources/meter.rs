@@ -1,13 +1,13 @@
 use std::hash::Hash;
+use std::time::Duration;
 
+use crate::resources::rate::Rate;
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
-use crate::resources::rate::Rate;
 
 use crate::ring::PeerKeyLocation;
 
 use super::running_average::RunningAverage;
-
 
 /// A structure that keeps track of the usage of dynamic resources which are consumed over time.
 /// It provides methods to report and query resource usage, both total and attributed to specific
@@ -20,7 +20,7 @@ pub(super) struct Meter {
 
 impl Meter {
     /// Creates a new `Meter`.
-    pub fn new_with_window_size(running_average_window_size : usize) -> Self {
+    pub fn new_with_window_size(running_average_window_size: usize) -> Self {
         Meter {
             totals_by_resource: ResourceTotals::new(),
             attribution_meters: AttributionMeters::new(),
@@ -53,7 +53,7 @@ impl Meter {
                         // Get the current measurement value
                         meter.get_rate()
                     }
-                    None => 0.0, // No meter found for the given resource
+                    None => Some(Rate::new(0.0, Duration::from_secs(1))), // No meter found for the given resource
                 }
             }
             None => None, // No AttributionMeters found for the given attribution
@@ -139,12 +139,13 @@ impl ResourceTotals {
 #[cfg(test)]
 mod tests {
     use crate::DynError;
+    use std::time::Duration;
 
     use super::*;
 
     #[test]
     fn test_meter() {
-        let meter = Meter::new_with_window_size(10);
+        let meter = Meter::new_with_window_size(100);
 
         // Test that the new Meter has empty totals_by_resource and attribution_meters
         assert!(meter.totals_by_resource.map.is_empty());
@@ -153,99 +154,155 @@ mod tests {
 
     #[test]
     fn test_meter_total_usage() {
-        let meter = Meter::new();
+        let meter = Meter::new_with_window_size(100);
 
         // Test that the total usage is 0.0 for all resources
-        assert_eq!(meter.resource_usage_rate(ResourceType::InboundBandwidthBytes), 0.0);
-        assert_eq!(meter.resource_usage_rate(ResourceType::OutboundBandwidthBytes), 0.0);
-        assert_eq!(meter.resource_usage_rate(ResourceType::CpuInstructions), 0.0);
+        assert_eq!(
+            meter
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .unwrap(),
+            Rate::new(0.0, Duration::from_secs(1))
+        );
+        assert_eq!(
+            meter
+                .resource_usage_rate(ResourceType::OutboundBandwidthBytes)
+                .unwrap(),
+            Rate::new(0.0, Duration::from_secs(1))
+        );
+        assert_eq!(
+            meter
+                .resource_usage_rate(ResourceType::CpuInstructions)
+                .unwrap(),
+            Rate::new(0.0, Duration::from_secs(1))
+        );
 
         // Report some usage and test that the total usage is updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
-            meter.resource_usage_rate(ResourceType::InboundBandwidthBytes),
+            meter
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             100.0
         );
     }
 
     #[test]
     fn test_meter_attributed_usage() {
-        let meter = Meter::new();
+        let meter = Meter::new_with_window_size(100);
 
         // Test that the attributed usage is 0.0 for all resources
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
         assert_eq!(
-            meter.attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes),
+            meter
+                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             0.0
         );
         assert_eq!(
-            meter.attributed_usage_rate(&attribution, ResourceType::OutboundBandwidthBytes),
+            meter
+                .attributed_usage_rate(&attribution, ResourceType::OutboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             0.0
         );
         assert_eq!(
-            meter.attributed_usage_rate(&attribution, ResourceType::CpuInstructions),
+            meter
+                .attributed_usage_rate(&attribution, ResourceType::CpuInstructions)
+                .unwrap()
+                .per_second(),
             0.0
         );
 
         // Report some usage and test that the attributed usage is updated
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
-            meter.attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes),
+            meter
+                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             100.0
         );
     }
 
     #[test]
     fn test_meter_report() -> Result<(), DynError> {
-        let meter = Meter::new();
+        let meter = Meter::new_with_window_size(100);
 
         // Report some usage and test that the total and attributed usage are updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
-            meter.resource_usage_rate(ResourceType::InboundBandwidthBytes),
+            meter
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             100.0
         );
         assert_eq!(
-            meter.attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes),
+            meter
+                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             100.0
         );
 
         // Report more usage and test that the total and attributed usage are updated
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 200.0);
         assert_eq!(
-            meter.resource_usage_rate(ResourceType::InboundBandwidthBytes),
+            meter
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             300.0
         );
         assert_eq!(
-            meter.attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes),
+            meter
+                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             300.0
         );
         // Report usage for a different resource and test that the total and attributed usage are updated
         meter.report(&attribution, ResourceType::CpuInstructions, 50.0);
-        assert_eq!(meter.resource_usage_rate(ResourceType::CpuInstructions), 50.0);
         assert_eq!(
-            meter.attributed_usage_rate(&attribution, ResourceType::CpuInstructions),
+            meter
+                .resource_usage_rate(ResourceType::CpuInstructions)
+                .unwrap()
+                .per_second(),
+            50.0
+        );
+        assert_eq!(
+            meter
+                .attributed_usage_rate(&attribution, ResourceType::CpuInstructions)
+                .unwrap()
+                .per_second(),
             50.0
         );
 
         let bytes = crate::util::test::random_bytes_1kb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         // Report usage for a different attribution and test that the total and attributed usage are updated
-        let other_attribution =
-            AttributionSource::Peer(PeerKeyLocation::random());
+        let other_attribution = AttributionSource::Peer(PeerKeyLocation::random());
         meter.report(
             &other_attribution,
             ResourceType::InboundBandwidthBytes,
             150.0,
         );
         assert_eq!(
-            meter.resource_usage_rate(ResourceType::InboundBandwidthBytes),
+            meter
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             450.0
         );
         assert_eq!(
-            meter.attributed_usage_rate(&other_attribution, ResourceType::InboundBandwidthBytes),
+            meter
+                .attributed_usage_rate(&other_attribution, ResourceType::InboundBandwidthBytes)
+                .unwrap()
+                .per_second(),
             150.0
         );
         Ok(())
