@@ -46,8 +46,8 @@ use crate::{
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
     message::{Message, NodeEvent, Transaction, TransactionType},
     node::{
-        event_log::EventLog, handle_cancelled_op, join_ring_request, process_message,
-        EventLogRegister, InitPeerNode, NodeBuilder, OpManager, PeerKey,
+        handle_cancelled_op, join_ring_request, network_event_log::NetEventLog, process_message,
+        InitPeerNode, NetEventRegister, NodeBuilder, OpManager, PeerKey,
     },
     operations::OpError,
     ring::PeerKeyLocation,
@@ -127,7 +127,7 @@ pub(crate) struct P2pBridge {
     accepted_peers: Arc<DashSet<PeerKey>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
-    log_register: Arc<Mutex<Box<dyn EventLogRegister>>>,
+    log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
 }
 
 impl P2pBridge {
@@ -137,7 +137,7 @@ impl P2pBridge {
         event_register: EL,
     ) -> Self
     where
-        EL: EventLogRegister,
+        EL: NetEventRegister,
     {
         Self {
             active_net_connections: Arc::new(DashMap::new()),
@@ -215,7 +215,7 @@ impl NetworkBridge for P2pBridge {
         self.log_register
             .try_lock()
             .expect("single reference")
-            .register_events(Either::Left(EventLog::disconnected(peer)))
+            .register_events(Either::Left(NetEventLog::disconnected(peer)))
             .await;
         Ok(())
     }
@@ -224,7 +224,7 @@ impl NetworkBridge for P2pBridge {
         self.log_register
             .try_lock()
             .expect("single reference")
-            .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager));
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager));
         self.op_manager.sending_transaction(target, &msg);
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
@@ -242,7 +242,7 @@ pub(in crate::node) struct P2pConnManager {
     /// last valid observed public address
     public_addr: Option<Multiaddr>,
     listening_addr: Option<Multiaddr>,
-    event_listener: Box<dyn EventLogRegister>,
+    event_listener: Box<dyn NetEventRegister>,
 }
 
 impl P2pConnManager {
@@ -250,7 +250,7 @@ impl P2pConnManager {
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
         config: &NodeBuilder<CLIENTS>,
         op_manager: Arc<OpManager>,
-        event_listener: impl EventLogRegister + Clone,
+        event_listener: impl NetEventRegister + Clone,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.

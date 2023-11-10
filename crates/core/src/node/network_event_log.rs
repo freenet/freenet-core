@@ -20,11 +20,13 @@ use crate::{
     contract::StoreResponse,
     message::{Message, Transaction},
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
-    ring::PeerKeyLocation,
+    ring::{Location, PeerKeyLocation},
     router::RouteEvent,
     DynError,
 };
 
+#[cfg(feature = "trace-ot")]
+pub(super) use opentelemetry_tracer::OTEventRegister;
 #[cfg(test)]
 pub(super) use test::TestEventListener;
 
@@ -33,17 +35,13 @@ use super::OpManager;
 #[derive(Debug, Clone, Copy)]
 struct ListenerLogId(usize);
 
-/// A type that reacts to incoming messages from the network.
-/// It injects itself at the message event loop.
-///
-/// This type then can emit it's own information to adjacent systems
-/// or is a no-op.
-pub(crate) trait EventLogRegister: std::any::Any + Send + Sync + 'static {
+/// A type that reacts to incoming messages from the network and records information about them.
+pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
     fn register_events<'a>(
         &'a mut self,
-        events: Either<EventLog<'a>, Vec<EventLog<'a>>>,
+        events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()>;
-    fn trait_clone(&self) -> Box<dyn EventLogRegister>;
+    fn trait_clone(&self) -> Box<dyn NetEventRegister>;
     fn as_any(&self) -> &dyn std::any::Any
     where
         Self: Sized,
@@ -52,19 +50,62 @@ pub(crate) trait EventLogRegister: std::any::Any + Send + Sync + 'static {
     }
 }
 
-pub(crate) struct EventLog<'a> {
+#[cfg(feature = "trace-ot")]
+pub(crate) struct CombinedRegister<const N: usize>([Box<dyn NetEventRegister>; N]);
+
+#[cfg(feature = "trace-ot")]
+impl<const N: usize> CombinedRegister<N> {
+    pub fn new(registries: [Box<dyn NetEventRegister>; N]) -> Self {
+        Self(registries)
+    }
+}
+
+#[cfg(feature = "trace-ot")]
+impl<const N: usize> NetEventRegister for CombinedRegister<N> {
+    fn register_events<'a>(
+        &'a mut self,
+        events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+    ) -> BoxFuture<'a, ()> {
+        async move {
+            for registry in &mut self.0 {
+                registry.register_events(events.clone()).await;
+            }
+        }
+        .boxed()
+    }
+
+    fn trait_clone(&self) -> Box<dyn NetEventRegister> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(feature = "trace-ot")]
+impl<const N: usize> Clone for CombinedRegister<N> {
+    fn clone(&self) -> Self {
+        let mut i = 0;
+        let cloned: [Box<dyn NetEventRegister>; N] = [None::<()>; N].map(|_| {
+            let cloned = self.0[i].trait_clone();
+            i += 1;
+            cloned
+        });
+        Self(cloned)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct NetEventLog<'a> {
     tx: &'a Transaction,
     peer_id: &'a PeerKey,
     kind: EventKind,
 }
 
-impl<'a> EventLog<'a> {
+impl<'a> NetEventLog<'a> {
     pub fn route_event(
         tx: &'a Transaction,
         op_storage: &'a OpManager,
         route_event: &RouteEvent,
     ) -> Self {
-        EventLog {
+        NetEventLog {
             tx,
             peer_id: &op_storage.ring.peer_key,
             kind: EventKind::Route(route_event.clone()),
@@ -72,7 +113,7 @@ impl<'a> EventLog<'a> {
     }
 
     pub fn disconnected(from: &'a PeerKey) -> Self {
-        EventLog {
+        NetEventLog {
             tx: Transaction::NULL,
             peer_id: from,
             kind: EventKind::Disconnected,
@@ -95,20 +136,20 @@ impl<'a> EventLog<'a> {
             }) => {
                 let this_peer = op_storage.ring.own_location();
                 if peers.contains(&this_peer) {
-                    EventKind::Connected {
+                    EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
                         connected: PeerKeyLocation {
                             peer: *your_peer_id,
                             location: Some(*your_location),
                         },
-                    }
+                    })
                 } else {
                     EventKind::Ignored
                 }
             }
             _ => EventKind::Ignored,
         };
-        Either::Left(EventLog {
+        Either::Left(NetEventLog {
             tx: msg.id(),
             peer_id: &op_storage.ring.peer_key,
             kind,
@@ -129,25 +170,35 @@ impl<'a> EventLog<'a> {
                     },
                 ..
             }) => {
-                return Either::Right(
-                    peers
-                        .iter()
-                        .map(|peer| {
-                            let kind: EventKind = EventKind::Connected {
-                                this: PeerKeyLocation {
-                                    peer: *your_peer_id,
-                                    location: Some(*your_location),
-                                },
-                                connected: *peer,
-                            };
-                            EventLog {
-                                tx: msg.id(),
-                                peer_id: &op_storage.ring.peer_key,
-                                kind,
-                            }
-                        })
-                        .collect(),
-                );
+                let this_peer = &op_storage.ring.peer_key;
+                let mut events = peers
+                    .iter()
+                    .map(|peer| {
+                        let kind: EventKind = EventKind::Connect(ConnectEvent::Connected {
+                            this: PeerKeyLocation {
+                                peer: *your_peer_id,
+                                location: Some(*your_location),
+                            },
+                            connected: *peer,
+                        });
+                        NetEventLog {
+                            tx: msg.id(),
+                            peer_id: this_peer,
+                            kind,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if this_peer == your_peer_id {
+                    events.push(NetEventLog {
+                        tx: msg.id(),
+                        peer_id: this_peer,
+                        kind: EventKind::Connect(ConnectEvent::Finished {
+                            initiator: *your_peer_id,
+                            location: *your_location,
+                        }),
+                    });
+                }
+                return Either::Right(events);
             }
             Message::Put(PutMsg::RequestPut {
                 contract, target, ..
@@ -200,7 +251,7 @@ impl<'a> EventLog<'a> {
             },
             _ => EventKind::Ignored,
         };
-        Either::Left(EventLog {
+        Either::Left(NetEventLog {
             tx: msg.id(),
             peer_id: &op_storage.ring.peer_key,
             kind,
@@ -210,16 +261,85 @@ impl<'a> EventLog<'a> {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-struct LogMessage {
+struct NetLogMessage {
     tx: Transaction,
     datetime: DateTime<Utc>,
     peer_id: PeerKey,
     kind: EventKind,
 }
 
+impl NetLogMessage {
+    fn to_log_message<'a>(
+        log: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+    ) -> impl Iterator<Item = NetLogMessage> + Send + 'a {
+        let erased_iter = match log {
+            Either::Left(one) => Box::new([one].into_iter())
+                as Box<dyn std::iter::Iterator<Item = NetEventLog<'_>> + Send + 'a>,
+            Either::Right(multiple) => Box::new(multiple.into_iter())
+                as Box<dyn std::iter::Iterator<Item = NetEventLog<'_>> + Send + 'a>,
+        };
+        erased_iter.into_iter().map(NetLogMessage::from)
+    }
+
+    /// Signals whether this message closes a transaction span.
+    ///
+    /// In case of isolated events where the span is not being tracked it should return true.
+    fn span_completed(&self) -> bool {
+        match &self.kind {
+            // EventKind::Connect(ConnectEvent::)
+            EventKind::Connect(_) => false,
+            EventKind::Put(PutEvent::PutSuccess { .. }) => true,
+            EventKind::Put(_) => false,
+            _ => true,
+        }
+    }
+}
+
+impl<'a> From<NetEventLog<'a>> for NetLogMessage {
+    fn from(log: NetEventLog<'a>) -> NetLogMessage {
+        NetLogMessage {
+            datetime: Utc::now(),
+            tx: *log.tx,
+            kind: log.kind,
+            peer_id: *log.peer_id,
+        }
+    }
+}
+
+#[cfg(feature = "trace-ot")]
+impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
+    fn from(msg: &'a NetLogMessage) -> Self {
+        use opentelemetry::KeyValue;
+        let map: Option<Vec<KeyValue>> = match &msg.kind {
+            EventKind::Connect(ConnectEvent::StartConnection { from }) => Some(vec![
+                KeyValue::new("phase", "start"),
+                KeyValue::new("initiator", format!("{from}")),
+            ]),
+            EventKind::Connect(ConnectEvent::Connected { this, connected }) => Some(vec![
+                KeyValue::new("phase", "connected"),
+                KeyValue::new("from", format!("{this}")),
+                KeyValue::new("to", format!("{connected}")),
+            ]),
+            EventKind::Connect(ConnectEvent::Finished {
+                initiator,
+                location,
+            }) => Some(vec![
+                KeyValue::new("phase", "finished"),
+                KeyValue::new("initiator", format!("{initiator}")),
+                KeyValue::new("location", location.as_f64()),
+            ]),
+            _ => None,
+        };
+        map.map(|mut map| {
+            map.push(KeyValue::new("peer_id", format!("{}", msg.peer_id)));
+            map
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EventRegister {
-    log_sender: mpsc::Sender<LogMessage>,
+    log_sender: mpsc::Sender<NetLogMessage>,
 }
 
 /// Records from a new session must have higher than this ts.
@@ -234,12 +354,12 @@ impl EventRegister {
 
     pub fn new() -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
-        NEW_RECORDS_TS.set(SystemTime::now()).expect("non set");
+        NEW_RECORDS_TS.get_or_init(SystemTime::now);
         GlobalExecutor::spawn(Self::record_logs(log_recv));
         Self { log_sender }
     }
 
-    async fn record_logs(mut log_recv: mpsc::Receiver<LogMessage>) {
+    async fn record_logs(mut log_recv: mpsc::Receiver<NetLogMessage>) {
         const BATCH_SIZE: usize = 100;
 
         async fn num_lines(path: &Path) -> io::Result<usize> {
@@ -319,7 +439,7 @@ impl EventRegister {
                 while read_buf.read_exact(&mut length_bytes).await.is_ok() {
                     let length = u32::from_be_bytes(length_bytes) as usize;
                     cursor += 4;
-                    let log: LogMessage =
+                    let log: NetLogMessage =
                         bincode::deserialize(&buffer[cursor..cursor + length]).unwrap();
                     cursor += length;
                     read_buf = &buffer[cursor..];
@@ -350,7 +470,7 @@ impl EventRegister {
             Ok(file) => file,
             Err(err) => {
                 tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
-                panic!("Failed openning log file"); // todo: propagate this to the main thread
+                panic!("Failed openning log file"); // fixme: propagate this to the main thread
             }
         };
         let mut num_written = 0;
@@ -470,7 +590,7 @@ impl EventRegister {
         let deserialized_records = tokio::task::spawn_blocking(move || {
             let mut filtered = vec![];
             for buf in records {
-                let record: LogMessage = bincode::deserialize(&buf).map_err(|e| {
+                let record: NetLogMessage = bincode::deserialize(&buf).map_err(|e| {
                     tracing::error!(?buf, "deserialization error");
                     e
                 })?;
@@ -490,62 +610,204 @@ impl EventRegister {
     }
 }
 
-impl EventLogRegister for EventRegister {
+impl NetEventRegister for EventRegister {
     fn register_events<'a>(
         &'a mut self,
-        logs: Either<EventLog<'a>, Vec<EventLog<'a>>>,
+        logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()> {
         async {
-            match logs {
-                Either::Left(log) => {
-                    let log_msg = LogMessage {
-                        datetime: Utc::now(),
-                        tx: *log.tx,
-                        kind: log.kind,
-                        peer_id: *log.peer_id,
-                    };
-                    let _ = self.log_sender.send(log_msg).await;
-                }
-                Either::Right(logs) => {
-                    for log in logs {
-                        let log_msg = LogMessage {
-                            datetime: Utc::now(),
-                            tx: *log.tx,
-                            kind: log.kind,
-                            peer_id: *log.peer_id,
-                        };
-                        let _ = self.log_sender.send(log_msg).await;
-                    }
-                }
+            for log_msg in NetLogMessage::to_log_message(logs) {
+                let _ = self.log_sender.send(log_msg).await;
             }
         }
         .boxed()
     }
 
-    fn trait_clone(&self) -> Box<dyn EventLogRegister> {
+    fn trait_clone(&self) -> Box<dyn NetEventRegister> {
         Box::new(self.clone())
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[cfg(feature = "trace-ot")]
+mod opentelemetry_tracer {
+    use std::{collections::HashMap, time::Duration};
+
+    use opentelemetry::{global, trace};
+
+    use super::*;
+
+    struct OTSpan {
+        inner: global::BoxedSpan,
+    }
+
+    impl OTSpan {
+        fn new(transaction: Transaction) -> Self {
+            use trace::{Tracer, TracerProvider};
+
+            let tracer = {
+                let tracer_provider = global::tracer_provider();
+                tracer_provider.versioned_tracer(
+                    "freenet",
+                    Some(env!("CARGO_PKG_VERSION")),
+                    Some("https://opentelemetry.io/schemas/1.21.0"),
+                    None,
+                )
+            };
+            let tx_bytes = transaction.as_bytes();
+            let mut span_id = [0; 8];
+            span_id.copy_from_slice(&tx_bytes[8..]);
+            let inner = tracer.build(trace::SpanBuilder {
+                name: transaction.transaction_type().description().into(),
+                start_time: Some(transaction.started()),
+                span_id: Some(trace::SpanId::from_bytes(span_id)),
+                trace_id: Some(trace::TraceId::from_bytes(tx_bytes)),
+                ..Default::default()
+            });
+            OTSpan { inner }
+        }
+
+        fn add_log(&mut self, log: &NetLogMessage) {
+            // NOTE: if we need to add some standard attributes in the future take a look at
+            // https://docs.rs/opentelemetry-semantic-conventions/latest/opentelemetry_semantic_conventions/
+            use trace::Span;
+            if let Some(log_vals) = <Option<Vec<_>>>::from(log) {
+                let ts =
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(log.datetime.timestamp() as u64);
+
+                self.inner.add_event_with_timestamp(
+                    log.tx.transaction_type().description(),
+                    ts,
+                    log_vals,
+                );
+            }
+        }
+    }
+
+    impl trace::Span for OTSpan {
+        delegate::delegate! {
+            to self.inner {
+                fn span_context(&self) -> &trace::SpanContext;
+                fn is_recording(&self) -> bool;
+                fn set_attribute(&mut self, attribute: opentelemetry::KeyValue);
+                fn set_status(&mut self, status: trace::Status);
+                fn end_with_timestamp(&mut self, timestamp: SystemTime);
+            }
+        }
+
+        fn add_event_with_timestamp<T>(
+            &mut self,
+            _: T,
+            _: SystemTime,
+            _: Vec<opentelemetry::KeyValue>,
+        ) where
+            T: Into<std::borrow::Cow<'static, str>>,
+        {
+            unreachable!("not explicitly called")
+        }
+
+        fn update_name<T>(&mut self, _: T)
+        where
+            T: Into<std::borrow::Cow<'static, str>>,
+        {
+            unreachable!("shouldn't change span name")
+        }
+    }
+
+    #[derive(Clone)]
+    pub(in crate::node) struct OTEventRegister {
+        log_sender: mpsc::Sender<NetLogMessage>,
+    }
+
+    impl OTEventRegister {
+        pub fn new() -> Self {
+            let (log_sender, log_recv) = mpsc::channel(1000);
+            NEW_RECORDS_TS.get_or_init(SystemTime::now);
+            GlobalExecutor::spawn(Self::record_logs(log_recv));
+            Self { log_sender }
+        }
+
+        async fn record_logs(mut log_recv: mpsc::Receiver<NetLogMessage>) {
+            use trace::Span;
+            let mut logs: HashMap<_, OTSpan> = HashMap::new();
+            while let Some(log) = log_recv.recv().await {
+                let span_completed = log.span_completed();
+                match logs.entry(log.tx) {
+                    std::collections::hash_map::Entry::Occupied(mut val) => {
+                        {
+                            let span = val.get_mut();
+                            span.add_log(&log);
+                        }
+                        if span_completed {
+                            let (_, mut completed_span) = val.remove_entry();
+                            completed_span.end_with_timestamp(SystemTime::now())
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(empty) => {
+                        let span = empty.insert(OTSpan::new(log.tx));
+                        // does not make much sense to treat a single isolated event as a span,
+                        // so just ignore those in case they were to happen
+                        if !span_completed {
+                            span.add_log(&log);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl NetEventRegister for OTEventRegister {
+        fn register_events<'a>(
+            &'a mut self,
+            logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+        ) -> BoxFuture<'a, ()> {
+            async {
+                for log_msg in NetLogMessage::to_log_message(logs) {
+                    let _ = self.log_sender.send(log_msg).await;
+                }
+            }
+            .boxed()
+        }
+
+        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
+            Box::new(self.clone())
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-// todo: make this take by ref instead
+// todo: make this take by ref instead, probably will need an owned version
 enum EventKind {
-    Connected {
-        this: PeerKeyLocation,
-        connected: PeerKeyLocation,
-    },
+    Connect(ConnectEvent),
     Put(PutEvent),
+    // todo: make this a sequence like Put
     Get {
         key: ContractKey,
     },
     Route(RouteEvent),
+    // todo: add update sequences too
     Subscribed {
         key: ContractKey,
         at: PeerKeyLocation,
     },
     Ignored,
     Disconnected,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+enum ConnectEvent {
+    StartConnection {
+        from: PeerKey,
+    },
+    Connected {
+        this: PeerKeyLocation,
+        connected: PeerKeyLocation,
+    },
+    Finished {
+        initiator: PeerKey,
+        location: Location,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -618,7 +880,7 @@ pub(super) mod test {
         }
         for _ in 0..TEST_LOGS {
             let kind: EventKind = gen.arbitrary()?;
-            events.push(EventLog {
+            events.push(NetEventLog {
                 tx: transactions.last().unwrap(),
                 peer_id: peers.last().unwrap(),
                 kind,
@@ -638,7 +900,7 @@ pub(super) mod test {
     pub(crate) struct TestEventListener {
         node_labels: Arc<DashMap<NodeLabel, PeerKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<Mutex<Vec<LogMessage>>>,
+        logs: Arc<Mutex<Vec<NetLogMessage>>>,
     }
 
     impl TestEventListener {
@@ -656,8 +918,10 @@ pub(super) mod test {
 
         pub fn is_connected(&self, peer: &PeerKey) -> bool {
             let logs = self.logs.lock();
-            logs.iter()
-                .any(|log| &log.peer_id == peer && matches!(log.kind, EventKind::Connected { .. }))
+            logs.iter().any(|log| {
+                &log.peer_id == peer
+                    && matches!(log.kind, EventKind::Connect(ConnectEvent::Connected { .. }))
+            })
         }
 
         pub fn has_put_contract(
@@ -769,7 +1033,8 @@ pub(super) mod test {
 
             logs.iter()
                 .filter_map(|l| {
-                    if let EventKind::Connected { this, connected } = l.kind {
+                    if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = l.kind
+                    {
                         let disconnected = disconnects
                             .get(&connected.peer)
                             .iter()
@@ -791,10 +1056,10 @@ pub(super) mod test {
                 .into_iter()
         }
 
-        fn create_log(log: EventLog) -> (LogMessage, ListenerLogId) {
+        fn create_log(log: NetEventLog) -> (NetLogMessage, ListenerLogId) {
             let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
-            let EventLog { peer_id, kind, .. } = log;
-            let msg_log = LogMessage {
+            let NetEventLog { peer_id, kind, .. } = log;
+            let msg_log = NetLogMessage {
                 datetime: Utc::now(),
                 tx: *log.tx,
                 peer_id: *peer_id,
@@ -804,10 +1069,10 @@ pub(super) mod test {
         }
     }
 
-    impl super::EventLogRegister for TestEventListener {
+    impl super::NetEventRegister for TestEventListener {
         fn register_events<'a>(
             &'a mut self,
-            logs: Either<EventLog<'a>, Vec<EventLog<'a>>>,
+            logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
         ) -> BoxFuture<'a, ()> {
             match logs {
                 Either::Left(log) => {
@@ -829,7 +1094,7 @@ pub(super) mod test {
             async {}.boxed()
         }
 
-        fn trait_clone(&self) -> Box<dyn EventLogRegister> {
+        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
             Box::new(self.clone())
         }
     }
@@ -848,10 +1113,10 @@ pub(super) mod test {
 
         let mut listener = TestEventListener::new();
         locations.iter().for_each(|(other, location)| {
-            listener.register_events(Either::Left(EventLog {
+            listener.register_events(Either::Left(NetEventLog {
                 tx: &tx,
                 peer_id: &peer_id,
-                kind: EventKind::Connected {
+                kind: EventKind::Connect(ConnectEvent::Connected {
                     this: PeerKeyLocation {
                         peer: peer_id,
                         location: Some(loc),
@@ -860,7 +1125,7 @@ pub(super) mod test {
                         peer: *other,
                         location: Some(*location),
                     },
-                },
+                }),
             }));
         });
 

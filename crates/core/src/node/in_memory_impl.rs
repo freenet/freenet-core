@@ -5,12 +5,11 @@ use freenet_stdlib::prelude::*;
 use tracing::Instrument;
 
 use super::{
-    client_event_handling,
-    event_log::EventLog,
-    handle_cancelled_op, join_ring_request,
+    client_event_handling, handle_cancelled_op, join_ring_request,
     network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
+    network_event_log::NetEventLog,
     op_state_manager::OpManager,
-    process_message, EventLogRegister, PeerKey,
+    process_message, NetEventRegister, PeerKey,
 };
 use crate::{
     client_events::ClientEventsProxy,
@@ -33,7 +32,7 @@ pub(super) struct NodeInMemory {
     gateways: Vec<PeerKeyLocation>,
     notification_channel: EventLoopNotifications,
     conn_manager: MemoryConnManager,
-    event_listener: Box<dyn EventLogRegister + Send + 'static>,
+    event_listener: Box<dyn NetEventRegister>,
     is_gateway: bool,
     _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     /// Span to use for this node for tracing purposes
@@ -42,7 +41,7 @@ pub(super) struct NodeInMemory {
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub async fn build<EL: EventLogRegister>(
+    pub async fn build<EL: NetEventRegister>(
         builder: NodeBuilder<1>,
         event_listener: EL,
         ch_builder: String,
@@ -225,7 +224,7 @@ impl NodeInMemory {
                     NodeEvent::DropConnection(peer) => {
                         tracing::info!("Dropping connection to {peer}");
                         self.event_listener
-                            .register_events(Either::Left(EventLog::disconnected(&peer)));
+                            .register_events(Either::Left(NetEventLog::disconnected(&peer)));
                         self.op_storage.ring.prune_connection(peer);
                         continue;
                     }

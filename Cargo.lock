@@ -1606,6 +1606,7 @@ dependencies = [
  "libp2p-identity",
  "notify",
  "once_cell",
+ "opentelemetry",
  "opentelemetry-jaeger",
  "ordered-float 4.1.1",
  "parking_lot",

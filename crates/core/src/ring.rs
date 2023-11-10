@@ -44,7 +44,7 @@ use crate::{
     config::GlobalExecutor,
     message::Transaction,
     node::{
-        self, EventLogRegister, EventLoopNotificationsSender, EventRegister, NodeBuilder, PeerKey,
+        self, EventLoopNotificationsSender, EventRegister, NetEventRegister, NodeBuilder, PeerKey,
     },
     operations::connect,
     router::Router,
@@ -224,7 +224,7 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<const CLIENTS: usize, EL: EventLogRegister>(
+    pub fn new<const CLIENTS: usize, EL: NetEventRegister>(
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
@@ -306,7 +306,7 @@ impl Ring {
         Ok(ring)
     }
 
-    async fn refresh_router<EL: EventLogRegister>(router: Arc<RwLock<Router>>) {
+    async fn refresh_router<EL: NetEventRegister>(router: Arc<RwLock<Router>>) {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {

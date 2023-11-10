@@ -17,7 +17,10 @@ use tracing::{info, Instrument};
 use crate::{
     client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
-    node::{event_log::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
+    node::{
+        network_event_log::{CombinedRegister, TestEventListener},
+        InitPeerNode, NetEventRegister, NodeBuilder, NodeInMemory,
+    },
     ring::{Distance, Location, PeerKeyLocation},
 };
 
@@ -282,9 +285,23 @@ impl SimNetwork {
             self.event_listener.add_node(label.clone(), peer);
 
             let parent_span = tracing::info_span!("in_mem_node", %peer);
+            let event_listener = {
+                #[cfg(feature = "trace-ot")]
+                {
+                    use super::network_event_log::OTEventRegister;
+                    CombinedRegister::new([
+                        self.event_listener.trait_clone(),
+                        Box::new(OTEventRegister::new()),
+                    ])
+                }
+                #[cfg(not(feature = "trace-ot"))]
+                {
+                    self.event_listener.clone()
+                }
+            };
             let node = NodeInMemory::build(
                 config,
-                self.event_listener.clone(),
+                event_listener,
                 format!("{}-{label}", self.name),
                 self.add_noise,
             )

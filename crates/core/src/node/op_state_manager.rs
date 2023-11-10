@@ -17,7 +17,7 @@ use crate::{
     ring::{LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, EventLogRegister, NodeBuilder, PeerKey};
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeBuilder, PeerKey};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -59,7 +59,7 @@ pub(crate) struct OpManager {
 }
 
 impl OpManager {
-    pub(super) fn new<const CLIENTS: usize, EL: EventLogRegister>(
+    pub(super) fn new<const CLIENTS: usize, EL: NetEventRegister>(
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
         builder: &NodeBuilder<CLIENTS>,

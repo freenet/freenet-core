@@ -74,6 +74,7 @@ xz2 = { version = "0.1" }
 
 # Tracing deps
 tracing = { version = "0.1" }
+opentelemetry = "0.21.0"
 opentelemetry-jaeger = { version = "0.20.0", features = ["rt-tokio","collector_client", "isahc"], optional = true }
 tracing-opentelemetry = { version = "0.22.0", optional = true }
 tracing-subscriber = { version = "0.3.16", optional = true }

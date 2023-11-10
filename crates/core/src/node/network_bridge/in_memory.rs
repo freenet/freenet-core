@@ -15,7 +15,7 @@ use super::{ConnectionError, NetworkBridge, PeerKey};
 use crate::{
     config::GlobalExecutor,
     message::Message,
-    node::{event_log::EventLog, EventLogRegister, OpManager},
+    node::{network_event_log::NetEventLog, NetEventRegister, OpManager},
 };
 
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
@@ -23,7 +23,7 @@ static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTran
 
 pub(in crate::node) struct MemoryConnManager {
     pub transport: InMemoryTransport,
-    log_register: Arc<Mutex<Box<dyn EventLogRegister>>>,
+    log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
     op_manager: Arc<OpManager>,
     msg_queue: Arc<Mutex<Vec<Message>>>,
     peer: PeerKey,
@@ -32,7 +32,7 @@ pub(in crate::node) struct MemoryConnManager {
 impl MemoryConnManager {
     pub fn new(
         peer: PeerKey,
-        log_register: Box<dyn EventLogRegister>,
+        log_register: Box<dyn NetEventRegister>,
         op_manager: Arc<OpManager>,
         add_noise: bool,
     ) -> Self {
@@ -98,7 +98,7 @@ impl NetworkBridge for MemoryConnManager {
         self.log_register
             .try_lock()
             .expect("unique lock")
-            .register_events(EventLog::from_outbound_msg(&msg, &self.op_manager))
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager))
             .await;
         self.op_manager.sending_transaction(target, &msg);
         let msg = bincode::serialize(&msg)?;

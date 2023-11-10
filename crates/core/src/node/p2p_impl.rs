@@ -14,7 +14,7 @@ use tracing::Instrument;
 use super::{
     client_event_handling, join_ring_request,
     network_bridge::{p2p_protoc::P2pConnManager, EventLoopNotifications},
-    EventLogRegister, PeerKey,
+    NetEventRegister, PeerKey,
 };
 use crate::{
     client_events::combinator::ClientEventsCombinator,
@@ -79,7 +79,7 @@ impl NodeP2P {
     ) -> Result<NodeP2P, anyhow::Error>
     where
         CH: ContractHandler + Send + 'static,
-        EL: EventLogRegister + Clone,
+        EL: NetEventRegister + Clone,
     {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
@@ -158,7 +158,7 @@ mod test {
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
         contract::MemoryContractHandler,
-        node::{event_log, tests::get_free_port, InitPeerNode},
+        node::{network_event_log, tests::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -217,7 +217,7 @@ mod test {
             let mut peer1 = Box::new(
                 NodeP2P::build::<MemoryContractHandler, 1, _>(
                     config,
-                    event_log::TestEventListener::new(),
+                    network_event_log::TestEventListener::new(),
                     "ping-listener".into(),
                 )
                 .await?,
@@ -234,7 +234,7 @@ mod test {
             config.add_gateway(peer1_config.clone());
             let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1, _>(
                 config,
-                event_log::TestEventListener::new(),
+                network_event_log::TestEventListener::new(),
                 "ping-dialer".into(),
             )
             .await

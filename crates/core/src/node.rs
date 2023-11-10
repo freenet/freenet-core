@@ -22,7 +22,7 @@ use tracing::Instrument;
 
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;
-use self::{event_log::EventLog, p2p_impl::NodeP2P};
+use self::{network_event_log::NetEventLog, p2p_impl::NodeP2P};
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::Config,
@@ -43,14 +43,14 @@ use crate::{
 };
 
 use crate::operations::handle_op_request;
-pub(crate) use event_log::{EventLogRegister, EventRegister};
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
+pub(crate) use network_event_log::{EventRegister, NetEventRegister};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-mod event_log;
 #[cfg(test)]
 mod in_memory_impl;
 mod network_bridge;
+mod network_event_log;
 mod op_state_manager;
 mod p2p_impl;
 #[cfg(test)]
@@ -185,11 +185,23 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
 
     /// Builds a node using the default backend connection manager.
     pub async fn build(self, config: NodeConfig) -> Result<Node, anyhow::Error> {
-        let event_log = event_log::EventRegister::new();
-        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, event_log::EventRegister>(
-            self, event_log, config,
-        )
-        .await?;
+        let event_register = {
+            #[cfg(feature = "trace-ot")]
+            {
+                use super::node::network_event_log::{CombinedRegister, OTEventRegister};
+                CombinedRegister::new([
+                    Box::new(EventRegister::new()),
+                    Box::new(OTEventRegister::new()),
+                ])
+            }
+            #[cfg(not(feature = "trace-ot"))]
+            {
+                EventRegister::new()
+            }
+        };
+        let node =
+            NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(self, event_register, config)
+                .await?;
         Ok(Node(node))
     }
 
@@ -463,7 +475,7 @@ async fn report_result(
     op_storage: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
-    event_listener: &mut dyn EventLogRegister,
+    event_listener: &mut dyn NetEventRegister,
 ) {
     match op_result {
         Ok(Some(op_res)) => {
@@ -491,7 +503,7 @@ async fn report_result(
                         },
                     };
                     event_listener
-                        .register_events(Either::Left(EventLog::route_event(
+                        .register_events(Either::Left(NetEventLog::route_event(
                             op_res.id(),
                             op_storage,
                             &event,
@@ -568,7 +580,7 @@ async fn process_message<CB>(
     msg: Message,
     op_storage: Arc<OpManager>,
     mut conn_manager: CB,
-    mut event_listener: Box<dyn EventLogRegister>,
+    mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<ClientId>,
@@ -579,7 +591,7 @@ async fn process_message<CB>(
 
     let tx = Some(*msg.id());
     event_listener
-        .register_events(EventLog::from_inbound_msg(&msg, &op_storage))
+        .register_events(NetEventLog::from_inbound_msg(&msg, &op_storage))
         .await;
     loop {
         match &msg {
