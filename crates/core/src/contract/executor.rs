@@ -32,7 +32,7 @@ use crate::runtime::{
 use crate::{
     client_events::{ClientId, HostResult},
     node::NodeConfig,
-    operations::{self, op_trait::Operation},
+    operations::{self, Operation},
     DynError,
 };
 

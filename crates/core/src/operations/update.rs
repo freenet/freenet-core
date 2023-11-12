@@ -2,10 +2,10 @@
 
 use futures::future::BoxFuture;
 
-pub(crate) use self::messages::UpdateMsg;
+use super::{OpError, OpOutcome, Operation};
 use crate::{client_events::ClientId, node::NetworkBridge};
 
-use super::{op_trait::Operation, OpError, OpOutcome};
+pub(crate) use self::messages::UpdateMsg;
 
 pub(crate) struct UpdateOp {}
 

@@ -4,9 +4,7 @@ use futures::{Future, FutureExt};
 use std::pin::Pin;
 use std::{collections::HashSet, time::Duration};
 
-use super::{OpError, OpOutcome, OperationResult};
-use crate::operations::op_trait::Operation;
-use crate::operations::OpInitialization;
+use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::ClientId,
     message::{InnerMessage, Message, Transaction},
@@ -216,7 +214,7 @@ impl Operation for ConnectOp {
                     id,
                     msg:
                         ConnectRequest::StartReq {
-                            target: this_node_loc,
+                            target: this_peer,
                             joiner,
                             hops_to_live,
                             assigned_location,
@@ -226,19 +224,19 @@ impl Operation for ConnectOp {
                     // likely a gateway which accepts connections
                     tracing::debug!(
                         tx = %id,
-                        "Connection request received from {} with HTL {} @ {}",
-                        joiner,
-                        hops_to_live,
-                        this_node_loc.peer
+                        at = %this_peer.peer,
+                        from = %joiner,
+                        %hops_to_live,
+                        "Connection request received",
                     );
 
                     // todo: location should be based on your public IP
                     let new_location = assigned_location.unwrap_or_else(Location::random);
                     let accepted_by = if op_storage.ring.should_accept(new_location) {
-                        tracing::debug!(tx = %id, "Accepting connection from {}", joiner,);
-                        HashSet::from_iter([*this_node_loc])
+                        tracing::debug!(tx = %id, %joiner, "Accepting connection from");
+                        HashSet::from_iter([*this_peer])
                     } else {
-                        tracing::debug!(tx = %id, at_peer = %this_node_loc.peer, "Rejecting connection from peer {}", joiner);
+                        tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner, "Rejecting connection");
                         HashSet::new()
                     };
 
@@ -253,14 +251,14 @@ impl Operation for ConnectOp {
                         (new_peer_loc, new_peer_loc),
                         *hops_to_live,
                         accepted_by.clone(),
-                        vec![this_node_loc.peer, *joiner],
+                        vec![this_peer.peer, *joiner],
                     )
                     .await?
                     {
                         tracing::debug!(
                             tx = %id,
-                            "Awaiting proxy response from @ {}",
-                            this_node_loc.peer,
+                            at = %this_peer.peer,
+                            "Awaiting proxy response",
                         );
                         updated_state.add_new_proxy(accepted_by.iter().copied())?;
                         // awaiting responses from proxies
@@ -270,9 +268,9 @@ impl Operation for ConnectOp {
                         if !accepted_by.is_empty() {
                             tracing::debug!(
                                 tx = %id,
-                                "OC received at gateway {} from requesting peer {}",
-                                this_node_loc.peer,
-                                joiner
+                                at = %this_peer.peer,
+                                %joiner,
+                                "Open connection received at gateway",
                             );
                             new_state = Some(ConnectState::OCReceived);
                         } else {
@@ -280,7 +278,7 @@ impl Operation for ConnectOp {
                         }
                         return_msg = Some(ConnectMsg::Response {
                             id: *id,
-                            sender: *this_node_loc,
+                            sender: *this_peer,
                             msg: ConnectResponse::AcceptedBy {
                                 peers: accepted_by,
                                 your_location: new_location,
@@ -308,10 +306,11 @@ impl Operation for ConnectOp {
                     let mut accepted_by = accepted_by.clone();
                     tracing::debug!(
                         tx = %id,
-                        "Proxy connect request received from {} to connect with peer {} (HTL {hops_to_live} @ {})",
-                        sender.peer,
-                        joiner.peer,
-                        own_loc.peer
+                        from = %sender.peer,
+                        joiner = %joiner.peer,
+                        at = %own_loc.peer,
+                        %hops_to_live,
+                        "Proxy connect request received to connect with peer",
                     );
                     if op_storage
                         .ring
@@ -322,8 +321,9 @@ impl Operation for ConnectOp {
                     } else {
                         tracing::debug!(
                             tx = %id,
-                            "Not accepting new proxy connection from {}",
-                            joiner.peer
+                            joiner = %joiner.peer,
+                            at = %own_loc.peer,
+                            "Not accepting new proxy connection",
                         );
                     }
 
@@ -368,7 +368,7 @@ impl Operation for ConnectOp {
                 }
                 ConnectMsg::Response {
                     id,
-                    sender: gateway,
+                    sender,
                     target,
                     msg:
                         ConnectResponse::AcceptedBy {
@@ -379,8 +379,9 @@ impl Operation for ConnectOp {
                 } => {
                     tracing::debug!(
                         tx = %id,
-                        this_peer = %target.peer,
-                        "Connect response received from {}", gateway.peer
+                        at = %target.peer,
+                        from = %sender.peer,
+                        "Connect response received",
                     );
 
                     // Set the given location
@@ -396,9 +397,9 @@ impl Operation for ConnectOp {
                     if !accepted_by.is_empty() {
                         tracing::debug!(
                             tx = %id,
-                            "OC acknowledged at requesting peer {} from gateway {}",
-                            your_peer_id,
-                            gateway.peer
+                            at = %your_peer_id,
+                            from = %sender.peer,
+                            "Open connections acknowledged at requesting peer",
                         );
                         new_state = Some(ConnectState::OCReceived);
                         if accepted_by.contains(&gateway) {
@@ -418,7 +419,7 @@ impl Operation for ConnectOp {
                         }
                         tracing::debug!(
                             tx = %id,
-                            this_peer = %your_peer_id,
+                            at = %your_peer_id,
                             location = %your_location,
                             "Updating assigned location"
                         );
@@ -471,7 +472,7 @@ impl Operation for ConnectOp {
                     sender,
                     msg: ConnectResponse::Proxy { accepted_by },
                 } => {
-                    tracing::debug!(tx = %id, "Received proxy connect response at @ {}", target.peer);
+                    tracing::debug!(tx = %id, at = %target.peer, "Received proxy connect response");
                     match self.state {
                         Some(ConnectState::AwaitingProxyResponse {
                             accepted_by: mut previously_accepted,
@@ -493,10 +494,10 @@ impl Operation for ConnectOp {
                             if target_is_joiner {
                                 tracing::debug!(
                                     tx = %id,
+                                    original_receiver = %target.peer,
+                                    original_target = %original_target.peer,
                                     "Sending response to connect request with all the peers that accepted \
-                                    connection from gateway {} to connecting peer {}",
-                                    target.peer,
-                                    original_target.peer
+                                    connection from original target",
                                 );
                                 return_msg = Some(ConnectMsg::Response {
                                     id: *id,
@@ -511,10 +512,10 @@ impl Operation for ConnectOp {
                             } else {
                                 tracing::debug!(
                                     tx = %id,
+                                    at = %target.peer,
+                                    to = %original_target.peer,
                                     "Sending response to connect request with all the peers that accepted \
-                                    connection from proxy peer {} to proxy peer {}",
-                                    target.peer,
-                                    original_target.peer
+                                    connection from proxy peer",
                                 );
 
                                 return_msg = Some(ConnectMsg::Response {
@@ -589,7 +590,7 @@ impl Operation for ConnectOp {
                     match self.state {
                         Some(ConnectState::OCReceived) => {
                             if target == gateway {
-                                tracing::debug!(tx = %id, by_peer = %by_peer.peer, at = %target.peer, "Acknowledge connected at gateway");
+                                tracing::debug!(tx = %id, from = %by_peer.peer, at = %target.peer, "Acknowledge connected at gateway");
                                 return_msg = Some(ConnectMsg::Connected {
                                     id: *id,
                                     sender: *target,
@@ -597,7 +598,7 @@ impl Operation for ConnectOp {
                                 });
                                 new_state = Some(ConnectState::Connected);
                             } else {
-                                tracing::debug!(tx = %id, by_peer = %by_peer.peer, at = %target.peer, "Acknowledge connected at peer");
+                                tracing::debug!(tx = %id, from = %by_peer.peer, at = %target.peer, "Acknowledge connected at peer");
                                 return_msg = None;
                                 new_state = None;
                             }
@@ -609,7 +610,7 @@ impl Operation for ConnectOp {
                             ))
                         }
                         None => {
-                            tracing::error!(tx = %self.id, this_peer =  %target.peer, "completed");
+                            tracing::error!(tx = %self.id, at =  %target.peer, "completed");
                             return Err(OpError::invalid_transition(self.id));
                         }
                     }
@@ -619,7 +620,7 @@ impl Operation for ConnectOp {
                         sender.location.ok_or(ConnectionError::LocationUnknown)?,
                         sender.peer,
                     );
-                    tracing::debug!(tx = %id, "Opened connection with peer {}", by_peer.peer);
+                    tracing::debug!(tx = %id, from = %by_peer.peer, "Opened connection with peer");
                     if target != gateway {
                         new_state = None;
                     }
@@ -627,7 +628,7 @@ impl Operation for ConnectOp {
                 ConnectMsg::Connected { target, sender, id } => {
                     match self.state {
                         Some(ConnectState::OCReceived) => {
-                            tracing::debug!(tx = %id, "Acknowledge connected at peer {}", target.peer);
+                            tracing::debug!(tx = %id, at = %target.peer, "Acknowledge connected at peer");
                             return_msg = None;
                         }
                         Some(other_state) => {
@@ -640,9 +641,9 @@ impl Operation for ConnectOp {
                     };
                     tracing::info!(
                         tx = %id,
+                        at = %target.peer,
                         assigned_location = ?op_storage.ring.own_location().location,
-                        "Successfully completed connection @ {}",
-                        target.peer,
+                        "Successfully completed connection",
                     );
                     network_bridge.add_connection(sender.peer).await?;
                     op_storage.ring.add_connection(
@@ -687,13 +688,13 @@ fn try_returning_proxy_connection(
     let new_state = if accepted_by.contains(own_loc) {
         tracing::debug!(
             tx = %id,
-            "Return to {}, connected at proxy {}",
-            sender.peer,
-            own_loc.peer,
+            to = % sender.peer,
+            proxy = %own_loc.peer,
+            "Return message, connected at proxy",
         );
         Some(ConnectState::OCReceived)
     } else {
-        tracing::debug!(tx = %id, "Failed to connect at proxy {}", sender.peer);
+        tracing::debug!(tx = %id, proxy = % sender.peer, "Failed to connect at proxy");
         None
     };
     let return_msg = Some(ConnectMsg::Response {
@@ -718,7 +719,7 @@ async fn propagate_oc_to_accepted_peers<NB: NetworkBridge>(
             .location
             .ok_or(ConnectionError::LocationUnknown)?,
     ) {
-        tracing::info!(tx = %id, from = %sender.peer, "Establishing connection to {}", other_peer.peer);
+        tracing::info!(tx = %id, from = %sender.peer, to = %other_peer.peer, "Established connection");
         network_bridge.add_connection(other_peer.peer).await?;
         op_storage.ring.add_connection(
             other_peer
@@ -732,7 +733,7 @@ async fn propagate_oc_to_accepted_peers<NB: NetworkBridge>(
             let _ = network_bridge.send(&other_peer.peer, msg.into()).await;
         }
     } else {
-        tracing::debug!(tx = %id, "Not accepting connection to {}", other_peer.peer);
+        tracing::debug!(tx = %id, from = %sender.peer, to = %other_peer.peer, "Not accepting connection to");
     }
 
     Ok(())
@@ -839,9 +840,8 @@ where
     tracing::info!(
         tx = %id,
         %this_peer,
-        "Connecting to gateway {} (at {})",
-        gateway.peer,
-        gateway.location.ok_or(ConnectionError::LocationUnknown)?,
+        gateway = %gateway,
+        "Connecting to gateway",
     );
 
     conn_bridge.add_connection(gateway.peer).await?;
@@ -940,9 +940,9 @@ where
         });
         tracing::debug!(
             tx = %id,
-            "Forwarding connect request from sender {} to {}",
-            req_peer.peer,
-            forward_to.peer
+            sender = %req_peer.peer,
+            forward_target = %forward_to.peer,
+            "Forwarding connect request from sender to other peer",
         );
         network_bridge.send(&forward_to.peer, forwarded).await?;
         // awaiting for responses from forward nodes
@@ -1173,7 +1173,7 @@ mod test {
     /// Given a network of N peers all good connectivity
     #[tokio::test(flavor = "multi_thread")]
     async fn network_should_achieve_good_connectivity() -> Result<(), anyhow::Error> {
-        // crate::config::set_logger();
+        crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 2usize;
         let mut sim_nw = SimNetwork::new(

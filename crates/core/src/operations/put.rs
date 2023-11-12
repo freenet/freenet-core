@@ -11,13 +11,12 @@ use freenet_stdlib::prelude::*;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
-use super::{OpEnum, OpError, OpOutcome, OperationResult};
+use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::ClientId,
     contract::ContractHandlerEvent,
     message::{InnerMessage, Message, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
-    operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
