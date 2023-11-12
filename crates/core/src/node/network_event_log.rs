@@ -48,6 +48,7 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
     {
         self as _
     }
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()>;
 }
 
 #[cfg(feature = "trace-ot")]
@@ -76,6 +77,15 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
 
     fn trait_clone(&self) -> Box<dyn NetEventRegister> {
         Box::new(self.clone())
+    }
+
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
+        async move {
+            for reg in &mut self.0 {
+                reg.notify_of_time_out(tx);
+            }
+        }
+        .boxed()
     }
 }
 
@@ -626,18 +636,28 @@ impl NetEventRegister for EventRegister {
     fn trait_clone(&self) -> Box<dyn NetEventRegister> {
         Box::new(self.clone())
     }
+
+    fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
+        async {}.boxed()
+    }
 }
 
 #[cfg(feature = "trace-ot")]
 mod opentelemetry_tracer {
     use std::{collections::HashMap, time::Duration};
 
-    use opentelemetry::{global, trace};
+    use opentelemetry::{
+        global,
+        trace::{self, Span},
+    };
+
+    use crate::local_node::OperationMode;
 
     use super::*;
 
     struct OTSpan {
         inner: global::BoxedSpan,
+        last_log: SystemTime,
     }
 
     impl OTSpan {
@@ -663,23 +683,28 @@ mod opentelemetry_tracer {
                 trace_id: Some(trace::TraceId::from_bytes(tx_bytes)),
                 ..Default::default()
             });
-            OTSpan { inner }
+            OTSpan {
+                inner,
+                last_log: SystemTime::now(),
+            }
         }
 
         fn add_log(&mut self, log: &NetLogMessage) {
             // NOTE: if we need to add some standard attributes in the future take a look at
             // https://docs.rs/opentelemetry-semantic-conventions/latest/opentelemetry_semantic_conventions/
-            use trace::Span;
+            let ts =
+                SystemTime::UNIX_EPOCH + Duration::from_millis(log.datetime.timestamp() as u64);
+            self.last_log = ts;
             if let Some(log_vals) = <Option<Vec<_>>>::from(log) {
-                let ts =
-                    SystemTime::UNIX_EPOCH + Duration::from_millis(log.datetime.timestamp() as u64);
-
                 self.inner.add_event_with_timestamp(
                     log.tx.transaction_type().description(),
                     ts,
                     log_vals,
                 );
             }
+        }
+        fn finish(&mut self) {
+            self.inner.end_with_timestamp(self.last_log);
         }
     }
 
@@ -716,20 +741,28 @@ mod opentelemetry_tracer {
     #[derive(Clone)]
     pub(in crate::node) struct OTEventRegister {
         log_sender: mpsc::Sender<NetLogMessage>,
+        finished_tx_notifier: mpsc::Sender<Transaction>,
     }
 
     impl OTEventRegister {
         pub fn new() -> Self {
+            let (sender, finished_tx_notifier) = mpsc::channel(100);
             let (log_sender, log_recv) = mpsc::channel(1000);
             NEW_RECORDS_TS.get_or_init(SystemTime::now);
-            GlobalExecutor::spawn(Self::record_logs(log_recv));
-            Self { log_sender }
+            GlobalExecutor::spawn(Self::record_logs(log_recv, finished_tx_notifier));
+            Self {
+                log_sender,
+                finished_tx_notifier: sender,
+            }
         }
 
-        async fn record_logs(mut log_recv: mpsc::Receiver<NetLogMessage>) {
-            use trace::Span;
-            let mut logs: HashMap<_, OTSpan> = HashMap::new();
-            while let Some(log) = log_recv.recv().await {
+        async fn record_logs(
+            mut log_recv: mpsc::Receiver<NetLogMessage>,
+            mut finished_tx_notifier: mpsc::Receiver<Transaction>,
+        ) {
+            let mut logs = HashMap::new();
+
+            fn process_log(logs: &mut HashMap<Transaction, OTSpan>, log: NetLogMessage) {
                 let span_completed = log.span_completed();
                 match logs.entry(log.tx) {
                     std::collections::hash_map::Entry::Occupied(mut val) => {
@@ -739,7 +772,7 @@ mod opentelemetry_tracer {
                         }
                         if span_completed {
                             let (_, mut completed_span) = val.remove_entry();
-                            completed_span.end_with_timestamp(SystemTime::now())
+                            completed_span.finish();
                         }
                     }
                     std::collections::hash_map::Entry::Vacant(empty) => {
@@ -748,6 +781,31 @@ mod opentelemetry_tracer {
                         // so just ignore those in case they were to happen
                         if !span_completed {
                             span.add_log(&log);
+                        }
+                    }
+                }
+            }
+
+            fn cleanup_timed_out(logs: &mut HashMap<Transaction, OTSpan>, tx: Transaction) {
+                if let Some(mut span) = logs.remove(&tx) {
+                    span.finish();
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    log_msg = log_recv.recv() => {
+                        if let Some(log) = log_msg {
+                            process_log(&mut logs, log);
+                        } else {
+                            break;
+                        }
+                    }
+                    finished_tx = finished_tx_notifier.recv() => {
+                        if let Some(tx) = finished_tx {
+                            cleanup_timed_out(&mut logs, tx);
+                        } else {
+                            break;
                         }
                     }
                 }
@@ -770,6 +828,15 @@ mod opentelemetry_tracer {
 
         fn trait_clone(&self) -> Box<dyn NetEventRegister> {
             Box::new(self.clone())
+        }
+
+        fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
+            async move {
+                if matches!(crate::config::Config::node_mode(), OperationMode::Network) {
+                    let _ = self.finished_tx_notifier.send(tx).await;
+                }
+            }
+            .boxed()
         }
     }
 }
@@ -1096,6 +1163,10 @@ pub(super) mod test {
 
         fn trait_clone(&self) -> Box<dyn NetEventRegister> {
             Box::new(self.clone())
+        }
+
+        fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
+            async {}.boxed()
         }
     }
 

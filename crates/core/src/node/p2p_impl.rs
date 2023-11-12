@@ -72,14 +72,14 @@ impl NodeP2P {
             .await
     }
 
-    pub(crate) async fn build<CH, const CLIENTS: usize, EL>(
+    pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
         builder: NodeBuilder<CLIENTS>,
-        event_listener: EL,
+        event_register: ER,
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
         CH: ContractHandler + Send + 'static,
-        EL: NetEventRegister + Clone,
+        ER: NetEventRegister + Clone,
     {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
@@ -88,11 +88,12 @@ impl NodeP2P {
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
 
-        let op_storage = Arc::new(OpManager::new::<CLIENTS, EL>(
+        let op_storage = Arc::new(OpManager::new(
             notification_tx,
             ch_outbound,
             &builder,
             &gateways,
+            event_register.clone(),
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_storage.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
@@ -101,7 +102,7 @@ impl NodeP2P {
 
         let conn_manager = {
             let transport = Self::config_transport(&builder.local_key)?;
-            P2pConnManager::build(transport, &builder, op_storage.clone(), event_listener)?
+            P2pConnManager::build(transport, &builder, op_storage.clone(), event_register)?
         };
 
         let parent_span = tracing::Span::current();

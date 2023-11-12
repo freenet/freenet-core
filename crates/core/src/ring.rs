@@ -311,6 +311,7 @@ impl Ring {
         interval.tick().await;
         loop {
             interval.tick().await;
+            // fixme
             let history = if std::any::type_name::<EL>() == std::any::type_name::<EventRegister>() {
                 EventRegister::get_router_events(10_000)
                     .await

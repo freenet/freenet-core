@@ -157,7 +157,7 @@ impl Config {
             .store(local_mode, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn node_mode() -> OperationMode {
+    pub fn node_mode() -> OperationMode {
         if Self::conf()
             .local_mode
             .load(std::sync::atomic::Ordering::SeqCst)

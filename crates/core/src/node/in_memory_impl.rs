@@ -32,7 +32,7 @@ pub(super) struct NodeInMemory {
     gateways: Vec<PeerKeyLocation>,
     notification_channel: EventLoopNotifications,
     conn_manager: MemoryConnManager,
-    event_listener: Box<dyn NetEventRegister>,
+    event_register: Box<dyn NetEventRegister>,
     is_gateway: bool,
     _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     /// Span to use for this node for tracing purposes
@@ -41,13 +41,12 @@ pub(super) struct NodeInMemory {
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub async fn build<EL: NetEventRegister>(
+    pub async fn build<ER: NetEventRegister + Clone>(
         builder: NodeBuilder<1>,
-        event_listener: EL,
+        event_register: ER,
         ch_builder: String,
         add_noise: bool,
     ) -> Result<NodeInMemory, anyhow::Error> {
-        let event_listener = Box::new(event_listener);
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
@@ -55,11 +54,12 @@ impl NodeInMemory {
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
 
-        let op_storage = Arc::new(OpManager::new::<1, EL>(
+        let op_storage = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &builder,
             &gateways,
+            event_register.clone(),
         )?);
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =
@@ -67,9 +67,10 @@ impl NodeInMemory {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 
+        let event_register = Box::new(event_register);
         let conn_manager = MemoryConnManager::new(
             peer_key,
-            event_listener.trait_clone(),
+            event_register.trait_clone(),
             op_storage.clone(),
             add_noise,
         );
@@ -86,7 +87,7 @@ impl NodeInMemory {
             op_storage,
             gateways,
             notification_channel,
-            event_listener,
+            event_register,
             is_gateway,
             _executor_listener,
             parent_span,
@@ -223,7 +224,7 @@ impl NodeInMemory {
                     NodeEvent::ShutdownNode => break Ok(()),
                     NodeEvent::DropConnection(peer) => {
                         tracing::info!("Dropping connection to {peer}");
-                        self.event_listener
+                        self.event_register
                             .register_events(Either::Left(NetEventLog::disconnected(&peer)));
                         self.op_storage.ring.prune_connection(peer);
                         continue;
@@ -239,7 +240,7 @@ impl NodeInMemory {
                         &self.op_storage,
                         None,
                         None,
-                        &mut *self.event_listener as &mut _,
+                        &mut *self.event_register as &mut _,
                     )
                     .await;
                     continue;
@@ -248,7 +249,7 @@ impl NodeInMemory {
 
             let op_storage = self.op_storage.clone();
             let conn_manager = self.conn_manager.clone();
-            let event_listener = self.event_listener.trait_clone();
+            let event_listener = self.event_register.trait_clone();
 
             let parent_span = tracing::Span::current();
             let span = tracing::info_span!(
