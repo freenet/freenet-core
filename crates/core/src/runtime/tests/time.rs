@@ -11,7 +11,7 @@ fn now() -> Result<(), Box<dyn std::error::Error>> {
         delegate_store,
         secrets_store,
         contract_key,
-        temp_dir: _,
+        temp_dir,
     } = super::setup_test_contract("test_contract_2")?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
@@ -22,5 +22,6 @@ fn now() -> Result<(), Box<dyn std::error::Error>> {
         .get_function("time_func")?
         .typed(&runtime.wasm_store)?;
     f.call(&mut runtime.wasm_store)?;
+    std::mem::drop(temp_dir);
     Ok(())
 }

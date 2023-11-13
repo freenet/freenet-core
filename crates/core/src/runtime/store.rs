@@ -337,9 +337,10 @@ mod tests {
         sync::{Arc, Barrier},
     };
 
+    use crate::util::tests_util::get_temp_dir;
+
     use super::*;
     use dashmap::DashMap;
-    use tempfile::TempDir;
 
     struct TestStore1;
 
@@ -375,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_store() {
-        let temp_dir = TempDir::new().expect("Failed to create a temporary directory");
+        let temp_dir = crate::util::tests_util::get_temp_dir();
         let contract_keys_file_path = temp_dir.path().join("contract_keys");
         let delegate_keys_file_path = temp_dir.path().join("delegate_keys");
 
@@ -453,7 +454,7 @@ mod tests {
     fn test_concurrent_updates() {
         const NUM_THREADS: usize = 4;
 
-        let temp_dir = TempDir::new().expect("Failed to create a temporary directory");
+        let temp_dir = get_temp_dir();
         let contract_keys_file_path = temp_dir.path().join("contract_keys");
         std::fs::File::create(&contract_keys_file_path).expect("Failed to create file");
 
@@ -513,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_compaction() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = get_temp_dir();
         let key_file_path = temp_dir.path().join("data.dat");
         std::fs::File::create(&key_file_path).expect("Failed to create file");
 

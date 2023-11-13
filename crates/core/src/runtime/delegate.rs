@@ -390,7 +390,8 @@ mod test {
     use freenet_stdlib::prelude::*;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
-    use tempfile::TempDir;
+
+    use crate::util::tests_util::get_temp_dir;
 
     use super::super::{delegate_store::DelegateStore, ContractStore, SecretsStore};
     use super::*;
@@ -416,9 +417,9 @@ mod test {
 
     fn setup_runtime(
         name: &str,
-    ) -> Result<(DelegateContainer, Runtime, TempDir), Box<dyn std::error::Error>> {
+    ) -> Result<(DelegateContainer, Runtime, tempfile::TempDir), Box<dyn std::error::Error>> {
         // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-        let temp_dir = TempDir::new().expect("Failed to create a temporary directory");
+        let temp_dir = get_temp_dir();
         let contracts_dir = temp_dir.path().join("contracts");
         let delegates_dir = temp_dir.path().join("delegates");
         let secrets_dir = temp_dir.path().join("secrets");
@@ -455,7 +456,7 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_1)?;
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_1)?;
         let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // CreateInboxRequest message parts
@@ -489,6 +490,7 @@ mod test {
             outbound.get(0),
             Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
+        std::mem::drop(temp_dir);
         Ok(())
     }
 }

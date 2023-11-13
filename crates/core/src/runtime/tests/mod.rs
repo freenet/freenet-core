@@ -7,7 +7,8 @@ use std::{
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
 };
-use tempfile::TempDir;
+
+use crate::util::tests_util::get_temp_dir;
 
 use super::{ContractStore, DelegateStore, SecretsStore};
 
@@ -49,7 +50,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
 
 pub(crate) struct TestSetup {
     #[allow(unused)]
-    temp_dir: TempDir,
+    temp_dir: tempfile::TempDir,
     contract_store: ContractStore,
     delegate_store: DelegateStore,
     secrets_store: SecretsStore,
@@ -58,7 +59,7 @@ pub(crate) struct TestSetup {
 
 pub(crate) fn setup_test_contract(name: &str) -> Result<TestSetup, Box<dyn std::error::Error>> {
     // let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let temp_dir = TempDir::new().expect("Failed to create a temporary directory");
+    let temp_dir = get_temp_dir();
 
     let mut contract_store = ContractStore::new(temp_dir.path().join("contract"), 10_000)?;
     let delegate_store = DelegateStore::new(temp_dir.path().join("delegate"), 10_000)?;
