@@ -1,3 +1,5 @@
+use crate::resources::rate::Rate;
+use std::time::Duration;
 use std::{collections::VecDeque, time::Instant};
 
 #[derive(Clone, Debug)]
@@ -37,25 +39,19 @@ impl RunningAverage {
         }
     }
 
-    pub fn per_second_measurement(&self) -> f64 {
-        self.per_second_measurement_with_time(Instant::now())
+    pub fn get_rate(&self) -> Option<Rate> {
+        self.get_rate_at_time(Instant::now())
     }
 
-    pub fn per_second_measurement_with_time(&self, now: Instant) -> f64 {
+    fn get_rate_at_time(&self, now: Instant) -> Option<Rate> {
         if self.samples.is_empty() {
-            return 0.0;
+            return None;
         }
-        if self.samples.len() == 1 {
-            return self.samples[0].1; // or return a custom value
-        }
-        let oldest_sample = self.samples.front().unwrap().0;
-        let sample_duration = now - oldest_sample;
-        let sample_duration_secs = sample_duration.as_secs_f64();
-        // Define a minimum time window (e.g., 1 second)
-        const MIN_TIME_WINDOW_SECS: f64 = 1.0;
-        // Use the maximum of the actual sample duration and the minimum time window as the divisor
-        let divisor = sample_duration_secs.max(MIN_TIME_WINDOW_SECS);
-        self.sum_samples / divisor
+        let oldest_sample_time = self.samples.front().unwrap().0;
+        let sample_duration = now - oldest_sample_time;
+        const MINIMUM_TIME_WINDOW: Duration = Duration::from_secs(1);
+        let divisor = sample_duration.max(MINIMUM_TIME_WINDOW);
+        Some(Rate::new(self.sum_samples, divisor))
     }
 
     pub fn total_sample_count(&self) -> usize {
@@ -100,12 +96,15 @@ mod tests {
         let now = Instant::now();
 
         // Test with no samples
-        assert_eq!(running_avg.per_second_measurement_with_time(now), 0.0);
+        assert!(running_avg.get_rate_at_time(now).is_none());
 
         // Test with one sample
         running_avg.insert_with_time(now, 2.0);
         assert_eq!(
-            running_avg.per_second_measurement_with_time(now + Duration::from_secs(1)),
+            running_avg
+                .get_rate_at_time(now + Duration::from_secs(1))
+                .unwrap()
+                .per_second(),
             2.0
         );
 
@@ -113,14 +112,20 @@ mod tests {
         running_avg.insert_with_time(now + Duration::from_secs(1), 4.0);
         running_avg.insert_with_time(now + Duration::from_secs(2), 6.0);
         assert_eq!(
-            running_avg.per_second_measurement_with_time(now + Duration::from_secs(3)),
+            running_avg
+                .get_rate_at_time(now + Duration::from_secs(3))
+                .unwrap()
+                .per_second(),
             4.0
         );
 
         // Test with max_samples exceeded
         running_avg.insert_with_time(now + Duration::from_secs(3), 8.0);
         assert_eq!(
-            running_avg.per_second_measurement_with_time(now + Duration::from_secs(4)),
+            running_avg
+                .get_rate_at_time(now + Duration::from_secs(4))
+                .unwrap()
+                .per_second(),
             6.0
         );
     }
