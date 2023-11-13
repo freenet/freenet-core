@@ -315,6 +315,7 @@ impl NetLogMessage {
     /// Signals whether this message closes a transaction span.
     ///
     /// In case of isolated events where the span is not being tracked it should return true.
+    #[cfg(feature = "trace-ot")]
     fn span_completed(&self) -> bool {
         match &self.kind {
             EventKind::Connect(ConnectEvent::Finished { .. }) => true,

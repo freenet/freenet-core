@@ -10,7 +10,7 @@ use crate::{
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, Message, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
-    operations::{Operation, OpInitialization},
+    operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
 };

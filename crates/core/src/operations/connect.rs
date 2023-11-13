@@ -1186,7 +1186,7 @@ mod test {
     /// Given a network of N peers all good connectivity
     #[tokio::test(flavor = "multi_thread")]
     async fn network_should_achieve_good_connectivity() -> Result<(), anyhow::Error> {
-        crate::config::set_logger();
+        // crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 2usize;
         let mut sim_nw = SimNetwork::new(

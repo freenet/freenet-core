@@ -14,13 +14,12 @@ use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, Instrument};
 
+#[cfg(feature = "trace-ot")]
+use crate::node::network_event_log::{CombinedRegister, NetEventRegister};
 use crate::{
     client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
-    node::{
-        network_event_log::{CombinedRegister, TestEventListener},
-        InitPeerNode, NetEventRegister, NodeBuilder, NodeInMemory,
-    },
+    node::{network_event_log::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
 };
 

@@ -59,10 +59,12 @@ impl Transaction {
         self.elapsed() >= crate::config::OPERATION_TTL
     }
 
+    #[cfg(feature = "trace-ot")]
     pub fn started(&self) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_millis(self.id.timestamp_ms())
     }
 
+    #[cfg(feature = "trace-ot")]
     pub fn as_bytes(&self) -> [u8; 16] {
         self.id.0.to_le_bytes()
     }

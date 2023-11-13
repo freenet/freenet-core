@@ -239,32 +239,15 @@ impl<'x> Contains<PeerKey> for &'x [&PeerKey] {
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::atomic::AtomicU64;
 
-    use rand::{Rng, RngCore};
     use tempfile::TempDir;
 
     /// Use this to guarantee unique directory names in case you are running multiple tests in parallel.
     pub fn get_temp_dir() -> TempDir {
-        static TEST_NUM: AtomicU64 = AtomicU64::new(0);
-        use rand::SeedableRng;
-        const CHARS: &str = "abcdefghijklmnopqrstuvwxyz";
-        let len = CHARS.chars().count();
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(
-            rand::rngs::OsRng
-                .next_u64()
-                .wrapping_add(TEST_NUM.fetch_add(1, std::sync::atomic::Ordering::SeqCst)),
-        );
-        tempfile::Builder::new()
-            .suffix(
-                &(0..8)
-                    .map(|_| {
-                        let idx = rng.gen_range(0..len);
-                        CHARS.chars().nth(idx).unwrap()
-                    })
-                    .collect::<String>(),
-            )
+        let dir = tempfile::Builder::new()
             .tempdir()
-            .expect("Failed to create a temporary directory")
+            .expect("Failed to create a temporary directory");
+        eprintln!("Created temp dir: {:?}", dir.path());
+        dir
     }
 }
