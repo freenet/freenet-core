@@ -1,3 +1,68 @@
+//! # Resource Management
+//!
+//! The resource management module is responsible for tracking resource usage,
+//! ensuring that usage does not exceed specified limits, and ensure that those
+//! resources are used to maximize the utility of the network.
+//!
+//! ## Resources
+//!
+//! The resource management module tracks usage of the following resources:
+//!
+//! * Upstream and downstream bandwidth
+//! * CPU usage
+//!
+//! These resources will be tracked in the future:
+//!
+//! * Memory usage
+//! * Storage
+//!
+//! ## Attribution
+//!
+//! When used this resource usage is attributed to either:
+//!
+//! * Remote
+//!   * A connected peer
+//! * Local
+//!   * A local delegate
+//!   * The user interface
+//!
+//! ## Resource allocation for contract subscriptions
+//!
+//! When one or more peers are subscribed to a contract, the required
+//! resources will be allocated as follows:
+//!
+//! * Upstream bandwidth is allocated to the subscribed peer to which
+//!   the data is sent
+//! * Downstream bandwidth and CPU is split evenly between all subscribed
+//!   peers for that contract
+//!
+//! ## Resource limits
+//!
+//! Resource limits should be set to ensure that the peer does not disrupt the
+//! user's experience of their computer. We should choose intelligent defaults
+//! but the limits should be user-configurable.
+//!
+//! ## Code component overview
+//!
+//! The [ResourceManager] is responsible for tracking resource usage and identifying
+//! which peers to remove if/when limits are exceeded. It does this by identifying
+//! the peers with the highest usage of the limit-exceeding resource relative to
+//! their usefulness. The usefulness of a peer is determined by the number of
+//! requests sent to that peer over a certain period of time.
+//!
+//! A [Meter] is used by the ResourceManager to tracking resource usage over time.
+//! Resource usage is reported to the meter, which tracks the usage over a sliding
+//! window of time. The meter is responsible for calculating the rate of resource
+//! usage along with which peers (or delegates, or UIs) are responsible for that
+//! usage.
+//!
+//! ## Future Improvements
+//!
+//! * Track non-flow resources like memory and storage
+//! * Responses to specific requests will contain information about the resources used
+//!   by downstream peers to fulfill the request, however how this information is used
+//!   will require careful consideration.
+
 mod meter;
 pub mod rate;
 mod running_average;
