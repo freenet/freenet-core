@@ -3,6 +3,7 @@ use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 use dashmap::{DashMap, DashSet};
 use either::Either;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::{
     config::GlobalExecutor,
@@ -16,7 +17,7 @@ use crate::{
     ring::{LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, EventLogRegister, NodeBuilder, PeerKey};
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeBuilder, PeerKey};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -58,21 +59,27 @@ pub(crate) struct OpManager {
 }
 
 impl OpManager {
-    pub(super) fn new<const CLIENTS: usize, EL: EventLogRegister>(
+    pub(super) fn new<const CLIENTS: usize, ER: NetEventRegister>(
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
         builder: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
+        event_register: ER,
     ) -> Result<Self, anyhow::Error> {
-        let ring = Ring::new::<CLIENTS, EL>(builder, gateways, notification_channel.clone())?;
+        let ring = Ring::new::<CLIENTS, ER>(builder, gateways, notification_channel.clone())?;
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
-        GlobalExecutor::spawn(garbage_cleanup_task(
-            rx,
-            ops.clone(),
-            ring.live_tx_tracker.clone(),
-        ));
+        let parent_span = tracing::Span::current();
+        GlobalExecutor::spawn(
+            garbage_cleanup_task(
+                rx,
+                ops.clone(),
+                ring.live_tx_tracker.clone(),
+                event_register,
+            )
+            .instrument(tracing::info_span!(parent: parent_span, "garbage_cleanup_task")),
+        );
 
         Ok(Self {
             ring,
@@ -213,11 +220,11 @@ impl OpManager {
     }
 }
 
-#[tracing::instrument(skip_all)]
-async fn garbage_cleanup_task(
+async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
     ops: Arc<Ops>,
     live_tx_tracker: LiveTransactionTracker,
+    mut event_register: ER,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -225,11 +232,16 @@ async fn garbage_cleanup_task(
 
     let mut ttl_set = BTreeSet::new();
 
-    let remove_old = move |ttl_set: &mut BTreeSet<Reverse<Transaction>>,
-                           delayed: &mut Vec<Transaction>| {
+    let mut remove_old = move |ttl_set: &mut BTreeSet<Reverse<Transaction>>,
+                               delayed: &mut Vec<Transaction>| {
         let mut old_missing = std::mem::replace(delayed, Vec::with_capacity(200));
         for tx in old_missing.drain(..) {
-            if ops.completed.remove(&tx).is_some() {
+            if let Some(tx) = ops.completed.remove(&tx) {
+                if cfg!(feature = "trace-ot") {
+                    event_register.notify_of_time_out(tx);
+                } else {
+                    _ = tx;
+                }
                 continue;
             }
             let still_waiting = match tx.transaction_type() {
@@ -258,7 +270,12 @@ async fn garbage_cleanup_task(
                 delayed.push(tx);
                 continue;
             }
-            if ops.completed.remove(&tx).is_some() {
+            if let Some(tx) = ops.completed.remove(&tx) {
+                if cfg!(feature = "trace-ot") {
+                    event_register.notify_of_time_out(tx);
+                } else {
+                    _ = tx;
+                }
                 continue;
             }
             let removed = match tx.transaction_type() {

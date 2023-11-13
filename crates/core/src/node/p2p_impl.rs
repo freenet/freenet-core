@@ -9,11 +9,12 @@ use libp2p::{
     identity::Keypair,
     noise, tcp, yamux, PeerId, Transport,
 };
+use tracing::Instrument;
 
 use super::{
     client_event_handling, join_ring_request,
     network_bridge::{p2p_protoc::P2pConnManager, EventLoopNotifications},
-    EventLogRegister, PeerKey,
+    NetEventRegister, PeerKey,
 };
 use crate::{
     client_events::combinator::ClientEventsCombinator,
@@ -71,14 +72,14 @@ impl NodeP2P {
             .await
     }
 
-    pub(crate) async fn build<CH, const CLIENTS: usize, EL>(
+    pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
         builder: NodeBuilder<CLIENTS>,
-        event_listener: EL,
+        event_register: ER,
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
     where
-        CH: ContractHandler + Send + Sync + 'static,
-        EL: EventLogRegister + Clone,
+        CH: ContractHandler + Send + 'static,
+        ER: NetEventRegister + Clone,
     {
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
@@ -87,11 +88,12 @@ impl NodeP2P {
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
 
-        let op_storage = Arc::new(OpManager::new::<CLIENTS, EL>(
+        let op_storage = Arc::new(OpManager::new(
             notification_tx,
             ch_outbound,
             &builder,
             &gateways,
+            event_register.clone(),
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_storage.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
@@ -100,16 +102,19 @@ impl NodeP2P {
 
         let conn_manager = {
             let transport = Self::config_transport(&builder.local_key)?;
-            P2pConnManager::build(transport, &builder, op_storage.clone(), event_listener)?
+            P2pConnManager::build(transport, &builder, op_storage.clone(), event_register)?
         };
 
-        GlobalExecutor::spawn(contract::contract_handling(contract_handler));
+        let parent_span = tracing::Span::current();
+        GlobalExecutor::spawn(
+            contract::contract_handling(contract_handler)
+                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+        );
         let clients = ClientEventsCombinator::new(builder.clients);
-        GlobalExecutor::spawn(client_event_handling(
-            op_storage.clone(),
-            clients,
-            client_responses,
-        ));
+        GlobalExecutor::spawn(
+            client_event_handling(op_storage.clone(), clients, client_responses)
+                .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
+        );
 
         Ok(NodeP2P {
             peer_key,
@@ -154,7 +159,7 @@ mod test {
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
         contract::MemoryContractHandler,
-        node::{event_log, tests::get_free_port, InitPeerNode},
+        node::{network_event_log, tests::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -213,7 +218,7 @@ mod test {
             let mut peer1 = Box::new(
                 NodeP2P::build::<MemoryContractHandler, 1, _>(
                     config,
-                    event_log::TestEventListener::new(),
+                    network_event_log::TestEventListener::new(),
                     "ping-listener".into(),
                 )
                 .await?,
@@ -230,7 +235,7 @@ mod test {
             config.add_gateway(peer1_config.clone());
             let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1, _>(
                 config,
-                event_log::TestEventListener::new(),
+                network_event_log::TestEventListener::new(),
                 "ping-dialer".into(),
             )
             .await

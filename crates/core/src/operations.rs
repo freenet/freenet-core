@@ -1,10 +1,10 @@
 #[cfg(debug_assertions)]
 use std::backtrace::Backtrace as StdTrace;
-use std::time::Duration;
+use std::{pin::Pin, time::Duration};
 
+use futures::{future::BoxFuture, Future};
 use tokio::sync::mpsc::error::SendError;
 
-use self::op_trait::Operation;
 use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
@@ -16,7 +16,6 @@ use crate::{
 
 pub(crate) mod connect;
 pub(crate) mod get;
-pub(crate) mod op_trait;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 pub(crate) mod update;
@@ -253,4 +252,29 @@ impl<T> From<SendError<T>> for OpError {
     fn from(_: SendError<T>) -> OpError {
         OpError::NotificationError
     }
+}
+
+pub(crate) trait Operation
+where
+    Self: Sized + TryInto<Self::Result>,
+{
+    type Message: InnerMessage + std::fmt::Display;
+
+    type Result;
+
+    fn load_or_init<'a>(
+        op_storage: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
+
+    fn id(&self) -> &Transaction;
+
+    #[allow(clippy::type_complexity)]
+    fn process_message<'a, CB: NetworkBridge>(
+        self,
+        conn_manager: &'a mut CB,
+        op_storage: &'a OpManager,
+        input: &'a Self::Message,
+        client_id: Option<ClientId>,
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }

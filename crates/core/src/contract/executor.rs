@@ -32,7 +32,7 @@ use crate::runtime::{
 use crate::{
     client_events::{ClientId, HostResult},
     node::NodeConfig,
-    operations::{self, op_trait::Operation},
+    operations::{self, Operation},
     DynError,
 };
 
@@ -87,6 +87,15 @@ impl From<ExecutorError> for DynError {
         match value.0 {
             Either::Left(l) => l as DynError,
             Either::Right(r) => r,
+        }
+    }
+}
+
+impl From<ExecutorError> for anyhow::Error {
+    fn from(value: ExecutorError) -> Self {
+        match value.0 {
+            Either::Left(l) => anyhow::Error::new(*l),
+            Either::Right(r) => anyhow::Error::msg(r),
         }
     }
 }
@@ -219,7 +228,7 @@ struct UpdateContract {
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {}
 
 #[async_trait::async_trait]
-pub(crate) trait ContractExecutor: Send + Sync + 'static {
+pub(crate) trait ContractExecutor: Send + 'static {
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -229,6 +238,7 @@ pub(crate) trait ContractExecutor: Send + Sync + 'static {
         &mut self,
         contract: ContractContainer,
     ) -> Result<(), crate::runtime::ContractError>;
+
     async fn upsert_contract_state(
         &mut self,
         key: ContractKey,

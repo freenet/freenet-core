@@ -10,10 +10,10 @@ use crate::{
     build::*,
     config::{ContractKind, NewPackageCliConfig},
     util::pipe_std_streams,
-    DynError, Error,
+    Error,
 };
 
-pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), DynError> {
+pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), anyhow::Error> {
     let cwd = env::current_dir()?;
     match config.kind {
         ContractKind::WebApp => create_view_package(&cwd)?,
@@ -22,7 +22,7 @@ pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), DynError> {
     Ok(())
 }
 
-fn create_view_package(cwd: &Path) -> Result<(), DynError> {
+fn create_view_package(cwd: &Path) -> Result<(), anyhow::Error> {
     create_rust_crate(cwd, ContractKind::WebApp)?;
     create_web_init_files(cwd)?;
     let freenet_file_config = BuildToolConfig {
@@ -50,7 +50,7 @@ fn create_view_package(cwd: &Path) -> Result<(), DynError> {
     Ok(())
 }
 
-fn create_regular_contract(cwd: &Path) -> Result<(), DynError> {
+fn create_regular_contract(cwd: &Path) -> Result<(), anyhow::Error> {
     create_rust_crate(cwd, ContractKind::Contract)?;
     let freenet_file_config = BuildToolConfig {
         contract: Contract {
@@ -68,7 +68,7 @@ fn create_regular_contract(cwd: &Path) -> Result<(), DynError> {
     Ok(())
 }
 
-fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), DynError> {
+fn create_rust_crate(cwd: &Path, kind: ContractKind) -> Result<(), anyhow::Error> {
     let (dest_path, cmd) = match kind {
         ContractKind::WebApp => (cwd.join("container"), &["new"]),
         ContractKind::Contract => (cwd.to_owned(), &["init"]),
@@ -140,7 +140,7 @@ const TSC: &str = "tsc.cmd";
 #[cfg(unix)]
 const TSC: &str = "tsc";
 
-fn create_web_init_files(cwd: &Path) -> Result<(), DynError> {
+fn create_web_init_files(cwd: &Path) -> Result<(), anyhow::Error> {
     let child = Command::new(NPM)
         .args(["init", "--force"])
         .stdout(Stdio::piped())

@@ -59,6 +59,16 @@ impl Transaction {
         self.elapsed() >= crate::config::OPERATION_TTL
     }
 
+    #[cfg(feature = "trace-ot")]
+    pub fn started(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(self.id.timestamp_ms())
+    }
+
+    #[cfg(feature = "trace-ot")]
+    pub fn as_bytes(&self) -> [u8; 16] {
+        self.id.0.to_le_bytes()
+    }
+
     fn elapsed(&self) -> Duration {
         let current_unix_epoch_ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -166,15 +176,21 @@ mod sealed_msg_type {
         Update = 4,
     }
 
+    impl TransactionType {
+        pub fn description(&self) -> &'static str {
+            match self {
+                TransactionType::Connect => "connect",
+                TransactionType::Put => "put",
+                TransactionType::Get => "get",
+                TransactionType::Subscribe => "subscribe",
+                TransactionType::Update => "update",
+            }
+        }
+    }
+
     impl Display for TransactionType {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                TransactionType::Connect => write!(f, "join ring"),
-                TransactionType::Put => write!(f, "put"),
-                TransactionType::Get => write!(f, "get"),
-                TransactionType::Subscribe => write!(f, "subscribe"),
-                TransactionType::Update => write!(f, "update"),
-            }
+            write!(f, "{}", self.description())
         }
     }
 

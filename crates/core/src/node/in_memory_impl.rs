@@ -2,14 +2,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use either::Either;
 use freenet_stdlib::prelude::*;
+use tracing::Instrument;
 
 use super::{
-    client_event_handling,
-    event_log::EventLog,
-    handle_cancelled_op, join_ring_request,
+    client_event_handling, handle_cancelled_op, join_ring_request,
     network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
+    network_event_log::NetEventLog,
     op_state_manager::OpManager,
-    process_message, EventLogRegister, PeerKey,
+    process_message, NetEventRegister, PeerKey,
 };
 use crate::{
     client_events::ClientEventsProxy,
@@ -32,20 +32,21 @@ pub(super) struct NodeInMemory {
     gateways: Vec<PeerKeyLocation>,
     notification_channel: EventLoopNotifications,
     conn_manager: MemoryConnManager,
-    event_listener: Box<dyn EventLogRegister + Send + Sync + 'static>,
+    event_register: Box<dyn NetEventRegister>,
     is_gateway: bool,
     _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+    /// Span to use for this node for tracing purposes
+    pub parent_span: tracing::Span,
 }
 
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
-    pub async fn build<EL: EventLogRegister>(
+    pub async fn build<ER: NetEventRegister + Clone>(
         builder: NodeBuilder<1>,
-        event_listener: EL,
+        event_register: ER,
         ch_builder: String,
         add_noise: bool,
     ) -> Result<NodeInMemory, anyhow::Error> {
-        let event_listener = Box::new(event_listener);
         let peer_key = PeerKey::from(builder.local_key.public());
         let gateways = builder.get_gateways()?;
         let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
@@ -53,11 +54,12 @@ impl NodeInMemory {
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
 
-        let op_storage = Arc::new(OpManager::new::<1, EL>(
+        let op_storage = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &builder,
             &gateways,
+            event_register.clone(),
         )?);
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =
@@ -65,14 +67,19 @@ impl NodeInMemory {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 
+        let event_register = Box::new(event_register);
         let conn_manager = MemoryConnManager::new(
             peer_key,
-            event_listener.trait_clone(),
+            event_register.trait_clone(),
             op_storage.clone(),
             add_noise,
         );
 
-        GlobalExecutor::spawn(contract::contract_handling(contract_handler));
+        let parent_span = tracing::Span::current();
+        GlobalExecutor::spawn(
+            contract::contract_handling(contract_handler)
+                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+        );
 
         Ok(NodeInMemory {
             peer_key,
@@ -80,15 +87,16 @@ impl NodeInMemory {
             op_storage,
             gateways,
             notification_channel,
-            event_listener,
+            event_register,
             is_gateway,
             _executor_listener,
+            parent_span,
         })
     }
 
     pub async fn run_node<UsrEv>(&mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
     where
-        UsrEv: ClientEventsProxy + Send + Sync + 'static,
+        UsrEv: ClientEventsProxy + Send + 'static,
     {
         if !self.is_gateway {
             if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {
@@ -105,12 +113,15 @@ impl NodeInMemory {
             }
         }
         let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
-        GlobalExecutor::spawn(client_event_handling(
-            self.op_storage.clone(),
-            user_events,
-            client_responses,
-        ));
-        self.run_event_listener(cli_response_sender).await
+        let parent_span = self.parent_span.clone();
+        GlobalExecutor::spawn(
+            client_event_handling(self.op_storage.clone(), user_events, client_responses)
+                .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
+        );
+        let parent_span = self.parent_span.clone();
+        self.run_event_listener(cli_response_sender)
+            .instrument(parent_span)
+            .await
     }
 
     pub async fn append_contracts<'a>(
@@ -160,7 +171,6 @@ impl NodeInMemory {
     }
 
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
-    #[tracing::instrument(name = "memory_event_listener", skip_all)]
     async fn run_event_listener(
         &mut self,
         _client_responses: ClientResponsesSender, // fixme: use this
@@ -209,13 +219,13 @@ impl NodeInMemory {
             }
 
             let msg = match msg {
-                Ok(Either::Left(msg)) => Ok(msg),
+                Ok(Either::Left(msg)) => msg,
                 Ok(Either::Right(action)) => match action {
                     NodeEvent::ShutdownNode => break Ok(()),
                     NodeEvent::DropConnection(peer) => {
                         tracing::info!("Dropping connection to {peer}");
-                        self.event_listener
-                            .register_events(Either::Left(EventLog::disconnected(&peer)));
+                        self.event_register
+                            .register_events(Either::Left(NetEventLog::disconnected(&peer)));
                         self.op_storage.ring.prune_connection(peer);
                         continue;
                     }
@@ -223,14 +233,32 @@ impl NodeInMemory {
                         unreachable!("event {other:?}, shouldn't happen in the in-memory impl")
                     }
                 },
-                Err(err) => Err(err),
+                Err(err) => {
+                    super::report_result(
+                        None,
+                        Err(err.into()),
+                        &self.op_storage,
+                        None,
+                        None,
+                        &mut *self.event_register as &mut _,
+                    )
+                    .await;
+                    continue;
+                }
             };
 
             let op_storage = self.op_storage.clone();
             let conn_manager = self.conn_manager.clone();
-            let event_listener = self.event_listener.trait_clone();
+            let event_listener = self.event_register.trait_clone();
 
-            GlobalExecutor::spawn(process_message(
+            let parent_span = tracing::Span::current();
+            let span = tracing::info_span!(
+                parent: parent_span,
+                "process_network_message",
+                peer = %self.peer_key, transaction = %msg.id(),
+                tx_type = %msg.id().transaction_type()
+            );
+            let msg = process_message(
                 msg,
                 op_storage,
                 conn_manager,
@@ -238,7 +266,9 @@ impl NodeInMemory {
                 None,
                 None,
                 None,
-            ));
+            )
+            .instrument(span);
+            GlobalExecutor::spawn(msg);
         }
     }
 }

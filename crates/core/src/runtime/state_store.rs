@@ -47,7 +47,7 @@ pub struct StateStore<S: StateStorage> {
 
 impl<S> StateStore<S>
 where
-    S: StateStorage + Send + Sync + 'static,
+    S: StateStorage + Send + 'static,
     <S as StateStorage>::Error: Into<DynError>,
 {
     const AVG_STATE_SIZE: usize = 1_000;

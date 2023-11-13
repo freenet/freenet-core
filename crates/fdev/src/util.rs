@@ -6,9 +6,12 @@ use std::{
 
 use serde::de::DeserializeOwned;
 
-use crate::{local_node::DeserializationFmt, DynError};
+use crate::local_node::DeserializationFmt;
 
-pub fn deserialize<T, R>(deser_format: Option<DeserializationFmt>, data: &R) -> Result<T, DynError>
+pub fn deserialize<T, R>(
+    deser_format: Option<DeserializationFmt>,
+    data: &R,
+) -> Result<T, anyhow::Error>
 where
     T: DeserializeOwned,
     R: AsRef<[u8]> + ?Sized,
@@ -27,11 +30,11 @@ where
     }
 }
 
-pub(crate) fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
+pub(crate) fn pipe_std_streams(mut child: Child) -> Result<(), anyhow::Error> {
     let c_stdout = child.stdout.take().expect("Failed to open command stdout");
     let c_stderr = child.stderr.take().expect("Failed to open command stderr");
 
-    let write_child_stderr = move || -> Result<(), DynError> {
+    let write_child_stderr = move || -> Result<(), anyhow::Error> {
         let mut stderr = io::stderr();
         for b in c_stderr.bytes() {
             let b = b?;
@@ -40,7 +43,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
         Ok(())
     };
 
-    let write_child_stdout = move || -> Result<(), DynError> {
+    let write_child_stdout = move || -> Result<(), anyhow::Error> {
         let mut stdout = io::stdout();
         for b in c_stdout.bytes() {
             let b = b?;
@@ -55,7 +58,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> Result<(), DynError> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return Err(format!("exit with status: {status}").into());
+                    anyhow::bail!("exit with status: {status}");
                 }
                 break;
             }

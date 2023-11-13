@@ -22,7 +22,7 @@ use tracing::Instrument;
 
 #[cfg(test)]
 use self::in_memory_impl::NodeInMemory;
-use self::{event_log::EventLog, p2p_impl::NodeP2P};
+use self::{network_event_log::NetEventLog, p2p_impl::NodeP2P};
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::Config,
@@ -39,17 +39,18 @@ use crate::{
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
     util::ExponentialBackoff,
+    DynError,
 };
 
 use crate::operations::handle_op_request;
-pub(crate) use event_log::{EventLogRegister, EventRegister};
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
+pub(crate) use network_event_log::{EventRegister, NetEventRegister};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-mod event_log;
 #[cfg(test)]
 mod in_memory_impl;
 mod network_bridge;
+mod network_event_log;
 mod op_state_manager;
 mod p2p_impl;
 #[cfg(test)]
@@ -75,7 +76,7 @@ pub struct NodeConfig {
 pub struct Node(NodeP2P);
 
 impl Node {
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    pub async fn run(self) -> Result<(), DynError> {
         self.0.run_node().await?;
         Ok(())
     }
@@ -117,11 +118,7 @@ pub struct NodeBuilder<const CLIENTS: usize> {
 
 impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeBuilder<CLIENTS> {
-        let local_key = if let Some(key) = &Config::conf().local_peer_keypair {
-            key.clone()
-        } else {
-            identity::Keypair::generate_ed25519()
-        };
+        let local_key = Config::conf().local_peer_keypair.clone();
         NodeBuilder {
             local_key,
             remote_nodes: Vec::with_capacity(1),
@@ -188,11 +185,23 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
 
     /// Builds a node using the default backend connection manager.
     pub async fn build(self, config: NodeConfig) -> Result<Node, anyhow::Error> {
-        let event_log = event_log::EventRegister::new();
-        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, event_log::EventRegister>(
-            self, event_log, config,
-        )
-        .await?;
+        let event_register = {
+            #[cfg(feature = "trace-ot")]
+            {
+                use super::node::network_event_log::{CombinedRegister, OTEventRegister};
+                CombinedRegister::new([
+                    Box::new(EventRegister::new()),
+                    Box::new(OTEventRegister::new()),
+                ])
+            }
+            #[cfg(not(feature = "trace-ot"))]
+            {
+                EventRegister::new()
+            }
+        };
+        let node =
+            NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(self, event_register, config)
+                .await?;
         Ok(Node(node))
     }
 
@@ -286,7 +295,7 @@ async fn join_ring_request<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: NetworkBridge + Send + Sync,
+    CM: NetworkBridge + Send,
 {
     let tx_id = Transaction::new::<ConnectMsg>();
     let mut op =
@@ -305,13 +314,12 @@ where
 }
 
 /// Process client events.
-#[tracing::instrument(skip_all)]
 async fn client_event_handling<ClientEv>(
     op_storage: Arc<OpManager>,
     mut client_events: ClientEv,
     mut client_responses: ClientResponses,
 ) where
-    ClientEv: ClientEventsProxy + Send + Sync + 'static,
+    ClientEv: ClientEventsProxy + Send + 'static,
 {
     loop {
         tokio::select! {
@@ -467,7 +475,7 @@ async fn report_result(
     op_storage: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
-    event_listener: &mut Box<dyn EventLogRegister>,
+    event_listener: &mut dyn NetEventRegister,
 ) {
     match op_result {
         Ok(Some(op_res)) => {
@@ -495,7 +503,7 @@ async fn report_result(
                         },
                     };
                     event_listener
-                        .register_events(Either::Left(EventLog::route_event(
+                        .register_events(Either::Left(NetEventLog::route_event(
                             op_res.id(),
                             op_storage,
                             &event,
@@ -568,12 +576,11 @@ macro_rules! handle_op_not_available {
     };
 }
 
-#[tracing::instrument(name = "process_network_message", skip_all)]
 async fn process_message<CB>(
-    msg: Result<Message, ConnectionError>,
+    msg: Message,
     op_storage: Arc<OpManager>,
     mut conn_manager: CB,
-    mut event_listener: Box<dyn EventLogRegister>,
+    mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<ClientId>,
@@ -581,108 +588,94 @@ async fn process_message<CB>(
     CB: NetworkBridge,
 {
     let cli_req = client_id.zip(client_req_handler_callback);
-    match msg {
-        Ok(msg) => {
-            let tx = Some(*msg.id());
-            event_listener
-                .register_events(EventLog::from_inbound_msg(&msg, &op_storage))
+
+    let tx = Some(*msg.id());
+    event_listener
+        .register_events(NetEventLog::from_inbound_msg(&msg, &op_storage))
+        .await;
+    loop {
+        match &msg {
+            Message::Connect(op) => {
+                // log_handling_msg!("join", op.id(), op_storage);
+                let op_result = handle_op_request::<connect::ConnectOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
                 .await;
-            loop {
-                match &msg {
-                    Message::Connect(op) => {
-                        // log_handling_msg!("join", op.id(), op_storage);
-                        let op_result = handle_op_request::<connect::ConnectOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    Message::Put(op) => {
-                        // log_handling_msg!("put", *op.id(), op_storage);
-                        let op_result = handle_op_request::<put::PutOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    Message::Get(op) => {
-                        // log_handling_msg!("get", op.id(), op_storage);
-                        let op_result = handle_op_request::<get::GetOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    Message::Subscribe(op) => {
-                        // log_handling_msg!("subscribe", op.id(), op_storage);
-                        let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
-                            &op_storage,
-                            &mut conn_manager,
-                            op,
-                            client_id,
-                        )
-                        .await;
-                        handle_op_not_available!(op_result);
-                        break report_result(
-                            tx,
-                            op_result,
-                            &op_storage,
-                            executor_callback,
-                            cli_req,
-                            &mut event_listener,
-                        )
-                        .await;
-                    }
-                    _ => break,
-                }
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
             }
-        }
-        Err(err) => {
-            report_result(
-                None,
-                Err(err.into()),
-                &op_storage,
-                executor_callback,
-                cli_req,
-                &mut event_listener,
-            )
-            .await;
+            Message::Put(op) => {
+                // log_handling_msg!("put", *op.id(), op_storage);
+                let op_result = handle_op_request::<put::PutOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
+                .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            Message::Get(op) => {
+                // log_handling_msg!("get", op.id(), op_storage);
+                let op_result = handle_op_request::<get::GetOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
+                .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            Message::Subscribe(op) => {
+                // log_handling_msg!("subscribe", op.id(), op_storage);
+                let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
+                    &op_storage,
+                    &mut conn_manager,
+                    op,
+                    client_id,
+                )
+                .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_storage,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            _ => break,
         }
     }
 }
@@ -694,7 +687,7 @@ async fn handle_cancelled_op<CM>(
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
-    CM: NetworkBridge + Send + Sync,
+    CM: NetworkBridge + Send,
 {
     if let TransactionType::Connect = tx.transaction_type() {
         // the attempt to join the network failed, this could be a fatal error since the node

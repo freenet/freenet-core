@@ -35,6 +35,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync;
+use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::{AcquisitionStrategy, TopologyManager};
@@ -43,7 +44,7 @@ use crate::{
     config::GlobalExecutor,
     message::Transaction,
     node::{
-        self, EventLogRegister, EventLoopNotificationsSender, EventRegister, NodeBuilder, PeerKey,
+        self, EventLoopNotificationsSender, EventRegister, NetEventRegister, NodeBuilder, PeerKey,
     },
     operations::connect,
     router::Router,
@@ -223,7 +224,7 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<const CLIENTS: usize, EL: EventLogRegister>(
+    pub fn new<const CLIENTS: usize, EL: NetEventRegister>(
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
@@ -296,19 +297,21 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
-        GlobalExecutor::spawn(ring.clone().connection_maintenance(
-            event_loop_notifier,
-            live_tx_tracker,
-            missing_candidate_rx,
-        ));
+        let parent_span = tracing::Span::current();
+        GlobalExecutor::spawn(
+            ring.clone()
+                .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
+                .instrument(tracing::info_span!(parent: parent_span, "connection_maintenance")),
+        );
         Ok(ring)
     }
 
-    async fn refresh_router<EL: EventLogRegister>(router: Arc<RwLock<Router>>) {
+    async fn refresh_router<EL: NetEventRegister>(router: Arc<RwLock<Router>>) {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
             interval.tick().await;
+            // fixme
             let history = if std::any::type_name::<EL>() == std::any::type_name::<EventRegister>() {
                 EventRegister::get_router_events(10_000)
                     .await
@@ -603,7 +606,6 @@ impl Ring {
             })
     }
 
-    #[tracing::instrument(skip_all)]
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,

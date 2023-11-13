@@ -391,7 +391,7 @@ mod test {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
-    use crate::util::tests_util::get_temp_dir;
+    use crate::util::tests::get_temp_dir;
 
     use super::super::{delegate_store::DelegateStore, ContractStore, SecretsStore};
     use super::*;

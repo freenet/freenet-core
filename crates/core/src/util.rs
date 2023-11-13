@@ -238,19 +238,16 @@ impl<'x> Contains<PeerKey> for &'x [&PeerKey] {
 }
 
 #[cfg(test)]
-pub mod tests_util {
-    use rand::Rng;
+pub mod tests {
+
     use tempfile::TempDir;
 
     /// Use this to guarantee unique directory names in case you are running multiple tests in parallel.
     pub fn get_temp_dir() -> TempDir {
-        tempfile::Builder::new()
-            .suffix(
-                &(0..8)
-                    .map(|_| rand::thread_rng().gen::<char>())
-                    .collect::<String>(),
-            )
+        let dir = tempfile::Builder::new()
             .tempdir()
-            .expect("Failed to create a temporary directory")
+            .expect("Failed to create a temporary directory");
+        eprintln!("Created temp dir: {:?}", dir.path());
+        dir
     }
 }

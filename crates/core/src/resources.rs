@@ -62,6 +62,7 @@
 //! * Responses to specific requests will contain information about the resources used
 //!   by downstream peers to fulfill the request, however how this information is used
 //!   will require careful consideration.
+#![allow(dead_code, unused)] // FIXME: remove after integration
 
 mod meter;
 pub mod rate;

@@ -12,12 +12,14 @@ use itertools::Itertools;
 use libp2p::{identity, PeerId};
 use rand::Rng;
 use tokio::sync::watch::{channel, Receiver, Sender};
-use tracing::{info, instrument};
+use tracing::{info, Instrument};
 
+#[cfg(feature = "trace-ot")]
+use crate::node::network_event_log::{CombinedRegister, NetEventRegister};
 use crate::{
     client_events::test::MemoryEventsGen,
     config::GlobalExecutor,
-    node::{event_log::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
+    node::{network_event_log::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
 };
 
@@ -178,7 +180,6 @@ impl SimNetwork {
         self.debug = true;
     }
 
-    #[instrument(skip(self))]
     async fn build_gateways(&mut self, num: usize) {
         info!("Building {} gateways", num);
         let mut configs = Vec::with_capacity(num);
@@ -230,19 +231,21 @@ impl SimNetwork {
                         .listening_port(*port),
                 );
             }
+            let peer = PeerKey::from(this_node.local_key.public());
+            let parent_span = tracing::info_span!("in_mem_gateway", %peer);
             let gateway = NodeInMemory::build(
                 this_node,
                 self.event_listener.clone(),
                 format!("{}-{label}", self.name, label = this_config.label),
                 self.add_noise,
             )
+            .instrument(parent_span)
             .await
             .unwrap();
             self.gateways.push((gateway, this_config));
         }
     }
 
-    #[instrument(skip(self))]
     async fn build_nodes(&mut self, num: usize) {
         info!("Building {} regular nodes", num);
         let gateways: Vec<_> = self
@@ -277,15 +280,31 @@ impl SimNetwork {
                 .max_number_of_connections(self.max_connections)
                 .with_key(pair);
 
-            self.event_listener
-                .add_node(label.clone(), PeerKey::from(id));
+            let peer = PeerKey::from(id);
+            self.event_listener.add_node(label.clone(), peer);
 
+            let parent_span = tracing::info_span!("in_mem_node", %peer);
+            let event_listener = {
+                #[cfg(feature = "trace-ot")]
+                {
+                    use super::network_event_log::OTEventRegister;
+                    CombinedRegister::new([
+                        self.event_listener.trait_clone(),
+                        Box::new(OTEventRegister::new()),
+                    ])
+                }
+                #[cfg(not(feature = "trace-ot"))]
+                {
+                    self.event_listener.clone()
+                }
+            };
             let node = NodeInMemory::build(
                 config,
-                self.event_listener.clone(),
+                event_listener,
                 format!("{}-{label}", self.name),
                 self.add_noise,
             )
+            .instrument(parent_span)
             .await
             .unwrap();
             self.nodes.push((node, label));
@@ -321,14 +340,15 @@ impl SimNetwork {
         }
         tracing::debug!(peer = %label, "initializing");
         self.labels.insert(label, peer.peer_key);
-        GlobalExecutor::spawn(async move {
+        let node_task = async move {
             if let Some(specs) = node_specs {
                 peer.append_contracts(specs.owned_contracts, specs.contract_subscribers)
                     .await
                     .map_err(|_| anyhow::anyhow!("failed inserting test owned contracts"))?;
             }
             peer.run_node(user_events).await
-        });
+        };
+        GlobalExecutor::spawn(node_task);
     }
 
     pub fn get_locations_by_node(&self) -> HashMap<NodeLabel, PeerKeyLocation> {

@@ -5,16 +5,14 @@ use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 
+use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::ClientId,
     contract::ContractError,
     message::{InnerMessage, Message, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
-    operations::{op_trait::Operation, OpInitialization},
     ring::{Location, PeerKeyLocation, RingError},
 };
-
-use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
 pub(crate) use self::messages::SubscribeMsg;
 

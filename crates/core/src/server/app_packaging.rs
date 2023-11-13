@@ -8,10 +8,12 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tar::{Archive, Builder};
 use xz2::read::{XzDecoder, XzEncoder};
 
+use crate::DynError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum WebContractError {
     #[error("unpacking error: {0}")]
-    UnpackingError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    UnpackingError(DynError),
     #[error("{0}")]
     StoringError(std::io::Error),
     #[error("file not found: {0}")]
