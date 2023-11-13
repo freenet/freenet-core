@@ -181,6 +181,7 @@ impl Operation for ConnectOp {
                                 target: *joiner,
                                 msg: ConnectResponse::Proxy {
                                     accepted_by: HashSet::new(),
+                                    joiner: joiner.peer,
                                 },
                             });
                             new_state = None;
@@ -352,6 +353,7 @@ impl Operation for ConnectOp {
                                     sender,
                                     &own_loc,
                                     accepted_by,
+                                    joiner.peer,
                                 );
                                 new_state = state;
                                 return_msg = msg;
@@ -470,7 +472,11 @@ impl Operation for ConnectOp {
                     id,
                     target,
                     sender,
-                    msg: ConnectResponse::Proxy { accepted_by },
+                    msg:
+                        ConnectResponse::Proxy {
+                            accepted_by,
+                            joiner,
+                        },
                 } => {
                     tracing::debug!(tx = %id, at = %target.peer, "Received proxy connect response");
                     match self.state {
@@ -524,6 +530,7 @@ impl Operation for ConnectOp {
                                     sender: *target,
                                     msg: ConnectResponse::Proxy {
                                         accepted_by: previously_accepted,
+                                        joiner: *joiner,
                                     },
                                 });
                             }
@@ -535,6 +542,7 @@ impl Operation for ConnectOp {
                                 sender: *target,
                                 msg: ConnectResponse::Proxy {
                                     accepted_by: accepted_by.clone(),
+                                    joiner: joiner.peer,
                                 },
                             });
                             new_state = None;
@@ -684,6 +692,7 @@ fn try_returning_proxy_connection(
     sender: &PeerKeyLocation,
     own_loc: &PeerKeyLocation,
     accepted_by: HashSet<PeerKeyLocation>,
+    joiner: PeerKey,
 ) -> (Option<ConnectState>, Option<ConnectMsg>) {
     let new_state = if accepted_by.contains(own_loc) {
         tracing::debug!(
@@ -698,7 +707,10 @@ fn try_returning_proxy_connection(
         None
     };
     let return_msg = Some(ConnectMsg::Response {
-        msg: ConnectResponse::Proxy { accepted_by },
+        msg: ConnectResponse::Proxy {
+            accepted_by,
+            joiner,
+        },
         sender: *own_loc,
         id: *id,
         target: *sender,
@@ -1121,6 +1133,7 @@ mod messages {
         },
         Proxy {
             accepted_by: HashSet<PeerKeyLocation>,
+            joiner: PeerKey,
         },
     }
 }
