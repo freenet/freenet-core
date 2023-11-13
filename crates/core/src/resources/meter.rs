@@ -2,9 +2,9 @@ use std::hash::Hash;
 use std::time::Duration;
 
 use crate::resources::rate::Rate;
+use crate::resources::{BytesPerSecond, InstructionsPerSecond};
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
-use crate::resources::{BytesPerSecond, InstructionsPerSecond};
 
 use crate::ring::PeerKeyLocation;
 
@@ -158,18 +158,15 @@ mod tests {
         let mut meter = Meter::new_with_window_size(100);
 
         // Test that the total usage is 0.0 for all resources
-        assert!(
-            meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
-                .is_none());
-        assert!(
-            meter
-                .resource_usage_rate(ResourceType::OutboundBandwidthBytes)
-                .is_none());
-        assert!(
-            meter
-                .resource_usage_rate(ResourceType::CpuInstructions)
-                .is_none());
+        assert!(meter
+            .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+            .is_none());
+        assert!(meter
+            .resource_usage_rate(ResourceType::OutboundBandwidthBytes)
+            .is_none());
+        assert!(meter
+            .resource_usage_rate(ResourceType::CpuInstructions)
+            .is_none());
 
         // Report some usage and test that the total usage is updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
@@ -189,18 +186,15 @@ mod tests {
 
         // Test that the attributed usage is 0.0 for all resources
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
-        assert!(
-            meter
-                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
-                .is_none());
-        assert!(
-            meter
-                .attributed_usage_rate(&attribution, ResourceType::OutboundBandwidthBytes)
-                .is_none());
-        assert!(
-            meter
-                .attributed_usage_rate(&attribution, ResourceType::CpuInstructions)
-                .is_none());
+        assert!(meter
+            .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+            .is_none());
+        assert!(meter
+            .attributed_usage_rate(&attribution, ResourceType::OutboundBandwidthBytes)
+            .is_none());
+        assert!(meter
+            .attributed_usage_rate(&attribution, ResourceType::CpuInstructions)
+            .is_none());
 
         // Report some usage and test that the attributed usage is updated
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
