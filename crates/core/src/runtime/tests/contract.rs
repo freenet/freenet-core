@@ -14,7 +14,7 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
         delegate_store,
         secrets_store,
         contract_key,
-        temp_dir: _,
+        temp_dir,
     } = super::setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
@@ -33,7 +33,7 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
         &Default::default(),
     )?;
     assert!(matches!(not_valid, ValidateResult::RequestRelated(_)));
-
+    std::mem::drop(temp_dir);
     Ok(())
 }
 
@@ -44,7 +44,7 @@ fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
         delegate_store,
         secrets_store,
         contract_key,
-        temp_dir: _,
+        temp_dir,
     } = super::setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
@@ -61,7 +61,7 @@ fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
         &StateDelta::from([1, 0, 0, 1].as_ref()),
     )?;
     assert!(not_valid);
-
+    std::mem::drop(temp_dir);
     Ok(())
 }
 
@@ -72,7 +72,7 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
         delegate_store,
         secrets_store,
         contract_key,
-        temp_dir: _,
+        temp_dir,
     } = super::setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
@@ -86,6 +86,7 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_valid();
     assert!(new_state.as_ref().len() == 4);
     assert!(new_state.as_ref()[3] == 4);
+    std::mem::drop(temp_dir);
     Ok(())
 }
 
@@ -96,7 +97,7 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
         delegate_store,
         secrets_store,
         contract_key,
-        temp_dir: _,
+        temp_dir,
     } = super::setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
@@ -106,6 +107,7 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
         &WrappedState::new(vec![5, 2, 3, 4]),
     )?;
     assert_eq!(summary.as_ref(), &[5, 2, 3]);
+    std::mem::drop(temp_dir);
     Ok(())
 }
 
@@ -116,7 +118,7 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
         delegate_store,
         secrets_store,
         contract_key,
-        temp_dir: _,
+        temp_dir,
     } = super::setup_test_contract(TEST_CONTRACT_1)?;
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
@@ -128,5 +130,6 @@ fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert!(delta.as_ref().len() == 1);
     assert!(delta.as_ref()[0] == 4);
+    std::mem::drop(temp_dir);
     Ok(())
 }

@@ -19,7 +19,8 @@ target/
 .idea/*
 **/.vscode/*
 
+# Other config files
 config.toml
+.env
 .rustc*
-expanded_code.rs
 
