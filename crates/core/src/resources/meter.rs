@@ -158,24 +158,18 @@ mod tests {
         let mut meter = Meter::new_with_window_size(100);
 
         // Test that the total usage is 0.0 for all resources
-        assert_eq!(
+        assert!(
             meter
                 .resource_usage_rate(ResourceType::InboundBandwidthBytes)
-                .unwrap(),
-            Rate::new(0.0, Duration::from_secs(1))
-        );
-        assert_eq!(
+                .is_none());
+        assert!(
             meter
                 .resource_usage_rate(ResourceType::OutboundBandwidthBytes)
-                .unwrap(),
-            Rate::new(0.0, Duration::from_secs(1))
-        );
-        assert_eq!(
+                .is_none());
+        assert!(
             meter
                 .resource_usage_rate(ResourceType::CpuInstructions)
-                .unwrap(),
-            Rate::new(0.0, Duration::from_secs(1))
-        );
+                .is_none());
 
         // Report some usage and test that the total usage is updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
@@ -195,27 +189,18 @@ mod tests {
 
         // Test that the attributed usage is 0.0 for all resources
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
-        assert_eq!(
+        assert!(
             meter
                 .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
-                .unwrap()
-                .per_second(),
-            0.0
-        );
-        assert_eq!(
+                .is_none());
+        assert!(
             meter
                 .attributed_usage_rate(&attribution, ResourceType::OutboundBandwidthBytes)
-                .unwrap()
-                .per_second(),
-            0.0
-        );
-        assert_eq!(
+                .is_none());
+        assert!(
             meter
                 .attributed_usage_rate(&attribution, ResourceType::CpuInstructions)
-                .unwrap()
-                .per_second(),
-            0.0
-        );
+                .is_none());
 
         // Report some usage and test that the attributed usage is updated
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
