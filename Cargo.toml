@@ -4,12 +4,14 @@ members = ["crates/*"]
 
 [workspace.dependencies]
 arrayvec = { version = "0.7", features = ["serde"] }
-bs58 = "0.5"
 blake3 = { version = "1", features = ["std", "traits-preview"] }
-clap = "4"
+bs58 = "0.5"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = true }
+clap = "4"
+ctrlc = { version = "3.4" }
 either = "1.8"
+fastrand = "2"
 futures = "0.3"
 rand = { version = "0.8" }
 semver = { version = "1.0.14",  features = ["serde"] }
@@ -21,8 +23,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 wasmer = "4.2.0"
 
-freenet-stdlib = { path = "./stdlib/rust/", version = "0.0.8", features = ["unstable"]   }
-# freenet-stdlib = { version = "0.0.7" }
+freenet-stdlib = { path = "./stdlib/rust/", features = ["unstable"]   }
+# freenet-stdlib = { version = "0.0.8" }
 
 [profile.dev.package."*"]
 opt-level = 3
