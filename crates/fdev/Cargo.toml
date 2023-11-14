@@ -10,26 +10,27 @@ repository = "https://github.com/freenet/freenet"
 
 [dependencies]
 anyhow = "1"
+bincode = "1"
 bs58 = { workspace = true }
-# byteorder = "1"
 clap = { workspace = true, features = ["derive", "env"] }
 either = { workspace = true }
+fastrand = { workspace = true }
 futures = { workspace = true }
 glob = "0.3"
-thiserror = "1"
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot"] }
 pico-args = "0.5"
-semver = { workspace = true }
+rand = { workspace = true }
 serde = "1"
 serde_json = "1"
 serde_with = { workspace = true }
-bincode = "1"
+semver = { workspace = true }
 tar = "0.4"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot"] }
 toml = { version = "0.8", features = ["default", "preserve_order"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 xz2 = "0.1"
 
 # internal
-freenet = { path = "../core", version = "0.0.6" }
+freenet = { path = "../core" }
 freenet-stdlib = { workspace = true }
