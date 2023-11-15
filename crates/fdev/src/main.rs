@@ -7,17 +7,18 @@ mod build;
 mod commands;
 mod config;
 mod inspect;
-mod local_node;
 mod new_package;
+mod testing;
 mod util;
+mod wasm_runtime;
 
 use crate::{
     build::build_package,
     commands::{put, update},
     config::{Config, SubCommand},
     inspect::inspect,
-    local_node::run_local_node_client,
     new_package::create_new_package,
+    wasm_runtime::run_local_executor,
 };
 
 type CommandReceiver = tokio::sync::mpsc::Receiver<ClientRequest<'static>>;
@@ -38,7 +39,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = Config::parse();
     freenet::config::Config::set_op_mode(config.additional.mode);
     let r = match config.sub_command {
-        SubCommand::RunLocal(local_node_config) => run_local_node_client(local_node_config).await,
+        SubCommand::WasmRuntime(local_node_config) => run_local_executor(local_node_config).await,
         SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),
         SubCommand::Inspect(inspect_config) => inspect(inspect_config),
         SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
@@ -49,6 +50,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 update(update_config, config.additional).await
             }
         },
+        SubCommand::Test(test_config) => testing::test_framework(test_config).await,
     };
     // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow
     r.map_err(|e| anyhow::format_err!(e))

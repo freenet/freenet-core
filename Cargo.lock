@@ -1450,7 +1450,7 @@ checksum = "25cbce373ec4653f1a01a31e8a5e5ec0c622dc27ff9c4e6606eefef5cbbed4a5"
 
 [[package]]
 name = "fdev"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "arbitrary",

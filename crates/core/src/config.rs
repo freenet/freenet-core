@@ -19,10 +19,25 @@ use tokio::runtime::Runtime;
 
 use crate::local_node::OperationMode;
 
+/// Default maximum number of connections for the peer.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
+/// Default minimum number of connections for the peer.
+pub const DEFAULT_MIN_CONNECTIONS: usize = 10;
+/// Default threshold for randomizing potential peers for new connections.
+///
+/// If the hops left for the operation is above or equal to this threshold
+/// (of the total DEFAULT_MAX_HOPS_TO_LIVE), then the next potential peer
+/// will be selected randomly. Otherwise the optimal peer will be selected
+/// by Freenet custom algorithms.
+pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
+/// Default maximum number of hops to live for any operation
+/// (if it applies, e.g. connect requests).
+pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
 
 static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
@@ -376,8 +391,8 @@ pub(super) mod tracer {
         let filter_layer = tracing_subscriber::EnvFilter::builder()
             .with_default_directive(filter.into())
             .from_env_lossy()
-            .add_directive("stretto=off".parse().unwrap())
-            .add_directive("sqlx=error".parse().unwrap());
+            .add_directive("stretto=off".parse().expect("infallible"))
+            .add_directive("sqlx=error".parse().expect("infallible"));
 
         // use opentelemetry_sdk::propagation::TraceContextPropagator;
         use tracing_subscriber::layer::SubscriberExt;
@@ -393,6 +408,7 @@ pub(super) mod tracer {
             };
             #[cfg(feature = "trace-ot")]
             {
+                let disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
                 let identifier = if matches!(Config::node_mode(), OperationMode::Local) {
                     "freenet-core".to_string()
                 } else {
@@ -410,10 +426,12 @@ pub(super) mod tracer {
                     // Get a tracer which will route OT spans to a Jaeger agent
                     tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer)
                 };
-                if !disabled_logs {
+                if !disabled_logs && !disabled_ot_traces {
                     fmt_layer.and_then(tracing_ot_layer).boxed()
-                } else {
+                } else if !disabled_ot_traces {
                     tracing_ot_layer.boxed()
+                } else {
+                    return Ok(());
                 }
             }
             #[cfg(not(feature = "trace-ot"))]

@@ -27,7 +27,7 @@ pub mod local_node {
 pub mod network_sim {
     use super::*;
     pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
-    pub use node::{InitPeerNode, NodeBuilder, NodeConfig};
+    pub use node::{tests::SimNetwork, InitPeerNode, NodeBuilder, NodeConfig};
     pub use ring::Location;
 }
 

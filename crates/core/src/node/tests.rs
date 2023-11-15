@@ -6,18 +6,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use freenet_stdlib::client_api::ClientRequest;
 use freenet_stdlib::prelude::*;
 use itertools::Itertools;
 use libp2p::{identity, PeerId};
 use rand::Rng;
-use tokio::sync::watch::{channel, Receiver, Sender};
+use tokio::sync::{
+    watch::{channel, Receiver, Sender},
+    Barrier,
+};
 use tracing::{info, Instrument};
 
 #[cfg(feature = "trace-ot")]
 use crate::node::network_event_log::{CombinedRegister, NetEventRegister};
 use crate::{
-    client_events::test::MemoryEventsGen,
+    client_events::test::{MemoryEventsGen, RandomEventGenerator},
     config::GlobalExecutor,
     node::{network_event_log::TestEventListener, InitPeerNode, NodeBuilder, NodeInMemory},
     ring::{Distance, Location, PeerKeyLocation},
@@ -47,7 +49,7 @@ pub fn get_dynamic_port() -> u16 {
 pub(crate) type EventId = usize;
 
 #[derive(PartialEq, Eq, Hash, Clone)]
-pub(crate) struct NodeLabel(Arc<str>);
+pub struct NodeLabel(Arc<str>);
 
 impl NodeLabel {
     fn gateway(id: usize) -> Self {
@@ -97,12 +99,11 @@ impl<'a> From<&'a str> for NodeLabel {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
-    /// Pair of contract and the initial value
     pub owned_contracts: Vec<(ContractContainer, WrappedState)>,
-    pub non_owned_contracts: Vec<ContractKey>,
-    pub events_to_generate: HashMap<EventId, ClientRequest<'static>>,
+    pub events_to_generate: HashMap<EventId, freenet_stdlib::client_api::ClientRequest<'static>>,
     pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
 
@@ -115,11 +116,11 @@ struct GatewayConfig {
 }
 
 /// A simulated in-memory network topology.
-pub(crate) struct SimNetwork {
+pub struct SimNetwork {
     name: String,
     debug: bool,
-    pub labels: HashMap<NodeLabel, PeerKey>,
-    pub event_listener: TestEventListener,
+    pub(crate) labels: HashMap<NodeLabel, PeerKey>,
+    pub(crate) event_listener: TestEventListener,
     user_ev_controller: Sender<(EventId, PeerKey)>,
     receiver_ch: Receiver<(EventId, PeerKey)>,
     gateways: Vec<(NodeInMemory, GatewayConfig)>,
@@ -190,10 +191,7 @@ impl SimNetwork {
             let port = get_free_port().unwrap();
             let location = Location::random();
 
-            let mut config = NodeBuilder::new([Box::new(MemoryEventsGen::new(
-                self.receiver_ch.clone(),
-                PeerKey::from(id),
-            ))]);
+            let mut config = NodeBuilder::new([]);
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
@@ -260,10 +258,7 @@ impl SimNetwork {
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().to_peer_id();
 
-            let mut config = NodeBuilder::new([Box::new(MemoryEventsGen::new(
-                self.receiver_ch.clone(),
-                PeerKey::from(id),
-            ))]);
+            let mut config = NodeBuilder::new([]);
             for GatewayConfig {
                 port, id, location, ..
             } in &gateways
@@ -311,21 +306,25 @@ impl SimNetwork {
         }
     }
 
-    pub async fn start(&mut self) {
+    #[cfg(test)]
+    pub(crate) async fn start(&mut self) {
         self.start_with_spec(HashMap::new()).await
     }
 
-    pub async fn start_with_spec(&mut self, mut specs: HashMap<NodeLabel, NodeSpecification>) {
-        let mut gw_not_init = self.gateways.len();
+    #[cfg(test)]
+    pub(crate) async fn start_with_spec(
+        &mut self,
+        mut specs: HashMap<NodeLabel, NodeSpecification>,
+    ) {
         let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
         for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             let node_spec = specs.remove(&label);
             self.initialize_peer(node, label, node_spec);
-            gw_not_init = gw_not_init.saturating_sub(1);
             tokio::time::sleep(self.init_backoff).await;
         }
     }
 
+    #[cfg(test)]
     fn initialize_peer(
         &mut self,
         mut peer: NodeInMemory,
@@ -334,8 +333,6 @@ impl SimNetwork {
     ) {
         let mut user_events = MemoryEventsGen::new(self.receiver_ch.clone(), peer.peer_key);
         if let Some(specs) = node_specs.clone() {
-            user_events.has_contract(specs.owned_contracts);
-            user_events.request_contracts(specs.non_owned_contracts);
             user_events.generate_events(specs.events_to_generate);
         }
         tracing::debug!(peer = %label, "initializing");
@@ -349,6 +346,47 @@ impl SimNetwork {
             peer.run_node(user_events).await
         };
         GlobalExecutor::spawn(node_task);
+    }
+
+    pub async fn start_with_rand_gen<R>(
+        &mut self,
+        seed: u64,
+        max_contract_num: usize,
+        iterations: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>>
+    where
+        R: RandomEventGenerator + Send + 'static,
+    {
+        let total_peer_num = self.gateways.len() + self.nodes.len();
+        let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
+        let mut peers = vec![];
+        for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
+            let handle = self.initialize_peer_with_rnd_gen::<R>(
+                node,
+                label,
+                (total_peer_num, max_contract_num, seed, iterations),
+            );
+            peers.push(handle);
+            tokio::time::sleep(self.init_backoff).await;
+        }
+        peers
+    }
+
+    fn initialize_peer_with_rnd_gen<R>(
+        &mut self,
+        mut peer: NodeInMemory,
+        label: NodeLabel,
+        (total_peer_num, max_contract_num, seed, iterations): (usize, usize, u64, usize),
+    ) -> tokio::task::JoinHandle<Result<(), anyhow::Error>>
+    where
+        R: RandomEventGenerator + Send + 'static,
+    {
+        tracing::debug!(peer = %label, "initializing");
+        let mut user_events =
+            MemoryEventsGen::<R>::new_with_seed(self.receiver_ch.clone(), peer.peer_key, seed);
+        user_events.rng_params(total_peer_num, max_contract_num, iterations);
+        let node_task = async move { peer.run_node(user_events).await };
+        GlobalExecutor::spawn(node_task)
     }
 
     pub fn get_locations_by_node(&self) -> HashMap<NodeLabel, PeerKeyLocation> {

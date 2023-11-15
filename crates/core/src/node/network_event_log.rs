@@ -27,7 +27,6 @@ use crate::{
 
 #[cfg(feature = "trace-ot")]
 pub(super) use opentelemetry_tracer::OTEventRegister;
-#[cfg(test)]
 pub(super) use test::TestEventListener;
 
 use super::OpManager;
@@ -674,6 +673,7 @@ mod opentelemetry_tracer {
     use opentelemetry::{
         global,
         trace::{self, Span},
+        KeyValue,
     };
 
     use super::*;
@@ -705,6 +705,10 @@ mod opentelemetry_tracer {
                 start_time: Some(start_time),
                 span_id: Some(trace::SpanId::from_bytes(span_id)),
                 trace_id: Some(trace::TraceId::from_bytes(tx_bytes)),
+                attributes: Some(vec![
+                    KeyValue::new("transaction", transaction.to_string()),
+                    KeyValue::new("tx_type", transaction.transaction_type().description()),
+                ]),
                 ..Default::default()
             });
             OTSpan {
@@ -986,7 +990,6 @@ enum PutEvent {
     },
 }
 
-#[cfg(test)]
 pub(super) mod test {
     use std::{
         collections::HashMap,
@@ -994,7 +997,6 @@ pub(super) mod test {
             atomic::{AtomicUsize, Ordering::SeqCst},
             Arc,
         },
-        time::Duration,
     };
 
     use dashmap::DashMap;
@@ -1007,6 +1009,7 @@ pub(super) mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
+        use std::time::Duration;
         let event_log_path = crate::config::Config::conf().event_log();
         // truncate the log if it exists
         std::fs::File::create(event_log_path).unwrap();
@@ -1114,6 +1117,7 @@ pub(super) mod test {
         }
 
         /// The contract was broadcasted from one peer to an other successfully.
+        #[cfg(test)]
         pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
             let logs = self.logs.lock();
             let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {

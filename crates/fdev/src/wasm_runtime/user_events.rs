@@ -17,7 +17,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{util, CommandSender};
 
-use super::{state::AppState, DeserializationFmt, LocalNodeCliConfig};
+use super::{state::AppState, DeserializationFmt, ExecutorConfig};
 
 const HELP: &str = "Freenet Contract Development Environment
 
@@ -31,7 +31,7 @@ SUBCOMMANDS:
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
 pub(super) async fn user_fn_handler(
-    config: LocalNodeCliConfig,
+    config: ExecutorConfig,
     command_sender: CommandSender,
     app_state: AppState,
 ) -> Result<(), anyhow::Error> {
@@ -53,7 +53,7 @@ pub(super) async fn user_fn_handler(
 }
 
 struct StdInput {
-    config: LocalNodeCliConfig,
+    config: ExecutorConfig,
     contract: ContractContainer,
     input: File,
     buf: Vec<u8>,
@@ -61,7 +61,7 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: LocalNodeCliConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
+    fn new(config: ExecutorConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
         let params = config
             .params
             .as_ref()

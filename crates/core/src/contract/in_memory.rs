@@ -1,8 +1,5 @@
 use crate::{client_events::ClientId, runtime::ContractStore};
-use freenet_stdlib::{
-    client_api::{ClientError, ClientRequest, HostResponse},
-    prelude::WrappedContract,
-};
+use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use futures::{future::BoxFuture, FutureExt};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -69,6 +66,7 @@ impl ContractHandler for MemoryContractHandler {
 
 #[test]
 fn serialization() -> Result<(), anyhow::Error> {
+    use freenet_stdlib::prelude::WrappedContract;
     let bytes = crate::util::test::random_bytes_1kb();
     let mut gen = arbitrary::Unstructured::new(&bytes);
     let contract: WrappedContract = gen.arbitrary()?;

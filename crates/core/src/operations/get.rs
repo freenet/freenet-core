@@ -873,7 +873,6 @@ mod test {
         .into();
         let node_0 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
@@ -883,7 +882,6 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };
@@ -929,7 +927,6 @@ mod test {
         .into();
         let node_1 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
@@ -970,7 +967,6 @@ mod test {
 
         let node_0 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
@@ -980,14 +976,12 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };

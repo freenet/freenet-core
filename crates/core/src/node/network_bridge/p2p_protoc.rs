@@ -317,6 +317,7 @@ impl P2pConnManager {
         mut notification_channel: EventLoopNotifications,
         mut executor_channel: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
+        mut node_controller: Receiver<NodeEvent>,
     ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
@@ -422,6 +423,13 @@ impl P2pConnManager {
                 msg = network_msg => { msg }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
+                msg = node_controller.recv() => {
+                    if let Some(msg) = msg {
+                        Ok(Right(NodeAction(msg)))
+                    } else {
+                        Ok(Right(ClosedChannel))
+                    }
+                }
                 event_id = op_manager.recv_from_handler() => {
                     if let Some((client_id, transaction)) = event_id.client_id().zip(event_id.transaction()) {
                         tx_to_client.insert(transaction, client_id);
@@ -523,6 +531,13 @@ impl P2pConnManager {
                 Ok(Right(NodeAction(NodeEvent::AcceptConnection(_key)))) => {
                     // todo: if we prefilter connections, should only accept ones informed this way
                     //       (except 'join ring' requests)
+                }
+                Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
+                    match cause {
+                        Some(cause) => tracing::warn!("Shutting down node: {cause}"),
+                        None => tracing::warn!("Shutting down node"),
+                    }
+                    return Ok(());
                 }
                 Ok(Right(ConnectionEstablished {
                     address: addr,

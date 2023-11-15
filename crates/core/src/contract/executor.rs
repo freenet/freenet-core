@@ -1196,7 +1196,6 @@ impl Executor<Runtime> {
     }
 }
 
-#[cfg(test)]
 impl Executor<crate::contract::MockRuntime> {
     pub async fn new_mock(data_dir: &str) -> Result<Self, DynError> {
         let tmp_path = std::env::temp_dir().join(format!("freenet-executor-{data_dir}"));
@@ -1267,7 +1266,6 @@ impl ContractExecutor for Executor<Runtime> {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl ContractExecutor for Executor<crate::contract::MockRuntime> {
     async fn fetch_contract(

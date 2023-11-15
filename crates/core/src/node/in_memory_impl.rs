@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use either::Either;
 use freenet_stdlib::prelude::*;
@@ -15,9 +15,8 @@ use crate::{
     client_events::ClientEventsProxy,
     config::GlobalExecutor,
     contract::{
-        self, executor_channel, ClientResponsesSender, ContractError, ContractHandler,
-        ContractHandlerEvent, ExecutorToEventLoopChannel, MemoryContractHandler,
-        NetworkEventListenerHalve,
+        self, executor_channel, ClientResponsesSender, ContractHandler, ExecutorToEventLoopChannel,
+        MemoryContractHandler, NetworkEventListenerHalve,
     },
     message::{Message, NodeEvent, TransactionType},
     node::NodeBuilder,
@@ -42,7 +41,7 @@ pub(super) struct NodeInMemory {
 impl NodeInMemory {
     /// Buils an in-memory node. Does nothing upon construction,
     pub async fn build<ER: NetEventRegister + Clone>(
-        builder: NodeBuilder<1>,
+        builder: NodeBuilder<0>,
         event_register: ER,
         ch_builder: String,
         add_noise: bool,
@@ -114,21 +113,29 @@ impl NodeInMemory {
         }
         let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
         let parent_span = self.parent_span.clone();
+        let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
         GlobalExecutor::spawn(
-            client_event_handling(self.op_storage.clone(), user_events, client_responses)
-                .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
+            client_event_handling(
+                self.op_storage.clone(),
+                user_events,
+                client_responses,
+                node_controller_tx,
+            )
+            .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
         );
-        let parent_span = self.parent_span.clone();
-        self.run_event_listener(cli_response_sender)
+        let parent_span: tracing::Span = self.parent_span.clone();
+        self.run_event_listener(cli_response_sender, node_controller_rx)
             .instrument(parent_span)
             .await
     }
 
+    #[cfg(test)]
     pub async fn append_contracts<'a>(
         &self,
         contracts: Vec<(ContractContainer, WrappedState)>,
-        contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
-    ) -> Result<(), ContractError> {
+        contract_subscribers: std::collections::HashMap<ContractKey, Vec<PeerKeyLocation>>,
+    ) -> Result<(), crate::contract::ContractError> {
+        use crate::contract::ContractHandlerEvent;
         for (contract, state) in contracts {
             let key: ContractKey = contract.key();
             let parameters = contract.params();
@@ -173,15 +180,25 @@ impl NodeInMemory {
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
     async fn run_event_listener(
         &mut self,
-        _client_responses: ClientResponsesSender, // fixme: use this
+        _client_responses: ClientResponsesSender,
+        mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
     ) -> Result<(), anyhow::Error> {
         loop {
             let msg = tokio::select! {
                 msg = self.conn_manager.recv() => { msg.map(Either::Left) }
-                msg = self.notification_channel.recv() => if let Some(msg) = msg {
-                    Ok(msg.map_left(|(msg, _cli_id)| msg))
-                } else {
-                    anyhow::bail!("notification channel shutdown, fatal error");
+                msg = self.notification_channel.recv() => {
+                    if let Some(msg) = msg {
+                        Ok(msg.map_left(|(msg, _cli_id)| msg))
+                    } else {
+                        anyhow::bail!("notification channel shutdown, fatal error");
+                    }
+                }
+                msg = node_controller_rx.recv() => {
+                    if let Some(msg) = msg {
+                        Ok(Either::Right(msg))
+                    } else {
+                        anyhow::bail!("node controller channel shutdown, fatal error");
+                    }
                 }
             };
 
@@ -228,6 +245,14 @@ impl NodeInMemory {
                             .register_events(Either::Left(NetEventLog::disconnected(&peer)));
                         self.op_storage.ring.prune_connection(peer);
                         continue;
+                    }
+                    NodeEvent::Disconnect { cause: Some(cause) } => {
+                        tracing::info!(peer = %self.peer_key, "Shutting down node, reason: {cause}");
+                        return Ok(());
+                    }
+                    NodeEvent::Disconnect { cause: None } => {
+                        tracing::info!(peer = %self.peer_key, "Shutting down node");
+                        return Ok(());
                     }
                     other => {
                         unreachable!("event {other:?}, shouldn't happen in the in-memory impl")

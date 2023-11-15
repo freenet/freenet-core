@@ -256,6 +256,9 @@ pub(crate) enum NodeEvent {
     /// Error while sending a message by the connection bridge from within the ops.
     #[serde(skip)]
     Error(ConnectionError),
+    Disconnect {
+        cause: Option<String>,
+    },
 }
 
 impl Display for NodeEvent {
@@ -264,12 +267,18 @@ impl Display for NodeEvent {
             NodeEvent::ShutdownNode => f.write_str("ShutdownNode"),
             NodeEvent::ConfirmedInbound => f.write_str("ConfirmedInbound"),
             NodeEvent::DropConnection(peer) => {
-                f.write_str(&format!("DropConnection (from {peer})"))
+                write!(f, "DropConnection (from {peer})")
             }
             NodeEvent::AcceptConnection(peer) => {
-                f.write_str(&format!("AcceptConnection (from {peer})"))
+                write!(f, "AcceptConnection (from {peer})")
             }
-            NodeEvent::Error(err) => f.write_str(&format!("{err}")),
+            NodeEvent::Error(err) => write!(f, "{err}"),
+            NodeEvent::Disconnect { cause: Some(cause) } => {
+                write!(f, "Disconnect node, reason: {cause}")
+            }
+            NodeEvent::Disconnect { cause: None } => {
+                write!(f, "Disconnect node, reason: unknown")
+            }
         }
     }
 }

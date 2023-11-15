@@ -12,7 +12,7 @@ use std::{
 use tar::Builder;
 
 use crate::{
-    config::{BuildToolCliConfig, PackageType},
+    config::{BuildToolConfig, PackageType},
     util::pipe_std_streams,
     Error,
 };
@@ -21,14 +21,14 @@ pub(crate) use contract::*;
 const DEFAULT_OUTPUT_NAME: &str = "contract-state";
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
-pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), anyhow::Error> {
+pub fn build_package(cli_config: BuildToolConfig, cwd: &Path) -> Result<(), anyhow::Error> {
     match cli_config.package_type {
         PackageType::Contract => contract::package_contract(cli_config, cwd),
         PackageType::Delegate => delegate::package_delegate(cli_config, cwd),
     }
 }
 
-fn compile_options(cli_config: &BuildToolCliConfig) -> impl Iterator<Item = String> {
+fn compile_options(cli_config: &BuildToolConfig) -> impl Iterator<Item = String> {
     let release: &[&str] = if cli_config.debug {
         &[]
     } else {
@@ -54,7 +54,7 @@ fn compile_options(cli_config: &BuildToolCliConfig) -> impl Iterator<Item = Stri
 #[cfg(test)]
 #[test]
 fn test_get_compile_options() {
-    let config = BuildToolCliConfig {
+    let config = BuildToolConfig {
         features: Some("contract".into()),
         version: semver::Version::new(0, 0, 1),
         package_type: PackageType::Contract,
@@ -68,7 +68,7 @@ fn test_get_compile_options() {
 }
 
 fn compile_rust_wasm_lib(
-    cli_config: &BuildToolCliConfig,
+    cli_config: &BuildToolConfig,
     work_dir: &Path,
 ) -> Result<(), anyhow::Error> {
     const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
@@ -108,7 +108,7 @@ fn compile_rust_wasm_lib(
 
 fn get_out_lib(
     work_dir: &Path,
-    cli_config: &BuildToolCliConfig,
+    cli_config: &BuildToolConfig,
 ) -> Result<(String, PathBuf), anyhow::Error> {
     const ERR: &str = "Cargo.toml definition incorrect";
 
@@ -159,7 +159,7 @@ mod contract {
     use super::*;
 
     pub(super) fn package_contract(
-        cli_config: BuildToolCliConfig,
+        cli_config: BuildToolConfig,
         cwd: &Path,
     ) -> Result<(), anyhow::Error> {
         let mut config = get_config(cwd)?;
@@ -185,7 +185,7 @@ mod contract {
     }
 
     #[derive(Serialize, Deserialize)]
-    pub(crate) struct BuildToolConfig {
+    pub(crate) struct ContractBuildConfig {
         pub contract: Contract,
         pub state: Option<Sources>,
         pub webapp: Option<WebAppContract>,
@@ -241,7 +241,7 @@ mod contract {
     }
 
     fn build_web_state(
-        config: &BuildToolConfig,
+        config: &ContractBuildConfig,
         embedded_deps: EmbeddedDeps,
         cwd: &Path,
     ) -> Result<(), anyhow::Error> {
@@ -398,7 +398,10 @@ mod contract {
         build_state(sources)
     }
 
-    fn build_generic_state(config: &mut BuildToolConfig, cwd: &Path) -> Result<(), anyhow::Error> {
+    fn build_generic_state(
+        config: &mut ContractBuildConfig,
+        cwd: &Path,
+    ) -> Result<(), anyhow::Error> {
         const REQ_ONE_FILE_ERR: &str = "Requires exactly one source file specified for the state.";
 
         let sources = config.state.as_mut().and_then(|s| s.files.as_mut());
@@ -441,7 +444,7 @@ mod contract {
         Ok(())
     }
 
-    fn get_config(cwd: &Path) -> Result<BuildToolConfig, anyhow::Error> {
+    fn get_config(cwd: &Path) -> Result<ContractBuildConfig, anyhow::Error> {
         let config_file = cwd.join("freenet.toml");
         if config_file.exists() {
             let mut f_content = vec![];
@@ -453,8 +456,8 @@ mod contract {
     }
 
     fn compile_contract(
-        config: &BuildToolConfig,
-        cli_config: &BuildToolCliConfig,
+        config: &ContractBuildConfig,
+        cli_config: &BuildToolConfig,
         cwd: &Path,
     ) -> Result<(), anyhow::Error> {
         let work_dir = match config.contract.c_type.unwrap_or(ContractType::Standard) {
@@ -488,7 +491,7 @@ mod contract {
 
     fn get_versioned_contract(
         contract_code_path: &Path,
-        cli_config: &BuildToolCliConfig,
+        cli_config: &BuildToolConfig,
     ) -> Result<Vec<u8>, anyhow::Error> {
         let code: ContractCode = ContractCode::load_raw(contract_code_path)?;
         tracing::info!("compiled contract code hash: {}", code.hash_str());
@@ -555,7 +558,7 @@ mod contract {
     fn embed_deps(
         cwd: &Path,
         deps: HashMap<impl Into<String>, DependencyDefinition>,
-        cli_config: &BuildToolCliConfig,
+        cli_config: &BuildToolConfig,
     ) -> Result<EmbeddedDeps, anyhow::Error> {
         let cwd = fs::canonicalize(cwd)?;
         let mut deps_json = HashMap::new();
@@ -589,11 +592,11 @@ mod contract {
     mod test {
         use super::*;
 
-        fn setup_webapp_contract() -> Result<(BuildToolConfig, PathBuf), anyhow::Error> {
+        fn setup_webapp_contract() -> Result<(ContractBuildConfig, PathBuf), anyhow::Error> {
             const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
             let cwd = PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/web");
             Ok((
-                BuildToolConfig {
+                ContractBuildConfig {
                     contract: Contract {
                         c_type: Some(ContractType::WebApp),
                         lang: Some(SupportedContractLangs::Rust),
@@ -647,7 +650,7 @@ mod contract {
         fn compile_webapp_contract() -> Result<(), anyhow::Error> {
             //
             let (config, cwd) = setup_webapp_contract()?;
-            compile_contract(&config, &BuildToolCliConfig::default(), &cwd)?;
+            compile_contract(&config, &BuildToolConfig::default(), &cwd)?;
             Ok(())
         }
 
@@ -656,7 +659,7 @@ mod contract {
             const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
             let cwd =
                 PathBuf::from(CRATE_DIR).join("../../apps/freenet-microblogging/contracts/posts");
-            let mut config = BuildToolConfig {
+            let mut config = ContractBuildConfig {
                 contract: Contract {
                     c_type: Some(ContractType::Standard),
                     lang: Some(SupportedContractLangs::Rust),
@@ -698,7 +701,7 @@ mod contract {
                 posts = { path = "../contracts/posts" }
             };
             let defs = include_deps(&deps).unwrap();
-            embed_deps(&cwd, defs, &BuildToolCliConfig::default()).unwrap();
+            embed_deps(&cwd, defs, &BuildToolConfig::default()).unwrap();
             Ok(())
         }
     }
@@ -710,7 +713,7 @@ mod delegate {
     use super::*;
 
     pub(super) fn package_delegate(
-        cli_config: BuildToolCliConfig,
+        cli_config: BuildToolConfig,
         cwd: &Path,
     ) -> Result<(), anyhow::Error> {
         compile_rust_wasm_lib(&cli_config, cwd)?;
@@ -730,7 +733,7 @@ mod delegate {
 
     fn get_versioned_contract(
         contract_code_path: &Path,
-        cli_config: &BuildToolCliConfig,
+        cli_config: &BuildToolConfig,
     ) -> Result<Vec<u8>, anyhow::Error> {
         let code: DelegateCode = DelegateCode::load_raw(contract_code_path)?;
         tracing::info!("compiled contract code hash: {}", code.hash_str());

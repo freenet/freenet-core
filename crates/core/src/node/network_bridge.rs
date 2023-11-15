@@ -13,7 +13,6 @@ use crate::{
     message::{Message, NodeEvent},
 };
 
-#[cfg(test)]
 pub(crate) mod in_memory;
 pub(crate) mod p2p_protoc;
 

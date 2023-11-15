@@ -6,7 +6,7 @@ use std::{
 
 use serde::de::DeserializeOwned;
 
-use crate::local_node::DeserializationFmt;
+use crate::wasm_runtime::DeserializationFmt;
 
 pub fn deserialize<T, R>(
     deser_format: Option<DeserializationFmt>,

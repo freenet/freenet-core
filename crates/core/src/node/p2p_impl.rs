@@ -23,6 +23,7 @@ use crate::{
         self, ClientResponsesSender, ContractHandler, ExecutorToEventLoopChannel,
         NetworkEventListenerHalve,
     },
+    message::NodeEvent,
     node::NodeBuilder,
     util::IterExt,
 };
@@ -37,6 +38,7 @@ pub(super) struct NodeP2P {
     is_gateway: bool,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     cli_response_sender: ClientResponsesSender,
+    node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
 }
 
 impl NodeP2P {
@@ -68,6 +70,7 @@ impl NodeP2P {
                 self.notification_channel,
                 self.executor_listener,
                 self.cli_response_sender,
+                self.node_controller,
             )
             .await
     }
@@ -111,9 +114,15 @@ impl NodeP2P {
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
         let clients = ClientEventsCombinator::new(builder.clients);
+        let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
         GlobalExecutor::spawn(
-            client_event_handling(op_storage.clone(), clients, client_responses)
-                .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
+            client_event_handling(
+                op_storage.clone(),
+                clients,
+                client_responses,
+                node_controller_tx,
+            )
+            .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
         );
 
         Ok(NodeP2P {
@@ -124,6 +133,7 @@ impl NodeP2P {
             is_gateway: builder.location.is_some(),
             executor_listener,
             cli_response_sender,
+            node_controller: node_controller_rx,
         })
     }
 

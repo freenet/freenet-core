@@ -974,7 +974,6 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
             )],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::from_iter([(key.clone(), vec![node1_loc])]),
         };
@@ -984,7 +983,6 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
             )],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::from_iter([(key.clone(), vec![node0_loc])]),
         };
@@ -1001,7 +999,6 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val,
             )],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::from_iter([(1, put_event)]),
             contract_subscribers: HashMap::new(),
         };

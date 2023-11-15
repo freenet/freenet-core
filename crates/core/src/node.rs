@@ -20,7 +20,6 @@ use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use tracing::Instrument;
 
-#[cfg(test)]
 use self::in_memory_impl::NodeInMemory;
 use self::{network_event_log::NetEventLog, p2p_impl::NodeP2P};
 use crate::{
@@ -31,7 +30,7 @@ use crate::{
         ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
         NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
     },
-    message::{Message, Transaction, TransactionType},
+    message::{Message, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectMsg, ConnectOp},
         get, put, subscribe, OpEnum, OpError, OpOutcome,
@@ -47,13 +46,11 @@ pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, N
 pub(crate) use network_event_log::{EventRegister, NetEventRegister};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-#[cfg(test)]
 mod in_memory_impl;
 mod network_bridge;
 mod network_event_log;
 mod op_state_manager;
 mod p2p_impl;
-#[cfg(test)]
 pub(crate) mod tests;
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -318,6 +315,7 @@ async fn client_event_handling<ClientEv>(
     op_storage: Arc<OpManager>,
     mut client_events: ClientEv,
     mut client_responses: ClientResponses,
+    node_controller: tokio::sync::mpsc::Sender<NodeEvent>,
 ) where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
@@ -334,8 +332,8 @@ async fn client_event_handling<ClientEv>(
                         continue;
                     }
                 };
-                if let ClientRequest::Disconnect { .. } = &*req.request {
-                    // todo: notify executor of disconnect
+                if let ClientRequest::Disconnect { cause } = &*req.request {
+                    node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
                     continue;
                 }
                 process_open_request(req, op_storage.clone()).await;
@@ -728,8 +726,7 @@ impl<'a> arbitrary::Arbitrary<'a> for PeerKey {
 }
 
 impl PeerKey {
-    #[cfg(test)]
-    pub fn random() -> Self {
+    pub(crate) fn random() -> Self {
         use libp2p::identity::Keypair;
         PeerKey::from(Keypair::generate_ed25519().public())
     }
