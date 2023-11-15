@@ -129,7 +129,9 @@ pub(super) async fn contract_home(
             result: Err(err), ..
         }) => {
             tracing::error!("error getting contract `{key}`: {err}");
-            return Err(WebSocketApiError::AxumError { error: err.kind() });
+            return Err(WebSocketApiError::AxumError {
+                error: err.kind().clone(),
+            });
         }
         None => {
             return Err(WebSocketApiError::NodeError {

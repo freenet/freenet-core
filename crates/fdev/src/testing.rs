@@ -34,6 +34,13 @@ pub struct TestConfig {
     /// Events are simulated get, puts and other operations.
     #[arg(long, default_value_t = usize::MAX)]
     events: usize,
+    /// Time in milliseconds to wait for the network to be sufficiently connected
+    /// to start requesting events. (20% of the network)
+    #[arg(long, default_value_t = 15_000)]
+    wait_duration: u64,
+    /// Time in milliseconds to wait for the next event to be executed.
+    #[arg(long)]
+    event_wait_time: Option<u64>,
     #[clap(subcommand)]
     /// Execution mode for the test.
     pub command: TestMode,
@@ -77,6 +84,8 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> Result<(), Error>
 }
 
 mod single_process {
+    use std::time::Duration;
+
     use freenet::network_sim::SimNetwork;
     use futures::StreamExt;
     use rand::RngCore;
@@ -111,7 +120,22 @@ mod single_process {
             )
             .await;
 
-        let join_tasks = async move {
+        let events = base_config.events;
+        let connectivity_timeout = Duration::from_millis(base_config.wait_duration);
+        let next_event_wait_time = base_config.event_wait_time.map(Duration::from_millis);
+        let events_generated = tokio::task::spawn_blocking(move || {
+            // todo: come with a good time_out wait value experimentally,
+            // on avg how long should it take for the 20% of the network to be connected?
+            simulated_network.check_partial_connectivity(connectivity_timeout, 0.20)?;
+            for _ in simulated_network.event_chain(events) {
+                if let Some(t) = next_event_wait_time {
+                    std::thread::sleep(t);
+                }
+            }
+            Ok::<_, super::Error>(())
+        });
+
+        let join_peer_tasks = async move {
             let mut futs = futures::stream::FuturesUnordered::from_iter(join_handles);
             while let Some(join_handle) = futs.next().await {
                 join_handle??;
@@ -119,16 +143,35 @@ mod single_process {
             Ok::<_, super::Error>(())
         };
 
-        // Wait for a signal to gracefully shut down the program
-        #[cfg(unix)]
-        {
-            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+        let ctrl_c = signal::ctrl_c();
+
+        tokio::pin!(events_generated);
+        tokio::pin!(join_peer_tasks);
+        tokio::pin!(ctrl_c);
+
+        loop {
             tokio::select! {
-                _ = signal::ctrl_c() /* SIGINT handling */ => {}
-                _ = sigterm.recv() => {}
-                finalized = join_tasks => {
+                _ = &mut ctrl_c  /* SIGINT handling */ => {
+                    break;
+                }
+                res = &mut events_generated => {
+                    match res? {
+                        Ok(_) => {
+                            println!("Test events generated successfully");
+                            *events_generated = tokio::task::spawn(futures::future::pending::<Result<(), super::Error>>());
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                finalized = &mut join_peer_tasks => {
                     match finalized {
-                        Ok(_) => println!("Test finalized successfully"),
+                        Ok(_) => {
+                            println!("Test finalized successfully");
+                            break;
+                        }
                         Err(e) => {
                             println!("Test finalized with error: {}", e);
                             return Err(e);
@@ -137,12 +180,6 @@ mod single_process {
                 }
             }
         }
-        #[cfg(not(unix))]
-        {
-            unimplemented!("Windows support is not implemented");
-        }
-
-        println!("Shutting down test...");
 
         Ok(())
     }

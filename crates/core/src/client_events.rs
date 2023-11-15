@@ -190,12 +190,15 @@ pub(crate) mod test {
             }
         }
 
-        pub fn rng_params(&mut self, num_peers: usize, max_contract_num: usize, iterations: usize) {
-            // let hasher = &mut rand::thread_rng();
-            // let hash = self.id.hash(hasher);
-            // let this_peer = hasher.finish();
+        pub fn rng_params(
+            &mut self,
+            id: usize,
+            num_peers: usize,
+            max_contract_num: usize,
+            iterations: usize,
+        ) {
             let internal_state = InternalGeneratorState {
-                this_peer: 0,
+                this_peer: id,
                 num_peers,
                 max_contract_num,
                 max_iterations: iterations,
@@ -276,7 +279,7 @@ pub(crate) mod test {
                     } else {
                         // probably the process finished, wait for a bit and then kill the thread
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        panic!("finished orphan background thread");
+                        break Err(ErrorKind::Shutdown.into());
                     }
                 }
             }

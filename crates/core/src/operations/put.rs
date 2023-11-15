@@ -1011,7 +1011,7 @@ mod test {
         ]);
 
         sim_nw.start_with_spec(put_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
 
         // trigger the put op @ gw-0
         sim_nw

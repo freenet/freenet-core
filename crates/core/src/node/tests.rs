@@ -9,11 +9,8 @@ use std::{
 use freenet_stdlib::prelude::*;
 use itertools::Itertools;
 use libp2p::{identity, PeerId};
-use rand::Rng;
-use tokio::sync::{
-    watch::{channel, Receiver, Sender},
-    Barrier,
-};
+use rand::{seq::SliceRandom, Rng};
+use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, Instrument};
 
 #[cfg(feature = "trace-ot")]
@@ -48,7 +45,7 @@ pub fn get_dynamic_port() -> u16 {
 
 pub(crate) type EventId = usize;
 
-#[derive(PartialEq, Eq, Hash, Clone)]
+#[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
 pub struct NodeLabel(Arc<str>);
 
 impl NodeLabel {
@@ -66,6 +63,17 @@ impl NodeLabel {
 
     pub fn is_node(&self) -> bool {
         self.0.starts_with("node")
+    }
+
+    pub fn number(&self) -> usize {
+        let mut parts = self.0.split('-');
+        assert!(parts.next().is_some());
+        parts
+            .next()
+            .map(|s| s.parse::<usize>())
+            .transpose()
+            .expect("should be an usize")
+            .expect("should have an other part")
     }
 }
 
@@ -115,15 +123,44 @@ struct GatewayConfig {
     location: Location,
 }
 
+pub struct EventChain<'a> {
+    network: &'a SimNetwork,
+    total_events: usize,
+    count: usize,
+    rng: rand::rngs::SmallRng,
+}
+
+impl Iterator for EventChain<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.count < self.total_events).then(|| {
+            let (_, id) = self
+                .network
+                .labels
+                .choose(&mut self.rng)
+                .expect("not empty");
+            self.network
+                .user_ev_controller
+                .send((self.count, *id))
+                .expect("peer controller should be alive");
+            self.count += 1;
+            self.count
+        })
+    }
+}
+
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
     debug: bool,
-    pub(crate) labels: HashMap<NodeLabel, PeerKey>,
+    labels: Vec<(NodeLabel, PeerKey)>,
     pub(crate) event_listener: TestEventListener,
     user_ev_controller: Sender<(EventId, PeerKey)>,
     receiver_ch: Receiver<(EventId, PeerKey)>,
+    number_of_gateways: usize,
     gateways: Vec<(NodeInMemory, GatewayConfig)>,
+    number_of_nodes: usize,
     nodes: Vec<(NodeInMemory, NodeLabel)>,
     ring_max_htl: usize,
     rnd_if_htl_above: usize,
@@ -131,6 +168,24 @@ pub struct SimNetwork {
     min_connections: usize,
     init_backoff: Duration,
     add_noise: bool,
+}
+
+#[cfg(any(debug_assertions, test))]
+impl std::fmt::Debug for SimNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimNetwork")
+            .field("name", &self.name)
+            .field("labels", &self.labels)
+            .field("number_of_gateways", &self.number_of_gateways)
+            .field("number_of_nodes", &self.number_of_nodes)
+            .field("ring_max_htl", &self.ring_max_htl)
+            .field("rnd_if_htl_above", &self.rnd_if_htl_above)
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("init_backoff", &self.init_backoff)
+            .field("add_noise", &self.add_noise)
+            .finish()
+    }
 }
 
 impl SimNetwork {
@@ -149,10 +204,12 @@ impl SimNetwork {
             name: name.into(),
             debug: false,
             event_listener: TestEventListener::new(),
-            labels: HashMap::new(),
+            labels: Vec::with_capacity(nodes + gateways),
             user_ev_controller,
             receiver_ch,
+            number_of_gateways: gateways,
             gateways: Vec::with_capacity(gateways),
+            number_of_nodes: nodes,
             nodes: Vec::with_capacity(nodes),
             ring_max_htl,
             rnd_if_htl_above,
@@ -253,7 +310,7 @@ impl SimNetwork {
             .cloned()
             .collect();
 
-        for node_no in 0..num {
+        for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().to_peer_id();
@@ -322,6 +379,7 @@ impl SimNetwork {
             self.initialize_peer(node, label, node_spec);
             tokio::time::sleep(self.init_backoff).await;
         }
+        self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
     }
 
     #[cfg(test)]
@@ -336,7 +394,7 @@ impl SimNetwork {
             user_events.generate_events(specs.events_to_generate);
         }
         tracing::debug!(peer = %label, "initializing");
-        self.labels.insert(label, peer.peer_key);
+        self.labels.push((label, peer.peer_key));
         let node_task = async move {
             if let Some(specs) = node_specs {
                 peer.append_contracts(specs.owned_contracts, specs.contract_subscribers)
@@ -369,6 +427,7 @@ impl SimNetwork {
             peers.push(handle);
             tokio::time::sleep(self.init_backoff).await;
         }
+        self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
         peers
     }
 
@@ -384,7 +443,8 @@ impl SimNetwork {
         tracing::debug!(peer = %label, "initializing");
         let mut user_events =
             MemoryEventsGen::<R>::new_with_seed(self.receiver_ch.clone(), peer.peer_key, seed);
-        user_events.rng_params(total_peer_num, max_contract_num, iterations);
+        user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+        self.labels.push((label, peer.peer_key));
         let node_task = async move { peer.run_node(user_events).await };
         GlobalExecutor::spawn(node_task)
     }
@@ -403,11 +463,11 @@ impl SimNetwork {
     }
 
     pub fn connected(&self, peer: &NodeLabel) -> bool {
-        if let Some(key) = self.labels.get(peer) {
-            self.event_listener.is_connected(key)
-        } else {
-            panic!("peer not found");
-        }
+        let pos = self
+            .labels
+            .binary_search_by(|(label, _)| label.cmp(peer))
+            .expect("peer not found");
+        self.event_listener.is_connected(&self.labels[pos].1)
     }
 
     pub fn has_put_contract(
@@ -416,27 +476,33 @@ impl SimNetwork {
         key: &ContractKey,
         value: &WrappedState,
     ) -> bool {
-        if let Some(pk) = self.labels.get(&peer.into()) {
-            self.event_listener.has_put_contract(pk, key, value)
-        } else {
-            panic!("peer not found");
-        }
+        let peer = peer.into();
+        let pos = self
+            .labels
+            .binary_search_by(|(label, _)| label.cmp(&peer))
+            .expect("peer not found");
+        self.event_listener
+            .has_put_contract(&self.labels[pos].1, key, value)
     }
 
     pub fn has_got_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
-        if let Some(pk) = self.labels.get(&peer.into()) {
-            self.event_listener.has_got_contract(pk, key)
-        } else {
-            panic!("peer not found");
-        }
+        let peer = peer.into();
+        let pos = self
+            .labels
+            .binary_search_by(|(label, _)| label.cmp(&peer))
+            .expect("peer not found");
+        self.event_listener
+            .has_got_contract(&self.labels[pos].1, key)
     }
 
     pub fn is_subscribed_to_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
-        if let Some(pk) = self.labels.get(&peer.into()) {
-            self.event_listener.is_subscribed_to_contract(pk, key)
-        } else {
-            panic!("peer not found");
-        }
+        let peer = peer.into();
+        let pos = self
+            .labels
+            .binary_search_by(|(label, _)| label.cmp(&peer))
+            .expect("peer not found");
+        self.event_listener
+            .is_subscribed_to_contract(&self.labels[pos].1, key)
     }
 
     /// Builds an histogram of the distribution in the ring of each node relative to each other.
@@ -476,16 +542,19 @@ impl SimNetwork {
     /// - label: node for which to trigger the
     /// - event_id: which event to trigger
     /// - await_for: if set, wait for the duration before returning
-    pub async fn trigger_event(
+    #[cfg(test)]
+    pub(crate) async fn trigger_event(
         &self,
         label: impl Into<NodeLabel>,
         event_id: EventId,
         await_for: Option<Duration>,
     ) -> Result<(), anyhow::Error> {
-        let peer = self
+        let label = label.into();
+        let pos = self
             .labels
-            .get(&label.into())
-            .ok_or_else(|| anyhow::anyhow!("node not found"))?;
+            .binary_search_by(|(other, _)| other.cmp(&label))
+            .map_err(|_| anyhow::anyhow!("peer not found"))?;
+        let (_, peer) = &self.labels[pos];
         self.user_ev_controller
             .send((event_id, *peer))
             .expect("node listeners disconnected");
@@ -495,21 +564,48 @@ impl SimNetwork {
         Ok(())
     }
 
+    /// Start an event chain for this simulation.
+    pub fn event_chain(&self, total_events: usize) -> EventChain<'_> {
+        const SEED: u64 = 0xdeadbeef;
+        EventChain {
+            network: self,
+            total_events,
+            count: 0,
+            rng: rand::rngs::SmallRng::seed_from_u64(SEED),
+        }
+    }
+
     /// Checks that all peers in the network have acquired at least one connection to any
     /// other peers.
-    pub async fn check_connectivity(&self, time_out: Duration) -> Result<(), anyhow::Error> {
-        let num_nodes = self.nodes.capacity();
+    pub fn check_connectivity(&self, time_out: Duration) -> Result<(), anyhow::Error> {
+        self.connectivity(time_out, 1.0)
+    }
+
+    /// Checks that a percentage (given as a float between 0 and 1) of the nodes has at least
+    /// one connection to any other peers.
+    pub fn check_partial_connectivity(
+        &self,
+        time_out: Duration,
+        percent: f64,
+    ) -> Result<(), anyhow::Error> {
+        self.connectivity(time_out, percent)
+    }
+
+    fn connectivity(&self, time_out: Duration, percent: f64) -> Result<(), anyhow::Error> {
+        let num_nodes = self.number_of_nodes;
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
-        while elapsed.elapsed() < time_out && connected.len() < num_nodes {
-            for node in 0..num_nodes {
+        while elapsed.elapsed() < time_out && (connected.len() as f64 / num_nodes as f64) < percent
+        {
+            for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
                 if !connected.contains(&node) && self.connected(&NodeLabel::node(node)) {
                     connected.insert(node);
                 }
             }
         }
 
-        let expected = HashSet::from_iter(0..num_nodes);
+        let expected =
+            HashSet::from_iter(self.number_of_gateways..num_nodes + self.number_of_gateways);
         let mut missing: Vec<_> = expected
             .difference(&connected)
             .map(|n| format!("node-{}", n))
@@ -517,9 +613,16 @@ impl SimNetwork {
 
         tracing::info!("Number of simulated nodes: {num_nodes}");
 
-        if !missing.is_empty() {
+        let missing_percent = 1.0 - (missing.len() as f64 / num_nodes as f64);
+        if missing_percent > percent {
             missing.sort();
-            tracing::error!("Nodes without connection: {:?}", missing);
+            let show_max = missing.len().min(100);
+            tracing::error!(
+                "Nodes without connection: {:?}(..) ({}% > {}%)",
+                &missing[..show_max],
+                missing_percent * 100.0,
+                percent * 100.0
+            );
             tracing::error!("Total nodes without connection: {:?}", missing.len());
             anyhow::bail!("found disconnected nodes");
         }
@@ -553,7 +656,7 @@ impl SimNetwork {
     /// -
     pub fn network_connectivity_quality(&self) -> Result<(), anyhow::Error> {
         const HIGHER_THAN_MIN_THRESHOLD: f64 = 0.5;
-        let num_nodes = self.nodes.capacity();
+        let num_nodes = self.number_of_nodes;
         let min_connections_threshold = (num_nodes as f64 * HIGHER_THAN_MIN_THRESHOLD) as usize;
         let node_connectivity = self.node_connectivity();
 
@@ -596,7 +699,7 @@ impl SimNetwork {
 impl Drop for SimNetwork {
     fn drop(&mut self) {
         if !self.debug {
-            for label in self.labels.keys() {
+            for (label, _) in &self.labels {
                 let p = std::env::temp_dir()
                     .join(format!("freenet-executor-{sim}-{label}", sim = self.name));
                 let _ = std::fs::remove_dir_all(p);

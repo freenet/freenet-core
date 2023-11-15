@@ -523,7 +523,7 @@ mod test {
         )
         .await;
         sim_nw.start_with_spec(subscribe_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
         sim_nw
             .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;

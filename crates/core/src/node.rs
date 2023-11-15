@@ -16,7 +16,7 @@ use std::{
 };
 
 use either::Either;
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
 use tracing::Instrument;
 
@@ -327,6 +327,10 @@ async fn client_event_handling<ClientEv>(
                         tracing::debug!(%req, "got client request event");
                         req
                     }
+                    Err(err) if matches!(err.kind(), ErrorKind::Shutdown) => {
+                        node_controller.send(NodeEvent::Disconnect { cause: None }).await.ok();
+                        break;
+                    }
                     Err(err) => {
                         tracing::debug!(error = %err, "client error");
                         continue;
@@ -334,7 +338,7 @@ async fn client_event_handling<ClientEv>(
                 };
                 if let ClientRequest::Disconnect { cause } = &*req.request {
                     node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
-                    continue;
+                    break;
                 }
                 process_open_request(req, op_storage.clone()).await;
             }

@@ -900,7 +900,7 @@ mod test {
         )
         .await;
         sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
 
         // trigger get @ node-0, which does not own the contract
         sim_nw
@@ -937,7 +937,7 @@ mod test {
         let mut sim_nw =
             SimNetwork::new("get_contract_not_found", NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
 
         // trigger get @ node-1, which does not own the contract
         sim_nw
@@ -1004,7 +1004,7 @@ mod test {
         )
         .await;
         sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
         sim_nw
             .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
             .await?;
