@@ -3,7 +3,7 @@
 //! The resource management module is responsible for tracking resource usage,
 //! ensuring that usage does not exceed specified limits, and ensure that those
 //! resources are used to maximize the utility of the network. If limits are
-//! exceeded then peers are removed until the usage is below the limit.
+//! exceeded then peers are removed until the usage is below the limit.git
 //!
 //! ## Resources
 //!
