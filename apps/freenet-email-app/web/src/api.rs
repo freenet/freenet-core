@@ -3,9 +3,9 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::OnceLock};
 #[cfg(feature = "use-node")]
 use dioxus::prelude::UseSharedState;
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
-use futures::SinkExt;
 use freenet_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+use futures::SinkExt;
 
 use crate::app::{ContractType, InboxController};
 use crate::DynError;
@@ -499,11 +499,11 @@ pub(crate) async fn node_comms(
 ) {
     // todo don't unwrap inside this function, propagate errors to the UI somehow
     use freenet_email_inbox::Inbox as StoredInbox;
-    use futures::StreamExt;
     use freenet_stdlib::{
         client_api::{ContractError, ContractResponse, DelegateError, ErrorKind, RequestError},
         prelude::*,
     };
+    use futures::StreamExt;
     use std::sync::Arc;
 
     use crate::{
@@ -835,7 +835,7 @@ pub(crate) async fn node_comms(
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
                 if let Some(identity) = token_rec_to_id.remove(&key) {
                     let summary = TokenAllocationSummary::try_from(summary).unwrap();
-                    AftRecords::confirm_allocation(&mut client, key.id(), summary)
+                    AftRecords::confirm_allocation(&mut client, key.id().clone(), summary)
                         .await
                         .unwrap();
                     token_rec_to_id.insert(key, identity.clone());

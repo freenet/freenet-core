@@ -468,7 +468,7 @@ impl ContractInterface for Inbox {
             let serialized = inbox.serialize()?;
             Ok(UpdateModification::valid(serialized.into()))
         } else {
-            Ok(UpdateModification::requires(missing_related))
+            Ok(UpdateModification::requires(missing_related)?)
         }
     }
 

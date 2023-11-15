@@ -14,7 +14,8 @@ panic = 'abort'
 strip = true
 
 [workspace.dependencies]
-freenet-stdlib = { version = "0.0.5", default-features = false }
+# freenet-stdlib = { version = "0.0.7", default-features = false }
+freenet-stdlib = { path = "../../stdlib/rust", features = ["contract"] }
 
 #[target.wasm32-unknown-unknown]
 #rustflags = ["-C", "link-arg=--import-memory"]

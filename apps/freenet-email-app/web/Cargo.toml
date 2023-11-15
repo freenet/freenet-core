@@ -60,6 +60,6 @@ features = [
 dioxus-desktop = "0.4.0"
 
 [features]
-default = ["ui-testing"]
+default = ["use-node"]
 ui-testing = []
 use-node = []
