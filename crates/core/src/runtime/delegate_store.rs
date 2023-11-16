@@ -3,10 +3,10 @@ use freenet_stdlib::prelude::{
     APIVersion, CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, Parameters,
 };
-use std::fs::OpenOptions;
-use std::io::BufWriter;
 use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 use stretto::Cache;
+
+use crate::runtime::store::SafeWriter;
 
 use super::store::StoreFsManagement;
 use super::RuntimeResult;
@@ -15,7 +15,7 @@ pub struct DelegateStore {
     delegates_dir: PathBuf,
     delegate_cache: Cache<CodeHash, DelegateCode<'static>>,
     key_to_code_part: Arc<DashMap<DelegateKey, (u64, CodeHash)>>,
-    index_file: BufWriter<File>,
+    index_file: SafeWriter<Self>,
     key_file: PathBuf,
 }
 
@@ -51,8 +51,7 @@ impl DelegateStore {
         }
         Self::watch_changes(key_to_code_part.clone(), &key_file)?;
 
-        let index_file =
-            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(&key_file)?);
+        let index_file = SafeWriter::new(&key_file, false)?;
         Ok(Self {
             delegate_cache: Cache::new(100, max_size).expect(ERR),
             delegates_dir,

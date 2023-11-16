@@ -35,7 +35,6 @@ delegate = "0.10"
 directories = "5"
 either = { features = ["serde"], workspace = true }
 fastrand = { workspace = true }
-fs4 = "0.7"
 futures = "0.3.21"
 itertools = "0.11"
 libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }

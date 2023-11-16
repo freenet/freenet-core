@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    fs::{self, File},
+    io::Write,
     path::PathBuf,
     sync::Arc,
 };
@@ -12,7 +12,10 @@ use dashmap::DashMap;
 use freenet_stdlib::{client_api::DelegateRequest, prelude::*};
 use once_cell::sync::Lazy;
 
-use super::{store::StoreFsManagement, RuntimeResult};
+use super::{
+    store::{SafeWriter, StoreFsManagement},
+    RuntimeResult,
+};
 
 type SecretKey = [u8; 32];
 
@@ -38,7 +41,7 @@ pub struct SecretsStore {
     base_path: PathBuf,
     ciphers: HashMap<DelegateKey, Encryption>,
     key_to_secret_part: Arc<DashMap<DelegateKey, (u64, HashSet<SecretKey>)>>,
-    index_file: BufWriter<File>,
+    index_file: SafeWriter<Self>,
     key_file: PathBuf,
 }
 
@@ -119,8 +122,7 @@ impl SecretsStore {
         }
         Self::watch_changes(key_to_secret_part.clone(), &key_file)?;
 
-        let index_file =
-            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(&key_file)?);
+        let index_file = SafeWriter::new(&key_file, false)?;
         Ok(Self {
             base_path: secrets_dir,
             ciphers: HashMap::new(),

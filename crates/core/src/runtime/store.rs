@@ -3,8 +3,8 @@ use either::Either;
 use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, DelegateKey};
 use notify::Watcher;
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, BufWriter, Seek, Write};
-use std::path::Path;
+use std::io::{self, BufReader, BufWriter, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs::File, io::Read};
 
@@ -12,6 +12,82 @@ use crate::DynError;
 
 const INTERNAL_KEY: usize = 32;
 const TOMBSTONE_MARKER: usize = 1;
+
+pub(super) struct SafeWriter<S> {
+    file: BufWriter<File>,
+    lock_file_path: PathBuf,
+    compact: bool,
+    _marker: std::marker::PhantomData<fn(&S) -> ()>,
+}
+
+impl<S: StoreFsManagement> SafeWriter<S> {
+    pub fn new(path: &Path, compact: bool) -> Result<Self, io::Error> {
+        let file = if compact {
+            OpenOptions::new().create(true).write(true).open(path)?
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(path)?
+        };
+        let s = Self {
+            file: BufWriter::new(file),
+            _marker: std::marker::PhantomData,
+            compact,
+            lock_file_path: path.with_extension("lock"),
+        };
+        Ok(s)
+    }
+
+    /// Inserts a new record and returns the offset
+    fn insert_record(&mut self, key: StoreKey, value: &[u8]) -> std::io::Result<u64> {
+        self.check_lock();
+        // The full key is the tombstone marker byte + kind + [internal key content]  + size of value
+        self.file.write_u8(false as u8)?;
+        let mut traversed = 1;
+        match key {
+            StoreKey::ContractKey(key) => {
+                self.file.write_u8(KeyType::Contract as u8)?;
+                self.file.write_all(&key)?;
+            }
+            StoreKey::DelegateKey { key, code_hash } => {
+                self.file.write_u8(KeyType::Delegate as u8)?;
+                self.file.write_all(&key)?;
+                self.file.write_all(&code_hash)?;
+                traversed += 32; // additional code_hash bytes
+            }
+        }
+        traversed += 1 + 32; // key + type marker
+        self.file
+            .write_u32::<BigEndian>(value.as_ref().len() as u32)?;
+        traversed += std::mem::size_of::<u32>();
+        self.file.write_all(value)?;
+        traversed += value.len();
+        self.file.flush()?;
+        let current_offset = self.file.stream_position()?;
+        Ok(current_offset - traversed as u64)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check_lock();
+        self.file.flush()
+    }
+}
+
+impl<S> SafeWriter<S> {
+    fn check_lock(&self) {
+        while !self.compact && self.lock_file_path.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl<S> Drop for SafeWriter<S> {
+    fn drop(&mut self) {
+        self.check_lock();
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum StoreKey {
@@ -61,7 +137,7 @@ enum KeyType {
     Delegate = 1,
 }
 
-pub(super) trait StoreFsManagement {
+pub(super) trait StoreFsManagement: Sized {
     type MemContainer: Send + Sync + 'static;
     type Key: Clone + From<StoreKey>;
     type Value: AsRef<[u8]> + for<'x> TryFrom<&'x [u8], Error = std::io::Error>;
@@ -94,7 +170,7 @@ pub(super) trait StoreFsManagement {
         )?;
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(5 * 60));
-            if let Err(err) = compact_index_file(&key_path) {
+            if let Err(err) = compact_index_file::<Self>(&key_path) {
                 tracing::warn!("Failed index file ({key_path:?}) compaction: {err}");
             }
         });
@@ -104,7 +180,7 @@ pub(super) trait StoreFsManagement {
 
     /// Insert in index file and returns the offset at which this record resides.
     fn insert(
-        file: &mut BufWriter<File>,
+        file: &mut SafeWriter<Self>,
         key: Self::Key,
         value: &Self::Value,
     ) -> std::io::Result<u64>
@@ -113,7 +189,7 @@ pub(super) trait StoreFsManagement {
     {
         // The full key is the tombstone marker byte + kind + [internal key content]  + size of value
         let internal_key: StoreKey = key.into();
-        let offset = insert_record(file, internal_key, value.as_ref())?;
+        let offset = file.insert_record(internal_key, value.as_ref())?;
         Ok(offset)
     }
 
@@ -147,33 +223,6 @@ pub(super) trait StoreFsManagement {
         }
         Ok(())
     }
-}
-
-/// Inserts a new record and returns the offset
-fn insert_record(file: &mut BufWriter<File>, key: StoreKey, value: &[u8]) -> std::io::Result<u64> {
-    // The full key is the tombstone marker byte + kind + [internal key content]  + size of value
-    file.write_u8(false as u8)?;
-    let mut traversed = 1;
-    match key {
-        StoreKey::ContractKey(key) => {
-            file.write_u8(KeyType::Contract as u8)?;
-            file.write_all(&key)?;
-        }
-        StoreKey::DelegateKey { key, code_hash } => {
-            file.write_u8(KeyType::Delegate as u8)?;
-            file.write_all(&key)?;
-            file.write_all(&code_hash)?;
-            traversed += 32; // additional code_hash bytes
-        }
-    }
-    traversed += 1 + 32; // key + type marker
-    file.write_u32::<BigEndian>(value.as_ref().len() as u32)?;
-    traversed += std::mem::size_of::<u32>();
-    file.write_all(value)?;
-    traversed += value.len();
-    file.flush()?;
-    let current_offset = file.stream_position()?;
-    Ok(current_offset - traversed as u64)
 }
 
 #[allow(clippy::type_complexity)]
@@ -242,36 +291,44 @@ where
     }
 }
 
-fn compact_index_file(key_file_path: &Path) -> std::io::Result<()> {
-    use fs4::FileExt;
+fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Result<()> {
+    // Define the path to the lock file
+    let lock_file_path = key_file_path.with_extension("lock");
+
+    // Attempt to create the lock file
+    let mut opts = fs::OpenOptions::new();
+    opts.create_new(true).write(true);
+    match opts.open(&lock_file_path) {
+        Ok(_) => {
+            // The lock file was created successfully, so a compaction can proceed
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The lock file already exists, so a compaction is in progress
+            println!("locked");
+            return Ok(());
+        }
+        Err(e) => {
+            // An unexpected error occurred
+            return Err(e);
+        }
+    }
 
     let original_file = OpenOptions::new()
         .truncate(false)
         .read(true)
         .open(key_file_path)?;
 
-    // Lock the original file exclusively
-    if original_file.try_lock_exclusive().is_err() {
-        return Ok(());
-    }
-
     // Create a new temporary file to write compacted data
     let temp_file_path = key_file_path.with_extension("tmp");
-    let temp_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&temp_file_path)
-        .map_err(|e| {
-            let _ = original_file.unlock();
-            e
-        })?;
-
-    // Lock the temporary file exclusively
-    temp_file.try_lock_exclusive()?;
 
     // Read the original file and compact data into the temp file
     let mut original_reader = BufReader::new(original_file);
-    let mut temp_writer = BufWriter::new(temp_file);
+    let mut temp_writer = SafeWriter::<S>::new(&temp_file_path, true).map_err(|e| {
+        if let Err(e) = fs::remove_file(&lock_file_path) {
+            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+        }
+        e
+    })?;
 
     let mut any_deleted = false; // Track if any deleted records were found
 
@@ -282,11 +339,10 @@ fn compact_index_file(key_file_path: &Path) -> std::io::Result<()> {
                     Either::Left(v) => v.as_slice(),
                     Either::Right(v) => v.as_slice(),
                 };
-                if let Err(err) = insert_record(&mut temp_writer, store_key, value) {
-                    // Handle the error gracefully
-                    let _ = original_reader.into_inner().unlock();
-                    let _ = temp_writer.into_inner().map(|f| f.unlock());
-                    let _ = fs::remove_file(&temp_file_path);
+                if let Err(err) = temp_writer.insert_record(store_key, value) {
+                    if let Err(e) = fs::remove_file(&lock_file_path) {
+                        eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+                    }
                     return Err(err);
                 }
             }
@@ -300,9 +356,9 @@ fn compact_index_file(key_file_path: &Path) -> std::io::Result<()> {
             }
             Err(other) => {
                 // Handle other errors gracefully
-                let _ = original_reader.into_inner().unlock();
-                let _ = temp_writer.into_inner().map(|f| f.unlock());
-                let _ = fs::remove_file(&temp_file_path);
+                if let Err(e) = fs::remove_file(&lock_file_path) {
+                    eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+                }
                 return Err(other);
             }
         }
@@ -310,32 +366,40 @@ fn compact_index_file(key_file_path: &Path) -> std::io::Result<()> {
 
     // Check if any deleted records were found; if not, skip compaction
     if !any_deleted {
-        let _ = original_reader.into_inner().unlock();
-        let _ = temp_writer.into_inner().map(|f| f.unlock());
-        let _ = fs::remove_file(&temp_file_path);
+        if let Err(e) = fs::remove_file(&lock_file_path) {
+            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+        }
         return Ok(());
     }
 
     // Clean up and finalize the compaction process
-    let original_file = original_reader.into_inner();
-    original_file.unlock()?;
-    temp_writer.flush()?;
-    let _ = temp_writer.into_inner().map(|f| f.unlock());
-    std::mem::drop(original_file);
+    if let Err(e) = temp_writer.flush() {
+        if let Err(e) = fs::remove_file(&lock_file_path) {
+            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+        }
+        return Err(e);
+    }
 
     // Replace the original file with the temporary file
-    fs::rename(&temp_file_path, key_file_path)?;
-    let _ = fs::remove_file(&temp_file_path);
+    if let Err(e) = fs::rename(&temp_file_path, key_file_path) {
+        if let Err(e) = fs::remove_file(&lock_file_path) {
+            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+        }
+        return Err(e);
+    }
+
+    // Remove the lock file
+    fs::remove_file(&lock_file_path).map_err(|e| {
+        eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+        e
+    })?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::OpenOptions,
-        sync::{Arc, Barrier},
-    };
+    use std::sync::{Arc, Barrier};
 
     use crate::util::tests::get_temp_dir;
 
@@ -387,22 +451,8 @@ mod tests {
 
         // Test the update function
         {
-            let mut file_1 = BufWriter::new(
-                OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .append(true)
-                    .open(&contract_keys_file_path)
-                    .expect("Failed to open key file"),
-            );
-            let mut file_2 = BufWriter::new(
-                OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .append(true)
-                    .open(&delegate_keys_file_path)
-                    .expect("Failed to open key file"),
-            );
+            let mut file_1 = SafeWriter::new(&contract_keys_file_path, false).expect("failed");
+            let mut file_2 = SafeWriter::new(&delegate_keys_file_path, false).expect("failed");
             let container_1 = <TestStore1 as StoreFsManagement>::MemContainer::default();
             let container_2 = <TestStore2 as StoreFsManagement>::MemContainer::default();
 
@@ -465,13 +515,8 @@ mod tests {
         for i in [0, 10, 20, 30] {
             let shared_data = container.clone();
             let barrier = barrier.clone();
-            let mut file = BufWriter::new(
-                OpenOptions::new()
-                    .read(true)
-                    .append(true)
-                    .open(&temp_dir.path().join("contract_keys"))
-                    .expect("Failed to open key file"),
-            );
+            let path = &temp_dir.path().join("contract_keys");
+            let mut file = SafeWriter::new(path, false).expect("failed");
             let key_file_path = contract_keys_file_path.clone();
             let handle = std::thread::spawn(move || {
                 // Wait for all threads to reach this point
@@ -514,6 +559,12 @@ mod tests {
 
     #[test]
     fn test_concurrent_compaction() {
+        for _ in 0..100 {
+            concurrent_compaction();
+        }
+    }
+
+    fn concurrent_compaction() {
         let temp_dir = get_temp_dir();
         let key_file_path = temp_dir.path().join("data.dat");
         std::fs::File::create(&key_file_path).expect("Failed to create file");
@@ -530,25 +581,21 @@ mod tests {
                 let key_file_path = key_file_path.clone();
                 let barrier = barrier.clone();
                 let shared_data = container.clone();
-                let mut file = BufWriter::new(
-                    OpenOptions::new()
-                        .read(true)
-                        .append(true)
-                        .open(&key_file_path)
-                        .expect("Failed to open key file"),
-                );
+                let mut file = SafeWriter::new(&key_file_path, false).expect("failed");
                 std::thread::spawn(move || {
                     barrier.wait();
                     // concurrently creates/removes some data and compacts
                     if [10, 30].contains(&i) {
                         create_test_data(&mut file, &key_file_path, shared_data, i);
-                    } else if let Err(err) = super::compact_index_file(&key_file_path) {
+                    } else if let Err(err) = super::compact_index_file::<TestStore1>(&key_file_path)
+                    {
                         eprintln!("Thread encountered an error during compaction: {err}");
                         return Err(err);
                     }
                     barrier.wait();
+                    println!("next compaction (this should print 4 times");
                     // compact a last time so we know what data to compare against
-                    super::compact_index_file(&key_file_path).map_err(|err| {
+                    super::compact_index_file::<TestStore1>(&key_file_path).map_err(|err| {
                         eprintln!("Thread encountered an error during compaction: {err}");
                         err
                     })
@@ -594,7 +641,7 @@ mod tests {
     }
 
     fn create_test_data(
-        file: &mut BufWriter<File>,
+        file: &mut SafeWriter<TestStore1>,
         test_path: &Path,
         shared_data: <TestStore1 as StoreFsManagement>::MemContainer,
         thread: u8,

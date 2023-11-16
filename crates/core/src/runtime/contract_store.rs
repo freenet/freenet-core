@@ -1,15 +1,14 @@
-use std::{
-    fs::{File, OpenOptions},
-    io::{BufWriter, Write},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
 use stretto::Cache;
 
-use super::{error::RuntimeInnerError, store::StoreFsManagement, RuntimeResult};
+use super::{
+    error::RuntimeInnerError,
+    store::{SafeWriter, StoreFsManagement},
+    RuntimeResult,
+};
 
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
@@ -17,7 +16,7 @@ pub struct ContractStore {
     key_file: PathBuf,
     contract_cache: Cache<CodeHash, Arc<ContractCode<'static>>>,
     key_to_code_part: Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>,
-    index_file: BufWriter<File>,
+    index_file: SafeWriter<Self>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total space used under a configured threshold
@@ -54,8 +53,7 @@ impl ContractStore {
         }
         Self::watch_changes(key_to_code_part.clone(), &key_file)?;
 
-        let index_file =
-            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(&key_file)?);
+        let index_file = SafeWriter::new(&key_file, false)?;
         Ok(Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,

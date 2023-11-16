@@ -1565,7 +1565,6 @@ dependencies = [
  "either",
  "fastrand 2.0.1",
  "freenet-stdlib",
- "fs4",
  "futures",
  "itertools",
  "libp2p",
@@ -1639,16 +1638,6 @@ dependencies = [
  "wasm-bindgen",
  "wasmer",
  "web-sys",
-]
-
-[[package]]
-name = "fs4"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29f9df8a11882c4e3335eb2d18a0137c505d9ca927470b0cac9c6f0ae07d28f7"
-dependencies = [
- "rustix 0.38.24",
- "windows-sys 0.48.0",
 ]
 
 [[package]]
