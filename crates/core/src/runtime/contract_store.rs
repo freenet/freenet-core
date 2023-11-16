@@ -14,14 +14,13 @@ use super::{error::RuntimeInnerError, store::StoreFsManagement, RuntimeResult};
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
     contracts_dir: PathBuf,
+    key_file: PathBuf,
     contract_cache: Cache<CodeHash, Arc<ContractCode<'static>>>,
     key_to_code_part: Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>,
     index_file: BufWriter<File>,
 }
 // TODO: add functionality to delete old contracts which have not been used for a while
 //       to keep the total space used under a configured threshold
-
-static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
 impl StoreFsManagement for ContractStore {
     type MemContainer = Arc<DashMap<ContractInstanceId, (u64, CodeHash)>>;
@@ -43,13 +42,7 @@ impl ContractStore {
     pub fn new(contracts_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
         const ERR: &str = "failed to build mem cache";
         let mut key_to_code_part = Arc::new(DashMap::new());
-        let key_file = match KEY_FILE_PATH
-            .try_insert(contracts_dir.join("KEY_DATA"))
-            .map_err(|(e, _)| e)
-        {
-            Ok(f) => f,
-            Err(f) => f,
-        };
+        let key_file = contracts_dir.join("KEY_DATA");
         if !key_file.exists() {
             std::fs::create_dir_all(&contracts_dir).map_err(|err| {
                 tracing::error!("error creating contract dir: {err}");
@@ -57,15 +50,16 @@ impl ContractStore {
             })?;
             File::create(contracts_dir.join("KEY_DATA"))?;
         } else {
-            Self::load_from_file(key_file, &mut key_to_code_part)?;
+            Self::load_from_file(&key_file, &mut key_to_code_part)?;
         }
-        Self::watch_changes(key_to_code_part.clone(), key_file)?;
+        Self::watch_changes(key_to_code_part.clone(), &key_file)?;
 
         let index_file =
-            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(key_file)?);
+            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(&key_file)?);
         Ok(Self {
             contract_cache: Cache::new(100, max_size).expect(ERR),
             contracts_dir,
+            key_file,
             key_to_code_part,
             index_file,
         })
@@ -160,10 +154,7 @@ impl ContractStore {
                 let current_version_offset = v.get().0;
                 let prev_val = &mut v.get_mut().1;
                 // first mark the old entry (if it exists) as removed
-                Self::remove(
-                    KEY_FILE_PATH.get().expect("should be set"),
-                    current_version_offset,
-                )?;
+                Self::remove(&self.key_file, current_version_offset)?;
                 let new_offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
                 *prev_val = *code_hash;
                 v.get_mut().0 = new_offset;
@@ -198,7 +189,7 @@ impl ContractStore {
             })?,
         };
         if let Some((_, (offset, _))) = self.key_to_code_part.remove(key.id()) {
-            Self::remove(KEY_FILE_PATH.get().expect("infallible"), offset)?;
+            Self::remove(&self.key_file, offset)?;
         }
         let key_path = self
             .contracts_dir
