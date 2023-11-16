@@ -207,13 +207,21 @@ pub(crate) mod test {
             self.internal_state = Some(internal_state);
         }
 
-        fn generate_rand_event(&mut self) -> Option<ClientRequest<'static>> {
-            let (rng, state) = self
+        async fn generate_rand_event(&mut self) -> Option<ClientRequest<'static>> {
+            let (mut rng, mut state) = self
                 .rng
-                .as_mut()
-                .zip(self.internal_state.as_mut())
+                .take()
+                .zip(self.internal_state.take())
                 .expect("rng should be set");
-            rng.gen_event(state)
+            let (rng, state, res) = tokio::task::spawn_blocking(move || {
+                let res = rng.gen_event(&mut state);
+                (rng, state, res)
+            })
+            .await
+            .expect("task shouldn't fail");
+            self.rng = Some(rng);
+            self.internal_state = Some(state);
+            res
         }
     }
 
@@ -258,6 +266,7 @@ pub(crate) mod test {
                                 client_id: ClientId::FIRST,
                                 request: self
                                     .generate_rand_event()
+                                    .await
                                     .ok_or_else(|| ClientError::from(ErrorKind::Disconnect))?
                                     .into(),
                                 notification_channel: None,
@@ -307,7 +316,7 @@ pub(crate) mod test {
         existing_contracts: Vec<ContractContainer>,
     }
 
-    pub trait RandomEventGenerator {
+    pub trait RandomEventGenerator: Send + 'static {
         fn seed_from_u64(seed: u64) -> Self;
 
         fn gen_u8(&mut self) -> u8;

@@ -323,16 +323,16 @@ async fn client_event_handling<ClientEv>(
         tokio::select! {
             client_request = client_events.recv() => {
                 let req = match client_request {
-                    Ok(req) => {
-                        tracing::debug!(%req, "got client request event");
-                        req
+                    Ok(request) => {
+                        tracing::debug!(%request, "got client request event");
+                        request
                     }
-                    Err(err) if matches!(err.kind(), ErrorKind::Shutdown) => {
+                    Err(error) if matches!(error.kind(), ErrorKind::Shutdown) => {
                         node_controller.send(NodeEvent::Disconnect { cause: None }).await.ok();
                         break;
                     }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "client error");
+                    Err(error) => {
+                        tracing::debug!(%error, "client error");
                         continue;
                     }
                 };
@@ -344,8 +344,8 @@ async fn client_event_handling<ClientEv>(
             }
             res = client_responses.recv() => {
                 if let Some((cli_id, res)) = res {
-                    if let Ok(res) = &res {
-                        tracing::debug!(%res, "sending client response");
+                    if let Ok(result) = &res {
+                        tracing::debug!(%result, "sending client response");
                     }
                     if let Err(err) = client_events.send(cli_id, res).await {
                         tracing::debug!("channel closed: {err}");
@@ -372,8 +372,8 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                 } => {
                     // Initialize a put op.
                     tracing::debug!(
-                        "Received put from user event @ {}",
-                        &op_storage.ring.peer_key
+                        this_peer = %op_storage.ring.peer_key,
+                        "Received put from user event",
                     );
                     let op = put::start_op(
                         contract,
@@ -406,41 +406,49 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     }
                 }
                 ContractRequest::Subscribe { key, .. } => {
-                    // Initialize a subscribe op.
-                    loop {
-                        let op = subscribe::start_op(key.clone());
-                        match subscribe::request_subscribe(&op_storage, op, Some(client_id)).await {
-                            Err(OpError::ContractError(ContractError::ContractNotFound(key)))
-                                if !missing_contract =>
+                    const TIMEOUT: Duration = Duration::from_secs(10);
+                    let timeout = tokio::time::timeout(TIMEOUT, async {
+                        // Initialize a subscribe op.
+                        loop {
+                            let op = subscribe::start_op(key.clone());
+                            match subscribe::request_subscribe(&op_storage, op, Some(client_id))
+                                .await
                             {
-                                tracing::info!("Trying to subscribe to a contract not present: {key}, requesting it first");
-                                missing_contract = true;
-                                let get_op = get::start_op(key.clone(), true);
-                                if let Err(err) =
-                                    get::request_get(&op_storage, get_op, Some(client_id)).await
-                                {
-                                    tracing::error!("Failed getting the contract `{key}` while previously trying to subscribe; bailing: {err}");
+                                Err(OpError::ContractError(ContractError::ContractNotFound(
+                                    key,
+                                ))) if !missing_contract => {
+                                    tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
+                                    missing_contract = true;
+                                    let get_op = get::start_op(key.clone(), true);
+                                    if let Err(error) =
+                                        get::request_get(&op_storage, get_op, Some(client_id)).await
+                                    {
+                                        tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
+                                        break;
+                                    }
+                                }
+                                Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
+                                    tracing::warn!("Still waiting for {key} contract");
+                                    tokio::time::sleep(Duration::from_secs(2)).await
+                                }
+                                Err(err) => {
+                                    tracing::error!("{}", err);
+                                    break;
+                                }
+                                Ok(()) => {
+                                    if missing_contract {
+                                        tracing::debug!(%key,
+                                            "Got back the missing contract while subscribing"
+                                        );
+                                    }
+                                    tracing::debug!(%key, "Starting subscribe request");
                                     break;
                                 }
                             }
-                            Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
-                                tracing::warn!("Still waiting for {key} contract");
-                                tokio::time::sleep(Duration::from_secs(2)).await
-                            }
-                            Err(err) => {
-                                tracing::error!("{}", err);
-                                break;
-                            }
-                            Ok(()) => {
-                                if missing_contract {
-                                    tracing::debug!(
-                                        "Got back the missing contract ({key}) while subscribing"
-                                    );
-                                }
-                                tracing::debug!("Starting subscribe request to {key}");
-                                break;
-                            }
                         }
+                    });
+                    if timeout.await.is_err() {
+                        tracing::error!(%key, "Timeout while waiting for contract");
                     }
                 }
                 _ => {
@@ -536,7 +544,7 @@ async fn report_result(
             if let Some(tx) = tx {
                 op_storage.completed(tx);
             }
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, test))]
             {
                 let OpError::InvalidStateTransition { tx, state, trace } = err else {
                     tracing::error!("Finished transaction with error: {err}");
@@ -556,7 +564,7 @@ async fn report_result(
                 tracing::error!(%tx, ?state, "Wrong state");
                 eprintln!("Operation error trace:\n{trace}");
             }
-            #[cfg(not(debug_assertions))]
+            #[cfg(not(any(debug_assertions, test)))]
             {
                 tracing::debug!("Finished transaction with error: {err}");
             }

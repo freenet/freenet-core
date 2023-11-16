@@ -628,7 +628,7 @@ impl Ring {
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(1);
-        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(1);
+        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(2);
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
         let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
@@ -644,6 +644,10 @@ impl Ring {
         let retry_interval = REMOVAL_TICK_DURATION * 2;
         #[cfg(test)]
         let retry_interval = Duration::from_secs(5);
+
+        // if the peer is just starting wait a bit before
+        // we even attempt acquiring more connections
+        tokio::time::sleep(ACQUIRE_CONNS_TICK_DURATION).await;
 
         let mut live_tx = None;
         'outer: loop {

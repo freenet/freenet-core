@@ -203,7 +203,7 @@ impl Operation for GetOp {
                         self.state,
                         Some(GetState::AwaitingResponse { .. })
                     ));
-                    tracing::debug!(tx = %id, "Seek contract {} @ {}", key, target.peer);
+                    tracing::info!(tx = %id, %key, target = %target.peer, "Seek contract");
                     new_state = self.state;
                     stats = Some(GetStats {
                         contract_location: Location::from(key),
@@ -243,17 +243,17 @@ impl Operation for GetOp {
                     if !is_cached_contract {
                         tracing::warn!(
                             tx = %id,
-                            "Contract `{}` not found while processing a get request at node @ {}",
-                            key,
-                            target.peer
+                            %key,
+                            this_peer = %target.peer,
+                            "Contract not found while processing a get request",
                         );
 
                         if htl == 0 {
                             tracing::warn!(
                                 tx = %id,
-                                "The maximum hops has been exceeded, sending the error \
-                                 back to the node @ {}",
-                                sender.peer
+                                sender = %sender.peer,
+                                "The maximum hops has been exceeded, sending error \
+                                 back to the node",
                             );
 
                             return build_op_result(
@@ -279,7 +279,12 @@ impl Operation for GetOp {
                             .ring
                             .closest_caching(&key, [&sender.peer].as_slice())
                         else {
-                            tracing::warn!(tx = %id, "No other peers found while trying getting contract {key} @ {}", target.peer);
+                            tracing::warn!(
+                                tx = %id,
+                                %key,
+                                target = %target.peer,
+                                "No other peers found while trying getting contract",
+                            );
                             return Err(OpError::RingError(RingError::NoCachingPeers(key)));
                         };
                         continue_seeking(
@@ -373,10 +378,10 @@ impl Operation for GetOp {
                     let this_peer = target;
                     tracing::warn!(
                         tx = %id,
+                        %key,
                         %this_peer,
-                        "Neither contract or contract value for contract `{}` found at peer {}, \
+                        "Neither contract or contract value for contract found at peer {}, \
                         retrying with other peers",
-                        key,
                         sender.peer
                     );
 
@@ -556,7 +561,7 @@ impl Operation for GetOp {
                                     contract: contract.clone(),
                                 });
                             } else {
-                                tracing::debug!(tx = %id, "Get response received for contract {}", key);
+                                tracing::info!(tx = %id, %key, "Get response received for contract");
                                 new_state = None;
                                 return_msg = None;
                                 result = Some(GetResult {
@@ -566,7 +571,7 @@ impl Operation for GetOp {
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
-                            tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
+                            tracing::info!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
@@ -719,8 +724,8 @@ pub(crate) async fn request_get(
     };
     tracing::debug!(
         tx = %id,
-        "Preparing get contract request to {}",
-        target.peer,
+        target = %target.peer,
+        "Preparing get contract request",
     );
 
     match get_op.state {

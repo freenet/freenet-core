@@ -223,9 +223,9 @@ impl Operation for PutOp {
 
                     tracing::debug!(
                         tx = %id,
-                        "Puttting contract {} at target peer {}",
-                        key,
-                        target.peer,
+                        %key,
+                        target = %target.peer,
+                        "Puttting contract at target peer",
                     );
 
                     if !is_cached_contract
@@ -233,7 +233,7 @@ impl Operation for PutOp {
                             .ring
                             .within_caching_distance(&Location::from(&key))
                     {
-                        tracing::debug!(tx = %id, "Contract `{}` not cached @ peer {}", key, target.peer);
+                        tracing::debug!(tx = %id, %key, "Contract not cached @ peer {}", target.peer);
                         match try_to_cache_contract(op_storage, contract, &key, client_id).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
@@ -244,8 +244,8 @@ impl Operation for PutOp {
                         // to give back to requesting peer
                         tracing::warn!(
                             tx = %id,
-                            "Contract {} not found while processing info, forwarding",
-                            key
+                            %key,
+                            "Contract not found while processing info, forwarding",
                         );
                     }
 
@@ -446,9 +446,9 @@ impl Operation for PutOp {
                         }
                         _ => return Err(OpError::invalid_transition(self.id)),
                     };
-                    tracing::debug!(
-                        "Peer {} completed contract value put",
-                        op_storage.ring.peer_key
+                    tracing::info!(
+                        this_peer = %op_storage.ring.peer_key,
+                        "Peer completed contract value put",
                     );
                 }
                 PutMsg::PutForward {
@@ -461,9 +461,9 @@ impl Operation for PutOp {
                     let peer_loc = op_storage.ring.own_location();
 
                     tracing::debug!(
-                        "Forwarding changes at {}, trying put the contract {}",
-                        peer_loc.peer,
-                        key
+                        %key,
+                        this_peer = % peer_loc.peer,
+                        "Forwarding changes, trying put the contract"
                     );
 
                     let cached_contract = op_storage.ring.is_contract_cached(&key);

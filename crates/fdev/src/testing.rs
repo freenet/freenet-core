@@ -34,10 +34,10 @@ pub struct TestConfig {
     /// Events are simulated get, puts and other operations.
     #[arg(long, default_value_t = usize::MAX)]
     events: usize,
-    /// Time in milliseconds to wait for the network to be sufficiently connected
-    /// to start requesting events. (20% of the network)
-    #[arg(long, default_value_t = 15_000)]
-    wait_duration: u64,
+    /// Time in milliseconds to wait for the network to be sufficiently connected to start requesting events.
+    /// (20% of the expected connections to be processed per gateway)
+    #[arg(long)]
+    wait_duration: Option<u64>,
     /// Time in milliseconds to wait for the next event to be executed.
     #[arg(long)]
     event_wait_time: Option<u64>,
@@ -92,6 +92,12 @@ mod single_process {
     use tokio::signal;
 
     pub(super) async fn run(base_config: &super::TestConfig) -> Result<(), super::Error> {
+        if base_config.gateways == 0 {
+            anyhow::bail!("Gateways should be higher than 0");
+        }
+        if base_config.nodes == 0 {
+            anyhow::bail!("Nodes should be higher than 0");
+        }
         let name = &base_config
             .name
             .as_ref()
@@ -121,18 +127,32 @@ mod single_process {
             .await;
 
         let events = base_config.events;
-        let connectivity_timeout = Duration::from_millis(base_config.wait_duration);
         let next_event_wait_time = base_config.event_wait_time.map(Duration::from_millis);
+        let (connectivity_timeout, network_connection_percent) = {
+            let conns_per_gw = (base_config.nodes / base_config.gateways) as f64;
+            let conn_percent = (conns_per_gw / base_config.nodes as f64).min(0.99);
+            let connectivity_timeout =
+                Duration::from_millis(base_config.wait_duration.unwrap_or_else(|| {
+                    // expect a peer to take max 200ms to connect, this should happen in parallel
+                    // but err on the side of safety
+                    (conns_per_gw * 200.0).ceil() as u64
+                }));
+            (connectivity_timeout, conn_percent)
+        };
         let events_generated = tokio::task::spawn_blocking(move || {
-            // todo: come with a good time_out wait value experimentally,
-            // on avg how long should it take for the 20% of the network to be connected?
-            simulated_network.check_partial_connectivity(connectivity_timeout, 0.20)?;
+            println!(
+                "Waiting for network to be sufficiently connected ({}ms timeout, {}%)",
+                connectivity_timeout.as_millis(),
+                network_connection_percent * 100.0
+            );
+            simulated_network
+                .check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
             for _ in simulated_network.event_chain(events) {
                 if let Some(t) = next_event_wait_time {
                     std::thread::sleep(t);
                 }
             }
-            Ok::<_, super::Error>(())
+            Ok::<_, super::Error>(simulated_network)
         });
 
         let join_peer_tasks = async move {
@@ -149,6 +169,7 @@ mod single_process {
         tokio::pin!(join_peer_tasks);
         tokio::pin!(ctrl_c);
 
+        let mut network_sim = None;
         loop {
             tokio::select! {
                 _ = &mut ctrl_c  /* SIGINT handling */ => {
@@ -156,9 +177,10 @@ mod single_process {
                 }
                 res = &mut events_generated => {
                     match res? {
-                        Ok(_) => {
+                        Ok(return_nw) => {
                             println!("Test events generated successfully");
-                            *events_generated = tokio::task::spawn(futures::future::pending::<Result<(), super::Error>>());
+                            network_sim = Some(return_nw);
+                            *events_generated = tokio::task::spawn(futures::future::pending::<Result<SimNetwork, super::Error>>());
                             continue;
                         }
                         Err(err) => {
@@ -180,6 +202,8 @@ mod single_process {
                 }
             }
         }
+
+        _ = network_sim;
 
         Ok(())
     }

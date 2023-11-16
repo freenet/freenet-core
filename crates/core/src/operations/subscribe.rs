@@ -188,10 +188,11 @@ impl Operation for SubscribeOp {
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
-                            tracing::debug!(
+                            tracing::info!(
                                 tx = %id,
-                                "Peer {} successfully subscribed to contract {key}",
-                                subscriber.peer,
+                                %key,
+                                subscriber = % subscriber.peer,
+                                "Peer successfully subscribed to contract",
                             );
                             new_state = None;
                             // TODO review behaviour, if the contract is not cached should return subscribed false?
@@ -215,8 +216,9 @@ impl Operation for SubscribeOp {
                 } => {
                     tracing::warn!(
                         tx = %id,
-                        "Contract `{key}` not found at potential subscription provider {}",
-                        sender.peer
+                        %key,
+                        potential_provider = %sender.peer,
+                        "Contract not found at potential subscription provider",
                     );
                     // will error out in case it has reached max number of retries
                     match self.state {
@@ -269,15 +271,15 @@ impl Operation for SubscribeOp {
                 } => {
                     match self.state {
                         Some(SubscribeState::AwaitingResponse { .. }) => {
-                            tracing::debug!(
+                            tracing::info!(
                                 tx = %id,
-                                target = ?target.peer,
-                                this = ?op_storage.ring.own_location().peer,
-                                "Subscribed to `{key}` at provider {}", sender.peer
+                                %key,
+                                this_peer = %target.peer,
+                                provider = %sender.peer,
+                                "Subscribed to contract"
                             );
                             op_storage.ring.add_subscription(key.clone());
-                            // todo: should inform back to the network event loop in case a client
-                            // is waiting for response
+                            // fixme: should inform back to the network event loop in case a client is waiting for response
                             let _ = client_id;
                             new_state = Some(SubscribeState::Completed);
                             return_msg = None;
