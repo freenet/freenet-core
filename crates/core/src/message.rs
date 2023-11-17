@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    node::{ConnectionError, PeerKey},
+    node::{ConnectionError, PeerId},
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
@@ -250,9 +250,9 @@ pub(crate) enum NodeEvent {
     /// Received a confirmation from a peer that a physical connection was established.
     ConfirmedInbound,
     /// Drop the given peer connection.
-    DropConnection(PeerKey),
+    DropConnection(PeerId),
     /// Accept the connections from the given peer.
-    AcceptConnection(PeerKey),
+    AcceptConnection(PeerId),
     /// Error while sending a message by the connection bridge from within the ops.
     #[serde(skip)]
     Error(ConnectionError),

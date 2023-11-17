@@ -14,7 +14,7 @@ use tokio::{
     },
 };
 
-use super::PeerKey;
+use super::PeerId;
 use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
@@ -104,7 +104,7 @@ impl<const N: usize> Clone for CombinedRegister<N> {
 #[derive(Clone)]
 pub(crate) struct NetEventLog<'a> {
     tx: &'a Transaction,
-    peer_id: &'a PeerKey,
+    peer_id: &'a PeerId,
     kind: EventKind,
 }
 
@@ -121,7 +121,7 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
-    pub fn disconnected(from: &'a PeerKey) -> Self {
+    pub fn disconnected(from: &'a PeerId) -> Self {
         NetEventLog {
             tx: Transaction::NULL,
             peer_id: from,
@@ -294,7 +294,7 @@ impl<'a> NetEventLog<'a> {
 struct NetLogMessage {
     tx: Transaction,
     datetime: DateTime<Utc>,
-    peer_id: PeerKey,
+    peer_id: PeerId,
     kind: EventKind,
 }
 
@@ -949,14 +949,14 @@ enum EventKind {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum ConnectEvent {
     StartConnection {
-        from: PeerKey,
+        from: PeerId,
     },
     Connected {
         this: PeerKeyLocation,
         connected: PeerKeyLocation,
     },
     Finished {
-        initiator: PeerKey,
+        initiator: PeerId,
         location: Location,
     },
 }
@@ -965,11 +965,11 @@ enum ConnectEvent {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
     Request {
-        performer: PeerKey,
+        performer: PeerId,
         key: ContractKey,
     },
     PutSuccess {
-        requester: PeerKey,
+        requester: PeerId,
         value: WrappedState,
     },
     BroadcastEmitted {
@@ -982,7 +982,7 @@ enum PutEvent {
     },
     BroadcastReceived {
         /// peer who started the broadcast op
-        requester: PeerKey,
+        requester: PeerId,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
@@ -1025,7 +1025,7 @@ pub(super) mod test {
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerKey = gen.arbitrary()?;
+            let peer: PeerId = gen.arbitrary()?;
             peers.push(peer);
         }
         for _ in 0..TEST_LOGS {
@@ -1048,7 +1048,7 @@ pub(super) mod test {
 
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
-        node_labels: Arc<DashMap<NodeLabel, PeerKey>>,
+        node_labels: Arc<DashMap<NodeLabel, PeerId>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
         logs: Arc<Mutex<Vec<NetLogMessage>>>,
     }
@@ -1062,11 +1062,11 @@ pub(super) mod test {
             }
         }
 
-        pub fn add_node(&mut self, label: NodeLabel, peer: PeerKey) {
+        pub fn add_node(&mut self, label: NodeLabel, peer: PeerId) {
             self.node_labels.insert(label, peer);
         }
 
-        pub fn is_connected(&self, peer: &PeerKey) -> bool {
+        pub fn is_connected(&self, peer: &PeerId) -> bool {
             let logs = self.logs.lock();
             logs.iter().any(|log| {
                 &log.peer_id == peer
@@ -1076,7 +1076,7 @@ pub(super) mod test {
 
         pub fn has_put_contract(
             &self,
-            peer: &PeerKey,
+            peer: &PeerId,
             for_key: &ContractKey,
             expected_value: &WrappedState,
         ) -> bool {
@@ -1151,7 +1151,7 @@ pub(super) mod test {
             false
         }
 
-        pub fn has_got_contract(&self, peer: &PeerKey, expected_key: &ContractKey) -> bool {
+        pub fn has_got_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
             let logs = self.logs.lock();
             logs.iter().any(|log| {
                 &log.peer_id == peer
@@ -1159,11 +1159,7 @@ pub(super) mod test {
             })
         }
 
-        pub fn is_subscribed_to_contract(
-            &self,
-            peer: &PeerKey,
-            expected_key: &ContractKey,
-        ) -> bool {
+        pub fn is_subscribed_to_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
             let logs = self.logs.lock();
             logs.iter().any(|log| {
                 &log.peer_id == peer
@@ -1172,7 +1168,7 @@ pub(super) mod test {
         }
 
         /// Unique connections for a given peer and their relative distance to other peers.
-        pub fn connections(&self, peer: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
+        pub fn connections(&self, peer: PeerId) -> impl Iterator<Item = (PeerId, Distance)> {
             let logs = self.logs.lock();
             let disconnects = logs
                 .iter()
@@ -1253,13 +1249,13 @@ pub(super) mod test {
     #[test]
     fn test_get_connections() -> Result<(), anyhow::Error> {
         use crate::ring::Location;
-        let peer_id = PeerKey::random();
+        let peer_id = PeerId::random();
         let loc = Location::try_from(0.5)?;
         let tx = Transaction::new::<connect::ConnectMsg>();
         let locations = [
-            (PeerKey::random(), Location::try_from(0.5)?),
-            (PeerKey::random(), Location::try_from(0.75)?),
-            (PeerKey::random(), Location::try_from(0.25)?),
+            (PeerId::random(), Location::try_from(0.5)?),
+            (PeerId::random(), Location::try_from(0.75)?),
+            (PeerId::random(), Location::try_from(0.25)?),
         ];
 
         let mut listener = TestEventListener::new();

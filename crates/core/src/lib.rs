@@ -20,7 +20,7 @@ pub mod local_node {
     use super::*;
     pub use contract::Executor;
     pub use contract::OperationMode;
-    pub use node::NodeConfig;
+    pub use node::PeerCliConfig;
 }
 
 /// Exports for the dev tool.
@@ -29,7 +29,7 @@ pub mod dev_tool {
     pub use crate::config::Config;
     pub use client_events::{test::MemoryEventsGen, ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
-    pub use node::{testing_impl::SimNetwork, InitPeerNode, NodeBuilder, NodeConfig, PeerKey};
+    pub use node::{testing_impl::SimNetwork, InitPeerNode, NodeConfig, PeerCliConfig, PeerId};
     pub use ring::Location;
     pub use runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }

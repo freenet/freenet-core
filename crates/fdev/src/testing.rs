@@ -130,7 +130,7 @@ async fn config_sim_network(base_config: &TestConfig) -> Result<SimNetwork, Erro
 }
 
 mod multiple_process {
-    use freenet::dev_tool::{MemoryEventsGen, PeerKey};
+    use freenet::dev_tool::{MemoryEventsGen, PeerId};
 
     struct MultiProcessEventSender {}
 
@@ -139,7 +139,7 @@ mod multiple_process {
     pub(super) async fn run(base_config: &super::TestConfig) -> Result<(), super::Error> {
         let mut simulated_network = super::config_sim_network(base_config).await?;
         let peers = simulated_network.build_peers();
-        let (user_ev_controller, receiver_ch) = tokio::sync::watch::channel((0, PeerKey::random()));
+        let (user_ev_controller, receiver_ch) = tokio::sync::watch::channel((0, PeerId::random()));
         for (label, node) in peers {
             let mut user_events = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
                 receiver_ch.clone(),

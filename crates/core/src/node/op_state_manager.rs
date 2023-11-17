@@ -17,7 +17,7 @@ use crate::{
     ring::{LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeBuilder, PeerKey};
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -62,11 +62,11 @@ impl OpManager {
     pub(super) fn new<ER: NetEventRegister>(
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
-        builder: &NodeBuilder,
+        config: &NodeConfig,
         gateways: &[PeerKeyLocation],
         event_register: ER,
     ) -> Result<Self, anyhow::Error> {
-        let ring = Ring::new::<ER>(builder, gateways, notification_channel.clone())?;
+        let ring = Ring::new::<ER>(config, gateways, notification_channel.clone())?;
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
@@ -208,7 +208,7 @@ impl OpManager {
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
-    pub fn sending_transaction(&self, peer: &PeerKey, msg: &NetMessage) {
+    pub fn sending_transaction(&self, peer: &PeerId, msg: &NetMessage) {
         let transaction = msg.id();
         if let Some(loc) = msg.requested_location() {
             self.ring

@@ -9,7 +9,7 @@ use crate::{
     client_events::ClientId,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
-    node::{NetworkBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerId},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
@@ -142,7 +142,7 @@ impl Operation for GetOp {
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
-            let mut sender: Option<PeerKey> = None;
+            let mut sender: Option<PeerId> = None;
             if let Some(peer_key_loc) = msg.sender().cloned() {
                 sender = Some(peer_key_loc.peer);
             };
@@ -693,7 +693,7 @@ enum GetState {
     },
     /// Awaiting response from petition.
     AwaitingResponse {
-        skip_list: Vec<PeerKey>,
+        skip_list: Vec<PeerId>,
         retries: usize,
         fetch_contract: bool,
     },
@@ -706,7 +706,7 @@ pub(crate) async fn request_get(
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
-        const EMPTY: &[PeerKey] = &[];
+        const EMPTY: &[PeerId] = &[];
         // the initial request must provide:
         // - a location in the network where the contract resides
         // - and the key of the contract value to get

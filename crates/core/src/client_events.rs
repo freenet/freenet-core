@@ -164,13 +164,13 @@ pub(crate) mod test {
     use rand::{seq::SliceRandom, SeedableRng};
     use tokio::sync::watch::Receiver;
 
-    use crate::node::{testing_impl::EventId, PeerKey};
+    use crate::node::{testing_impl::EventId, PeerId};
 
     use super::*;
 
     pub struct MemoryEventsGen<R = rand::rngs::SmallRng> {
-        id: PeerKey,
-        signal: Receiver<(EventId, PeerKey)>,
+        id: PeerId,
+        signal: Receiver<(EventId, PeerId)>,
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
@@ -180,7 +180,7 @@ pub(crate) mod test {
     where
         R: RandomEventGenerator,
     {
-        pub fn new_with_seed(signal: Receiver<(EventId, PeerKey)>, id: PeerKey, seed: u64) -> Self {
+        pub fn new_with_seed(signal: Receiver<(EventId, PeerId)>, id: PeerId, seed: u64) -> Self {
             Self {
                 signal,
                 id,
@@ -227,7 +227,7 @@ pub(crate) mod test {
 
     impl MemoryEventsGen {
         #[cfg(test)]
-        pub fn new(signal: Receiver<(EventId, PeerKey)>, id: PeerKey) -> Self {
+        pub fn new(signal: Receiver<(EventId, PeerId)>, id: PeerId) -> Self {
             Self {
                 signal,
                 id,

@@ -9,7 +9,7 @@ use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
-    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerKey},
+    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
 };
@@ -28,7 +28,7 @@ pub(crate) struct OperationResult {
 }
 
 pub(crate) struct OpInitialization<Op> {
-    sender: Option<PeerKey>,
+    sender: Option<PeerId>,
     op: Op,
 }
 
@@ -58,7 +58,7 @@ async fn handle_op_result<CB>(
     network_bridge: &mut CB,
     result: Result<OperationResult, OpError>,
     tx_id: Transaction,
-    sender: Option<PeerKey>,
+    sender: Option<PeerId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     CB: NetworkBridge,

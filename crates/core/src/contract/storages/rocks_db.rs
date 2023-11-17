@@ -23,8 +23,8 @@ impl RocksDb {
 }
 
 impl RocksDb {
-    const STATE_SUFFIX: &[u8] = "_key".as_bytes();
-    const PARAMS_SUFFIX: &[u8] = "_params".as_bytes();
+    const STATE_SUFFIX: &'static [u8] = "_key".as_bytes();
+    const PARAMS_SUFFIX: &'static [u8] = "_params".as_bytes();
 }
 
 #[async_trait::async_trait]

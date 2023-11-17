@@ -33,9 +33,9 @@ impl<S: StoreFsManagement> SafeWriter<S> {
         };
         let s = Self {
             file: BufWriter::new(file),
-            _marker: std::marker::PhantomData,
             compact,
             lock_file_path: path.with_extension("lock"),
+            _marker: std::marker::PhantomData,
         };
         Ok(s)
     }
@@ -304,7 +304,6 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // The lock file already exists, so a compaction is in progress
-            println!("locked");
             return Ok(());
         }
         Err(e) => {
@@ -593,7 +592,6 @@ mod tests {
                         return Err(err);
                     }
                     barrier.wait();
-                    println!("next compaction (this should print 4 times");
                     // compact a last time so we know what data to compare against
                     super::compact_index_file::<TestStore1>(&key_file_path).map_err(|err| {
                         eprintln!("Thread encountered an error during compaction: {err}");

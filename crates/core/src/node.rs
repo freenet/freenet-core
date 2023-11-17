@@ -17,7 +17,7 @@ use std::{
 
 use either::Either;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind};
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
@@ -55,7 +55,7 @@ mod p2p_impl;
 pub(crate) mod testing_impl;
 
 #[derive(clap::Parser, Clone, Debug)]
-pub struct NodeConfig {
+pub struct PeerCliConfig {
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]
     pub mode: OperationMode,
@@ -91,9 +91,9 @@ impl Node {
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
 #[derive(Serialize, Deserialize)]
-pub struct NodeBuilder {
-    /// public key for the peer
-    pub(crate) public_key: PeerKey,
+pub struct NodeConfig {
+    /// public identifier for the peer
+    pub(crate) peer_id: PeerId,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
     pub(crate) local_ip: Option<IpAddr>,
@@ -114,11 +114,11 @@ pub struct NodeBuilder {
     pub(crate) min_number_conn: Option<usize>,
 }
 
-impl NodeBuilder {
-    pub fn new() -> NodeBuilder {
+impl NodeConfig {
+    pub fn new() -> NodeConfig {
         let local_key = Config::conf().local_peer_keypair.public().into();
-        NodeBuilder {
-            public_key: local_key,
+        NodeConfig {
+            peer_id: local_key,
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
@@ -164,8 +164,8 @@ impl NodeBuilder {
 
     /// Optional identity key of this node.
     /// If not provided it will be either obtained from the configuration or freshly generated.
-    pub fn with_key(&mut self, key: PeerKey) -> &mut Self {
-        self.public_key = key;
+    pub fn with_key(&mut self, key: PeerId) -> &mut Self {
+        self.peer_id = key;
         self
     }
 
@@ -183,7 +183,7 @@ impl NodeBuilder {
     /// Builds a node using the default backend connection manager.
     pub async fn build<const CLIENTS: usize>(
         self,
-        config: NodeConfig,
+        config: PeerCliConfig,
         clients: [BoxedClient; CLIENTS],
         private_key: identity::Keypair,
     ) -> Result<Node, anyhow::Error> {
@@ -215,7 +215,7 @@ impl NodeBuilder {
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
-        let peer = self.public_key;
+        let peer = self.peer_id;
         let gateways: Vec<_> = self
             .remote_nodes
             .iter()
@@ -241,7 +241,7 @@ impl NodeBuilder {
     }
 }
 
-impl Default for NodeBuilder {
+impl Default for NodeConfig {
     fn default() -> Self {
         Self::new()
     }
@@ -251,15 +251,15 @@ impl Default for NodeBuilder {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
-    identifier: PeerKey,
+    identifier: PeerId,
     location: Location,
 }
 
 impl InitPeerNode {
-    pub fn new(identifier: PeerId, location: Location) -> Self {
+    pub fn new(identifier: Libp2pPeerId, location: Location) -> Self {
         Self {
             addr: None,
-            identifier: PeerKey(identifier),
+            identifier: PeerId(identifier),
             location,
         }
     }
@@ -268,8 +268,8 @@ impl InitPeerNode {
     ///
     /// # Panic
     /// Will panic if is not a valid representation.
-    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> PeerId {
-        PeerId::from_public_key(
+    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> Libp2pPeerId {
+        Libp2pPeerId::from_public_key(
             &identity::Keypair::try_from(
                 identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
             )
@@ -302,7 +302,7 @@ impl InitPeerNode {
 
 async fn join_ring_request<CM>(
     backoff: Option<ExponentialBackoff>,
-    peer_key: PeerKey,
+    peer_key: PeerId,
     gateway: &PeerKeyLocation,
     op_storage: &OpManager,
     conn_manager: &mut CM,
@@ -708,7 +708,7 @@ async fn process_message<CB>(
 
 async fn handle_cancelled_op<CM>(
     tx: Transaction,
-    peer_key: PeerKey,
+    peer_key: PeerId,
     op_storage: &OpManager,
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
@@ -740,23 +740,24 @@ where
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
-pub struct PeerKey(PeerId);
+pub struct PeerId(Libp2pPeerId);
 
 #[cfg(test)]
-impl<'a> arbitrary::Arbitrary<'a> for PeerKey {
+impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: [u8; 32] = u.arbitrary()?;
-        let id =
-            PeerId::from_multihash(libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap())
-                .unwrap();
+        let id = Libp2pPeerId::from_multihash(
+            libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap(),
+        )
+        .unwrap();
         Ok(Self(id))
     }
 }
 
-impl PeerKey {
+impl PeerId {
     pub fn random() -> Self {
         use libp2p::identity::Keypair;
-        PeerKey::from(Keypair::generate_ed25519().public())
+        PeerId::from(Keypair::generate_ed25519().public())
     }
 
     #[cfg(test)]
@@ -765,37 +766,37 @@ impl PeerKey {
     }
 }
 
-impl std::fmt::Debug for PeerKey {
+impl std::fmt::Debug for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <Self as Display>::fmt(self, f)
     }
 }
 
-impl Display for PeerKey {
+impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl From<identity::PublicKey> for PeerKey {
+impl From<identity::PublicKey> for PeerId {
     fn from(val: identity::PublicKey) -> Self {
-        PeerKey(PeerId::from(val))
+        PeerId(Libp2pPeerId::from(val))
     }
 }
 
-impl From<PeerId> for PeerKey {
-    fn from(val: PeerId) -> Self {
-        PeerKey(val)
+impl From<Libp2pPeerId> for PeerId {
+    fn from(val: Libp2pPeerId) -> Self {
+        PeerId(val)
     }
 }
 
 mod serialization {
-    use libp2p::PeerId;
+    use libp2p::PeerId as Libp2pPeerId;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    use super::PeerKey;
+    use super::PeerId;
 
-    impl Serialize for PeerKey {
+    impl Serialize for PeerId {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
@@ -804,14 +805,14 @@ mod serialization {
         }
     }
 
-    impl<'de> Deserialize<'de> for PeerKey {
+    impl<'de> Deserialize<'de> for PeerId {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>,
         {
             let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-            Ok(PeerKey(
-                PeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
+            Ok(PeerId(
+                Libp2pPeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
             ))
         }
     }

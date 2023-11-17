@@ -18,7 +18,7 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
-use crate::{client_events::ClientId, node::NodeConfig, runtime::Runtime, DynError};
+use crate::{client_events::ClientId, node::PeerCliConfig, runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponses(UnboundedReceiver<(ClientId, HostResult)>);
 
@@ -86,7 +86,7 @@ pub(crate) struct NetworkContractHandler<R = Runtime> {
 }
 
 impl ContractHandler for NetworkContractHandler<Runtime> {
-    type Builder = NodeConfig;
+    type Builder = PeerCliConfig;
     type ContractExecutor = Executor<Runtime>;
 
     fn build(

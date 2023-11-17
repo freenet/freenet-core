@@ -31,7 +31,7 @@ use crate::runtime::{
 };
 use crate::{
     client_events::{ClientId, HostResult},
-    node::NodeConfig,
+    node::PeerCliConfig,
     operations::{self, Operation},
     DynError,
 };
@@ -377,7 +377,7 @@ impl<R> Executor<R> {
     }
 
     async fn get_stores(
-        config: &NodeConfig,
+        config: &PeerCliConfig,
     ) -> Result<
         (
             ContractStore,
@@ -419,7 +419,7 @@ impl<R> Executor<R> {
 }
 
 impl Executor<Runtime> {
-    pub async fn from_config(config: NodeConfig) -> Result<Self, DynError> {
+    pub async fn from_config(config: PeerCliConfig) -> Result<Self, DynError> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();

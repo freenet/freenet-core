@@ -7,14 +7,14 @@ use libp2p::{
     },
     dns,
     identity::Keypair,
-    noise, tcp, yamux, PeerId, Transport,
+    noise, tcp, yamux, PeerId as Libp2pPeerId, Transport,
 };
 use tracing::Instrument;
 
 use super::{
     client_event_handling, join_ring_request,
     network_bridge::{p2p_protoc::P2pConnManager, EventLoopNotifications},
-    NetEventRegister, PeerKey,
+    NetEventRegister, PeerId as FreenetPeerId,
 };
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
@@ -24,14 +24,14 @@ use crate::{
         NetworkEventListenerHalve,
     },
     message::NodeEvent,
-    node::NodeBuilder,
+    node::NodeConfig,
     util::IterExt,
 };
 
 use super::OpManager;
 
 pub(super) struct NodeP2P {
-    pub(crate) peer_key: PeerKey,
+    pub(crate) peer_key: FreenetPeerId,
     pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotifications,
     pub(super) conn_manager: P2pConnManager,
@@ -76,7 +76,7 @@ impl NodeP2P {
     }
 
     pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
-        builder: NodeBuilder,
+        builder: NodeConfig,
         private_key: Keypair,
         clients: [BoxedClient; CLIENTS],
         event_register: ER,
@@ -86,7 +86,7 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let peer_key = builder.public_key;
+        let peer_key = builder.peer_id;
         let gateways = builder.get_gateways()?;
 
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
@@ -154,7 +154,7 @@ impl NodeP2P {
     /// - Multiplexing using [Yamux](https://github.com/hashicorp/yamux/blob/master/spec.md).
     fn config_transport(
         local_key: &Keypair,
-    ) -> std::io::Result<transport::Boxed<(PeerId, muxing::StreamMuxerBox)>> {
+    ) -> std::io::Result<transport::Boxed<(Libp2pPeerId, muxing::StreamMuxerBox)>> {
         let tcp = tcp::tokio::Transport::new(tcp::Config::new().nodelay(true).port_reuse(true));
         let with_dns = dns::tokio::Transport::system(tcp)?;
         Ok(with_dns
@@ -214,21 +214,21 @@ mod test {
     async fn ping() -> Result<(), ()> {
         let peer1_port = get_free_port().unwrap();
         let peer1_key = Keypair::generate_ed25519();
-        let peer1_id: PeerId = peer1_key.public().into();
+        let peer1_id: Libp2pPeerId = peer1_key.public().into();
         let peer1_config = InitPeerNode::new(peer1_id, Location::random())
             .listening_ip(Ipv4Addr::LOCALHOST)
             .listening_port(peer1_port);
 
         let peer2_key = Keypair::generate_ed25519();
-        let peer2_id: PeerId = peer2_key.public().into();
+        let peer2_id: Libp2pPeerId = peer2_key.public().into();
 
-        let (_, receiver1) = channel((0, PeerKey::from(peer1_id)));
-        let (_, receiver2) = channel((0, PeerKey::from(peer2_id)));
+        let (_, receiver1) = channel((0, FreenetPeerId::from(peer1_id)));
+        let (_, receiver2) = channel((0, FreenetPeerId::from(peer2_id)));
 
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
-            let user_events = MemoryEventsGen::new(receiver1, PeerKey::from(peer1_id));
-            let mut config = NodeBuilder::new();
+            let user_events = MemoryEventsGen::new(receiver1, FreenetPeerId::from(peer1_id));
+            let mut config = NodeConfig::new();
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
@@ -250,8 +250,8 @@ mod test {
 
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
-            let user_events = MemoryEventsGen::new(receiver2, PeerKey::from(peer2_id));
-            let mut config = NodeBuilder::new();
+            let user_events = MemoryEventsGen::new(receiver2, FreenetPeerId::from(peer2_id));
+            let mut config = NodeConfig::new();
             config
                 .add_gateway(peer1_config.clone())
                 .with_key(peer2_key.public().into());

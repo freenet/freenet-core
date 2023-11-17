@@ -7,7 +7,7 @@ use libp2p::swarm::StreamUpgradeError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use super::PeerKey;
+use super::PeerId;
 use crate::{
     client_events::ClientId,
     message::{NetMessage, NodeEvent},
@@ -27,11 +27,11 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 /// to other peers in the network with whom connection has been established.
 #[async_trait::async_trait]
 pub(crate) trait NetworkBridge: Send + Sync {
-    async fn add_connection(&mut self, peer: PeerKey) -> ConnResult<()>;
+    async fn add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
 
-    async fn drop_connection(&mut self, peer: &PeerKey) -> ConnResult<()>;
+    async fn drop_connection(&mut self, peer: &PeerId) -> ConnResult<()>;
 
-    async fn send(&self, target: &PeerKey, msg: NetMessage) -> ConnResult<()>;
+    async fn send(&self, target: &PeerId, msg: NetMessage) -> ConnResult<()>;
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]

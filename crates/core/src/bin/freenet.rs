@@ -1,17 +1,17 @@
 use clap::Parser;
-use freenet::local_node::{Executor, NodeConfig, OperationMode};
+use freenet::local_node::{Executor, OperationMode, PeerCliConfig};
 use std::net::SocketAddr;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-async fn run(config: NodeConfig) -> Result<(), DynError> {
+async fn run(config: PeerCliConfig) -> Result<(), DynError> {
     match config.mode {
         OperationMode::Local => run_local(config).await,
         OperationMode::Network => Err("network mode not yet enabled".into()),
     }
 }
 
-async fn run_local(config: NodeConfig) -> Result<(), DynError> {
+async fn run_local(config: PeerCliConfig) -> Result<(), DynError> {
     let port = config.port;
     let ip = config.address;
     freenet::config::Config::set_op_mode(OperationMode::Local);
@@ -22,7 +22,7 @@ async fn run_local(config: NodeConfig) -> Result<(), DynError> {
 
 fn main() -> Result<(), DynError> {
     freenet::config::set_logger();
-    let config = NodeConfig::parse();
+    let config = PeerCliConfig::parse();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

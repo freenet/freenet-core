@@ -30,7 +30,7 @@ use libp2p::{
         KeepAlive, NetworkBehaviour, NotifyHandler, Stream as NegotiatedSubstream,
         SubstreamProtocol, SwarmEvent, ToSwarm,
     },
-    InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
+    InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId as Libp2pPeerId, Swarm,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -47,7 +47,7 @@ use crate::{
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
         handle_cancelled_op, join_ring_request, network_event_log::NetEventLog, process_message,
-        InitPeerNode, NetEventRegister, NodeBuilder, OpManager, PeerKey,
+        InitPeerNode, NetEventRegister, NodeConfig, OpManager, PeerId as FreenetPeerId,
     },
     operations::OpError,
     ring::PeerKeyLocation,
@@ -122,11 +122,11 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
     addr
 }
 
-type P2pBridgeEvent = Either<(PeerKey, Box<NetMessage>), NodeEvent>;
+type P2pBridgeEvent = Either<(FreenetPeerId, Box<NetMessage>), NodeEvent>;
 
 pub(crate) struct P2pBridge {
-    active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
-    accepted_peers: Arc<DashSet<PeerKey>>,
+    active_net_connections: Arc<DashMap<FreenetPeerId, Multiaddr>>,
+    accepted_peers: Arc<DashSet<FreenetPeerId>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
     log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
@@ -197,7 +197,7 @@ impl Clone for P2pBridge {
 
 #[async_trait::async_trait]
 impl NetworkBridge for P2pBridge {
-    async fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
+    async fn add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
             self.accepted_peers.insert(peer);
         }
@@ -208,7 +208,7 @@ impl NetworkBridge for P2pBridge {
         Ok(())
     }
 
-    async fn drop_connection(&mut self, peer: &PeerKey) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, peer: &FreenetPeerId) -> super::ConnResult<()> {
         self.accepted_peers.remove(peer);
         self.ev_listener_tx
             .send(Right(NodeEvent::DropConnection(*peer)))
@@ -222,7 +222,7 @@ impl NetworkBridge for P2pBridge {
         Ok(())
     }
 
-    async fn send(&self, target: &PeerKey, msg: NetMessage) -> super::ConnResult<()> {
+    async fn send(&self, target: &FreenetPeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .try_lock()
             .expect("single reference")
@@ -249,8 +249,8 @@ pub(in crate::node) struct P2pConnManager {
 
 impl P2pConnManager {
     pub fn build(
-        transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
-        config: &NodeBuilder,
+        transport: transport::Boxed<(Libp2pPeerId, muxing::StreamMuxerBox)>,
+        config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
         private_key: Keypair,
@@ -282,7 +282,7 @@ impl P2pConnManager {
         let mut swarm = Swarm::new(
             transport,
             behaviour,
-            config.public_key.0,
+            config.peer_id.0,
             SwarmConfig::with_executor(global_executor)
                 .with_idle_connection_timeout(config::PEER_TIMEOUT),
         );
@@ -327,7 +327,7 @@ impl P2pConnManager {
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
-        let this_peer = super::PeerKey(
+        let this_peer = FreenetPeerId::from(
             crate::config::Config::conf()
                 .local_peer_keypair
                 .public()
@@ -342,7 +342,7 @@ impl P2pConnManager {
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     Ok(Right(ConnMngrActions::ConnectionClosed {
-                        peer: PeerKey::from(peer_id),
+                        peer: FreenetPeerId::from(peer_id),
                     }))
                 }
                 SwarmEvent::Dialing { peer_id, .. } => {
@@ -355,13 +355,13 @@ impl P2pConnManager {
                     if let identify::Event::Received { peer_id, info } = *id {
                         if Self::is_compatible_peer(&info) {
                             Ok(Right(ConnMngrActions::ConnectionEstablished {
-                                peer: PeerKey(peer_id),
+                                peer: FreenetPeerId::from(peer_id),
                                 address: info.observed_addr,
                             }))
                         } else {
                             tracing::warn!("Incompatible peer: {}, disconnecting", peer_id);
                             Ok(Right(ConnMngrActions::ConnectionClosed {
-                                peer: PeerKey::from(peer_id),
+                                peer: FreenetPeerId::from(peer_id),
                             }))
                         }
                     } else {
@@ -378,7 +378,7 @@ impl P2pConnManager {
                             "Successful autonat probe, established conn with {peer} @ {address}"
                         );
                         Ok(Right(ConnMngrActions::ConnectionEstablished {
-                            peer: PeerKey(peer),
+                            peer: FreenetPeerId::from(peer),
                             address,
                         }))
                     }
@@ -597,22 +597,22 @@ impl P2pConnManager {
 enum ConnMngrActions {
     /// Received a new connection
     ConnectionEstablished {
-        peer: PeerKey,
+        peer: FreenetPeerId,
         address: Multiaddr,
     },
     /// Closed a connection with the peer
     ConnectionClosed {
-        peer: PeerKey,
+        peer: FreenetPeerId,
     },
     /// Outbound message
     SendMessage {
-        peer: PeerKey,
+        peer: FreenetPeerId,
         msg: Box<NetMessage>,
     },
     /// Update self own public address, useful when communicating for first time
     UpdatePublicAddr(Multiaddr),
     /// This is private, so when establishing connections hole-punching should be performed
-    IsPrivatePeer(PeerId),
+    IsPrivatePeer(Libp2pPeerId),
     NodeAction(NodeEvent),
     ClosedChannel,
     NoAction,
@@ -621,12 +621,12 @@ enum ConnMngrActions {
 /// Manages network connections with different peers and event routing within the swarm.
 pub(in crate::node) struct FreenetBehaviour {
     // FIFO queue for outbound messages
-    outbound: VecDeque<(PeerId, Either<NetMessage, NodeEvent>)>,
+    outbound: VecDeque<(Libp2pPeerId, Either<NetMessage, NodeEvent>)>,
     // FIFO queue for inbound messages
     inbound: VecDeque<Either<NetMessage, NodeEvent>>,
-    routing_table: HashMap<PeerId, HashSet<Multiaddr>>,
-    connected: HashMap<PeerId, ConnectionId>,
-    openning_connection: HashSet<PeerId>,
+    routing_table: HashMap<Libp2pPeerId, HashSet<Multiaddr>>,
+    connected: HashMap<Libp2pPeerId, ConnectionId>,
+    openning_connection: HashSet<Libp2pPeerId>,
     op_manager: Arc<OpManager>,
 }
 
@@ -638,7 +638,7 @@ impl NetworkBehaviour for FreenetBehaviour {
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: ConnectionId,
-        peer_id: PeerId,
+        peer_id: Libp2pPeerId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
@@ -655,7 +655,7 @@ impl NetworkBehaviour for FreenetBehaviour {
     fn handle_established_outbound_connection(
         &mut self,
         connection_id: ConnectionId,
-        peer_id: PeerId,
+        peer_id: Libp2pPeerId,
         addr: &Multiaddr,
         _role_override: libp2p::core::Endpoint,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
@@ -671,7 +671,7 @@ impl NetworkBehaviour for FreenetBehaviour {
 
     fn on_connection_handler_event(
         &mut self,
-        peer_id: PeerId,
+        peer_id: Libp2pPeerId,
         _connection: ConnectionId,
         event: <Self::ConnectionHandler as ConnectionHandler>::ToBehaviour,
     ) {

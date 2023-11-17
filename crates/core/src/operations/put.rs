@@ -16,7 +16,7 @@ use crate::{
     client_events::ClientId,
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
-    node::{NetworkBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -128,7 +128,7 @@ impl Operation for PutOp {
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
-            let mut sender: Option<PeerKey> = None;
+            let mut sender: Option<PeerId> = None;
             if let Some(peer_key_loc) = msg.sender().cloned() {
                 sender = Some(peer_key_loc.peer);
             };
@@ -344,7 +344,7 @@ impl Operation for PutOp {
                         .map(|i| {
                             // Avoid already broadcast nodes and sender from broadcasting
                             let mut subscribers: Vec<PeerKeyLocation> = i.value().to_vec();
-                            let mut avoid_list: HashSet<PeerKey> =
+                            let mut avoid_list: HashSet<PeerId> =
                                 sender_subscribers.iter().map(|pl| pl.peer).collect();
                             avoid_list.insert(sender.peer);
                             subscribers.retain(|s| !avoid_list.contains(&s.peer));
@@ -770,7 +770,7 @@ async fn forward_changes<CB>(
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    const EMPTY: &[PeerKey] = &[];
+    const EMPTY: &[PeerId] = &[];
     let forward_to = op_storage.ring.closest_caching(&key, EMPTY);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     if let Some(peer) = forward_to {

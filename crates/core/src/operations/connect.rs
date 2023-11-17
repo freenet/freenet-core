@@ -8,7 +8,7 @@ use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::ClientId,
     message::{InnerMessage, NetMessage, Transaction},
-    node::{ConnectionError, NetworkBridge, OpManager, PeerKey},
+    node::{ConnectionError, NetworkBridge, OpManager, PeerId},
     operations::OpEnum,
     ring::{Location, PeerKeyLocation, Ring},
     util::ExponentialBackoff,
@@ -692,7 +692,7 @@ fn try_returning_proxy_connection(
     sender: &PeerKeyLocation,
     own_loc: &PeerKeyLocation,
     accepted_by: HashSet<PeerKeyLocation>,
-    joiner: PeerKey,
+    joiner: PeerId,
 ) -> (Option<ConnectState>, Option<ConnectMsg>) {
     let new_state = if accepted_by.contains(own_loc) {
         tracing::debug!(
@@ -760,13 +760,13 @@ enum ConnectState {
         target: PeerKeyLocation,
         accepted_by: HashSet<PeerKeyLocation>,
         new_location: Location,
-        new_peer_id: PeerKey,
+        new_peer_id: PeerId,
     },
     AwaitingConnectionAcquisition {
         joiner: PeerKeyLocation,
     },
     AwaitingNewConnection {
-        query_target: PeerKey,
+        query_target: PeerId,
     },
     OCReceived,
     Connected,
@@ -775,7 +775,7 @@ enum ConnectState {
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    this_peer: PeerKey,
+    this_peer: PeerId,
     max_hops_to_live: usize,
 }
 
@@ -802,7 +802,7 @@ impl ConnectState {
 }
 
 pub(crate) fn initial_request(
-    this_peer: PeerKey,
+    this_peer: PeerId,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
     id: Transaction,
@@ -894,7 +894,7 @@ async fn forward_conn<NB>(
     (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
     left_htl: usize,
     accepted_by: HashSet<PeerKeyLocation>,
-    skip_list: Vec<PeerKey>,
+    skip_list: Vec<PeerId>,
 ) -> Result<Option<ConnectState>, OpError>
 where
     NB: NetworkBridge,
@@ -1042,7 +1042,7 @@ mod messages {
     }
 
     impl ConnectMsg {
-        pub fn sender(&self) -> Option<&PeerKey> {
+        pub fn sender(&self) -> Option<&PeerId> {
             use ConnectMsg::*;
             match self {
                 Response { sender, .. } => Some(&sender.peer),
@@ -1093,7 +1093,7 @@ mod messages {
     pub(crate) enum ConnectRequest {
         StartReq {
             target: PeerKeyLocation,
-            joiner: PeerKey,
+            joiner: PeerId,
             assigned_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
@@ -1111,7 +1111,7 @@ mod messages {
             sender: PeerKeyLocation,
             joiner: PeerKeyLocation,
             hops_to_live: usize,
-            skip_list: Vec<PeerKey>,
+            skip_list: Vec<PeerId>,
             accepted_by: HashSet<PeerKeyLocation>,
         },
         ReceivedOC,
@@ -1122,7 +1122,7 @@ mod messages {
         AcceptedBy {
             peers: HashSet<PeerKeyLocation>,
             your_location: Location,
-            your_peer_id: PeerKey,
+            your_peer_id: PeerId,
         },
         ReceivedOC {
             by_peer: PeerKeyLocation,
@@ -1130,7 +1130,7 @@ mod messages {
         },
         Proxy {
             accepted_by: HashSet<PeerKeyLocation>,
-            joiner: PeerKey,
+            joiner: PeerId,
         },
     }
 }

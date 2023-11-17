@@ -8,7 +8,7 @@ use rand::{
     SeedableRng,
 };
 
-use crate::node::PeerKey;
+use crate::node::PeerId;
 
 pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
@@ -225,14 +225,14 @@ pub(crate) trait Contains<T> {
     fn has_element(&self, target: &T) -> bool;
 }
 
-impl<'x> Contains<PeerKey> for &'x [PeerKey] {
-    fn has_element(&self, target: &PeerKey) -> bool {
+impl<'x> Contains<PeerId> for &'x [PeerId] {
+    fn has_element(&self, target: &PeerId) -> bool {
         self.contains(target)
     }
 }
 
-impl<'x> Contains<PeerKey> for &'x [&PeerKey] {
-    fn has_element(&self, target: &PeerKey) -> bool {
+impl<'x> Contains<PeerId> for &'x [&PeerId] {
+    fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
     }
 }

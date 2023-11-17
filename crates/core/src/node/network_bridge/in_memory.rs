@@ -7,15 +7,18 @@ use std::{
 };
 
 use crossbeam::channel::{self, Receiver, Sender};
+use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::OnceCell;
 use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use tokio::sync::Mutex;
 
-use super::{ConnectionError, NetworkBridge, PeerKey};
+use super::{ConnectionError, NetworkBridge, PeerId};
 use crate::{
     config::GlobalExecutor,
     message::NetMessage,
-    node::{network_event_log::NetEventLog, NetEventRegister, OpManager},
+    node::{
+        network_event_log::NetEventLog, testing_impl::NetworkBridgeExt, NetEventRegister, OpManager,
+    },
 };
 
 static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
@@ -26,12 +29,12 @@ pub(in crate::node) struct MemoryConnManager {
     log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
     op_manager: Arc<OpManager>,
     msg_queue: Arc<Mutex<Vec<NetMessage>>>,
-    peer: PeerKey,
+    peer: PeerId,
 }
 
 impl MemoryConnManager {
     pub fn new(
-        peer: PeerKey,
+        peer: PeerId,
         log_register: Box<dyn NetEventRegister>,
         op_manager: Arc<OpManager>,
         add_noise: bool,
@@ -61,17 +64,22 @@ impl MemoryConnManager {
             peer,
         }
     }
+}
 
-    pub async fn recv(&self) -> Result<NetMessage, ConnectionError> {
-        loop {
-            let mut queue = self.msg_queue.lock().await;
-            let Some(msg) = queue.pop() else {
-                std::mem::drop(queue);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            };
-            return Ok(msg);
+impl NetworkBridgeExt for MemoryConnManager {
+    fn recv(&mut self) -> BoxFuture<'_, Result<NetMessage, ConnectionError>> {
+        async {
+            loop {
+                let mut queue = self.msg_queue.lock().await;
+                let Some(msg) = queue.pop() else {
+                    std::mem::drop(queue);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                return Ok(msg);
+            }
         }
+        .boxed()
     }
 }
 
@@ -95,7 +103,7 @@ impl Clone for MemoryConnManager {
 
 #[async_trait::async_trait]
 impl NetworkBridge for MemoryConnManager {
-    async fn send(&self, target: &PeerKey, msg: NetMessage) -> super::ConnResult<()> {
+    async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .try_lock()
             .expect("unique lock")
@@ -107,25 +115,25 @@ impl NetworkBridge for MemoryConnManager {
         Ok(())
     }
 
-    async fn add_connection(&mut self, _peer: PeerKey) -> super::ConnResult<()> {
+    async fn add_connection(&mut self, _peer: PeerId) -> super::ConnResult<()> {
         Ok(())
     }
 
-    async fn drop_connection(&mut self, _peer: &PeerKey) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, _peer: &PeerId) -> super::ConnResult<()> {
         Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 struct MessageOnTransit {
-    origin: PeerKey,
-    target: PeerKey,
+    origin: PeerId,
+    target: PeerId,
     data: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 pub struct InMemoryTransport {
-    interface_peer: PeerKey,
+    interface_peer: PeerId,
     /// received messages per each peer awaiting processing
     msg_stack_queue: Arc<Mutex<Vec<MessageOnTransit>>>,
     /// all messages 'traversing' the network at a given time
@@ -133,7 +141,7 @@ pub struct InMemoryTransport {
 }
 
 impl InMemoryTransport {
-    fn new(interface_peer: PeerKey, add_noise: bool) -> Self {
+    fn new(interface_peer: PeerId, add_noise: bool) -> Self {
         let msg_stack_queue = Arc::new(Mutex::new(Vec::new()));
         let (network_tx, network_rx) = NETWORK_WIRES.get_or_init(crossbeam::channel::unbounded);
 
@@ -199,7 +207,7 @@ impl InMemoryTransport {
         }
     }
 
-    fn send(&self, peer: PeerKey, message: Vec<u8>) {
+    fn send(&self, peer: PeerId, message: Vec<u8>) {
         let send_res = self.network.send(MessageOnTransit {
             origin: self.interface_peer,
             target: peer,

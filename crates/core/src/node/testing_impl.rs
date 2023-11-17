@@ -6,9 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use either::Either;
 use freenet_stdlib::prelude::*;
+use futures::future::BoxFuture;
 use itertools::Itertools;
-use libp2p::{identity, PeerId};
+use libp2p::{identity, PeerId as Libp2pPeerId};
 use rand::{seq::SliceRandom, Rng};
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tracing::{info, Instrument};
@@ -18,7 +20,9 @@ use crate::node::network_event_log::CombinedRegister;
 use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
     config::GlobalExecutor,
-    node::{network_event_log::TestEventListener, InitPeerNode, NetEventRegister, NodeBuilder},
+    contract,
+    message::{NetMessage, NodeEvent},
+    node::{network_event_log::TestEventListener, InitPeerNode, NetEventRegister, NodeConfig},
     ring::{Distance, Location, PeerKeyLocation},
 };
 
@@ -27,7 +31,7 @@ mod inter_process;
 
 use self::inter_process::SimPeer;
 
-use super::PeerKey;
+use super::{network_bridge::EventLoopNotifications, ConnectionError, NetworkBridge, PeerId};
 
 pub fn get_free_port() -> Result<u16, ()> {
     let mut port;
@@ -124,7 +128,7 @@ pub(crate) struct NodeSpecification {
 struct GatewayConfig {
     label: NodeLabel,
     port: u16,
-    id: PeerId,
+    id: Libp2pPeerId,
     location: Location,
 }
 
@@ -162,8 +166,8 @@ type DefaultRegistry = CombinedRegister<2>;
 type DefaultRegistry = TestEventListener;
 
 pub(super) struct Builder<ER> {
-    pub(super) peer_key: PeerKey,
-    builder: NodeBuilder,
+    pub(super) peer_key: PeerId,
+    config: NodeConfig,
     ch_builder: String,
     add_noise: bool,
     event_register: ER,
@@ -174,15 +178,15 @@ pub(super) struct Builder<ER> {
 impl<ER: NetEventRegister> Builder<ER> {
     /// Buils an in-memory node. Does nothing upon construction,
     pub fn build(
-        builder: NodeBuilder,
+        builder: NodeConfig,
         event_register: ER,
         ch_builder: String,
         add_noise: bool,
     ) -> Builder<ER> {
-        let peer_key = builder.public_key;
+        let peer_key = builder.peer_id;
         Builder {
             peer_key,
-            builder,
+            config: builder,
             ch_builder,
             add_noise,
             event_register,
@@ -196,10 +200,10 @@ impl<ER: NetEventRegister> Builder<ER> {
 pub struct SimNetwork {
     name: String,
     debug: bool,
-    labels: Vec<(NodeLabel, PeerKey)>,
+    labels: Vec<(NodeLabel, PeerId)>,
     pub(crate) event_listener: TestEventListener,
-    user_ev_controller: Sender<(EventId, PeerKey)>,
-    receiver_ch: Receiver<(EventId, PeerKey)>,
+    user_ev_controller: Sender<(EventId, PeerId)>,
+    receiver_ch: Receiver<(EventId, PeerId)>,
     number_of_gateways: usize,
     gateways: Vec<(Builder<DefaultRegistry>, GatewayConfig)>,
     number_of_nodes: usize,
@@ -241,7 +245,7 @@ impl SimNetwork {
         min_connections: usize,
     ) -> Self {
         assert!(gateways > 0 && nodes > 0);
-        let (user_ev_controller, receiver_ch) = channel((0, PeerKey::random()));
+        let (user_ev_controller, receiver_ch) = channel((0, PeerId::random()));
         let mut net = Self {
             name: name.into(),
             debug: false,
@@ -292,7 +296,7 @@ impl SimNetwork {
             let port = get_free_port().unwrap();
             let location = Location::random();
 
-            let mut config = NodeBuilder::new();
+            let mut config = NodeConfig::new();
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
@@ -304,7 +308,7 @@ impl SimNetwork {
                 .rnd_if_htl_above(self.rnd_if_htl_above);
 
             self.event_listener
-                .add_node(label.clone(), PeerKey::from(id));
+                .add_node(label.clone(), PeerId::from(id));
             configs.push((
                 config,
                 GatewayConfig {
@@ -368,7 +372,7 @@ impl SimNetwork {
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().to_peer_id();
 
-            let mut config = NodeBuilder::new();
+            let mut config = NodeConfig::new();
             for GatewayConfig {
                 port, id, location, ..
             } in &gateways
@@ -385,7 +389,7 @@ impl SimNetwork {
                 .max_number_of_connections(self.max_connections)
                 .with_key(pair.public().into());
 
-            let peer = PeerKey::from(id);
+            let peer = PeerId::from(id);
             self.event_listener.add_node(label.clone(), peer);
 
             let event_listener = {
@@ -440,8 +444,8 @@ impl SimNetwork {
             }
             self.labels.push((label, node.peer_key));
 
-            let node_task = async move { node.run_node(user_events).await };
-            GlobalExecutor::spawn(node_task.instrument(span));
+            let node_task = async move { node.run_node(user_events, span).await };
+            GlobalExecutor::spawn(node_task);
 
             tokio::time::sleep(self.init_backoff).await;
         }
@@ -472,8 +476,8 @@ impl SimNetwork {
             };
             self.labels.push((label, node.peer_key));
 
-            let node_task = async move { node.run_node(user_events).await };
-            let handle = GlobalExecutor::spawn(node_task.instrument(span));
+            let node_task = async move { node.run_node(user_events, span).await };
+            let handle = GlobalExecutor::spawn(node_task);
             peers.push(handle);
 
             tokio::time::sleep(self.init_backoff).await;
@@ -486,9 +490,14 @@ impl SimNetwork {
     pub fn build_peers(&mut self) -> Vec<(NodeLabel, SimPeer)> {
         let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
         let mut peers = vec![];
-        for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
-            self.labels.push((label.clone(), node.peer_key));
-            peers.push((label, SimPeer(node)));
+        for (builder, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
+            self.labels.push((label.clone(), builder.peer_key));
+            peers.push((
+                label,
+                SimPeer {
+                    config: builder.config,
+                },
+            ));
         }
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
         peers.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -581,7 +590,7 @@ impl SimNetwork {
 
     /// Returns the connectivity in the network per peer (that is all the connections
     /// this peers has registered).
-    pub fn node_connectivity(&self) -> HashMap<NodeLabel, (PeerKey, HashMap<NodeLabel, Distance>)> {
+    pub fn node_connectivity(&self) -> HashMap<NodeLabel, (PeerId, HashMap<NodeLabel, Distance>)> {
         let mut peers_connections = HashMap::with_capacity(self.labels.len());
         let key_to_label: HashMap<_, _> = self.labels.iter().map(|(k, v)| (v, k)).collect();
         for (label, key) in &self.labels {
@@ -629,7 +638,7 @@ impl SimNetwork {
     pub fn event_chain(
         mut self,
         total_events: usize,
-        controller: Option<Sender<(EventId, PeerKey)>>,
+        controller: Option<Sender<(EventId, PeerId)>>,
     ) -> EventChain {
         const SEED: u64 = 0xdeadbeef;
         if let Some(controller) = controller {
@@ -797,7 +806,7 @@ fn group_locations_in_buckets(
 }
 
 fn pretty_print_connections(
-    conns: &HashMap<NodeLabel, (PeerKey, HashMap<NodeLabel, Distance>)>,
+    conns: &HashMap<NodeLabel, (PeerId, HashMap<NodeLabel, Distance>)>,
 ) -> String {
     let mut connections = String::from("Node connections:\n");
     let mut conns = conns.iter().collect::<Vec<_>>();
@@ -835,4 +844,227 @@ fn group_locations_test() -> Result<(), anyhow::Error> {
     );
 
     Ok(())
+}
+
+use super::op_state_manager::OpManager;
+use crate::client_events::ClientEventsProxy;
+
+pub(super) trait NetworkBridgeExt: Clone + 'static {
+    fn recv(&mut self) -> BoxFuture<Result<NetMessage, ConnectionError>>;
+}
+
+struct RunnerConfig<NB, UsrEv>
+where
+    NB: NetworkBridge,
+    UsrEv: ClientEventsProxy + Send + 'static,
+{
+    peer_key: PeerId,
+    is_gateway: bool,
+    gateways: Vec<PeerKeyLocation>,
+    parent_span: Option<tracing::Span>,
+    op_storage: Arc<OpManager>,
+    conn_manager: NB,
+    /// Set on creation, taken on run
+    user_events: Option<UsrEv>,
+    notification_channel: EventLoopNotifications,
+    event_register: Box<dyn NetEventRegister>,
+}
+
+async fn run_node<NB, UsrEv>(mut config: RunnerConfig<NB, UsrEv>) -> Result<(), anyhow::Error>
+where
+    NB: NetworkBridge + NetworkBridgeExt,
+    UsrEv: ClientEventsProxy + Send + 'static,
+{
+    use crate::util::IterExt;
+    if !config.is_gateway {
+        if let Some(gateway) = config.gateways.iter().shuffle().take(1).next() {
+            super::join_ring_request(
+                None,
+                config.peer_key,
+                gateway,
+                &config.op_storage,
+                &mut config.conn_manager,
+            )
+            .await?;
+        } else {
+            anyhow::bail!("requires at least one gateway");
+        }
+    }
+    let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
+    let span = {
+        config
+            .parent_span
+            .clone()
+            .map(|parent_span| {
+                tracing::info_span!(
+                    parent: parent_span,
+                    "client_event_handling",
+                    peer = %config.peer_key
+                )
+            })
+            .unwrap_or_else(
+                || tracing::info_span!("client_event_handling", peer = %config.peer_key),
+            )
+    };
+    let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
+    GlobalExecutor::spawn(
+        super::client_event_handling(
+            config.op_storage.clone(),
+            config.user_events.take().expect("should be set"),
+            client_responses,
+            node_controller_tx,
+        )
+        .instrument(span),
+    );
+    let parent_span: tracing::Span = config
+        .parent_span
+        .clone()
+        .unwrap_or_else(|| tracing::info_span!("event_listener", peer = %config.peer_key));
+    run_event_listener(cli_response_sender, node_controller_rx, config)
+        .instrument(parent_span)
+        .await
+}
+
+/// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
+async fn run_event_listener<NB, UsrEv>(
+    _client_responses: contract::ClientResponsesSender,
+    mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
+    RunnerConfig {
+        peer_key,
+        is_gateway,
+        gateways,
+        parent_span,
+        op_storage,
+        mut conn_manager,
+        mut notification_channel,
+        mut event_register,
+        ..
+    }: RunnerConfig<NB, UsrEv>,
+) -> Result<(), anyhow::Error>
+where
+    NB: NetworkBridge + NetworkBridgeExt,
+    UsrEv: ClientEventsProxy + Send + 'static,
+{
+    use crate::util::IterExt;
+    loop {
+        let msg = tokio::select! {
+            msg = conn_manager.recv() => { msg.map(Either::Left) }
+            msg = notification_channel.recv() => {
+                if let Some(msg) = msg {
+                    Ok(msg.map_left(|(msg, _cli_id)| msg))
+                } else {
+                    anyhow::bail!("notification channel shutdown, fatal error");
+                }
+            }
+            msg = node_controller_rx.recv() => {
+                if let Some(msg) = msg {
+                    Ok(Either::Right(msg))
+                } else {
+                    anyhow::bail!("node controller channel shutdown, fatal error");
+                }
+            }
+        };
+
+        if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
+            let tx_type = tx.transaction_type();
+            let res =
+                super::handle_cancelled_op(tx, peer_key, &op_storage, &mut conn_manager).await;
+            match res {
+                Err(crate::operations::OpError::MaxRetriesExceeded(_, _))
+                    if tx_type == crate::message::TransactionType::Connect && !is_gateway =>
+                {
+                    tracing::warn!("Retrying joining the ring with an other peer");
+                    if let Some(gateway) = gateways.iter().shuffle().next() {
+                        super::join_ring_request(
+                            None,
+                            peer_key,
+                            gateway,
+                            &op_storage,
+                            &mut conn_manager,
+                        )
+                        .await?
+                    } else {
+                        anyhow::bail!("requires at least one gateway");
+                    }
+                }
+                Err(err) => return Err(anyhow::anyhow!(err)),
+                Ok(_) => {}
+            }
+            continue;
+        }
+
+        let msg = match msg {
+            Ok(Either::Left(msg)) => msg,
+            Ok(Either::Right(action)) => match action {
+                NodeEvent::ShutdownNode => break Ok(()),
+                NodeEvent::DropConnection(peer) => {
+                    tracing::info!("Dropping connection to {peer}");
+                    event_register.register_events(Either::Left(
+                        crate::node::network_event_log::NetEventLog::disconnected(&peer),
+                    ));
+                    op_storage.ring.prune_connection(peer);
+                    continue;
+                }
+                NodeEvent::Disconnect { cause: Some(cause) } => {
+                    tracing::info!(peer = %peer_key, "Shutting down node, reason: {cause}");
+                    return Ok(());
+                }
+                NodeEvent::Disconnect { cause: None } => {
+                    tracing::info!(peer = %peer_key, "Shutting down node");
+                    return Ok(());
+                }
+                other => {
+                    unreachable!("event {other:?}, shouldn't happen in the in-memory impl")
+                }
+            },
+            Err(err) => {
+                super::report_result(
+                    None,
+                    Err(err.into()),
+                    &op_storage,
+                    None,
+                    None,
+                    &mut *event_register as &mut _,
+                )
+                .await;
+                continue;
+            }
+        };
+
+        let op_storage = op_storage.clone();
+        let conn_manager = conn_manager.clone();
+        let event_listener = event_register.trait_clone();
+
+        let span = {
+            parent_span
+                .clone()
+                .map(|parent_span| {
+                    tracing::info_span!(
+                        parent: parent_span.clone(),
+                        "process_network_message",
+                        peer = %peer_key, transaction = %msg.id(),
+                        tx_type = %msg.id().transaction_type()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    tracing::info_span!(
+                        "process_network_message",
+                        peer = %peer_key, transaction = %msg.id(),
+                        tx_type = %msg.id().transaction_type()
+                    )
+                })
+        };
+
+        let msg = super::process_message(
+            msg,
+            op_storage,
+            conn_manager,
+            event_listener,
+            None,
+            None,
+            None,
+        )
+        .instrument(span);
+        GlobalExecutor::spawn(msg);
+    }
 }

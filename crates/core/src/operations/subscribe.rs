@@ -10,7 +10,7 @@ use crate::{
     client_events::ClientId,
     contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction},
-    node::{NetworkBridge, OpManager, PeerKey},
+    node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -57,7 +57,7 @@ impl Operation for SubscribeOp {
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
-            let mut sender: Option<PeerKey> = None;
+            let mut sender: Option<PeerId> = None;
             if let Some(peer_key_loc) = msg.sender().cloned() {
                 sender = Some(peer_key_loc.peer);
             };
@@ -329,7 +329,7 @@ enum SubscribeState {
     ReceivedRequest,
     /// Awaitinh response from petition.
     AwaitingResponse {
-        skip_list: Vec<PeerKey>,
+        skip_list: Vec<PeerId>,
         retries: usize,
     },
     Completed,
@@ -347,7 +347,7 @@ pub(crate) async fn request_subscribe(
                 key.clone(),
             )));
         }
-        const EMPTY: &[PeerKey] = &[];
+        const EMPTY: &[PeerId] = &[];
         (
             op_storage
                 .ring
@@ -404,7 +404,7 @@ mod messages {
             key: ContractKey,
             target: PeerKeyLocation,
             subscriber: PeerKeyLocation,
-            skip_list: Vec<PeerKey>,
+            skip_list: Vec<PeerId>,
             htl: usize,
         },
         ReturnSub {
